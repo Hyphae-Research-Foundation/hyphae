@@ -29,19 +29,23 @@ if os.name == "posix":
 try:
     from tools.prepare_native_g7_macos_template import prepare as prepare_macos_template
     from tools.check_native_g7_receipt import (
+        DEFAULT_AUTHORITY,
         validate_ann_read_view_cell,
         validate_bm25_read_view_cell,
         validate_filtered_bm25_read_view_cell,
         validate_hybrid_read_view_cell,
+        validate_strict_group_commit_cell,
     )
     from tools.check_native_performance_receipt import validate_progress
 except ModuleNotFoundError:
     from prepare_native_g7_macos_template import prepare as prepare_macos_template
     from check_native_g7_receipt import (
+        DEFAULT_AUTHORITY,
         validate_ann_read_view_cell,
         validate_bm25_read_view_cell,
         validate_filtered_bm25_read_view_cell,
         validate_hybrid_read_view_cell,
+        validate_strict_group_commit_cell,
     )
     from check_native_performance_receipt import validate_progress
 
@@ -246,6 +250,17 @@ def validate_cross_artifact_dataset(
         or partial.get("dataset_digest") != digest
     ):
         raise RuntimeError("G7 receipt, progress, or partial targets another dataset")
+    receipt_cells = receipt.get("cells")
+    partial_cells = partial.get("cells")
+    if (
+        partial.get("status") != "completed"
+        or partial.get("completed_count") != len(G7_SURFACES)
+        or partial.get("current_cell") is not None
+        or not isinstance(receipt_cells, dict)
+        or not isinstance(partial_cells, dict)
+        or partial_cells != receipt_cells
+    ):
+        raise RuntimeError("G7 terminal partial differs from the final measured cells")
 
 
 def validate_partial_receipt(
@@ -353,6 +368,32 @@ def derive_cell_runtime_budget(
         or seed_primed is not True
     ):
         raise RuntimeBudgetExceeded("G7 pilot or requested runtime bounds are invalid")
+    strict_cell = cells.get("strict-group-commit")
+    strict_evidence = (
+        strict_cell.get("group_commit_evidence")
+        if isinstance(strict_cell, dict)
+        else None
+    )
+    reopen = strict_evidence.get("reopen") if isinstance(strict_evidence, dict) else None
+    if (
+        not isinstance(reopen, dict)
+        or strict_evidence.get("logical_commits") != PILOT_OBSERVATIONS
+        or any(
+            not isinstance(reopen.get(field), int)
+            or isinstance(reopen[field], bool)
+            or reopen[field] <= 0
+            for field in ("open_time_nanos", "verification_time_nanos")
+        )
+    ):
+        raise RuntimeBudgetExceeded(
+            "G7 pilot omitted validated strict group-commit reopen evidence"
+        )
+    pilot_commit_correctness_seconds = (
+        reopen["open_time_nanos"] + reopen["verification_time_nanos"]
+    ) / 1_000_000_000
+    full_commit_correctness_seconds = pilot_commit_correctness_seconds * (
+        observations / PILOT_OBSERVATIONS
+    )
     full_surface_seconds: dict[str, float] = {}
     pilot_surface_seconds = 0.0
     for name in G7_SURFACES:
@@ -371,21 +412,23 @@ def derive_cell_runtime_budget(
             raise RuntimeBudgetExceeded(f"G7 pilot timing is invalid for {name}")
         pilot_measurement_seconds = PILOT_OBSERVATIONS / throughput
         throughput_seconds = observations / throughput
-        p99_measurement_seconds = (
-            observations
-            * p99_nanos
-            / max(expected_concurrency, 1)
-            / 1_000_000_000
-        )
         pilot_warmup_seconds = 0.0
         full_warmup_seconds = 0.0
+        pilot_correctness_seconds = 0.0
+        full_correctness_seconds = 0.0
         if name != "strict-group-commit" and expected_state == "warm":
             pilot_warmup_seconds = PILOT_WARMUP * p99_nanos / 1_000_000_000
             full_warmup_seconds = warmup * p99_nanos / 1_000_000_000
-        pilot_surface_seconds += pilot_measurement_seconds + pilot_warmup_seconds
+        elif name == "strict-group-commit":
+            pilot_correctness_seconds = pilot_commit_correctness_seconds
+            full_correctness_seconds = full_commit_correctness_seconds
+        pilot_surface_seconds += (
+            pilot_measurement_seconds
+            + pilot_warmup_seconds
+            + pilot_correctness_seconds
+        )
         full_surface_seconds[name] = (
-            max(throughput_seconds, p99_measurement_seconds)
-            + full_warmup_seconds
+            throughput_seconds + full_warmup_seconds + full_correctness_seconds
         )
     fixed_overhead_seconds = max(0.0, wall_seconds - pilot_surface_seconds)
     expected_seconds = fixed_overhead_seconds + sum(full_surface_seconds.values())
@@ -402,8 +445,8 @@ def derive_cell_runtime_budget(
             f"slowest_seconds={full_surface_seconds[slowest]:.1f}s"
         )
     return {
-        "schema": "hyphae-native-g7-runtime-budget-v1",
-        "method": "exact-runner-short-pilot-v1",
+        "schema": "hyphae-native-g7-runtime-budget-v2",
+        "method": "exact-runner-short-pilot-with-linear-reopen-v2",
         "seed_treatment": "measured-after-identical-seed-prime",
         "pilot_observations": PILOT_OBSERVATIONS,
         "pilot_warmup": PILOT_WARMUP,
@@ -411,6 +454,11 @@ def derive_cell_runtime_budget(
         "full_warmup": warmup,
         "pilot_wall_seconds": round(float(wall_seconds), 6),
         "fixed_overhead_seconds": round(fixed_overhead_seconds, 6),
+        "strict_group_commit_correctness_projection": {
+            "method": "linear-pilot-reopen-and-full-key-verification-v1",
+            "pilot_seconds": round(pilot_commit_correctness_seconds, 9),
+            "full_seconds": round(full_commit_correctness_seconds, 9),
+        },
         "expected_seconds": round(expected_seconds, 6),
         "multiplier": PILOT_BUDGET_MULTIPLIER,
         "reserve_seconds": PILOT_BUDGET_RESERVE_SECONDS,
@@ -420,6 +468,42 @@ def derive_cell_runtime_budget(
             name: round(value, 6) for name, value in full_surface_seconds.items()
         },
     }
+
+
+def validate_warm_control_pilot_latency(pilot: object) -> None:
+    """Fail before matrix execution when the normative control pilot misses."""
+    if not isinstance(pilot, dict):
+        raise RuntimeBudgetExceeded("G7 warm control pilot must be an object")
+    background = pilot.get("background_interference")
+    if (
+        pilot.get("state") != "warm"
+        or pilot.get("concurrency") != 1
+        or not isinstance(background, dict)
+        or background.get("status") != "control"
+    ):
+        raise RuntimeBudgetExceeded("G7 warm control pilot identity is invalid")
+    cells = pilot.get("cells")
+    if not isinstance(cells, dict) or set(cells) != set(DEFAULT_AUTHORITY.cells):
+        raise RuntimeBudgetExceeded("G7 warm control pilot coverage is invalid")
+    for name, (target_p50, target_p99) in sorted(
+        DEFAULT_AUTHORITY.warm_targets.items()
+    ):
+        cell = cells.get(name)
+        if not isinstance(cell, dict):
+            raise RuntimeBudgetExceeded(
+                f"G7 warm control pilot omitted normative surface {name}"
+            )
+        for percentile, target in (("p50", target_p50), ("p99", target_p99)):
+            value = cell.get(percentile)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise RuntimeBudgetExceeded(
+                    f"G7 warm control pilot timing is invalid: {name}.{percentile}"
+                )
+            if value > target:
+                raise RuntimeBudgetExceeded(
+                    "G7 warm control pilot missed normative latency target: "
+                    f"{name}.{percentile}={value}, target={target}"
+                )
 
 
 def derive_matrix_runtime_plan(
@@ -443,7 +527,7 @@ def derive_matrix_runtime_plan(
     for budget in cell_budgets:
         timeout = budget.get("timeout_seconds")
         if (
-            budget.get("schema") != "hyphae-native-g7-runtime-budget-v1"
+            budget.get("schema") != "hyphae-native-g7-runtime-budget-v2"
             or not isinstance(timeout, (int, float))
             or isinstance(timeout, bool)
             or not math.isfinite(timeout)
@@ -885,6 +969,9 @@ def validate_pilot_search_evidence(
     )
     validate_filtered_bm25_read_view_cell(
         cells.get("filtered-bm25-top10"), hybrid_cell, observations
+    )
+    validate_strict_group_commit_cell(
+        cells.get("strict-group-commit"), observations, pilot.get("concurrency")
     )
 
 
@@ -1407,6 +1494,11 @@ def bind_and_validate_cell_receipt(
     validate_filtered_bm25_read_view_cell(
         receipt_cells.get("filtered-bm25-top10"), hybrid_cell, observations
     )
+    validate_strict_group_commit_cell(
+        receipt_cells.get("strict-group-commit"),
+        observations,
+        expected_concurrency,
+    )
     if not isinstance(initial_ann_bulk, dict):
         raise RuntimeError("G7 runner omitted initial ANN bulk evidence")
     validate_execution_authority_evidence(
@@ -1869,6 +1961,12 @@ def main() -> int:
                 ),
                 stall_timeout_seconds=float(arguments.stall_timeout_seconds),
             )
+            if (
+                plan.state == "warm"
+                and plan.background_mode == "control"
+                and plan.concurrency == 1
+            ):
+                validate_warm_control_pilot_latency(pilot)
             plan.runtime_budget = derive_cell_runtime_budget(
                 pilot,
                 expected_commit=arguments.source_commit,

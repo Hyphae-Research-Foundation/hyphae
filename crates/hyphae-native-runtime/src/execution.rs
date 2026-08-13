@@ -470,6 +470,7 @@ fn parse_numa_variant(variant: &str) -> Option<(u32, u32)> {
 
 struct WorkQueue {
     jobs: Mutex<VecDeque<Job>>,
+    changed: Condvar,
 }
 
 struct WakeState {
@@ -480,12 +481,31 @@ struct WakeState {
 struct ExecutionInner {
     queues: Vec<WorkQueue>,
     wake_lock: Mutex<WakeState>,
-    changed: Condvar,
     steal_policy: NativeNumaStealPolicy,
     shutdown: AtomicBool,
     completed_jobs: AtomicU64,
     local_dispatches: AtomicU64,
     stolen_dispatches: AtomicU64,
+    #[cfg(test)]
+    test_probe: ExecutionTestProbe,
+}
+
+#[cfg(test)]
+struct ExecutionTestProbe {
+    waiting_workers: Vec<std::sync::atomic::AtomicUsize>,
+    notified_wake_returns: Vec<AtomicU64>,
+}
+
+#[cfg(test)]
+impl ExecutionTestProbe {
+    fn new(pool_count: usize) -> Self {
+        Self {
+            waiting_workers: (0..pool_count)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+            notified_wake_returns: (0..pool_count).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
 }
 
 /// Persistent physical-core-first workers with NUMA-local queues and stealing.
@@ -544,18 +564,20 @@ impl NativeExecutionPool {
                 .iter()
                 .map(|_| WorkQueue {
                     jobs: Mutex::new(VecDeque::new()),
+                    changed: Condvar::new(),
                 })
                 .collect(),
             wake_lock: Mutex::new(WakeState {
                 foreground_dispatches_since_background: vec![0; pool_count],
                 high_dispatches_since_normal: vec![0; pool_count],
             }),
-            changed: Condvar::new(),
             steal_policy: topology.numa_steal_policy.clone(),
             shutdown: AtomicBool::new(false),
             completed_jobs: AtomicU64::new(0),
             local_dispatches: AtomicU64::new(0),
             stolen_dispatches: AtomicU64::new(0),
+            #[cfg(test)]
+            test_probe: ExecutionTestProbe::new(pool_count),
         });
         let worker_count = topology.worker_count();
         if worker_count == 0 {
@@ -804,8 +826,28 @@ impl NativeExecutionPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(job);
-        self.inner.changed.notify_all();
+        notify_eligible_pool_workers(&self.inner, pool_index);
         drop(wake);
+    }
+}
+
+fn notify_eligible_pool_workers(inner: &ExecutionInner, home_pool: usize) {
+    inner.queues[home_pool].changed.notify_one();
+    if inner.steal_policy.status != "calibrated" {
+        return;
+    }
+    let Some(home_node) = inner.steal_policy.pools[home_pool].worker_numa_node_id else {
+        return;
+    };
+    for (candidate_pool, policy) in inner.steal_policy.pools.iter().enumerate() {
+        if candidate_pool != home_pool
+            && policy
+                .steal_targets
+                .iter()
+                .any(|target| target.home_numa_node_id == home_node)
+        {
+            inner.queues[candidate_pool].changed.notify_one();
+        }
     }
 }
 
@@ -861,20 +903,45 @@ fn run_worker(inner: &ExecutionInner, local_pool: usize) {
         if inner.shutdown.load(Ordering::Acquire) {
             break;
         }
-        wake = if let Some(wait) = next_steal_wait(inner, local_pool, now) {
-            inner
+        record_worker_wait_started(inner, local_pool);
+        let (next_wake, notified) = if let Some(wait) = next_steal_wait(inner, local_pool, now) {
+            let (next_wake, timeout) = inner.queues[local_pool]
                 .changed
                 .wait_timeout(wake, wait)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (next_wake, !timeout.timed_out())
         } else {
-            inner
-                .changed
-                .wait(wake)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            (
+                inner.queues[local_pool]
+                    .changed
+                    .wait(wake)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                true,
+            )
         };
+        record_worker_wait_finished(inner, local_pool, notified);
+        wake = next_wake;
     }
 }
+
+#[cfg(test)]
+fn record_worker_wait_started(inner: &ExecutionInner, local_pool: usize) {
+    inner.test_probe.waiting_workers[local_pool].fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(not(test))]
+fn record_worker_wait_started(_inner: &ExecutionInner, _local_pool: usize) {}
+
+#[cfg(test)]
+fn record_worker_wait_finished(inner: &ExecutionInner, local_pool: usize, notified: bool) {
+    inner.test_probe.waiting_workers[local_pool].fetch_sub(1, Ordering::AcqRel);
+    if notified {
+        inner.test_probe.notified_wake_returns[local_pool].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(not(test))]
+fn record_worker_wait_finished(_inner: &ExecutionInner, _local_pool: usize, _notified: bool) {}
 
 fn complete_job(inner: &ExecutionInner, job: Job) {
     let outcome = catch_unwind(AssertUnwindSafe(job.operation)).is_ok();
@@ -1056,7 +1123,9 @@ fn signal_shutdown(inner: &ExecutionInner) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     inner.shutdown.store(true, Ordering::Release);
-    inner.changed.notify_all();
+    for queue in &inner.queues {
+        queue.changed.notify_all();
+    }
     drop(wake);
 }
 
@@ -1290,18 +1359,19 @@ mod tests {
             queues: (0..pool_count)
                 .map(|_| WorkQueue {
                     jobs: Mutex::new(VecDeque::new()),
+                    changed: Condvar::new(),
                 })
                 .collect(),
             wake_lock: Mutex::new(WakeState {
                 foreground_dispatches_since_background: vec![0; pool_count],
                 high_dispatches_since_normal: vec![0; pool_count],
             }),
-            changed: Condvar::new(),
             steal_policy,
             shutdown: AtomicBool::new(false),
             completed_jobs: AtomicU64::new(0),
             local_dispatches: AtomicU64::new(0),
             stolen_dispatches: AtomicU64::new(0),
+            test_probe: ExecutionTestProbe::new(pool_count),
         }
     }
 
@@ -1312,6 +1382,71 @@ mod tests {
             enqueued_at,
             operation: Box::new(|| {}),
             completed,
+        }
+    }
+
+    fn wait_for_sleeping_workers(
+        pool: &NativeExecutionPool,
+        expected_by_pool: &[usize],
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or_else(|| io::Error::other("test deadline overflow"))?;
+        loop {
+            let actual = pool
+                .inner
+                .test_probe
+                .waiting_workers
+                .iter()
+                .map(|waiting| waiting.load(Ordering::Acquire))
+                .collect::<Vec<_>>();
+            if actual == expected_by_pool {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "workers did not sleep: expected {expected_by_pool:?}, found {actual:?}"
+                ))
+                .into());
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn wake_returns(pool: &NativeExecutionPool) -> Vec<u64> {
+        pool.inner
+            .test_probe
+            .notified_wake_returns
+            .iter()
+            .map(|returns| returns.load(Ordering::Acquire))
+            .collect()
+    }
+
+    fn wait_for_wakes_to_settle(
+        pool: &NativeExecutionPool,
+        expected_sleeping: &[usize],
+    ) -> Result<Vec<u64>, Box<dyn Error>> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .ok_or_else(|| io::Error::other("test deadline overflow"))?;
+        let mut previous = wake_returns(pool);
+        let mut stable_checks = 0_u8;
+        loop {
+            wait_for_sleeping_workers(pool, expected_sleeping)?;
+            thread::sleep(Duration::from_millis(1));
+            let current = wake_returns(pool);
+            if current == previous {
+                stable_checks = stable_checks.saturating_add(1);
+                if stable_checks == 10 {
+                    return Ok(current);
+                }
+            } else {
+                previous = current;
+                stable_checks = 0;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("worker wake returns did not settle").into());
+            }
         }
     }
 
@@ -1579,6 +1714,213 @@ mod tests {
         );
         assert_eq!(inner.local_dispatches.load(Ordering::Acquire), 3);
         assert_eq!(inner.stolen_dispatches.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn one_local_job_wakes_only_one_sleeping_worker() -> Result<(), Box<dyn Error>> {
+        let mut profile = profile();
+        profile.cpu.processor_topology.clear();
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let pool = NativeExecutionPool::new(&profile, &policy)?;
+        wait_for_sleeping_workers(&pool, &[4])?;
+        let before = wake_returns(&pool);
+
+        assert_eq!(
+            pool.execute_ordered(&parent, vec![41_u64], |value| value + 1)?,
+            vec![42]
+        );
+
+        let after = wait_for_wakes_to_settle(&pool, &[4])?;
+        assert_eq!(after[0].saturating_sub(before[0]), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn submitted_job_wakes_only_its_numa_pool() -> Result<(), Box<dyn Error>> {
+        let profile = profile();
+        let policy = policy();
+        let pool = NativeExecutionPool::new(&profile, &policy)?;
+        wait_for_sleeping_workers(&pool, &[2, 2])?;
+        let before = wake_returns(&pool);
+        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        pool.submit(
+            1,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at: Instant::now(),
+                operation: Box::new(move || {
+                    let _ignored = worker_tx.send(
+                        thread::current()
+                            .name()
+                            .unwrap_or("unnamed-worker")
+                            .to_owned(),
+                    );
+                }),
+                completed: completed_tx,
+            },
+        );
+        assert!(completed_rx.recv_timeout(Duration::from_secs(2))?);
+        assert!(
+            worker_rx
+                .recv_timeout(Duration::from_secs(2))?
+                .starts_with("hyphae-numa-1-")
+        );
+
+        let after = wait_for_wakes_to_settle(&pool, &[2, 2])?;
+        assert_eq!(after[0].saturating_sub(before[0]), 0);
+        assert_eq!(after[1].saturating_sub(before[1]), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn two_jobs_have_two_completions_and_at_most_two_wake_returns() -> Result<(), Box<dyn Error>> {
+        let mut profile = profile();
+        profile.cpu.processor_topology.clear();
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 2,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let pool = NativeExecutionPool::new(&profile, &policy)?;
+        wait_for_sleeping_workers(&pool, &[4])?;
+        let before = wake_returns(&pool);
+        let completed_before = pool.completed_jobs();
+        let rendezvous = Arc::new(Barrier::new(2));
+
+        let values = pool.execute_ordered(&parent, vec![3_u64, 5], {
+            let rendezvous = Arc::clone(&rendezvous);
+            move |value| {
+                rendezvous.wait();
+                value * 2
+            }
+        })?;
+
+        assert_eq!(values, vec![6, 10]);
+        assert_eq!(pool.completed_jobs().saturating_sub(completed_before), 2);
+        let after = wait_for_wakes_to_settle(&pool, &[4])?;
+        assert!(after[0].saturating_sub(before[0]) <= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_remote_candidate_observes_steal_delay() -> Result<(), Box<dyn Error>> {
+        let mut topology = NativeExecutionTopology::derive(&profile(), &policy())?;
+        topology.numa_steal_policy = calibrated_policy_for_scheduler_tests()?;
+        let steal_delay = Duration::from_millis(80);
+        for pool_policy in &mut topology.numa_steal_policy.pools {
+            for target in &mut pool_policy.steal_targets {
+                target.steal_after_nanoseconds = u64::try_from(steal_delay.as_nanos())?;
+            }
+        }
+        let pool = NativeExecutionPool::from_topology(topology)?;
+        wait_for_sleeping_workers(&pool, &[2, 2])?;
+
+        let release_home = Arc::new(Barrier::new(3));
+        let (home_started_tx, home_started_rx) = mpsc::channel();
+        let (home_completed_tx, home_completed_rx) = mpsc::channel();
+        for _ in 0..2 {
+            let release_home = Arc::clone(&release_home);
+            let home_started_tx = home_started_tx.clone();
+            pool.submit(
+                1,
+                Job {
+                    class: WorkloadClass::ForegroundBounded,
+                    enqueued_at: Instant::now(),
+                    operation: Box::new(move || {
+                        let _ignored = home_started_tx.send(());
+                        release_home.wait();
+                    }),
+                    completed: home_completed_tx.clone(),
+                },
+            );
+        }
+        drop(home_started_tx);
+        drop(home_completed_tx);
+        home_started_rx.recv_timeout(Duration::from_secs(2))?;
+        home_started_rx.recv_timeout(Duration::from_secs(2))?;
+        let before = wait_for_wakes_to_settle(&pool, &[2, 0])?;
+
+        let (stolen_worker_tx, stolen_worker_rx) = mpsc::sync_channel(1);
+        let (stolen_completed_tx, stolen_completed_rx) = mpsc::channel();
+        let enqueued_at = Instant::now();
+        pool.submit(
+            1,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at,
+                operation: Box::new(move || {
+                    let _ignored = stolen_worker_tx.send(
+                        thread::current()
+                            .name()
+                            .unwrap_or("unnamed-worker")
+                            .to_owned(),
+                    );
+                }),
+                completed: stolen_completed_tx,
+            },
+        );
+        assert!(matches!(
+            stolen_completed_rx.recv_timeout(steal_delay / 2),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(stolen_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        assert!(enqueued_at.elapsed() >= steal_delay);
+        assert!(
+            stolen_worker_rx
+                .recv_timeout(Duration::from_secs(2))?
+                .starts_with("hyphae-numa-0-")
+        );
+        let after = wake_returns(&pool);
+        assert_eq!(after[0].saturating_sub(before[0]), 1);
+        assert_eq!(after[1].saturating_sub(before[1]), 0);
+        assert_eq!(pool.stolen_dispatches(), 1);
+
+        release_home.wait();
+        assert!(home_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        assert!(home_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        wait_for_sleeping_workers(&pool, &[2, 2])?;
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_wakes_and_joins_every_sleeping_worker() -> Result<(), Box<dyn Error>> {
+        let mut profile = profile();
+        profile.cpu.processor_topology.clear();
+        let pool = NativeExecutionPool::new(&profile, &policy())?;
+        wait_for_sleeping_workers(&pool, &[4])?;
+        let inner = Arc::clone(&pool.inner);
+        let before = inner.test_probe.notified_wake_returns[0].load(Ordering::Acquire);
+
+        drop(pool);
+
+        assert!(inner.shutdown.load(Ordering::Acquire));
+        assert_eq!(
+            inner.test_probe.notified_wake_returns[0]
+                .load(Ordering::Acquire)
+                .saturating_sub(before),
+            4
+        );
+        assert_eq!(
+            inner.test_probe.waiting_workers[0].load(Ordering::Acquire),
+            0
+        );
         Ok(())
     }
 

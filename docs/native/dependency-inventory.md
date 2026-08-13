@@ -50,6 +50,7 @@ dependency, performance and replacement-cost review.
 | `uuid` | transaction/session ID construction | allowed primitive |
 | `unicode-normalization`, `unicode-casefold` | analyzer primitives | allowed primitive |
 | `tokio` | native daemon scheduling and asynchronous local IPC | allowed outside embedded hot path |
+| `futures-channel` | one-shot completion handoff from the sole product owner to asynchronous transport adapters | allowed bounded async primitive |
 | `interprocess` | safe UDS and Windows named-pipe local transport, peer credentials and endpoint ACLs | allowed operating-system IPC wrapper |
 | `widestring` | safe UTF-16 security-descriptor construction for the Windows named-pipe ACL | allowed Windows encoding primitive |
 | `recvmsg` | target-conditioned Windows named-pipe message primitive used by `interprocess` | allowed operating-system IPC wrapper |
@@ -83,8 +84,8 @@ The native product daemon target path currently consists of:
 The exact locked normal/build metadata closure is rooted at
 `hyphae-native-daemon`, the local native product entry point. This root includes
 the protocol, product facade, runtime, and every native engine package: 14
-Hyphae-owned packages and 51 external package identities (50 package names) as
-of 2026-08-07. The two identities for `syn` are 2.0.119 on the Tokio macro
+Hyphae-owned packages and 55 external package identities (54 package names) as
+of 2026-08-12. The two identities for `syn` are 2.0.119 on the Tokio macro
 path and 3.0.2 on the serde/thiserror derive paths. Target-conditioned
 dependencies remain in scope even when they are not compiled on the audit
 host.

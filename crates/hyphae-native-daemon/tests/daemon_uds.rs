@@ -9,7 +9,11 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -169,6 +173,46 @@ fn request(operation: ProductOperation) -> WireRequest {
     }
 }
 
+#[test]
+fn response_completion_does_not_depend_on_the_blocking_pool() -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    runtime.block_on(async {
+        let test = TestDirectory::new("async-completion")?;
+        let daemon = NativeDaemon::start(
+            NativeProduct::create(&test.data)?,
+            test.socket.to_string_lossy(),
+            NativeDaemonConfig::default(),
+        )?;
+        let client = Client::connect(&test.socket, 64 * 1024).await?;
+
+        let blocking_started = Arc::new(Barrier::new(2));
+        let worker_started = Arc::clone(&blocking_started);
+        let (release, released) = mpsc::sync_channel(0);
+        let blocking_worker = tokio::task::spawn_blocking(move || {
+            worker_started.wait();
+            released.recv()
+        });
+        blocking_started.wait();
+
+        client
+            .send_request(1, 2, &request(ProductOperation::Capabilities))
+            .await?;
+        let response = tokio::time::timeout(Duration::from_secs(2), client.response(1, 2)).await;
+
+        release.send(())?;
+        blocking_worker.await??;
+        let response = response.map_err(|_| "response waited for a blocking worker")??;
+        assert!(matches!(response, ProductResponse::Capabilities(_)));
+
+        drop(client);
+        daemon.shutdown().await?;
+        Ok::<(), Box<dyn Error>>(())
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_clients_handshake_share_one_product_and_endpoint_is_private()
 -> Result<(), Box<dyn Error>> {
@@ -263,15 +307,43 @@ async fn terminal_frames_release_the_stream_before_client_reuse() -> Result<(), 
     )?;
     let client = Client::connect(&test.socket, 64 * 1024).await?;
 
-    for request_id in 2..=129 {
+    for _ in 0..128 {
         client
-            .send_request(1, request_id, &request(ProductOperation::Capabilities))
+            .send_request(1, 2, &request(ProductOperation::Capabilities))
             .await?;
         assert!(matches!(
-            client.response(1, request_id).await?,
+            client.response(1, 2).await?,
             ProductResponse::Capabilities(_)
         ));
     }
+
+    for _ in 0..128 {
+        client
+            .codec
+            .send(
+                &mut &client.stream,
+                FrameKind::Cancel,
+                2,
+                3,
+                &encode_cancel(1),
+            )
+            .await?;
+        client
+            .send_request(2, 3, &request(ProductOperation::Capabilities))
+            .await?;
+        let Err(cancelled) = client.response(2, 3).await else {
+            return Err("cancelled request completed during stream reuse".into());
+        };
+        assert!(cancelled.to_string().contains("cancelled"));
+    }
+
+    client
+        .send_request(2, 3, &request(ProductOperation::Capabilities))
+        .await?;
+    assert!(matches!(
+        client.response(2, 3).await?,
+        ProductResponse::Capabilities(_)
+    ));
 
     drop(client);
     daemon.shutdown().await?;

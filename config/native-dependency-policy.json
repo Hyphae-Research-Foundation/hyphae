@@ -162,6 +162,14 @@
       "rationale": "MSVC discovery used transitively by the cc build primitive."
     },
     {
+      "name": "futures-channel",
+      "version": "0.3.32",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "bounded asynchronous channel primitive",
+      "rationale": "One-shot response completion from the sole synchronous product owner to asynchronous local transport tasks without an executor thread per request."
+    },
+    {
       "name": "futures-core",
       "version": "0.3.32",
       "source": "registry+https://github.com/rust-lang/crates.io-index",

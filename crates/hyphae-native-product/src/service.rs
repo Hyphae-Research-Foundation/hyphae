@@ -78,7 +78,7 @@ enum ServiceCommand {
         context: ProductRequestContext,
         operation: Box<ProductOperation>,
         enqueued_at: Instant,
-        reply: SyncSender<Result<ProductResponse, ProductError>>,
+        reply: DispatchReply,
     },
     CloseSession {
         session_id: ProductSessionId,
@@ -87,6 +87,24 @@ enum ServiceCommand {
     Shutdown {
         reply: SyncSender<()>,
     },
+}
+
+enum DispatchReply {
+    Blocking(SyncSender<Result<ProductResponse, ProductError>>),
+    Async(futures_channel::oneshot::Sender<Result<ProductResponse, ProductError>>),
+}
+
+impl DispatchReply {
+    fn send(self, response: Result<ProductResponse, ProductError>) {
+        match self {
+            Self::Blocking(reply) => {
+                let _ignored = reply.send(response);
+            }
+            Self::Async(reply) => {
+                let _ignored = reply.send(response);
+            }
+        }
+    }
 }
 
 struct SharedService {
@@ -302,9 +320,39 @@ impl NativeProductClient {
             context,
             operation: Box::new(operation),
             enqueued_at: Instant::now(),
-            reply,
+            reply: DispatchReply::Blocking(reply),
         })?;
         Ok(NativeProductPendingResponse {
+            receive,
+            request_id,
+        })
+    }
+
+    /// Enqueues one operation and returns an asynchronous completion receiver.
+    ///
+    /// The sole product owner remains synchronous. This completion path lets
+    /// async transport adapters await its result without occupying a blocking
+    /// executor thread per in-flight request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the context is foreign or service admission fails.
+    pub fn submit_async(
+        &self,
+        context: ProductRequestContext,
+        operation: ProductOperation,
+    ) -> Result<NativeProductPendingAsyncResponse, ProductError> {
+        self.validate_context(&context)?;
+        let request_id = context.request_id;
+        let (reply, receive) = futures_channel::oneshot::channel();
+        self.handle.send(ServiceCommand::Dispatch {
+            session_id: self.session_id,
+            context,
+            operation: Box::new(operation),
+            enqueued_at: Instant::now(),
+            reply: DispatchReply::Async(reply),
+        })?;
+        Ok(NativeProductPendingAsyncResponse {
             receive,
             request_id,
         })
@@ -328,7 +376,7 @@ impl NativeProductClient {
             context,
             operation: Box::new(operation),
             enqueued_at: Instant::now(),
-            reply,
+            reply: DispatchReply::Blocking(reply),
         })?;
         Ok(NativeProductPendingResponse {
             receive,
@@ -380,6 +428,26 @@ impl NativeProductPendingResponse {
     pub fn wait(self) -> Result<ProductResponse, ProductError> {
         let request_id = self.request_id;
         self.receive.recv().map_err(|_| {
+            ProductError::from_code(ProductErrorCode::Unavailable).with_request_id(request_id)
+        })?
+    }
+}
+
+/// Asynchronous completion of one admitted process-local service operation.
+pub struct NativeProductPendingAsyncResponse {
+    receive: futures_channel::oneshot::Receiver<Result<ProductResponse, ProductError>>,
+    request_id: u128,
+}
+
+impl NativeProductPendingAsyncResponse {
+    /// Waits asynchronously for the sole owner to execute this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operation error or `unavailable` if the owner terminates.
+    pub async fn wait(self) -> Result<ProductResponse, ProductError> {
+        let request_id = self.request_id;
+        self.receive.await.map_err(|_| {
             ProductError::from_code(ProductErrorCode::Unavailable).with_request_id(request_id)
         })?
     }
@@ -549,7 +617,7 @@ fn owner_loop(
                     },
                     |session| product.dispatch(session, &context, *operation),
                 );
-                let _ignored = reply.send(result);
+                reply.send(result);
             }
             ServiceCommand::CloseSession { session_id, reply } => {
                 sessions.remove(&session_id);

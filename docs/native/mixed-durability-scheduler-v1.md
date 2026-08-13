@@ -44,6 +44,9 @@ beyond the current cohort and must retain that command as the next FIFO item.
 - A `group` request starts a cohort containing only immediately consecutive
   live `group` requests, bounded by the configured cohort size and collection
   interval.
+- An explicit group cohort is one indivisible FIFO barrier. Its requests are
+  prevalidated and inserted together, never mixed with adjacent commands, and
+  execute in their input order.
 - A `strict`, `memory`, shutdown, cancelled, or expired command ends collection.
 - A later `group` request must never jump over another durability class.
 
@@ -60,13 +63,18 @@ The public client supports:
 - controlled admission with an optional absolute queue deadline and explicit
   cancellation handle.
 
-The admission-state lock protects only `accepting` and sender acquisition. No
-blocking queue send or response wait may hold it. A full queue therefore cannot
-prevent another thread from stopping admission.
+The admission-state lock protects `accepting`, sender acquisition, and logical
+request-capacity accounting. No blocking queue send or response wait may hold
+it. A full queue therefore cannot prevent another thread from stopping
+admission.
 
-Queue capacity counts commit and control commands. A client that observes
-`saturated`, `deadline exceeded`, `cancelled`, or `unavailable` receives no
-commit acknowledgement.
+Queue capacity counts retained logical commit requests, not transport
+commands. A singleton reserves one unit. An explicit cohort atomically reserves
+its complete request count before insertion and releases that count when the
+worker claims the command; partial reservation is forbidden. Shutdown and
+other internal control markers consume no logical-request capacity. A client
+that observes `saturated`, `deadline exceeded`, `cancelled`, or `unavailable`
+receives no commit acknowledgement.
 
 ## Exact cancellation boundary
 
@@ -141,10 +149,13 @@ Executable evidence must cover:
 - a consecutive group cohort sharing one page and WAL synchronization;
 - strict and memory singleton receipts through the scheduler;
 - immediate saturation without mutation;
+- atomic weighted admission in which one explicit cohort can fill the logical
+  request bound even though it occupies one transport command;
 - queue-deadline and explicit-cancellation wins without consuming IDs or CSNs;
 - cancellation losing to execution and returning a definite outcome;
 - abandoned waiters without database rollback;
-- shutdown while the queue is saturated;
+- shutdown while the queue is saturated and while accepted work is waiting for
+  bounded resource admission, with all work before the marker drained;
 - worker-failure unavailability;
 - no starvation under sustained group submissions; and
 - warm Windows and WSL2 latency/throughput under mixed and group-only load.

@@ -12,6 +12,7 @@ from tools.check_native_g7_receipt import (
     GateFailure,
     resolve_expected_tree,
     validate as validate_receipt,
+    validate_strict_group_commit_cell,
 )
 
 
@@ -231,6 +232,90 @@ def _filtered_bm25_evidence() -> dict:
     }
 
 
+def _latency_summary(
+    p50: int = 1,
+    p95: int = 2,
+    p99: int = 3,
+    p999: int = 4,
+    maximum: int = 5,
+) -> dict:
+    return {
+        "p50": p50,
+        "p95": p95,
+        "p99": p99,
+        "p999": p999,
+        "maximum": maximum,
+    }
+
+
+def _strict_group_commit_evidence(
+    observations: int = 1_000_000,
+    concurrency: int = 1,
+) -> dict:
+    cohort_width = 32
+    full_cohorts, remainder = divmod(observations, cohort_width)
+    cohort_count = full_cohorts + int(remainder > 0)
+    cohort_size_histogram = {str(cohort_width): full_cohorts}
+    if remainder:
+        cohort_size_histogram[str(remainder)] = 1
+    return {
+        "schema": "hyphae-native-g7-strict-group-commit-evidence-v1",
+        "latency_scope": "scheduler-enqueue-through-durable-response-v1",
+        "throughput_scope": "bounded-cohort-window-wall-time-v1",
+        "submission_mode": "explicit-bounded-cohort-v1",
+        "producer_concurrency": concurrency,
+        "maximum_active_producers": concurrency,
+        "cohort_width": cohort_width,
+        "scheduler_queue_capacity": 64,
+        "outstanding_limit": cohort_width,
+        "maximum_outstanding": cohort_width,
+        "logical_commits": observations,
+        "cohort_count": cohort_count,
+        "final_cohort_size": remainder or cohort_width,
+        "cohort_size_histogram": cohort_size_histogram,
+        "cohort_position_histogram": {
+            str(position): full_cohorts + int(position < remainder)
+            for position in range(cohort_width)
+        },
+        "first_commit_csn": 3,
+        "last_commit_csn": observations + 2,
+        "distinct_commit_csns": observations,
+        "commit_receipt_digest_algorithm": (
+            "blake3-csn-ordered-native-commit-receipts-v1"
+        ),
+        "commit_receipt_digest": "a" * 64,
+        "page_synchronizations": cohort_count,
+        "wal_synchronizations": cohort_count,
+        "cohort_execution_nanos_total": cohort_count * 3,
+        "page_synchronization_nanos_total": cohort_count,
+        "wal_synchronization_nanos_total": cohort_count,
+        "timing_sample_count": observations,
+        "timings_nanoseconds": {
+            "admission_wait": _latency_summary(0, 0, 0, 0, 0),
+            "queue_wait": _latency_summary(),
+            "cohort_execution": _latency_summary(),
+            "page_synchronization": _latency_summary(),
+            "wal_synchronization": _latency_summary(),
+            "end_to_end": _latency_summary(),
+        },
+        "reopen": {
+            "provider": "single-reopened-root-snapshot-full-key-digest-v1",
+            "baseline_visible_csn": 2,
+            "baseline_committed_transactions": 2,
+            "reopened_visible_csn": observations + 2,
+            "reopened_committed_transactions": observations + 2,
+            "verified_logical_commits": observations,
+            "missing_keys": 0,
+            "mismatched_values": 0,
+            "state_digest_algorithm": "blake3-logical-id-key-value-v1",
+            "expected_state_digest": "b" * 64,
+            "recovered_state_digest": "b" * 64,
+            "open_time_nanos": 100,
+            "verification_time_nanos": 1_000,
+        },
+    }
+
+
 def validate(
     payload: dict,
     expected_commit: str,
@@ -325,6 +410,10 @@ def receipt() -> dict:
     cells["bm25-top10"].update(_bm25_evidence())
     cells["filtered-bm25-top10"].update(_filtered_bm25_evidence())
     cells["hybrid-top10"].update(_hybrid_evidence())
+    cells["strict-group-commit"].update({
+        "durability": "group-physical-sync",
+        "group_commit_evidence": _strict_group_commit_evidence(),
+    })
     return {
         "schema": "hyphae-native-g7-receipt-v4",
         "gate": "G7",
@@ -1218,13 +1307,216 @@ class G7ReceiptTests(unittest.TestCase):
         payload["concurrency"] = 32
         payload["cells"]["bm25-top10"]["p50"] = 10_000_000
         payload["cells"]["bm25-top10"]["p99"] = 20_000_000
+        payload["cells"]["strict-group-commit"]["group_commit_evidence"] = (
+            _strict_group_commit_evidence(concurrency=32)
+        )
         self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
 
     def test_group_commit_research_target_is_advisory(self) -> None:
         payload = copy.deepcopy(receipt())
-        payload["cells"]["strict-group-commit"]["p50"] = 2_000_000
-        payload["cells"]["strict-group-commit"]["p99"] = 3_000_000
+        cell = payload["cells"]["strict-group-commit"]
+        advisory = _latency_summary(
+            2_000_000,
+            2_500_000,
+            3_000_000,
+            3_500_000,
+            4_000_000,
+        )
+        cell.update(advisory)
+        cell["group_commit_evidence"]["timings_nanoseconds"]["end_to_end"] = (
+            advisory
+        )
         self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+    def test_group_commit_accepts_exact_full_and_pilot_cohort_plans(self) -> None:
+        for observations, expected_sizes, expected_positions, final_size in (
+            (
+                1_000_000,
+                {"32": 31_250},
+                {str(position): 31_250 for position in range(32)},
+                32,
+            ),
+            (
+                10_000,
+                {"32": 312, "16": 1},
+                {
+                    str(position): 313 if position < 16 else 312
+                    for position in range(32)
+                },
+                16,
+            ),
+        ):
+            for concurrency in (1, 8, 32):
+                with self.subTest(observations=observations, concurrency=concurrency):
+                    cell = {
+                        "status": "measured",
+                        **_latency_summary(),
+                        "throughput_per_second": 1.0,
+                        "durability": "group-physical-sync",
+                        "group_commit_evidence": _strict_group_commit_evidence(
+                            observations,
+                            concurrency,
+                        ),
+                    }
+                    validate_strict_group_commit_cell(
+                        cell,
+                        observations,
+                        concurrency,
+                    )
+                    evidence = cell["group_commit_evidence"]
+                    self.assertEqual(evidence["cohort_size_histogram"], expected_sizes)
+                    self.assertEqual(
+                        evidence["cohort_position_histogram"],
+                        expected_positions,
+                    )
+                    self.assertEqual(evidence["final_cohort_size"], final_size)
+
+    def test_group_commit_requires_exact_evidence_fields(self) -> None:
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                evidence = payload["cells"]["strict-group-commit"][
+                    "group_commit_evidence"
+                ]
+                if mutation == "missing":
+                    del evidence["cohort_width"]
+                else:
+                    evidence["unexpected"] = 0
+                with self.assertRaisesRegex(GateFailure, "group-commit.*fields"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_fixed_bounded_real_concurrency(self) -> None:
+        for field, value in (
+            ("producer_concurrency", 8),
+            ("maximum_active_producers", 0),
+            ("cohort_width", 31),
+            ("submission_mode", "natural-timed-collection-v1"),
+            ("scheduler_queue_capacity", 65),
+            ("outstanding_limit", 31),
+            ("maximum_outstanding", 33),
+            ("maximum_outstanding", True),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = receipt()
+                payload["cells"]["strict-group-commit"]["group_commit_evidence"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*configuration"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_exact_full_cohorts_and_terminal_remainder(self) -> None:
+        mutations = (
+            ("logical_commits", 999_999),
+            ("cohort_count", 31_249),
+            ("final_cohort_size", 16),
+            ("cohort_size_histogram", {"32": 31_249, "16": 2}),
+            (
+                "cohort_position_histogram",
+                {str(position): 31_250 for position in range(31)},
+            ),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["strict-group-commit"]["group_commit_evidence"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*cohort"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_contiguous_distinct_commit_receipts(self) -> None:
+        for field, value in (
+            ("first_commit_csn", 4),
+            ("last_commit_csn", 1_000_003),
+            ("distinct_commit_csns", 999_999),
+            ("distinct_commit_csns", False),
+            ("commit_receipt_digest_algorithm", "sha256"),
+            ("commit_receipt_digest", "0" * 63),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["strict-group-commit"]["group_commit_evidence"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*commit receipt"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_one_page_and_wal_sync_per_cohort(self) -> None:
+        for field, value in (
+            ("page_synchronizations", 31_249),
+            ("wal_synchronizations", 31_251),
+            ("cohort_execution_nanos_total", 62_499),
+            ("page_synchronization_nanos_total", 0),
+            ("wal_synchronization_nanos_total", True),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["strict-group-commit"]["group_commit_evidence"][
+                    field
+                ] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*synchronization"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_exact_timing_samples_and_end_to_end_stats(self) -> None:
+        for mutation, field, value in (
+            ("count", "timing_sample_count", 999_999),
+            ("component", "p95", 0),
+            ("top-level", "p99", 4),
+            ("extra", "unexpected", {}),
+            ("summary-missing", "maximum", None),
+            ("summary-extra", "average", 1),
+        ):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                cell = payload["cells"]["strict-group-commit"]
+                evidence = cell["group_commit_evidence"]
+                if mutation == "count":
+                    evidence[field] = value
+                elif mutation == "component":
+                    evidence["timings_nanoseconds"]["queue_wait"][field] = value
+                elif mutation == "top-level":
+                    cell[field] = value
+                elif mutation == "summary-missing":
+                    del evidence["timings_nanoseconds"]["queue_wait"][field]
+                elif mutation == "summary-extra":
+                    evidence["timings_nanoseconds"]["queue_wait"][field] = value
+                else:
+                    evidence["timings_nanoseconds"][field] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*timing"):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_requires_exact_reopen_equivalence(self) -> None:
+        for field, value in (
+            ("baseline_visible_csn", 3),
+            ("reopened_visible_csn", 1_000_003),
+            ("reopened_committed_transactions", 1_000_001),
+            ("verified_logical_commits", 999_999),
+            ("missing_keys", 1),
+            ("mismatched_values", True),
+            ("recovered_state_digest", "c" * 64),
+            ("open_time_nanos", 0),
+            ("verification_time_nanos", False),
+        ):
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["cells"]["strict-group-commit"]["group_commit_evidence"][
+                    "reopen"
+                ][field] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*reopen"):
+                    validate(payload, COMMIT)
+
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                reopen = payload["cells"]["strict-group-commit"][
+                    "group_commit_evidence"
+                ]["reopen"]
+                if mutation == "missing":
+                    del reopen["provider"]
+                else:
+                    reopen["unexpected"] = 0
+                with self.assertRaisesRegex(GateFailure, "group-commit.*reopen.*fields"):
+                    validate(payload, COMMIT)
 
     def test_interference_requires_control_comparison(self) -> None:
         payload = interference_receipt()

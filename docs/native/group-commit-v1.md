@@ -27,12 +27,23 @@ The scheduler configuration names:
 
 - the maximum number of requests in one cohort;
 - the maximum collection interval after the first request arrives; and
-- the bounded submission-queue capacity.
+- the bounded submission-queue capacity, measured in retained logical
+  requests rather than transport commands.
 
 All three bounds are validated before the worker starts. The first request
 starts the collection interval. The worker drains requests until the cohort is
 full or the interval expires, whichever occurs first. A singleton cohort is
 valid and still receives one synchronization.
+
+The additive explicit-cohort path accepts between one and the configured
+maximum number of detached `group` batches in one call. It validates and
+retains every batch before inserting one indivisible FIFO command, returns one
+`NativePendingCommit` handle per request in input order, and never mixes that
+cohort with neighboring commands. Pre-insertion failure inserts nothing and
+produces no completion evidence. Although the transport uses one command, the
+submission gate reserves one queue-capacity unit per retained request. The
+worker releases those units when it claims the command, so an explicit cohort
+cannot multiply the configured request bound.
 
 Shutdown stops accepting new work, drains requests ordered before the shutdown
 marker, joins the worker, and closes the database handle. A worker-level
@@ -93,6 +104,36 @@ Singleton `strict`, `memory`, and direct `group` commits report cohort size one
 and position zero. A scheduler cohort containing rejected requests reports only
 the accepted count in committed receipts.
 
+`NativePendingCommit::wait` preserves the existing receipt API. The additive
+`wait_with_evidence` form returns a `ScheduledCommitCompletion` containing the
+same receipt plus explicit page- and WAL-synchronization counts. A successful
+strict or `group` singleton reports one of each; a `memory` singleton reports
+zero of each. Every successful member of one group cohort reports the same
+cohort size, the complete zero-based position set, and exactly one shared page
+synchronization and one shared WAL synchronization.
+End-to-end time is sealed when the worker produces the completion; delaying
+consumption of a pending handle cannot increase it.
+
+## Strict G7 cohort evidence
+
+The strict G7 surface uses the explicit-cohort path rather than timing-based
+collection. Its authority is a bounded window of 32 outstanding logical
+commits, submitted as full cohorts of 32 plus at most one final partial cohort.
+Configured producer concurrency (`1`, `8`, or `32`) controls preparation; it
+does not reduce the outstanding durable window. The runner measures the
+maximum simultaneously active producers instead of copying the configured
+value.
+
+The timed throughput window begins before cohort preparation and ends only
+after every pending completion in the window is durable. Per-request latency
+remains scheduler enqueue through durable response. G7 evidence reconciles the
+exact cohort-size and position histograms, contiguous CSNs, one page and WAL
+synchronization per cohort, and all scheduler timing components. It then drops
+the live database, reopens the directory once, verifies every logical key from
+one recovered snapshot, and requires the expected and recovered state digests
+to match. These rules do not weaken the advisory strict-fsync latency target or
+by themselves close G7.
+
 ## Failure behavior
 
 - Invalid scheduler bounds fail before a thread or file mutation exists.
@@ -122,6 +163,12 @@ Required executable evidence covers:
 - all deterministic interruption points with permitted prefix recovery before
   WAL synchronization and complete-cohort recovery afterwards;
 - clean shutdown, post-shutdown rejection, and worker-failure unavailability;
+- explicit full and partial cohorts that remain isolated from neighboring FIFO
+  commands and report one page and WAL synchronization;
+- queue capacity charged by logical request, including an explicit cohort that
+  fills the configured bound and prevents another admission until claim;
+- shutdown that drains an already accepted cohort after its bounded resource
+  wait becomes available;
 - strict reopen equivalence; and
 - warm concurrency-one and contended latency/throughput receipts that separate
   queue time, execution time, page synchronization, WAL synchronization, and

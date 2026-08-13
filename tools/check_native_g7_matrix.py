@@ -64,6 +64,7 @@ def validate_matrix(
     build_identities: set[str] = set()
     initial_ann_bulk_identities: set[str] = set()
     dataset_digests: set[str] = set()
+    recovered_group_state_digests: set[str] = set()
     for receipt in receipts:
         audit = validate(
             receipt,
@@ -83,13 +84,20 @@ def validate_matrix(
             json.dumps(receipt["initial_ann_bulk"], sort_keys=True)
         )
         dataset_digests.add(receipt["dataset"]["digest"])
+        recovered_group_state_digests.add(
+            receipt["cells"]["strict-group-commit"]["group_commit_evidence"][
+                "reopen"
+            ]["recovered_state_digest"]
+        )
     if (
         len(build_identities) != 1
         or len(initial_ann_bulk_identities) != 1
         or len(dataset_digests) != 1
+        or len(recovered_group_state_digests) != 1
     ):
         raise GateFailure(
-            "G7 matrix receipts do not share one build, ANN generation, and dataset"
+            "G7 matrix receipts do not share one build, ANN generation, dataset, "
+            "and recovered group-commit state"
         )
     if seen != {
         (state, concurrency, background)

@@ -557,6 +557,7 @@ async fn serve_connection(
 #[derive(Clone)]
 struct ActiveRequest {
     stream_id: u32,
+    generation: u64,
     cancellation: hyphae_native_product::ProductCancellationToken,
 }
 
@@ -569,6 +570,7 @@ struct PendingControl {
 
 struct ActiveWindow {
     request_id: u64,
+    generation: u64,
     window: FlowWindow,
 }
 
@@ -601,6 +603,7 @@ async fn connection_loop(
     let mut reader = stream.as_ref();
     let output = Arc::new(AsyncMutex::new(()));
     let mut responses = JoinSet::new();
+    let mut next_generation = 1_u64;
     loop {
         let received: Option<hyphae_native_protocol::OwnedFrame> = tokio::select! {
             result = receive_codec.receive(&mut reader) => result?,
@@ -841,6 +844,10 @@ async fn connection_loop(
                 if pending_control.is_some_and(|control| control.cancelled) {
                     token.cancel();
                 }
+                let generation = next_generation;
+                next_generation = next_generation
+                    .checked_add(1)
+                    .ok_or(DaemonError::ClientProtocol)?;
                 {
                     // Admission shares the output lock with terminal frames so a
                     // completed stream cannot be reused until its END or FAILURE
@@ -857,6 +864,7 @@ async fn connection_loop(
                         frame.request_id,
                         ActiveRequest {
                             stream_id: frame.stream_id,
+                            generation,
                             cancellation: token.clone(),
                         },
                     );
@@ -864,6 +872,7 @@ async fn connection_loop(
                         frame.stream_id,
                         ActiveWindow {
                             request_id: frame.request_id,
+                            generation,
                             window: FlowWindow::new(
                                 u64::from(welcome.initial_window),
                                 config.maximum_window,
@@ -880,16 +889,18 @@ async fn connection_loop(
                 context.idempotency_token = request.idempotency_token;
                 context.limits = request.limits;
                 context.durability = request.durability;
-                let pending = match client.submit(context, request.operation) {
+                let pending = match client.submit_async(context, request.operation) {
                     Ok(pending) => pending,
                     Err(error) => {
-                        finish_request(&requests, &windows, frame.stream_id, frame.request_id)?;
-                        send_product_error(
+                        send_terminal_product_error(
                             stream.as_ref(),
                             codec,
                             &output,
+                            &requests,
+                            &windows,
                             frame.stream_id,
                             frame.request_id,
+                            generation,
                             error,
                         )
                         .await?;
@@ -904,70 +915,65 @@ async fn connection_loop(
                 let response_client = client.clone();
                 let mut response_shutdown = shutdown.resubscribe();
                 responses.spawn(async move {
-                    let response = tokio::task::spawn_blocking(move || pending.wait()).await;
-                    let sent =
-                        match response {
-                            Ok(response) => match AsyncFrameIo::new(negotiated_payload) {
-                                Ok(response_codec) => match response {
-                                    Ok(response) => {
-                                        let encoding_started = Instant::now();
-                                        match encode_product_response(&response) {
-                                            Ok(encoded) => {
-                                                response_client.record_timing(
-                                                    TimingClass::ResultEncoding,
-                                                    encoding_started.elapsed(),
-                                                );
-                                                let transport_started = Instant::now();
-                                                send_stream(
-                                                    response_stream.as_ref(),
-                                                    &response_codec,
-                                                    &response_output,
-                                                    frame.stream_id,
-                                                    frame.request_id,
-                                                    &encoded,
-                                                    &response_requests,
-                                                    &response_windows,
-                                                    &response_notify,
-                                                    &mut response_shutdown,
-                                                )
-                                                .await
-                                                .inspect(|()| {
-                                                    response_client.record_timing(
-                                                        TimingClass::Transport,
-                                                        transport_started.elapsed(),
-                                                    );
-                                                })
-                                            }
-                                            Err(error) => Err(error.into()),
-                                        }
-                                    }
-                                    Err(error) => {
-                                        finish_request(
-                                            &response_requests,
-                                            &response_windows,
-                                            frame.stream_id,
-                                            frame.request_id,
-                                        )?;
-                                        send_product_error(
+                    let response = pending.wait().await;
+                    let sent = match AsyncFrameIo::new(negotiated_payload) {
+                        Ok(response_codec) => match response {
+                            Ok(response) => {
+                                let encoding_started = Instant::now();
+                                match encode_product_response(&response) {
+                                    Ok(encoded) => {
+                                        response_client.record_timing(
+                                            TimingClass::ResultEncoding,
+                                            encoding_started.elapsed(),
+                                        );
+                                        let transport_started = Instant::now();
+                                        send_stream(
                                             response_stream.as_ref(),
                                             &response_codec,
                                             &response_output,
                                             frame.stream_id,
                                             frame.request_id,
-                                            error,
+                                            generation,
+                                            &encoded,
+                                            &response_requests,
+                                            &response_windows,
+                                            &response_notify,
+                                            &mut response_shutdown,
                                         )
                                         .await
+                                        .inspect(|()| {
+                                            response_client.record_timing(
+                                                TimingClass::Transport,
+                                                transport_started.elapsed(),
+                                            );
+                                        })
                                     }
-                                },
-                                Err(error) => Err(error.into()),
-                            },
-                            Err(_) => Err(DaemonError::Task),
-                        };
+                                    Err(error) => Err(error.into()),
+                                }
+                            }
+                            Err(error) => {
+                                send_terminal_product_error(
+                                    response_stream.as_ref(),
+                                    &response_codec,
+                                    &response_output,
+                                    &response_requests,
+                                    &response_windows,
+                                    frame.stream_id,
+                                    frame.request_id,
+                                    generation,
+                                    error,
+                                )
+                                .await
+                            }
+                        },
+                        Err(error) => Err(error.into()),
+                    };
                     finish_request(
                         &response_requests,
                         &response_windows,
                         frame.stream_id,
                         frame.request_id,
+                        generation,
                     )?;
                     sent
                 });
@@ -1016,18 +1022,19 @@ fn finish_request(
     windows: &WindowState,
     stream_id: u32,
     request_id: u64,
+    generation: u64,
 ) -> Result<(), DaemonError> {
     let mut requests = requests.lock().map_err(|_| DaemonError::Task)?;
     if requests
         .get(&request_id)
-        .is_some_and(|request| request.stream_id == stream_id)
+        .is_some_and(|request| request.stream_id == stream_id && request.generation == generation)
     {
         requests.remove(&request_id);
     }
     let mut windows = windows.lock().map_err(|_| DaemonError::Task)?;
     if windows
         .get(&stream_id)
-        .is_some_and(|window| window.request_id == request_id)
+        .is_some_and(|window| window.request_id == request_id && window.generation == generation)
     {
         windows.remove(&stream_id);
     }
@@ -1075,6 +1082,7 @@ async fn send_stream(
     output: &AsyncMutex<()>,
     stream_id: u32,
     request_id: u64,
+    generation: u64,
     response: &[u8],
     requests: &RequestState,
     windows: &WindowState,
@@ -1086,7 +1094,7 @@ async fn send_stream(
         let chunk = {
             let mut windows = windows.lock().map_err(|_| DaemonError::Task)?;
             let window = windows.get_mut(&stream_id).ok_or(DaemonError::Task)?;
-            if window.request_id != request_id {
+            if window.request_id != request_id || window.generation != generation {
                 return Err(DaemonError::Task);
             }
             let available = usize::try_from(window.window.available()).unwrap_or(usize::MAX);
@@ -1123,7 +1131,7 @@ async fn send_stream(
     }
     let completion = StreamCompletion::for_data(response)?;
     let _output = output.lock().await;
-    finish_request(requests, windows, stream_id, request_id)?;
+    finish_request(requests, windows, stream_id, request_id, generation)?;
     codec
         .send(
             &mut &*stream,
@@ -1144,23 +1152,60 @@ async fn send_product_error(
     request_id: u64,
     error: ProductError,
 ) -> Result<(), DaemonError> {
+    let encoded = encode_product_failure(codec, request_id, error)?;
+    let _output = output.lock().await;
+    send_product_failure(stream, codec, stream_id, request_id, &encoded).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_terminal_product_error(
+    stream: &interprocess::local_socket::tokio::Stream,
+    codec: &AsyncFrameIo,
+    output: &AsyncMutex<()>,
+    requests: &RequestState,
+    windows: &WindowState,
+    stream_id: u32,
+    request_id: u64,
+    generation: u64,
+    error: ProductError,
+) -> Result<(), DaemonError> {
+    let encoded = encode_product_failure(codec, request_id, error)?;
+    let _output = output.lock().await;
+    finish_request(requests, windows, stream_id, request_id, generation)?;
+    send_product_failure(stream, codec, stream_id, request_id, &encoded).await
+}
+
+fn encode_product_failure(
+    codec: &AsyncFrameIo,
+    request_id: u64,
+    error: ProductError,
+) -> Result<Vec<u8>, DaemonError> {
     let error = if error.request_id().is_some() {
         error
     } else {
         error.with_request_id(u128::from(request_id))
     };
     let encoded = encode_failure(&error)?;
-    let _output = output.lock().await;
     if encoded.len() > codec.maximum_payload() {
         return Err(DaemonError::ClientProtocol);
     }
+    Ok(encoded)
+}
+
+async fn send_product_failure(
+    stream: &interprocess::local_socket::tokio::Stream,
+    codec: &AsyncFrameIo,
+    stream_id: u32,
+    request_id: u64,
+    encoded: &[u8],
+) -> Result<(), DaemonError> {
     codec
         .send(
             &mut &*stream,
             FrameKind::Failure,
             stream_id,
             request_id,
-            &encoded,
+            encoded,
         )
         .await?;
     Ok(())

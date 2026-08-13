@@ -100,11 +100,13 @@ pub use governor::{
 };
 pub use group_commit::{
     ActiveExpiryConfig, ActiveExpiryConfigError, ActiveExpiryFailure, ActiveExpiryStats,
-    CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError, GroupCommitSubmitError,
+    CommitCancellationOutcome, GroupCommitConfig, GroupCommitConfigError,
+    GroupCommitExecutionAdmissionWaitError, GroupCommitSubmitError,
     MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET, MAX_ACTIVE_EXPIRY_INTERVAL,
-    MAX_GROUP_COMMIT_QUEUE_CAPACITY, MAX_GROUP_COMMIT_WAIT, MIN_ACTIVE_EXPIRY_INTERVAL,
-    NativeCommitCancellation, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
-    NativeSchedulerClock, ScheduledCommitReceipt,
+    MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT, MAX_GROUP_COMMIT_QUEUE_CAPACITY,
+    MAX_GROUP_COMMIT_WAIT, MIN_ACTIVE_EXPIRY_INTERVAL, NativeCommitCancellation,
+    NativeCommitClient, NativeCommitControl, NativeCommitScheduler, NativePendingCommit,
+    NativeSchedulerClock, ScheduledCommitCompletion, ScheduledCommitReceipt,
 };
 pub use hardware::{
     HardwareCache, HardwareCpu, HardwareMemory, HardwareNumaNode, HardwareOperatingSystem,
@@ -2090,6 +2092,19 @@ impl ResolvedCommitError {
 
 struct SingletonCommitReport {
     commit: CommitReceipt,
+    page_synchronizations: usize,
+    wal_synchronizations: usize,
+}
+
+impl SingletonCommitReport {
+    const fn new(commit: CommitReceipt, synchronize: bool) -> Self {
+        let synchronizations = synchronize as usize;
+        Self {
+            commit,
+            page_synchronizations: synchronizations,
+            wal_synchronizations: synchronizations,
+        }
+    }
 }
 
 struct PageCommitInput<'commit> {
@@ -5616,16 +5631,51 @@ impl NativeDatabase {
         )
     }
 
-    fn admit_mutation_owned(&self) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
-        self.admit_database_work(
+    fn admit_mutation_owned_with_wait(
+        &self,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work_at(
             WorkloadClass::Mutation,
             GovernorRequest {
                 compute_threads: 1,
                 io_slots: 1,
                 memory_bytes: MUTATION_MEMORY_BYTES,
             },
+            maximum_wait,
+            cancellation,
         )
         .map(|permit| permit.map(DatabaseGovernorPermit::into_owned))
+    }
+
+    fn admit_scheduled_commit_execution(
+        &self,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        let Some(governor) = &self.resource_governor else {
+            return Ok(None);
+        };
+        let owned_cancellation;
+        let cancellation = if let Some(cancellation) = cancellation {
+            cancellation
+        } else {
+            owned_cancellation = governor.cancellation_token();
+            &owned_cancellation
+        };
+        admit_governor_work(
+            governor,
+            maximum_wait,
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: 0,
+            },
+            Some(cancellation),
+        )
+        .map(Some)
     }
 
     fn admit_maintenance_owned(&self) -> Result<Option<OwnedGovernorPermit>, NativeRuntimeError> {
@@ -5817,17 +5867,20 @@ impl NativeDatabase {
         request: GovernorRequest,
         cancellation: Option<&GovernorCancellation>,
     ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
+        self.admit_database_work_at(class, request, self.resource_queue_wait, cancellation)
+    }
+
+    fn admit_database_work_at(
+        &self,
+        class: WorkloadClass,
+        request: GovernorRequest,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<Option<DatabaseGovernorPermit>, NativeRuntimeError> {
         let Some(governor) = &self.resource_governor else {
             return Ok(None);
         };
-        admit_governor_work(
-            governor,
-            self.resource_queue_wait,
-            class,
-            request,
-            cancellation,
-        )
-        .map(Some)
+        admit_governor_work(governor, maximum_wait, class, request, cancellation).map(Some)
     }
 
     /// Returns a retained durable outcome by its opaque resolution identity.
@@ -16225,7 +16278,37 @@ impl NativeDatabase {
         logical_time_micros: i64,
         durability: DurabilityClass,
     ) -> Result<NativeWriteBatch, NativeRuntimeError> {
-        let resource_permit = self.admit_mutation_owned()?;
+        self.begin_optimistic_with_admission(
+            logical_time_micros,
+            durability,
+            self.resource_queue_wait,
+            None,
+        )
+    }
+
+    fn begin_optimistic_scheduled(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        self.begin_optimistic_with_admission(
+            logical_time_micros,
+            durability,
+            maximum_wait,
+            cancellation,
+        )
+    }
+
+    fn begin_optimistic_with_admission(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let resource_permit = self.admit_mutation_owned_with_wait(maximum_wait, cancellation)?;
         let snapshot = self.coordinator.snapshot(logical_time_micros)?;
         let state = load_state(&self.pages, &self.blobs, snapshot.roots())?;
         Ok(NativeWriteBatch {
@@ -16350,7 +16433,37 @@ impl NativeDatabase {
         logical_time_micros: i64,
         durability: DurabilityClass,
     ) -> Result<NativeDeltaWriteBatch, NativeRuntimeError> {
-        let resource_permit = self.admit_mutation_owned()?;
+        self.begin_optimistic_delta_with_admission(
+            logical_time_micros,
+            durability,
+            self.resource_queue_wait,
+            None,
+        )
+    }
+
+    fn begin_optimistic_delta_scheduled(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<NativeDeltaWriteBatch, NativeRuntimeError> {
+        self.begin_optimistic_delta_with_admission(
+            logical_time_micros,
+            durability,
+            maximum_wait,
+            cancellation,
+        )
+    }
+
+    fn begin_optimistic_delta_with_admission(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+        maximum_wait: Duration,
+        cancellation: Option<&GovernorCancellation>,
+    ) -> Result<NativeDeltaWriteBatch, NativeRuntimeError> {
+        let resource_permit = self.admit_mutation_owned_with_wait(maximum_wait, cancellation)?;
         if self.relational_format != RelationalFormat::VersionChainV2
             || !matches!(
                 self.structure_format,
@@ -20211,6 +20324,40 @@ impl DerefMut for NativeTransaction<'_> {
 }
 
 impl NativeWriteBatch {
+    fn retain_scheduler_queue_memory(mut self) -> Result<Self, NativeRuntimeError> {
+        let retained_memory_bytes = match self.mode {
+            NativeWriteBatchMode::PhysicalAllEngineDelta => {
+                let measured = replay_delta_retained_memory_bytes(&self);
+                let ledger = self
+                    .delta
+                    .as_ref()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                    .retained_memory_bytes;
+                if measured == u64::MAX || measured != ledger {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                measured.max(1)
+            }
+            NativeWriteBatchMode::Materialized => self
+                .resource_permit
+                .as_ref()
+                .map_or(1, |permit| permit.request().memory_bytes.max(1)),
+            _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+        };
+        let Some(permit) = self.resource_permit.take() else {
+            return Ok(self);
+        };
+        if permit.class() != WorkloadClass::Mutation {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        self.resource_permit = Some(permit.shrink_to(GovernorRequest {
+            compute_threads: 0,
+            io_slots: 0,
+            memory_bytes: retained_memory_bytes,
+        })?);
+        Ok(self)
+    }
+
     fn require_materialized_mutation_entry(&self) -> Result<(), NativeRuntimeError> {
         if self.mode == NativeWriteBatchMode::PhysicalAllEngineDelta && !self.delta_stage_active {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
@@ -23652,7 +23799,7 @@ impl NativeTransaction<'_> {
                 .insert(resolution.resolution_id, resolution);
         }
         interrupt(interruption, CommitBoundary::RootPublished)?;
-        Ok(SingletonCommitReport { commit })
+        Ok(SingletonCommitReport::new(commit, synchronize))
     }
 }
 
@@ -35523,16 +35670,17 @@ mod tests {
         GroupCommitSubmitError, HardwareCpu, HardwareMemory, HardwareOperatingSystem,
         HardwareProfile, HardwareStorage, HashFieldEntry, HashPatternError, HashPatternScanPage,
         HashPatternScanRequest, HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError,
-        Mutation, NativeCommitControl, NativeCommitScheduler, NativeDatabase,
-        NativeDeltaWriteBatch, NativeDirectoryError, NativeExecutionPool, NativeGovernorPolicy,
-        NativeHybridFusion, NativeHybridRequest, NativeResourceGovernor, NativeRuntimeError,
-        NativeSchedulerClock, NativeTransaction, NativeVectorBranch, NativeWriteBatch,
-        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
-        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric,
-        VectorRecord, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass,
-        ZAddOutcome, append_catalog_object_entries, binary_relation_definition,
+        Mutation, NativeCommitBatch, NativeCommitClient, NativeCommitControl,
+        NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch, NativeDirectoryError,
+        NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion, NativeHybridRequest,
+        NativePendingCommit, NativeResourceGovernor, NativeRuntimeError, NativeSchedulerClock,
+        NativeTransaction, NativeVectorBranch, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
+        PageStore, PromotionBoundary, QualifiedName, RelationDefinition, RelationalScanRow,
+        RootManifest, SLOT_CATALOG, SetCondition, SetOutcome, SnapshotPinBoundary,
+        SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue,
+        VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric, VectorRecord, WAL_FILE,
+        WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass, ZAddOutcome,
+        append_catalog_object_entries, binary_relation_definition,
         catalog_definition_storage_value, catalog_dependency_prefix, catalog_name_identity,
         catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
@@ -47734,6 +47882,665 @@ mod tests {
             Some(b"two".to_vec())
         );
         assert_eq!(reopened.get_latest_structure(b"too-late", 153)?, None);
+        Ok(())
+    }
+
+    fn concurrently_enqueue_governed_group(
+        client: &NativeCommitClient,
+        cohort_size: usize,
+    ) -> Result<Vec<NativePendingCommit>, Box<dyn std::error::Error>> {
+        let start = Arc::new(Barrier::new(cohort_size));
+        std::thread::scope(|scope| {
+            let producers = (0..cohort_size)
+                .map(|request_index| {
+                    let client = client.clone();
+                    let start = Arc::clone(&start);
+                    scope.spawn(move || {
+                        start.wait();
+                        let mut batch = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+                        client.stage_delta_set(
+                            &mut batch,
+                            format!("governed-group-{cohort_size}-{request_index}").into_bytes(),
+                            b"visible".to_vec(),
+                            None,
+                        )?;
+                        client.enqueue(batch)
+                    })
+                })
+                .collect::<Vec<_>>();
+            producers
+                .into_iter()
+                .map(|producer| {
+                    producer
+                        .join()
+                        .map_err(|_| "governed group producer panicked")?
+                        .map_err(Into::into)
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn governed_scheduler_retains_only_batch_memory_and_executes_one_io_cohort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for cohort_size in [8_usize, 32] {
+            let temporary = TestDirectory::new();
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+            database
+                .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::ZERO)?;
+            let scheduler = NativeCommitScheduler::start(
+                database,
+                GroupCommitConfig::new(cohort_size, Duration::from_millis(10), cohort_size)?,
+            )?;
+            let client = scheduler.client();
+            let collection_guard = client.block_cohort_collection_for_test()?;
+            let execution_guard = client.block_commit_execution_for_test()?;
+            let pending = concurrently_enqueue_governed_group(&client, cohort_size)?;
+
+            let queued_usage = governor.usage_snapshot();
+            assert_eq!(queued_usage.compute_threads, 0);
+            assert_eq!(queued_usage.io_slots, 0);
+            assert!(queued_usage.memory_bytes > 0);
+            let interference = governor.try_admit_owned(
+                WorkloadClass::Mutation,
+                GovernorRequest {
+                    compute_threads: 1,
+                    io_slots: 1,
+                    memory_bytes: 0,
+                },
+            )?;
+            drop(collection_guard);
+
+            let queued_deadline = Instant::now() + Duration::from_secs(2);
+            while governor.queued_requests() != 1 {
+                if Instant::now() >= queued_deadline {
+                    return Err("group cohort did not wait for occupied I/O capacity".into());
+                }
+                std::thread::yield_now();
+            }
+            drop(interference);
+
+            let execution_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let execution_usage = governor.usage_snapshot();
+                if execution_usage.compute_threads == 1 && execution_usage.io_slots == 1 {
+                    assert!(execution_usage.memory_bytes > 0);
+                    break;
+                }
+                if Instant::now() >= execution_deadline {
+                    return Err("group cohort did not acquire one execution permit".into());
+                }
+                std::thread::yield_now();
+            }
+            drop(execution_guard);
+
+            let receipts = pending
+                .into_iter()
+                .map(NativePendingCommit::wait)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(receipts.len(), cohort_size);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.durability_cohort_size == cohort_size)
+            );
+            let mut positions = receipts
+                .iter()
+                .map(|receipt| receipt.durability_cohort_position)
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            assert_eq!(positions, (0..cohort_size).collect::<Vec<_>>());
+            let mut commit_csns = receipts
+                .iter()
+                .map(|receipt| receipt.commit_csn.get())
+                .collect::<Vec<_>>();
+            commit_csns.sort_unstable();
+            assert_eq!(
+                commit_csns,
+                (1..=u64::try_from(cohort_size)?).collect::<Vec<_>>()
+            );
+            let first = receipts.first().ok_or("empty governed cohort")?;
+            assert!(first.page_synchronization > Duration::ZERO);
+            assert!(first.wal_synchronization > Duration::ZERO);
+            assert!(receipts.iter().all(|receipt| {
+                receipt.cohort_execution == first.cohort_execution
+                    && receipt.page_synchronization == first.page_synchronization
+                    && receipt.wal_synchronization == first.wal_synchronization
+            }));
+            assert_eq!(governor.usage_snapshot().compute_threads, 0);
+            assert_eq!(governor.usage_snapshot().io_slots, 0);
+            assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+            scheduler.shutdown()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_commit_cancel_and_drop_release_retained_batch_memory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::ZERO)?;
+        let scheduler =
+            NativeCommitScheduler::start(database, GroupCommitConfig::new(4, Duration::ZERO, 4)?)?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+
+        let mut committed = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut committed,
+            b"pending-committed".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        let committed = client.enqueue(committed)?;
+
+        let mut cancelled = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut cancelled,
+            b"pending-cancelled".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        let cancelled = client.enqueue(cancelled)?;
+        assert_eq!(cancelled.cancel(), CommitCancellationOutcome::Cancelled);
+
+        let mut dropped = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut dropped,
+            b"pending-dropped".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        drop(client.enqueue(dropped)?);
+
+        let failed = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        let failed = client.enqueue(failed)?;
+        assert!(governor.usage_snapshot().memory_bytes > 0);
+        drop(collection_guard);
+
+        assert_eq!(committed.wait()?.commit_csn, Csn::new(1)?);
+        assert!(matches!(
+            cancelled.wait(),
+            Err(GroupCommitSubmitError::Cancelled)
+        ));
+        let Err(failed) = failed.wait() else {
+            return Err("empty batch unexpectedly committed".into());
+        };
+        assert!(
+            matches!(
+                failed,
+                GroupCommitSubmitError::Runtime { ref source }
+                    if matches!(
+                        source.as_ref(),
+                        NativeRuntimeError::WalSemantic(_)
+                            | NativeRuntimeError::InvalidPreparedMutation
+                    )
+            ),
+            "unexpected empty-batch failure: {failed:?}"
+        );
+        scheduler.shutdown()?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"pending-committed", 2)?,
+            Some(b"visible".to_vec())
+        );
+        assert_eq!(
+            reopened.get_latest_structure(b"pending-cancelled", 2)?,
+            None
+        );
+        assert_eq!(reopened.get_latest_structure(b"pending-dropped", 2)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_commit_end_to_end_is_sealed_before_consumers_wait()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(4, Duration::from_millis(1), 4)?,
+        )?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let mut pending = Vec::with_capacity(4);
+        for request_index in 0..4 {
+            let mut batch = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+            client.stage_delta_set(
+                &mut batch,
+                format!("sealed-end-to-end-{request_index}").into_bytes(),
+                b"visible".to_vec(),
+                None,
+            )?;
+            pending.push(client.enqueue(batch)?);
+        }
+        drop(collection_guard);
+
+        let completion_deadline = Instant::now() + Duration::from_secs(2);
+        while pending.iter().any(|commit| !commit.completed_for_test()) {
+            if Instant::now() >= completion_deadline {
+                return Err("pending cohort did not complete".into());
+            }
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(60));
+
+        let consumer_elapsed = pending[0].submitted_at_for_test().elapsed();
+        let mut end_to_end = Vec::with_capacity(pending.len());
+        for commit in pending {
+            end_to_end.push(commit.wait()?.end_to_end);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let minimum = end_to_end.iter().min().ok_or("missing end-to-end")?;
+        let maximum = end_to_end.iter().max().ok_or("missing end-to-end")?;
+        assert!(minimum.saturating_add(Duration::from_millis(40)) < consumer_elapsed);
+        assert!(maximum.saturating_sub(*minimum) < Duration::from_millis(10));
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    fn staged_group_delta_batches(
+        client: &NativeCommitClient,
+        logical_time_micros: i64,
+        count: usize,
+        prefix: &str,
+    ) -> Result<Vec<NativeCommitBatch>, GroupCommitSubmitError> {
+        let mut batches = Vec::with_capacity(count);
+        for request_index in 0..count {
+            let mut batch =
+                client.begin_optimistic_delta(logical_time_micros, DurabilityClass::Group)?;
+            client.stage_delta_set(
+                &mut batch,
+                format!("{prefix}-{request_index}").into_bytes(),
+                b"visible".to_vec(),
+                None,
+            )?;
+            batches.push(batch.into());
+        }
+        Ok(batches)
+    }
+
+    #[test]
+    fn scheduled_completion_exposes_one_exact_group_flush_without_receipt_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const COHORT_SIZE: usize = 32;
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(COHORT_SIZE, Duration::ZERO, COHORT_SIZE)?,
+        )?;
+        let client = scheduler.client();
+
+        let mut neighbor_before = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut neighbor_before,
+            b"completion-neighbor-before".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        let neighbor_before = client.enqueue(neighbor_before)?;
+
+        let batches = staged_group_delta_batches(&client, 1, COHORT_SIZE, "completion-evidence")?;
+        let pending = client.enqueue_cohort(batches)?;
+
+        let mut neighbor_after = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut neighbor_after,
+            b"completion-neighbor-after".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+        let neighbor_after = client.enqueue(neighbor_after)?;
+
+        let completions = pending
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completions.len(), COHORT_SIZE);
+        assert!(completions.iter().all(|completion| {
+            completion.page_synchronizations == 1
+                && completion.wal_synchronizations == 1
+                && completion.receipt.durability_cohort_size == COHORT_SIZE
+        }));
+        let mut positions = completions
+            .iter()
+            .map(|completion| completion.receipt.durability_cohort_position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        assert_eq!(positions, (0..COHORT_SIZE).collect::<Vec<_>>());
+        let commit_csns = completions
+            .iter()
+            .map(|completion| completion.receipt.commit_csn.get())
+            .collect::<Vec<_>>();
+        assert_eq!(commit_csns, (2..=33).collect::<Vec<_>>());
+        let neighbor_before = neighbor_before.wait_with_evidence()?;
+        let neighbor_after = neighbor_after.wait_with_evidence()?;
+        assert_eq!(neighbor_before.receipt.durability_cohort_size, 1);
+        assert_eq!(neighbor_before.receipt.commit_csn.get(), 1);
+        assert_eq!(neighbor_after.receipt.durability_cohort_size, 1);
+        assert_eq!(neighbor_after.receipt.commit_csn.get(), 34);
+
+        let partial_batches =
+            staged_group_delta_batches(&client, 2, COHORT_SIZE / 2, "partial-completion-evidence")?;
+        let partial = client
+            .enqueue_cohort(partial_batches)?
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(partial.len(), COHORT_SIZE / 2);
+        assert!(partial.iter().all(|completion| {
+            completion.receipt.durability_cohort_size == COHORT_SIZE / 2
+                && completion.page_synchronizations == 1
+                && completion.wal_synchronizations == 1
+        }));
+
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_cohort_rejection_has_no_completion_evidence_or_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(32, Duration::ZERO, 32)?,
+        )?;
+        let client = scheduler.client();
+        assert!(matches!(
+            client.enqueue_cohort(Vec::new()),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::InvalidGroupCommitBatchSize { requested: 0 }
+                )
+        ));
+        let memory = client.begin_optimistic_delta(1, DurabilityClass::Memory)?;
+        assert!(matches!(
+            client.enqueue_cohort(vec![memory.into()]),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::GroupCommitRequiresGroupDurability
+                )
+        ));
+        let oversized = staged_group_delta_batches(&client, 1, 33, "oversized-cohort")?;
+        assert!(matches!(
+            client.enqueue_cohort(oversized),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::InvalidGroupCommitBatchSize { requested: 33 }
+                )
+        ));
+        let failed = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        assert!(matches!(
+            client.enqueue(failed)?.wait_with_evidence(),
+            Err(GroupCommitSubmitError::Runtime { .. })
+        ));
+        let mut valid = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(&mut valid, b"valid".to_vec(), b"visible".to_vec(), None)?;
+        assert_eq!(client.enqueue(valid)?.wait()?.commit_csn.get(), 1);
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_cohort_consumes_weighted_logical_queue_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const COHORT_SIZE: usize = 32;
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(COHORT_SIZE, Duration::ZERO, COHORT_SIZE)?,
+        )?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let first = staged_group_delta_batches(&client, 1, 1, "weighted-first")?
+            .pop()
+            .ok_or("missing first batch")?;
+        let first = client.enqueue(first)?;
+        let cohort = staged_group_delta_batches(&client, 1, COHORT_SIZE, "weighted-cohort")?;
+        let pending = client.enqueue_cohort(cohort)?;
+
+        let saturated = staged_group_delta_batches(&client, 1, 1, "weighted-saturated")?
+            .pop()
+            .ok_or("missing saturated batch")?;
+        assert!(matches!(
+            client.try_submit(saturated),
+            Err(GroupCommitSubmitError::Saturated)
+        ));
+        let deadline = staged_group_delta_batches(&client, 1, 1, "weighted-deadline")?
+            .pop()
+            .ok_or("missing deadline batch")?;
+        assert!(matches!(
+            client.submit_controlled(
+                deadline,
+                NativeCommitControl::new(),
+                Some(Instant::now() + Duration::from_millis(20)),
+            ),
+            Err(GroupCommitSubmitError::DeadlineExceeded)
+        ));
+
+        drop(collection_guard);
+        assert_eq!(first.wait()?.durability_cohort_size, 1);
+        let completions = pending
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completions.len(), COHORT_SIZE);
+        assert!(completions.iter().all(|completion| {
+            completion.receipt.durability_cohort_size == COHORT_SIZE
+                && completion.page_synchronizations == 1
+                && completion.wal_synchronizations == 1
+        }));
+        scheduler.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn due_active_expiry_sweeps_before_an_indivisible_explicit_cohort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const COHORT_SIZE: usize = 32;
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(0, DurabilityClass::Strict)?;
+        seed.set(b"due-before-cohort".to_vec(), b"expired".to_vec(), Some(10))?;
+        seed.commit()?;
+        let mut batches = Vec::with_capacity(COHORT_SIZE);
+        for request_index in 0..COHORT_SIZE {
+            let mut batch = database.begin_optimistic_delta(10, DurabilityClass::Group)?;
+            database.stage_delta_set(
+                &mut batch,
+                format!("after-expiry-{request_index}").into_bytes(),
+                b"visible".to_vec(),
+                None,
+            )?;
+            batches.push(batch.into());
+        }
+        let scheduler = NativeCommitScheduler::start_with_active_expiry_clock(
+            database,
+            GroupCommitConfig::new(COHORT_SIZE, Duration::ZERO, COHORT_SIZE)?,
+            ActiveExpiryConfig::new(Duration::from_millis(10), 1, DurabilityClass::Strict, 1)?,
+            Arc::new(TestSchedulerClock::new(10)),
+        )?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let pending = client.enqueue_cohort(batches)?;
+        std::thread::sleep(Duration::from_millis(20));
+        drop(collection_guard);
+
+        let completions = pending
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.receipt.commit_csn.get())
+                .collect::<Vec<_>>(),
+            (3..=34).collect::<Vec<_>>()
+        );
+        let stats = scheduler
+            .active_expiry_stats()
+            .ok_or("active expiry stats missing")?;
+        assert_eq!(stats.committed_sweeps, 1);
+        assert!(stats.max_foreground_after_due <= 1);
+        scheduler.shutdown()?;
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"due-before-cohort", 10)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_cohort_execution_timeout_is_typed_and_releases_every_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::ZERO)?;
+        let config = GroupCommitConfig::new(1, Duration::ZERO, 1)?
+            .with_execution_admission_wait(Duration::from_millis(10))?;
+        let scheduler = NativeCommitScheduler::start(database, config)?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+
+        let mut batch = client.begin_optimistic_delta(1, DurabilityClass::Group)?;
+        client.stage_delta_set(
+            &mut batch,
+            b"execution-timeout".to_vec(),
+            b"absent".to_vec(),
+            None,
+        )?;
+        let pending = client.enqueue(batch)?;
+        let interference = governor.try_admit_owned(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: 0,
+            },
+        )?;
+        drop(collection_guard);
+
+        assert!(matches!(
+            pending.wait(),
+            Err(GroupCommitSubmitError::Runtime { source })
+                if matches!(
+                    source.as_ref(),
+                    NativeRuntimeError::ResourceQueue(GovernorQueueError::TimedOut)
+                )
+        ));
+        drop(interference);
+        scheduler.shutdown()?;
+        assert_eq!(governor.queued_requests(), 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.get_latest_structure(b"execution-timeout", 2)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_shutdown_drains_an_accepted_cohort_waiting_for_execution_capacity()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::ZERO)?;
+        let config = GroupCommitConfig::new(1, Duration::ZERO, 1)?
+            .with_execution_admission_wait(Duration::from_secs(60))?;
+        let scheduler = NativeCommitScheduler::start(database, config)?;
+        let client = scheduler.client();
+        let collection_guard = client.block_cohort_collection_for_test()?;
+        let batches = staged_group_delta_batches(&client, 1, 1, "shutdown-drain")?;
+        let pending = client.enqueue_cohort(batches)?;
+        let interference = governor.try_admit_owned(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: 0,
+            },
+        )?;
+        drop(collection_guard);
+
+        let queued_deadline = Instant::now() + Duration::from_secs(2);
+        while governor.queued_requests() != 1 {
+            if Instant::now() >= queued_deadline {
+                return Err("cohort execution admission did not queue".into());
+            }
+            std::thread::yield_now();
+        }
+        let shutdown = std::thread::spawn(move || scheduler.shutdown());
+        let gate_deadline = Instant::now() + Duration::from_secs(2);
+        while client.accepting_for_test()? {
+            if Instant::now() >= gate_deadline {
+                return Err("shutdown did not close admission".into());
+            }
+            std::thread::yield_now();
+        }
+        assert!(!shutdown.is_finished());
+        drop(interference);
+        let released_usage = governor.usage_snapshot();
+        assert_eq!(released_usage.compute_threads, 0, "{released_usage:?}");
+        assert_eq!(released_usage.io_slots, 0, "{released_usage:?}");
+        let admitted_deadline = Instant::now() + Duration::from_secs(2);
+        while governor.queued_requests() != 0 {
+            if Instant::now() >= admitted_deadline {
+                return Err(format!(
+                    "shutdown cohort remained queued after release: {:?}",
+                    governor.usage_snapshot()
+                )
+                .into());
+            }
+            std::thread::yield_now();
+        }
+
+        let completions = pending
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completions.len(), 1);
+        assert!(completions.iter().all(|completion| {
+            completion.receipt.durability_cohort_size == 1
+                && completion.page_synchronizations == 1
+                && completion.wal_synchronizations == 1
+        }));
+        shutdown.join().map_err(|_| "shutdown thread panicked")??;
+        assert_eq!(governor.queued_requests(), 0);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        for request_index in 0..1 {
+            assert_eq!(
+                reopened.get_latest_structure(
+                    format!("shutdown-drain-{request_index}").as_bytes(),
+                    2,
+                )?,
+                Some(b"visible".to_vec())
+            );
+        }
         Ok(())
     }
 

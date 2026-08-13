@@ -9,7 +9,8 @@ use std::{
     hint::black_box,
     io::Read,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::mpsc::{self, TryRecvError},
     sync::{Arc, Barrier, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +22,8 @@ use hyphae_native_catalog::IncrementalVectorLifecycle;
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
     NativeProduct, ProductAuthorization, ProductDurabilityPolicy, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductSession, ProductSessionId,
+    ProductPreparedHandle, ProductPrincipal, ProductRequestContext, ProductResponse,
+    ProductSession, ProductSessionId,
 };
 use hyphae_native_runtime::{
     ANN_PARTITION_ROUTING_POLICY_V1, AnnPartitionRoutingOutcome, AnnSearchOptions, CalibrationMode,
@@ -29,10 +31,10 @@ use hyphae_native_runtime::{
     InitialAnnBulkBuildEvidence, InitialAnnBulkBuilder, InitialAnnBulkProgress,
     InitialAnnBulkProgressStage, MAX_INITIAL_ANN_BULK_PARTITIONS,
     NATIVE_LEXICAL_INDEX_IDENTITY_ALGORITHM, NATIVE_LEXICAL_READ_VIEW_PLAN_SCOPE,
-    NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch, NativeExecutionPool,
-    NativeExecutionTopology, NativeFilteredLexicalReadView,
-    NativeFilteredLexicalReadViewOpenReceipt, NativeGovernorPolicy, NativeHybridFusion,
-    NativeHybridOutcome, NativeHybridReadView, NativeHybridReadViewOpenReceipt,
+    NativeCommitBatch, NativeCommitClient, NativeCommitScheduler, NativeDatabase,
+    NativeDeltaWriteBatch, NativeExecutionPool, NativeExecutionTopology,
+    NativeFilteredLexicalReadView, NativeFilteredLexicalReadViewOpenReceipt, NativeGovernorPolicy,
+    NativeHybridFusion, NativeHybridOutcome, NativeHybridReadView, NativeHybridReadViewOpenReceipt,
     NativeHybridReadViewOpenRequest, NativeHybridReadViewQuery, NativeLexicalReadView,
     NativeLexicalReadViewOpenRequest, NativeResourceGovernor, NativeStructureScalarFilter,
     ThreadScalingDiagnostic, Vector, VectorMetric, WorkloadClass,
@@ -64,15 +66,159 @@ const BACKGROUND_INTERVAL: Duration = Duration::from_millis(10);
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_CHUNK_UNITS: usize = 10_000;
 const EVIDENCE_MEASUREMENT_CHUNK: usize = 256;
+const STRICT_GROUP_COMMIT_COHORT_WIDTH: usize = 32;
+const STRICT_GROUP_COMMIT_QUEUE_CAPACITY: usize = 64;
+const STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT: usize = 32;
+const STRICT_GROUP_COMMIT_COLLECTION_WAIT: Duration = Duration::ZERO;
+const STRICT_GROUP_COMMIT_EXECUTION_WAIT: Duration = Duration::from_secs(60);
 const SEED_BATCH_DOCUMENTS: usize = 512;
 const MAX_SEED_COHORTS: usize = 2;
 const SEED_PARTITION_RULE: &str = "batch-index-modulo-cohort-count-ordinal-commit-v1";
+const LOCAL_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SeedCohortPlan {
     cohort_count: usize,
     batch_size: usize,
     partition_rule: &'static str,
+}
+
+struct LocalDaemonThread {
+    shutdown: mpsc::SyncSender<()>,
+    completed: mpsc::Receiver<Result<(), String>>,
+    worker: Option<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    server_thread_id: thread::ThreadId,
+}
+
+impl LocalDaemonThread {
+    fn start(
+        product: NativeProduct,
+        endpoint: String,
+        config: NativeDaemonConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        let (ready_send, ready_receive) = mpsc::sync_channel(1);
+        let (shutdown_send, shutdown_receive) = mpsc::sync_channel(1);
+        let (completed_send, completed_receive) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("hyphae-g7-local-daemon".to_owned())
+            .spawn(move || {
+                let result = run_local_daemon_thread(
+                    product,
+                    endpoint,
+                    config,
+                    &ready_send,
+                    &shutdown_receive,
+                );
+                let _ignored = completed_send.send(result);
+            })?;
+        let server_thread_id = match ready_receive.recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT) {
+            Ok(Ok(thread_id)) => thread_id,
+            Ok(Err(error)) => {
+                worker
+                    .join()
+                    .map_err(|_| "local daemon startup thread panicked")?;
+                return Err(error.into());
+            }
+            Err(error) => {
+                let _ignored = shutdown_send.try_send(());
+                if completed_receive
+                    .recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT)
+                    .is_ok()
+                {
+                    worker
+                        .join()
+                        .map_err(|_| "local daemon startup thread panicked")?;
+                }
+                return Err(format!("local daemon startup did not become ready: {error}").into());
+            }
+        };
+        if server_thread_id == thread::current().id() {
+            return Err("local daemon did not acquire a dedicated thread".into());
+        }
+        Ok(Self {
+            shutdown: shutdown_send,
+            completed: completed_receive,
+            worker: Some(worker),
+            #[cfg(test)]
+            server_thread_id,
+        })
+    }
+
+    #[cfg(test)]
+    fn server_thread_id(&self) -> thread::ThreadId {
+        self.server_thread_id
+    }
+
+    fn shutdown(mut self) -> Result<(), Box<dyn Error>> {
+        self.shutdown
+            .send(())
+            .map_err(|_| "local daemon stopped before shutdown")?;
+        let completed = self
+            .completed
+            .recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT)
+            .map_err(|error| format!("local daemon shutdown did not complete: {error}"))?;
+        self.worker
+            .take()
+            .ok_or("local daemon worker is unavailable")?
+            .join()
+            .map_err(|_| "local daemon shutdown thread panicked")?;
+        completed.map_err(Into::into)
+    }
+}
+
+impl Drop for LocalDaemonThread {
+    fn drop(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let _ignored = self.shutdown.try_send(());
+        if self
+            .completed
+            .recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT)
+            .is_ok()
+            && let Some(worker) = self.worker.take()
+        {
+            let _ignored = worker.join();
+        }
+    }
+}
+
+fn run_local_daemon_thread(
+    product: NativeProduct,
+    endpoint: String,
+    config: NativeDaemonConfig,
+    ready: &mpsc::SyncSender<Result<thread::ThreadId, String>>,
+    shutdown: &mpsc::Receiver<()>,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async move {
+        let daemon = match NativeDaemon::start(product, endpoint, config) {
+            Ok(daemon) => daemon,
+            Err(error) => {
+                let message = error.to_string();
+                let _ignored = ready.send(Err(message.clone()));
+                return Err(message);
+            }
+        };
+        ready
+            .send(Ok(thread::current().id()))
+            .map_err(|_| "local daemon ready receiver disappeared".to_owned())?;
+        loop {
+            match shutdown.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(1)).await,
+            }
+        }
+        daemon
+            .shutdown()
+            .await
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
 }
 
 impl SeedCohortPlan {
@@ -251,6 +397,565 @@ struct Stats {
     p999: u64,
     maximum: u64,
     throughput: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StrictGroupCommitPlan {
+    logical_commits: usize,
+    cohort_count: usize,
+    final_cohort_size: usize,
+    cohort_size_histogram: BTreeMap<usize, usize>,
+    cohort_position_histogram: BTreeMap<usize, usize>,
+}
+
+struct StrictGroupCommitWindowTimer {
+    started: Instant,
+}
+
+#[derive(Debug, Default)]
+struct StrictProducerActivity {
+    current: AtomicUsize,
+    maximum: AtomicUsize,
+}
+
+impl StrictProducerActivity {
+    fn enter(self: &Arc<Self>) -> StrictProducerActivityGuard {
+        let active = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum.fetch_max(active, Ordering::SeqCst);
+        StrictProducerActivityGuard {
+            activity: Arc::clone(self),
+        }
+    }
+
+    fn current(&self) -> usize {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    fn maximum(&self) -> usize {
+        self.maximum.load(Ordering::SeqCst)
+    }
+}
+
+struct StrictProducerActivityGuard {
+    activity: Arc<StrictProducerActivity>,
+}
+
+impl Drop for StrictProducerActivityGuard {
+    fn drop(&mut self) {
+        let previous = self.activity.current.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "strict producer activity underflowed");
+    }
+}
+
+impl StrictGroupCommitWindowTimer {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self) -> Result<Duration, Box<dyn Error>> {
+        self.finish_at(Instant::now())
+    }
+
+    fn finish_at(self, finished: Instant) -> Result<Duration, Box<dyn Error>> {
+        finished
+            .checked_duration_since(self.started)
+            .ok_or_else(|| "strict group commit window clock moved backwards".into())
+    }
+}
+
+impl StrictGroupCommitPlan {
+    fn new(logical_commits: usize) -> Result<Self, Box<dyn Error>> {
+        if logical_commits == 0 {
+            return Err("strict group commit requires at least one logical commit".into());
+        }
+        let full_cohorts = logical_commits / STRICT_GROUP_COMMIT_COHORT_WIDTH;
+        let remainder = logical_commits % STRICT_GROUP_COMMIT_COHORT_WIDTH;
+        let cohort_count = logical_commits.div_ceil(STRICT_GROUP_COMMIT_COHORT_WIDTH);
+        let final_cohort_size = if remainder == 0 {
+            STRICT_GROUP_COMMIT_COHORT_WIDTH
+        } else {
+            remainder
+        };
+        let mut cohort_size_histogram = BTreeMap::new();
+        if full_cohorts > 0 {
+            cohort_size_histogram.insert(STRICT_GROUP_COMMIT_COHORT_WIDTH, full_cohorts);
+        }
+        if remainder > 0 {
+            cohort_size_histogram.insert(remainder, 1);
+        }
+        let cohort_position_histogram = (0..STRICT_GROUP_COMMIT_COHORT_WIDTH)
+            .map(|position| {
+                (
+                    position,
+                    full_cohorts.saturating_add(usize::from(position < remainder)),
+                )
+            })
+            .collect();
+        Ok(Self {
+            logical_commits,
+            cohort_count,
+            final_cohort_size,
+            cohort_size_histogram,
+            cohort_position_histogram,
+        })
+    }
+
+    fn validate_histograms(
+        &self,
+        cohort_sizes: &BTreeMap<usize, usize>,
+        cohort_positions: &BTreeMap<usize, usize>,
+    ) -> Result<(), Box<dyn Error>> {
+        if cohort_sizes != &self.cohort_size_histogram {
+            return Err("strict group commit cohort-size histogram is not canonical".into());
+        }
+        if cohort_positions != &self.cohort_position_histogram {
+            return Err("strict group commit cohort-position histogram is not canonical".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictCommitObservation {
+    transaction_id: u128,
+    commit_csn: u64,
+    catalog_version: u64,
+    commit_lsn: u64,
+    wal_block_digest: [u8; 32],
+    cohort_size: usize,
+    cohort_position: usize,
+    page_synchronizations: usize,
+    wal_synchronizations: usize,
+    admission_wait_nanos: u64,
+    queue_wait_nanos: u64,
+    cohort_execution_nanos: u64,
+    page_synchronization_nanos: u64,
+    wal_synchronization_nanos: u64,
+    end_to_end_nanos: u64,
+}
+
+impl StrictCommitObservation {
+    fn from_completion(
+        completion: hyphae_native_runtime::ScheduledCommitCompletion,
+    ) -> Result<Self, Box<dyn Error>> {
+        let receipt = completion.receipt;
+        if receipt.commit.durability != hyphae_native_types::DurabilityClass::Group {
+            return Err("strict group commit returned a non-group durability receipt".into());
+        }
+        Ok(Self {
+            transaction_id: receipt.commit.transaction_id.get(),
+            commit_csn: receipt.commit.commit_csn.get(),
+            catalog_version: receipt.commit.catalog_version.get(),
+            commit_lsn: receipt.commit.commit_lsn.get(),
+            wal_block_digest: receipt.commit.wal_block_digest,
+            cohort_size: receipt.commit.durability_cohort_size,
+            cohort_position: receipt.commit.durability_cohort_position,
+            page_synchronizations: completion.page_synchronizations,
+            wal_synchronizations: completion.wal_synchronizations,
+            admission_wait_nanos: duration_nanos(receipt.admission_wait)?,
+            queue_wait_nanos: duration_nanos(receipt.queue_wait)?,
+            cohort_execution_nanos: duration_nanos(receipt.cohort_execution)?,
+            page_synchronization_nanos: duration_nanos(receipt.page_synchronization)?,
+            wal_synchronization_nanos: duration_nanos(receipt.wal_synchronization)?,
+            end_to_end_nanos: duration_nanos(receipt.end_to_end)?,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct StrictGroupCommitTimings {
+    admission_wait: Vec<u64>,
+    queue_wait: Vec<u64>,
+    cohort_execution: Vec<u64>,
+    page_synchronization: Vec<u64>,
+    wal_synchronization: Vec<u64>,
+    end_to_end: Vec<u64>,
+}
+
+impl StrictGroupCommitTimings {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            admission_wait: Vec::with_capacity(capacity),
+            queue_wait: Vec::with_capacity(capacity),
+            cohort_execution: Vec::with_capacity(capacity),
+            page_synchronization: Vec::with_capacity(capacity),
+            wal_synchronization: Vec::with_capacity(capacity),
+            end_to_end: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, observation: StrictCommitObservation) {
+        self.admission_wait.push(observation.admission_wait_nanos);
+        self.queue_wait.push(observation.queue_wait_nanos);
+        self.cohort_execution
+            .push(observation.cohort_execution_nanos);
+        self.page_synchronization
+            .push(observation.page_synchronization_nanos);
+        self.wal_synchronization
+            .push(observation.wal_synchronization_nanos);
+        self.end_to_end.push(observation.end_to_end_nanos);
+    }
+
+    fn json(&self) -> Result<serde_json::Value, Box<dyn Error>> {
+        Ok(json!({
+            "admission_wait": nanosecond_summary(&self.admission_wait)?,
+            "queue_wait": nanosecond_summary(&self.queue_wait)?,
+            "cohort_execution": nanosecond_summary(&self.cohort_execution)?,
+            "page_synchronization": nanosecond_summary(&self.page_synchronization)?,
+            "wal_synchronization": nanosecond_summary(&self.wal_synchronization)?,
+            "end_to_end": nanosecond_summary(&self.end_to_end)?,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct StrictGroupCommitEvidence {
+    plan: StrictGroupCommitPlan,
+    baseline_visible_csn: u64,
+    maximum_active_producers: usize,
+    observed_cohorts: usize,
+    observed_commits: usize,
+    maximum_outstanding: usize,
+    cohort_size_histogram: BTreeMap<usize, usize>,
+    cohort_position_histogram: BTreeMap<usize, usize>,
+    first_commit_csn: Option<u64>,
+    last_commit_csn: Option<u64>,
+    receipt_digest: blake3::Hasher,
+    page_synchronizations: usize,
+    wal_synchronizations: usize,
+    cohort_execution_nanos_total: u64,
+    page_synchronization_nanos_total: u64,
+    wal_synchronization_nanos_total: u64,
+    timings: StrictGroupCommitTimings,
+}
+
+impl StrictGroupCommitEvidence {
+    fn new(plan: StrictGroupCommitPlan, baseline_visible_csn: u64) -> Self {
+        let mut receipt_digest = blake3::Hasher::new();
+        receipt_digest.update(b"blake3-csn-ordered-native-commit-receipts-v1\0");
+        Self {
+            timings: StrictGroupCommitTimings::with_capacity(plan.logical_commits),
+            plan,
+            baseline_visible_csn,
+            maximum_active_producers: 0,
+            observed_cohorts: 0,
+            observed_commits: 0,
+            maximum_outstanding: 0,
+            cohort_size_histogram: BTreeMap::new(),
+            cohort_position_histogram: BTreeMap::new(),
+            first_commit_csn: None,
+            last_commit_csn: None,
+            receipt_digest,
+            page_synchronizations: 0,
+            wal_synchronizations: 0,
+            cohort_execution_nanos_total: 0,
+            page_synchronization_nanos_total: 0,
+            wal_synchronization_nanos_total: 0,
+        }
+    }
+
+    fn observe_cohort(
+        &mut self,
+        observations: &[StrictCommitObservation],
+        outstanding: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.observed_cohorts >= self.plan.cohort_count {
+            return Err("strict group commit produced an extra cohort".into());
+        }
+        let expected_size = if self.observed_cohorts + 1 == self.plan.cohort_count {
+            self.plan.final_cohort_size
+        } else {
+            STRICT_GROUP_COMMIT_COHORT_WIDTH
+        };
+        if observations.len() != expected_size
+            || outstanding != expected_size
+            || outstanding > STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT
+        {
+            return Err("strict group commit cohort or outstanding window changed width".into());
+        }
+        let first = observations
+            .first()
+            .ok_or("strict group commit produced an empty cohort")?;
+        if first.page_synchronizations != 1 || first.wal_synchronizations != 1 {
+            return Err(
+                "strict group commit cohort did not perform exactly one physical flush".into(),
+            );
+        }
+        if first.cohort_execution_nanos == 0
+            || first.page_synchronization_nanos == 0
+            || first.wal_synchronization_nanos == 0
+            || first.cohort_execution_nanos
+                < first
+                    .page_synchronization_nanos
+                    .checked_add(first.wal_synchronization_nanos)
+                    .ok_or("strict group commit synchronization timing overflowed")?
+        {
+            return Err("strict group commit cohort timings are not physically credible".into());
+        }
+        for (position, observation) in observations.iter().copied().enumerate() {
+            if observation.cohort_size != expected_size
+                || observation.cohort_position != position
+                || observation.end_to_end_nanos == 0
+                || observation.page_synchronizations != first.page_synchronizations
+                || observation.wal_synchronizations != first.wal_synchronizations
+                || observation.cohort_execution_nanos != first.cohort_execution_nanos
+                || observation.page_synchronization_nanos != first.page_synchronization_nanos
+                || observation.wal_synchronization_nanos != first.wal_synchronization_nanos
+            {
+                return Err("strict group commit returned inconsistent cohort receipts".into());
+            }
+            let expected_csn = self
+                .baseline_visible_csn
+                .checked_add(u64::try_from(self.observed_commits)?)
+                .and_then(|value| value.checked_add(1))
+                .ok_or("strict group commit CSN interval overflowed")?;
+            if observation.commit_csn != expected_csn {
+                return Err("strict group commit CSNs are not contiguous and ordered".into());
+            }
+            self.first_commit_csn.get_or_insert(observation.commit_csn);
+            self.last_commit_csn = Some(observation.commit_csn);
+            self.hash_receipt(observation)?;
+            *self
+                .cohort_position_histogram
+                .entry(observation.cohort_position)
+                .or_default() += 1;
+            self.timings.push(observation);
+            self.observed_commits += 1;
+        }
+        *self.cohort_size_histogram.entry(expected_size).or_default() += 1;
+        self.maximum_outstanding = self.maximum_outstanding.max(outstanding);
+        self.observed_cohorts += 1;
+        self.page_synchronizations = self
+            .page_synchronizations
+            .checked_add(first.page_synchronizations)
+            .ok_or("strict group commit page synchronization count overflowed")?;
+        self.wal_synchronizations = self
+            .wal_synchronizations
+            .checked_add(first.wal_synchronizations)
+            .ok_or("strict group commit WAL synchronization count overflowed")?;
+        self.cohort_execution_nanos_total = self
+            .cohort_execution_nanos_total
+            .checked_add(first.cohort_execution_nanos)
+            .ok_or("strict group commit execution timing overflowed")?;
+        self.page_synchronization_nanos_total = self
+            .page_synchronization_nanos_total
+            .checked_add(first.page_synchronization_nanos)
+            .ok_or("strict group commit page timing overflowed")?;
+        self.wal_synchronization_nanos_total = self
+            .wal_synchronization_nanos_total
+            .checked_add(first.wal_synchronization_nanos)
+            .ok_or("strict group commit WAL timing overflowed")?;
+        Ok(())
+    }
+
+    fn hash_receipt(&mut self, observation: StrictCommitObservation) -> Result<(), Box<dyn Error>> {
+        self.receipt_digest
+            .update(&observation.commit_csn.to_le_bytes());
+        self.receipt_digest
+            .update(&observation.transaction_id.to_le_bytes());
+        self.receipt_digest
+            .update(&observation.catalog_version.to_le_bytes());
+        self.receipt_digest
+            .update(&observation.commit_lsn.to_le_bytes());
+        self.receipt_digest.update(&observation.wal_block_digest);
+        self.receipt_digest
+            .update(&u64::try_from(observation.cohort_size)?.to_le_bytes());
+        self.receipt_digest
+            .update(&u64::try_from(observation.cohort_position)?.to_le_bytes());
+        Ok(())
+    }
+
+    fn validate_complete(&self) -> Result<(), Box<dyn Error>> {
+        if self.observed_cohorts != self.plan.cohort_count
+            || self.observed_commits != self.plan.logical_commits
+            || self.maximum_active_producers == 0
+            || self.maximum_outstanding
+                != STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT.min(self.plan.logical_commits)
+            || self.page_synchronizations != self.plan.cohort_count
+            || self.wal_synchronizations != self.plan.cohort_count
+        {
+            return Err("strict group commit evidence is incomplete".into());
+        }
+        self.plan
+            .validate_histograms(&self.cohort_size_histogram, &self.cohort_position_histogram)
+    }
+
+    fn record_producer_activity(
+        &mut self,
+        current: usize,
+        maximum: usize,
+        expected: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if current != 0 || maximum != expected {
+            return Err(
+                "strict group commit did not observe its configured producer concurrency".into(),
+            );
+        }
+        self.maximum_active_producers = maximum;
+        Ok(())
+    }
+
+    fn stats(&self, elapsed_seconds: f64) -> Result<Stats, Box<dyn Error>> {
+        if elapsed_seconds <= 0.0 || !elapsed_seconds.is_finite() {
+            return Err("strict group commit wall time is not positive and finite".into());
+        }
+        Ok(stats_from_samples(
+            self.timings.end_to_end.clone(),
+            elapsed_seconds,
+        ))
+    }
+
+    fn json(
+        &self,
+        producer_concurrency: usize,
+        reopen: &StrictGroupCommitReopenEvidence,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        self.validate_complete()?;
+        if self.maximum_active_producers != producer_concurrency {
+            return Err(
+                "strict group commit producer activity changed before serialization".into(),
+            );
+        }
+        Ok(json!({
+            "schema": "hyphae-native-g7-strict-group-commit-evidence-v1",
+            "latency_scope": "scheduler-enqueue-through-durable-response-v1",
+            "throughput_scope": "bounded-cohort-window-wall-time-v1",
+            "submission_mode": "explicit-bounded-cohort-v1",
+            "producer_concurrency": producer_concurrency,
+            "maximum_active_producers": self.maximum_active_producers,
+            "cohort_width": STRICT_GROUP_COMMIT_COHORT_WIDTH,
+            "scheduler_queue_capacity": STRICT_GROUP_COMMIT_QUEUE_CAPACITY,
+            "outstanding_limit": STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT,
+            "maximum_outstanding": self.maximum_outstanding,
+            "logical_commits": self.observed_commits,
+            "cohort_count": self.observed_cohorts,
+            "final_cohort_size": self.plan.final_cohort_size,
+            "cohort_size_histogram": self.cohort_size_histogram,
+            "cohort_position_histogram": self.cohort_position_histogram,
+            "first_commit_csn": self.first_commit_csn
+                .ok_or("strict group commit evidence omitted its first CSN")?,
+            "last_commit_csn": self.last_commit_csn
+                .ok_or("strict group commit evidence omitted its last CSN")?,
+            "distinct_commit_csns": self.observed_commits,
+            "commit_receipt_digest_algorithm":
+                "blake3-csn-ordered-native-commit-receipts-v1",
+            "commit_receipt_digest": self.receipt_digest.clone().finalize().to_hex().to_string(),
+            "page_synchronizations": self.page_synchronizations,
+            "wal_synchronizations": self.wal_synchronizations,
+            "cohort_execution_nanos_total": self.cohort_execution_nanos_total,
+            "page_synchronization_nanos_total": self.page_synchronization_nanos_total,
+            "wal_synchronization_nanos_total": self.wal_synchronization_nanos_total,
+            "timing_sample_count": self.observed_commits,
+            "timings_nanoseconds": self.timings.json()?,
+            "reopen": reopen.json(),
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StrictGroupCommitReopenEvidence {
+    baseline_visible_csn: u64,
+    baseline_committed_transactions: usize,
+    reopened_visible_csn: u64,
+    reopened_committed_transactions: usize,
+    verified_logical_commits: usize,
+    missing_keys: usize,
+    mismatched_values: usize,
+    expected_state_digest: String,
+    recovered_state_digest: String,
+    open_time_nanos: u64,
+    verification_time_nanos: u64,
+}
+
+impl StrictGroupCommitReopenEvidence {
+    fn validate(
+        &self,
+        plan: &StrictGroupCommitPlan,
+        first_commit_csn: u64,
+        last_commit_csn: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        if self
+            .reopened_visible_csn
+            .checked_sub(self.baseline_visible_csn)
+            != Some(u64::try_from(plan.logical_commits)?)
+            || self
+                .reopened_committed_transactions
+                .checked_sub(self.baseline_committed_transactions)
+                != Some(plan.logical_commits)
+            || first_commit_csn != self.baseline_visible_csn.saturating_add(1)
+            || last_commit_csn != self.reopened_visible_csn
+            || self.verified_logical_commits != plan.logical_commits
+            || self.missing_keys != 0
+            || self.mismatched_values != 0
+            || self.expected_state_digest != self.recovered_state_digest
+            || self.open_time_nanos == 0
+            || self.verification_time_nanos == 0
+        {
+            return Err("strict group commit reopen evidence is incomplete or inconsistent".into());
+        }
+        Ok(())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "provider": "single-reopened-root-snapshot-full-key-digest-v1",
+            "baseline_visible_csn": self.baseline_visible_csn,
+            "baseline_committed_transactions": self.baseline_committed_transactions,
+            "reopened_visible_csn": self.reopened_visible_csn,
+            "reopened_committed_transactions": self.reopened_committed_transactions,
+            "verified_logical_commits": self.verified_logical_commits,
+            "missing_keys": self.missing_keys,
+            "mismatched_values": self.mismatched_values,
+            "state_digest_algorithm": "blake3-logical-id-key-value-v1",
+            "expected_state_digest": self.expected_state_digest,
+            "recovered_state_digest": self.recovered_state_digest,
+            "open_time_nanos": self.open_time_nanos,
+            "verification_time_nanos": self.verification_time_nanos,
+        })
+    }
+}
+
+fn strict_group_commit_key(sequence: usize) -> Vec<u8> {
+    format!("g7-group-{sequence}").into_bytes()
+}
+
+fn strict_group_commit_value(sequence: usize) -> Vec<u8> {
+    format!("g7-group-value-{sequence}").into_bytes()
+}
+
+fn update_strict_group_state_digest(
+    digest: &mut blake3::Hasher,
+    sequence: usize,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    digest.update(&u64::try_from(sequence)?.to_le_bytes());
+    digest.update(&u64::try_from(key.len())?.to_le_bytes());
+    digest.update(key);
+    digest.update(&u64::try_from(value.len())?.to_le_bytes());
+    digest.update(value);
+    Ok(())
+}
+
+fn duration_nanos(duration: Duration) -> Result<u64, Box<dyn Error>> {
+    u64::try_from(duration.as_nanos()).map_err(|_| "nanosecond duration exceeds u64".into())
+}
+
+fn nanosecond_summary(samples: &[u64]) -> Result<serde_json::Value, Box<dyn Error>> {
+    if samples.is_empty() {
+        return Err("cannot summarize an empty timing sample".into());
+    }
+    let mut samples = samples.to_vec();
+    samples.sort_unstable();
+    Ok(json!({
+        "p50": percentile(&samples, 500),
+        "p95": percentile(&samples, 950),
+        "p99": percentile(&samples, 990),
+        "p999": percentile(&samples, 999),
+        "maximum": samples.last().copied().ok_or("timing summary lost its sample")?,
+    }))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1808,6 +2513,12 @@ impl ExecutionAuthority {
     }
 
     fn install(&self, database: &mut NativeDatabase, surface: &str) -> Result<(), Box<dyn Error>> {
+        self.reinstall(database)?;
+        self.record_installation(surface)?;
+        Ok(())
+    }
+
+    fn reinstall(&self, database: &mut NativeDatabase) -> Result<(), Box<dyn Error>> {
         database
             .set_resource_governor_with_execution_pool(
                 Arc::clone(&self.governor),
@@ -1818,7 +2529,6 @@ impl ExecutionAuthority {
         if database.resource_governor().is_none() || database.execution_pool().is_none() {
             return Err("G7 database did not retain its execution authority".into());
         }
-        self.record_installation(surface)?;
         Ok(())
     }
 
@@ -3212,6 +3922,42 @@ fn run_embedded_sql(
     stats_with_materialization(stats, materialization)
 }
 
+fn local_clients(endpoint: &Path, concurrency: usize) -> Result<Vec<HyphaeClient>, Box<dyn Error>> {
+    if concurrency == 0 {
+        return Err("local benchmark requires at least one independent client".into());
+    }
+    let endpoint = endpoint.to_string_lossy().into_owned();
+    (0..concurrency)
+        .map(|_| HyphaeClient::local(endpoint.clone()).map_err(Into::into))
+        .collect()
+}
+
+#[derive(Clone)]
+struct LocalSqlSession {
+    client: HyphaeClient,
+    handle: ProductPreparedHandle,
+}
+
+async fn prepare_local_sql_sessions(
+    clients: Vec<HyphaeClient>,
+    options: &RequestOptions,
+) -> Result<Vec<LocalSqlSession>, Box<dyn Error>> {
+    let mut sessions = Vec::with_capacity(clients.len());
+    for client in clients {
+        let prepared = client
+            .prepare_sql(
+                "SELECT id, payload FROM g7_items WHERE id = ?",
+                options.clone(),
+            )
+            .await?;
+        let ProductResponse::PreparedSql { handle, .. } = prepared else {
+            return Err("local SQL prepare returned an unexpected response".into());
+        };
+        sessions.push(LocalSqlSession { client, handle });
+    }
+    Ok(sessions)
+}
+
 async fn run_local_structure(
     root: &Path,
     authority: &ExecutionAuthority,
@@ -3249,47 +3995,61 @@ async fn run_local_structure(
         .map_err(|error| format!("local structure reopen after migration: {error}"))?;
     authority.install_product(&mut product, "local-structure-daemon")?;
     let endpoint = short_endpoint("structure");
-    let daemon = NativeDaemon::start(
+    let daemon = LocalDaemonThread::start(
         product,
         endpoint.to_string_lossy().into_owned(),
         NativeDaemonConfig::default(),
     )?;
     let result = async {
-        let client = HyphaeClient::local(endpoint.to_string_lossy().into_owned())?;
+        let clients = local_clients(&endpoint, concurrency)?;
         let options = RequestOptions::default();
         let materialization = NativeDatabase::process_materialization_observation();
         if warm {
             progress.begin_phase("warmup", warmup)?;
-            for _ in 0..warmup {
-                require_structure_response(
-                    client
-                        .structure_get(b"g7-local-structure".to_vec(), options.clone())
-                        .await?,
-                )?;
-                progress.advance(1)?;
-            }
+            warm_async(
+                concurrency,
+                warmup,
+                progress,
+                |worker| {
+                    let client = clients[worker].clone();
+                    let options = options.clone();
+                    async move {
+                        Ok::<_, Box<dyn Error>>(
+                            client
+                                .structure_get(b"g7-local-structure".to_vec(), options)
+                                .await?,
+                        )
+                    }
+                },
+                &require_structure_response,
+            )
+            .await?;
             progress.finish_phase("warmup")?;
         }
         progress.begin_phase("measure", observations)?;
-        let stats = measure_async(concurrency, observations, progress, || {
-            let client = client.clone();
-            let options = options.clone();
-            async move {
-                require_structure_response(
-                    client
-                        .structure_get(b"g7-local-structure".to_vec(), options)
-                        .await?,
-                )?;
-                Ok::<(), Box<dyn Error>>(())
-            }
-        })
+        let stats = measure_async(
+            concurrency,
+            observations,
+            progress,
+            |worker| {
+                let client = clients[worker].clone();
+                let options = options.clone();
+                async move {
+                    Ok::<_, Box<dyn Error>>(
+                        client
+                            .structure_get(b"g7-local-structure".to_vec(), options)
+                            .await?,
+                    )
+                }
+            },
+            &require_structure_response,
+        )
         .await?;
         progress.finish_phase("measure")?;
         stats_with_materialization(stats, materialization)
     }
     .await;
-    let shutdown = daemon.shutdown().await?;
-    drop(shutdown);
+    daemon.shutdown()?;
     result
 }
 
@@ -3309,68 +4069,76 @@ async fn run_local_sql(
     authority.install_product(&mut product, "local-sql-daemon")?;
     seed_product_sql(&mut product)?;
     let endpoint = short_endpoint("sql");
-    let daemon = NativeDaemon::start(
+    let daemon = LocalDaemonThread::start(
         product,
         endpoint.to_string_lossy().into_owned(),
         NativeDaemonConfig::default(),
     )?;
     let result = async {
-        let client = HyphaeClient::local(endpoint.to_string_lossy().into_owned())?;
+        let clients = local_clients(&endpoint, concurrency)?;
         let options = RequestOptions::default();
-        let prepared = client
-            .prepare_sql(
-                "SELECT id, payload FROM g7_items WHERE id = ?",
-                options.clone(),
-            )
-            .await?;
-        let hyphae_native_product::ProductResponse::PreparedSql { handle, .. } = prepared else {
-            return Err("local SQL prepare returned an unexpected response".into());
-        };
+        let sessions = prepare_local_sql_sessions(clients, &options).await?;
         let materialization = NativeDatabase::process_materialization_observation();
         if warm {
             progress.begin_phase("warmup", warmup)?;
-            for _ in 0..warmup {
-                require_sql_response(
-                    client
-                        .execute_prepared(
-                            handle,
-                            vec![hyphae_native_product::ProductValue::Signed(
-                                (SQL_KEYS / 2) as i64,
-                            )],
-                            options.clone(),
+            warm_async(
+                concurrency,
+                warmup,
+                progress,
+                |worker| {
+                    let session = sessions[worker].clone();
+                    let options = options.clone();
+                    async move {
+                        Ok::<_, Box<dyn Error>>(
+                            session
+                                .client
+                                .execute_prepared(
+                                    session.handle,
+                                    vec![hyphae_native_product::ProductValue::Signed(
+                                        (SQL_KEYS / 2) as i64,
+                                    )],
+                                    options,
+                                )
+                                .await?,
                         )
-                        .await?,
-                )?;
-                progress.advance(1)?;
-            }
+                    }
+                },
+                &require_sql_response,
+            )
+            .await?;
             progress.finish_phase("warmup")?;
         }
         progress.begin_phase("measure", observations)?;
-        let stats = measure_async(concurrency, observations, progress, || {
-            let client = client.clone();
-            let options = options.clone();
-            async move {
-                require_sql_response(
-                    client
-                        .execute_prepared(
-                            handle,
-                            vec![hyphae_native_product::ProductValue::Signed(
-                                (SQL_KEYS / 2) as i64,
-                            )],
-                            options,
-                        )
-                        .await?,
-                )?;
-                Ok::<(), Box<dyn Error>>(())
-            }
-        })
+        let stats = measure_async(
+            concurrency,
+            observations,
+            progress,
+            |worker| {
+                let session = sessions[worker].clone();
+                let options = options.clone();
+                async move {
+                    Ok::<_, Box<dyn Error>>(
+                        session
+                            .client
+                            .execute_prepared(
+                                session.handle,
+                                vec![hyphae_native_product::ProductValue::Signed(
+                                    (SQL_KEYS / 2) as i64,
+                                )],
+                                options,
+                            )
+                            .await?,
+                    )
+                }
+            },
+            &require_sql_response,
+        )
         .await?;
         progress.finish_phase("measure")?;
         stats_with_materialization(stats, materialization)
     }
     .await;
-    let shutdown = daemon.shutdown().await?;
-    drop(shutdown);
+    daemon.shutdown()?;
     result
 }
 
@@ -4298,42 +5066,74 @@ fn require_sql_response(
     Ok(())
 }
 
-async fn measure_async<F, Fut>(
+async fn warm_async<F, Fut, T>(
     concurrency: usize,
     observations: usize,
     progress: &SurfaceProgress,
     mut operation: F,
-) -> Result<Stats, Box<dyn Error>>
+    validate: &(impl Fn(T) -> Result<(), Box<dyn Error>> + Sync),
+) -> Result<(), Box<dyn Error>>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), Box<dyn Error>>>,
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T, Box<dyn Error>>>,
 {
-    let started = Instant::now();
-    let mut samples = Vec::with_capacity(observations);
+    if concurrency == 0 || observations < concurrency {
+        return Err("async benchmark requires at least one observation per client".into());
+    }
+    let mut completed = 0;
     let rounds = observations.div_ceil(concurrency.max(1));
     for _ in 0..rounds {
-        let sample = Instant::now();
-        let results = join_all((0..concurrency).map(|_| operation())).await;
-        let elapsed = sample.elapsed().as_nanos() as u64;
+        let active = concurrency.min(observations - completed);
+        let results = join_all((0..active).map(&mut operation)).await;
         for result in results {
-            result?;
-            samples.push(elapsed);
+            validate(result?)?;
             progress.advance(1)?;
-            if samples.len() == observations {
-                break;
-            }
+            completed += 1;
         }
     }
-    let elapsed = started.elapsed().as_secs_f64();
-    samples.sort_unstable();
-    Ok(Stats {
-        p50: percentile(&samples, 500),
-        p95: percentile(&samples, 950),
-        p99: percentile(&samples, 990),
-        p999: percentile(&samples, 999),
-        maximum: *samples.last().ok_or("empty async benchmark")?,
-        throughput: samples.len() as f64 / elapsed,
-    })
+    Ok(())
+}
+
+async fn timed_async_operation<Fut, T>(future: Fut) -> Result<(u64, T), Box<dyn Error>>
+where
+    Fut: std::future::Future<Output = Result<T, Box<dyn Error>>>,
+{
+    let started = Instant::now();
+    let output = future.await?;
+    Ok((started.elapsed().as_nanos() as u64, output))
+}
+
+async fn measure_async<F, Fut, T>(
+    concurrency: usize,
+    observations: usize,
+    progress: &SurfaceProgress,
+    mut operation: F,
+    validate: &(impl Fn(T) -> Result<(), Box<dyn Error>> + Sync),
+) -> Result<Stats, Box<dyn Error>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T, Box<dyn Error>>>,
+{
+    if concurrency == 0 || observations < concurrency {
+        return Err("async benchmark requires at least one observation per client".into());
+    }
+    let mut samples = Vec::with_capacity(observations);
+    let mut query_elapsed = Duration::ZERO;
+    let rounds = observations.div_ceil(concurrency);
+    for _ in 0..rounds {
+        let active = concurrency.min(observations - samples.len());
+        let round_started = Instant::now();
+        let results =
+            join_all((0..active).map(|worker| timed_async_operation(operation(worker)))).await;
+        query_elapsed += round_started.elapsed();
+        for result in results {
+            let (elapsed, output) = result?;
+            validate(output)?;
+            samples.push(elapsed);
+        }
+        progress.advance(active)?;
+    }
+    Ok(stats_from_samples(samples, query_elapsed.as_secs_f64()))
 }
 
 fn run_bm25(
@@ -4668,87 +5468,330 @@ fn run_commit(
     observations: usize,
     progress: &SurfaceProgress,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    if !matches!(concurrency, 1 | 8 | 32) {
+        return Err("strict group commit requires producer concurrency 1, 8, or 32".into());
+    }
+    if observations < STRICT_GROUP_COMMIT_COHORT_WIDTH {
+        return Err("strict group commit requires at least one complete cohort".into());
+    }
+    let plan = StrictGroupCommitPlan::new(observations)?;
     fs::create_dir_all(root)?;
     let group_path = root.join("group");
     let mut database =
         NativeDatabase::create(&group_path).map_err(|error| format!("group seed: {error}"))?;
-    authority.install(&mut database, "group-commit")?;
     let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
     seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
     seed.commit()?;
     database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+    drop(database);
+
+    let mut database = NativeDatabase::open(&group_path)?;
+    let baseline_visible_csn = database
+        .recovery_report()
+        .visible_csn
+        .map(hyphae_native_types::Csn::get)
+        .ok_or("strict group commit baseline reopen omitted its visible CSN")?;
+    let baseline_committed_transactions = database.recovery_report().committed_transactions;
+    authority.install(&mut database, "group-commit")?;
     let materialization = NativeDatabase::process_materialization_observation();
-    let scheduler = NativeCommitScheduler::start(
-        database,
-        hyphae_native_runtime::GroupCommitConfig::new(concurrency, Duration::from_millis(2), 64)?,
-    )?;
-    let clients = (0..concurrency)
+    let config = hyphae_native_runtime::GroupCommitConfig::new(
+        STRICT_GROUP_COMMIT_COHORT_WIDTH,
+        STRICT_GROUP_COMMIT_COLLECTION_WAIT,
+        STRICT_GROUP_COMMIT_QUEUE_CAPACITY,
+    )?
+    .with_execution_admission_wait(STRICT_GROUP_COMMIT_EXECUTION_WAIT)?;
+    let scheduler = NativeCommitScheduler::start(database, config)?;
+    let producer_clients = (0..concurrency)
         .map(|_| scheduler.client())
         .collect::<Vec<_>>();
-    let barrier = Barrier::new(concurrency);
+    let cohort_client = scheduler.client();
     progress.begin_phase("measure", observations)?;
-    let started = Instant::now();
-    let samples = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(concurrency);
-        for (producer, client) in clients.into_iter().enumerate() {
-            let count =
-                observations / concurrency + usize::from(producer < observations % concurrency);
-            let barrier = &barrier;
-            handles.push(scope.spawn(move || -> Result<Vec<u64>, String> {
-                let mut samples = Vec::with_capacity(count);
-                let mut pending_progress = 0;
-                barrier.wait();
-                for sequence in 0..count {
-                    let sample = Instant::now();
-                    let mut batch = client
-                        .begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Group)
-                        .map_err(|error| error.to_string())?;
-                    client
-                        .stage_delta_set(
-                            &mut batch,
-                            format!("g7-group-{producer}-{sequence}").into_bytes(),
-                            b"v".to_vec(),
-                            None,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    client.submit(batch).map_err(|error| error.to_string())?;
-                    samples.push(sample.elapsed().as_nanos() as u64);
-                    pending_progress += 1;
-                    if pending_progress == PROGRESS_CHUNK_UNITS {
-                        progress
-                            .advance(pending_progress)
-                            .map_err(|error| error.to_string())?;
-                        pending_progress = 0;
-                    }
-                }
-                if pending_progress > 0 {
-                    progress
-                        .advance(pending_progress)
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(samples)
+    let (evidence, measured_wall) = measure_strict_group_commits(
+        cohort_client,
+        producer_clients,
+        plan.clone(),
+        baseline_visible_csn,
+        progress,
+    )?;
+    progress.finish_phase("measure")?;
+    let stats = evidence.stats(measured_wall.as_secs_f64())?;
+    let mut output = stats_with_materialization(stats, materialization)?;
+    scheduler.shutdown()?;
+    let reopen = verify_strict_group_commit_reopen(
+        &group_path,
+        authority,
+        &plan,
+        baseline_visible_csn,
+        baseline_committed_transactions,
+    )?;
+    reopen.validate(
+        &plan,
+        evidence
+            .first_commit_csn
+            .ok_or("strict group commit omitted its first CSN")?,
+        evidence
+            .last_commit_csn
+            .ok_or("strict group commit omitted its last CSN")?,
+    )?;
+    output["durability"] = json!("group-physical-sync");
+    output["group_commit_evidence"] = evidence.json(concurrency, &reopen)?;
+    Ok(output)
+}
+
+enum CommitProducerCommand {
+    Prepare {
+        assignments: Vec<(usize, usize)>,
+        active_gate: Arc<Barrier>,
+    },
+    Stop,
+}
+
+type PreparedCommitResult = Result<Vec<(usize, NativeDeltaWriteBatch)>, String>;
+
+fn run_commit_producer(
+    client: NativeCommitClient,
+    commands: mpsc::Receiver<CommitProducerCommand>,
+    prepared: mpsc::Sender<PreparedCommitResult>,
+    activity: Arc<StrictProducerActivity>,
+) {
+    while let Ok(command) = commands.recv() {
+        let CommitProducerCommand::Prepare {
+            assignments,
+            active_gate,
+        } = command
+        else {
+            break;
+        };
+        let _activity_guard = if assignments.is_empty() {
+            None
+        } else {
+            let guard = activity.enter();
+            active_gate.wait();
+            Some(guard)
+        };
+        let result = assignments
+            .into_iter()
+            .map(|(position, sequence)| {
+                let mut batch = client
+                    .begin_optimistic_delta(0, hyphae_native_types::DurabilityClass::Group)
+                    .map_err(|error| error.to_string())?;
+                client
+                    .stage_delta_set(
+                        &mut batch,
+                        strict_group_commit_key(sequence),
+                        strict_group_commit_value(sequence),
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok((position, batch))
+            })
+            .collect();
+        if prepared.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+fn measure_strict_group_commits(
+    cohort_client: NativeCommitClient,
+    producer_clients: Vec<NativeCommitClient>,
+    plan: StrictGroupCommitPlan,
+    baseline_visible_csn: u64,
+    progress: &SurfaceProgress,
+) -> Result<(StrictGroupCommitEvidence, Duration), Box<dyn Error>> {
+    let producer_concurrency = producer_clients.len();
+    if producer_concurrency == 0 || producer_concurrency > STRICT_GROUP_COMMIT_COHORT_WIDTH {
+        return Err("strict group commit producer count is outside its cohort width".into());
+    }
+    thread::scope(|scope| {
+        let (prepared_send, prepared_receive) = mpsc::channel();
+        let producer_activity = Arc::new(StrictProducerActivity::default());
+        let mut commands = Vec::with_capacity(producer_concurrency);
+        let mut workers = Vec::with_capacity(producer_concurrency);
+        for client in producer_clients {
+            let (command_send, command_receive) = mpsc::sync_channel(1);
+            commands.push(command_send);
+            let prepared_send = prepared_send.clone();
+            let producer_activity = Arc::clone(&producer_activity);
+            workers.push(scope.spawn(move || {
+                run_commit_producer(client, command_receive, prepared_send, producer_activity);
             }));
         }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .map_err(|_| "group commit worker panicked".to_owned())?
-            })
-            .collect::<Result<Vec<_>, String>>()
+        drop(prepared_send);
+
+        let measured = (|| -> Result<(StrictGroupCommitEvidence, Duration), Box<dyn Error>> {
+            let mut evidence = StrictGroupCommitEvidence::new(plan.clone(), baseline_visible_csn);
+            let mut measured_wall = Duration::ZERO;
+            let mut pending_progress = 0_usize;
+            for cohort_index in 0..plan.cohort_count {
+                let window_timer = StrictGroupCommitWindowTimer::start();
+                let sequence_start = cohort_index
+                    .checked_mul(STRICT_GROUP_COMMIT_COHORT_WIDTH)
+                    .ok_or("strict group commit sequence start overflowed")?;
+                let cohort_size = if cohort_index + 1 == plan.cohort_count {
+                    plan.final_cohort_size
+                } else {
+                    STRICT_GROUP_COMMIT_COHORT_WIDTH
+                };
+                let active_gate = Arc::new(Barrier::new(producer_concurrency.min(cohort_size)));
+                for (producer, command) in commands.iter().enumerate() {
+                    let assignments = (producer..cohort_size)
+                        .step_by(producer_concurrency)
+                        .map(|position| (position, sequence_start + position))
+                        .collect();
+                    command
+                        .send(CommitProducerCommand::Prepare {
+                            assignments,
+                            active_gate: Arc::clone(&active_gate),
+                        })
+                        .map_err(|_| "strict group commit producer stopped before preparation")?;
+                }
+                let mut prepared = Vec::with_capacity(cohort_size);
+                let mut preparation_error = None;
+                for _ in 0..producer_concurrency {
+                    match prepared_receive.recv() {
+                        Ok(Ok(mut batches)) => prepared.append(&mut batches),
+                        Ok(Err(error)) => {
+                            preparation_error.get_or_insert(error);
+                        }
+                        Err(_) => {
+                            return Err(
+                                "strict group commit producer response channel disconnected".into(),
+                            );
+                        }
+                    };
+                }
+                if let Some(error) = preparation_error {
+                    return Err(error.into());
+                }
+                prepared.sort_unstable_by_key(|(position, _)| *position);
+                if prepared.len() != cohort_size
+                    || prepared
+                        .iter()
+                        .enumerate()
+                        .any(|(position, (observed, _))| position != *observed)
+                {
+                    return Err("strict group commit preparation lost canonical order".into());
+                }
+                let batches = prepared
+                    .into_iter()
+                    .map(|(_, batch)| NativeCommitBatch::from(batch))
+                    .collect();
+                let pending = cohort_client.enqueue_cohort(batches)?;
+                let outstanding = pending.len();
+                let completions = pending
+                    .into_iter()
+                    .map(|pending| pending.wait_with_evidence())
+                    .collect::<Result<Vec<_>, _>>()?;
+                measured_wall = measured_wall
+                    .checked_add(window_timer.finish()?)
+                    .ok_or("strict group commit measured wall time overflowed")?;
+                let observations = completions
+                    .into_iter()
+                    .map(StrictCommitObservation::from_completion)
+                    .collect::<Result<Vec<_>, _>>()?;
+                evidence.observe_cohort(&observations, outstanding)?;
+                pending_progress = pending_progress
+                    .checked_add(cohort_size)
+                    .ok_or("strict group commit progress overflowed")?;
+                if pending_progress >= PROGRESS_CHUNK_UNITS {
+                    progress.advance(pending_progress)?;
+                    pending_progress = 0;
+                }
+            }
+            if pending_progress > 0 {
+                progress.advance(pending_progress)?;
+            }
+            evidence.record_producer_activity(
+                producer_activity.current(),
+                producer_activity.maximum(),
+                producer_concurrency,
+            )?;
+            evidence.validate_complete()?;
+            Ok((evidence, measured_wall))
+        })();
+
+        for command in &commands {
+            let _ignored = command.send(CommitProducerCommand::Stop);
+        }
+        let mut worker_failed = false;
+        for worker in workers {
+            worker_failed |= worker.join().is_err();
+        }
+        if worker_failed {
+            return Err("strict group commit producer panicked".into());
+        }
+        measured
     })
-    .map_err(|error| -> Box<dyn Error> { error.into() })?
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    progress.finish_phase("measure")?;
-    let stats = stats_from_samples(samples, started.elapsed().as_secs_f64());
-    scheduler.shutdown()?;
-    let mut output = stats_with_materialization(stats, materialization)?;
-    output["group_concurrency"] = json!(concurrency);
-    output["durability"] = json!("group-physical-sync");
-    Ok(output)
+}
+
+fn verify_strict_group_commit_reopen(
+    group_path: &Path,
+    authority: &ExecutionAuthority,
+    plan: &StrictGroupCommitPlan,
+    baseline_visible_csn: u64,
+    baseline_committed_transactions: usize,
+) -> Result<StrictGroupCommitReopenEvidence, Box<dyn Error>> {
+    let mut reopened = NativeDatabase::open(group_path)?;
+    authority.reinstall(&mut reopened)?;
+    inspect_strict_group_commit_reopen(
+        &reopened,
+        plan,
+        baseline_visible_csn,
+        baseline_committed_transactions,
+    )
+}
+
+fn inspect_strict_group_commit_reopen(
+    reopened: &NativeDatabase,
+    plan: &StrictGroupCommitPlan,
+    baseline_visible_csn: u64,
+    baseline_committed_transactions: usize,
+) -> Result<StrictGroupCommitReopenEvidence, Box<dyn Error>> {
+    let open_time_nanos = duration_nanos(reopened.recovery_report().open_time)?;
+    let reopened_visible_csn = reopened
+        .recovery_report()
+        .visible_csn
+        .map(hyphae_native_types::Csn::get)
+        .ok_or("strict group commit final reopen omitted its visible CSN")?;
+    let reopened_committed_transactions = reopened.recovery_report().committed_transactions;
+    let verification_started = Instant::now();
+    let snapshot = reopened.snapshot(0)?;
+    let mut expected_digest = blake3::Hasher::new();
+    let mut recovered_digest = blake3::Hasher::new();
+    expected_digest.update(b"blake3-logical-id-key-value-v1\0");
+    recovered_digest.update(b"blake3-logical-id-key-value-v1\0");
+    let mut missing_keys = 0_usize;
+    let mut mismatched_values = 0_usize;
+    for sequence in 0..plan.logical_commits {
+        let key = strict_group_commit_key(sequence);
+        let expected = strict_group_commit_value(sequence);
+        update_strict_group_state_digest(&mut expected_digest, sequence, &key, &expected)?;
+        match snapshot.get(&key) {
+            Some(observed) => {
+                update_strict_group_state_digest(&mut recovered_digest, sequence, &key, observed)?;
+                mismatched_values += usize::from(observed != expected);
+            }
+            None => {
+                missing_keys += 1;
+                update_strict_group_state_digest(&mut recovered_digest, sequence, &key, &[])?;
+            }
+        }
+    }
+    let verification_time_nanos = duration_nanos(verification_started.elapsed())?;
+    Ok(StrictGroupCommitReopenEvidence {
+        baseline_visible_csn,
+        baseline_committed_transactions,
+        reopened_visible_csn,
+        reopened_committed_transactions,
+        verified_logical_commits: plan.logical_commits,
+        missing_keys,
+        mismatched_values,
+        expected_state_digest: expected_digest.finalize().to_hex().to_string(),
+        recovered_state_digest: recovered_digest.finalize().to_hex().to_string(),
+        open_time_nanos,
+        verification_time_nanos,
+    })
 }
 
 fn measure_concurrent(
@@ -5127,6 +6170,274 @@ mod tests {
         )?;
         cell.begin_surface(G7_SURFACE_NAMES[0], 0, total)
             .map_err(Into::into)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_measurement_records_each_operation_latency() -> Result<(), Box<dyn Error>> {
+        let progress = measurement_test_progress(3)?;
+        progress.begin_phase("measure", 3)?;
+        let delays = [
+            Duration::from_millis(1),
+            Duration::from_millis(12),
+            Duration::from_millis(24),
+        ];
+        let stats = measure_async(
+            3,
+            3,
+            &progress,
+            |worker| async move {
+                tokio::time::sleep(delays[worker]).await;
+                Ok::<_, Box<dyn Error>>(worker)
+            },
+            &|_| Ok(()),
+        )
+        .await?;
+        progress.finish_phase("measure")?;
+
+        assert!(stats.p50 < stats.maximum);
+        assert!(stats.p95 <= stats.maximum);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_rounds_are_balanced_gapless_and_reach_requested_concurrency()
+    -> Result<(), Box<dyn Error>> {
+        let concurrency = 3;
+        let observations = 10;
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("measure", observations)?;
+        let counts = Arc::new(
+            (0..concurrency)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>(),
+        );
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let _stats = measure_async(
+            concurrency,
+            observations,
+            &progress,
+            |worker| {
+                let counts = Arc::clone(&counts);
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                async move {
+                    counts[worker].fetch_add(1, Ordering::Relaxed);
+                    let live = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(live, Ordering::AcqRel);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                    Ok::<_, Box<dyn Error>>(worker)
+                }
+            },
+            &|_| Ok(()),
+        )
+        .await?;
+        progress.finish_phase("measure")?;
+
+        assert_eq!(peak.load(Ordering::Acquire), u64::try_from(concurrency)?);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|count| count.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            vec![4, 3, 3]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_warmup_reaches_every_independent_worker() -> Result<(), Box<dyn Error>> {
+        let concurrency = 4;
+        let observations = 11;
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("warmup", observations)?;
+        let counts = Arc::new(
+            (0..concurrency)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>(),
+        );
+        warm_async(
+            concurrency,
+            observations,
+            &progress,
+            |worker| {
+                let counts = Arc::clone(&counts);
+                async move {
+                    counts[worker].fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Box<dyn Error>>(())
+                }
+            },
+            &|()| Ok(()),
+        )
+        .await?;
+        progress.finish_phase("warmup")?;
+
+        assert_eq!(
+            counts
+                .iter()
+                .map(|count| count.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3, 2]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_throughput_excludes_response_validation() -> Result<(), Box<dyn Error>> {
+        let progress = measurement_test_progress(4)?;
+        progress.begin_phase("measure", 4)?;
+        let stats = measure_async(
+            2,
+            4,
+            &progress,
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                Ok::<_, Box<dyn Error>>(())
+            },
+            &|()| {
+                thread::sleep(Duration::from_millis(20));
+                Ok(())
+            },
+        )
+        .await?;
+        progress.finish_phase("measure")?;
+
+        assert!(stats.throughput > 200.0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_progress_is_outside_the_query_timing_window() -> Result<(), Box<dyn Error>> {
+        let progress_path = std::env::temp_dir().join(format!(
+            "hyphae-g7-async-progress-{}-{}.json",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let cell = CellProgress::new(
+            Some(progress_path.clone()),
+            "1".repeat(40),
+            Some("2".repeat(40)),
+            "3".repeat(64),
+            4,
+            0,
+        )?;
+        let progress = cell.begin_surface(G7_SURFACE_NAMES[0], 0, 4)?;
+        progress.begin_phase("measure", 4)?;
+        let stats = measure_async(
+            2,
+            4,
+            &progress,
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                Ok::<_, Box<dyn Error>>(())
+            },
+            &|()| Ok(()),
+        )
+        .await?;
+        progress.finish_phase("measure")?;
+        fs::remove_file(progress_path)?;
+
+        assert!(stats.throughput > 200.0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_sql_clients_prepare_one_handle_per_independent_session()
+    -> Result<(), Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-local-sql-sessions-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let endpoint = short_endpoint("sql-sessions");
+        let mut product = NativeProduct::create(&root)?;
+        seed_product_sql(&mut product)?;
+        let daemon = LocalDaemonThread::start(
+            product,
+            endpoint.to_string_lossy().into_owned(),
+            NativeDaemonConfig::default(),
+        )?;
+        let sessions =
+            prepare_local_sql_sessions(local_clients(&endpoint, 3)?, &RequestOptions::default())
+                .await?;
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.handle.get())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        for session in sessions {
+            require_sql_response(
+                session
+                    .client
+                    .execute_prepared(
+                        session.handle,
+                        vec![hyphae_native_product::ProductValue::Signed(
+                            (SQL_KEYS / 2) as i64,
+                        )],
+                        RequestOptions::default(),
+                    )
+                    .await?,
+            )?;
+        }
+        daemon.shutdown()?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_daemon_owns_a_dedicated_runtime_thread_and_stops_cleanly()
+    -> Result<(), Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-local-daemon-thread-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let endpoint = short_endpoint("daemon-thread");
+        let product = NativeProduct::create(&root)?;
+        let caller_thread = thread::current().id();
+        let daemon = LocalDaemonThread::start(
+            product,
+            endpoint.to_string_lossy().into_owned(),
+            NativeDaemonConfig::default(),
+        )?;
+
+        assert_ne!(daemon.server_thread_id(), caller_thread);
+        daemon.shutdown()?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_daemon_startup_error_does_not_stop_existing_owner() -> Result<(), Box<dyn Error>>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-local-daemon-error-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let endpoint = short_endpoint("daemon-error");
+        fs::create_dir_all(&root)?;
+        let owner = LocalDaemonThread::start(
+            NativeProduct::create(root.join("owner"))?,
+            endpoint.to_string_lossy().into_owned(),
+            NativeDaemonConfig::default(),
+        )?;
+        let duplicate = LocalDaemonThread::start(
+            NativeProduct::create(root.join("duplicate"))?,
+            endpoint.to_string_lossy().into_owned(),
+            NativeDaemonConfig::default(),
+        );
+
+        assert!(duplicate.is_err());
+        let client = HyphaeClient::local(endpoint.to_string_lossy().into_owned())?;
+        black_box(client.capabilities(RequestOptions::default()).await?);
+        owner.shutdown()?;
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
@@ -6026,6 +7337,223 @@ mod tests {
             total_work_units(1_000_000, 1_000_000, 100_000, false)?,
             13_000_000
         );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_group_commit_plan_uses_fixed_cohorts_for_full_and_partial_windows()
+    -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (64, 2, 32, BTreeMap::from([(32, 2)])),
+            (80, 3, 16, BTreeMap::from([(16, 1), (32, 2)])),
+            (10_000, 313, 16, BTreeMap::from([(16, 1), (32, 312)])),
+        ];
+        for (observations, cohort_count, final_size, size_histogram) in cases {
+            let plan = StrictGroupCommitPlan::new(observations)?;
+            assert_eq!(plan.cohort_count, cohort_count);
+            assert_eq!(plan.final_cohort_size, final_size);
+            assert_eq!(plan.cohort_size_histogram, size_histogram);
+            for position in 0..32 {
+                let full = observations / 32;
+                let remainder = observations % 32;
+                assert_eq!(
+                    plan.cohort_position_histogram.get(&position).copied(),
+                    Some(full + usize::from(position < remainder))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_group_commit_window_includes_preparation_without_changing_scheduler_latency()
+    -> Result<(), Box<dyn Error>> {
+        let started = Instant::now();
+        let preparation = Duration::from_millis(7);
+        let scheduler_latency = Duration::from_millis(3);
+        let scheduler_started = started
+            .checked_add(preparation)
+            .ok_or("test preparation instant overflowed")?;
+        let finished = scheduler_started
+            .checked_add(scheduler_latency)
+            .ok_or("test scheduler instant overflowed")?;
+
+        let measured_wall = StrictGroupCommitWindowTimer { started }.finish_at(finished)?;
+
+        assert_eq!(measured_wall, preparation + scheduler_latency);
+        assert_eq!(
+            finished.duration_since(scheduler_started),
+            scheduler_latency
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_group_commit_activity_is_observed_for_every_producer_and_unwinds_after_panic() {
+        for concurrency in [1, 8, 32] {
+            let activity = Arc::new(StrictProducerActivity::default());
+            let gate = Arc::new(Barrier::new(concurrency));
+            thread::scope(|scope| {
+                for _ in 0..concurrency {
+                    let activity = Arc::clone(&activity);
+                    let gate = Arc::clone(&gate);
+                    scope.spawn(move || {
+                        let _guard = activity.enter();
+                        gate.wait();
+                    });
+                }
+            });
+            assert_eq!(activity.current(), 0);
+            assert_eq!(activity.maximum(), concurrency);
+        }
+
+        let activity = Arc::new(StrictProducerActivity::default());
+        let panicking_activity = Arc::clone(&activity);
+        assert!(
+            thread::spawn(move || {
+                let _guard = panicking_activity.enter();
+                panic!("injected strict producer panic");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(activity.current(), 0);
+        assert_eq!(activity.maximum(), 1);
+    }
+
+    #[test]
+    fn strict_group_commit_plan_rejects_forged_histograms() -> Result<(), Box<dyn Error>> {
+        let plan = StrictGroupCommitPlan::new(80)?;
+        let mut forged_sizes = plan.cohort_size_histogram.clone();
+        forged_sizes.insert(31, 1);
+        assert!(
+            plan.validate_histograms(&forged_sizes, &plan.cohort_position_histogram)
+                .is_err()
+        );
+
+        let mut forged_positions = plan.cohort_position_histogram.clone();
+        forged_positions.insert(31, 1);
+        assert!(
+            plan.validate_histograms(&plan.cohort_size_histogram, &forged_positions)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_group_commit_evidence_rejects_forged_receipts() -> Result<(), Box<dyn Error>> {
+        let cohort = |start_csn: u64| {
+            (0..STRICT_GROUP_COMMIT_COHORT_WIDTH)
+                .map(|position| StrictCommitObservation {
+                    transaction_id: u128::from(start_csn) + position as u128,
+                    commit_csn: start_csn + position as u64,
+                    catalog_version: 1,
+                    commit_lsn: start_csn + position as u64,
+                    wal_block_digest: [position as u8; 32],
+                    cohort_size: STRICT_GROUP_COMMIT_COHORT_WIDTH,
+                    cohort_position: position,
+                    page_synchronizations: 1,
+                    wal_synchronizations: 1,
+                    admission_wait_nanos: 0,
+                    queue_wait_nanos: 1,
+                    cohort_execution_nanos: 3,
+                    page_synchronization_nanos: 1,
+                    wal_synchronization_nanos: 1,
+                    end_to_end_nanos: 4,
+                })
+                .collect::<Vec<_>>()
+        };
+        let plan = StrictGroupCommitPlan::new(64)?;
+        let mut evidence = StrictGroupCommitEvidence::new(plan.clone(), 2);
+        evidence.observe_cohort(&cohort(3), STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT)?;
+        evidence.observe_cohort(&cohort(35), STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT)?;
+        evidence.record_producer_activity(0, 8, 8)?;
+        evidence.validate_complete()?;
+
+        let mut forged_position = cohort(3);
+        forged_position[7].cohort_position = 6;
+        assert!(
+            StrictGroupCommitEvidence::new(plan.clone(), 2)
+                .observe_cohort(&forged_position, STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT)
+                .is_err()
+        );
+
+        let mut forged_csn = cohort(3);
+        forged_csn[9].commit_csn += 1;
+        assert!(
+            StrictGroupCommitEvidence::new(plan, 2)
+                .observe_cohort(&forged_csn, STRICT_GROUP_COMMIT_OUTSTANDING_LIMIT)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_group_commit_small_cohorts_survive_full_reopen() -> Result<(), Box<dyn Error>> {
+        const OBSERVATIONS: usize = 64;
+        for concurrency in [1, 8, 32] {
+            let root = std::env::temp_dir().join(format!(
+                "hyphae-g7-strict-group-reopen-{}-{}-{concurrency}",
+                std::process::id(),
+                unique_nonce()
+            ));
+            let mut database = NativeDatabase::create(&root)?;
+            let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+            seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
+            seed.commit()?;
+            database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+            drop(database);
+
+            let baseline = NativeDatabase::open(&root)?;
+            let baseline_visible_csn = baseline
+                .recovery_report()
+                .visible_csn
+                .map(hyphae_native_types::Csn::get)
+                .ok_or("test baseline omitted its visible CSN")?;
+            let baseline_committed_transactions = baseline.recovery_report().committed_transactions;
+            let config = hyphae_native_runtime::GroupCommitConfig::new(
+                STRICT_GROUP_COMMIT_COHORT_WIDTH,
+                STRICT_GROUP_COMMIT_COLLECTION_WAIT,
+                STRICT_GROUP_COMMIT_QUEUE_CAPACITY,
+            )?
+            .with_execution_admission_wait(STRICT_GROUP_COMMIT_EXECUTION_WAIT)?;
+            let scheduler = NativeCommitScheduler::start(baseline, config)?;
+            let producers = (0..concurrency)
+                .map(|_| scheduler.client())
+                .collect::<Vec<_>>();
+            let progress = measurement_test_progress(OBSERVATIONS)?;
+            progress.begin_phase("measure", OBSERVATIONS)?;
+            let plan = StrictGroupCommitPlan::new(OBSERVATIONS)?;
+            let (evidence, measured_wall) = measure_strict_group_commits(
+                scheduler.client(),
+                producers,
+                plan.clone(),
+                baseline_visible_csn,
+                &progress,
+            )?;
+            progress.finish_phase("measure")?;
+            assert!(measured_wall > Duration::ZERO);
+            assert_eq!(evidence.maximum_active_producers, concurrency);
+            scheduler.shutdown()?;
+
+            let reopened = NativeDatabase::open(&root)?;
+            let reopen = inspect_strict_group_commit_reopen(
+                &reopened,
+                &plan,
+                baseline_visible_csn,
+                baseline_committed_transactions,
+            )?;
+            reopen.validate(
+                &plan,
+                evidence.first_commit_csn.ok_or("test omitted first CSN")?,
+                evidence.last_commit_csn.ok_or("test omitted last CSN")?,
+            )?;
+            assert_eq!(reopen.verified_logical_commits, OBSERVATIONS);
+            assert_eq!(reopen.missing_keys, 0);
+            assert_eq!(reopen.mismatched_values, 0);
+            assert_eq!(reopen.expected_state_digest, reopen.recovered_state_digest);
+            fs::remove_dir_all(root)?;
+        }
         Ok(())
     }
 }

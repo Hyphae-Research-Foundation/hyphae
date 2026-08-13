@@ -23,6 +23,8 @@ MAX_INITIAL_ANN_BULK_PARTITIONS = 111
 G7_LOGICAL_ANN_PARTITIONS = 64
 G7_PREFERRED_ANN_PARTITIONS = 32
 G7_ANN_PARTITION_POLICY = "g7-fixed-64-logical-partitions-v1"
+G7_GROUP_COMMIT_COHORT_WIDTH = 32
+G7_GROUP_COMMIT_QUEUE_CAPACITY = 64
 G7_PROFILE_PATH = Path(__file__).resolve().parents[1] / "config/native-g7-readiness-profile.json"
 
 
@@ -348,6 +350,11 @@ def validate(
         cells["hybrid-top10"],
         payload["dataset"]["observations"],
     )
+    validate_strict_group_commit_cell(
+        cells["strict-group-commit"],
+        payload["dataset"]["observations"],
+        payload["concurrency"],
+    )
     counters = payload["counters"]
     if set(counters) != set(authority.counters):
         raise GateFailure("G7 counters are incomplete")
@@ -388,6 +395,270 @@ def validate(
         "claims": [],
         "closure_declared": False,
     }
+
+
+def validate_strict_group_commit_cell(
+    cell: Any,
+    expected_observations: int,
+    expected_concurrency: int,
+) -> None:
+    """Validate one fixed-width, bounded, physically durable commit interval."""
+    latency_fields = ("p50", "p95", "p99", "p999", "maximum")
+    if (
+        not isinstance(cell, dict)
+        or cell.get("status") != "measured"
+        or cell.get("durability") != "group-physical-sync"
+        or not isinstance(cell.get("throughput_per_second"), (int, float))
+        or isinstance(cell.get("throughput_per_second"), bool)
+        or not math.isfinite(cell["throughput_per_second"])
+        or cell["throughput_per_second"] <= 0
+        or any(
+            not isinstance(cell.get(field), int)
+            or isinstance(cell[field], bool)
+            or cell[field] <= 0
+            for field in latency_fields
+        )
+        or any(
+            cell[left] > cell[right]
+            for left, right in zip(latency_fields, latency_fields[1:])
+        )
+        or not isinstance(expected_observations, int)
+        or isinstance(expected_observations, bool)
+        or expected_observations < G7_GROUP_COMMIT_COHORT_WIDTH
+        or expected_concurrency not in {1, 8, 32}
+        or isinstance(expected_concurrency, bool)
+    ):
+        raise GateFailure("G7 strict group-commit cell identity is invalid")
+    evidence = cell.get("group_commit_evidence")
+    fields = {
+        "schema", "latency_scope", "throughput_scope", "submission_mode",
+        "producer_concurrency", "maximum_active_producers", "cohort_width",
+        "scheduler_queue_capacity", "outstanding_limit", "maximum_outstanding",
+        "logical_commits", "cohort_count", "final_cohort_size",
+        "cohort_size_histogram", "cohort_position_histogram", "first_commit_csn",
+        "last_commit_csn", "distinct_commit_csns", "commit_receipt_digest_algorithm",
+        "commit_receipt_digest", "page_synchronizations", "wal_synchronizations",
+        "cohort_execution_nanos_total", "page_synchronization_nanos_total",
+        "wal_synchronization_nanos_total", "timing_sample_count",
+        "timings_nanoseconds", "reopen",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        raise GateFailure("G7 strict group-commit evidence fields mismatch")
+    _validate_group_commit_configuration(evidence, expected_concurrency)
+    _validate_group_commit_cohorts(evidence, expected_observations)
+    _validate_group_commit_receipts(evidence, expected_observations)
+    _validate_group_commit_synchronization(evidence)
+    _validate_group_commit_timings(cell, evidence, expected_observations)
+    _validate_group_commit_reopen(evidence, expected_observations)
+
+
+def _validate_group_commit_configuration(
+    evidence: dict[str, Any],
+    expected_concurrency: int,
+) -> None:
+    if (
+        evidence["schema"]
+        != "hyphae-native-g7-strict-group-commit-evidence-v1"
+        or evidence["latency_scope"]
+        != "scheduler-enqueue-through-durable-response-v1"
+        or evidence["throughput_scope"] != "bounded-cohort-window-wall-time-v1"
+        or evidence["submission_mode"] != "explicit-bounded-cohort-v1"
+        or evidence["producer_concurrency"] != expected_concurrency
+        or isinstance(evidence["producer_concurrency"], bool)
+        or evidence["maximum_active_producers"] != expected_concurrency
+        or isinstance(evidence["maximum_active_producers"], bool)
+        or evidence["cohort_width"] != G7_GROUP_COMMIT_COHORT_WIDTH
+        or isinstance(evidence["cohort_width"], bool)
+        or evidence["scheduler_queue_capacity"] != G7_GROUP_COMMIT_QUEUE_CAPACITY
+        or isinstance(evidence["scheduler_queue_capacity"], bool)
+        or evidence["outstanding_limit"] != G7_GROUP_COMMIT_COHORT_WIDTH
+        or isinstance(evidence["outstanding_limit"], bool)
+        or evidence["maximum_outstanding"] != G7_GROUP_COMMIT_COHORT_WIDTH
+        or isinstance(evidence["maximum_outstanding"], bool)
+    ):
+        raise GateFailure("G7 strict group-commit configuration is invalid")
+
+
+def _validate_group_commit_cohorts(
+    evidence: dict[str, Any],
+    expected_observations: int,
+) -> None:
+    full_cohorts, remainder = divmod(
+        expected_observations,
+        G7_GROUP_COMMIT_COHORT_WIDTH,
+    )
+    expected_cohort_count = full_cohorts + int(remainder > 0)
+    expected_size_histogram = {str(G7_GROUP_COMMIT_COHORT_WIDTH): full_cohorts}
+    if remainder:
+        expected_size_histogram[str(remainder)] = 1
+    expected_position_histogram = {
+        str(position): full_cohorts + int(position < remainder)
+        for position in range(G7_GROUP_COMMIT_COHORT_WIDTH)
+    }
+    size_histogram = evidence["cohort_size_histogram"]
+    position_histogram = evidence["cohort_position_histogram"]
+    if (
+        evidence["logical_commits"] != expected_observations
+        or isinstance(evidence["logical_commits"], bool)
+        or evidence["cohort_count"] != expected_cohort_count
+        or isinstance(evidence["cohort_count"], bool)
+        or evidence["final_cohort_size"]
+        != (remainder or G7_GROUP_COMMIT_COHORT_WIDTH)
+        or isinstance(evidence["final_cohort_size"], bool)
+        or not _is_canonical_count_histogram(size_histogram)
+        or size_histogram != expected_size_histogram
+        or not _is_canonical_count_histogram(position_histogram)
+        or position_histogram != expected_position_histogram
+    ):
+        raise GateFailure("G7 strict group-commit cohort evidence is invalid")
+
+
+def _is_canonical_count_histogram(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(isinstance(key, str) and key.isascii() and key.isdecimal() for key in value)
+        and all(
+            isinstance(count, int) and not isinstance(count, bool) and count > 0
+            for count in value.values()
+        )
+    )
+
+
+def _validate_group_commit_receipts(
+    evidence: dict[str, Any],
+    expected_observations: int,
+) -> None:
+    first_csn = evidence["first_commit_csn"]
+    last_csn = evidence["last_commit_csn"]
+    if (
+        not isinstance(first_csn, int)
+        or isinstance(first_csn, bool)
+        or first_csn <= 0
+        or not isinstance(last_csn, int)
+        or isinstance(last_csn, bool)
+        or last_csn < first_csn
+        or last_csn - first_csn + 1 != expected_observations
+        or evidence["distinct_commit_csns"] != expected_observations
+        or isinstance(evidence["distinct_commit_csns"], bool)
+        or evidence["commit_receipt_digest_algorithm"]
+        != "blake3-csn-ordered-native-commit-receipts-v1"
+        or not isinstance(evidence["commit_receipt_digest"], str)
+        or HEX64.fullmatch(evidence["commit_receipt_digest"]) is None
+    ):
+        raise GateFailure("G7 strict group-commit commit receipt evidence is invalid")
+
+
+def _validate_group_commit_synchronization(evidence: dict[str, Any]) -> None:
+    cohort_count = evidence["cohort_count"]
+    execution_nanos = evidence["cohort_execution_nanos_total"]
+    page_nanos = evidence["page_synchronization_nanos_total"]
+    wal_nanos = evidence["wal_synchronization_nanos_total"]
+    if (
+        evidence["page_synchronizations"] != cohort_count
+        or isinstance(evidence["page_synchronizations"], bool)
+        or evidence["wal_synchronizations"] != cohort_count
+        or isinstance(evidence["wal_synchronizations"], bool)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in (execution_nanos, page_nanos, wal_nanos)
+        )
+        or execution_nanos < page_nanos + wal_nanos
+    ):
+        raise GateFailure("G7 strict group-commit synchronization evidence is invalid")
+
+
+def _validate_group_commit_timings(
+    cell: dict[str, Any],
+    evidence: dict[str, Any],
+    expected_observations: int,
+) -> None:
+    timings = evidence["timings_nanoseconds"]
+    components = {
+        "admission_wait", "queue_wait", "cohort_execution",
+        "page_synchronization", "wal_synchronization", "end_to_end",
+    }
+    if (
+        evidence["timing_sample_count"] != expected_observations
+        or isinstance(evidence["timing_sample_count"], bool)
+        or not isinstance(timings, dict)
+        or set(timings) != components
+    ):
+        raise GateFailure("G7 strict group-commit timing evidence is invalid")
+    for component in components:
+        _validate_group_commit_latency_summary(timings[component])
+    end_to_end = timings["end_to_end"]
+    if any(end_to_end[field] != cell.get(field) for field in end_to_end):
+        raise GateFailure("G7 strict group-commit timing differs from end-to-end latency")
+
+
+def _validate_group_commit_latency_summary(value: Any) -> None:
+    fields = ("p50", "p95", "p99", "p999", "maximum")
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(fields)
+        or any(
+            not isinstance(value[field], int)
+            or isinstance(value[field], bool)
+            or value[field] < 0
+            for field in fields
+        )
+        or any(value[left] > value[right] for left, right in zip(fields, fields[1:]))
+    ):
+        raise GateFailure("G7 strict group-commit timing summary is invalid")
+
+
+def _validate_group_commit_reopen(
+    evidence: dict[str, Any],
+    expected_observations: int,
+) -> None:
+    reopen = evidence["reopen"]
+    fields = {
+        "provider", "baseline_visible_csn", "baseline_committed_transactions",
+        "reopened_visible_csn", "reopened_committed_transactions",
+        "verified_logical_commits", "missing_keys", "mismatched_values",
+        "state_digest_algorithm", "expected_state_digest", "recovered_state_digest",
+        "open_time_nanos", "verification_time_nanos",
+    }
+    if not isinstance(reopen, dict) or set(reopen) != fields:
+        raise GateFailure("G7 strict group-commit reopen evidence fields mismatch")
+    baseline_visible = reopen["baseline_visible_csn"]
+    baseline_committed = reopen["baseline_committed_transactions"]
+    reopened_visible = reopen["reopened_visible_csn"]
+    reopened_committed = reopen["reopened_committed_transactions"]
+    if (
+        reopen["provider"] != "single-reopened-root-snapshot-full-key-digest-v1"
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (
+                baseline_visible,
+                baseline_committed,
+                reopened_visible,
+                reopened_committed,
+                reopen["verified_logical_commits"],
+                reopen["missing_keys"],
+                reopen["mismatched_values"],
+            )
+        )
+        or reopened_visible - baseline_visible != expected_observations
+        or reopened_committed - baseline_committed != expected_observations
+        or evidence["first_commit_csn"] != baseline_visible + 1
+        or evidence["last_commit_csn"] != reopened_visible
+        or reopen["verified_logical_commits"] != expected_observations
+        or reopen["missing_keys"] != 0
+        or reopen["mismatched_values"] != 0
+        or reopen["state_digest_algorithm"] != "blake3-logical-id-key-value-v1"
+        or not isinstance(reopen["expected_state_digest"], str)
+        or HEX64.fullmatch(reopen["expected_state_digest"]) is None
+        or reopen["recovered_state_digest"] != reopen["expected_state_digest"]
+        or not isinstance(reopen["recovered_state_digest"], str)
+        or any(
+            not isinstance(reopen[field], int)
+            or isinstance(reopen[field], bool)
+            or reopen[field] <= 0
+            for field in ("open_time_nanos", "verification_time_nanos")
+        )
+    ):
+        raise GateFailure("G7 strict group-commit reopen evidence is invalid")
 
 
 def validate_ann_read_view_cell(

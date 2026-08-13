@@ -16,6 +16,11 @@ def matrix() -> dict:
                 value = interference_receipt() if background == "interference" else receipt()
                 value["state"] = state
                 value["concurrency"] = concurrency
+                commit_evidence = value["cells"]["strict-group-commit"][
+                    "group_commit_evidence"
+                ]
+                commit_evidence["producer_concurrency"] = concurrency
+                commit_evidence["maximum_active_producers"] = concurrency
                 receipts.append(value)
     return {
         "schema": "hyphae-native-g7-matrix-v4",
@@ -70,6 +75,25 @@ class G7MatrixTests(unittest.TestCase):
         payload["receipts"][0]["initial_ann_bulk"]["aggregate_identity"] = "e" * 64
         with self.assertRaisesRegex(GateFailure, "ANN generation"):
             validate_matrix(payload, "a" * 40, expected_tree=TREE)
+
+    def test_mixed_recovered_group_commit_state_fails(self) -> None:
+        payload = matrix()
+        reopen = payload["receipts"][0]["cells"]["strict-group-commit"][
+            "group_commit_evidence"
+        ]["reopen"]
+        reopen["expected_state_digest"] = "c" * 64
+        reopen["recovered_state_digest"] = "c" * 64
+        with self.assertRaisesRegex(GateFailure, "recovered group-commit state"):
+            validate_matrix(payload, "a" * 40, expected_tree=TREE)
+
+    def test_matrix_allows_distinct_commit_receipt_digests(self) -> None:
+        payload = matrix()
+        for index, value in enumerate(payload["receipts"], start=1):
+            value["cells"]["strict-group-commit"]["group_commit_evidence"][
+                "commit_receipt_digest"
+            ] = f"{index:064x}"
+        result = validate_matrix(payload, "a" * 40, expected_tree=TREE)
+        self.assertEqual(result["receipts"], 6)
 
     def test_matrix_rejects_a_different_authoritative_source_tree(self) -> None:
         with self.assertRaisesRegex(GateFailure, "source tree"):

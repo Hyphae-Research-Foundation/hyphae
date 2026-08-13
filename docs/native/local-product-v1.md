@@ -13,6 +13,12 @@ catalog snapshot sequence, one MVCC root-set sequence, and one scheduler. The
 embedded API, local daemon, CLI, HTTP `/v2`, and SDKs are adapters over that
 instance. No adapter maintains a second logical database or indexing path.
 
+The sole product owner remains synchronous. Its additive asynchronous
+submission handle carries only the definite completion of one already admitted
+operation to an async adapter; it does not add an executor, a second owner, or
+engine semantics. Dropping the completion receiver cannot roll back an
+operation that the owner has executed.
+
 Engine-to-engine execution uses direct typed Rust calls. TCP, HTTP, JSON,
 GraphQL, gRPC, RESP, PostgreSQL wire, OpenSearch REST, and the native local
 protocol are forbidden internal engine paths.
@@ -36,6 +42,12 @@ shutdown, and explicit transaction outcome after disconnect. Read streams are
 provisional until one mandatory completion frame; clients discard a stream
 that terminates without successful completion. Mutations remain atomically
 all-or-none and never stream partial success.
+
+The daemon awaits the owner's completion directly and does not consume one
+blocking-executor thread per in-flight response. Terminal END and FAILURE
+publication owns one generation-bound request cleanup under the output lock.
+Reusing the same stream and request IDs after a terminal frame cannot let an
+older response remove the new request or flow-control window.
 
 ### CLI
 
