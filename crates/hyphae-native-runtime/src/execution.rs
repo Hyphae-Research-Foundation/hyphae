@@ -1469,6 +1469,18 @@ mod tests {
         Ok(topology.numa_steal_policy)
     }
 
+    fn portable_unbound_numa_topology() -> Result<NativeExecutionTopology, NativeExecutionError> {
+        // These tests exercise queue isolation and wake routing, not kernel
+        // placement. Keep the synthetic NUMA identities while avoiding host
+        // cpuset assumptions that would make the fixture itself invalid.
+        let mut topology = NativeExecutionTopology::derive(&profile(), &policy())?;
+        topology.hard_affinity = false;
+        for worker in topology.pools.iter_mut().flat_map(|pool| &mut pool.workers) {
+            worker.logical_processor_id = None;
+        }
+        Ok(topology)
+    }
+
     #[test]
     fn topology_selects_physical_cores_before_smt_and_groups_numa() -> Result<(), Box<dyn Error>> {
         let topology = NativeExecutionTopology::derive(&profile(), &policy())?;
@@ -1747,9 +1759,7 @@ mod tests {
 
     #[test]
     fn submitted_job_wakes_only_its_numa_pool() -> Result<(), Box<dyn Error>> {
-        let profile = profile();
-        let policy = policy();
-        let pool = NativeExecutionPool::new(&profile, &policy)?;
+        let pool = NativeExecutionPool::from_topology(portable_unbound_numa_topology()?)?;
         wait_for_sleeping_workers(&pool, &[2, 2])?;
         let before = wake_returns(&pool);
         let (worker_tx, worker_rx) = mpsc::sync_channel(1);
@@ -1821,7 +1831,7 @@ mod tests {
 
     #[test]
     fn calibrated_remote_candidate_observes_steal_delay() -> Result<(), Box<dyn Error>> {
-        let mut topology = NativeExecutionTopology::derive(&profile(), &policy())?;
+        let mut topology = portable_unbound_numa_topology()?;
         topology.numa_steal_policy = calibrated_policy_for_scheduler_tests()?;
         let steal_delay = Duration::from_millis(80);
         for pool_policy in &mut topology.numa_steal_policy.pools {

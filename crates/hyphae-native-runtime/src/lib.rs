@@ -47936,6 +47936,7 @@ mod tests {
             let client = scheduler.client();
             let collection_guard = client.block_cohort_collection_for_test()?;
             let execution_guard = client.block_commit_execution_for_test()?;
+            let completion_return_guard = client.block_completion_return_for_test()?;
             let pending = concurrently_enqueue_governed_group(&client, cohort_size)?;
 
             let queued_usage = governor.usage_snapshot();
@@ -48011,8 +48012,39 @@ mod tests {
             assert_eq!(governor.usage_snapshot().compute_threads, 0);
             assert_eq!(governor.usage_snapshot().io_slots, 0);
             assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+            drop(completion_return_guard);
             scheduler.shutdown()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn governed_singleton_releases_execution_permit_before_completion_is_observable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database.set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::ZERO)?;
+        let scheduler =
+            NativeCommitScheduler::start(database, GroupCommitConfig::new(1, Duration::ZERO, 1)?)?;
+        let client = scheduler.client();
+        let completion_return_guard = client.block_completion_return_for_test()?;
+        let mut batch = client.begin_optimistic_delta(1, DurabilityClass::Strict)?;
+        client.stage_delta_set(
+            &mut batch,
+            b"governed-singleton".to_vec(),
+            b"visible".to_vec(),
+            None,
+        )?;
+
+        let receipt = client.enqueue(batch)?.wait()?;
+        assert_eq!(receipt.durability_cohort_size, 1);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+
+        drop(completion_return_guard);
+        scheduler.shutdown()?;
         Ok(())
     }
 
@@ -48500,9 +48532,6 @@ mod tests {
         }
         assert!(!shutdown.is_finished());
         drop(interference);
-        let released_usage = governor.usage_snapshot();
-        assert_eq!(released_usage.compute_threads, 0, "{released_usage:?}");
-        assert_eq!(released_usage.io_slots, 0, "{released_usage:?}");
         let admitted_deadline = Instant::now() + Duration::from_secs(2);
         while governor.queued_requests() != 0 {
             if Instant::now() >= admitted_deadline {

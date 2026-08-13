@@ -3,8 +3,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -565,26 +570,89 @@ fn assert_members(actual: &[Vec<u8>], expected: &[&[u8]]) {
     );
 }
 
-struct TemporaryDirectory(PathBuf);
+struct TemporaryDirectory {
+    root: PathBuf,
+    database: PathBuf,
+}
 
 impl TemporaryDirectory {
-    fn create() -> Result<Self, Box<dyn Error>> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        Ok(Self(std::env::temp_dir().join(format!(
-            "hyphae-set-algebra-{}-{timestamp}",
+    fn create() -> io::Result<Self> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        Self::create_at(timestamp)
+    }
+
+    fn create_at(timestamp: u128) -> io::Result<Self> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-set-algebra-{}-{timestamp}-{sequence}",
             std::process::id()
-        ))))
+        ));
+        fs::create_dir(&root)?;
+        Ok(Self {
+            database: root.join("database"),
+            root,
+        })
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.database
     }
 }
 
 impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
-        let _ignored = fs::remove_dir_all(&self.0);
+        let _ignored = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn temporary_directories_remain_unique_when_timestamps_collide() -> Result<(), Box<dyn Error>> {
+    const THREADS: usize = 16;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let start = Arc::new(Barrier::new(THREADS));
+    let directories = thread::scope(|scope| -> io::Result<Vec<TemporaryDirectory>> {
+        let workers = (0..THREADS)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                scope.spawn(move || -> io::Result<TemporaryDirectory> {
+                    start.wait();
+                    let directory = TemporaryDirectory::create_at(timestamp)?;
+                    drop(NativeDatabase::create(directory.path()).map_err(io::Error::other)?);
+                    Ok(directory)
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("temporary-directory worker panicked"))?
+            })
+            .collect()
+    })?;
+
+    assert_eq!(
+        directories
+            .iter()
+            .map(TemporaryDirectory::path)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        THREADS
+    );
+    assert!(
+        directories
+            .iter()
+            .all(|directory| directory.path().is_dir())
+    );
+    Ok(())
 }
 
 struct SplitMix64 {

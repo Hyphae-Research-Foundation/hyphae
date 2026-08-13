@@ -19,9 +19,9 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::CommitBoundary;
 use crate::{
-    CommitReceipt, GovernorCancellation, GroupCommitOutcome, MAX_EXPIRY_SWEEP_KEYS,
-    MAX_GROUP_COMMIT_BATCH_SIZE, NativeCommitBatch, NativeDatabase, NativeDeltaWriteBatch,
-    NativeResourceGovernor, NativeRuntimeError, NativeWriteBatch,
+    CommitReceipt, GovernorCancellation, GroupCommitOutcome, GroupCommitReport,
+    MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE, NativeCommitBatch, NativeDatabase,
+    NativeDeltaWriteBatch, NativeResourceGovernor, NativeRuntimeError, NativeWriteBatch,
 };
 
 const DEFAULT_GROUP_COMMIT_BATCH_SIZE: usize = 32;
@@ -726,6 +726,7 @@ struct SubmissionGate {
 struct SchedulerTestGates {
     cohort_collection: Arc<RwLock<()>>,
     commit_execution: Arc<RwLock<()>>,
+    completion_return: Arc<RwLock<()>>,
 }
 
 /// Cloneable producer for one native group-commit scheduler.
@@ -740,6 +741,8 @@ pub struct NativeCommitClient {
     cohort_collection_gate: Arc<RwLock<()>>,
     #[cfg(test)]
     commit_execution_gate: Arc<RwLock<()>>,
+    #[cfg(test)]
+    completion_return_gate: Arc<RwLock<()>>,
 }
 
 impl NativeCommitClient {
@@ -1078,6 +1081,15 @@ impl NativeCommitClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn block_completion_return_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, GroupCommitSubmitError> {
+        self.completion_return_gate
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
+    }
+
+    #[cfg(test)]
     pub(crate) fn block_worker_for_test(
         &self,
     ) -> Result<std::sync::RwLockReadGuard<'_, Option<NativeDatabase>>, GroupCommitSubmitError>
@@ -1176,6 +1188,7 @@ impl NativeCommitScheduler {
         let test_gates = SchedulerTestGates {
             cohort_collection: Arc::new(RwLock::new(())),
             commit_execution: Arc::new(RwLock::new(())),
+            completion_return: Arc::new(RwLock::new(())),
         };
         let client = NativeCommitClient {
             gate: Arc::clone(&gate),
@@ -1187,6 +1200,8 @@ impl NativeCommitScheduler {
             cohort_collection_gate: Arc::clone(&test_gates.cohort_collection),
             #[cfg(test)]
             commit_execution_gate: Arc::clone(&test_gates.commit_execution),
+            #[cfg(test)]
+            completion_return_gate: Arc::clone(&test_gates.completion_return),
         };
         let (active_expiry, active_expiry_metrics) = active_expiry
             .map_or((None, None), |(runtime, metrics)| {
@@ -1650,19 +1665,18 @@ fn run_scheduler(
         };
         #[cfg(test)]
         drop(cohort_collection_guard);
-        let counts_after_due = active_expiry
-            .as_ref()
-            .is_some_and(|expiry| expiry.wait_until_deadline().is_zero());
+        let counts_after_due = expiry_is_due(active_expiry.as_ref());
         if first.batch.durability != DurabilityClass::Group {
-            let completed = execute_single_request(
+            if !execute_single_request(
                 database,
                 first,
                 config.execution_admission_wait,
                 execution_cancellation,
                 #[cfg(test)]
                 &test_gates.commit_execution,
-            );
-            if !completed {
+                #[cfg(test)]
+                &test_gates.completion_return,
+            ) {
                 break;
             }
             if counts_after_due {
@@ -1683,15 +1697,16 @@ fn run_scheduler(
             &mut shutdown,
         );
         let request_count = requests.len();
-        let completed = execute_group_requests(
+        if !execute_group_requests(
             database,
             requests,
             config.execution_admission_wait,
             execution_cancellation,
             #[cfg(test)]
             &test_gates.commit_execution,
-        );
-        if !completed {
+            #[cfg(test)]
+            &test_gates.completion_return,
+        ) {
             shutdown = true;
         } else if counts_after_due {
             record_expiry_foreground(&mut active_expiry, request_count);
@@ -1699,6 +1714,10 @@ fn run_scheduler(
     }
     stop_accepting(gate);
     close_database(database);
+}
+
+fn expiry_is_due(active_expiry: Option<&ActiveExpiryRuntime>) -> bool {
+    active_expiry.is_some_and(|expiry| expiry.wait_until_deadline().is_zero())
 }
 
 fn execute_explicit_cohort(
@@ -1734,6 +1753,8 @@ fn execute_explicit_cohort(
         execution_cancellation,
         #[cfg(test)]
         &test_gates.commit_execution,
+        #[cfg(test)]
+        &test_gates.completion_return,
     );
     if completed && counts_after_due {
         record_expiry_foreground(active_expiry, request_count);
@@ -1933,6 +1954,7 @@ fn execute_single_request(
     execution_admission_wait: Duration,
     execution_cancellation: Option<&GovernorCancellation>,
     #[cfg(test)] commit_execution_gate: &RwLock<()>,
+    #[cfg(test)] completion_return_gate: &RwLock<()>,
 ) -> bool {
     let execution_started = Instant::now();
     let CommitRequest {
@@ -1959,7 +1981,7 @@ fn execute_single_request(
         };
         database.admit_scheduled_commit_execution(execution_admission_wait, execution_cancellation)
     };
-    let _execution_permit = match execution_permit {
+    let execution_permit = match execution_permit {
         Ok(permit) => permit,
         Err(source) => {
             control.complete();
@@ -1969,50 +1991,57 @@ fn execute_single_request(
     };
     #[cfg(test)]
     let Ok(commit_execution_guard) = commit_execution_gate.read() else {
+        drop(execution_permit);
         control.complete();
         deliver(&response, Err(GroupCommitSubmitError::Unavailable));
         return false;
     };
     #[cfg(test)]
     drop(commit_execution_guard);
-    let Ok(mut database) = database.write() else {
+    let Ok(mut database_guard) = database.write() else {
+        drop(execution_permit);
         control.complete();
         deliver(&response, Err(GroupCommitSubmitError::Unavailable));
         return false;
     };
-    let Some(database) = database.as_mut() else {
+    let Some(database) = database_guard.as_mut() else {
+        drop(database_guard);
+        drop(execution_permit);
         control.complete();
         deliver(&response, Err(GroupCommitSubmitError::Unavailable));
         return false;
     };
-    match database.commit_optimistic_scheduled(batch) {
-        Ok(report) => {
-            control.complete();
-            deliver(
-                &response,
-                Ok(ScheduledCommitCompletion {
-                    receipt: ScheduledCommitReceipt {
-                        commit: report.commit,
-                        admission_wait: enqueued_at.saturating_duration_since(submitted_at),
-                        queue_wait: execution_started.saturating_duration_since(enqueued_at),
-                        cohort_execution: report.commit.execution_time,
-                        page_synchronization: report.commit.page_synchronization_time,
-                        wal_synchronization: report.commit.wal_synchronization_time,
-                        end_to_end: submitted_at.elapsed(),
-                    },
-                    page_synchronizations: report.page_synchronizations,
-                    wal_synchronizations: report.wal_synchronizations,
-                }),
-            );
-            true
-        }
+    let (result, request_local) = match database.commit_optimistic_scheduled(batch) {
+        Ok(report) => (Ok(report), true),
         Err(source) => {
             let request_local = scheduler_request_local(&source);
-            control.complete();
-            deliver(&response, Err(GroupCommitSubmitError::runtime(source)));
-            request_local
+            (Err(GroupCommitSubmitError::runtime(source)), request_local)
         }
-    }
+    };
+    drop(database_guard);
+    drop(execution_permit);
+    let result = result.map(|report| ScheduledCommitCompletion {
+        receipt: ScheduledCommitReceipt {
+            commit: report.commit,
+            admission_wait: enqueued_at.saturating_duration_since(submitted_at),
+            queue_wait: execution_started.saturating_duration_since(enqueued_at),
+            cohort_execution: report.commit.execution_time,
+            page_synchronization: report.commit.page_synchronization_time,
+            wal_synchronization: report.commit.wal_synchronization_time,
+            end_to_end: submitted_at.elapsed(),
+        },
+        page_synchronizations: report.page_synchronizations,
+        wal_synchronizations: report.wal_synchronizations,
+    });
+    control.complete();
+    deliver(&response, result);
+    #[cfg(test)]
+    let Ok(completion_return_guard) = completion_return_gate.read() else {
+        return false;
+    };
+    #[cfg(test)]
+    drop(completion_return_guard);
+    request_local
 }
 
 fn execute_group_requests(
@@ -2021,6 +2050,7 @@ fn execute_group_requests(
     execution_admission_wait: Duration,
     execution_cancellation: Option<&GovernorCancellation>,
     #[cfg(test)] commit_execution_gate: &RwLock<()>,
+    #[cfg(test)] completion_return_gate: &RwLock<()>,
 ) -> bool {
     let execution_started = Instant::now();
     let mut batches = Vec::with_capacity(requests.len());
@@ -2052,7 +2082,7 @@ fn execute_group_requests(
         };
         database.admit_scheduled_commit_execution(execution_admission_wait, execution_cancellation)
     };
-    let _execution_permit = match execution_permit {
+    let execution_permit = match execution_permit {
         Ok(permit) => permit,
         Err(source) => {
             let failure = GroupCommitSubmitError::runtime(source);
@@ -2065,20 +2095,41 @@ fn execute_group_requests(
     };
     #[cfg(test)]
     let Ok(commit_execution_guard) = commit_execution_gate.read() else {
+        drop(execution_permit);
         deliver_all_unavailable(waiters);
         return false;
     };
     #[cfg(test)]
     drop(commit_execution_guard);
-    let Ok(mut database) = database.write() else {
+    let Ok(mut database_guard) = database.write() else {
+        drop(execution_permit);
         deliver_all_unavailable(waiters);
         return false;
     };
-    let Some(database) = database.as_mut() else {
+    let Some(database) = database_guard.as_mut() else {
+        drop(database_guard);
+        drop(execution_permit);
         deliver_all_unavailable(waiters);
         return false;
     };
     let report = database.commit_group(batches);
+    drop(database_guard);
+    drop(execution_permit);
+    let completed = deliver_group_report(report, waiters, execution_started);
+    #[cfg(test)]
+    let Ok(completion_return_guard) = completion_return_gate.read() else {
+        return false;
+    };
+    #[cfg(test)]
+    drop(completion_return_guard);
+    completed
+}
+
+fn deliver_group_report(
+    report: Result<GroupCommitReport, NativeRuntimeError>,
+    waiters: Vec<CommitWaiter>,
+    execution_started: Instant,
+) -> bool {
     match report {
         Ok(report) if report.outcomes.len() == waiters.len() => {
             for ((submitted_at, enqueued_at, control, response), outcome) in
