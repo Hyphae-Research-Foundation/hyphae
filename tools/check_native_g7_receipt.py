@@ -334,11 +334,13 @@ def validate(
         cells["ann-top10-recall-095"],
         payload["initial_ann_bulk"],
         payload["dataset"]["observations"],
+        payload["concurrency"],
     )
     validate_hybrid_read_view_cell(
         cells["hybrid-top10"],
         cells["ann-top10-recall-095"],
         payload["dataset"]["observations"],
+        payload["concurrency"],
     )
     validate_bm25_read_view_cell(
         cells["bm25-top10"],
@@ -413,20 +415,17 @@ def validate_strict_group_commit_cell(
         or not math.isfinite(cell["throughput_per_second"])
         or cell["throughput_per_second"] <= 0
         or any(
-            not isinstance(cell.get(field), int)
-            or isinstance(cell[field], bool)
-            or cell[field] <= 0
+            not _is_positive_u64(cell.get(field))
             for field in latency_fields
         )
         or any(
             cell[left] > cell[right]
             for left, right in zip(latency_fields, latency_fields[1:])
         )
-        or not isinstance(expected_observations, int)
-        or isinstance(expected_observations, bool)
+        or not _is_positive_u64(expected_observations)
         or expected_observations < G7_GROUP_COMMIT_COHORT_WIDTH
+        or not _is_positive_u64(expected_concurrency)
         or expected_concurrency not in {1, 8, 32}
-        or isinstance(expected_concurrency, bool)
     ):
         raise GateFailure("G7 strict group-commit cell identity is invalid")
     evidence = cell.get("group_commit_evidence")
@@ -440,7 +439,7 @@ def validate_strict_group_commit_cell(
         "commit_receipt_digest", "page_synchronizations", "wal_synchronizations",
         "cohort_execution_nanos_total", "page_synchronization_nanos_total",
         "wal_synchronization_nanos_total", "timing_sample_count",
-        "timings_nanoseconds", "reopen",
+        "timings_nanoseconds", "maintenance", "reopen",
     }
     if not isinstance(evidence, dict) or set(evidence) != fields:
         raise GateFailure("G7 strict group-commit evidence fields mismatch")
@@ -449,6 +448,7 @@ def validate_strict_group_commit_cell(
     _validate_group_commit_receipts(evidence, expected_observations)
     _validate_group_commit_synchronization(evidence)
     _validate_group_commit_timings(cell, evidence, expected_observations)
+    _validate_group_commit_maintenance(evidence)
     _validate_group_commit_reopen(evidence, expected_observations)
 
 
@@ -458,23 +458,23 @@ def _validate_group_commit_configuration(
 ) -> None:
     if (
         evidence["schema"]
-        != "hyphae-native-g7-strict-group-commit-evidence-v1"
+        != "hyphae-native-g7-strict-group-commit-evidence-v2"
         or evidence["latency_scope"]
         != "scheduler-enqueue-through-durable-response-v1"
         or evidence["throughput_scope"] != "bounded-cohort-window-wall-time-v1"
         or evidence["submission_mode"] != "explicit-bounded-cohort-v1"
+        or not _is_positive_u64(evidence["producer_concurrency"])
         or evidence["producer_concurrency"] != expected_concurrency
-        or isinstance(evidence["producer_concurrency"], bool)
+        or not _is_positive_u64(evidence["maximum_active_producers"])
         or evidence["maximum_active_producers"] != expected_concurrency
-        or isinstance(evidence["maximum_active_producers"], bool)
+        or not _is_positive_u64(evidence["cohort_width"])
         or evidence["cohort_width"] != G7_GROUP_COMMIT_COHORT_WIDTH
-        or isinstance(evidence["cohort_width"], bool)
+        or not _is_positive_u64(evidence["scheduler_queue_capacity"])
         or evidence["scheduler_queue_capacity"] != G7_GROUP_COMMIT_QUEUE_CAPACITY
-        or isinstance(evidence["scheduler_queue_capacity"], bool)
+        or not _is_positive_u64(evidence["outstanding_limit"])
         or evidence["outstanding_limit"] != G7_GROUP_COMMIT_COHORT_WIDTH
-        or isinstance(evidence["outstanding_limit"], bool)
+        or not _is_positive_u64(evidence["maximum_outstanding"])
         or evidence["maximum_outstanding"] != G7_GROUP_COMMIT_COHORT_WIDTH
-        or isinstance(evidence["maximum_outstanding"], bool)
     ):
         raise GateFailure("G7 strict group-commit configuration is invalid")
 
@@ -498,13 +498,13 @@ def _validate_group_commit_cohorts(
     size_histogram = evidence["cohort_size_histogram"]
     position_histogram = evidence["cohort_position_histogram"]
     if (
-        evidence["logical_commits"] != expected_observations
-        or isinstance(evidence["logical_commits"], bool)
+        not _is_positive_u64(evidence["logical_commits"])
+        or evidence["logical_commits"] != expected_observations
+        or not _is_positive_u64(evidence["cohort_count"])
         or evidence["cohort_count"] != expected_cohort_count
-        or isinstance(evidence["cohort_count"], bool)
+        or not _is_positive_u64(evidence["final_cohort_size"])
         or evidence["final_cohort_size"]
         != (remainder or G7_GROUP_COMMIT_COHORT_WIDTH)
-        or isinstance(evidence["final_cohort_size"], bool)
         or not _is_canonical_count_histogram(size_histogram)
         or size_histogram != expected_size_histogram
         or not _is_canonical_count_histogram(position_histogram)
@@ -516,11 +516,14 @@ def _validate_group_commit_cohorts(
 def _is_canonical_count_histogram(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and all(isinstance(key, str) and key.isascii() and key.isdecimal() for key in value)
         and all(
-            isinstance(count, int) and not isinstance(count, bool) and count > 0
-            for count in value.values()
+            isinstance(key, str)
+            and key.isascii()
+            and key.isdecimal()
+            and _is_u64(int(key))
+            for key in value
         )
+        and all(_is_positive_u64(count) for count in value.values())
     )
 
 
@@ -531,15 +534,12 @@ def _validate_group_commit_receipts(
     first_csn = evidence["first_commit_csn"]
     last_csn = evidence["last_commit_csn"]
     if (
-        not isinstance(first_csn, int)
-        or isinstance(first_csn, bool)
-        or first_csn <= 0
-        or not isinstance(last_csn, int)
-        or isinstance(last_csn, bool)
+        not _is_positive_u64(first_csn)
+        or not _is_positive_u64(last_csn)
         or last_csn < first_csn
         or last_csn - first_csn + 1 != expected_observations
+        or not _is_positive_u64(evidence["distinct_commit_csns"])
         or evidence["distinct_commit_csns"] != expected_observations
-        or isinstance(evidence["distinct_commit_csns"], bool)
         or evidence["commit_receipt_digest_algorithm"]
         != "blake3-csn-ordered-native-commit-receipts-v1"
         or not isinstance(evidence["commit_receipt_digest"], str)
@@ -554,12 +554,12 @@ def _validate_group_commit_synchronization(evidence: dict[str, Any]) -> None:
     page_nanos = evidence["page_synchronization_nanos_total"]
     wal_nanos = evidence["wal_synchronization_nanos_total"]
     if (
-        evidence["page_synchronizations"] != cohort_count
-        or isinstance(evidence["page_synchronizations"], bool)
+        not _is_positive_u64(evidence["page_synchronizations"])
+        or evidence["page_synchronizations"] != cohort_count
+        or not _is_positive_u64(evidence["wal_synchronizations"])
         or evidence["wal_synchronizations"] != cohort_count
-        or isinstance(evidence["wal_synchronizations"], bool)
         or any(
-            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            not _is_positive_u64(value)
             for value in (execution_nanos, page_nanos, wal_nanos)
         )
         or execution_nanos < page_nanos + wal_nanos
@@ -578,8 +578,8 @@ def _validate_group_commit_timings(
         "page_synchronization", "wal_synchronization", "end_to_end",
     }
     if (
-        evidence["timing_sample_count"] != expected_observations
-        or isinstance(evidence["timing_sample_count"], bool)
+        not _is_positive_u64(evidence["timing_sample_count"])
+        or evidence["timing_sample_count"] != expected_observations
         or not isinstance(timings, dict)
         or set(timings) != components
     ):
@@ -597,14 +597,139 @@ def _validate_group_commit_latency_summary(value: Any) -> None:
         not isinstance(value, dict)
         or set(value) != set(fields)
         or any(
-            not isinstance(value[field], int)
-            or isinstance(value[field], bool)
-            or value[field] < 0
+            not _is_u64(value[field])
             for field in fields
         )
         or any(value[left] > value[right] for left, right in zip(fields, fields[1:]))
     ):
         raise GateFailure("G7 strict group-commit timing summary is invalid")
+
+
+_U64_MAX = (1 << 64) - 1
+
+
+def _is_u64(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _U64_MAX
+    )
+
+
+def _is_positive_u64(value: Any) -> bool:
+    return _is_u64(value) and value > 0
+
+
+def _validate_group_commit_maintenance(evidence: dict[str, Any]) -> None:
+    maintenance = evidence["maintenance"]
+    fields = {"provider", "total_time_nanos", "vacuum", "checkpoint", "wal_retention"}
+    if not isinstance(maintenance, dict) or set(maintenance) != fields:
+        raise GateFailure("G7 strict group-commit maintenance fields mismatch")
+    vacuum = maintenance["vacuum"]
+    checkpoint = maintenance["checkpoint"]
+    retention = maintenance["wal_retention"]
+    vacuum_fields = {
+        "applied", "previous_page_generation", "active_page_generation",
+        "previous_page_count", "active_page_count", "reclaimed_pages",
+        "commit_csn", "commit_transaction_id", "commit_lsn", "wal_block_digest",
+        "commit_durability", "duration_nanos",
+    }
+    checkpoint_fields = {
+        "visible_csn", "transaction_id", "manifest_generation", "manifest_digest",
+        "checkpoint_lsn", "parent_directory_sync_supported", "duration_nanos",
+    }
+    retention_fields = {
+        "base_visible_csn", "anchor_epoch", "anchor_digest", "retired_wal_blocks",
+        "retired_wal_bytes", "checkpoint_lsn", "retired_manifest_files",
+        "retired_manifest_bytes", "retained_manifest_files", "retained_manifest_bytes",
+        "parent_directory_sync_supported", "manifest_directory_sync_supported",
+        "duration_nanos",
+    }
+    if (
+        not isinstance(vacuum, dict)
+        or set(vacuum) != vacuum_fields
+        or not isinstance(checkpoint, dict)
+        or set(checkpoint) != checkpoint_fields
+        or not isinstance(retention, dict)
+        or set(retention) != retention_fields
+    ):
+        raise GateFailure("G7 strict group-commit maintenance nested fields mismatch")
+    last_commit_csn = evidence["last_commit_csn"]
+    maintenance_csn = vacuum["commit_csn"]
+    if (
+        maintenance["provider"] != "vacuum-checkpoint-wal-retention-v1"
+        or vacuum["applied"] is not True
+        or not all(
+            _is_positive_u64(vacuum[field])
+            for field in (
+                "previous_page_generation", "active_page_generation",
+                "previous_page_count", "active_page_count", "commit_csn",
+                "commit_transaction_id", "commit_lsn", "duration_nanos",
+            )
+        )
+        or vacuum["active_page_generation"] != vacuum["previous_page_generation"] + 1
+        or vacuum["active_page_count"] >= vacuum["previous_page_count"]
+        or not _is_positive_u64(vacuum["reclaimed_pages"])
+        or vacuum["reclaimed_pages"]
+        != vacuum["previous_page_count"] - vacuum["active_page_count"]
+        or maintenance_csn != last_commit_csn + 1
+        or vacuum["commit_durability"] != "strict"
+        or not isinstance(vacuum["wal_block_digest"], str)
+        or HEX64.fullmatch(vacuum["wal_block_digest"]) is None
+    ):
+        raise GateFailure("G7 strict group-commit maintenance vacuum is invalid")
+    if (
+        not _is_positive_u64(checkpoint["visible_csn"])
+        or checkpoint["visible_csn"] != maintenance_csn
+        or not all(
+            _is_positive_u64(checkpoint[field])
+            for field in (
+                "transaction_id", "manifest_generation", "checkpoint_lsn",
+                "duration_nanos",
+            )
+        )
+        or checkpoint["transaction_id"] <= vacuum["commit_transaction_id"]
+        or checkpoint["checkpoint_lsn"] <= vacuum["commit_lsn"]
+        or not isinstance(checkpoint["manifest_digest"], str)
+        or HEX64.fullmatch(checkpoint["manifest_digest"]) is None
+        or not isinstance(checkpoint["parent_directory_sync_supported"], bool)
+    ):
+        raise GateFailure("G7 strict group-commit maintenance checkpoint is invalid")
+    if (
+        not _is_positive_u64(retention["base_visible_csn"])
+        or retention["base_visible_csn"] != maintenance_csn
+        or not _is_positive_u64(retention["checkpoint_lsn"])
+        or retention["checkpoint_lsn"] != checkpoint["checkpoint_lsn"]
+        or not all(
+            _is_positive_u64(retention[field])
+            for field in (
+                "anchor_epoch", "retired_wal_blocks", "retired_wal_bytes",
+                "retained_manifest_files", "retained_manifest_bytes", "duration_nanos",
+            )
+        )
+        or not all(
+            _is_u64(retention[field])
+            for field in ("retired_manifest_files", "retired_manifest_bytes")
+        )
+        or (retention["retired_manifest_files"] == 0)
+        != (retention["retired_manifest_bytes"] == 0)
+        or retention["retained_manifest_files"] != 1
+        or not isinstance(retention["anchor_digest"], str)
+        or HEX64.fullmatch(retention["anchor_digest"]) is None
+        or not isinstance(retention["parent_directory_sync_supported"], bool)
+        or not isinstance(retention["manifest_directory_sync_supported"], bool)
+    ):
+        raise GateFailure("G7 strict group-commit maintenance WAL retention is invalid")
+    stage_nanos = (
+        vacuum["duration_nanos"]
+        + checkpoint["duration_nanos"]
+        + retention["duration_nanos"]
+    )
+    if (
+        not _is_positive_u64(maintenance["total_time_nanos"])
+        or maintenance["total_time_nanos"] < stage_nanos
+    ):
+        raise GateFailure("G7 strict group-commit maintenance timing is invalid")
 
 
 def _validate_group_commit_reopen(
@@ -615,8 +740,12 @@ def _validate_group_commit_reopen(
     fields = {
         "provider", "baseline_visible_csn", "baseline_committed_transactions",
         "reopened_visible_csn", "reopened_committed_transactions",
+        "wal_base_csn", "retained_wal_blocks", "retained_wal_bytes",
+        "replayed_transactions",
         "verified_logical_commits", "missing_keys", "mismatched_values",
         "state_digest_algorithm", "expected_state_digest", "recovered_state_digest",
+        "manifest_verification_time_nanos", "wal_physical_verification_time_nanos",
+        "wal_semantic_replay_time_nanos", "root_validation_time_nanos",
         "open_time_nanos", "verification_time_nanos",
     }
     if not isinstance(reopen, dict) or set(reopen) != fields:
@@ -625,24 +754,35 @@ def _validate_group_commit_reopen(
     baseline_committed = reopen["baseline_committed_transactions"]
     reopened_visible = reopen["reopened_visible_csn"]
     reopened_committed = reopen["reopened_committed_transactions"]
+    maintenance_csn = evidence["maintenance"]["vacuum"]["commit_csn"]
     if (
-        reopen["provider"] != "single-reopened-root-snapshot-full-key-digest-v1"
+        reopen["provider"]
+        != "retained-anchor-reopened-root-snapshot-full-key-digest-v2"
         or any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            not _is_u64(value)
             for value in (
                 baseline_visible,
                 baseline_committed,
                 reopened_visible,
                 reopened_committed,
+                reopen["wal_base_csn"],
+                reopen["retained_wal_blocks"],
+                reopen["retained_wal_bytes"],
+                reopen["replayed_transactions"],
                 reopen["verified_logical_commits"],
                 reopen["missing_keys"],
                 reopen["mismatched_values"],
             )
         )
-        or reopened_visible - baseline_visible != expected_observations
-        or reopened_committed - baseline_committed != expected_observations
+        or reopened_visible - baseline_visible != expected_observations + 1
+        or reopened_committed - baseline_committed != expected_observations + 1
         or evidence["first_commit_csn"] != baseline_visible + 1
-        or evidence["last_commit_csn"] != reopened_visible
+        or evidence["last_commit_csn"] != maintenance_csn - 1
+        or reopened_visible != maintenance_csn
+        or reopen["wal_base_csn"] != maintenance_csn
+        or reopen["retained_wal_blocks"] != 0
+        or reopen["retained_wal_bytes"] != 0
+        or reopen["replayed_transactions"] != 0
         or reopen["verified_logical_commits"] != expected_observations
         or reopen["missing_keys"] != 0
         or reopen["mismatched_values"] != 0
@@ -652,11 +792,21 @@ def _validate_group_commit_reopen(
         or reopen["recovered_state_digest"] != reopen["expected_state_digest"]
         or not isinstance(reopen["recovered_state_digest"], str)
         or any(
-            not isinstance(reopen[field], int)
-            or isinstance(reopen[field], bool)
-            or reopen[field] <= 0
-            for field in ("open_time_nanos", "verification_time_nanos")
+            not _is_positive_u64(reopen[field])
+            for field in (
+                "manifest_verification_time_nanos",
+                "wal_physical_verification_time_nanos",
+                "wal_semantic_replay_time_nanos",
+                "root_validation_time_nanos",
+                "open_time_nanos",
+                "verification_time_nanos",
+            )
         )
+        or reopen["open_time_nanos"]
+        < reopen["manifest_verification_time_nanos"]
+        + reopen["wal_physical_verification_time_nanos"]
+        + reopen["wal_semantic_replay_time_nanos"]
+        + reopen["root_validation_time_nanos"]
     ):
         raise GateFailure("G7 strict group-commit reopen evidence is invalid")
 
@@ -665,6 +815,7 @@ def validate_ann_read_view_cell(
     cell: Any,
     initial_bulk: dict[str, Any],
     expected_observations: int,
+    expected_concurrency: int,
 ) -> None:
     if not isinstance(cell, dict):
         raise GateFailure("G7 ANN cell is not an evidence object")
@@ -740,6 +891,7 @@ def validate_ann_read_view_cell(
     _validate_selected_routing_interval(
         routing,
         expected_observations=expected_observations,
+        expected_concurrency=expected_concurrency,
         worker_limit=worker_limit,
         label="ANN",
     )
@@ -1032,6 +1184,7 @@ def _validate_selected_routing_interval(
     routing: Any,
     *,
     expected_observations: int,
+    expected_concurrency: int,
     worker_limit: int,
     label: str,
 ) -> None:
@@ -1040,6 +1193,7 @@ def _validate_selected_routing_interval(
         "execution_waves_max", "selected_certified", "full_fanout_requested",
         "full_fanout_budget_fallback", "single_generation_fallback",
         "next_partition_lower_bound_present", "selected_partitions_max",
+        "targeted_single_batches", "generic_single_fallback_batches",
         "minimum_next_partition_lower_bound", "maximum_kth_distance",
     }
     if not isinstance(routing, dict) or set(routing) != fields:
@@ -1050,13 +1204,14 @@ def _validate_selected_routing_interval(
         "selected_certified", "full_fanout_requested", "full_fanout_budget_fallback",
         "single_generation_fallback", "next_partition_lower_bound_present",
         "selected_partitions_max",
+        "targeted_single_batches", "generic_single_fallback_batches",
     )
     if (
         not isinstance(observations, int)
         or isinstance(observations, bool)
         or observations != expected_observations
         or any(
-            not isinstance(routing[field], int) or isinstance(routing[field], bool)
+            not _is_u64(routing[field])
             for field in integer_fields
         )
         or routing["selected_certified"] != observations
@@ -1072,6 +1227,21 @@ def _validate_selected_routing_interval(
         or not 1 <= routing["execution_waves_max"] <= 6
     ):
         raise GateFailure(f"G7 {label} routing interval was not selected-certified")
+    targeted = routing["targeted_single_batches"]
+    fallback = routing["generic_single_fallback_batches"]
+    route_total = targeted + fallback
+    if expected_concurrency == 1:
+        route_counts_valid = targeted == observations and fallback == 0
+    elif expected_concurrency in (8, 32):
+        route_counts_valid = (
+            observations
+            <= route_total
+            <= observations * routing["execution_waves_max"]
+        )
+    else:
+        route_counts_valid = False
+    if not route_counts_valid:
+        raise GateFailure(f"G7 {label} targeted routing evidence is invalid")
     lower_bound = routing["minimum_next_partition_lower_bound"]
     kth_distance = routing["maximum_kth_distance"]
     if (
@@ -1088,6 +1258,7 @@ def validate_hybrid_read_view_cell(
     cell: Any,
     ann_cell: Any,
     expected_observations: int,
+    expected_concurrency: int,
 ) -> None:
     """Validate one G7 hybrid cell against its shared ANN/root authority."""
     if not isinstance(cell, dict) or not isinstance(ann_cell, dict):
@@ -1196,6 +1367,7 @@ def validate_hybrid_read_view_cell(
     _validate_selected_routing_interval(
         cell.get("hybrid_ann_routing_interval"),
         expected_observations=expected_observations,
+        expected_concurrency=expected_concurrency,
         worker_limit=worker_limit,
         label="hybrid",
     )

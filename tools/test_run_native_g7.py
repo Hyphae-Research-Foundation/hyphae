@@ -717,6 +717,8 @@ class NativeG7ControllerTests(unittest.TestCase):
         ann["ann_routing_interval"]["next_partition_lower_bound_present"] = (
             PILOT_OBSERVATIONS
         )
+        ann["ann_routing_interval"]["targeted_single_batches"] = PILOT_OBSERVATIONS
+        ann["ann_routing_interval"]["generic_single_fallback_batches"] = 0
         bm25 = pilot["cells"]["bm25-top10"]
         bm25_interval = bm25["lexical_read_view_query_interval"]
         bm25_interval["observations"] = PILOT_OBSERVATIONS
@@ -750,6 +752,10 @@ class NativeG7ControllerTests(unittest.TestCase):
         hybrid["hybrid_ann_routing_interval"]["next_partition_lower_bound_present"] = (
             PILOT_OBSERVATIONS
         )
+        hybrid["hybrid_ann_routing_interval"][
+            "targeted_single_batches"
+        ] = PILOT_OBSERVATIONS
+        hybrid["hybrid_ann_routing_interval"]["generic_single_fallback_batches"] = 0
         pilot["cells"]["strict-group-commit"]["group_commit_evidence"] = (
             _strict_group_commit_evidence(observations=PILOT_OBSERVATIONS)
         )
@@ -760,6 +766,18 @@ class NativeG7ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "group-commit configuration"):
             validate_pilot_search_evidence(pilot, "a" * 40)
         strict["submission_mode"] = "explicit-bounded-cohort-v1"
+
+        for cell_name, interval_name in (
+            ("ann-top10-recall-095", "ann_routing_interval"),
+            ("hybrid-top10", "hybrid_ann_routing_interval"),
+        ):
+            interval = pilot["cells"][cell_name][interval_name]
+            interval["targeted_single_batches"] -= 1
+            interval["generic_single_fallback_batches"] = 1
+            with self.assertRaisesRegex(GateFailure, "targeted routing evidence"):
+                validate_pilot_search_evidence(pilot, "a" * 40)
+            interval["targeted_single_batches"] = PILOT_OBSERVATIONS
+            interval["generic_single_fallback_batches"] = 0
 
         pilot["schema"] = "hyphae-native-g7-receipt-v3"
         with self.assertRaisesRegex(RuntimeError, "identity or open state"):
@@ -838,7 +856,38 @@ class NativeG7ControllerTests(unittest.TestCase):
                 expected_warmup=PILOT_WARMUP,
             )
 
-        partial["status"] = "running"
+    def test_terminal_partial_must_preserve_strict_maintenance_evidence(self) -> None:
+        receipt = self.pilot_receipt()
+        progress = self.completed_cell_progress()
+        partial = self.partial_receipt()
+        partial.update({
+            "status": "completed",
+            "completed_count": len(G7_SURFACES),
+            "current_cell": None,
+            "cells": json.loads(json.dumps(receipt["cells"])),
+        })
+        partial["cells"]["strict-group-commit"]["group_commit_evidence"][
+            "maintenance"
+        ]["checkpoint"]["manifest_digest"] = "f" * 64
+        with self.assertRaisesRegex(RuntimeError, "terminal partial differs"):
+            validate_cross_artifact_dataset(
+                receipt,
+                progress,
+                partial,
+                expected_observations=PILOT_OBSERVATIONS,
+                expected_warmup=PILOT_WARMUP,
+            )
+
+    def test_terminal_partial_status_must_be_completed(self) -> None:
+        receipt = self.pilot_receipt()
+        progress = self.completed_cell_progress()
+        partial = self.partial_receipt()
+        partial.update({
+            "status": "running",
+            "completed_count": len(G7_SURFACES),
+            "current_cell": None,
+            "cells": json.loads(json.dumps(receipt["cells"])),
+        })
         with self.assertRaisesRegex(RuntimeError, "terminal partial differs"):
             validate_cross_artifact_dataset(
                 receipt,
@@ -862,7 +911,7 @@ class NativeG7ControllerTests(unittest.TestCase):
         )
         self.assertEqual(
             budget["method"],
-            "exact-runner-short-pilot-with-linear-reopen-v2",
+            "exact-runner-short-pilot-with-bounded-recovery-v3",
         )
         self.assertEqual(
             budget["seed_treatment"],
@@ -875,30 +924,32 @@ class NativeG7ControllerTests(unittest.TestCase):
         projection = budget["strict_group_commit_correctness_projection"]
         self.assertEqual(
             projection["method"],
-            "linear-pilot-reopen-and-full-key-verification-v1",
+            "linear-pilot-maintenance-reopen-full-key-verification-v2",
         )
         self.assertAlmostEqual(
             projection["full_seconds"],
             projection["pilot_seconds"] * 100,
         )
 
-    def test_budget_rejects_missing_commit_reopen_cost(self) -> None:
-        pilot = self.pilot_receipt()
-        del pilot["cells"]["strict-group-commit"]["group_commit_evidence"][
-            "reopen"
-        ]
-        with self.assertRaisesRegex(RuntimeBudgetExceeded, "reopen evidence"):
-            derive_cell_runtime_budget(
-                pilot,
-                expected_commit=self.SOURCE_COMMIT,
-                expected_platform="linux",
-                expected_state="warm",
-                expected_concurrency=1,
-                observations=1_000_000,
-                warmup=100_000,
-                hard_cap_seconds=7_200,
-                seed_primed=True,
-            )
+    def test_budget_rejects_missing_commit_maintenance_or_reopen_cost(self) -> None:
+        for field in ("maintenance", "reopen"):
+            with self.subTest(field=field):
+                pilot = self.pilot_receipt()
+                del pilot["cells"]["strict-group-commit"]["group_commit_evidence"][field]
+                with self.assertRaisesRegex(
+                    RuntimeBudgetExceeded, "maintenance/reopen evidence"
+                ):
+                    derive_cell_runtime_budget(
+                        pilot,
+                        expected_commit=self.SOURCE_COMMIT,
+                        expected_platform="linux",
+                        expected_state="warm",
+                        expected_concurrency=1,
+                        observations=1_000_000,
+                        warmup=100_000,
+                        hard_cap_seconds=7_200,
+                        seed_primed=True,
+                    )
 
     def test_high_tail_does_not_project_every_observation_at_p99(self) -> None:
         pilot = self.pilot_receipt(throughput=10_000.0)
@@ -917,7 +968,7 @@ class NativeG7ControllerTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             budget["surface_seconds"]["strict-group-commit"],
-            100.00011,
+            100.0005,
         )
         self.assertLessEqual(budget["timeout_seconds"], 7_200)
 
@@ -1001,6 +1052,19 @@ class NativeG7ControllerTests(unittest.TestCase):
                 ):
                     validate_warm_control_pilot_latency(pilot)
 
+    def test_warm_control_pilot_reports_every_normative_target_miss(self) -> None:
+        pilot = self.warm_control_pilot()
+        pilot["cells"]["ann-top10-recall-095"]["p50"] = 286_523
+        pilot["cells"]["local-structure-point-get"]["p50"] = 27_507
+        with self.assertRaises(RuntimeBudgetExceeded) as raised:
+            validate_warm_control_pilot_latency(pilot)
+        message = str(raised.exception)
+        ann = "ann-top10-recall-095.p50=286523, target=250000"
+        local = "local-structure-point-get.p50=27507, target=25000"
+        self.assertIn(ann, message)
+        self.assertIn(local, message)
+        self.assertLess(message.index(ann), message.index(local))
+
     def test_warm_control_pilot_excludes_advisory_commit_target(self) -> None:
         pilot = self.warm_control_pilot()
         pilot["cells"]["strict-group-commit"]["p50"] = 20_000_000
@@ -1067,7 +1131,7 @@ class NativeG7ControllerTests(unittest.TestCase):
 
     def test_matrix_budget_fails_before_measurement_when_plan_cannot_fit(self) -> None:
         budget = {
-            "schema": "hyphae-native-g7-runtime-budget-v2",
+            "schema": "hyphae-native-g7-runtime-budget-v3",
             "timeout_seconds": 7_200,
         }
         with self.assertRaisesRegex(
@@ -1079,6 +1143,19 @@ class NativeG7ControllerTests(unittest.TestCase):
                 cell_budgets=[budget] * 6,
                 hard_cap_seconds=39_600,
                 expected_cell_count=6,
+            )
+
+    def test_matrix_runtime_plan_rejects_legacy_v2_cell_budget(self) -> None:
+        budget = {
+            "schema": "hyphae-native-g7-runtime-budget-v2",
+            "timeout_seconds": 1,
+        }
+        with self.assertRaisesRegex(RuntimeBudgetExceeded, "invalid cell budget"):
+            derive_matrix_runtime_plan(
+                calibration_seconds=0,
+                cell_budgets=[budget],
+                hard_cap_seconds=2,
+                expected_cell_count=1,
             )
 
     def test_invalid_runner_output_never_becomes_a_validated_cell_artifact(self) -> None:

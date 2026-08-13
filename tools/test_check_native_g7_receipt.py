@@ -128,6 +128,8 @@ def _hybrid_evidence() -> dict:
             "execution_workers_max": 8,
             "execution_worker_batches_max": 8,
             "execution_waves_max": 4,
+            "targeted_single_batches": 1_000_000,
+            "generic_single_fallback_batches": 0,
             "minimum_next_partition_lower_bound": 0.25,
             "maximum_kth_distance": 0.20,
         },
@@ -259,7 +261,7 @@ def _strict_group_commit_evidence(
     if remainder:
         cohort_size_histogram[str(remainder)] = 1
     return {
-        "schema": "hyphae-native-g7-strict-group-commit-evidence-v1",
+        "schema": "hyphae-native-g7-strict-group-commit-evidence-v2",
         "latency_scope": "scheduler-enqueue-through-durable-response-v1",
         "throughput_scope": "bounded-cohort-window-wall-time-v1",
         "submission_mode": "explicit-bounded-cohort-v1",
@@ -298,19 +300,69 @@ def _strict_group_commit_evidence(
             "wal_synchronization": _latency_summary(),
             "end_to_end": _latency_summary(),
         },
+        "maintenance": {
+            "provider": "vacuum-checkpoint-wal-retention-v1",
+            "total_time_nanos": 3_000,
+            "vacuum": {
+                "applied": True,
+                "previous_page_generation": 1,
+                "active_page_generation": 2,
+                "previous_page_count": 100,
+                "active_page_count": 10,
+                "reclaimed_pages": 90,
+                "commit_csn": observations + 3,
+                "commit_transaction_id": observations + 4,
+                "commit_lsn": observations + 10,
+                "wal_block_digest": "c" * 64,
+                "commit_durability": "strict",
+                "duration_nanos": 1_000,
+            },
+            "checkpoint": {
+                "visible_csn": observations + 3,
+                "transaction_id": observations + 5,
+                "manifest_generation": 1,
+                "manifest_digest": "d" * 64,
+                "checkpoint_lsn": observations + 20,
+                "parent_directory_sync_supported": True,
+                "duration_nanos": 1_000,
+            },
+            "wal_retention": {
+                "base_visible_csn": observations + 3,
+                "anchor_epoch": 1,
+                "anchor_digest": "e" * 64,
+                "retired_wal_blocks": 1,
+                "retired_wal_bytes": 1,
+                "checkpoint_lsn": observations + 20,
+                "retired_manifest_files": 0,
+                "retired_manifest_bytes": 0,
+                "retained_manifest_files": 1,
+                "retained_manifest_bytes": 1,
+                "parent_directory_sync_supported": True,
+                "manifest_directory_sync_supported": True,
+                "duration_nanos": 1_000,
+            },
+        },
         "reopen": {
-            "provider": "single-reopened-root-snapshot-full-key-digest-v1",
+            "provider": "retained-anchor-reopened-root-snapshot-full-key-digest-v2",
             "baseline_visible_csn": 2,
             "baseline_committed_transactions": 2,
-            "reopened_visible_csn": observations + 2,
-            "reopened_committed_transactions": observations + 2,
+            "reopened_visible_csn": observations + 3,
+            "reopened_committed_transactions": observations + 3,
+            "wal_base_csn": observations + 3,
+            "retained_wal_blocks": 0,
+            "retained_wal_bytes": 0,
+            "replayed_transactions": 0,
             "verified_logical_commits": observations,
             "missing_keys": 0,
             "mismatched_values": 0,
             "state_digest_algorithm": "blake3-logical-id-key-value-v1",
             "expected_state_digest": "b" * 64,
             "recovered_state_digest": "b" * 64,
-            "open_time_nanos": 100,
+            "manifest_verification_time_nanos": 100,
+            "wal_physical_verification_time_nanos": 100,
+            "wal_semantic_replay_time_nanos": 100,
+            "root_validation_time_nanos": 100,
+            "open_time_nanos": 1_000,
             "verification_time_nanos": 1_000,
         },
     }
@@ -329,6 +381,10 @@ def readiness_profile() -> dict:
     return json.loads(
         (ROOT / "config/native-g7-readiness-profile.json").read_text(encoding="utf-8")
     )
+
+
+def receipt_with_valid_targeted_routing() -> dict:
+    return receipt()
 
 
 def receipt() -> dict:
@@ -372,6 +428,8 @@ def receipt() -> dict:
             "execution_workers_max": 8,
             "execution_worker_batches_max": 32,
             "execution_waves_max": 1,
+            "targeted_single_batches": 1_000_000,
+            "generic_single_fallback_batches": 0,
             "selected_certified": 1_000_000,
             "full_fanout_requested": 0,
             "full_fanout_budget_fallback": 0,
@@ -681,6 +739,102 @@ class G7ReceiptTests(unittest.TestCase):
             "execution_waves_max"
         ] = 4
         self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+    def test_ann_and_hybrid_routing_require_targeted_dispatch_evidence(self) -> None:
+        for cell_name, interval_name in (
+            ("ann-top10-recall-095", "ann_routing_interval"),
+            ("hybrid-top10", "hybrid_ann_routing_interval"),
+        ):
+            with self.subTest(cell=cell_name, case="missing"):
+                payload = receipt()
+                del payload["cells"][cell_name][interval_name][
+                    "targeted_single_batches"
+                ]
+                del payload["cells"][cell_name][interval_name][
+                    "generic_single_fallback_batches"
+                ]
+                with self.assertRaisesRegex(GateFailure, "routing.*fields"):
+                    validate(payload, "a" * 40)
+
+            payload = receipt_with_valid_targeted_routing()
+            interval = payload["cells"][cell_name][interval_name]
+            with self.subTest(cell=cell_name, case="valid-c1"):
+                self.assertEqual(validate(payload, "a" * 40)["status"], "passed")
+
+            for case, field, value in (
+                ("targeted-bool", "targeted_single_batches", True),
+                ("targeted-negative", "targeted_single_batches", -1),
+                ("targeted-float", "targeted_single_batches", 1.0),
+                ("targeted-string", "targeted_single_batches", "1"),
+                ("targeted-u64-overflow", "targeted_single_batches", 1 << 64),
+                ("fallback-bool", "generic_single_fallback_batches", True),
+                ("fallback-negative", "generic_single_fallback_batches", -1),
+                ("fallback-float", "generic_single_fallback_batches", 1.0),
+                ("fallback-string", "generic_single_fallback_batches", "1"),
+                ("fallback-u64-overflow", "generic_single_fallback_batches", 1 << 64),
+            ):
+                with self.subTest(cell=cell_name, case=case):
+                    mutated = copy.deepcopy(payload)
+                    mutated_interval = mutated["cells"][cell_name][interval_name]
+                    mutated_interval[field] = value
+                    with self.assertRaisesRegex(GateFailure, "routing"):
+                        validate(mutated, "a" * 40)
+
+            for field in (
+                "targeted_single_batches",
+                "generic_single_fallback_batches",
+            ):
+                with self.subTest(cell=cell_name, case=f"missing-{field}"):
+                    mutated = copy.deepcopy(payload)
+                    del mutated["cells"][cell_name][interval_name][field]
+                    with self.assertRaisesRegex(GateFailure, "routing.*fields"):
+                        validate(mutated, "a" * 40)
+
+            with self.subTest(cell=cell_name, case="forged-c1-fallback"):
+                mutated = copy.deepcopy(payload)
+                mutated_interval = mutated["cells"][cell_name][interval_name]
+                mutated_interval["targeted_single_batches"] -= 1
+                mutated_interval["generic_single_fallback_batches"] = 1
+                with self.assertRaisesRegex(GateFailure, "routing"):
+                    validate(mutated, "a" * 40)
+
+            for concurrency in (8, 32):
+                with self.subTest(cell=cell_name, concurrency=concurrency):
+                    concurrent = copy.deepcopy(payload)
+                    concurrent["concurrency"] = concurrency
+                    concurrent["cells"]["strict-group-commit"][
+                        "group_commit_evidence"
+                    ] = _strict_group_commit_evidence(concurrency=concurrency)
+                    concurrent_interval = concurrent["cells"][cell_name][interval_name]
+                    concurrent_interval["targeted_single_batches"] -= 1
+                    concurrent_interval["generic_single_fallback_batches"] = 1
+                    self.assertEqual(validate(concurrent, "a" * 40)["status"], "passed")
+
+                    all_fallback = copy.deepcopy(concurrent)
+                    all_fallback_interval = all_fallback["cells"][cell_name][interval_name]
+                    all_fallback_interval["targeted_single_batches"] = 0
+                    all_fallback_interval["generic_single_fallback_batches"] = (
+                        all_fallback_interval["observations"]
+                    )
+                    self.assertEqual(validate(all_fallback, "a" * 40)["status"], "passed")
+
+                    too_few = copy.deepcopy(concurrent)
+                    too_few_interval = too_few["cells"][cell_name][interval_name]
+                    too_few_interval["targeted_single_batches"] -= 1
+                    too_few_interval["generic_single_fallback_batches"] = 0
+                    with self.assertRaisesRegex(GateFailure, "routing"):
+                        validate(too_few, "a" * 40)
+
+                    too_many = copy.deepcopy(concurrent)
+                    too_many_interval = too_many["cells"][cell_name][interval_name]
+                    too_many_interval["targeted_single_batches"] = (
+                        too_many_interval["observations"]
+                        * too_many_interval["execution_waves_max"]
+                        + 1
+                    )
+                    too_many_interval["generic_single_fallback_batches"] = 0
+                    with self.assertRaisesRegex(GateFailure, "routing"):
+                        validate(too_many, "a" * 40)
 
     def test_ann_routing_requires_finite_strict_omission_bound(self) -> None:
         for field, value in (
@@ -1488,12 +1642,18 @@ class G7ReceiptTests(unittest.TestCase):
     def test_group_commit_requires_exact_reopen_equivalence(self) -> None:
         for field, value in (
             ("baseline_visible_csn", 3),
-            ("reopened_visible_csn", 1_000_003),
-            ("reopened_committed_transactions", 1_000_001),
+            ("reopened_visible_csn", 1_000_004),
+            ("reopened_committed_transactions", 1_000_002),
+            ("wal_base_csn", 1_000_002),
+            ("retained_wal_blocks", 1),
+            ("retained_wal_bytes", 1),
+            ("replayed_transactions", 1),
             ("verified_logical_commits", 999_999),
             ("missing_keys", 1),
             ("mismatched_values", True),
             ("recovered_state_digest", "c" * 64),
+            ("root_validation_time_nanos", 0),
+            ("open_time_nanos", 300),
             ("open_time_nanos", 0),
             ("verification_time_nanos", False),
         ):
@@ -1517,6 +1677,179 @@ class G7ReceiptTests(unittest.TestCase):
                     reopen["unexpected"] = 0
                 with self.assertRaisesRegex(GateFailure, "group-commit.*reopen.*fields"):
                     validate(payload, COMMIT)
+
+    def test_group_commit_requires_exact_bounded_recovery_maintenance(self) -> None:
+        mutations = (
+            ("maintenance", "total_time_nanos", 0),
+            ("maintenance", "total_time_nanos", 2_000),
+            ("vacuum", "applied", False),
+            ("vacuum", "active_page_generation", 3),
+            ("vacuum", "active_page_count", 100),
+            ("vacuum", "reclaimed_pages", 89),
+            ("vacuum", "commit_csn", 1_000_002),
+            ("vacuum", "commit_durability", "group"),
+            ("checkpoint", "visible_csn", 1_000_002),
+            ("checkpoint", "manifest_digest", "d" * 63),
+            ("wal_retention", "base_visible_csn", 1_000_002),
+            ("wal_retention", "checkpoint_lsn", 1_000_019),
+            ("wal_retention", "retained_manifest_files", 2),
+            ("wal_retention", "duration_nanos", False),
+        )
+        for section, field, value in mutations:
+            with self.subTest(section=section, field=field):
+                payload = receipt()
+                maintenance = payload["cells"]["strict-group-commit"][
+                    "group_commit_evidence"
+                ]["maintenance"]
+                target = maintenance if section == "maintenance" else maintenance[section]
+                target[field] = value
+                with self.assertRaisesRegex(GateFailure, "group-commit.*maintenance"):
+                    validate(payload, COMMIT)
+
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation):
+                payload = receipt()
+                maintenance = payload["cells"]["strict-group-commit"][
+                    "group_commit_evidence"
+                ]["maintenance"]
+                if mutation == "missing":
+                    del maintenance["provider"]
+                else:
+                    maintenance["unexpected"] = 0
+                with self.assertRaisesRegex(
+                    GateFailure, "group-commit.*maintenance.*fields"
+                ):
+                    validate(payload, COMMIT)
+
+    def test_group_commit_rejects_values_outside_native_u64_domain(self) -> None:
+        overflow = 1 << 64
+        latency_fields = ("p50", "p95", "p99", "p999", "maximum")
+
+        def top_level_duration(cell: dict, evidence: dict) -> None:
+            for field in latency_fields:
+                cell[field] = overflow
+                evidence["timings_nanoseconds"]["end_to_end"][field] = overflow
+
+        def coherent_csn_interval(_cell: dict, evidence: dict) -> None:
+            observations = evidence["logical_commits"]
+            baseline = overflow + 2
+            maintenance_csn = baseline + observations + 1
+            evidence["first_commit_csn"] = baseline + 1
+            evidence["last_commit_csn"] = baseline + observations
+            evidence["maintenance"]["vacuum"]["commit_csn"] = maintenance_csn
+            evidence["maintenance"]["checkpoint"]["visible_csn"] = maintenance_csn
+            evidence["maintenance"]["wal_retention"][
+                "base_visible_csn"
+            ] = maintenance_csn
+            evidence["reopen"]["baseline_visible_csn"] = baseline
+            evidence["reopen"]["reopened_visible_csn"] = maintenance_csn
+            evidence["reopen"]["wal_base_csn"] = maintenance_csn
+
+        def transaction_ids(_cell: dict, evidence: dict) -> None:
+            evidence["maintenance"]["vacuum"]["commit_transaction_id"] = overflow
+            evidence["maintenance"]["checkpoint"]["transaction_id"] = overflow + 1
+
+        def log_sequence_numbers(_cell: dict, evidence: dict) -> None:
+            evidence["maintenance"]["vacuum"]["commit_lsn"] = overflow
+            evidence["maintenance"]["checkpoint"]["checkpoint_lsn"] = overflow + 1
+            evidence["maintenance"]["wal_retention"][
+                "checkpoint_lsn"
+            ] = overflow + 1
+
+        def maintenance_durations(_cell: dict, evidence: dict) -> None:
+            maintenance = evidence["maintenance"]
+            maintenance["vacuum"]["duration_nanos"] = overflow
+            maintenance["checkpoint"]["duration_nanos"] = overflow
+            maintenance["wal_retention"]["duration_nanos"] = overflow
+            maintenance["total_time_nanos"] = overflow * 3
+
+        def reopen_durations(_cell: dict, evidence: dict) -> None:
+            reopen = evidence["reopen"]
+            for field in (
+                "manifest_verification_time_nanos",
+                "wal_physical_verification_time_nanos",
+                "wal_semantic_replay_time_nanos",
+                "root_validation_time_nanos",
+            ):
+                reopen[field] = overflow
+            reopen["open_time_nanos"] = overflow * 4
+            reopen["verification_time_nanos"] = overflow
+
+        def byte_counts(_cell: dict, evidence: dict) -> None:
+            retention = evidence["maintenance"]["wal_retention"]
+            retention["retired_wal_bytes"] = overflow
+            retention["retained_manifest_bytes"] = overflow
+
+        def page_counts(_cell: dict, evidence: dict) -> None:
+            vacuum = evidence["maintenance"]["vacuum"]
+            vacuum["previous_page_count"] = overflow + 100
+            vacuum["active_page_count"] = 10
+            vacuum["reclaimed_pages"] = overflow + 90
+
+        def generations(_cell: dict, evidence: dict) -> None:
+            vacuum = evidence["maintenance"]["vacuum"]
+            vacuum["previous_page_generation"] = overflow
+            vacuum["active_page_generation"] = overflow + 1
+            evidence["maintenance"]["checkpoint"]["manifest_generation"] = overflow
+
+        def anchor_epoch(_cell: dict, evidence: dict) -> None:
+            evidence["maintenance"]["wal_retention"]["anchor_epoch"] = overflow
+
+        def committed_transaction_counts(_cell: dict, evidence: dict) -> None:
+            observations = evidence["logical_commits"]
+            evidence["reopen"]["baseline_committed_transactions"] = overflow
+            evidence["reopen"][
+                "reopened_committed_transactions"
+            ] = overflow + observations + 1
+
+        for value_class, mutation in (
+            ("top-level-duration", top_level_duration),
+            ("csn", coherent_csn_interval),
+            ("transaction-id", transaction_ids),
+            ("lsn", log_sequence_numbers),
+            ("maintenance-duration", maintenance_durations),
+            ("reopen-duration", reopen_durations),
+            ("bytes", byte_counts),
+            ("page-count", page_counts),
+            ("generation", generations),
+            ("epoch", anchor_epoch),
+            ("transaction-count", committed_transaction_counts),
+        ):
+            with self.subTest(value_class=value_class):
+                payload = receipt()
+                cell = payload["cells"]["strict-group-commit"]
+                mutation(cell, cell["group_commit_evidence"])
+                with self.assertRaises(GateFailure):
+                    validate_strict_group_commit_cell(cell, 1_000_000, 1)
+
+        with self.subTest(value_class="all-observation-counts"):
+            payload = receipt()
+            cell = payload["cells"]["strict-group-commit"]
+            cell["group_commit_evidence"] = _strict_group_commit_evidence(
+                observations=overflow,
+            )
+            with self.assertRaises(GateFailure):
+                validate_strict_group_commit_cell(cell, overflow, 1)
+
+    def test_group_commit_rejects_bool_as_native_u64(self) -> None:
+        for section, field in (
+            ("cell", "p50"),
+            ("reopen", "baseline_visible_csn"),
+            ("reopen", "retained_wal_blocks"),
+            ("retention", "retired_manifest_files"),
+        ):
+            with self.subTest(section=section, field=field):
+                payload = receipt()
+                cell = payload["cells"]["strict-group-commit"]
+                evidence = cell["group_commit_evidence"]
+                if section == "cell":
+                    cell[field] = True
+                elif section == "reopen":
+                    evidence["reopen"][field] = True
+                else:
+                    evidence["maintenance"]["wal_retention"][field] = True
+                with self.assertRaises(GateFailure):
+                    validate_strict_group_commit_cell(cell, 1_000_000, 1)
 
     def test_interference_requires_control_comparison(self) -> None:
         payload = interference_receipt()

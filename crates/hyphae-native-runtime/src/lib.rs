@@ -2890,8 +2890,12 @@ pub struct AnnSelectedSearchReceipt {
     pub execution_workers: usize,
     /// Persistent-pool worker batches scheduled across all routing waves.
     pub execution_worker_batches: usize,
-    /// One certified/requested wave or two waves after adaptive widening.
+    /// Number of deterministic routing waves executed, including any final full-fanout fallback.
     pub execution_waves: usize,
+    /// One-item routing waves dispatched to their stable persistent worker.
+    pub targeted_single_batches: usize,
+    /// One-item routing waves admitted generically because the target was busy.
+    pub generic_single_fallback_batches: usize,
 }
 
 /// Durable base shape retained by one owned ANN read view.
@@ -4357,6 +4361,8 @@ fn ann_selected_search_receipt(
         execution_workers: execution.execution_workers,
         execution_worker_batches: execution.execution_worker_batches,
         execution_waves: execution.execution_waves,
+        targeted_single_batches: execution.targeted_single_batches,
+        generic_single_fallback_batches: execution.generic_single_fallback_batches,
     }
 }
 
@@ -35664,7 +35670,9 @@ mod tests {
         sync::{
             Arc, Barrier,
             atomic::{AtomicI64, AtomicU64, Ordering},
+            mpsc,
         },
+        thread,
         time::{Duration, Instant},
     };
 
@@ -47915,6 +47923,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scheduler_shutdown_into_database_drains_and_returns_the_exact_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let database = NativeDatabase::create(temporary.path())?;
+        let scheduler =
+            NativeCommitScheduler::start(database, GroupCommitConfig::new(2, Duration::ZERO, 2)?)?;
+        let client = scheduler.client();
+        let batches = staged_group_delta_batches(&client, 1, 2, "shutdown-owner")?;
+        let pending = client.enqueue_cohort(batches)?;
+
+        let database = scheduler.shutdown_into_database()?;
+        let completions = pending
+            .into_iter()
+            .map(NativePendingCommit::wait_with_evidence)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completions.len(), 2);
+        assert_eq!(database.snapshot(2)?.visible_csn(), Some(Csn::new(2)?));
+        for request_index in 0..2 {
+            assert_eq!(
+                database.get_latest_structure(
+                    format!("shutdown-owner-{request_index}").as_bytes(),
+                    2,
+                )?,
+                Some(b"visible".to_vec())
+            );
+        }
+        assert!(staged_group_delta_batches(&client, 1, 1, "after-shutdown").is_err());
+        Ok(())
+    }
+
     fn concurrently_enqueue_governed_group(
         client: &NativeCommitClient,
         cohort_size: usize,
@@ -48867,7 +48906,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_shutdown_drains_an_accepted_cohort_waiting_for_execution_capacity()
+    fn scheduler_shutdown_into_database_drains_an_accepted_cohort_waiting_for_capacity()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
@@ -48897,7 +48936,7 @@ mod tests {
             }
             std::thread::yield_now();
         }
-        let shutdown = std::thread::spawn(move || scheduler.shutdown());
+        let shutdown = std::thread::spawn(move || scheduler.shutdown_into_database());
         let gate_deadline = Instant::now() + Duration::from_secs(2);
         while client.accepting_for_test()? {
             if Instant::now() >= gate_deadline {
@@ -48929,16 +48968,15 @@ mod tests {
                 && completion.page_synchronizations == 1
                 && completion.wal_synchronizations == 1
         }));
-        shutdown.join().map_err(|_| "shutdown thread panicked")??;
+        let database = shutdown.join().map_err(|_| "shutdown thread panicked")??;
         assert_eq!(governor.queued_requests(), 0);
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
         assert_eq!(governor.usage_snapshot().memory_bytes, 0);
 
-        let reopened = NativeDatabase::open(temporary.path())?;
         for request_index in 0..1 {
             assert_eq!(
-                reopened.get_latest_structure(
+                database.get_latest_structure(
                     format!("shutdown-drain-{request_index}").as_bytes(),
                     2,
                 )?,
@@ -57280,6 +57318,8 @@ mod tests {
         let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
         let options = AnnSearchOptions::new(10, 64, Some(64))?;
         let serial = database.search_ann_selected_latest(index, &query, options, 4)?;
+        assert_eq!(serial.targeted_single_batches, 0);
+        assert_eq!(serial.generic_single_fallback_batches, 0);
 
         for workers in [1_u64, 2, 4] {
             let policy = routed_ann_admission_test_policy(workers);
@@ -57301,6 +57341,10 @@ mod tests {
             assert_eq!(routed.execution_workers, usize::try_from(workers)?);
             assert_eq!(routed.execution_worker_batches, usize::try_from(workers)?);
             assert_eq!(routed.execution_waves, 1);
+            // The route is one four-partition wave even when one worker batch
+            // processes its four partitions serially.
+            assert_eq!(routed.targeted_single_batches, 0);
+            assert_eq!(routed.generic_single_fallback_batches, 0);
             assert_eq!(pool.completed_jobs() - completed_before, workers);
             assert_eq!(governor.usage_snapshot().memory_bytes, 0);
         }
@@ -57316,6 +57360,8 @@ mod tests {
         assert_eq!(certified.execution_workers, 1);
         assert_eq!(certified.execution_worker_batches, 3);
         assert_eq!(certified.execution_waves, 3);
+        assert_eq!(certified.targeted_single_batches, 3);
+        assert_eq!(certified.generic_single_fallback_batches, 0);
 
         let fallback_options = AnnSearchOptions::new(64, 64, Some(64))?;
         let expected_fallback = database.search_ann_latest(index, &query, fallback_options)?;
@@ -57331,6 +57377,8 @@ mod tests {
         assert_eq!(widened.execution_workers, 3);
         assert_eq!(widened.execution_worker_batches, 4);
         assert_eq!(widened.execution_waves, 2);
+        assert_eq!(widened.targeted_single_batches, 1);
+        assert_eq!(widened.generic_single_fallback_batches, 0);
 
         let governor = database
             .resource_governor()
@@ -57352,6 +57400,85 @@ mod tests {
         ));
         assert_eq!(super::ann_store::index_scoped_restore_count_for_test(), 0);
         assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn routed_ann_one_item_wave_reports_the_physical_targeted_or_busy_fallback_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(196)?;
+        seed_durable_routing_fixture(&mut database, index, ObjectId::new(199)?)?;
+        let query = Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?;
+        let options = AnnSearchOptions::new(1, 64, Some(64))?;
+        let mut policy = routed_ann_admission_test_policy(6);
+        policy
+            .class_limits
+            .iter_mut()
+            .find(|limit| limit.class == WorkloadClass::ForegroundBounded)
+            .ok_or("missing foreground bounded policy")?
+            .compute_threads = 4;
+        let profile = portable_execution_profile(&policy);
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let pool = Arc::new(NativeExecutionPool::new(&profile, &policy)?);
+        database.set_resource_governor_with_execution_pool(
+            Arc::clone(&governor),
+            Arc::clone(&pool),
+            Duration::ZERO,
+        )?;
+
+        let targeted = database.search_ann_selected_latest(index, &query, options, 1)?;
+        // This fixture cannot certify after its one-partition first wave and
+        // therefore follows it with one full-fanout fallback wave.
+        assert_eq!(targeted.execution_waves, 2);
+        assert_eq!(targeted.targeted_single_batches, 1);
+        assert_eq!(targeted.generic_single_fallback_batches, 0);
+        let stable_hint = targeted.selected_partitions[0];
+
+        let blocker = Arc::new(governor.try_admit_owned(
+            WorkloadClass::Mutation,
+            GovernorRequest {
+                compute_threads: 2,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&blocker);
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(
+                &active_parent,
+                stable_hint,
+                None,
+                move || {
+                    let _ignored = started_tx.send(());
+                    let _ignored = release_rx.recv();
+                },
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let queued_pool = Arc::clone(&pool);
+        let queued_parent = Arc::clone(&blocker);
+        let queued = thread::spawn(move || {
+            queued_pool.execute_single_targeted_profiled(&queued_parent, stable_hint, None, || ())
+        });
+        pool.wait_for_targeted_slot_for_test(stable_hint, Duration::from_secs(2))?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 2);
+
+        let fallback = database.search_ann_selected_latest(index, &query, options, 1)?;
+        assert_eq!(fallback.execution_waves, 2);
+        assert_eq!(fallback.targeted_single_batches, 0);
+        assert_eq!(fallback.generic_single_fallback_batches, 1);
+        assert_eq!(fallback.search, targeted.search);
+
+        release_tx.send(())?;
+        active.join().map_err(|_| "active route panicked")??;
+        queued.join().map_err(|_| "queued route panicked")??;
+        drop(blocker);
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
         Ok(())
     }
 

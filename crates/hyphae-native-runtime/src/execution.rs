@@ -33,7 +33,13 @@ struct Job {
     class: WorkloadClass,
     enqueued_at: Instant,
     operation: Box<dyn FnOnce() + Send + 'static>,
-    completed: mpsc::Sender<bool>,
+    completed: Option<mpsc::Sender<bool>>,
+    targeted_completion: Option<TargetedCompletion>,
+}
+
+struct TargetedCompletion {
+    state: Arc<Mutex<Option<(bool, usize)>>>,
+    event: mpsc::Sender<()>,
 }
 const EXECUTION_TOPOLOGY_SCHEMA: &str = "hyphae-native-execution-topology-v1";
 const NUMA_STEAL_POLICY_SCHEMA: &str = "hyphae-native-numa-steal-policy-v1";
@@ -470,16 +476,37 @@ fn parse_numa_variant(variant: &str) -> Option<(u32, u32)> {
 
 struct WorkQueue {
     jobs: Mutex<VecDeque<Job>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetedSingleTicket {
+    worker_index: usize,
+    generation: u64,
+}
+
+struct TargetedSingleJob {
+    ticket: TargetedSingleTicket,
+    job: Job,
+}
+
+struct WorkerWake {
     changed: Condvar,
 }
 
 struct WakeState {
     foreground_dispatches_since_background: Vec<u64>,
     high_dispatches_since_normal: Vec<u64>,
+    next_worker_by_pool: Vec<usize>,
+    targeted_slots: Vec<Option<TargetedSingleJob>>,
+    targeted_generations: Vec<u64>,
+    last_dispatch_was_targeted: Vec<bool>,
+    waiting_by_worker: Vec<bool>,
 }
 
 struct ExecutionInner {
     queues: Vec<WorkQueue>,
+    worker_wakes: Vec<WorkerWake>,
+    pool_worker_ordinals: Vec<Vec<usize>>,
     wake_lock: Mutex<WakeState>,
     steal_policy: NativeNumaStealPolicy,
     shutdown: AtomicBool,
@@ -491,19 +518,74 @@ struct ExecutionInner {
 }
 
 #[cfg(test)]
+type PreWaitHook = Mutex<Option<Box<dyn FnOnce() + Send>>>;
+
+#[cfg(test)]
 struct ExecutionTestProbe {
     waiting_workers: Vec<std::sync::atomic::AtomicUsize>,
     notified_wake_returns: Vec<AtomicU64>,
+    pre_wait_hooks: Vec<PreWaitHook>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TargetedSingleExecutionRoute {
+    Targeted,
+    GenericFallbackBusy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TargetedSingleExecutionReceipt {
+    pub(crate) route: TargetedSingleExecutionRoute,
+    pub(crate) worker_index: usize,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TargetedSingleExecutionError {
+    #[error(transparent)]
+    Execution(#[from] NativeExecutionError),
+    #[error("targeted single-item execution was cancelled")]
+    Cancelled,
+    #[error("targeted single-item execution admission is closed")]
+    Closed,
+    #[error("targeted single-item cancellation belongs to another governor")]
+    ForeignCancellation,
+    #[error("targeted single-item generation is exhausted")]
+    GenerationExhausted,
+}
+
+struct TargetedSubmission {
+    route: TargetedSingleExecutionRoute,
+    ticket: Option<TargetedSingleTicket>,
+}
+
+#[cfg(test)]
+struct TargetedTestHandle<R> {
+    ticket: TargetedSingleTicket,
+    result: mpsc::Receiver<R>,
+    completed: mpsc::Receiver<bool>,
+}
+
+fn new_wake_state(pool_count: usize, worker_count: usize) -> WakeState {
+    WakeState {
+        foreground_dispatches_since_background: vec![0; pool_count],
+        high_dispatches_since_normal: vec![0; pool_count],
+        next_worker_by_pool: vec![0; pool_count],
+        targeted_slots: (0..worker_count).map(|_| None).collect(),
+        targeted_generations: vec![0; worker_count],
+        last_dispatch_was_targeted: vec![false; worker_count],
+        waiting_by_worker: vec![false; worker_count],
+    }
 }
 
 #[cfg(test)]
 impl ExecutionTestProbe {
-    fn new(pool_count: usize) -> Self {
+    fn new(pool_count: usize, worker_count: usize) -> Self {
         Self {
             waiting_workers: (0..pool_count)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
             notified_wake_returns: (0..pool_count).map(|_| AtomicU64::new(0)).collect(),
+            pre_wait_hooks: (0..worker_count).map(|_| Mutex::new(None)).collect(),
         }
     }
 }
@@ -558,31 +640,43 @@ impl NativeExecutionPool {
 
     fn from_topology(topology: NativeExecutionTopology) -> Result<Self, NativeExecutionError> {
         let pool_count = topology.pools.len();
+        let worker_count = topology.worker_count();
+        if worker_count == 0 {
+            return Err(NativeExecutionError::EmptyExecution);
+        }
+        let pool_worker_ordinals = topology
+            .pools
+            .iter()
+            .map(|pool| {
+                pool.workers
+                    .iter()
+                    .map(|worker| worker.worker_index)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let inner = Arc::new(ExecutionInner {
             queues: topology
                 .pools
                 .iter()
                 .map(|_| WorkQueue {
                     jobs: Mutex::new(VecDeque::new()),
+                })
+                .collect(),
+            worker_wakes: (0..worker_count)
+                .map(|_| WorkerWake {
                     changed: Condvar::new(),
                 })
                 .collect(),
-            wake_lock: Mutex::new(WakeState {
-                foreground_dispatches_since_background: vec![0; pool_count],
-                high_dispatches_since_normal: vec![0; pool_count],
-            }),
+            pool_worker_ordinals,
+            wake_lock: Mutex::new(new_wake_state(pool_count, worker_count)),
             steal_policy: topology.numa_steal_policy.clone(),
             shutdown: AtomicBool::new(false),
             completed_jobs: AtomicU64::new(0),
             local_dispatches: AtomicU64::new(0),
             stolen_dispatches: AtomicU64::new(0),
             #[cfg(test)]
-            test_probe: ExecutionTestProbe::new(pool_count),
+            test_probe: ExecutionTestProbe::new(pool_count, worker_count),
         });
-        let worker_count = topology.worker_count();
-        if worker_count == 0 {
-            return Err(NativeExecutionError::EmptyExecution);
-        }
         let (started_tx, started_rx) = mpsc::channel();
         let mut workers = Vec::with_capacity(worker_count);
         for (pool_index, placement) in
@@ -608,7 +702,7 @@ impl NativeExecutionPool {
                 let affinity_ok = affinity.is_ok();
                 let _ignored = worker_started.send(affinity);
                 if affinity_ok {
-                    run_worker(&worker_inner, pool_index);
+                    run_worker(&worker_inner, pool_index, placement.worker_index);
                 }
             }) {
                 Ok(handle) => handle,
@@ -789,7 +883,8 @@ impl NativeExecutionPool {
                     }
                     drop(child);
                 }),
-                completed: completed_tx.clone(),
+                completed: Some(completed_tx.clone()),
+                targeted_completion: None,
             };
             self.submit(pool_hint, job);
         }
@@ -813,26 +908,374 @@ impl NativeExecutionPool {
         Ok((ordered, worker_count))
     }
 
+    pub(crate) fn execute_single_targeted_profiled<R>(
+        &self,
+        parent: &OwnedGovernorPermit,
+        stable_hint: usize,
+        cancellation: Option<&crate::GovernorCancellation>,
+        operation: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<(R, TargetedSingleExecutionReceipt), TargetedSingleExecutionError>
+    where
+        R: Send + 'static,
+    {
+        if cancellation.is_some_and(|token| !parent.owns_cancellation(token)) {
+            return Err(TargetedSingleExecutionError::ForeignCancellation);
+        }
+        if cancellation.is_some_and(crate::GovernorCancellation::is_cancelled) {
+            return Err(TargetedSingleExecutionError::Cancelled);
+        }
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err(TargetedSingleExecutionError::Closed);
+        }
+        let child = parent
+            .try_subdivide_owned(GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            })
+            .map_err(NativeExecutionError::Admission)?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let completion_state = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::channel();
+        let job = Job {
+            class: parent.class(),
+            enqueued_at: Instant::now(),
+            operation: Box::new(move || {
+                let result = operation();
+                let _ignored = result_tx.send(result);
+                drop(child);
+            }),
+            completed: None,
+            targeted_completion: Some(TargetedCompletion {
+                state: Arc::clone(&completion_state),
+                event: event_tx.clone(),
+            }),
+        };
+        let submission = self.submit_single_targeted(stable_hint, job)?;
+        let operation_completed = self.wait_for_targeted_completion(
+            submission.ticket,
+            cancellation,
+            &completion_state,
+            event_tx,
+            &event_rx,
+        )?;
+        if !operation_completed {
+            return Err(NativeExecutionError::OperationPanicked.into());
+        }
+        let result = result_rx
+            .recv()
+            .map_err(|_| NativeExecutionError::Synchronization)?;
+        let worker_index = completion_state
+            .lock()
+            .map_err(|_| NativeExecutionError::Synchronization)?
+            .as_ref()
+            .map(|(_, worker_index)| *worker_index)
+            .ok_or(NativeExecutionError::Synchronization)?;
+        Ok((
+            result,
+            TargetedSingleExecutionReceipt {
+                route: submission.route,
+                worker_index,
+            },
+        ))
+    }
+
+    fn submit_single_targeted(
+        &self,
+        stable_hint: usize,
+        job: Job,
+    ) -> Result<TargetedSubmission, TargetedSingleExecutionError> {
+        let mut wake = self
+            .inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err(TargetedSingleExecutionError::Closed);
+        }
+        let worker_index = stable_hint % self.topology.worker_count();
+        let home_pool = worker_pool_index(&self.topology, worker_index)?;
+        if wake.targeted_slots[worker_index].is_some() {
+            self.submit_locked(&mut wake, home_pool, job);
+            return Ok(TargetedSubmission {
+                route: TargetedSingleExecutionRoute::GenericFallbackBusy,
+                ticket: None,
+            });
+        }
+        let generation = wake.targeted_generations[worker_index]
+            .checked_add(1)
+            .ok_or(TargetedSingleExecutionError::GenerationExhausted)?;
+        wake.targeted_generations[worker_index] = generation;
+        let ticket = TargetedSingleTicket {
+            worker_index,
+            generation,
+        };
+        wake.targeted_slots[worker_index] = Some(TargetedSingleJob { ticket, job });
+        self.inner.worker_wakes[worker_index].changed.notify_one();
+        Ok(TargetedSubmission {
+            route: TargetedSingleExecutionRoute::Targeted,
+            ticket: Some(ticket),
+        })
+    }
+
+    fn wait_for_targeted_completion(
+        &self,
+        ticket: Option<TargetedSingleTicket>,
+        cancellation: Option<&crate::GovernorCancellation>,
+        state: &Arc<Mutex<Option<(bool, usize)>>>,
+        event_tx: mpsc::Sender<()>,
+        events: &mpsc::Receiver<()>,
+    ) -> Result<bool, TargetedSingleExecutionError> {
+        let cancellation_registration = cancellation
+            .map(|cancellation| cancellation.register_waiter(event_tx))
+            .transpose()
+            .map_err(|()| NativeExecutionError::Synchronization)?;
+        let _cancellation_waiter = match cancellation_registration {
+            Some(crate::governor::CancellationWaiterRegistration::Registered(waiter)) => {
+                Some(waiter)
+            }
+            Some(crate::governor::CancellationWaiterRegistration::Cancelled) | None => None,
+        };
+        loop {
+            events
+                .recv()
+                .map_err(|_| NativeExecutionError::Synchronization)?;
+            if let Some((outcome, _)) = *state
+                .lock()
+                .map_err(|_| NativeExecutionError::Synchronization)?
+            {
+                return Ok(outcome);
+            }
+            if cancellation.is_some_and(crate::GovernorCancellation::is_cancelled)
+                && ticket.is_some_and(|ticket| cancel_targeted_ticket(&self.inner, ticket))
+            {
+                return Err(TargetedSingleExecutionError::Cancelled);
+            }
+        }
+    }
+
     fn submit(&self, pool_hint: usize, job: Job) {
         debug_assert!(!self.inner.shutdown.load(Ordering::Acquire));
-        let wake = self
+        let mut wake = self
             .inner
             .wake_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pool_index = pool_hint % self.inner.queues.len();
+        self.submit_locked(&mut wake, pool_index, job);
+    }
+
+    fn submit_locked(&self, wake: &mut WakeState, pool_index: usize, job: Job) {
         self.inner.queues[pool_index]
             .jobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(job);
-        notify_eligible_pool_workers(&self.inner, pool_index);
-        drop(wake);
+        notify_eligible_pool_workers(&self.inner, wake, pool_index);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_targeted_slot_for_test(
+        &self,
+        stable_hint: usize,
+        timeout: Duration,
+    ) -> Result<(), NativeExecutionError> {
+        let worker_index = stable_hint % self.topology.worker_count();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .inner
+                .wake_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .targeted_slots[worker_index]
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeExecutionError::Synchronization);
+            }
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_targeted_ticket_for_test(
+        &self,
+        stable_hint: usize,
+        timeout: Duration,
+    ) -> Result<TargetedSingleTicket, NativeExecutionError> {
+        self.wait_for_targeted_slot_for_test(stable_hint, timeout)?;
+        let worker_index = stable_hint % self.topology.worker_count();
+        self.inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .targeted_slots[worker_index]
+            .as_ref()
+            .map(|job| job.ticket)
+            .ok_or(NativeExecutionError::Synchronization)
+    }
+
+    #[cfg(test)]
+    fn enqueue_targeted_for_test<R>(
+        &self,
+        parent: &OwnedGovernorPermit,
+        stable_hint: usize,
+        operation: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<TargetedTestHandle<R>, TargetedSingleExecutionError>
+    where
+        R: Send + 'static,
+    {
+        let child = parent
+            .try_subdivide_owned(GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            })
+            .map_err(NativeExecutionError::Admission)?;
+        let (result_tx, result_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let job = Job {
+            class: parent.class(),
+            enqueued_at: Instant::now(),
+            operation: Box::new(move || {
+                let result = operation();
+                let _ignored = result_tx.send(result);
+                drop(child);
+            }),
+            completed: Some(completed_tx),
+            targeted_completion: None,
+        };
+        let submission = self.submit_single_targeted(stable_hint, job)?;
+        let ticket = submission
+            .ticket
+            .ok_or(NativeExecutionError::Synchronization)?;
+        Ok(TargetedTestHandle {
+            ticket,
+            result: result_rx,
+            completed: completed_rx,
+        })
+    }
+
+    #[cfg(test)]
+    fn wait_targeted_for_test<R>(
+        handle: &TargetedTestHandle<R>,
+    ) -> Result<(R, TargetedSingleExecutionReceipt), TargetedSingleExecutionError> {
+        if !handle
+            .completed
+            .recv()
+            .map_err(|_| NativeExecutionError::Synchronization)?
+        {
+            return Err(NativeExecutionError::OperationPanicked.into());
+        }
+        let result = handle
+            .result
+            .recv()
+            .map_err(|_| NativeExecutionError::Synchronization)?;
+        Ok((
+            result,
+            TargetedSingleExecutionReceipt {
+                route: TargetedSingleExecutionRoute::Targeted,
+                worker_index: handle.ticket.worker_index,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    fn cancel_targeted_ticket_for_test(&self, ticket: TargetedSingleTicket) -> bool {
+        cancel_targeted_ticket(&self.inner, ticket)
+    }
+
+    #[cfg(test)]
+    fn set_targeted_generation_for_test(&self, worker_index: usize, generation: u64) {
+        self.inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .targeted_generations[worker_index] = generation;
+    }
+
+    #[cfg(test)]
+    fn targeted_generation_for_test(&self, worker_index: usize) -> u64 {
+        self.inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .targeted_generations[worker_index]
+    }
+
+    #[cfg(test)]
+    fn targeted_slot_occupied_for_test(&self, worker_index: usize) -> bool {
+        self.inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .targeted_slots[worker_index]
+            .is_some()
+    }
+
+    #[cfg(test)]
+    fn wait_for_generic_queue_for_test(
+        &self,
+        pool_index: usize,
+        timeout: Duration,
+    ) -> Result<(), NativeExecutionError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.inner.queues[pool_index]
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(NativeExecutionError::Synchronization);
+            }
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(test)]
+    fn install_targeted_pre_wait_hook_for_test(
+        &self,
+        worker_index: usize,
+        waiting: mpsc::SyncSender<()>,
+        release: impl FnOnce() + Send + 'static,
+    ) {
+        let _wake = self
+            .inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.inner.test_probe.pre_wait_hooks[worker_index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+            let _ignored = waiting.send(());
+            release();
+        }));
+        self.inner.worker_wakes[worker_index].changed.notify_one();
+    }
+
+    #[cfg(test)]
+    fn signal_shutdown_for_test(&self) {
+        signal_shutdown(&self.inner);
+    }
+
+    #[cfg(test)]
+    fn shutdown_and_join_for_test(mut self) {
+        signal_shutdown(&self.inner);
+        for worker in self.workers.drain(..) {
+            let _ignored = worker.join();
+        }
     }
 }
 
-fn notify_eligible_pool_workers(inner: &ExecutionInner, home_pool: usize) {
-    inner.queues[home_pool].changed.notify_one();
+fn notify_eligible_pool_workers(inner: &ExecutionInner, wake: &mut WakeState, home_pool: usize) {
+    notify_next_pool_worker(inner, wake, home_pool);
     if inner.steal_policy.status != "calibrated" {
         return;
     }
@@ -846,9 +1289,25 @@ fn notify_eligible_pool_workers(inner: &ExecutionInner, home_pool: usize) {
                 .iter()
                 .any(|target| target.home_numa_node_id == home_node)
         {
-            inner.queues[candidate_pool].changed.notify_one();
+            notify_next_pool_worker(inner, wake, candidate_pool);
         }
     }
+}
+
+fn notify_next_pool_worker(inner: &ExecutionInner, wake: &mut WakeState, pool_index: usize) {
+    let workers = &inner.pool_worker_ordinals[pool_index];
+    if workers.is_empty() {
+        return;
+    }
+    let offset = wake.next_worker_by_pool[pool_index] % workers.len();
+    let selected_offset = (0..workers.len())
+        .map(|delta| (offset + delta) % workers.len())
+        .find(|candidate| wake.waiting_by_worker[workers[*candidate]])
+        .unwrap_or(offset);
+    wake.next_worker_by_pool[pool_index] = (selected_offset + 1) % workers.len();
+    inner.worker_wakes[workers[selected_offset]]
+        .changed
+        .notify_one();
 }
 
 fn nested_request_capacity(
@@ -884,45 +1343,110 @@ impl Drop for NativeExecutionPool {
     }
 }
 
-fn run_worker(inner: &ExecutionInner, local_pool: usize) {
+fn run_worker(inner: &ExecutionInner, local_pool: usize, worker_index: usize) {
     let mut wake = inner
         .wake_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
         let now = Instant::now();
-        if let Some(job) = take_job(inner, &mut wake, local_pool, now) {
+        if let Some(job) = take_worker_job(inner, &mut wake, local_pool, worker_index, now) {
             drop(wake);
-            complete_job(inner, job);
+            complete_job(inner, worker_index, job);
             wake = inner
                 .wake_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             continue;
         }
-        if inner.shutdown.load(Ordering::Acquire) {
+        if inner.shutdown.load(Ordering::Acquire)
+            && !has_any_accepted_job(inner, &wake, worker_index)
+        {
             break;
         }
         record_worker_wait_started(inner, local_pool);
+        wake.waiting_by_worker[worker_index] = true;
+        run_pre_wait_hook(inner, worker_index);
         let (next_wake, notified) = if let Some(wait) = next_steal_wait(inner, local_pool, now) {
-            let (next_wake, timeout) = inner.queues[local_pool]
+            let (next_wake, timeout) = inner.worker_wakes[worker_index]
                 .changed
                 .wait_timeout(wake, wait)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (next_wake, !timeout.timed_out())
         } else {
             (
-                inner.queues[local_pool]
+                inner.worker_wakes[worker_index]
                     .changed
                     .wait(wake)
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
                 true,
             )
         };
-        record_worker_wait_finished(inner, local_pool, notified);
         wake = next_wake;
+        wake.waiting_by_worker[worker_index] = false;
+        record_worker_wait_finished(inner, local_pool, notified);
     }
 }
+
+fn take_worker_job(
+    inner: &ExecutionInner,
+    wake: &mut WakeState,
+    local_pool: usize,
+    worker_index: usize,
+    now: Instant,
+) -> Option<Job> {
+    let generic_eligible = has_eligible_job(inner, local_pool, now, |_| true);
+    if !wake.last_dispatch_was_targeted[worker_index]
+        && let Some(targeted) = wake.targeted_slots[worker_index].take()
+    {
+        wake.last_dispatch_was_targeted[worker_index] = true;
+        inner.local_dispatches.fetch_add(1, Ordering::AcqRel);
+        return Some(targeted.job);
+    }
+    if generic_eligible && let Some(job) = take_job(inner, wake, local_pool, now) {
+        wake.last_dispatch_was_targeted[worker_index] = false;
+        return Some(job);
+    }
+    if let Some(targeted) = wake.targeted_slots[worker_index].take() {
+        wake.last_dispatch_was_targeted[worker_index] = true;
+        inner.local_dispatches.fetch_add(1, Ordering::AcqRel);
+        return Some(targeted.job);
+    }
+    take_job(inner, wake, local_pool, now).inspect(|_| {
+        wake.last_dispatch_was_targeted[worker_index] = false;
+    })
+}
+
+fn has_any_accepted_job(inner: &ExecutionInner, wake: &WakeState, worker_index: usize) -> bool {
+    wake.targeted_slots[worker_index].is_some()
+        || !inner.queues[worker_pool_for_inner(inner, worker_index)]
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+}
+
+fn worker_pool_for_inner(inner: &ExecutionInner, worker_index: usize) -> usize {
+    inner
+        .pool_worker_ordinals
+        .iter()
+        .position(|workers| workers.contains(&worker_index))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn run_pre_wait_hook(inner: &ExecutionInner, worker_index: usize) {
+    let hook = inner.test_probe.pre_wait_hooks[worker_index]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_pre_wait_hook(_inner: &ExecutionInner, _worker_index: usize) {}
 
 #[cfg(test)]
 fn record_worker_wait_started(inner: &ExecutionInner, local_pool: usize) {
@@ -943,10 +1467,22 @@ fn record_worker_wait_finished(inner: &ExecutionInner, local_pool: usize, notifi
 #[cfg(not(test))]
 fn record_worker_wait_finished(_inner: &ExecutionInner, _local_pool: usize, _notified: bool) {}
 
-fn complete_job(inner: &ExecutionInner, job: Job) {
+fn complete_job(inner: &ExecutionInner, worker_index: usize, job: Job) {
     let outcome = catch_unwind(AssertUnwindSafe(job.operation)).is_ok();
+    let targeted_event = job.targeted_completion.map(|completion| {
+        *completion
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((outcome, worker_index));
+        completion.event
+    });
     inner.completed_jobs.fetch_add(1, Ordering::AcqRel);
-    let _ignored = job.completed.send(outcome);
+    if let Some(event) = targeted_event {
+        let _ignored = event.send(());
+    }
+    if let Some(completed) = job.completed {
+        let _ignored = completed.send(outcome);
+    }
 }
 
 fn take_job(
@@ -1123,10 +1659,52 @@ fn signal_shutdown(inner: &ExecutionInner) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     inner.shutdown.store(true, Ordering::Release);
-    for queue in &inner.queues {
-        queue.changed.notify_all();
+    for worker in &inner.worker_wakes {
+        worker.changed.notify_all();
     }
     drop(wake);
+}
+
+fn cancel_targeted_ticket(inner: &ExecutionInner, ticket: TargetedSingleTicket) -> bool {
+    let mut wake = inner
+        .wake_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if wake.targeted_slots[ticket.worker_index]
+        .as_ref()
+        .is_some_and(|job| job.ticket == ticket)
+    {
+        wake.targeted_slots[ticket.worker_index].take();
+        true
+    } else {
+        false
+    }
+}
+
+fn worker_pool_index(
+    topology: &NativeExecutionTopology,
+    worker_index: usize,
+) -> Result<usize, NativeExecutionError> {
+    topology
+        .pools
+        .iter()
+        .position(|pool| {
+            pool.workers
+                .iter()
+                .any(|worker| worker.worker_index == worker_index)
+        })
+        .ok_or(NativeExecutionError::InsufficientTopology)
+}
+
+#[cfg(test)]
+fn worker_name(
+    topology: &NativeExecutionTopology,
+    worker_index: usize,
+) -> Result<String, NativeExecutionError> {
+    Ok(format!(
+        "hyphae-numa-{}-{worker_index}",
+        worker_pool_index(topology, worker_index)?
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1160,8 +1738,58 @@ mod tests {
     };
     use std::{
         error::Error,
-        sync::{Barrier, Mutex, atomic::AtomicUsize},
+        sync::{Barrier, Condvar, Mutex, atomic::AtomicUsize},
     };
+
+    #[derive(Default)]
+    struct HomeWorkerReleaseGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl HomeWorkerReleaseGate {
+        fn wait(&self) {
+            let released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(
+                self.changed
+                    .wait_while(released, |released| !*released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct HomeWorkerRelease {
+        gate: Arc<HomeWorkerReleaseGate>,
+    }
+
+    impl HomeWorkerRelease {
+        fn new() -> Self {
+            Self {
+                gate: Arc::new(HomeWorkerReleaseGate::default()),
+            }
+        }
+
+        fn waiter(&self) -> Arc<HomeWorkerReleaseGate> {
+            Arc::clone(&self.gate)
+        }
+    }
+
+    impl Drop for HomeWorkerRelease {
+        fn drop(&mut self) {
+            self.gate.release();
+        }
+    }
 
     fn profile() -> HardwareProfile {
         HardwareProfile {
@@ -1355,23 +1983,26 @@ mod tests {
 
     fn selection_inner(steal_policy: NativeNumaStealPolicy) -> ExecutionInner {
         let pool_count = steal_policy.pools.len();
+        let worker_count = pool_count;
         ExecutionInner {
             queues: (0..pool_count)
                 .map(|_| WorkQueue {
                     jobs: Mutex::new(VecDeque::new()),
+                })
+                .collect(),
+            worker_wakes: (0..worker_count)
+                .map(|_| WorkerWake {
                     changed: Condvar::new(),
                 })
                 .collect(),
-            wake_lock: Mutex::new(WakeState {
-                foreground_dispatches_since_background: vec![0; pool_count],
-                high_dispatches_since_normal: vec![0; pool_count],
-            }),
+            pool_worker_ordinals: (0..worker_count).map(|worker| vec![worker]).collect(),
+            wake_lock: Mutex::new(new_wake_state(pool_count, worker_count)),
             steal_policy,
             shutdown: AtomicBool::new(false),
             completed_jobs: AtomicU64::new(0),
             local_dispatches: AtomicU64::new(0),
             stolen_dispatches: AtomicU64::new(0),
-            test_probe: ExecutionTestProbe::new(pool_count),
+            test_probe: ExecutionTestProbe::new(pool_count, worker_count),
         }
     }
 
@@ -1381,7 +2012,8 @@ mod tests {
             class,
             enqueued_at,
             operation: Box::new(|| {}),
-            completed,
+            completed: Some(completed),
+            targeted_completion: None,
         }
     }
 
@@ -1478,6 +2110,21 @@ mod tests {
         for worker in topology.pools.iter_mut().flat_map(|pool| &mut pool.workers) {
             worker.logical_processor_id = None;
         }
+        Ok(topology)
+    }
+
+    fn single_worker_topology() -> Result<NativeExecutionTopology, NativeExecutionError> {
+        let mut policy = policy();
+        policy.schedulable_compute_threads = 1;
+        let mut topology = NativeExecutionTopology::derive(&profile(), &policy)?;
+        topology.hard_affinity = false;
+        let worker = topology
+            .pools
+            .iter_mut()
+            .flat_map(|pool| &mut pool.workers)
+            .next()
+            .ok_or(NativeExecutionError::EmptyExecution)?;
+        worker.logical_processor_id = None;
         Ok(topology)
     }
 
@@ -1626,10 +2273,7 @@ mod tests {
                 now.checked_sub(Duration::from_nanos(2_999))
                     .ok_or_else(|| io::Error::other("test clock underflow"))?,
             ));
-        let mut wake = WakeState {
-            foreground_dispatches_since_background: vec![0, 0],
-            high_dispatches_since_normal: vec![0, 0],
-        };
+        let mut wake = new_wake_state(2, 2);
         assert!(take_job(&inner, &mut wake, 0, now).is_none());
         assert!(
             take_job(
@@ -1670,10 +2314,7 @@ mod tests {
         jobs.push_back(queued_job(WorkloadClass::Mutation, now));
         jobs.push_back(queued_job(WorkloadClass::ForegroundBounded, now));
         drop(jobs);
-        let mut wake = WakeState {
-            foreground_dispatches_since_background: vec![0, 0],
-            high_dispatches_since_normal: vec![0, 0],
-        };
+        let mut wake = new_wake_state(2, 2);
         assert_eq!(
             take_job(&inner, &mut wake, 0, now).map(|job| job.class),
             Some(WorkloadClass::ForegroundPoint)
@@ -1708,10 +2349,7 @@ mod tests {
         jobs.push_back(queued_job(WorkloadClass::ForegroundPoint, now));
         jobs.push_back(queued_job(WorkloadClass::ForegroundBounded, now));
         drop(jobs);
-        let mut wake = WakeState {
-            foreground_dispatches_since_background: vec![0, 0],
-            high_dispatches_since_normal: vec![0, 0],
-        };
+        let mut wake = new_wake_state(2, 2);
         assert_eq!(
             take_job(&inner, &mut wake, 0, now).map(|job| job.class),
             Some(WorkloadClass::ForegroundPoint)
@@ -1778,7 +2416,8 @@ mod tests {
                             .to_owned(),
                     );
                 }),
-                completed: completed_tx,
+                completed: Some(completed_tx),
+                targeted_completion: None,
             },
         );
         assert!(completed_rx.recv_timeout(Duration::from_secs(2))?);
@@ -1830,6 +2469,121 @@ mod tests {
     }
 
     #[test]
+    fn generic_submit_wakes_sleeping_worker_instead_of_busy_round_robin_target()
+    -> Result<(), Box<dyn Error>> {
+        let mut topology = single_worker_topology()?;
+        let second = NativeWorkerPlacement {
+            worker_index: 1,
+            logical_processor_id: None,
+            numa_node_id: None,
+            socket_id: None,
+            core_id: None,
+            smt_rank: Some(0),
+        };
+        topology.pools[0].workers.push(second);
+        let pool = NativeExecutionPool::from_topology(topology)?;
+        let release = HomeWorkerRelease::new();
+        let (active_started_tx, active_started_rx) = mpsc::sync_channel(1);
+        let (active_completed_tx, active_completed_rx) = mpsc::channel();
+        let active_release = release.waiter();
+        pool.submit(
+            0,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at: Instant::now(),
+                operation: Box::new(move || {
+                    let _ignored = active_started_tx.send(());
+                    active_release.wait();
+                }),
+                completed: Some(active_completed_tx),
+                targeted_completion: None,
+            },
+        );
+        active_started_rx.recv_timeout(Duration::from_secs(2))?;
+        wait_for_sleeping_workers(&pool, &[1])?;
+        pool.inner
+            .wake_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_worker_by_pool[0] = 0;
+
+        let (generic_completed_tx, generic_completed_rx) = mpsc::channel();
+        pool.submit(
+            0,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at: Instant::now(),
+                operation: Box::new(|| {}),
+                completed: Some(generic_completed_tx),
+                targeted_completion: None,
+            },
+        );
+        assert!(generic_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        assert!(matches!(
+            active_completed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(release);
+        assert!(active_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_on_ineligible_remote_pool_work() -> Result<(), Box<dyn Error>> {
+        let pool = NativeExecutionPool::from_topology(portable_unbound_numa_topology()?)?;
+        let release = HomeWorkerRelease::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        for _ in 0..2 {
+            let started_tx = started_tx.clone();
+            let completed_tx = completed_tx.clone();
+            let worker_release = release.waiter();
+            pool.submit(
+                0,
+                Job {
+                    class: WorkloadClass::ForegroundBounded,
+                    enqueued_at: Instant::now(),
+                    operation: Box::new(move || {
+                        let _ignored = started_tx.send(());
+                        worker_release.wait();
+                    }),
+                    completed: Some(completed_tx),
+                    targeted_completion: None,
+                },
+            );
+        }
+        drop(started_tx);
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        pool.submit(
+            0,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at: Instant::now(),
+                operation: Box::new(|| {}),
+                completed: Some(completed_tx),
+                targeted_completion: None,
+            },
+        );
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            pool.shutdown_and_join_for_test();
+            let _ignored = shutdown_tx.send(());
+        });
+        assert!(matches!(
+            shutdown_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(release);
+        for _ in 0..3 {
+            assert!(completed_rx.recv_timeout(Duration::from_secs(2))?);
+        }
+        shutdown_rx.recv_timeout(Duration::from_secs(2))?;
+        shutdown.join().map_err(|_| "shutdown thread panicked")?;
+        Ok(())
+    }
+
+    #[test]
     fn calibrated_remote_candidate_observes_steal_delay() -> Result<(), Box<dyn Error>> {
         let mut topology = portable_unbound_numa_topology()?;
         topology.numa_steal_policy = calibrated_policy_for_scheduler_tests()?;
@@ -1842,11 +2596,11 @@ mod tests {
         let pool = NativeExecutionPool::from_topology(topology)?;
         wait_for_sleeping_workers(&pool, &[2, 2])?;
 
-        let release_home = Arc::new(Barrier::new(3));
+        let release_home = HomeWorkerRelease::new();
         let (home_started_tx, home_started_rx) = mpsc::channel();
         let (home_completed_tx, home_completed_rx) = mpsc::channel();
         for _ in 0..2 {
-            let release_home = Arc::clone(&release_home);
+            let release_home = release_home.waiter();
             let home_started_tx = home_started_tx.clone();
             pool.submit(
                 1,
@@ -1857,7 +2611,8 @@ mod tests {
                         let _ignored = home_started_tx.send(());
                         release_home.wait();
                     }),
-                    completed: home_completed_tx.clone(),
+                    completed: Some(home_completed_tx.clone()),
+                    targeted_completion: None,
                 },
             );
         }
@@ -1883,7 +2638,8 @@ mod tests {
                             .to_owned(),
                     );
                 }),
-                completed: stolen_completed_tx,
+                completed: Some(stolen_completed_tx),
+                targeted_completion: None,
             },
         );
         assert!(matches!(
@@ -1902,10 +2658,60 @@ mod tests {
         assert_eq!(after[1].saturating_sub(before[1]), 0);
         assert_eq!(pool.stolen_dispatches(), 1);
 
-        release_home.wait();
+        drop(release_home);
         assert!(home_completed_rx.recv_timeout(Duration::from_secs(2))?);
         assert!(home_completed_rx.recv_timeout(Duration::from_secs(2))?);
         wait_for_sleeping_workers(&pool, &[2, 2])?;
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_remote_candidate_early_unwind_does_not_deadlock() -> Result<(), Box<dyn Error>> {
+        let (scenario_completed_tx, scenario_completed_rx) = mpsc::sync_channel(1);
+        let scenario = thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<(), Box<dyn Error>> {
+                    let pool =
+                        NativeExecutionPool::from_topology(portable_unbound_numa_topology()?)?;
+                    let release_home = HomeWorkerRelease::new();
+                    let (home_started_tx, home_started_rx) = mpsc::channel();
+                    let (home_completed_tx, _home_completed_rx) = mpsc::channel();
+                    for _ in 0..2 {
+                        let release_home = release_home.waiter();
+                        let home_started_tx = home_started_tx.clone();
+                        pool.submit(
+                            1,
+                            Job {
+                                class: WorkloadClass::ForegroundBounded,
+                                enqueued_at: Instant::now(),
+                                operation: Box::new(move || {
+                                    let _ignored = home_started_tx.send(());
+                                    release_home.wait();
+                                }),
+                                completed: Some(home_completed_tx.clone()),
+                                targeted_completion: None,
+                            },
+                        );
+                    }
+                    drop(home_started_tx);
+                    drop(home_completed_tx);
+                    home_started_rx.recv_timeout(Duration::from_secs(2))?;
+                    home_started_rx.recv_timeout(Duration::from_secs(2))?;
+                    std::panic::resume_unwind(Box::new(
+                        "injected failure before releasing home workers",
+                    ));
+                },
+            ));
+            let _ignored = scenario_completed_tx.send(outcome.is_err());
+        });
+
+        let unwound = scenario_completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| io::Error::other("pool teardown deadlocked after test unwind"))?;
+        assert!(unwound);
+        scenario
+            .join()
+            .map_err(|_| io::Error::other("unwind scenario thread panicked"))?;
         Ok(())
     }
 
@@ -2017,6 +2823,580 @@ mod tests {
             pool.execute_ordered(&parent, vec![1_u64, 2, 3, 4], |value| value + 1)?,
             vec![2, 3, 4, 5]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_single_item_uses_one_stable_existing_worker() -> Result<(), Box<dyn Error>> {
+        let topology = portable_unbound_numa_topology()?;
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let target_worker = 5 % topology.worker_count();
+        let target_pool = topology
+            .pools
+            .iter()
+            .position(|pool| {
+                pool.workers
+                    .iter()
+                    .any(|worker| worker.worker_index == target_worker)
+            })
+            .ok_or("stable target worker was absent from topology")?;
+        let expected_worker_name = format!("hyphae-numa-{target_pool}-{target_worker}");
+        let pool = NativeExecutionPool::from_topology(topology)?;
+        let caller = thread::current().id();
+        let mut worker_names = BTreeSet::new();
+        for _ in 0..10_000 {
+            let ((worker_thread, actual_worker_name), execution) = pool
+                .execute_single_targeted_profiled(&parent, 5, None, || {
+                    (
+                        thread::current().id(),
+                        thread::current()
+                            .name()
+                            .unwrap_or("unnamed-worker")
+                            .to_owned(),
+                    )
+                })?;
+            assert_ne!(worker_thread, caller);
+            assert_eq!(execution.route, TargetedSingleExecutionRoute::Targeted);
+            assert_eq!(execution.worker_index, target_worker);
+            assert_eq!(
+                actual_worker_name,
+                worker_name(&pool.topology, execution.worker_index)?
+            );
+            assert_eq!(actual_worker_name, expected_worker_name);
+            worker_names.insert(actual_worker_name);
+        }
+        assert_eq!(worker_names.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_single_item_busy_slot_falls_back_without_losing_work() -> Result<(), Box<dyn Error>>
+    {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 3,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            portable_unbound_numa_topology()?,
+        )?);
+        let release = HomeWorkerRelease::new();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_release = release.waiter();
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(&active_parent, 1, None, move || {
+                let _ignored = started_tx.send(());
+                active_release.wait();
+                11_u64
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let queued_pool = Arc::clone(&pool);
+        let queued_parent = Arc::clone(&parent);
+        let queued = thread::spawn(move || {
+            queued_pool.execute_single_targeted_profiled(&queued_parent, 1, None, || 13_u64)
+        });
+        pool.wait_for_targeted_slot_for_test(1, Duration::from_secs(2))?;
+        let fallback_caller = thread::current().id();
+        let ((fallback_thread, actual_worker_name), fallback) = pool
+            .execute_single_targeted_profiled(&parent, 1, None, || {
+                (
+                    thread::current().id(),
+                    thread::current()
+                        .name()
+                        .unwrap_or("unnamed-worker")
+                        .to_owned(),
+                )
+            })?;
+        assert_ne!(fallback_thread, fallback_caller);
+        assert_eq!(
+            actual_worker_name,
+            worker_name(&pool.topology, fallback.worker_index)?
+        );
+        assert_eq!(
+            fallback.route,
+            TargetedSingleExecutionRoute::GenericFallbackBusy
+        );
+
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            11
+        );
+        assert_eq!(
+            queued.join().map_err(|_| "queued submitter panicked")??.0,
+            13
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_flood_cannot_starve_eligible_generic_work() -> Result<(), Box<dyn Error>> {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 3,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            single_worker_topology()?
+        )?);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let release = HomeWorkerRelease::new();
+        let (active_tx, active_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_release = release.waiter();
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(&active_parent, 0, None, move || {
+                let _ignored = active_tx.send(());
+                active_release.wait();
+                "active"
+            })
+        });
+        active_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let generic_child = parent.try_subdivide_owned(GovernorRequest {
+            compute_threads: 1,
+            io_slots: 0,
+            memory_bytes: 0,
+        })?;
+        let (generic_completed_tx, generic_completed_rx) = mpsc::channel();
+        pool.submit(
+            0,
+            Job {
+                class: WorkloadClass::ForegroundBounded,
+                enqueued_at: Instant::now(),
+                operation: Box::new({
+                    let observed = Arc::clone(&observed);
+                    move || {
+                        observed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push("generic");
+                        drop(generic_child);
+                    }
+                }),
+                completed: Some(generic_completed_tx),
+                targeted_completion: None,
+            },
+        );
+        let targeted_pool = Arc::clone(&pool);
+        let targeted_parent = Arc::clone(&parent);
+        let targeted_observed = Arc::clone(&observed);
+        let targeted = thread::spawn(move || {
+            targeted_pool.execute_single_targeted_profiled(&targeted_parent, 0, None, move || {
+                targeted_observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push("targeted");
+            })
+        });
+        pool.wait_for_targeted_slot_for_test(0, Duration::from_secs(2))?;
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            "active"
+        );
+        let ((), targeted) = targeted
+            .join()
+            .map_err(|_| "targeted submitter panicked")??;
+        assert_eq!(targeted.route, TargetedSingleExecutionRoute::Targeted);
+        assert!(generic_completed_rx.recv_timeout(Duration::from_secs(2))?);
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["generic", "targeted"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_queued_cancel_is_generation_safe_and_slot_reusable() -> Result<(), Box<dyn Error>> {
+        let mut policy = policy();
+        policy.schedulable_compute_threads = 2;
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 2,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            single_worker_topology()?
+        )?);
+        let release = HomeWorkerRelease::new();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_release = release.waiter();
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(&active_parent, 0, None, move || {
+                let _ignored = started_tx.send(());
+                active_release.wait();
+                1_u64
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let cancellation = governor.cancellation_token();
+        let queued_pool = Arc::clone(&pool);
+        let queued_parent = Arc::clone(&parent);
+        let queued_cancellation = cancellation.clone();
+        let queued = thread::spawn(move || {
+            queued_pool.execute_single_targeted_profiled(
+                &queued_parent,
+                0,
+                Some(&queued_cancellation),
+                || 2_u64,
+            )
+        });
+        let stale = pool.wait_for_targeted_ticket_for_test(0, Duration::from_secs(2))?;
+        cancellation.cancel();
+        let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+        let cancelled_waiter = thread::spawn(move || {
+            let result = queued.join().map_err(|_| "queued submitter panicked");
+            let _ignored = cancelled_tx.send(result);
+        });
+        assert!(matches!(
+            cancelled_rx.recv_timeout(Duration::from_secs(2))??,
+            Err(TargetedSingleExecutionError::Cancelled)
+        ));
+        cancelled_waiter
+            .join()
+            .map_err(|_| "cancel result waiter panicked")?;
+        let next = pool.enqueue_targeted_for_test(&parent, 0, || 3_u64)?;
+        assert_ne!(stale, next.ticket);
+        assert!(!pool.cancel_targeted_ticket_for_test(stale));
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            1
+        );
+        assert_eq!(NativeExecutionPool::wait_targeted_for_test(&next)?.0, 3);
+        assert_eq!(
+            pool.execute_single_targeted_profiled(&parent, 0, None, || 4_u64)?
+                .0,
+            4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_generation_overflow_fails_closed_without_overwriting_slot()
+    -> Result<(), Box<dyn Error>> {
+        let pool = NativeExecutionPool::from_topology(single_worker_topology()?)?;
+        pool.set_targeted_generation_for_test(0, u64::MAX);
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        assert!(matches!(
+            pool.execute_single_targeted_profiled(&parent, 0, None, || 1_u64),
+            Err(TargetedSingleExecutionError::GenerationExhausted)
+        ));
+        assert!(!pool.targeted_slot_occupied_for_test(0));
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_submit_between_worker_check_and_wait_has_no_lost_wake() -> Result<(), Box<dyn Error>>
+    {
+        let mut policy = policy();
+        policy.schedulable_compute_threads = 1;
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let pool = NativeExecutionPool::from_topology(single_worker_topology()?)?;
+        let release = HomeWorkerRelease::new();
+        let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+        let wait_release = release.waiter();
+        pool.install_targeted_pre_wait_hook_for_test(0, waiting_tx, move || {
+            wait_release.wait();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(2))?;
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let submitter = thread::spawn(move || {
+            let result = pool.execute_single_targeted_profiled(&parent, 0, None, || 41_u64);
+            let _ignored = completed_tx.send(result);
+        });
+        drop(release);
+        assert_eq!(completed_rx.recv_timeout(Duration::from_secs(2))??.0, 41);
+        submitter
+            .join()
+            .map_err(|_| "lost-wake submitter panicked")?;
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_pre_cancel_and_foreign_cancel_fail_without_consuming_generation()
+    -> Result<(), Box<dyn Error>> {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy.clone()));
+        let foreign = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let pool = NativeExecutionPool::from_topology(single_worker_topology()?)?;
+        let generation = pool.targeted_generation_for_test(0);
+        let cancelled = governor.cancellation_token();
+        cancelled.cancel();
+        assert!(matches!(
+            pool.execute_single_targeted_profiled(&parent, 0, Some(&cancelled), || 1_u64),
+            Err(TargetedSingleExecutionError::Cancelled)
+        ));
+        assert_eq!(pool.targeted_generation_for_test(0), generation);
+        let foreign = foreign.cancellation_token();
+        foreign.cancel();
+        assert!(matches!(
+            pool.execute_single_targeted_profiled(&parent, 0, Some(&foreign), || 2_u64),
+            Err(TargetedSingleExecutionError::ForeignCancellation)
+        ));
+        assert_eq!(pool.targeted_generation_for_test(0), generation);
+        assert!(!pool.targeted_slot_occupied_for_test(0));
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_active_cancellation_remains_cooperative() -> Result<(), Box<dyn Error>> {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            single_worker_topology()?
+        )?);
+        let release = HomeWorkerRelease::new();
+        let cancellation = governor.cancellation_token();
+        let executions = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_cancellation = cancellation.clone();
+        let active_release = release.waiter();
+        let active_executions = Arc::clone(&executions);
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(
+                &active_parent,
+                0,
+                Some(&active_cancellation),
+                move || {
+                    active_executions.fetch_add(1, Ordering::AcqRel);
+                    let _ignored = started_tx.send(());
+                    active_release.wait();
+                    1_u64
+                },
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        cancellation.cancel();
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            1
+        );
+        assert_eq!(executions.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_generic_fallback_cancellation_remains_cooperative() -> Result<(), Box<dyn Error>> {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 3,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            single_worker_topology()?
+        )?);
+        let release = HomeWorkerRelease::new();
+        let cancellation = governor.cancellation_token();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_cancellation = cancellation.clone();
+        let active_release = release.waiter();
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(
+                &active_parent,
+                0,
+                Some(&active_cancellation),
+                move || {
+                    let _ignored = started_tx.send(());
+                    active_release.wait();
+                    1_u64
+                },
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let queued = pool.enqueue_targeted_for_test(&parent, 0, || 3_u64)?;
+        let fallback_pool = Arc::clone(&pool);
+        let fallback_parent = Arc::clone(&parent);
+        let fallback_cancellation = cancellation.clone();
+        let fallback_executions = Arc::new(AtomicU64::new(0));
+        let worker_executions = Arc::clone(&fallback_executions);
+        let fallback = thread::spawn(move || {
+            fallback_pool.execute_single_targeted_profiled(
+                &fallback_parent,
+                0,
+                Some(&fallback_cancellation),
+                move || {
+                    worker_executions.fetch_add(1, Ordering::AcqRel);
+                    2_u64
+                },
+            )
+        });
+        pool.wait_for_generic_queue_for_test(0, Duration::from_secs(2))?;
+        cancellation.cancel();
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            1
+        );
+        let (value, receipt) = fallback
+            .join()
+            .map_err(|_| "fallback submitter panicked")??;
+        assert_eq!(value, 2);
+        assert_eq!(fallback_executions.load(Ordering::Acquire), 1);
+        assert_eq!(
+            receipt.route,
+            TargetedSingleExecutionRoute::GenericFallbackBusy
+        );
+        assert_eq!(NativeExecutionPool::wait_targeted_for_test(&queued)?.0, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_panic_releases_child_and_slot_for_reuse() -> Result<(), Box<dyn Error>> {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?;
+        let pool = NativeExecutionPool::from_topology(single_worker_topology()?)?;
+        assert!(matches!(
+            pool.execute_single_targeted_profiled(&parent, 0, None, || {
+                std::panic::resume_unwind(Box::new("injected targeted panic"));
+            }),
+            Err(TargetedSingleExecutionError::Execution(
+                NativeExecutionError::OperationPanicked
+            ))
+        ));
+        let child = parent.try_subdivide_owned(GovernorRequest {
+            compute_threads: 1,
+            io_slots: 0,
+            memory_bytes: 0,
+        })?;
+        drop(child);
+        assert_eq!(
+            pool.execute_single_targeted_profiled(&parent, 0, None, || 7_u64)?
+                .0,
+            7
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_shutdown_drains_accepted_and_rejects_closed_admission() -> Result<(), Box<dyn Error>>
+    {
+        let policy = policy();
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        let parent = Arc::new(governor.try_admit_owned(
+            WorkloadClass::ForegroundBounded,
+            GovernorRequest {
+                compute_threads: 2,
+                io_slots: 0,
+                memory_bytes: 0,
+            },
+        )?);
+        let pool = Arc::new(NativeExecutionPool::from_topology(
+            single_worker_topology()?
+        )?);
+        let release = HomeWorkerRelease::new();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let active_pool = Arc::clone(&pool);
+        let active_parent = Arc::clone(&parent);
+        let active_release = release.waiter();
+        let active = thread::spawn(move || {
+            active_pool.execute_single_targeted_profiled(&active_parent, 0, None, move || {
+                let _ignored = started_tx.send(());
+                active_release.wait();
+                1_u64
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let queued = pool.enqueue_targeted_for_test(&parent, 0, || 2_u64)?;
+        pool.signal_shutdown_for_test();
+        assert!(matches!(
+            pool.execute_single_targeted_profiled(&parent, 0, None, || 3_u64),
+            Err(TargetedSingleExecutionError::Closed)
+        ));
+        drop(release);
+        assert_eq!(
+            active.join().map_err(|_| "active submitter panicked")??.0,
+            1
+        );
+        assert_eq!(NativeExecutionPool::wait_targeted_for_test(&queued)?.0, 2);
+        Arc::try_unwrap(pool)
+            .map_err(|_| "shutdown test retained an unexpected pool owner")?
+            .shutdown_and_join_for_test();
         Ok(())
     }
 }

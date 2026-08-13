@@ -19,6 +19,37 @@ operation to an async adapter; it does not add an executor, a second owner, or
 engine semantics. Dropping the completion receiver cannot roll back an
 operation that the owner has executed.
 
+The service may execute only the exact scalar `StructureGet` operation through
+a concurrent immutable read guard. This is not a second product owner: the
+guard reads the same `NativeProduct`, current root authority, resource
+governor, telemetry registry, and service-owned session authority. SQL,
+prepared statements, scans, catalog reads, search, administration, proof work,
+mutations, and every explicit-transaction operation remain on the synchronous
+owner path.
+
+Every owner-bound command, including session open/close and shutdown, acquires
+an intent under the same admission lock before entering the bounded queue. A
+scalar fast read is admitted only while the service accepts work and no owner
+intent is pending; it acquires the product and session read guards before
+releasing admission. The owner acquires admission and the product write guard
+before retiring its intent. Consequently:
+
+- a read admitted before an owner command may finish against the preceding
+  complete root;
+- after any owner command is admitted, no later fast read can overtake it;
+- failed queue admission rolls back its owner intent exactly;
+- an active explicit transaction keeps the session on the owner path;
+- close and shutdown wait for every admitted fast read, then prevent any later
+  read from acquiring product or session authority; and
+- poisoned admission, product, or session state fails closed as `unavailable`.
+
+Fast scalar reads reuse the common context, authentication, authorization,
+request/response-limit, cancellation, deadline, request-ID, expiry, error, and
+telemetry logic. They record a zero-duration service queue observation and the
+same admission, engine-execution, request, error, cancellation, and deadline
+evidence as the owner dispatcher. The optimization does not weaken the native
+resource governor or change response bytes and protocol framing.
+
 Engine-to-engine execution uses direct typed Rust calls. TCP, HTTP, JSON,
 GraphQL, gRPC, RESP, PostgreSQL wire, OpenSearch REST, and the native local
 protocol are forbidden internal engine paths.

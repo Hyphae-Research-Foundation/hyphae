@@ -28,8 +28,9 @@ use hyphae_native_pages::{BufferPool, PAGE_PAYLOAD_SIZE, PageKind, PageStore, Un
 use hyphae_native_types::{Csn, ObjectId, PageId};
 
 use crate::{
-    GovernorCancellation, GovernorQueueError, NativeExecutionPool, NativeRuntimeError,
-    OwnedGovernorPermit,
+    GovernorCancellation, GovernorQueueError, NativeExecutionError, NativeExecutionPool,
+    NativeRuntimeError, OwnedGovernorPermit,
+    execution::{TargetedSingleExecutionError, TargetedSingleExecutionRoute},
     model::CatalogState,
     wal_codec::{Mutation, Opcode},
 };
@@ -62,6 +63,8 @@ pub(crate) struct AnnRoutedSearchExecution {
     pub(crate) execution_workers: usize,
     pub(crate) execution_worker_batches: usize,
     pub(crate) execution_waves: usize,
+    pub(crate) targeted_single_batches: usize,
+    pub(crate) generic_single_fallback_batches: usize,
 }
 
 pub(crate) const ANN_INDEX_META_PREFIX: u8 = 5;
@@ -382,6 +385,8 @@ impl AnnBase {
                 execution_workers: 1,
                 execution_worker_batches: 1,
                 execution_waves: 1,
+                targeted_single_batches: 0,
+                generic_single_fallback_batches: 0,
             }),
             Self::Partitioned(index) => {
                 let selected = index.search_routed(query, options, maximum_partitions)?;
@@ -408,6 +413,8 @@ impl AnnBase {
                     execution_workers: 1,
                     execution_worker_batches: 1,
                     execution_waves: 1,
+                    targeted_single_batches: 0,
+                    generic_single_fallback_batches: 0,
                 })
             }
         }
@@ -936,6 +943,8 @@ impl AnnIndexState {
             execution_workers: routed.workers,
             execution_worker_batches: routed.worker_batches,
             execution_waves: routed.waves,
+            targeted_single_batches: routed.targeted_single_batches,
+            generic_single_fallback_batches: routed.generic_single_fallback_batches,
         })
     }
 
@@ -1043,6 +1052,49 @@ struct AdaptiveRoutedBaseExecution {
     workers: usize,
     worker_batches: usize,
     waves: usize,
+    targeted_single_batches: usize,
+    generic_single_fallback_batches: usize,
+}
+
+#[derive(Default)]
+struct AdaptiveRoutingStats {
+    workers: usize,
+    worker_batches: usize,
+    waves: usize,
+    targeted_single_batches: usize,
+    generic_single_fallback_batches: usize,
+}
+
+impl AdaptiveRoutingStats {
+    fn record_wave(&mut self, wave: &RoutedWaveExecution) -> Result<(), NativeRuntimeError> {
+        self.worker_batches = self
+            .worker_batches
+            .checked_add(wave.worker_batches)
+            .ok_or(NativeExecutionError::Synchronization)?;
+        self.workers = self.workers.max(wave.worker_batches);
+        self.waves = self
+            .waves
+            .checked_add(1)
+            .ok_or(NativeExecutionError::Synchronization)?;
+        self.targeted_single_batches = self
+            .targeted_single_batches
+            .checked_add(wave.targeted_single_batches)
+            .ok_or(NativeExecutionError::Synchronization)?;
+        self.generic_single_fallback_batches = self
+            .generic_single_fallback_batches
+            .checked_add(wave.generic_single_fallback_batches)
+            .ok_or(NativeExecutionError::Synchronization)?;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), NativeRuntimeError> {
+        validate_single_route_counts(
+            self.targeted_single_batches,
+            self.generic_single_fallback_batches,
+            self.worker_batches,
+            self.waves,
+        )
+    }
 }
 
 fn execute_adaptive_routed_base(
@@ -1053,13 +1105,11 @@ fn execute_adaptive_routed_base(
     execution: AnnParallelSearchExecution<'_>,
 ) -> Result<AdaptiveRoutedBaseExecution, NativeRuntimeError> {
     let mut children = Vec::new();
-    let mut worker_batches = 0_usize;
-    let mut workers = 0_usize;
-    let mut waves = 0_usize;
+    let mut routing_counts = AdaptiveRoutingStats::default();
     let mut routed = None;
     for prefix in plan.geometric_prefixes() {
         reject_cancelled_ann_search(execution.cancellation)?;
-        let (next, wave_workers) = execute_routed_wave(
+        let wave = execute_routed_wave(
             state,
             plan,
             children.len()..prefix,
@@ -1067,11 +1117,9 @@ fn execute_adaptive_routed_base(
             execution.permit,
             execution.cancellation,
         )?;
-        children.extend(next);
-        worker_batches = worker_batches.saturating_add(wave_workers);
-        workers = workers.max(wave_workers);
-        waves = waves.saturating_add(1);
-        let cancellation_point = if waves == 1 {
+        routing_counts.record_wave(&wave)?;
+        children.extend(wave.children);
+        let cancellation_point = if routing_counts.waves == 1 {
             AnnSearchCancellationPoint::AfterFirstWave
         } else {
             AnnSearchCancellationPoint::AfterGeometricWidening
@@ -1100,7 +1148,7 @@ fn execute_adaptive_routed_base(
         result
     } else {
         reject_cancelled_ann_search(execution.cancellation)?;
-        let (remaining, fallback_workers) = execute_routed_wave(
+        let fallback = execute_routed_wave(
             state,
             plan,
             children.len()..plan.total_partitions(),
@@ -1113,19 +1161,42 @@ fn execute_adaptive_routed_base(
             execution.cancellation,
         );
         reject_cancelled_ann_search(execution.cancellation)?;
-        children.extend(remaining);
-        worker_batches = worker_batches.saturating_add(fallback_workers);
-        workers = workers.max(fallback_workers);
-        waves = waves.saturating_add(1);
+        routing_counts.record_wave(&fallback)?;
+        children.extend(fallback.children);
         let result = partitioned_base(state)?.merge_routed_search(plan, &children)?;
         merge_routed_candidate_with_deltas(state, query, options, result, execution.cancellation)?
     };
+    routing_counts.validate()?;
     Ok(AdaptiveRoutedBaseExecution {
         result,
-        workers,
-        worker_batches,
-        waves,
+        workers: routing_counts.workers,
+        worker_batches: routing_counts.worker_batches,
+        waves: routing_counts.waves,
+        targeted_single_batches: routing_counts.targeted_single_batches,
+        generic_single_fallback_batches: routing_counts.generic_single_fallback_batches,
     })
+}
+
+fn validate_single_route_counts(
+    targeted_single_batches: usize,
+    generic_single_fallback_batches: usize,
+    worker_batches: usize,
+    waves: usize,
+) -> Result<(), NativeRuntimeError> {
+    let single_route_batches = targeted_single_batches
+        .checked_add(generic_single_fallback_batches)
+        .ok_or(NativeExecutionError::Synchronization)?;
+    if single_route_batches > worker_batches || single_route_batches > waves {
+        return Err(NativeExecutionError::Synchronization.into());
+    }
+    Ok(())
+}
+
+struct RoutedWaveExecution {
+    children: Vec<PartitionedAnnChildSearchResult>,
+    worker_batches: usize,
+    targeted_single_batches: usize,
+    generic_single_fallback_batches: usize,
 }
 
 fn merge_routed_candidate_with_deltas(
@@ -1173,11 +1244,46 @@ fn execute_routed_wave(
     execution_pool: &NativeExecutionPool,
     permit: &OwnedGovernorPermit,
     cancellation: Option<&GovernorCancellation>,
-) -> Result<(Vec<PartitionedAnnChildSearchResult>, usize), NativeRuntimeError> {
+) -> Result<RoutedWaveExecution, NativeRuntimeError> {
     reject_cancelled_ann_search(cancellation)?;
     let work = positions.collect::<Vec<_>>();
     if work.is_empty() {
         return Err(AnnError::InvalidPartitionCount.into());
+    }
+    if work.len() == 1 {
+        let position = work[0];
+        let stable_hint = plan
+            .ranked_partitions()
+            .nth(position)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let state = Arc::clone(state);
+        let plan = Arc::clone(plan);
+        let waiter_cancellation = cancellation.cloned();
+        let operation_cancellation = waiter_cancellation.clone();
+        let (child, receipt) = execution_pool
+            .execute_single_targeted_profiled(
+                permit,
+                stable_hint,
+                waiter_cancellation.as_ref(),
+                move || {
+                    reject_cancelled_ann_search(operation_cancellation.as_ref())?;
+                    Ok::<_, NativeRuntimeError>(
+                        partitioned_base(&state)?.search_planned_partition(&plan, position)?,
+                    )
+                },
+            )
+            .map_err(map_targeted_ann_execution_error)?;
+        let child = child?;
+        let (targeted_single_batches, generic_single_fallback_batches) = match receipt.route {
+            TargetedSingleExecutionRoute::Targeted => (1, 0),
+            TargetedSingleExecutionRoute::GenericFallbackBusy => (0, 1),
+        };
+        return Ok(RoutedWaveExecution {
+            children: vec![child],
+            worker_batches: 1,
+            targeted_single_batches,
+            generic_single_fallback_batches,
+        });
     }
     let state = Arc::clone(state);
     let plan = Arc::clone(plan);
@@ -1190,12 +1296,28 @@ fn execute_routed_wave(
             Ok(partitioned_base(&state)?.search_planned_partition(&plan, position)?)
         },
     )?;
-    Ok((
-        children
+    Ok(RoutedWaveExecution {
+        children: children
             .into_iter()
             .collect::<Result<Vec<_>, NativeRuntimeError>>()?,
         worker_batches,
-    ))
+        targeted_single_batches: 0,
+        generic_single_fallback_batches: 0,
+    })
+}
+
+fn map_targeted_ann_execution_error(error: TargetedSingleExecutionError) -> NativeRuntimeError {
+    match error {
+        TargetedSingleExecutionError::Execution(error) => error.into(),
+        TargetedSingleExecutionError::Cancelled => GovernorQueueError::Cancelled.into(),
+        TargetedSingleExecutionError::ForeignCancellation => {
+            GovernorQueueError::ForeignCancellation.into()
+        }
+        TargetedSingleExecutionError::Closed
+        | TargetedSingleExecutionError::GenerationExhausted => {
+            NativeExecutionError::Synchronization.into()
+        }
+    }
 }
 
 fn reject_cancelled_ann_search(
@@ -5326,6 +5448,56 @@ mod tests {
             lifecycle: DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
             retained_generations: Vec::new(),
         })
+    }
+
+    #[test]
+    fn serial_and_single_generation_routes_never_claim_targeted_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let query = Vector::new([0.0, 0.0])?;
+        let options = SearchOptions::new(1, 16, Some(16))?;
+        let partitioned = partitioned_state()?.search_selected(&query, options, 2)?;
+        assert_eq!(partitioned.targeted_single_batches, 0);
+        assert_eq!(partitioned.generic_single_fallback_batches, 0);
+
+        let definition = definition()?;
+        let base = HnswIndex::build(definition, Vec::new())?;
+        let single = AnnBase::Single(base).search_routed(&query, options, 1)?;
+        assert_eq!(
+            single.routing_mode,
+            AnnRoutingExecutionMode::SingleGenerationFallback
+        );
+        assert_eq!(single.targeted_single_batches, 0);
+        assert_eq!(single.generic_single_fallback_batches, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn single_route_counts_are_bounded_by_batches_and_waves() {
+        assert!(validate_single_route_counts(1, 1, 2, 2).is_ok());
+        assert!(validate_single_route_counts(usize::MAX, 1, usize::MAX, usize::MAX).is_err());
+        assert!(validate_single_route_counts(2, 0, 1, 2).is_err());
+        assert!(validate_single_route_counts(2, 0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn targeted_foreign_cancellation_preserves_governor_causality() {
+        assert!(matches!(
+            map_targeted_ann_execution_error(TargetedSingleExecutionError::ForeignCancellation),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::ForeignCancellation)
+        ));
+        assert!(matches!(
+            map_targeted_ann_execution_error(TargetedSingleExecutionError::Cancelled),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Cancelled)
+        ));
+        for error in [
+            TargetedSingleExecutionError::Closed,
+            TargetedSingleExecutionError::GenerationExhausted,
+        ] {
+            assert!(matches!(
+                map_targeted_ann_execution_error(error),
+                NativeRuntimeError::Execution(NativeExecutionError::Synchronization)
+            ));
+        }
     }
 
     fn restored_entries(base: &AnnBase) -> BTreeMap<[u8; 32], RestoredChildEntries> {

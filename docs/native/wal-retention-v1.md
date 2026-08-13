@@ -151,6 +151,16 @@ Therefore the normal v1 sequence is: vacuum, checkpoint immediately, then
 truncate. A later user commit makes that checkpoint ineligible until another
 vacuum advances the retention floor.
 
+The strict G7 recovery receipt uses this normal sequence only after every
+timed group completion has returned and the scheduler has drained. The vacuum
+is an explicit maintenance transaction, so its CSN is exactly one greater than
+the last logical benchmark commit. The checkpoint retains that CSN without
+advancing it, and the retention anchor uses it as `base_visible_csn`. Reopen
+must then report an empty retained WAL suffix and zero replayed transactions.
+All three maintenance calls and the subsequent open and logical verification
+are outside the hot latency/throughput interval but remain measured and
+projected once in the G7 runtime budget.
+
 ## Publication order
 
 Under exclusive writer and maintenance admission:

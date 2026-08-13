@@ -37,7 +37,7 @@ use crate::{
     ProductTransactionSqlMutation, ProductTransactionStageReceipt, ProductTransactionStageResult,
     ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
     ProgressControl, QualifiedName, RestoreRequest, SnapshotIdentity, StatusRequest,
-    TelemetryEvent, TelemetryEventKind, TimingClass,
+    TelemetryEvent, TelemetryEventKind, TelemetryRegistry, TimingClass,
 };
 
 /// Product-owned durability policy applied to every mutation in one request.
@@ -532,20 +532,35 @@ pub(crate) fn dispatch(
     context: &ProductRequestContext,
     operation: ProductOperation,
 ) -> Result<ProductResponse, ProductError> {
-    let admission_started = Instant::now();
-    product.telemetry.increment(MetricId::Requests, 1);
-    let admitted = admit_operation(session, context, &operation);
-    product
-        .telemetry
-        .record_timing(TimingClass::Admission, admission_started.elapsed());
+    let telemetry = product.telemetry.clone();
+    let admitted = record_admission(&telemetry, session, context, &operation);
     let result = admitted.and_then(|()| {
         let execution_started = Instant::now();
         let result = dispatch_inner(product, session, context, operation);
-        product
-            .telemetry
-            .record_timing(TimingClass::EngineExecution, execution_started.elapsed());
+        telemetry.record_timing(TimingClass::EngineExecution, execution_started.elapsed());
         result
     });
+    record_dispatch_result(&telemetry, context, result)
+}
+
+fn record_admission(
+    telemetry: &TelemetryRegistry,
+    session: &ProductSession,
+    context: &ProductRequestContext,
+    operation: &ProductOperation,
+) -> Result<(), ProductError> {
+    let admission_started = Instant::now();
+    telemetry.increment(MetricId::Requests, 1);
+    let admitted = admit_operation(session, context, operation);
+    telemetry.record_timing(TimingClass::Admission, admission_started.elapsed());
+    admitted
+}
+
+fn record_dispatch_result(
+    telemetry: &TelemetryRegistry,
+    context: &ProductRequestContext,
+    result: Result<ProductResponse, ProductError>,
+) -> Result<ProductResponse, ProductError> {
     let result = result.map_err(|error| {
         if error.request_id().is_some() {
             error
@@ -554,24 +569,52 @@ pub(crate) fn dispatch(
         }
     });
     if let Err(error) = &result {
-        product.telemetry.increment(MetricId::Errors, 1);
+        telemetry.increment(MetricId::Errors, 1);
         let kind = match error.code() {
             ProductErrorCode::Cancelled => {
-                product.telemetry.increment(MetricId::Cancellations, 1);
+                telemetry.increment(MetricId::Cancellations, 1);
                 TelemetryEventKind::Cancelled
             }
             ProductErrorCode::DeadlineExceeded => {
-                product.telemetry.increment(MetricId::Deadlines, 1);
+                telemetry.increment(MetricId::Deadlines, 1);
                 TelemetryEventKind::Deadline
             }
             _ => TelemetryEventKind::Error(error.category()),
         };
-        product.telemetry.record_event(TelemetryEvent {
+        telemetry.record_event(TelemetryEvent {
             captured_at_micros: context.logical_time_micros,
             kind,
         });
     }
     result
+}
+
+pub(crate) fn dispatch_structure_get_read_only(
+    product: &NativeProduct,
+    session: &ProductSession,
+    context: &ProductRequestContext,
+    operation: &ProductOperation,
+) -> Result<ProductResponse, ProductError> {
+    let ProductOperation::StructureGet { key } = &operation else {
+        return Err(context.error(ProductErrorCode::InvalidRequest));
+    };
+    let telemetry = product.telemetry.clone();
+    let admitted = record_admission(&telemetry, session, context, operation);
+    let result = admitted.and_then(|()| {
+        let execution_started = Instant::now();
+        let result = (|| {
+            let response = ProductResponse::StructureValue(
+                product
+                    .database
+                    .get_latest_structure(key, context.logical_time_micros)?,
+            );
+            admit_response(context, &response)?;
+            Ok(response)
+        })();
+        telemetry.record_timing(TimingClass::EngineExecution, execution_started.elapsed());
+        result
+    });
+    record_dispatch_result(&telemetry, context, result)
 }
 
 #[allow(clippy::too_many_lines)]

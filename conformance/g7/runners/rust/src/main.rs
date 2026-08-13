@@ -810,6 +810,7 @@ impl StrictGroupCommitEvidence {
     fn json(
         &self,
         producer_concurrency: usize,
+        maintenance: &StrictGroupCommitMaintenanceEvidence,
         reopen: &StrictGroupCommitReopenEvidence,
     ) -> Result<serde_json::Value, Box<dyn Error>> {
         self.validate_complete()?;
@@ -818,8 +819,17 @@ impl StrictGroupCommitEvidence {
                 "strict group commit producer activity changed before serialization".into(),
             );
         }
+        if maintenance.total_time_nanos == 0
+            || maintenance.maintenance_csn
+                != self
+                    .last_commit_csn
+                    .ok_or("strict group commit evidence omitted its last CSN")?
+                    .saturating_add(1)
+        {
+            return Err("strict group commit maintenance changed before serialization".into());
+        }
         Ok(json!({
-            "schema": "hyphae-native-g7-strict-group-commit-evidence-v1",
+            "schema": "hyphae-native-g7-strict-group-commit-evidence-v2",
             "latency_scope": "scheduler-enqueue-through-durable-response-v1",
             "throughput_scope": "bounded-cohort-window-wall-time-v1",
             "submission_mode": "explicit-bounded-cohort-v1",
@@ -849,6 +859,7 @@ impl StrictGroupCommitEvidence {
             "wal_synchronization_nanos_total": self.wal_synchronization_nanos_total,
             "timing_sample_count": self.observed_commits,
             "timings_nanoseconds": self.timings.json()?,
+            "maintenance": maintenance.value.clone(),
             "reopen": reopen.json(),
         }))
     }
@@ -860,13 +871,28 @@ struct StrictGroupCommitReopenEvidence {
     baseline_committed_transactions: usize,
     reopened_visible_csn: u64,
     reopened_committed_transactions: usize,
+    wal_base_csn: u64,
+    retained_wal_blocks: usize,
+    retained_wal_bytes: u64,
+    replayed_transactions: usize,
     verified_logical_commits: usize,
     missing_keys: usize,
     mismatched_values: usize,
     expected_state_digest: String,
     recovered_state_digest: String,
+    manifest_verification_time_nanos: u64,
+    wal_physical_verification_time_nanos: u64,
+    wal_semantic_replay_time_nanos: u64,
+    root_validation_time_nanos: u64,
     open_time_nanos: u64,
     verification_time_nanos: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StrictGroupCommitMaintenanceEvidence {
+    value: serde_json::Value,
+    maintenance_csn: u64,
+    total_time_nanos: u64,
 }
 
 impl StrictGroupCommitReopenEvidence {
@@ -875,22 +901,39 @@ impl StrictGroupCommitReopenEvidence {
         plan: &StrictGroupCommitPlan,
         first_commit_csn: u64,
         last_commit_csn: u64,
+        maintenance_csn: u64,
     ) -> Result<(), Box<dyn Error>> {
+        let recovery_component_nanos = self
+            .manifest_verification_time_nanos
+            .checked_add(self.wal_physical_verification_time_nanos)
+            .and_then(|value| value.checked_add(self.wal_semantic_replay_time_nanos))
+            .and_then(|value| value.checked_add(self.root_validation_time_nanos))
+            .ok_or("strict group commit recovery timing overflowed")?;
         if self
             .reopened_visible_csn
             .checked_sub(self.baseline_visible_csn)
-            != Some(u64::try_from(plan.logical_commits)?)
+            != Some(u64::try_from(plan.logical_commits)?.saturating_add(1))
             || self
                 .reopened_committed_transactions
                 .checked_sub(self.baseline_committed_transactions)
-                != Some(plan.logical_commits)
+                != Some(plan.logical_commits.saturating_add(1))
             || first_commit_csn != self.baseline_visible_csn.saturating_add(1)
-            || last_commit_csn != self.reopened_visible_csn
+            || last_commit_csn.saturating_add(1) != maintenance_csn
+            || self.reopened_visible_csn != maintenance_csn
+            || self.wal_base_csn != maintenance_csn
+            || self.retained_wal_blocks != 0
+            || self.retained_wal_bytes != 0
+            || self.replayed_transactions != 0
             || self.verified_logical_commits != plan.logical_commits
             || self.missing_keys != 0
             || self.mismatched_values != 0
             || self.expected_state_digest != self.recovered_state_digest
+            || self.manifest_verification_time_nanos == 0
+            || self.wal_physical_verification_time_nanos == 0
+            || self.wal_semantic_replay_time_nanos == 0
+            || self.root_validation_time_nanos == 0
             || self.open_time_nanos == 0
+            || self.open_time_nanos < recovery_component_nanos
             || self.verification_time_nanos == 0
         {
             return Err("strict group commit reopen evidence is incomplete or inconsistent".into());
@@ -900,17 +943,25 @@ impl StrictGroupCommitReopenEvidence {
 
     fn json(&self) -> serde_json::Value {
         json!({
-            "provider": "single-reopened-root-snapshot-full-key-digest-v1",
+            "provider": "retained-anchor-reopened-root-snapshot-full-key-digest-v2",
             "baseline_visible_csn": self.baseline_visible_csn,
             "baseline_committed_transactions": self.baseline_committed_transactions,
             "reopened_visible_csn": self.reopened_visible_csn,
             "reopened_committed_transactions": self.reopened_committed_transactions,
+            "wal_base_csn": self.wal_base_csn,
+            "retained_wal_blocks": self.retained_wal_blocks,
+            "retained_wal_bytes": self.retained_wal_bytes,
+            "replayed_transactions": self.replayed_transactions,
             "verified_logical_commits": self.verified_logical_commits,
             "missing_keys": self.missing_keys,
             "mismatched_values": self.mismatched_values,
             "state_digest_algorithm": "blake3-logical-id-key-value-v1",
             "expected_state_digest": self.expected_state_digest,
             "recovered_state_digest": self.recovered_state_digest,
+            "manifest_verification_time_nanos": self.manifest_verification_time_nanos,
+            "wal_physical_verification_time_nanos": self.wal_physical_verification_time_nanos,
+            "wal_semantic_replay_time_nanos": self.wal_semantic_replay_time_nanos,
+            "root_validation_time_nanos": self.root_validation_time_nanos,
             "open_time_nanos": self.open_time_nanos,
             "verification_time_nanos": self.verification_time_nanos,
         })
@@ -964,6 +1015,8 @@ struct RoutingObservation {
     execution_worker_batches: u64,
     execution_waves: u64,
     selected_partitions: u64,
+    targeted_single_batches: u64,
+    generic_single_fallback_batches: u64,
     next_partition_lower_bound: f64,
     kth_distance: f64,
 }
@@ -975,6 +1028,8 @@ struct RoutingIntervalEvidence {
     execution_waves_max: u64,
     selected_certified: u64,
     selected_partitions_max: u64,
+    targeted_single_batches: u64,
+    generic_single_fallback_batches: u64,
     next_partition_lower_bound_present: u64,
     minimum_next_partition_lower_bound: f64,
     maximum_kth_distance: f64,
@@ -988,13 +1043,15 @@ impl RoutingIntervalEvidence {
             execution_waves_max: 0,
             selected_certified: 0,
             selected_partitions_max: 0,
+            targeted_single_batches: 0,
+            generic_single_fallback_batches: 0,
             next_partition_lower_bound_present: 0,
             minimum_next_partition_lower_bound: f64::INFINITY,
             maximum_kth_distance: 0.0,
         }
     }
 
-    fn observe(&mut self, observation: RoutingObservation) {
+    fn observe(&mut self, observation: RoutingObservation) -> Result<(), Box<dyn Error>> {
         self.execution_workers_max = self
             .execution_workers_max
             .max(observation.execution_workers);
@@ -1009,12 +1066,26 @@ impl RoutingIntervalEvidence {
             .minimum_next_partition_lower_bound
             .min(observation.next_partition_lower_bound);
         self.maximum_kth_distance = self.maximum_kth_distance.max(observation.kth_distance);
-        self.selected_certified = self.selected_certified.saturating_add(1);
-        self.next_partition_lower_bound_present =
-            self.next_partition_lower_bound_present.saturating_add(1);
+        self.targeted_single_batches = self
+            .targeted_single_batches
+            .checked_add(observation.targeted_single_batches)
+            .ok_or("G7 targeted ANN routing evidence overflowed")?;
+        self.generic_single_fallback_batches = self
+            .generic_single_fallback_batches
+            .checked_add(observation.generic_single_fallback_batches)
+            .ok_or("G7 generic ANN fallback evidence overflowed")?;
+        self.selected_certified = self
+            .selected_certified
+            .checked_add(1)
+            .ok_or("G7 selected ANN evidence overflowed")?;
+        self.next_partition_lower_bound_present = self
+            .next_partition_lower_bound_present
+            .checked_add(1)
+            .ok_or("G7 ANN bound evidence overflowed")?;
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
         self.execution_workers_max = self.execution_workers_max.max(other.execution_workers_max);
         self.execution_worker_batches_max = self
             .execution_worker_batches_max
@@ -1027,12 +1098,23 @@ impl RoutingIntervalEvidence {
             .minimum_next_partition_lower_bound
             .min(other.minimum_next_partition_lower_bound);
         self.maximum_kth_distance = self.maximum_kth_distance.max(other.maximum_kth_distance);
+        self.targeted_single_batches = self
+            .targeted_single_batches
+            .checked_add(other.targeted_single_batches)
+            .ok_or("G7 targeted ANN routing merge overflowed")?;
+        self.generic_single_fallback_batches = self
+            .generic_single_fallback_batches
+            .checked_add(other.generic_single_fallback_batches)
+            .ok_or("G7 generic ANN fallback merge overflowed")?;
         self.selected_certified = self
             .selected_certified
-            .saturating_add(other.selected_certified);
+            .checked_add(other.selected_certified)
+            .ok_or("G7 selected ANN merge overflowed")?;
         self.next_partition_lower_bound_present = self
             .next_partition_lower_bound_present
-            .saturating_add(other.next_partition_lower_bound_present);
+            .checked_add(other.next_partition_lower_bound_present)
+            .ok_or("G7 ANN bound merge overflowed")?;
+        Ok(())
     }
 
     fn observation(
@@ -1045,6 +1127,10 @@ impl RoutingIntervalEvidence {
             execution_worker_batches: u64::try_from(receipt.execution_worker_batches)?,
             execution_waves: u64::try_from(receipt.execution_waves)?,
             selected_partitions: u64::try_from(receipt.selected_partitions.len())?,
+            targeted_single_batches: u64::try_from(receipt.targeted_single_batches)?,
+            generic_single_fallback_batches: u64::try_from(
+                receipt.generic_single_fallback_batches,
+            )?,
             next_partition_lower_bound: next_lower_bound,
             kth_distance,
         })
@@ -1071,6 +1157,8 @@ impl RoutingIntervalEvidence {
             "single_generation_fallback": 0,
             "next_partition_lower_bound_present": self.next_partition_lower_bound_present,
             "selected_partitions_max": self.selected_partitions_max,
+            "targeted_single_batches": self.targeted_single_batches,
+            "generic_single_fallback_batches": self.generic_single_fallback_batches,
             "minimum_next_partition_lower_bound": self.minimum_next_partition_lower_bound,
             "maximum_kth_distance": self.maximum_kth_distance,
         }))
@@ -1086,8 +1174,8 @@ impl Default for RoutingIntervalEvidence {
 trait MeasurementEvidence: Default + Send {
     type Observation: Send;
 
-    fn observe(&mut self, observation: Self::Observation);
-    fn merge(&mut self, other: Self);
+    fn observe(&mut self, observation: Self::Observation) -> Result<(), Box<dyn Error>>;
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1111,12 +1199,12 @@ struct MeasurementFailure {
 impl MeasurementEvidence for RoutingIntervalEvidence {
     type Observation = RoutingObservation;
 
-    fn observe(&mut self, observation: Self::Observation) {
-        Self::observe(self, observation);
+    fn observe(&mut self, observation: Self::Observation) -> Result<(), Box<dyn Error>> {
+        Self::observe(self, observation)
     }
 
-    fn merge(&mut self, other: Self) {
-        Self::merge(self, other);
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
+        Self::merge(self, other)
     }
 }
 
@@ -1160,8 +1248,8 @@ impl Default for HybridIntervalEvidence {
 impl MeasurementEvidence for HybridIntervalEvidence {
     type Observation = HybridObservation;
 
-    fn observe(&mut self, observation: Self::Observation) {
-        self.routing.observe(observation.routing);
+    fn observe(&mut self, observation: Self::Observation) -> Result<(), Box<dyn Error>> {
+        self.routing.observe(observation.routing)?;
         self.peak_admission_executions = self.peak_admission_executions.saturating_add(1);
         self.peak_admission_compute_threads = self
             .peak_admission_compute_threads
@@ -1180,10 +1268,11 @@ impl MeasurementEvidence for HybridIntervalEvidence {
             .result_retention_memory_bytes_max
             .max(observation.result_retention_memory_bytes);
         self.fusion_executions = self.fusion_executions.saturating_add(1);
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
-        self.routing.merge(other.routing);
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
+        self.routing.merge(other.routing)?;
         self.peak_admission_executions = self
             .peak_admission_executions
             .saturating_add(other.peak_admission_executions);
@@ -1208,6 +1297,7 @@ impl MeasurementEvidence for HybridIntervalEvidence {
         self.fusion_executions = self
             .fusion_executions
             .saturating_add(other.fusion_executions);
+        Ok(())
     }
 }
 
@@ -1242,7 +1332,7 @@ impl Default for LexicalIntervalEvidence {
 impl MeasurementEvidence for LexicalIntervalEvidence {
     type Observation = LexicalObservation;
 
-    fn observe(&mut self, observation: Self::Observation) {
+    fn observe(&mut self, observation: Self::Observation) -> Result<(), Box<dyn Error>> {
         self.observations = self.observations.saturating_add(1);
         self.postings_evaluated = self
             .postings_evaluated
@@ -1256,9 +1346,10 @@ impl MeasurementEvidence for LexicalIntervalEvidence {
         self.execution_sequence_last = self
             .execution_sequence_last
             .max(observation.execution_sequence);
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
         self.observations = self.observations.saturating_add(other.observations);
         self.postings_evaluated = self
             .postings_evaluated
@@ -1272,6 +1363,7 @@ impl MeasurementEvidence for LexicalIntervalEvidence {
         self.execution_sequence_last = self
             .execution_sequence_last
             .max(other.execution_sequence_last);
+        Ok(())
     }
 }
 
@@ -1352,7 +1444,7 @@ impl Default for FilteredLexicalIntervalEvidence {
 impl MeasurementEvidence for FilteredLexicalIntervalEvidence {
     type Observation = FilteredLexicalObservation;
 
-    fn observe(&mut self, observation: Self::Observation) {
+    fn observe(&mut self, observation: Self::Observation) -> Result<(), Box<dyn Error>> {
         self.observations = self.observations.saturating_add(1);
         self.execution_sequence_first = self
             .execution_sequence_first
@@ -1372,9 +1464,10 @@ impl MeasurementEvidence for FilteredLexicalIntervalEvidence {
         self.physical_page_reads = self
             .physical_page_reads
             .saturating_add(observation.physical_page_reads);
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
         self.observations = self.observations.saturating_add(other.observations);
         self.execution_sequence_first = self
             .execution_sequence_first
@@ -1392,6 +1485,7 @@ impl MeasurementEvidence for FilteredLexicalIntervalEvidence {
         self.physical_page_reads = self
             .physical_page_reads
             .saturating_add(other.physical_page_reads);
+        Ok(())
     }
 }
 
@@ -1508,6 +1602,12 @@ struct SurfaceProgress {
     completed: AtomicU64,
     phase_base: AtomicU64,
     phase_total: AtomicU64,
+}
+
+struct SurfaceIdlePhase<'progress> {
+    progress: &'progress SurfaceProgress,
+    phase: String,
+    completed: bool,
 }
 
 struct ProgressReporter {
@@ -2249,6 +2349,22 @@ impl Drop for ProgressReporter {
     }
 }
 
+impl SurfaceIdlePhase<'_> {
+    fn complete(mut self) -> std::io::Result<()> {
+        self.progress.finish_idle_phase(&self.phase)?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SurfaceIdlePhase<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.progress.disable_idle_heartbeat();
+        }
+    }
+}
+
 impl SurfaceProgress {
     fn begin_phase(&self, phase: &str, total_units: usize) -> std::io::Result<()> {
         let completed = self.completed.load(Ordering::Relaxed);
@@ -2286,6 +2402,64 @@ impl SurfaceProgress {
             )));
         }
         self.cell.advance(units)
+    }
+
+    fn begin_idle_phase(&self, phase: &str) -> std::io::Result<()> {
+        self.cell.set_phase(
+            &format!("surface-{phase}"),
+            phase,
+            &self.name,
+            self.index,
+            G7_SURFACES,
+            0,
+        )?;
+        self.cell
+            .phase
+            .lock()
+            .map_err(|_| std::io::Error::other("G7 progress phase synchronization failed"))?
+            .heartbeat_while_idle = true;
+        let snapshot = self.cell.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: &format!("surface-{phase}"),
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        );
+        if snapshot.is_err() {
+            self.disable_idle_heartbeat();
+        }
+        snapshot
+    }
+
+    fn idle_phase(&self, phase: &str) -> std::io::Result<SurfaceIdlePhase<'_>> {
+        self.begin_idle_phase(phase)?;
+        Ok(SurfaceIdlePhase {
+            progress: self,
+            phase: phase.to_owned(),
+            completed: false,
+        })
+    }
+
+    fn disable_idle_heartbeat(&self) {
+        if let Ok(mut phase) = self.cell.phase.lock() {
+            phase.heartbeat_while_idle = false;
+        }
+    }
+
+    fn finish_idle_phase(&self, phase: &str) -> std::io::Result<()> {
+        self.disable_idle_heartbeat();
+        self.cell.set_stage(&format!("surface-{phase}-completed"))?;
+        self.cell.write_snapshot(
+            true,
+            CellProgressUpdate {
+                stage: &format!("surface-{phase}-completed"),
+                status: "running",
+                checkpoint_digest: None,
+                details: None,
+            },
+        )
     }
 
     fn finish_phase(&self, phase: &str) -> std::io::Result<()> {
@@ -5400,6 +5574,10 @@ fn validate_g7_ann_selected_route(
     total_partitions: usize,
     worker_limit: u64,
 ) -> Result<(f64, f64), Box<dyn Error>> {
+    let single_route_batches = receipt
+        .targeted_single_batches
+        .checked_add(receipt.generic_single_fallback_batches)
+        .ok_or("G7 ANN route batch evidence overflowed")?;
     let next_lower_bound = receipt
         .next_partition_lower_bound
         .ok_or("G7 ANN route omitted its next-partition lower bound")?;
@@ -5435,6 +5613,9 @@ fn validate_g7_ann_selected_route(
         || receipt.execution_worker_batches == 0
         || receipt.execution_worker_batches > preferred_partitions
         || !(1..=6).contains(&receipt.execution_waves)
+        || single_route_batches == 0
+        || single_route_batches > receipt.execution_worker_batches
+        || single_route_batches > receipt.execution_waves
         || !next_lower_bound.is_finite()
         || !kth_distance.is_finite()
         || next_lower_bound < 0.0
@@ -5516,7 +5697,14 @@ fn run_commit(
     progress.finish_phase("measure")?;
     let stats = evidence.stats(measured_wall.as_secs_f64())?;
     let mut output = stats_with_materialization(stats, materialization)?;
-    scheduler.shutdown()?;
+    let mut database = scheduler.shutdown_into_database()?;
+    let last_commit_csn = evidence
+        .last_commit_csn
+        .ok_or("strict group commit omitted its last CSN")?;
+    let maintenance =
+        perform_strict_group_commit_maintenance(&mut database, last_commit_csn, progress)?;
+    drop(database);
+    let reopen_phase = progress.idle_phase("strict-reopen")?;
     let reopen = verify_strict_group_commit_reopen(
         &group_path,
         authority,
@@ -5524,6 +5712,7 @@ fn run_commit(
         baseline_visible_csn,
         baseline_committed_transactions,
     )?;
+    reopen_phase.complete()?;
     reopen.validate(
         &plan,
         evidence
@@ -5532,10 +5721,120 @@ fn run_commit(
         evidence
             .last_commit_csn
             .ok_or("strict group commit omitted its last CSN")?,
+        maintenance.maintenance_csn,
     )?;
     output["durability"] = json!("group-physical-sync");
-    output["group_commit_evidence"] = evidence.json(concurrency, &reopen)?;
+    output["group_commit_evidence"] = evidence.json(concurrency, &maintenance, &reopen)?;
     Ok(output)
+}
+
+fn perform_strict_group_commit_maintenance(
+    database: &mut NativeDatabase,
+    last_commit_csn: u64,
+    progress: &SurfaceProgress,
+) -> Result<StrictGroupCommitMaintenanceEvidence, Box<dyn Error>> {
+    let maintenance_started = Instant::now();
+    let vacuum_phase = progress.idle_phase("strict-maintenance-vacuum")?;
+    let vacuum_started = Instant::now();
+    let vacuum = database.vacuum_pages()?;
+    let vacuum_time_nanos = duration_nanos(vacuum_started.elapsed())?;
+    vacuum_phase.complete()?;
+    let vacuum_commit = vacuum
+        .commit
+        .as_ref()
+        .filter(|_| vacuum.applied)
+        .ok_or("strict group commit maintenance vacuum did not compact the current root")?;
+    let maintenance_csn = vacuum_commit.commit_csn.get();
+    if maintenance_csn != last_commit_csn.saturating_add(1)
+        || vacuum.active_generation.get() != vacuum.previous_generation.get().saturating_add(1)
+        || vacuum.active_page_count >= vacuum.previous_page_count
+        || vacuum.reclaimed_pages != vacuum.previous_page_count - vacuum.active_page_count
+        || vacuum_commit.durability != hyphae_native_types::DurabilityClass::Strict
+    {
+        return Err("strict group commit maintenance vacuum authority is inconsistent".into());
+    }
+
+    let checkpoint_phase = progress.idle_phase("strict-maintenance-checkpoint")?;
+    let checkpoint_started = Instant::now();
+    let checkpoint = database.checkpoint()?;
+    let checkpoint_time_nanos = duration_nanos(checkpoint_started.elapsed())?;
+    checkpoint_phase.complete()?;
+    if checkpoint.visible_csn.get() != maintenance_csn
+        || checkpoint.transaction_id.get() <= vacuum_commit.transaction_id.get()
+        || checkpoint.checkpoint_lsn.get() <= vacuum_commit.commit_lsn.get()
+    {
+        return Err("strict group commit maintenance checkpoint authority is inconsistent".into());
+    }
+
+    let retention_phase = progress.idle_phase("strict-maintenance-retention")?;
+    let retention_started = Instant::now();
+    let retention = database.truncate_wal_at_retention_checkpoint()?;
+    let retention_time_nanos = duration_nanos(retention_started.elapsed())?;
+    retention_phase.complete()?;
+    if retention.base_visible_csn.get() != maintenance_csn
+        || retention.checkpoint_lsn != checkpoint.checkpoint_lsn
+        || retention.retired_wal_blocks == 0
+        || retention.retired_wal_bytes == 0
+        || retention.retained_manifest_files != 1
+        || retention.retained_manifest_bytes == 0
+    {
+        return Err("strict group commit WAL retention authority is inconsistent".into());
+    }
+    let total_time_nanos = duration_nanos(maintenance_started.elapsed())?;
+    let stage_time_nanos = vacuum_time_nanos
+        .checked_add(checkpoint_time_nanos)
+        .and_then(|value| value.checked_add(retention_time_nanos))
+        .ok_or("strict group commit maintenance timing overflowed")?;
+    if total_time_nanos < stage_time_nanos {
+        return Err("strict group commit maintenance timing is inconsistent".into());
+    }
+    let digest = |bytes: [u8; 32]| blake3::Hash::from_bytes(bytes).to_hex().to_string();
+    Ok(StrictGroupCommitMaintenanceEvidence {
+        maintenance_csn,
+        total_time_nanos,
+        value: json!({
+            "provider": "vacuum-checkpoint-wal-retention-v1",
+            "total_time_nanos": total_time_nanos,
+            "vacuum": {
+                "applied": vacuum.applied,
+                "previous_page_generation": vacuum.previous_generation.get(),
+                "active_page_generation": vacuum.active_generation.get(),
+                "previous_page_count": vacuum.previous_page_count,
+                "active_page_count": vacuum.active_page_count,
+                "reclaimed_pages": vacuum.reclaimed_pages,
+                "commit_csn": maintenance_csn,
+                "commit_transaction_id": vacuum_commit.transaction_id.get(),
+                "commit_lsn": vacuum_commit.commit_lsn.get(),
+                "wal_block_digest": digest(vacuum_commit.wal_block_digest),
+                "commit_durability": "strict",
+                "duration_nanos": vacuum_time_nanos,
+            },
+            "checkpoint": {
+                "visible_csn": checkpoint.visible_csn.get(),
+                "transaction_id": checkpoint.transaction_id.get(),
+                "manifest_generation": checkpoint.manifest_generation.get(),
+                "manifest_digest": digest(checkpoint.manifest_digest),
+                "checkpoint_lsn": checkpoint.checkpoint_lsn.get(),
+                "parent_directory_sync_supported": checkpoint.parent_directory_sync_supported,
+                "duration_nanos": checkpoint_time_nanos,
+            },
+            "wal_retention": {
+                "base_visible_csn": retention.base_visible_csn.get(),
+                "anchor_epoch": retention.anchor_epoch,
+                "anchor_digest": digest(retention.anchor_digest),
+                "retired_wal_blocks": retention.retired_wal_blocks,
+                "retired_wal_bytes": retention.retired_wal_bytes,
+                "checkpoint_lsn": retention.checkpoint_lsn.get(),
+                "retired_manifest_files": retention.retired_manifest_files,
+                "retired_manifest_bytes": retention.retired_manifest_bytes,
+                "retained_manifest_files": retention.retained_manifest_files,
+                "retained_manifest_bytes": retention.retained_manifest_bytes,
+                "parent_directory_sync_supported": retention.parent_directory_sync_supported,
+                "manifest_directory_sync_supported": retention.manifest_directory_sync_supported,
+                "duration_nanos": retention_time_nanos,
+            },
+        }),
+    })
 }
 
 enum CommitProducerCommand {
@@ -5749,6 +6048,7 @@ fn inspect_strict_group_commit_reopen(
     baseline_committed_transactions: usize,
 ) -> Result<StrictGroupCommitReopenEvidence, Box<dyn Error>> {
     let open_time_nanos = duration_nanos(reopened.recovery_report().open_time)?;
+    let recovery = reopened.recovery_report();
     let reopened_visible_csn = reopened
         .recovery_report()
         .visible_csn
@@ -5784,11 +6084,24 @@ fn inspect_strict_group_commit_reopen(
         baseline_committed_transactions,
         reopened_visible_csn,
         reopened_committed_transactions,
+        wal_base_csn: recovery
+            .wal_base_csn
+            .ok_or("strict group commit retained reopen omitted its WAL base CSN")?
+            .get(),
+        retained_wal_blocks: recovery.retained_wal_blocks,
+        retained_wal_bytes: recovery.retained_wal_bytes,
+        replayed_transactions: recovery.replayed_transactions,
         verified_logical_commits: plan.logical_commits,
         missing_keys,
         mismatched_values,
         expected_state_digest: expected_digest.finalize().to_hex().to_string(),
         recovered_state_digest: recovered_digest.finalize().to_hex().to_string(),
+        manifest_verification_time_nanos: duration_nanos(recovery.manifest_verification_time)?,
+        wal_physical_verification_time_nanos: duration_nanos(
+            recovery.wal_physical_verification_time,
+        )?,
+        wal_semantic_replay_time_nanos: duration_nanos(recovery.wal_semantic_replay_time)?,
+        root_validation_time_nanos: duration_nanos(recovery.root_validation_time)?,
         open_time_nanos,
         verification_time_nanos,
     })
@@ -5920,7 +6233,7 @@ where
     }
     for worker in workers {
         samples.extend(worker.samples);
-        evidence.merge(worker.evidence);
+        evidence.merge(worker.evidence)?;
     }
     if samples.len() != observations || query_elapsed.is_zero() {
         return Err("routed benchmark did not measure every requested observation".into());
@@ -5968,7 +6281,7 @@ where
                 }
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let observation = validate(receipt)?;
-                    result.evidence.observe(observation);
+                    result.evidence.observe(observation)?;
                     Ok::<(), Box<dyn Error>>(())
                 })) {
                     Ok(Ok(())) => {
@@ -6140,12 +6453,14 @@ mod tests {
     impl MeasurementEvidence for CountEvidence {
         type Observation = ();
 
-        fn observe(&mut self, (): Self::Observation) {
+        fn observe(&mut self, (): Self::Observation) -> Result<(), Box<dyn Error>> {
             self.0 = self.0.saturating_add(1);
+            Ok(())
         }
 
-        fn merge(&mut self, other: Self) {
+        fn merge(&mut self, other: Self) -> Result<(), Box<dyn Error>> {
             self.0 = self.0.saturating_add(other.0);
+            Ok(())
         }
     }
 
@@ -6902,7 +7217,9 @@ mod tests {
                     let mut evidence = RoutingIntervalEvidence::new();
                     let observation = RoutingIntervalEvidence::observation(&route, next, kth)
                         .map_err(|error| error.to_string())?;
-                    evidence.observe(observation);
+                    evidence
+                        .observe(observation)
+                        .map_err(|error| error.to_string())?;
                     Ok::<_, String>(evidence)
                 }));
             }
@@ -6918,7 +7235,7 @@ mod tests {
             Ok(workers)
         })?;
         for worker in workers {
-            evidence.merge(worker);
+            evidence.merge(worker)?;
         }
         assert!(evidence.json(3).is_ok());
 
@@ -6955,6 +7272,12 @@ mod tests {
         assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
         mutated = valid.clone();
         mutated.execution_worker_batches = 33;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.targeted_single_batches = 3;
+        assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
+        mutated = valid.clone();
+        mutated.targeted_single_batches = 0;
         assert!(validate_g7_ann_selected_route(&mutated, 32, 64, 4).is_err());
         mutated = valid;
         mutated.search.hits.pop();
@@ -7000,7 +7323,36 @@ mod tests {
             execution_workers: 2,
             execution_worker_batches: 2,
             execution_waves: 2,
+            targeted_single_batches: 2,
+            generic_single_fallback_batches: 0,
         })
+    }
+
+    #[test]
+    fn routing_interval_counts_every_single_item_wave_without_overflow()
+    -> Result<(), Box<dyn Error>> {
+        let route = valid_selected_route()?;
+        assert_eq!(route.targeted_single_batches, 2);
+        assert_eq!(route.generic_single_fallback_batches, 0);
+        assert_eq!(
+            route.targeted_single_batches + route.generic_single_fallback_batches,
+            route.execution_worker_batches
+        );
+
+        let mut evidence = RoutingIntervalEvidence::new();
+        evidence.targeted_single_batches = u64::MAX;
+        let observation = RoutingObservation {
+            execution_workers: 1,
+            execution_worker_batches: 1,
+            execution_waves: 1,
+            selected_partitions: 1,
+            targeted_single_batches: 1,
+            generic_single_fallback_batches: 0,
+            next_partition_lower_bound: 1.0,
+            kth_distance: 0.5,
+        };
+        assert!(evidence.observe(observation).is_err());
+        Ok(())
     }
 
     #[test]
@@ -7111,6 +7463,25 @@ mod tests {
         let reporter = progress.start_reporter();
         drop(reporter);
         assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
+    fn surface_idle_phase_error_disarms_heartbeat_without_completing_the_stage()
+    -> Result<(), Box<dyn Error>> {
+        let progress = CellProgress::new(None, "1".repeat(40), None, "3".repeat(64), 10, 10)?;
+        let surface = progress.begin_surface(G7_SURFACE_NAMES[0], 0, 10)?;
+        let failed = (|| -> Result<(), Box<dyn Error>> {
+            let _phase = surface.idle_phase("injected-failure")?;
+            Err("injected idle phase failure".into())
+        })();
+        assert!(failed.is_err());
+        let phase = progress
+            .phase
+            .lock()
+            .map_err(|_| "progress phase lock poisoned")?;
+        assert_eq!(phase.stage, "surface-injected-failure");
+        assert!(!phase.heartbeat_while_idle);
         Ok(())
     }
 
@@ -7528,79 +7899,117 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         const OBSERVATIONS: usize = 64;
         for concurrency in [1, 8, 32] {
-            let root = std::env::temp_dir().join(format!(
-                "hyphae-g7-strict-group-reopen-{}-{}-{concurrency}",
-                std::process::id(),
-                unique_nonce()
-            ));
-            let mut database = NativeDatabase::create(&root)?;
-            let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
-            seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
-            seed.commit()?;
-            database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
-            drop(database);
-
-            let mut baseline = NativeDatabase::open(&root)?;
-            let baseline_visible_csn = baseline
-                .recovery_report()
-                .visible_csn
-                .map(hyphae_native_types::Csn::get)
-                .ok_or("test baseline omitted its visible CSN")?;
-            let baseline_committed_transactions = baseline.recovery_report().committed_transactions;
-            let governor = Arc::new(NativeResourceGovernor::new(
-                strict_group_commit_mutation_cap_two_policy(),
-            ));
-            baseline.set_resource_governor_with_queue_wait(
-                Arc::clone(&governor),
-                Duration::from_millis(100),
-            )?;
-            let config = hyphae_native_runtime::GroupCommitConfig::new(
-                STRICT_GROUP_COMMIT_COHORT_WIDTH,
-                STRICT_GROUP_COMMIT_COLLECTION_WAIT,
-                STRICT_GROUP_COMMIT_QUEUE_CAPACITY,
-            )?
-            .with_execution_admission_wait(STRICT_GROUP_COMMIT_EXECUTION_WAIT)?;
-            let scheduler = NativeCommitScheduler::start(baseline, config)?;
-            let producers = (0..concurrency)
-                .map(|_| scheduler.client())
-                .collect::<Vec<_>>();
-            let progress = measurement_test_progress(OBSERVATIONS)?;
-            progress.begin_phase("measure", OBSERVATIONS)?;
-            let plan = StrictGroupCommitPlan::new(OBSERVATIONS)?;
-            let (evidence, measured_wall) = measure_strict_group_commits(
-                scheduler.client(),
-                producers,
-                plan.clone(),
-                baseline_visible_csn,
-                &progress,
-            )?;
-            progress.finish_phase("measure")?;
-            assert!(measured_wall > Duration::ZERO);
-            assert_eq!(evidence.maximum_active_producers, concurrency);
-            scheduler.shutdown()?;
-
-            let reopened = NativeDatabase::open(&root)?;
-            let reopen = inspect_strict_group_commit_reopen(
-                &reopened,
-                &plan,
-                baseline_visible_csn,
-                baseline_committed_transactions,
-            )?;
-            reopen.validate(
-                &plan,
-                evidence.first_commit_csn.ok_or("test omitted first CSN")?,
-                evidence.last_commit_csn.ok_or("test omitted last CSN")?,
-            )?;
-            assert_eq!(reopen.verified_logical_commits, OBSERVATIONS);
-            assert_eq!(reopen.missing_keys, 0);
-            assert_eq!(reopen.mismatched_values, 0);
-            assert_eq!(reopen.expected_state_digest, reopen.recovered_state_digest);
-            let usage = governor.usage_snapshot();
-            assert_eq!(usage.compute_threads, 0, "{usage:?}");
-            assert_eq!(usage.io_slots, 0, "{usage:?}");
-            assert_eq!(usage.memory_bytes, 0, "{usage:?}");
-            fs::remove_dir_all(root)?;
+            let diagnostic = exercise_strict_group_commit_recovery(OBSERVATIONS, concurrency)?;
+            assert_eq!(diagnostic["observations"], OBSERVATIONS);
+            assert_eq!(diagnostic["concurrency"], concurrency);
+            let evidence = &diagnostic["group_commit_evidence"];
+            assert_eq!(
+                evidence["schema"],
+                "hyphae-native-g7-strict-group-commit-evidence-v2"
+            );
+            assert_eq!(evidence["reopen"]["replayed_transactions"], 0);
+            assert_eq!(evidence["reopen"]["verified_logical_commits"], OBSERVATIONS);
         }
         Ok(())
+    }
+
+    fn exercise_strict_group_commit_recovery(
+        observations: usize,
+        concurrency: usize,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-strict-group-reopen-{}-{}-{concurrency}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let result = exercise_strict_group_commit_recovery_at(&root, observations, concurrency);
+        fs::remove_dir_all(&root)?;
+        result
+    }
+
+    fn exercise_strict_group_commit_recovery_at(
+        root: &Path,
+        observations: usize,
+        concurrency: usize,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let mut database = NativeDatabase::create(root)?;
+        let mut seed = database.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+        seed.set(b"g7-group-seed".to_vec(), b"v".to_vec(), None)?;
+        seed.commit()?;
+        database.migrate_structure_to_v3(hyphae_native_types::DurabilityClass::Memory)?;
+        drop(database);
+
+        let mut baseline = NativeDatabase::open(root)?;
+        let baseline_visible_csn = baseline
+            .recovery_report()
+            .visible_csn
+            .map(hyphae_native_types::Csn::get)
+            .ok_or("test baseline omitted its visible CSN")?;
+        let baseline_committed_transactions = baseline.recovery_report().committed_transactions;
+        let governor = Arc::new(NativeResourceGovernor::new(
+            strict_group_commit_mutation_cap_two_policy(),
+        ));
+        baseline.set_resource_governor_with_queue_wait(
+            Arc::clone(&governor),
+            Duration::from_millis(100),
+        )?;
+        let config = hyphae_native_runtime::GroupCommitConfig::new(
+            STRICT_GROUP_COMMIT_COHORT_WIDTH,
+            STRICT_GROUP_COMMIT_COLLECTION_WAIT,
+            STRICT_GROUP_COMMIT_QUEUE_CAPACITY,
+        )?
+        .with_execution_admission_wait(STRICT_GROUP_COMMIT_EXECUTION_WAIT)?;
+        let scheduler = NativeCommitScheduler::start(baseline, config)?;
+        let producers = (0..concurrency)
+            .map(|_| scheduler.client())
+            .collect::<Vec<_>>();
+        let progress = measurement_test_progress(observations)?;
+        progress.begin_phase("measure", observations)?;
+        let plan = StrictGroupCommitPlan::new(observations)?;
+        let (evidence, measured_wall) = measure_strict_group_commits(
+            scheduler.client(),
+            producers,
+            plan.clone(),
+            baseline_visible_csn,
+            &progress,
+        )?;
+        progress.finish_phase("measure")?;
+        assert!(measured_wall > Duration::ZERO);
+        assert_eq!(evidence.maximum_active_producers, concurrency);
+        let mut database = scheduler.shutdown_into_database()?;
+        let maintenance = perform_strict_group_commit_maintenance(
+            &mut database,
+            evidence.last_commit_csn.ok_or("test omitted last CSN")?,
+            &progress,
+        )?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(root)?;
+        let reopen = inspect_strict_group_commit_reopen(
+            &reopened,
+            &plan,
+            baseline_visible_csn,
+            baseline_committed_transactions,
+        )?;
+        reopen.validate(
+            &plan,
+            evidence.first_commit_csn.ok_or("test omitted first CSN")?,
+            evidence.last_commit_csn.ok_or("test omitted last CSN")?,
+            maintenance.maintenance_csn,
+        )?;
+        let serialized = evidence.json(concurrency, &maintenance, &reopen)?;
+        assert_eq!(serialized["reopen"]["replayed_transactions"], 0);
+        let usage = governor.usage_snapshot();
+        assert_eq!(usage.compute_threads, 0, "{usage:?}");
+        assert_eq!(usage.io_slots, 0, "{usage:?}");
+        assert_eq!(usage.memory_bytes, 0, "{usage:?}");
+        Ok(json!({
+            "schema": "hyphae-native-g7-strict-group-commit-diagnostic-v1",
+            "closure_declared": false,
+            "observations": observations,
+            "concurrency": concurrency,
+            "hot_wall_time_nanos": duration_nanos(measured_wall)?,
+            "group_commit_evidence": serialized,
+        }))
     }
 }

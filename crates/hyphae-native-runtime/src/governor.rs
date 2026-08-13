@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -314,27 +315,98 @@ pub enum GovernorQueueError {
 #[derive(Clone, Debug)]
 pub struct GovernorCancellation {
     cancelled: Arc<AtomicBool>,
+    waiters: Arc<Mutex<CancellationWaiters>>,
     governor: Weak<NativeResourceGovernor>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationWaiters {
+    next_id: u64,
+    senders: BTreeMap<u64, mpsc::Sender<()>>,
+}
+
+pub(crate) enum CancellationWaiterRegistration {
+    Registered(GovernorCancellationWaiter),
+    Cancelled,
+}
+
+pub(crate) struct GovernorCancellationWaiter {
+    waiters: Weak<Mutex<CancellationWaiters>>,
+    id: u64,
+}
+
+impl Drop for GovernorCancellationWaiter {
+    fn drop(&mut self) {
+        if let Some(waiters) = self.waiters.upgrade() {
+            waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .senders
+                .remove(&self.id);
+        }
+    }
 }
 
 impl GovernorCancellation {
     /// Cancels every wait using this handle and wakes the owning governor.
     pub fn cancel(&self) {
+        let senders = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.cancelled.store(true, Ordering::Release);
+            std::mem::take(&mut waiters.senders)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
         if let Some(governor) = self.governor.upgrade() {
             let _queue = governor
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.cancelled.store(true, Ordering::Release);
             governor.queue_changed.notify_all();
-        } else {
-            self.cancelled.store(true, Ordering::Release);
+        }
+        for sender in senders {
+            let _ignored = sender.send(());
         }
     }
 
     /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn register_waiter(
+        &self,
+        sender: mpsc::Sender<()>,
+    ) -> Result<CancellationWaiterRegistration, ()> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancelled.load(Ordering::Acquire) {
+            let _ignored = sender.send(());
+            return Ok(CancellationWaiterRegistration::Cancelled);
+        }
+        let id = waiters.next_id;
+        waiters.next_id = waiters.next_id.checked_add(1).ok_or(())?;
+        waiters.senders.insert(id, sender);
+        Ok(CancellationWaiterRegistration::Registered(
+            GovernorCancellationWaiter {
+                waiters: Arc::downgrade(&self.waiters),
+                id,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    fn registered_waiter_count(&self) -> usize {
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .senders
+            .len()
     }
 }
 
@@ -583,6 +655,7 @@ impl NativeResourceGovernor {
     pub fn cancellation_token(self: &Arc<Self>) -> GovernorCancellation {
         GovernorCancellation {
             cancelled: Arc::new(AtomicBool::new(false)),
+            waiters: Arc::new(Mutex::new(CancellationWaiters::default())),
             governor: Arc::downgrade(self),
         }
     }
@@ -889,6 +962,13 @@ impl OwnedGovernorPermit {
 
     pub(crate) fn is_admitted_by(&self, governor: &Arc<NativeResourceGovernor>) -> bool {
         Arc::ptr_eq(&self.allocation.governor, governor)
+    }
+
+    pub(crate) fn owns_cancellation(&self, cancellation: &GovernorCancellation) -> bool {
+        Weak::ptr_eq(
+            &cancellation.governor,
+            &Arc::downgrade(&self.allocation.governor),
+        )
     }
 
     /// Returns the class owning this allocation.
@@ -1599,6 +1679,73 @@ mod tests {
         assert_eq!(governor.queued_requests(), 0);
         drop(bulk_hold);
         drop(foreground_hold);
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_waiter_registration_is_bounded_and_race_safe()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let governor = Arc::new(NativeResourceGovernor::new(test_policy()));
+        let cancellation = governor.cancellation_token();
+        for _ in 0..10_000 {
+            let (event_tx, _event_rx) = mpsc::channel();
+            let registration = cancellation
+                .register_waiter(event_tx)
+                .map_err(|()| "cancellation waiter id exhausted")?;
+            assert!(matches!(
+                registration,
+                CancellationWaiterRegistration::Registered(_)
+            ));
+            drop(registration);
+            assert_eq!(cancellation.registered_waiter_count(), 0);
+        }
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let registration = cancellation
+            .register_waiter(event_tx)
+            .map_err(|()| "cancellation waiter id exhausted")?;
+        cancellation.cancel();
+        event_rx.recv_timeout(Duration::from_secs(1))?;
+        drop(registration);
+        assert_eq!(cancellation.registered_waiter_count(), 0);
+        let (late_tx, late_rx) = mpsc::channel();
+        assert!(matches!(
+            cancellation
+                .register_waiter(late_tx)
+                .map_err(|()| "cancellation waiter id exhausted")?,
+            CancellationWaiterRegistration::Cancelled
+        ));
+        late_rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(cancellation.registered_waiter_count(), 0);
+
+        for _ in 0..128 {
+            let cancellation = governor.cancellation_token();
+            let register = cancellation.clone();
+            let cancel = cancellation.clone();
+            let rendezvous = Arc::new(Barrier::new(3));
+            let register_rendezvous = Arc::clone(&rendezvous);
+            let cancel_rendezvous = Arc::clone(&rendezvous);
+            let (event_tx, event_rx) = mpsc::channel();
+            let registration = thread::spawn(move || {
+                register_rendezvous.wait();
+                register.register_waiter(event_tx)
+            });
+            let cancellation_worker = thread::spawn(move || {
+                cancel_rendezvous.wait();
+                cancel.cancel();
+            });
+            rendezvous.wait();
+            let registration = registration
+                .join()
+                .map_err(|_| "waiter registration thread panicked")?
+                .map_err(|()| "cancellation waiter id exhausted")?;
+            cancellation_worker
+                .join()
+                .map_err(|_| "cancellation thread panicked")?;
+            event_rx.recv_timeout(Duration::from_secs(1))?;
+            drop(registration);
+            assert_eq!(cancellation.registered_waiter_count(), 0);
+        }
         Ok(())
     }
 

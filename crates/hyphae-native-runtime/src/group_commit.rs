@@ -712,7 +712,7 @@ struct CommitRequest {
 enum SchedulerCommand {
     Commit(Box<CommitRequest>),
     Cohort(Vec<CommitRequest>),
-    Shutdown,
+    Shutdown { return_database: bool },
 }
 
 struct SubmissionGate {
@@ -1163,7 +1163,7 @@ impl NativeCommitClient {
 /// Owner of one bounded native group-commit worker and database handle.
 pub struct NativeCommitScheduler {
     client: NativeCommitClient,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<bool>>,
     active_expiry_metrics: Option<Arc<ActiveExpiryMetrics>>,
 }
 
@@ -1279,7 +1279,7 @@ impl NativeCommitScheduler {
                     active_expiry,
                     #[cfg(test)]
                     &test_gates,
-                );
+                )
             })
             .map_err(|source| GroupCommitSubmitError::runtime(NativeRuntimeError::Io(source)))?;
         Ok(Self {
@@ -1408,12 +1408,28 @@ impl NativeCommitScheduler {
     /// worker terminated abnormally, or the retained typed runtime failure
     /// when active expiry stopped the worker.
     pub fn shutdown(mut self) -> Result<(), GroupCommitSubmitError> {
-        self.stop_and_join()
+        self.stop_and_join(false).map(drop)
     }
 
-    fn stop_and_join(&mut self) -> Result<(), GroupCommitSubmitError> {
+    /// Stops admission, drains accepted work, and returns the exact database
+    /// owner for exclusive post-scheduler maintenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable when the worker did not reach the requested clean
+    /// shutdown marker, or the same retained active-expiry failure as
+    /// [`Self::shutdown`].
+    pub fn shutdown_into_database(mut self) -> Result<NativeDatabase, GroupCommitSubmitError> {
+        self.stop_and_join(true)?
+            .ok_or(GroupCommitSubmitError::Unavailable)
+    }
+
+    fn stop_and_join(
+        &mut self,
+        return_database: bool,
+    ) -> Result<Option<NativeDatabase>, GroupCommitSubmitError> {
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let sender = {
             let mut gate = self
@@ -1430,22 +1446,34 @@ impl NativeCommitScheduler {
         };
         if let Some(sender) = sender {
             sender
-                .send(SchedulerCommand::Shutdown)
+                .send(SchedulerCommand::Shutdown { return_database })
                 .map_err(|_| GroupCommitSubmitError::Unavailable)?;
         }
-        worker
+        let database_retained = worker
             .join()
             .map_err(|_| GroupCommitSubmitError::Unavailable)?;
-        match self.active_expiry_failure() {
-            Some(failure) => Err(failure.submit_error()),
-            None => Ok(()),
+        if let Some(failure) = self.active_expiry_failure() {
+            return Err(failure.submit_error());
         }
+        if !return_database {
+            return Ok(None);
+        }
+        if !database_retained {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        self.client
+            .database
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?
+            .take()
+            .ok_or(GroupCommitSubmitError::Unavailable)
+            .map(Some)
     }
 }
 
 impl Drop for NativeCommitScheduler {
     fn drop(&mut self) {
-        drop(self.stop_and_join());
+        drop(self.stop_and_join(false));
     }
 }
 
@@ -1547,7 +1575,7 @@ fn command_request_slots(command: &SchedulerCommand) -> usize {
     match command {
         SchedulerCommand::Commit(_) => 1,
         SchedulerCommand::Cohort(requests) => requests.len(),
-        SchedulerCommand::Shutdown => 0,
+        SchedulerCommand::Shutdown { .. } => 0,
     }
 }
 
@@ -1574,7 +1602,7 @@ fn stamp_command_enqueued_at(command: &mut SchedulerCommand, enqueued_at: Instan
                 request.enqueued_at = enqueued_at;
             }
         }
-        SchedulerCommand::Shutdown => {}
+        SchedulerCommand::Shutdown { .. } => {}
     }
 }
 
@@ -1674,18 +1702,20 @@ fn run_scheduler(
     execution_cancellation: Option<&GovernorCancellation>,
     mut active_expiry: Option<ActiveExpiryRuntime>,
     #[cfg(test)] test_gates: &SchedulerTestGates,
-) {
-    let mut shutdown = false;
+) -> bool {
+    let mut state = SchedulerLoopState::default();
     let mut pending = None;
-    while !shutdown {
+    while state.is_running() {
         if active_expiry
             .as_ref()
             .is_some_and(ActiveExpiryRuntime::should_force_sweep)
         {
             let Some(expiry) = active_expiry.as_mut() else {
+                state.fail();
                 break;
             };
             if !execute_active_expiry(database, expiry) {
+                state.fail();
                 break;
             }
             continue;
@@ -1703,77 +1733,175 @@ fn run_scheduler(
                         #[cfg(test)]
                         test_gates,
                     ) {
+                        state.fail();
                         break;
                     }
                     continue;
                 }
-                SchedulerWake::Command(SchedulerCommand::Shutdown)
-                | SchedulerWake::Disconnected => break,
+                SchedulerWake::Command(SchedulerCommand::Shutdown {
+                    return_database: requested_return,
+                }) => {
+                    state.request_shutdown(requested_return);
+                    break;
+                }
+                SchedulerWake::Disconnected => break,
                 SchedulerWake::ExpiryDue => {
                     let Some(expiry) = active_expiry.as_mut() else {
+                        state.fail();
                         break;
                     };
                     if !execute_active_expiry(database, expiry) {
+                        state.fail();
                         break;
                     }
                     continue;
                 }
             };
-        #[cfg(test)]
-        let Ok(cohort_collection_guard) = test_gates.cohort_collection.read() else {
-            break;
-        };
-        #[cfg(test)]
-        drop(cohort_collection_guard);
-        let counts_after_due = expiry_is_due(active_expiry.as_ref());
-        if first.batch.durability != DurabilityClass::Group {
-            if !execute_single_request(
+        if !execute_received_commit(
+            SchedulerExecutionContext {
+                receiver,
                 database,
-                first,
-                config.execution_admission_wait,
+                gate,
+                config,
                 execution_cancellation,
                 #[cfg(test)]
-                &test_gates.commit_execution,
-                #[cfg(test)]
-                &test_gates.completion_return,
-            ) {
-                break;
-            }
-            if counts_after_due {
-                record_expiry_foreground(&mut active_expiry, 1);
-            }
-            continue;
-        }
-        let requests = collect_group_requests(
-            GroupCollectionContext {
-                receiver,
-                gate,
-                active_expiry: active_expiry.as_ref(),
-                config,
-                counts_after_due,
+                test_gates,
             },
-            first,
+            &mut active_expiry,
             &mut pending,
-            &mut shutdown,
-        );
-        let request_count = requests.len();
-        if !execute_group_requests(
+            &mut state,
+            first,
+        ) {
+            break;
+        }
+    }
+    stop_accepting(gate);
+    let retain_database = state.returns_database();
+    if !retain_database {
+        close_database(database);
+    }
+    retain_database
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum SchedulerTermination {
+    #[default]
+    Running,
+    Shutdown,
+    ReturnDatabase,
+    Failed,
+}
+
+#[derive(Default)]
+struct SchedulerLoopState {
+    termination: SchedulerTermination,
+}
+
+impl SchedulerLoopState {
+    fn is_running(&self) -> bool {
+        self.termination == SchedulerTermination::Running
+    }
+
+    fn request_shutdown(&mut self, return_database: bool) {
+        self.termination = if return_database {
+            SchedulerTermination::ReturnDatabase
+        } else {
+            SchedulerTermination::Shutdown
+        };
+    }
+
+    fn fail(&mut self) {
+        self.termination = SchedulerTermination::Failed;
+    }
+
+    fn returns_database(&self) -> bool {
+        self.termination == SchedulerTermination::ReturnDatabase
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerExecutionContext<'scheduler> {
+    receiver: &'scheduler Receiver<SchedulerCommand>,
+    database: &'scheduler RwLock<Option<NativeDatabase>>,
+    gate: &'scheduler Mutex<SubmissionGate>,
+    config: GroupCommitConfig,
+    execution_cancellation: Option<&'scheduler GovernorCancellation>,
+    #[cfg(test)]
+    test_gates: &'scheduler SchedulerTestGates,
+}
+
+fn execute_received_commit(
+    context: SchedulerExecutionContext<'_>,
+    active_expiry: &mut Option<ActiveExpiryRuntime>,
+    pending: &mut Option<SchedulerCommand>,
+    state: &mut SchedulerLoopState,
+    first: CommitRequest,
+) -> bool {
+    let SchedulerExecutionContext {
+        receiver,
+        database,
+        gate,
+        config,
+        execution_cancellation,
+        #[cfg(test)]
+        test_gates,
+    } = context;
+    #[cfg(test)]
+    let Ok(cohort_collection_guard) = test_gates.cohort_collection.read() else {
+        state.fail();
+        return false;
+    };
+    #[cfg(test)]
+    drop(cohort_collection_guard);
+    let counts_after_due = expiry_is_due(active_expiry.as_ref());
+    if first.batch.durability != DurabilityClass::Group {
+        let completed = execute_single_request(
             database,
-            requests,
+            first,
             config.execution_admission_wait,
             execution_cancellation,
             #[cfg(test)]
             &test_gates.commit_execution,
             #[cfg(test)]
             &test_gates.completion_return,
-        ) {
-            shutdown = true;
-        } else if counts_after_due {
-            record_expiry_foreground(&mut active_expiry, request_count);
+        );
+        if !completed {
+            state.fail();
         }
+        if completed && counts_after_due {
+            record_expiry_foreground(active_expiry, 1);
+        }
+        return completed;
     }
-    stop_accepting(gate);
-    close_database(database);
+    let requests = collect_group_requests(
+        GroupCollectionContext {
+            receiver,
+            gate,
+            active_expiry: active_expiry.as_ref(),
+            config,
+            counts_after_due,
+        },
+        first,
+        pending,
+        state,
+    );
+    let request_count = requests.len();
+    let completed = execute_group_requests(
+        database,
+        requests,
+        config.execution_admission_wait,
+        execution_cancellation,
+        #[cfg(test)]
+        &test_gates.commit_execution,
+        #[cfg(test)]
+        &test_gates.completion_return,
+    );
+    if !completed {
+        state.fail();
+    } else if counts_after_due {
+        record_expiry_foreground(active_expiry, request_count);
+    }
+    completed
 }
 
 fn expiry_is_due(active_expiry: Option<&ActiveExpiryRuntime>) -> bool {
@@ -1849,7 +1977,7 @@ fn collect_group_requests(
     context: GroupCollectionContext<'_>,
     first: CommitRequest,
     pending: &mut Option<SchedulerCommand>,
-    shutdown: &mut bool,
+    state: &mut SchedulerLoopState,
 ) -> Vec<CommitRequest> {
     let GroupCollectionContext {
         receiver,
@@ -1882,7 +2010,7 @@ fn collect_group_requests(
         if let Ok(command) = &next_command
             && !release_dequeued_request_slots(gate, command)
         {
-            *shutdown = true;
+            state.request_shutdown(false);
             break;
         }
         match next_command {
@@ -1895,8 +2023,14 @@ fn collect_group_requests(
                 *pending = Some(command);
                 break;
             }
-            Ok(SchedulerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                *shutdown = true;
+            Ok(SchedulerCommand::Shutdown {
+                return_database: requested_return,
+            }) => {
+                state.request_shutdown(requested_return);
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                state.request_shutdown(false);
                 break;
             }
             Err(RecvTimeoutError::Timeout) => break,
@@ -2388,7 +2522,13 @@ mod tests {
     #[test]
     fn immediate_admission_reports_saturation_without_holding_the_gate() {
         let (sender, _receiver) = mpsc::sync_channel(1);
-        assert!(sender.send(SchedulerCommand::Shutdown).is_ok());
+        assert!(
+            sender
+                .send(SchedulerCommand::Shutdown {
+                    return_database: false,
+                })
+                .is_ok()
+        );
         let gate = Mutex::new(SubmissionGate {
             sender,
             accepting: true,
@@ -2398,7 +2538,15 @@ mod tests {
         let state = AtomicU8::new(REQUEST_QUEUED);
 
         assert!(matches!(
-            admit_command(&gate, SchedulerCommand::Shutdown, &state, None, true),
+            admit_command(
+                &gate,
+                SchedulerCommand::Shutdown {
+                    return_database: false,
+                },
+                &state,
+                None,
+                true,
+            ),
             Err(GroupCommitSubmitError::Saturated)
         ));
         assert!(gate.try_lock().is_ok());

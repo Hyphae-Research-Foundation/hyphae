@@ -86,6 +86,14 @@ class G7MatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "recovered group-commit state"):
             validate_matrix(payload, "a" * 40, expected_tree=TREE)
 
+    def test_matrix_rejects_one_legacy_group_commit_evidence(self) -> None:
+        payload = matrix()
+        payload["receipts"][0]["cells"]["strict-group-commit"][
+            "group_commit_evidence"
+        ]["schema"] = "hyphae-native-g7-strict-group-commit-evidence-v1"
+        with self.assertRaisesRegex(GateFailure, "strict group-commit configuration"):
+            validate_matrix(payload, "a" * 40, expected_tree=TREE)
+
     def test_matrix_allows_distinct_commit_receipt_digests(self) -> None:
         payload = matrix()
         for index, value in enumerate(payload["receipts"], start=1):

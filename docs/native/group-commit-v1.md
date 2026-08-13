@@ -98,10 +98,14 @@ cancellation or handle drop cannot roll back its database decision. Shutdown
 stops new insertion and drains every live, uncancelled cohort ordered before its
 FIFO marker; queued cancelled members are skipped.
 
-Shutdown stops accepting new work, drains requests ordered before the shutdown
-marker, joins the worker, and closes the database handle. A worker-level
-persistence or synchronization failure makes the scheduler unavailable; the
-database must be reopened before more reads or writes.
+Shutdown stops accepting new work and drains requests ordered before the
+shutdown marker. The compatibility `shutdown` form joins the worker and closes
+the database handle. The additive `shutdown_into_database` form joins the same
+drained worker and returns its exact `NativeDatabase` owner for exclusive
+post-queue maintenance. No client may submit after either shutdown marker. A
+worker-level persistence or synchronization failure makes the scheduler
+unavailable and prevents the database handle from being returned; the database
+must be reopened before more reads or writes.
 
 ## Admission and ordering
 
@@ -182,11 +186,33 @@ The timed throughput window begins before cohort preparation and ends only
 after every pending completion in the window is durable. Per-request latency
 remains scheduler enqueue through durable response. G7 evidence reconciles the
 exact cohort-size and position histograms, contiguous CSNs, one page and WAL
-synchronization per cohort, and all scheduler timing components. It then drops
-the live database, reopens the directory once, verifies every logical key from
-one recovered snapshot, and requires the expected and recovered state digests
-to match. These rules do not weaken the advisory strict-fsync latency target or
-by themselves close G7.
+synchronization per cohort, and all scheduler timing components.
+
+Strict evidence schema
+`hyphae-native-g7-strict-group-commit-evidence-v2` keeps that hot interval
+separate from bounded recovery maintenance. After all timed completions, the
+runner drains the scheduler through `shutdown_into_database` and performs one
+fail-closed sequence:
+
+1. current-root page vacuum, which must apply and advance the CSN exactly once;
+2. one checkpoint at that vacuum CSN, which does not advance the CSN;
+3. WAL retention anchored to that exact checkpoint and CSN;
+4. one drop and reopen from the retained anchor, with an empty retained WAL
+   suffix; and
+5. one full logical-key digest from the reopened snapshot.
+
+The v2 receipt preserves the logical commit interval and its digest unchanged.
+It records the maintenance CSN separately and requires it to equal the last
+logical commit CSN plus one. The `maintenance` object records exact vacuum,
+checkpoint, retention identities and one complete maintenance duration. The
+`reopen` object records the retained base CSN, zero replayed transactions,
+recovery component timings, open duration, full-key verification duration, and
+equal expected/recovered logical-state digests. Maintenance, open, and
+verification never enter hot latency histograms or throughput. The G7
+controller nevertheless projects their complete measured pilot cost exactly
+once per full cell; omitting, duplicating, or hiding that cost fails closed.
+These rules do not weaken the advisory strict-fsync latency target or by
+themselves close G7.
 
 ## Failure behavior
 
@@ -216,7 +242,8 @@ Required executable evidence covers:
   CSN;
 - all deterministic interruption points with permitted prefix recovery before
   WAL synchronization and complete-cohort recovery afterwards;
-- clean shutdown, post-shutdown rejection, and worker-failure unavailability;
+- clean shutdown, post-shutdown rejection, worker-failure unavailability, and
+  drain-then-return of the exact database owner without losing accepted work;
 - explicit full and partial cohorts that remain isolated from neighboring FIFO
   commands and report one page and WAL synchronization;
 - memory-only sealing under producer concurrency `1`, `8`, and `32`, including
@@ -230,7 +257,9 @@ Required executable evidence covers:
   fills the configured bound and prevents another admission until claim;
 - shutdown that drains an already accepted cohort after its bounded resource
   wait becomes available;
-- strict reopen equivalence; and
+- strict v2 vacuum/checkpoint/retention authority, bounded anchor reopen, and
+  full logical-state equivalence, including failure paths that publish no
+  terminal evidence; and
 - warm concurrency-one and contended latency/throughput receipts that separate
   queue time, execution time, page synchronization, WAL synchronization, and
   end-to-end acknowledgement.

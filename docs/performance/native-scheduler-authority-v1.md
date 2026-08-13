@@ -44,6 +44,24 @@ It records the NUMA policy schema, status, and every directed worker/home node
 ratio and age threshold so a benchmark receipt cannot hide an uncalibrated or
 disabled fallback behind a topology digest.
 
+## Directed single-item execution
+
+A single durable ANN partition may address one existing persistent worker by
+the partition identifier modulo the canonical global worker count. The route
+uses a capacity-one worker-local slot and the same worker wake authority as the
+generic queue; it creates no auxiliary thread and never runs on the submitting
+thread. A busy slot falls back atomically to the generic home-pool queue. Closed
+admission fails instead of falling back. Workers serve at most one directed job
+consecutively while generic work is eligible, so affinity cannot starve the
+ordinary priority and calibrated-stealing policy.
+
+Every routed ANN receipt counts `targeted_single_batches` and
+`generic_single_fallback_batches`. A one-item parallel routing wave increments
+exactly one of them; a multi-item wave increments neither. The counters are
+checked additions and never wrap. Single-generation and direct serial execution
+report zero for both counters. These counts describe dispatch, not a latency
+claim; dedicated qualification remains the only performance authority.
+
 ## Failure model
 
 Source/tree substitution, executable/calibration substitution, artifact

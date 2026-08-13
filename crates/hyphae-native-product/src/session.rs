@@ -356,6 +356,10 @@ impl ProductSession {
         self.active_transactions.get(&handle)
     }
 
+    pub(crate) fn has_active_transactions(&self) -> bool {
+        !self.active_transactions.is_empty()
+    }
+
     pub(crate) fn replace_active_transaction(
         &mut self,
         handle: ProductTransactionHandle,
