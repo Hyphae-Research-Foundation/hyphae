@@ -16,6 +16,8 @@ use std::{
 thread_local! {
     static SEARCH_SCRATCH_PEAKS: std::cell::Cell<(usize, usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0, 0)) };
+    static ROUTING_QUERY_WORK: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
@@ -32,6 +34,31 @@ fn record_search_scratch(visited: usize, layer_visited: usize, frontier: usize, 
 #[cfg(test)]
 fn search_scratch_peaks() -> (usize, usize, usize, usize) {
     SEARCH_SCRATCH_PEAKS.get()
+}
+
+#[cfg(test)]
+fn record_projection_weight_build_for_test() {
+    let (weight_builds, normalized_components) = ROUTING_QUERY_WORK.get();
+    ROUTING_QUERY_WORK.set((weight_builds.saturating_add(1), normalized_components));
+}
+
+#[cfg(test)]
+fn record_cosine_normalization_for_test(components: usize) {
+    let (weight_builds, normalized_components) = ROUTING_QUERY_WORK.get();
+    ROUTING_QUERY_WORK.set((
+        weight_builds,
+        normalized_components.saturating_add(components),
+    ));
+}
+
+#[cfg(test)]
+fn reset_routing_query_work_for_test() {
+    ROUTING_QUERY_WORK.set((0, 0));
+}
+
+#[cfg(test)]
+fn routing_query_work_for_test() -> (usize, usize) {
+    ROUTING_QUERY_WORK.get()
 }
 
 use hyphae_native_types::{Csn, ObjectId};
@@ -626,8 +653,52 @@ pub struct PartitionedHnswIndex {
     definition: VectorIndexDefinition,
     partitions: Vec<HnswIndex>,
     summaries: Vec<HnswPartitionSummary>,
+    projection_weights: Box<[f64]>,
     input_identity: [u8; 32],
     build_identity: [u8; 32],
+}
+
+struct PartitionRoutingQuery<'query> {
+    query: &'query Vector,
+    query_norm: f64,
+    normalized_cosine: Option<Box<[f64]>>,
+    projection: f64,
+}
+
+impl<'query> PartitionRoutingQuery<'query> {
+    fn new(
+        metric: Metric,
+        query: &'query Vector,
+        projection_weights: &[f64],
+    ) -> Result<Self, AnnError> {
+        if query.dimension() != projection_weights.len() {
+            return Err(AnnError::DimensionMismatch);
+        }
+        let query_norm = query.norm_squared.sqrt();
+        let normalized_cosine = if metric == Metric::Cosine {
+            if query_norm == 0.0 {
+                return Err(AnnError::ZeroCosineVector);
+            }
+            #[cfg(test)]
+            record_cosine_normalization_for_test(query.dimension());
+            Some(
+                query
+                    .values()
+                    .iter()
+                    .map(|value| f64::from(*value) / query_norm)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            query,
+            query_norm,
+            normalized_cosine,
+            projection: project_with_weights(query, projection_weights),
+        })
+    }
 }
 
 /// Deterministic routing summary for one child HNSW generation.
@@ -2012,10 +2083,17 @@ impl PartitionedHnswIndex {
         let build_identity =
             partitioned_build_identity(plan.definition, plan.input_identity, &partitions)?;
         let summaries = summarize_partitions(&partitions)?;
+        let projection_weights = deterministic_projection_weights(
+            plan.definition.digest(),
+            0,
+            usize::from(plan.definition.dimension),
+        )
+        .into_boxed_slice();
         Ok(Self {
             definition: plan.definition,
             partitions,
             summaries,
+            projection_weights,
             input_identity: plan.input_identity,
             build_identity,
         })
@@ -2066,11 +2144,18 @@ impl PartitionedHnswIndex {
             &mut control,
         )?;
         let summaries = summarize_partitions_with_control(&partitions, &mut control)?;
+        let projection_weights = deterministic_projection_weights(
+            definition.digest(),
+            0,
+            usize::from(definition.dimension),
+        )
+        .into_boxed_slice();
         check_build_control(&mut control)?;
         Ok(Self {
             definition,
             partitions,
             summaries,
+            projection_weights,
             input_identity,
             build_identity,
         })
@@ -2494,14 +2579,15 @@ impl PartitionedHnswIndex {
     }
 
     fn ranked_partition_routes(&self, query: &Vector) -> Result<Vec<(f64, f64, usize)>, AnnError> {
-        let query_projection = deterministic_projection(self.definition.digest(), query);
+        let query =
+            PartitionRoutingQuery::new(self.definition.metric, query, &self.projection_weights)?;
         let mut routes = self
             .summaries
             .iter()
             .map(|summary| {
                 Ok((
-                    partition_routing_lower_bound(self.definition.metric, query, summary)?,
-                    projection_interval_distance(query_projection, summary),
+                    partition_routing_lower_bound(self.definition.metric, &query, summary)?,
+                    projection_interval_distance(query.projection, summary),
                     summary.partition_index,
                 ))
             })
@@ -2717,15 +2803,16 @@ fn projection_interval_distance(query_projection: f64, summary: &HnswPartitionSu
 
 fn partition_routing_lower_bound(
     metric: Metric,
-    query: &Vector,
+    query: &PartitionRoutingQuery<'_>,
     summary: &HnswPartitionSummary,
 ) -> Result<f64, AnnError> {
-    if query.dimension() != summary.centroid.len() {
+    if query.query.dimension() != summary.centroid.len() {
         return Err(AnnError::CorruptGraph);
     }
     match metric {
         Metric::SquaredL2 => {
             let center_distance = query
+                .query
                 .values()
                 .iter()
                 .zip(&summary.centroid)
@@ -2738,33 +2825,35 @@ fn partition_routing_lower_bound(
             let minimum_distance = (center_distance - summary.squared_l2_radius.sqrt()).max(0.0);
             Ok(conservative_routing_lower_bound(
                 minimum_distance * minimum_distance,
-                query.dimension(),
+                query.query.dimension(),
             ))
         }
         Metric::NegativeDot => {
             let query_dot_centroid = query
+                .query
                 .values()
                 .iter()
                 .zip(&summary.centroid)
                 .map(|(query, center)| f64::from(*query) * center)
                 .sum::<f64>();
             Ok(conservative_routing_lower_bound(
-                -(query_dot_centroid
-                    + query.norm_squared.sqrt() * summary.squared_l2_radius.sqrt()),
-                query.dimension(),
+                -(query_dot_centroid + query.query_norm * summary.squared_l2_radius.sqrt()),
+                query.query.dimension(),
             ))
         }
         Metric::Cosine => {
-            if summary.unit_centroid.len() != query.dimension() {
+            let normalized_query = query
+                .normalized_cosine
+                .as_deref()
+                .ok_or(AnnError::CorruptGraph)?;
+            if summary.unit_centroid.len() != normalized_query.len() {
                 return Err(AnnError::CorruptGraph);
             }
-            let query_norm = query.norm_squared.sqrt();
-            let center_distance = query
-                .values()
+            let center_distance = normalized_query
                 .iter()
                 .zip(&summary.unit_centroid)
                 .map(|(query, center)| {
-                    let difference = f64::from(*query) / query_norm - center;
+                    let difference = query - center;
                     difference * difference
                 })
                 .sum::<f64>()
@@ -2772,7 +2861,7 @@ fn partition_routing_lower_bound(
             let minimum_chord = (center_distance - summary.squared_unit_radius.sqrt()).max(0.0);
             Ok(conservative_routing_lower_bound(
                 minimum_chord * minimum_chord / 2.0,
-                query.dimension(),
+                query.query.dimension(),
             ))
         }
     }
@@ -2859,20 +2948,13 @@ fn check_build_control(control: &mut impl FnMut() -> ControlFlow<()>) -> Result<
     }
 }
 
-fn deterministic_projection(projection_identity: [u8; 32], vector: &Vector) -> f64 {
-    deterministic_projection_axis(projection_identity, 0, vector)
-}
-
-fn deterministic_projection_axis(projection_identity: [u8; 32], axis: u64, vector: &Vector) -> f64 {
-    let weights = deterministic_projection_weights(projection_identity, axis, vector.dimension());
-    project_with_weights(vector, &weights)
-}
-
 fn deterministic_projection_weights(
     projection_identity: [u8; 32],
     axis: u64,
     dimension: usize,
 ) -> Vec<f64> {
+    #[cfg(test)]
+    record_projection_weight_build_for_test();
     (0..dimension)
         .map(|component| {
             let mut hasher = blake3::Hasher::new();
@@ -3270,9 +3352,10 @@ mod tests {
 
     use super::{
         AnnError, AnnRecallRisk, AnnSearchStrategy, HnswConfig, HnswIndex, HnswPartitionPlan,
-        HnswPartitionSummary, Metric, PartitionedAnnRoutingOutcome, PartitionedHnswIndex,
-        SearchOptions, Vector, VectorIndexDefinition, VectorRecord, distance,
-        partition_routing_lower_bound, search_scratch_peaks,
+        HnswPartitionSummary, Metric, PartitionRoutingQuery, PartitionedAnnRoutingOutcome,
+        PartitionedHnswIndex, SearchOptions, Vector, VectorIndexDefinition, VectorRecord, distance,
+        partition_routing_lower_bound, reset_routing_query_work_for_test,
+        routing_query_work_for_test, search_scratch_peaks,
     };
 
     fn object(value: u128) -> Result<ObjectId, Box<dyn std::error::Error>> {
@@ -4044,8 +4127,11 @@ mod tests {
             let index = PartitionedHnswIndex::build(&plan)?;
             for query_id in [1_u16, 17, 33, 64] {
                 let query = deterministic_vector(query_id, 384)?;
+                let routing_query =
+                    PartitionRoutingQuery::new(metric, &query, &index.projection_weights)?;
                 for summary in &index.summaries {
-                    let lower_bound = partition_routing_lower_bound(metric, &query, summary)?;
+                    let lower_bound =
+                        partition_routing_lower_bound(metric, &routing_query, summary)?;
                     let partition = index
                         .partitions
                         .get(summary.partition_index)
@@ -4060,6 +4146,44 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn routed_plans_reuse_projection_weights_and_normalize_cosine_once_per_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(990)?,
+            384,
+            Metric::Cosine,
+            HnswConfig::new(16, 96, 64, 128, 0xca_c4e)?,
+        )?;
+        let records = (1..=64_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: deterministic_vector(value, 384)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let index =
+            PartitionedHnswIndex::build(&HnswPartitionPlan::build(definition, records, 64)?)?;
+        let query = deterministic_vector(65, 384)?;
+        let options = SearchOptions::new(10, 64, Some(10))?;
+
+        reset_routing_query_work_for_test();
+        let first = index.plan_routed_search(&query, options, 32)?;
+        let second = index.plan_routed_search(&query, options, 32)?;
+        assert_eq!(
+            first.ranked_partitions().collect::<Vec<_>>(),
+            second.ranked_partitions().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            routing_query_work_for_test(),
+            (0, 2 * 384),
+            "projection weights belong to the immutable index and cosine normalization is query-scoped"
+        );
         Ok(())
     }
 

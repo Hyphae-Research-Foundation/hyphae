@@ -228,7 +228,7 @@ impl LocalTransport {
                 result = connection.codec.receive(&mut reader) => {
                     result.map_err(|error| ClientError::Local(error.to_string()))?
                 }
-                () = wait_cancelled(options.cancellation.clone()) => {
+                () = options.cancellation.cancelled() => {
                     connection.codec.send(
                         &mut &connection.stream,
                         FrameKind::Cancel,
@@ -371,12 +371,6 @@ fn operation_frame_kind(encoded: &[u8]) -> Result<FrameKind, ClientError> {
         12 => FrameKind::Deallocate,
         _ => FrameKind::Execute,
     })
-}
-
-async fn wait_cancelled(token: super::CancellationToken) {
-    while !token.is_cancelled() {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
 }
 
 async fn wait_deadline(deadline_micros: Option<i64>) {

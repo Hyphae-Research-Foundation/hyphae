@@ -153,7 +153,7 @@ impl HttpTransport {
                     }
                 })?
             }
-            () = wait_cancelled(options.cancellation.clone()) => {
+            () = options.cancellation.cancelled() => {
                 return Err(product_error(ProductErrorCode::Cancelled, request_id));
             }
         };
@@ -229,7 +229,7 @@ async fn read_bounded(
             result = response.chunk() => {
                 result.map_err(|error| ClientError::Http(error.to_string()))?
             }
-            () = wait_cancelled(cancellation.clone()) => {
+            () = cancellation.cancelled() => {
                 return Err(product_error(ProductErrorCode::Cancelled, request_id));
             }
         };
@@ -250,12 +250,6 @@ async fn read_bounded(
         ));
     }
     Ok(encoded)
-}
-
-async fn wait_cancelled(token: super::CancellationToken) {
-    while !token.is_cancelled() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 fn unique_request_id() -> u64 {
