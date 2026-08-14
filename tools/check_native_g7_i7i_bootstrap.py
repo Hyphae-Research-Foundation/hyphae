@@ -72,6 +72,12 @@ def validate_i7i_bootstrap(source: str) -> dict[str, object]:
         "instance NVMe model": "AmazonEC2NVMeInstanceStorage",
         "G7 data root": "/mnt/hyphae-g7",
         "hardware evidence": "/etc/hyphae/g7-hardware.json",
+        "integer memory source": (
+            "ram_kib=\"$(awk '$1 == \"MemTotal:\" {print $2}' /proc/meminfo)\""
+        ),
+        "integer memory validation": '[[ "$ram_kib" =~ ^[0-9]+$ ]]',
+        "integer byte conversion": 'ram_bytes="$((ram_kib * 1024))"',
+        "positive memory evidence": "(( ram_bytes > 0 ))",
         "performance governor": "printf '%s\\n' performance",
         "required perf events": "cycles,cache-misses,minor-faults,major-faults",
         "unsupported-event rejection": 'if raw.startswith("<"):',

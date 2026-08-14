@@ -49,6 +49,16 @@ class I7iBootstrapTests(unittest.TestCase):
                 with self.assertRaises(I7iBootstrapError):
                     validate_i7i_bootstrap(source.replace(old, new, 1))
 
+    def test_rejects_non_integer_memory_evidence(self) -> None:
+        source = BOOTSTRAP.read_text(encoding="utf-8")
+        invalid = source.replace(
+            'ram_bytes="$((ram_kib * 1024))"',
+            'ram_bytes="invalid"',
+            1,
+        )
+        with self.assertRaisesRegex(I7iBootstrapError, "integer byte conversion"):
+            validate_i7i_bootstrap(invalid)
+
     def test_rejects_perf_canary_after_runner_registration(self) -> None:
         source = BOOTSTRAP.read_text(encoding="utf-8")
         canary = "sudo -u ubuntu perf stat --no-big-num"
