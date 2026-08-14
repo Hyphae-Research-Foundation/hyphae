@@ -24,7 +24,7 @@
   "required_sdks": ["rust", "python", "typescript"],
   "required_transports": ["embedded", "native-local", "http-v2"],
   "contracts": [
-    {"reference": "docs/gates/native-local-phase-1.md", "sha256": "5db43af78b2415b7b0d72f2c2e4954e24f30db3f8bfa469326ee64336300f1f0"},
+    {"reference": "docs/gates/native-local-phase-1.md", "sha256": "41a109daef529fb0983a1a62a5916ebddce650a4668b9b4989bf2e0ea94f74d2"},
     {"reference": "docs/adr/0023-native-local-product-and-competitive-scope.md", "sha256": "c4fc93447a3bbf109668c50b86a0f8031dacccc99fc87d6d028189098c03a3a0"},
     {"reference": "docs/roadmaps/native-g6-roadmap.md", "sha256": "67a44336d3ad70e14a57e607c6d73a909192328995df65d4cb5ee2451a8a9ea1"},
     {"reference": "docs/native/local-product-v1.md", "sha256": "a2bcb19cd5b38d6056ff46371e3a965edd2cdc2f54eb72256629029e83f5423d"},

@@ -1,0 +1,79 @@
+{
+  "schema": "hyphae-native-g7-closure-v1",
+  "gate": "G7",
+  "status": "passed",
+  "source_commit": "ff188af589eff1f6f15ac4f2e782b43f0868fa21",
+  "source_tree": "d9f6493e31b8d4c139937dd57092908421256de6",
+  "authority_date": "2026-08-14",
+  "authority_scope": "operational-scale-performance",
+  "evidence_class": "virtual-machine-operational-scale-authority-v1",
+  "production_scale": true,
+  "required": 11,
+  "passed": 11,
+  "requirements": [
+    "embedded-structure-point-get",
+    "embedded-prepared-sql-primary-key",
+    "local-structure-point-get",
+    "local-prepared-sql-primary-key",
+    "indexed-sql-bounded-read",
+    "two-index-join-bounded-read",
+    "bm25-top10",
+    "filtered-bm25-top10",
+    "ann-top10-recall-095",
+    "hybrid-top10",
+    "strict-group-commit"
+  ],
+  "matrix_cells_required": 33,
+  "matrix_cells_passed": 33,
+  "contract": {
+    "background_modes": ["control"],
+    "cell_timeout_seconds": 9000,
+    "concurrency": [1, 8, 32],
+    "database_queue_wait_millis": 60000,
+    "observations_per_surface": 1000000,
+    "stall_timeout_seconds": 1800,
+    "states": ["warm"],
+    "surfaces": 11,
+    "warmup_per_surface": 100000
+  },
+  "contract_profile_sha256": "421e96da451c726dce293f26c795b862dba148cd408a7a2634cb4e70b97367f6",
+  "retained_evidence": {
+    "path": "docs/gates/evidence/native-g7-provisional-do-c60-2026-08-13.json",
+    "sha256": "95a78beb031de35a3d2532c7536d76491d6273f7b8ce74c6b3976038bc8c3234"
+  },
+  "artifact": "native-g7-provisional-do-c60-2026-08-13-bundle",
+  "artifact_sha256": "760ae09fe409a7ba39222ba9ff55367dc5923620124525b02ef7c75b0f536a47",
+  "matrix_sha256": "3e4523dadb308a2696fed0462ecf8d4cb166578c430e84744b11bb60a75147e6",
+  "checksums_sha256": "1f1a5c3e86eef1a36231f4aa06977d9a1076c473c26914e1ef2380449837197",
+  "runner_override_sha256": "f8a687ecfa06b3d2433dbe6d5a92ec69cc423c562d7ea9ebc717bf200a3ceccd",
+  "authority_execution": {
+    "provider": "DigitalOcean",
+    "droplet_id": 592176697,
+    "size": "c-60-intel",
+    "region": "nyc3",
+    "vcpus": 60,
+    "ram_gib": 120,
+    "deleted": true
+  },
+  "bare_metal_diagnostic": {
+    "provider": "AWS",
+    "instance_id": "i-0aec6617871f0ff8e",
+    "runner": "hyphae-g7-i7i-2ac90c8e84eb",
+    "workflow_run": 31789602285,
+    "source_commit": "b2f8679ef28be6f10fabf773ac8809712cebf035",
+    "conclusion": "failure",
+    "failure_class": "infrastructure-toolchain-install",
+    "failed_step": "Discover and calibrate dedicated hardware",
+    "product_measurements_started": false
+  },
+  "canonical_latency_certified": false,
+  "dedicated_hardware_certified": false,
+  "background_interference_certified": false,
+  "non_claims": [
+    "canonical dedicated-hardware latency certification",
+    "background-interference certification",
+    "bare-metal qualification"
+  ],
+  "claims": ["G7"],
+  "closure_declared": true
+}

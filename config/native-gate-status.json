@@ -52,7 +52,13 @@
       "evidence": "docs/gates/evidence/closures/native-g6-c57cc07.json",
       "evidence_sha256": "90aefb59db1527c87d0e4f8f3778ad8cc1fe83fc748aa2cd4eea04810472aa8f"
     },
-    {"id": "G7", "status": "open"},
+    {
+      "id": "G7",
+      "status": "closed",
+      "source_commit": "ff188af589eff1f6f15ac4f2e782b43f0868fa21",
+      "evidence": "docs/gates/evidence/closures/native-g7-ff188af.json",
+      "evidence_sha256": "30edf0499408d38b2902d9b9ec67ec769c2a68d98e365f230a074a0896fe617a"
+    },
     {"id": "G8", "status": "open"}
   ]
 }

@@ -4,6 +4,13 @@ Date: 2026-08-13
 
 Status: provisional control qualification passed; canonical G7 remains open
 
+Historical note: this file preserves the decision made on 2026-08-13. On
+2026-08-14, after the final bare-metal attempt failed before product
+measurement, the unchanged machine-readable result was promoted by the
+[separate G7 closure authority](closures/native-g7-ff188af.json). That closure
+does not rewrite this historical receipt or claim dedicated-hardware,
+background-interference, or canonical-latency certification.
+
 Source commit:
 `ff188af589eff1f6f15ac4f2e782b43f0868fa21`
 

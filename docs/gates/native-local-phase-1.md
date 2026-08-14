@@ -26,6 +26,14 @@ production-scale performance claim.
 | G7 | Performance | The warm microsecond contract passes on stable hardware with concurrency, saturation, background interference, p99.9, allocation and hardware-counter receipts; cold first-touch behavior is reported separately without a universal threshold |
 | G8 | Release evidence | Soak, crash, corruption, resource exhaustion, migration v2-to-native, multiplatform packaging, SBOM, signatures and independent restore verification are green on one exact commit |
 
+The retained G7 closure is an explicit environment-bound authority decision.
+It accepts the source-bound C-60 operational-scale control matrix while leaving
+the canonical profile and its numeric thresholds unchanged. The closure does
+not certify dedicated hardware, background interference, or canonical latency;
+those remain non-claims rather than silently weakened requirements. The final
+bare-metal attempt failed in toolchain installation before product measurement
+and is retained only as a failed diagnostic.
+
 ## G0 required decisions
 
 G0 must close these decisions before production implementation:

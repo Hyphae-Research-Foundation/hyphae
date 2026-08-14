@@ -14,16 +14,19 @@ mirror is [`config/native-gate-status.json`](../../config/native-gate-status.jso
 | G4 | Closed at `0059fce` | [12/12 hosted corpus-bound search closure](evidence/closures/native-g4-0059fce.json) |
 | G5 | Closed at `b7cf651` | [8/8 hosted exact-SHA convergence closure](evidence/closures/native-g5-b7cf651.json) |
 | G6 | Closed at `c57cc07` | [14/14 requirements and 42/42 exact-SHA platform cells](evidence/closures/native-g6-c57cc07.json) |
-| G7 | Open; authority defined | [Controlled-performance readiness profile](../../config/native-g7-readiness-profile.json); no performance closure claimed |
+| G7 | Closed at `ff188af` | [11/11 surfaces and 33/33 C-60 operational-scale cells](evidence/closures/native-g7-ff188af.json); environment-bound, with no dedicated-hardware, interference, or canonical-latency certification |
 | G8 | Open; authority defined | [Exact-commit release readiness profile](../../config/native-g8-readiness-profile.json); no release closure claimed |
 
 `bounded-readiness-only` records useful hosted evidence without promoting a
 deliberately restricted vertical into the broader normative gate outcome.
 
-G0 through G6 form the ordered product-readiness prefix. G8 closes independently
-on the exact release commit. G7 is a separate performance certification and may
-remain open without blocking a stable release; while it is open, no certified
-latency, saturation, or production-scale performance claim is permitted.
+G0 through G7 form the ordered product-readiness prefix. G8 closes independently
+on the exact release commit. G7 closed from the source-bound DigitalOcean C-60
+run after the final bare-metal attempt failed before product measurement. The
+closure certifies the million-observation operational-scale matrix, concurrency,
+correctness, ANN recall, accounting, and durable recovery. It does not certify
+the canonical dedicated-hardware latency targets, background interference, or
+bare-metal performance.
 Temporary workflow artifacts are inputs to an aggregate, not durable closure
 authority by themselves.
 
