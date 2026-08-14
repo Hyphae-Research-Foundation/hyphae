@@ -18,10 +18,10 @@ format.
 
 ## Next program: native local data ecosystem
 
-The Native product program ships as `1.0.0`. G0 through G6 have retained
-exact-SHA closure for their versioned, bounded profiles. G8 supplies
-exact-release safety evidence; G7 remains an independent post-release
-performance certification with machine-readable authority. See
+The Native product program ships as `1.0.0`. G0 through G7 have retained
+source-bound closure for their versioned, bounded profiles. G8 supplies
+exact-release safety evidence. G7 uses an environment-bound operational-scale
+authority and makes no canonical bare-metal latency or interference claim. See
 the [native gate status](gates/native-gate-status.md). Hyphae will build its own
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory

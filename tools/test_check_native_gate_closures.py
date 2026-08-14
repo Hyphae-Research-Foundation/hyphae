@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_native_gate_closures import GateFailure, validate
+from tools.check_native_gate_closures import (
+    GateFailure,
+    validate,
+    validate_g7_c60_closure,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,8 +20,38 @@ class NativeGateClosureTests(unittest.TestCase):
     def test_checked_in_closure_prefix_is_complete_and_bound(self) -> None:
         result = validate(ROOT)
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["closed"], ["G0", "G1", "G2", "G3", "G4", "G5", "G6"])
-        self.assertEqual(result["open"], ["G7", "G8"])
+        self.assertEqual(
+            result["closed"],
+            ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7"],
+        )
+        self.assertEqual(result["open"], ["G8"])
+
+    def test_g7_c60_closure_rejects_authority_drift(self) -> None:
+        closure_path = (
+            ROOT
+            / "docs/gates/evidence/closures/native-g7-ff188af.json"
+        )
+        closure = json.loads(closure_path.read_text(encoding="utf-8"))
+        for path, value in (
+            (("source_tree",), "0" * 40),
+            (("contract_profile_sha256",), "0" * 64),
+            (("retained_evidence", "sha256"), "0" * 64),
+            (("production_scale",), False),
+            (("authority_execution", "dedicated"), True),
+            (("canonical_latency_certified",), True),
+            (("dedicated_hardware_certified",), True),
+            (("background_interference_certified",), True),
+            (("claims",), []),
+            (("closure_declared",), False),
+        ):
+            candidate = json.loads(json.dumps(closure))
+            target = candidate
+            for segment in path[:-1]:
+                target = target[segment]
+            target[path[-1]] = value
+            with self.subTest(path=path):
+                with self.assertRaises(GateFailure):
+                    validate_g7_c60_closure(ROOT, candidate)
 
     def fixture(self, directory: str) -> Path:
         root = Path(directory)
