@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 blake3.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 hyphae-client.workspace = true
 hyphae-contracts.workspace = true
 hyphae-core.workspace = true
@@ -34,6 +35,7 @@ hyphae-query.workspace = true
 hyphae-retrieval.workspace = true
 hyphae-server.workspace = true
 hyphae-storage.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

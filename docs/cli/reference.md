@@ -29,6 +29,8 @@ This page explains semantics and side effects that do not fit in short help.
 - `hardware`
 - `status`
 - `telemetry`
+- `console`
+- `security`
 - `doctor`
 - `checkpoint`
 - `compact`
@@ -59,6 +61,43 @@ refuses to replace an existing proof, witness, backup, or data directory.
 Commands in the Native `dev` surface never initialize a missing directory on
 open: use `init` first. The format-2 compatibility commands retain their
 published `0.2.1` initialization behavior.
+
+## `console`
+
+```text
+hyphae console --data-dir <NATIVE_DIRECTORY>
+```
+
+Opens the interactive native operator console while holding the same exclusive
+directory ownership as other embedded commands. It starts no listener and
+connects to no external service. The console currently provides:
+
+- responsive overview and access-control dashboards;
+- an interactive SQL editor and result pane backed by `ProductOperation`;
+- navigation targets for structures, search, and catalog workflows; and
+- bounded input/output rendering that never displays API-key secrets.
+
+Use Tab or the arrow keys to change views. In the SQL view, Enter executes the
+current statement and Backspace edits it. In other views, `r` refreshes the
+native status. Escape or Ctrl-C exits. Terminal state is restored on normal
+exit and errors. Structure, search, and catalog mutation actions remain
+read-only placeholders until their typed workflows are implemented; the UI
+does not claim those actions are available.
+
+## `security`
+
+```text
+hyphae security --data-dir <NATIVE_DIRECTORY> status
+hyphae security --data-dir <NATIVE_DIRECTORY> bootstrap \
+  --name <PRINCIPAL_NAME> --label <KEY_LABEL> --key-out <NEW_FILE>
+```
+
+`status` reports whether the native access-control catalog is bootstrapped and
+returns only counts and the authorization epoch. `bootstrap` creates the first
+administrator principal and key through the strict native WAL. The output
+credential file must not exist, is created with owner-only permissions on
+Unix, and is activated only after its contents have been synchronized. Hyphae
+never prints the secret to stdout or writes it to logs.
 
 ## `version`
 

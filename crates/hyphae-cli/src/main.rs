@@ -9,6 +9,7 @@ mod mcp;
 mod native;
 mod native_client;
 mod native_service;
+mod tui;
 
 use std::{
     collections::BTreeMap,
@@ -204,6 +205,8 @@ enum Command {
     Status(LocalDirectory),
     /// Capture bounded process-local native telemetry.
     Telemetry(LocalDirectory),
+    /// Open the interactive native operator console.
+    Console(LocalDirectory),
     /// Bootstrap or inspect native principals, roles, and API keys.
     Security {
         #[command(flatten)]
@@ -1318,6 +1321,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             dispatch(&local, ProductOperation::AdminStatus).map_err(Into::into)
         }
         Command::Telemetry(local) => telemetry(&local).map_err(Into::into),
+        Command::Console(local) => tui::run(local.data_dir).map_err(Into::into),
         Command::Security { local, operation } => security(&local, operation).map_err(Into::into),
         Command::Doctor(local) => {
             if compatibility(compatibility::directory_family(&local.data_dir))?

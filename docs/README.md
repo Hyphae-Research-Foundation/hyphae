@@ -293,6 +293,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
 - [ADR-0026: Bounded calibration resampling](adr/0026-calibration-resampling-policy.md)
 - [ADR-0027: Parallel search seed cohorts](adr/0027-parallel-search-seed-cohorts.md)
+- [ADR-0028: Native identity, RBAC, and API keys](adr/0028-native-identity-rbac-and-api-keys.md)
 
 ## Documentation contract
 
