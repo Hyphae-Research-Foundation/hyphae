@@ -1,0 +1,30 @@
+{
+  "name": "hyphae",
+  "version": "0.1.0",
+  "description": "Query and mutate a local Hyphae data engine through bounded, proof-bearing MCP tools.",
+  "author": {
+    "name": "Celiums Solutions LLC",
+    "url": "https://hyphae.dev"
+  },
+  "homepage": "https://hyphae.dev",
+  "repository": "https://github.com/celiumsai/hyphae",
+  "license": "AGPL-3.0-only",
+  "keywords": ["database", "sql", "search", "rag", "mcp"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hyphae",
+    "shortDescription": "Use a local proof-bearing data engine.",
+    "longDescription": "Give Codex bounded SQL, document, lexical, vector, and hybrid retrieval tools backed by one local Hyphae authority.",
+    "developerName": "Celiums Solutions LLC",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://hyphae.dev",
+    "defaultPrompt": [
+      "Inspect the capabilities of my local Hyphae instance.",
+      "Query Hyphae and explain the returned proof metadata.",
+      "Store this data in Hyphae after showing the mutation plan."
+    ],
+    "brandColor": "#24D6A5"
+  },
+  "mcpServers": "./.mcp.json"
+}

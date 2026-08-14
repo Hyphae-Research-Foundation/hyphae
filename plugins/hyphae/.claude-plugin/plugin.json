@@ -1,0 +1,13 @@
+{
+  "name": "hyphae",
+  "description": "Query and mutate a local Hyphae data engine through bounded, proof-bearing MCP tools.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Celiums Solutions LLC",
+    "url": "https://hyphae.dev"
+  },
+  "homepage": "https://hyphae.dev",
+  "repository": "https://github.com/celiumsai/hyphae",
+  "license": "AGPL-3.0-only",
+  "keywords": ["database", "sql", "search", "rag", "mcp"]
+}

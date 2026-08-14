@@ -1,0 +1,20 @@
+{
+  "name": "hyphae",
+  "owner": {
+    "name": "Celiums Solutions LLC",
+    "url": "https://hyphae.dev"
+  },
+  "metadata": {
+    "description": "Official Hyphae plugins"
+  },
+  "plugins": [
+    {
+      "name": "hyphae",
+      "source": "./plugins/hyphae",
+      "description": "Bounded proof-bearing access to a local Hyphae data engine.",
+      "version": "0.1.0",
+      "category": "development",
+      "tags": ["database", "sql", "search", "rag", "mcp"]
+    }
+  ]
+}

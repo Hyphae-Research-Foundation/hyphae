@@ -45,6 +45,10 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_access_control -v
           PYTHONPATH=. python tools/check_native_access_control.py
+      - name: Verify Claude Code and Codex plugins
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_agent_plugins -v
+          PYTHONPATH=. python tools/check_agent_plugins.py
       - name: Verify open G7 and G8 authority
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v

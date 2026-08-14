@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hyphae": {
+      "type": "stdio",
+      "command": "hyphae",
+      "args": [
+        "mcp",
+        "--base-url",
+        "http://127.0.0.1:8787"
+      ]
+    }
+  }
+}
