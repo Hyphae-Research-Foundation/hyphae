@@ -96,6 +96,15 @@ The dedicated workflow installs the pinned `blake3==1.0.9` verifier and passes
 the exact `target/release/hyphae` binary to the checker. A missing verifier,
 dirty worktree, mismatched `HEAD`, or different executable fails before G7.
 
+The ephemeral i7i host must be created with
+`tools/bootstrap_native_g7_i7i.sh`. The bootstrap persists
+`kernel.perf_event_paranoid=-1`, applies and reads back that value, and executes
+the same four-event `perf stat` canary used by the workflow before registering
+the ephemeral runner. `tools/check_native_g7_i7i_bootstrap.py` freezes that
+ordering and is included in both CI quality and the exact-SHA G7 authority
+artifact. A host that cannot expose real hardware counters never accepts a G7
+job.
+
 ```sh
 python3 -m pip install blake3==1.0.9
 PYTHONPATH=. python3 tools/check_native_scheduler_authority.py \
