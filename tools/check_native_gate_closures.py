@@ -23,6 +23,7 @@ EXPECTED_SCHEMAS = {
     "G5": "hyphae-native-g5-closure-v1",
     "G6": "hyphae-native-g6-closure-v1",
     "G7": "hyphae-native-g7-closure-v1",
+    "G8": "hyphae-native-g8-aggregate-v1",
 }
 CANONICAL_G7_PROFILE_SHA256 = (
     "421e96da451c726dce293f26c795b862dba148cd408a7a2634cb4e70b97367f6"
@@ -30,6 +31,15 @@ CANONICAL_G7_PROFILE_SHA256 = (
 G7_C60_EVIDENCE = (
     "docs/gates/evidence/native-g7-provisional-do-c60-2026-08-13.json"
 )
+G8_RELEASE_COMMIT = "e88f2ea2c3455a393e3ac0cd69e25486cc26888e"
+G8_AGGREGATE_SHA256 = (
+    "8716602084a581b9ad009d3f9357677cfb262f4929fdff7959ef6de58acc6f23"
+)
+G8_WORKFLOW_RUNS = {
+    "readiness": 31796827556,
+    "release": 31797867994,
+    "closure": 31798866604,
+}
 
 
 class GateFailure(ValueError):
@@ -65,6 +75,16 @@ def _profile_requirements(root: Path, gate: str) -> list[str]:
             or len(requirements) != len(set(requirements))
         ):
             raise GateFailure("G7 readiness profile has invalid required cells")
+        return requirements
+    if gate == "G8":
+        requirements = profile.get("required_requirements")
+        if (
+            not isinstance(requirements, list)
+            or not requirements
+            or any(not isinstance(value, str) or not value for value in requirements)
+            or len(requirements) != len(set(requirements))
+        ):
+            raise GateFailure("G8 readiness profile has invalid requirements")
         return requirements
     requirements = profile.get("requirements")
     if not isinstance(requirements, list) or not requirements:
@@ -287,6 +307,99 @@ def validate_g7_c60_closure(root: Path, closure: dict[str, Any]) -> None:
     _validate_g7_artifacts(closure, evidence)
 
 
+def validate_g8_aggregate(root: Path, aggregate: dict[str, Any]) -> None:
+    expected_fields = {
+        "schema",
+        "gate",
+        "status",
+        "source_commit",
+        "required_platforms",
+        "requirements",
+        "claims",
+        "closure_declared",
+    }
+    if set(aggregate) != expected_fields:
+        raise GateFailure("G8 retained aggregate fields mismatch")
+    encoded = (json.dumps(aggregate, indent=2, sort_keys=True) + "\n").encode()
+    if hashlib.sha256(encoded).hexdigest() != G8_AGGREGATE_SHA256:
+        raise GateFailure("G8 retained aggregate digest mismatch")
+    profile = _load(
+        root / "config/native-g8-readiness-profile.json",
+        "G8 readiness profile",
+    )
+    manifest = _load(
+        root / "config/native-g8-suite-manifest.json",
+        "G8 suite manifest",
+    )
+    requirements = _profile_requirements(root, "G8")
+    required_platforms = profile.get("required_platforms")
+    rows = manifest.get("requirements")
+    if (
+        profile.get("schema") != "hyphae-native-g8-readiness-profile-v2"
+        or profile.get("status") != "open"
+        or profile.get("claims") != []
+        or profile.get("closure_declared") is not False
+        or manifest.get("schema") != "hyphae-native-g8-suite-manifest-v2"
+        or manifest.get("gate") != "G8"
+        or manifest.get("claims") != []
+        or manifest.get("closure_declared") is not False
+        or aggregate.get("schema") != "hyphae-native-g8-aggregate-v1"
+        or aggregate.get("gate") != "G8"
+        or aggregate.get("status") != "passed"
+        or aggregate.get("source_commit") != G8_RELEASE_COMMIT
+        or aggregate.get("required_platforms") != required_platforms
+        or aggregate.get("claims") != ["G8"]
+        or aggregate.get("closure_declared") is not True
+        or not isinstance(rows, list)
+        or [row.get("id") for row in rows if isinstance(row, dict)]
+        != requirements
+    ):
+        raise GateFailure("G8 retained aggregate identity mismatch")
+    authorities = {
+        row.get("id"): row.get("platforms")
+        for row in rows
+        if isinstance(row, dict)
+    }
+    evidence = aggregate.get("requirements")
+    if not isinstance(evidence, dict) or list(evidence) != sorted(requirements):
+        raise GateFailure("G8 retained aggregate requirement coverage mismatch")
+    for requirement in requirements:
+        platforms = evidence.get(requirement)
+        expected_platforms = authorities.get(requirement)
+        if (
+            not isinstance(platforms, dict)
+            or not isinstance(expected_platforms, list)
+            or set(platforms) != set(expected_platforms)
+        ):
+            raise GateFailure(f"G8 platform coverage mismatch: {requirement}")
+        for platform, record in platforms.items():
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"audit", "receipt_sha256"}
+            ):
+                raise GateFailure(
+                    f"G8 retained receipt record mismatch: {requirement}/{platform}"
+                )
+            receipt_digest = record.get("receipt_sha256")
+            audit = record.get("audit")
+            if (
+                not isinstance(receipt_digest, str)
+                or HEX64.fullmatch(receipt_digest) is None
+                or not isinstance(audit, dict)
+                or audit
+                != {
+                    "platform": platform,
+                    "requirement": requirement,
+                    "schema": "hyphae-native-g8-receipt-audit-v1",
+                    "source_commit": G8_RELEASE_COMMIT,
+                    "status": "passed",
+                }
+            ):
+                raise GateFailure(
+                    f"G8 retained receipt audit mismatch: {requirement}/{platform}"
+                )
+
+
 def validate(root: Path) -> dict[str, Any]:
     status = _load(root / "config/native-gate-status.json", "native gate status")
     if (
@@ -320,7 +433,12 @@ def validate(root: Path) -> dict[str, Any]:
             raise GateFailure(f"unsupported status for {gate}: {state}")
         if encountered_open:
             raise GateFailure(f"closed {gate} appears after an open predecessor")
-        if set(row) != {"id", "status", "source_commit", "evidence", "evidence_sha256"}:
+        expected_row_fields = {
+            "id", "status", "source_commit", "evidence", "evidence_sha256",
+        }
+        if gate == "G8":
+            expected_row_fields.add("workflow_runs")
+        if set(row) != expected_row_fields:
             raise GateFailure(f"closed {gate} row fields mismatch")
 
         source_commit = row["source_commit"]
@@ -352,20 +470,34 @@ def validate(root: Path) -> dict[str, Any]:
             or evidence.get("source_commit") != source_commit
         ):
             raise GateFailure(f"{gate} retained closure identity mismatch")
-        required = evidence.get("required")
-        passed = evidence.get("passed")
-        if (
-            not isinstance(required, int)
-            or isinstance(required, bool)
-            or required <= 0
-            or passed != required
-        ):
-            raise GateFailure(f"{gate} retained closure count mismatch")
-        if evidence.get("requirements") != _profile_requirements(root, gate):
-            raise GateFailure(f"{gate} retained closure requirements drifted")
         if gate == "G7":
+            required = evidence.get("required")
+            passed = evidence.get("passed")
+            if (
+                not isinstance(required, int)
+                or isinstance(required, bool)
+                or required <= 0
+                or passed != required
+                or evidence.get("requirements") != _profile_requirements(root, gate)
+            ):
+                raise GateFailure(f"{gate} retained closure count mismatch")
             validate_g7_c60_closure(root, evidence)
+        elif gate == "G8":
+            if row.get("workflow_runs") != G8_WORKFLOW_RUNS:
+                raise GateFailure("G8 retained workflow identities mismatch")
+            validate_g8_aggregate(root, evidence)
         else:
+            required = evidence.get("required")
+            passed = evidence.get("passed")
+            if (
+                not isinstance(required, int)
+                or isinstance(required, bool)
+                or required <= 0
+                or passed != required
+            ):
+                raise GateFailure(f"{gate} retained closure count mismatch")
+            if evidence.get("requirements") != _profile_requirements(root, gate):
+                raise GateFailure(f"{gate} retained closure requirements drifted")
             workflow_run = evidence.get("workflow_run")
             if (
                 not isinstance(workflow_run, int)
@@ -375,11 +507,12 @@ def validate(root: Path) -> dict[str, Any]:
                 raise GateFailure(
                     f"{gate} retained closure workflow identity is invalid"
                 )
-        if not isinstance(evidence.get("artifact"), str) or not evidence["artifact"]:
-            raise GateFailure(f"{gate} retained closure artifact is missing")
-        expected_production_scale = gate == "G7"
-        if evidence.get("production_scale") is not expected_production_scale:
-            raise GateFailure(f"{gate} retained closure production scale mismatch")
+        if gate != "G8":
+            if not isinstance(evidence.get("artifact"), str) or not evidence["artifact"]:
+                raise GateFailure(f"{gate} retained closure artifact is missing")
+            expected_production_scale = gate == "G7"
+            if evidence.get("production_scale") is not expected_production_scale:
+                raise GateFailure(f"{gate} retained closure production scale mismatch")
 
         if gate == "G1":
             predecessor = _object(evidence.get("predecessor"), "G1 predecessor")
