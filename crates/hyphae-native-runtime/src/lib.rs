@@ -36254,7 +36254,7 @@ mod tests {
             reopened.commit_optimistic(stale_singleton),
             Err(NativeRuntimeError::InvalidPreparedMutation)
         ));
-        assert_eq!(reopened.physical_observation()?, before);
+        assert_local_storage_unchanged(before, reopened.physical_observation()?);
         let resolved_error = reopened
             .commit_optimistic_resolved(stale_resolved, [9; 32], [10; 32])
             .err()
@@ -36264,12 +36264,12 @@ mod tests {
             resolved_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(reopened.physical_observation()?, before);
+        assert_local_storage_unchanged(before, reopened.physical_observation()?);
         assert!(matches!(
             reopened.commit_group(vec![stale_group]),
             Err(NativeRuntimeError::InvalidPreparedMutation)
         ));
-        assert_eq!(reopened.physical_observation()?, before);
+        assert_local_storage_unchanged(before, reopened.physical_observation()?);
         Ok(())
     }
 
@@ -40069,7 +40069,7 @@ mod tests {
             database.commit_optimistic(unhydrated),
             Err(NativeRuntimeError::InvalidPreparedMutation)
         ));
-        assert_eq!(database.physical_observation()?, before_unhydrated);
+        assert_local_storage_unchanged(before_unhydrated, database.physical_observation()?);
 
         let mut malformed = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
         assert!(!database.stage_delta_hdelete(
@@ -40093,7 +40093,7 @@ mod tests {
             matches!(malformed_error, NativeRuntimeError::InvalidPreparedMutation),
             "unexpected malformed shape error: {malformed_error:?}"
         );
-        assert_eq!(database.physical_observation()?, before_malformed);
+        assert_local_storage_unchanged(before_malformed, database.physical_observation()?);
 
         let mut forged_index = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
         database.stage_delta_hset(
@@ -40122,7 +40122,7 @@ mod tests {
             index_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(database.physical_observation()?, before_index);
+        assert_local_storage_unchanged(before_index, database.physical_observation()?);
 
         let mut forged_accounting = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
         database.stage_delta_hset(
@@ -40147,7 +40147,7 @@ mod tests {
             accounting_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(database.physical_observation()?, before_accounting);
+        assert_local_storage_unchanged(before_accounting, database.physical_observation()?);
 
         let mut forged_total = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
         database.stage_delta_set(
@@ -40172,7 +40172,7 @@ mod tests {
             total_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(database.physical_observation()?, before_total);
+        assert_local_storage_unchanged(before_total, database.physical_observation()?);
         Ok(())
     }
 
