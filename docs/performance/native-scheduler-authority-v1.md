@@ -62,6 +62,19 @@ checked additions and never wrap. Single-generation and direct serial execution
 report zero for both counters. These counts describe dispatch, not a latency
 claim; dedicated qualification remains the only performance authority.
 
+## Local transport placement
+
+Linux G7 local-protocol cells bind the client runtime, daemon runtime, and
+sole product owner to three distinct physical cores reserved by the canonical
+execution topology. The owner inherits its one-CPU mask at thread creation;
+the daemon is rebound before listener startup, and the client is rebound
+before warmup and measurement. The receipt records the three planned logical
+processors and the three observed one-CPU masks. Missing affinity, reuse of a
+processor, a mask wider than one CPU, or disagreement between the structure
+and prepared-SQL surfaces fails closed. This controls scheduler migration and
+SMT contention without changing a latency threshold or excluding transport,
+queueing, or product execution from the timed interval.
+
 ## Failure model
 
 Source/tree substitution, executable/calibration substitution, artifact

@@ -19,4 +19,7 @@ serde_json = "1.0.150"
 stats_alloc = "0.1.10"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["sched"] }
+
 [workspace]

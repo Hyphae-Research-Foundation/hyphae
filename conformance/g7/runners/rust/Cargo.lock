@@ -437,6 +437,7 @@ dependencies = [
  "hyphae-native-product",
  "hyphae-native-runtime",
  "hyphae-native-types",
+ "nix",
  "ring",
  "serde_json",
  "stats_alloc",

@@ -327,6 +327,18 @@ def validate(
             target_p50, target_p99 = authority.warm_targets[name]
             if cell["p50"] > target_p50 or cell["p99"] > target_p99:
                 raise GateFailure(f"G7 latency target missed: {name}")
+    if payload["platform"] == "linux":
+        local_surfaces = (
+            "local-structure-point-get",
+            "local-prepared-sql-primary-key",
+        )
+        for name in local_surfaces:
+            validate_local_transport_affinity(cells[name])
+        if (
+            cells[local_surfaces[0]]["local_transport_affinity"]
+            != cells[local_surfaces[1]]["local_transport_affinity"]
+        ):
+            raise GateFailure("G7 local transport affinity differs by surface")
     ann_recall = cells["ann-top10-recall-095"].get("recall_at_10")
     if not isinstance(ann_recall, (int, float)) or ann_recall < 0.95:
         raise GateFailure("G7 ANN recall floor was not met")
@@ -606,6 +618,45 @@ def _validate_group_commit_latency_summary(value: Any) -> None:
 
 
 _U64_MAX = (1 << 64) - 1
+
+
+def validate_local_transport_affinity(cell: dict[str, Any]) -> None:
+    affinity = cell.get("local_transport_affinity")
+    fields = {
+        "schema",
+        "status",
+        "placement_source",
+        "hard_affinity",
+        "client_logical_processor",
+        "daemon_logical_processor",
+        "owner_logical_processor",
+        "client_observed_cpu_set",
+        "daemon_observed_cpu_set",
+        "owner_observed_cpu_set",
+    }
+    if not isinstance(affinity, dict) or set(affinity) != fields:
+        raise GateFailure("G7 local transport affinity fields mismatch")
+    processors = (
+        affinity["client_logical_processor"],
+        affinity["daemon_logical_processor"],
+        affinity["owner_logical_processor"],
+    )
+    observed = (
+        affinity["client_observed_cpu_set"],
+        affinity["daemon_observed_cpu_set"],
+        affinity["owner_observed_cpu_set"],
+    )
+    if (
+        affinity["schema"] != "hyphae-native-g7-local-transport-affinity-v1"
+        or affinity["status"] != "measured"
+        or affinity["placement_source"]
+        != "hardware-profile-reserved-physical-cores-v1"
+        or affinity["hard_affinity"] is not True
+        or any(not _is_u64(processor) for processor in processors)
+        or len(set(processors)) != 3
+        or any(value != [processor] for value, processor in zip(observed, processors))
+    ):
+        raise GateFailure("G7 local transport affinity is invalid")
 
 
 def _is_u64(value: Any) -> bool:

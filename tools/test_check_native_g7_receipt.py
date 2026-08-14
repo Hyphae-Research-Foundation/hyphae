@@ -419,6 +419,24 @@ def receipt() -> dict:
             "strict-group-commit",
         }
     }
+    local_transport_affinity = {
+        "schema": "hyphae-native-g7-local-transport-affinity-v1",
+        "status": "measured",
+        "placement_source": "hardware-profile-reserved-physical-cores-v1",
+        "hard_affinity": True,
+        "client_logical_processor": 44,
+        "daemon_logical_processor": 45,
+        "owner_logical_processor": 46,
+        "client_observed_cpu_set": [44],
+        "daemon_observed_cpu_set": [45],
+        "owner_observed_cpu_set": [46],
+    }
+    cells["local-structure-point-get"]["local_transport_affinity"] = dict(
+        local_transport_affinity
+    )
+    cells["local-prepared-sql-primary-key"]["local_transport_affinity"] = dict(
+        local_transport_affinity
+    )
     cells["ann-top10-recall-095"].update({
         "per_query_worker_limit": 44,
         "query_queue_wait_millis": 60_000,
@@ -649,6 +667,37 @@ class G7ReceiptTests(unittest.TestCase):
     def test_valid_receipt(self) -> None:
         result = validate(receipt(), "a" * 40)
         self.assertEqual(result["status"], "passed")
+
+    def test_local_transport_affinity_is_exact_and_physically_observed(self) -> None:
+        for surface in (
+            "local-structure-point-get",
+            "local-prepared-sql-primary-key",
+        ):
+            payload = receipt()
+            del payload["cells"][surface]["local_transport_affinity"]
+            with self.assertRaisesRegex(GateFailure, "local transport affinity"):
+                validate(payload, "a" * 40)
+
+            for field, invalid in (
+                ("hard_affinity", False),
+                ("client_observed_cpu_set", [45]),
+                ("daemon_logical_processor", 44),
+                ("owner_observed_cpu_set", [46, 47]),
+            ):
+                payload = receipt()
+                payload["cells"][surface]["local_transport_affinity"][field] = invalid
+                with self.assertRaisesRegex(GateFailure, "local transport affinity"):
+                    validate(payload, "a" * 40)
+
+        payload = receipt()
+        payload["cells"]["local-prepared-sql-primary-key"][
+            "local_transport_affinity"
+        ]["owner_logical_processor"] = 47
+        payload["cells"]["local-prepared-sql-primary-key"][
+            "local_transport_affinity"
+        ]["owner_observed_cpu_set"] = [47]
+        with self.assertRaisesRegex(GateFailure, "differs by surface"):
+            validate(payload, "a" * 40)
 
     def test_build_source_tree_must_equal_the_expected_tree_not_commit(self) -> None:
         self.assertNotEqual(COMMIT, TREE)
