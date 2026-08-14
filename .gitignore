@@ -20,4 +20,5 @@ Thumbs.db
 /artifacts/
 /artifacts-local-*/
 /coverage/
+/website/
 /.hyphae/
