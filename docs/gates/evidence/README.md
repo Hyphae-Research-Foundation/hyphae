@@ -492,14 +492,15 @@ and binds:
 - the filename, role, byte size, and SHA-256 digest of every primary release
   payload.
 
-For a tagged `push` run, the primary payloads also include
+For a tagged `push` or exact-tag recovery run, the primary payloads also include
 `hyphae-vVERSION.required-checks.json` with role `required-checks`. That report
 conforms structurally to
 [`packaging/required-checks-report-v1.schema.json`](../../../packaging/required-checks-report-v1.schema.json)
-and records exactly the 17 canonical required GitHub Actions checks for the
-release commit. Each ordered record carries the matching `head_sha`, unique
+and records exactly the 18 canonical required GitHub Actions checks. Seventeen
+records bind the reviewed PR head and the G8 closure record binds the tagged
+merge commit on `main`. Each ordered record carries the matching `head_sha`, unique
 check-run ID, workflow-run ID, canonical GitHub job URL, GitHub Actions app
-identity, canonical workflow path, PR head branch, `pull_request` event, run
+identity, canonical workflow path, authoritative branch and event, run
 attempt, start/completion timestamps, and `completed`/`success` state. All
 checks from one workflow path must resolve to one workflow run. The report also
 records the unique merged in-repository PR to `main`, including its number,
@@ -519,8 +520,10 @@ event merge SHA/tree to equal the tested head SHA/tree. The release workflow
 verifies the recorded merge commit's parents and tree and its ancestry from
 `main`. It selects the latest unambiguous completion time after excluding the
 current tag workflow run and fails closed if another relevant run is still
-incomplete. Pull-request and manual candidate runs, including a manual run
-dispatched from a tag ref, omit this report and cannot publish.
+incomplete. Pull-request and ordinary manual candidate runs omit this report
+and cannot publish. A manual recovery can publish only when it supplies both
+the existing immutable tag and its exact peeled commit; it then requires the
+same report and all tag/source checks as a tag push.
 
 The schemas validate portable structure. The repository verifiers additionally
 enforce relationships JSON Schema cannot express here, including equality

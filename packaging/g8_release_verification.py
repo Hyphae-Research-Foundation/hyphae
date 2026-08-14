@@ -9,6 +9,7 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,7 +21,13 @@ from conclude_release_sbom_licenses import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
+PACKAGING = Path(__file__).resolve().parent
+ROOT = Path(
+    os.environ.get(
+        "HYPHAE_RELEASE_SOURCE_ROOT",
+        PACKAGING.parent,
+    )
+).resolve()
 RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
 SOFTWARE_LICENSE = "AGPL-3.0-only"
 
@@ -230,7 +237,7 @@ def verify(
         raise ValueError("release tag object and target must be provided together")
     manifest = directory / f"hyphae-{tag}.release-evidence.json"
     evidence_arguments: list[str | Path] = [
-        sys.executable, "packaging/release_evidence.py", "verify",
+        sys.executable, PACKAGING / "release_evidence.py", "verify",
         "--directory", directory, "--manifest", manifest, "--commit", commit,
     ]
     if tag_object is not None and tag_target is not None:
@@ -239,7 +246,7 @@ def verify(
         )
     run(*evidence_arguments)
     run(
-        sys.executable, "packaging/finalize_release.py",
+        sys.executable, PACKAGING / "finalize_release.py",
         "--directory", directory, "--tag", tag, "--verify",
     )
     archives = sorted([*directory.glob("*.tar.gz"), *directory.glob("*.zip")])

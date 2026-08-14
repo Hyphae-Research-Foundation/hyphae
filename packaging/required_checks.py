@@ -74,6 +74,25 @@ PROHIBITED_BASE_EVENTS = frozenset(
 )
 
 
+def expected_check_commit(
+    name: object,
+    *,
+    release_commit: str,
+    head_commit: str,
+) -> str:
+    if name not in REQUIRED_CHECK_WORKFLOWS:
+        raise ValueError("required check name is not canonical")
+    if name == "Validate all exact-SHA G8 receipts":
+        return release_commit
+    return head_commit
+
+
+def expected_check_branch(name: str, *, head_ref: str) -> str:
+    if name == "Validate all exact-SHA G8 receipts":
+        return CANONICAL_BASE_REF
+    return head_ref
+
+
 def require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
     actual = set(value)
     if actual != expected:
@@ -151,15 +170,25 @@ def select_check_runs(
     check_runs: list[object],
     *,
     commit: str,
+    head_commit: str | None = None,
     excluded_run_id: str,
 ) -> list[dict[str, Any]]:
     if HEX_COMMIT.fullmatch(commit) is None:
         raise ValueError("required-check selection commit must be a Git object ID")
+    if head_commit is None:
+        head_commit = commit
+    if HEX_COMMIT.fullmatch(head_commit) is None:
+        raise ValueError("required-check head commit must be a Git object ID")
     if POSITIVE_DECIMAL.fullmatch(excluded_run_id) is None:
         raise ValueError("excluded workflow run ID must be a positive decimal string")
     excluded_fragment = f"/actions/runs/{excluded_run_id}/"
     selected: list[dict[str, Any]] = []
     for name in REQUIRED_CHECK_NAMES:
+        expected_commit = expected_check_commit(
+            name,
+            release_commit=commit,
+            head_commit=head_commit,
+        )
         relevant: list[tuple[datetime, dict[str, Any]]] = []
         for check_run in check_runs:
             if not isinstance(check_run, dict):
@@ -167,7 +196,7 @@ def select_check_runs(
             app = check_run.get("app")
             if (
                 check_run.get("name") == name
-                and check_run.get("head_sha") == commit
+                and check_run.get("head_sha") == expected_commit
                 and isinstance(app, dict)
                 and app.get("id") == GITHUB_ACTIONS_APP_ID
                 and app.get("slug") == GITHUB_ACTIONS_APP_SLUG
@@ -181,7 +210,9 @@ def select_check_runs(
                 )
                 relevant.append((completed_at, check_run))
         if not relevant:
-            raise ValueError(f"required check lacks a prior run for {commit}: {name}")
+            raise ValueError(
+                f"required check lacks a prior run for {expected_commit}: {name}"
+            )
         latest_completed_at = max(item[0] for item in relevant)
         latest_runs = [
             check_run
@@ -219,6 +250,7 @@ def canonical_pull_request(
         "release pull request base repository",
     )
     head_ref = head.get("ref")
+    head_sha = head.get("sha")
     base_sha = base.get("sha")
     merge_commit_sha = source.get("merge_commit_sha")
     merged_at, _ = parse_github_timestamp(
@@ -234,12 +266,14 @@ def canonical_pull_request(
         or base_repository.get("full_name") != repository
         or not isinstance(head_ref, str)
         or HEAD_REF.fullmatch(head_ref) is None
-        or head.get("sha") != commit
+        or not isinstance(head_sha, str)
+        or HEX_COMMIT.fullmatch(head_sha) is None
         or base.get("ref") != CANONICAL_BASE_REF
         or not isinstance(base_sha, str)
         or HEX_COMMIT.fullmatch(base_sha) is None
         or not isinstance(merge_commit_sha, str)
         or HEX_COMMIT.fullmatch(merge_commit_sha) is None
+        or merge_commit_sha != commit
     ):
         raise ValueError(
             "release commit pull request is not a canonical merged main PR"
@@ -247,7 +281,7 @@ def canonical_pull_request(
     return {
         "number": number,
         "head_ref": head_ref,
-        "head_sha": commit,
+        "head_sha": head_sha,
         "base_ref": CANONICAL_BASE_REF,
         "base_sha": base_sha,
         "merge_commit_sha": merge_commit_sha,
@@ -533,14 +567,22 @@ def build_report(
         commit=commit,
     )
     require_stable_base_events(pull_request_events)
+    head_commit = str(pull_request["head_sha"])
     selected = [
         canonical_check_run(
             check_run,
             workflow_runs=workflow_runs,
             job_runs=job_runs,
             repository=repository,
-            commit=commit,
-            expected_head_branch=str(pull_request["head_ref"]),
+            commit=expected_check_commit(
+                name,
+                release_commit=commit,
+                head_commit=head_commit,
+            ),
+            expected_head_branch=expected_check_branch(
+                name,
+                head_ref=str(pull_request["head_ref"]),
+            ),
             expected_name=name,
         )
         for name, check_run in zip(
@@ -548,6 +590,7 @@ def build_report(
             select_check_runs(
                 check_runs,
                 commit=commit,
+                head_commit=head_commit,
                 excluded_run_id=excluded_run_id,
             ),
             strict=True,
@@ -620,12 +663,14 @@ def validate_report(document: object, *, expected_commit: str) -> None:
         or number < 1
         or not isinstance(head_ref, str)
         or HEAD_REF.fullmatch(head_ref) is None
-        or pull_request["head_sha"] != expected_commit
+        or not isinstance(pull_request["head_sha"], str)
+        or HEX_COMMIT.fullmatch(pull_request["head_sha"]) is None
         or pull_request["base_ref"] != CANONICAL_BASE_REF
         or not isinstance(pull_request["base_sha"], str)
         or HEX_COMMIT.fullmatch(pull_request["base_sha"]) is None
         or not isinstance(pull_request["merge_commit_sha"], str)
         or HEX_COMMIT.fullmatch(pull_request["merge_commit_sha"]) is None
+        or pull_request["merge_commit_sha"] != expected_commit
         or pull_request["merged_at"] != merged_at
         or pull_request["base_ref_history"] != "unchanged"
     ):
@@ -667,6 +712,15 @@ def validate_report(document: object, *, expected_commit: str) -> None:
         workflow_run_attempt = record["workflow_run_attempt"]
         workflow_path = record["workflow_path"]
         integration_guard = record["integration_guard"]
+        check_commit = expected_check_commit(
+            expected_name,
+            release_commit=expected_commit,
+            head_commit=str(pull_request["head_sha"]),
+        )
+        check_branch = expected_check_branch(
+            expected_name,
+            head_ref=head_ref,
+        )
         try:
             url_workflow_run_id, _ = check_run_url_identity(
                 record["check_run_url"],
@@ -692,7 +746,7 @@ def validate_report(document: object, *, expected_commit: str) -> None:
             ) from error
         if (
             record["name"] != expected_name
-            or record["head_sha"] != expected_commit
+            or record["head_sha"] != check_commit
             or record["status"] != "completed"
             or record["conclusion"] != "success"
             or isinstance(check_run_id, bool)
@@ -708,7 +762,7 @@ def validate_report(document: object, *, expected_commit: str) -> None:
             or workflow_run_attempt < 1
             or workflow_path != REQUIRED_CHECK_WORKFLOWS[expected_name]
             or record["workflow_event"] != REQUIRED_CHECK_EVENTS[expected_name]
-            or record["head_branch"] != head_ref
+            or record["head_branch"] != check_branch
             or (
                 workflow_run_id in seen_workflow_runs
                 and seen_workflow_runs[workflow_run_id]
@@ -827,11 +881,16 @@ def fetch_workflow_runs(
     *,
     repository: str,
     commit: str,
+    head_commit: str | None = None,
     excluded_run_id: str,
     token: str,
 ) -> dict[int, object]:
     if repository != REPOSITORY_SLUG or HEX_COMMIT.fullmatch(commit) is None:
         raise ValueError("repository or commit is not canonical")
+    if head_commit is None:
+        head_commit = commit
+    if HEX_COMMIT.fullmatch(head_commit) is None:
+        raise ValueError("required-check head commit is not canonical")
     if POSITIVE_DECIMAL.fullmatch(excluded_run_id) is None:
         raise ValueError("excluded workflow run ID must be a positive decimal string")
     if not token:
@@ -844,9 +903,15 @@ def fetch_workflow_runs(
         app = check_run.get("app")
         check_run_id = check_run.get("id")
         details_url = check_run.get("details_url")
+        name = check_run.get("name")
+        expected_commit = expected_check_commit(
+            name,
+            release_commit=commit,
+            head_commit=head_commit,
+        )
         if (
-            check_run.get("name") not in REQUIRED_CHECK_WORKFLOWS
-            or check_run.get("head_sha") != commit
+            name not in REQUIRED_CHECK_WORKFLOWS
+            or check_run.get("head_sha") != expected_commit
             or not isinstance(app, dict)
             or app.get("id") != GITHUB_ACTIONS_APP_ID
             or app.get("slug") != GITHUB_ACTIONS_APP_SLUG
@@ -887,11 +952,16 @@ def fetch_job_runs(
     *,
     repository: str,
     commit: str,
+    head_commit: str | None = None,
     excluded_run_id: str,
     token: str,
 ) -> dict[int, object]:
     if repository != REPOSITORY_SLUG or HEX_COMMIT.fullmatch(commit) is None:
         raise ValueError("repository or commit is not canonical")
+    if head_commit is None:
+        head_commit = commit
+    if HEX_COMMIT.fullmatch(head_commit) is None:
+        raise ValueError("required-check head commit is not canonical")
     if POSITIVE_DECIMAL.fullmatch(excluded_run_id) is None:
         raise ValueError("excluded workflow run ID must be a positive decimal string")
     if not token:
@@ -904,9 +974,15 @@ def fetch_job_runs(
         app = check_run.get("app")
         check_run_id = check_run.get("id")
         details_url = check_run.get("details_url")
+        name = check_run.get("name")
+        expected_commit = expected_check_commit(
+            name,
+            release_commit=commit,
+            head_commit=head_commit,
+        )
         if (
-            check_run.get("name") not in REQUIRED_CHECK_WORKFLOWS
-            or check_run.get("head_sha") != commit
+            name not in REQUIRED_CHECK_WORKFLOWS
+            or check_run.get("head_sha") != expected_commit
             or not isinstance(app, dict)
             or app.get("id") != GITHUB_ACTIONS_APP_ID
             or app.get("slug") != GITHUB_ACTIONS_APP_SLUG
@@ -1077,11 +1153,6 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     arguments = parser.parse_args()
     token = os.environ.get("GITHUB_TOKEN", "")
-    check_runs = fetch_check_runs(
-        repository=arguments.repository,
-        commit=arguments.commit,
-        token=token,
-    )
     pull_requests = fetch_pull_requests(
         repository=arguments.repository,
         commit=arguments.commit,
@@ -1092,9 +1163,24 @@ def main() -> int:
         repository=arguments.repository,
         commit=arguments.commit,
     )
+    head_commit = str(pull_request["head_sha"])
+    check_runs = fetch_check_runs(
+        repository=arguments.repository,
+        commit=head_commit,
+        token=token,
+    )
+    if head_commit != arguments.commit:
+        check_runs.extend(
+            fetch_check_runs(
+                repository=arguments.repository,
+                commit=arguments.commit,
+                token=token,
+            )
+        )
     selected_check_runs = select_check_runs(
         check_runs,
         commit=arguments.commit,
+        head_commit=head_commit,
         excluded_run_id=arguments.exclude_run_id,
     )
     report = build_report(
@@ -1103,6 +1189,7 @@ def main() -> int:
             selected_check_runs,
             repository=arguments.repository,
             commit=arguments.commit,
+            head_commit=head_commit,
             excluded_run_id=arguments.exclude_run_id,
             token=token,
         ),
@@ -1110,6 +1197,7 @@ def main() -> int:
             selected_check_runs,
             repository=arguments.repository,
             commit=arguments.commit,
+            head_commit=head_commit,
             excluded_run_id=arguments.exclude_run_id,
             token=token,
         ),

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -26,7 +27,12 @@ from provenance import (
 from required_checks import REPORT_SUFFIX, load_report
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(
+    os.environ.get(
+        "HYPHAE_RELEASE_SOURCE_ROOT",
+        Path(__file__).resolve().parents[1],
+    )
+).resolve()
 SCHEMA_NAME = "release-evidence-v1"
 SCHEMA_VERSION = 1
 SCHEMA_PATH = Path(__file__).with_name("release-evidence-v1.schema.json")
@@ -135,6 +141,24 @@ def requires_hosted_checks(tag: str, workflow_ref: str, event: str) -> bool:
     return event == "push" and is_release_tag_ref(tag, workflow_ref)
 
 
+def is_manual_tag_recovery(
+    *,
+    workflow_ref: str,
+    event: str,
+    tag_object: str | None,
+    tag_target: str | None,
+) -> bool:
+    return (
+        event == "workflow_dispatch"
+        and (
+            workflow_ref == "refs/heads/main"
+            or workflow_ref.startswith("refs/tags/")
+        )
+        and isinstance(tag_object, str)
+        and isinstance(tag_target, str)
+    )
+
+
 def expected_primary_names(
     version: str,
     *,
@@ -237,7 +261,16 @@ def build_release_evidence(
     identity = source_identity(commit)
     if tag != identity.tag:
         raise ValueError("release evidence tag does not match the release commit")
-    include_required_checks = requires_hosted_checks(identity.tag, workflow_ref, event)
+    include_required_checks = requires_hosted_checks(
+        identity.tag,
+        workflow_ref,
+        event,
+    ) or is_manual_tag_recovery(
+        workflow_ref=workflow_ref,
+        event=event,
+        tag_object=tag_object,
+        tag_target=tag_target,
+    )
     document: dict[str, object] = {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -528,7 +561,13 @@ def validate_release_evidence(
         raise ValueError("workflow tag ref differs from the release commit version")
     tag_object = source["tag_object"]
     tag_target = source["tag_target"]
-    if tag_ref:
+    manual_tag_recovery = is_manual_tag_recovery(
+        workflow_ref=workflow_ref,
+        event=event,
+        tag_object=tag_object,
+        tag_target=tag_target,
+    )
+    if tag_ref or manual_tag_recovery:
         if (
             not isinstance(tag_object, str)
             or HEX_OBJECT.fullmatch(tag_object) is None
@@ -560,7 +599,11 @@ def validate_release_evidence(
             or tag_target != expected_tag_target
         ):
             raise ValueError("release evidence differs from the live tag binding")
-    include_required_checks = requires_hosted_checks(identity.tag, workflow_ref, event)
+    include_required_checks = requires_hosted_checks(
+        identity.tag,
+        workflow_ref,
+        event,
+    ) or manual_tag_recovery
 
     artifacts = root["artifacts"]
     if not isinstance(artifacts, list) or not artifacts:

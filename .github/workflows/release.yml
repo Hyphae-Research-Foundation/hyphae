@@ -3,12 +3,21 @@ name: Release
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable tag to recover after a failed tag run
+        required: false
+        type: string
+      release_commit:
+        description: Exact commit targeted by the recovery tag
+        required: false
+        type: string
   push:
     tags:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -17,6 +26,10 @@ permissions:
 jobs:
   package:
     name: Package ${{ matrix.target }}
+    env:
+      RELEASE_SOURCE_COMMIT: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
+      RELEASE_SOURCE_REF: ${{ inputs.release_tag || github.event.pull_request.head.sha || github.sha }}
+      RECOVERY_TAG: ${{ inputs.release_tag }}
     permissions:
       contents: read
       id-token: write
@@ -41,8 +54,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ env.RELEASE_SOURCE_REF }}
           fetch-depth: 1
+      - name: Validate release source selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SOURCE_COMMIT"
+          if [[ -n "$RECOVERY_TAG" ]]; then
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            test -n "${{ inputs.release_commit }}"
+          else
+            test -z "${{ inputs.release_commit }}"
+          fi
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -60,16 +84,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           python packaging/verify_install.py \
             --directory artifacts \
-            --source-commit "$SHA" \
+            --source-commit "$RELEASE_SOURCE_COMMIT" \
             --platform "${{ matrix.target }}" \
             --output "native-g8-installed-package-${{ matrix.target }}.json"
           PYTHONPATH=. python tools/produce_native_g8_receipt.py \
             --requirement multiplatform-packaging \
             --platform "${{ matrix.target }}" \
-            --expected-commit "$SHA" \
+            --expected-commit "$RELEASE_SOURCE_COMMIT" \
             --artifact "native-g8-installed-package-${{ matrix.target }}.json" \
             --output "native-g8-package-${{ matrix.target }}-receipt.json"
       - name: Install pinned Cosign
@@ -88,7 +111,7 @@ jobs:
           bundle="${archive}.intoto.sigstore.json"
           python packaging/provenance.py \
             --target "${{ matrix.target }}" \
-            --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --commit "$RELEASE_SOURCE_COMMIT" \
             --git-ref "${{ github.ref }}" \
             --invocation-id "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --runner-os "${{ runner.os }}" \
@@ -117,7 +140,7 @@ jobs:
       - name: Upload G8 package evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-g8-package-${{ matrix.target }}-${{ github.event.pull_request.head.sha || github.sha }}
+          name: native-g8-package-${{ matrix.target }}-${{ env.RELEASE_SOURCE_COMMIT }}
           path: |
             native-g8-installed-package-${{ matrix.target }}.json
             native-g8-package-${{ matrix.target }}-receipt.json
@@ -135,12 +158,35 @@ jobs:
       contents: read
       id-token: write
       pull-requests: read
+    env:
+      CONTROL_PACKAGING: packaging
+      RECOVERY_COMMIT: ${{ inputs.release_commit }}
+      RECOVERY_TAG: ${{ inputs.release_tag }}
+      RELEASE_SOURCE_COMMIT: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
+      RELEASE_SOURCE_REF: ${{ inputs.release_tag || github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ env.RELEASE_SOURCE_REF }}
           fetch-depth: 0
+      - name: Check out recovery control plane
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-control
+          fetch-depth: 1
+      - name: Bind recovery control plane to source checkout
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C .release-control rev-parse HEAD)" = "$GITHUB_SHA"
+          control_root="$RUNNER_TEMP/release-control"
+          mv .release-control "$control_root"
+          echo "CONTROL_PACKAGING=$control_root/packaging" >> "$GITHUB_ENV"
+          echo "HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Verify the pull-request integration tree
         if: github.event_name == 'pull_request'
         shell: bash
@@ -161,12 +207,29 @@ jobs:
       - name: Resolve and validate release version
         shell: bash
         env:
-          RELEASE_COMMIT_INPUT: ${{ github.event.pull_request.head.sha || github.sha }}
+          RELEASE_COMMIT_INPUT: ${{ env.RELEASE_SOURCE_COMMIT }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT_INPUT"
-          release_tag="$(python packaging/finalize_release.py --print-expected-tag)"
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+          release_tag="$(python "$CONTROL_PACKAGING/finalize_release.py" --print-expected-tag)"
+          if [[ -n "$RECOVERY_TAG" || -n "$RECOVERY_COMMIT" ]]; then
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            test -n "$RECOVERY_TAG"
+            test -n "$RECOVERY_COMMIT"
+            test "$RECOVERY_TAG" = "$release_tag"
+            test "$RECOVERY_COMMIT" = "$RELEASE_COMMIT_INPUT"
+            git fetch --force --no-tags origin \
+              "+refs/tags/${release_tag}:refs/hyphae/release-tag"
+            tag_object="$(git rev-parse refs/hyphae/release-tag)"
+            tag_target="$(git rev-parse 'refs/hyphae/release-tag^{commit}')"
+            test "$tag_target" = "$RELEASE_COMMIT_INPUT"
+            git fetch --force --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor \
+              "$RELEASE_COMMIT_INPUT" refs/remotes/origin/main
+            echo "RELEASE_TAG_OBJECT=$tag_object" >> "$GITHUB_ENV"
+            echo "RELEASE_TAG_TARGET=$tag_target" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
             test "$GITHUB_REF_NAME" = "$release_tag"
             git fetch --force --no-tags origin \
               "+refs/tags/${release_tag}:refs/hyphae/release-tag"
@@ -204,28 +267,30 @@ jobs:
           "$syft" convert "$native_sbom" -o "spdx-json=${spdx_sbom}"
           "$syft" convert "$native_sbom" -o "cyclonedx-json=${cyclonedx_sbom}"
       - name: Bind successful hosted checks for a tag
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != '')
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           RELEASE_REPOSITORY: ${{ github.repository }}
           RELEASE_RUN_ID: ${{ github.run_id }}
         run: |
           report_path="dist/hyphae-${RELEASE_TAG}.required-checks.json"
-          python packaging/required_checks.py \
+          python "$CONTROL_PACKAGING/required_checks.py" \
             --repository "$RELEASE_REPOSITORY" \
             --commit "$RELEASE_COMMIT" \
             --exclude-run-id "$RELEASE_RUN_ID" \
             --output "$report_path"
-          read -r base_sha merge_commit < <(
+          read -r base_sha head_sha merge_commit < <(
             python -c \
-              'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8"))["pull_request"]; print(p["base_sha"], p["merge_commit_sha"])' \
+              'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8"))["pull_request"]; print(p["base_sha"], p["head_sha"], p["merge_commit_sha"])' \
               "$report_path"
           )
           test "$(git rev-parse "${merge_commit}^1")" = "$base_sha"
-          test "$(git rev-parse "${merge_commit}^2")" = "$RELEASE_COMMIT"
+          test "$(git rev-parse "${merge_commit}^2")" = "$head_sha"
+          test "$merge_commit" = "$RELEASE_COMMIT"
           test "$(git rev-parse "${merge_commit}^{tree}")" = \
-            "$(git rev-parse "${RELEASE_COMMIT}^{tree}")"
+            "$(git rev-parse "${head_sha}^{tree}")"
           git merge-base --is-ancestor "$merge_commit" refs/remotes/origin/main
       - name: Generate post-commit release evidence
         shell: bash
@@ -247,9 +312,9 @@ jobs:
               --tag-target "$RELEASE_TAG_TARGET"
             )
           fi
-          python packaging/release_evidence.py generate "${arguments[@]}"
+          python "$CONTROL_PACKAGING/release_evidence.py" generate "${arguments[@]}"
       - name: Validate tag and create checksums
-        run: python packaging/finalize_release.py --directory dist --tag "${{ env.RELEASE_TAG }}"
+        run: python "$CONTROL_PACKAGING/finalize_release.py" --directory dist --tag "${{ env.RELEASE_TAG }}"
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
@@ -296,7 +361,7 @@ jobs:
               "$artifact"
           done
       - name: Recheck release checksums
-        run: python packaging/finalize_release.py --directory dist --tag "${{ env.RELEASE_TAG }}" --verify
+        run: python "$CONTROL_PACKAGING/finalize_release.py" --directory dist --tag "${{ env.RELEASE_TAG }}" --verify
       - name: Produce cryptographically verified G8 release receipt
         shell: bash
         env:
@@ -316,7 +381,7 @@ jobs:
               --tag-target "$RELEASE_TAG_TARGET"
             )
           fi
-          PYTHONPATH=. python packaging/g8_release_verification.py \
+          PYTHONPATH="$CONTROL_PACKAGING" python "$CONTROL_PACKAGING/g8_release_verification.py" \
             "${arguments[@]}"
           PYTHONPATH=. python tools/produce_native_g8_receipt.py \
             --requirement sbom-signatures-provenance \
@@ -347,7 +412,9 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != '')
     needs: assemble
     runs-on: ubuntu-24.04
     permissions:
@@ -355,12 +422,33 @@ jobs:
       checks: read
       contents: write
       pull-requests: read
+    env:
+      CONTROL_PACKAGING: packaging
+      RELEASE_COMMIT: ${{ inputs.release_commit || github.sha }}
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ env.RELEASE_COMMIT }}
           fetch-depth: 0
+      - name: Check out recovery control plane
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-control
+          fetch-depth: 1
+      - name: Bind recovery control plane to source checkout
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C .release-control rev-parse HEAD)" = "$GITHUB_SHA"
+          control_root="$RUNNER_TEMP/release-control"
+          mv .release-control "$control_root"
+          echo "CONTROL_PACKAGING=$control_root/packaging" >> "$GITHUB_ENV"
+          echo "HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Download verified release candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -368,26 +456,24 @@ jobs:
           path: dist
       - name: Recheck tag identity, main ancestry, evidence, and checksums
         shell: bash
-        env:
-          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           git fetch --force --no-tags origin \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/hyphae/publish-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/hyphae/publish-tag"
           tag_object="$(git rev-parse refs/hyphae/publish-tag)"
           tag_target="$(git rev-parse 'refs/hyphae/publish-tag^{commit}')"
           test "$tag_target" = "$RELEASE_COMMIT"
           git fetch --force --no-tags origin \
             "+refs/heads/main:refs/remotes/origin/main"
           git merge-base --is-ancestor "$RELEASE_COMMIT" refs/remotes/origin/main
-          python packaging/release_evidence.py verify \
+          python "$CONTROL_PACKAGING/release_evidence.py" verify \
             --directory dist \
-            --manifest "dist/hyphae-${GITHUB_REF_NAME}.release-evidence.json" \
+            --manifest "dist/hyphae-${RELEASE_TAG}.release-evidence.json" \
             --commit "$RELEASE_COMMIT" \
             --tag-object "$tag_object" \
             --tag-target "$tag_target"
-          python packaging/finalize_release.py \
-            --directory dist --tag "$GITHUB_REF_NAME" --verify
+          python "$CONTROL_PACKAGING/finalize_release.py" \
+            --directory dist --tag "$RELEASE_TAG" --verify
           echo "RELEASE_TAG_OBJECT=$tag_object" >> "$GITHUB_ENV"
           echo "RELEASE_TAG_TARGET=$tag_target" >> "$GITHUB_ENV"
       - name: Recheck hosted checks and create GitHub release
@@ -399,19 +485,19 @@ jobs:
           set -euo pipefail
           comparison_dir="$(mktemp -d)"
           trap 'rm -f "$comparison_dir/required-checks.json"; rmdir "$comparison_dir"' EXIT
-          python packaging/required_checks.py \
+          python "$CONTROL_PACKAGING/required_checks.py" \
             --repository "${{ github.repository }}" \
-            --commit "${{ github.sha }}" \
+            --commit "$RELEASE_COMMIT" \
             --exclude-run-id "${{ github.run_id }}" \
             --output "$comparison_dir/required-checks.json"
           if ! cmp -s \
             "$comparison_dir/required-checks.json" \
-            "dist/hyphae-${GITHUB_REF_NAME}.required-checks.json"; then
+            "dist/hyphae-${RELEASE_TAG}.required-checks.json"; then
             echo "hosted required checks changed after assemble" >&2
             exit 1
           fi
           git fetch --force --no-tags origin \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/hyphae/publish-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/hyphae/publish-tag"
           test "$(git rev-parse refs/hyphae/publish-tag)" = \
             "$RELEASE_TAG_OBJECT"
           test "$(git rev-parse 'refs/hyphae/publish-tag^{commit}')" = \
@@ -420,21 +506,22 @@ jobs:
             "+refs/heads/main:refs/remotes/origin/main"
           git merge-base --is-ancestor \
             "$RELEASE_TAG_TARGET" refs/remotes/origin/main
-          report_path="dist/hyphae-${GITHUB_REF_NAME}.required-checks.json"
-          read -r base_sha merge_commit < <(
+          report_path="dist/hyphae-${RELEASE_TAG}.required-checks.json"
+          read -r base_sha head_sha merge_commit < <(
             python -c \
-              'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8"))["pull_request"]; print(p["base_sha"], p["merge_commit_sha"])' \
+              'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8"))["pull_request"]; print(p["base_sha"], p["head_sha"], p["merge_commit_sha"])' \
               "$report_path"
           )
           test "$(git rev-parse "${merge_commit}^1")" = "$base_sha"
           test "$(git rev-parse "${merge_commit}^2")" = \
-            "$RELEASE_TAG_TARGET"
+            "$head_sha"
+          test "$merge_commit" = "$RELEASE_TAG_TARGET"
           test "$(git rev-parse "${merge_commit}^{tree}")" = \
-            "$(git rev-parse "${RELEASE_TAG_TARGET}^{tree}")"
+            "$(git rev-parse "${head_sha}^{tree}")"
           git merge-base --is-ancestor \
             "$merge_commit" refs/remotes/origin/main
-          arguments=(--verify-tag --generate-notes --title "Hyphae ${GITHUB_REF_NAME}")
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          arguments=(--verify-tag --generate-notes --title "Hyphae ${RELEASE_TAG}")
+          if [[ "$RELEASE_TAG" == *-* ]]; then
             arguments+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" dist/* "${arguments[@]}"
+          gh release create "$RELEASE_TAG" dist/* "${arguments[@]}"

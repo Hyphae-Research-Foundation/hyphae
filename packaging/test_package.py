@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -77,13 +78,24 @@ def git_object(revision: str) -> str:
     return completed.stdout.strip()
 
 
-def fixture_check_runs(commit: str) -> list[dict[str, object]]:
+def fixture_check_runs(
+    commit: str,
+    *,
+    release_commit: str | None = None,
+) -> list[dict[str, object]]:
+    if release_commit is None:
+        release_commit = commit
     runs: list[dict[str, object]] = []
     workflow_run_ids = {
         path: 30_000 + index
         for index, path in enumerate(dict.fromkeys(REQUIRED_CHECK_WORKFLOWS.values()))
     }
     for check_run_id, name in enumerate(REQUIRED_CHECK_NAMES, start=10_000):
+        check_commit = (
+            release_commit
+            if name == "Validate all exact-SHA G8 receipts"
+            else commit
+        )
         workflow_run_id = workflow_run_ids[REQUIRED_CHECK_WORKFLOWS[name]]
         url = check_run_url(
             REPOSITORY_SLUG,
@@ -96,7 +108,7 @@ def fixture_check_runs(commit: str) -> list[dict[str, object]]:
                 "name": name,
                 "html_url": url,
                 "details_url": url,
-                "head_sha": commit,
+                "head_sha": check_commit,
                 "status": "completed",
                 "conclusion": "success",
                 "started_at": "2026-07-29T18:00:00Z",
@@ -125,8 +137,12 @@ def fixture_workflow_runs(
         workflows[workflow_run_id] = {
             "id": workflow_run_id,
             "path": REQUIRED_CHECK_WORKFLOWS[str(check_run["name"])],
-            "head_sha": commit,
-            "head_branch": "codex/release-candidate",
+            "head_sha": check_run["head_sha"],
+            "head_branch": (
+                "main"
+                if check_run["name"] == "Validate all exact-SHA G8 receipts"
+                else "codex/release-candidate"
+            ),
             "event": REQUIRED_CHECK_EVENTS[str(check_run["name"])],
             "run_attempt": 1,
             "repository": {"full_name": REPOSITORY_SLUG},
@@ -137,13 +153,19 @@ def fixture_workflow_runs(
     return workflows
 
 
-def fixture_pull_requests(commit: str) -> list[dict[str, object]]:
+def fixture_pull_requests(
+    commit: str,
+    *,
+    merge_commit: str | None = None,
+) -> list[dict[str, object]]:
+    if merge_commit is None:
+        merge_commit = commit
     return [
         {
             "number": 14,
             "state": "closed",
             "merged_at": "2026-07-29T18:25:42Z",
-            "merge_commit_sha": "c" * 40,
+            "merge_commit_sha": merge_commit,
             "head": {
                 "ref": "codex/release-candidate",
                 "sha": commit,
@@ -176,7 +198,7 @@ def fixture_job_runs(
             "run_id": workflow_run_id,
             "run_attempt": 1,
             "name": name,
-            "head_sha": commit,
+            "head_sha": check_run["head_sha"],
             "status": "completed",
             "conclusion": "success",
             "steps": (
@@ -200,6 +222,8 @@ def write_test_primary_payloads(
     *,
     tag_release: bool,
     include_required_checks: bool | None = None,
+    workflow_ref_override: str | None = None,
+    event_override: str | None = None,
 ) -> tuple[object, str, str]:
     commit = git_object("HEAD^{commit}")
     identity = source_identity(commit)
@@ -209,6 +233,10 @@ def write_test_primary_payloads(
         else "refs/heads/release-candidate"
     )
     event = "push" if tag_release else "workflow_dispatch"
+    if workflow_ref_override is not None:
+        workflow_ref = workflow_ref_override
+    if event_override is not None:
+        event = event_override
     invocation_id = (
         "https://github.com/celiumsai/hyphae/actions/runs/123456/attempts/1"
     )
@@ -356,11 +384,20 @@ class PackageTests(unittest.TestCase):
         self.assertIn("name: hyphae-native-${{ matrix.target }}", workflow)
         self.assertIn("pattern: hyphae-native-*", workflow)
         self.assertNotIn("pattern: hyphae-*", workflow)
-        publication_guard = (
-            "if: github.event_name == 'push' && "
-            "startsWith(github.ref, 'refs/tags/v')"
+        recovery_guard = (
+            "(github.event_name == 'workflow_dispatch' && "
+            "inputs.release_tag != '' && inputs.release_commit != '')"
         )
-        self.assertEqual(workflow.count(publication_guard), 2)
+        self.assertEqual(workflow.count(recovery_guard), 2)
+        self.assertIn("release_tag:", workflow)
+        self.assertIn("release_commit:", workflow)
+        self.assertIn("RELEASE_SOURCE_REF", workflow)
+        self.assertIn("RELEASE_SOURCE_COMMIT", workflow)
+        self.assertEqual(workflow.count("name: Check out recovery control plane"), 2)
+        self.assertEqual(
+            workflow.count("HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE"),
+            2,
+        )
         self.assertIn("refs/hyphae/release-tag", workflow)
         self.assertIn("refs/hyphae/publish-tag", workflow)
         self.assertIn("git merge-base --is-ancestor", workflow)
@@ -371,6 +408,9 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(workflow.count('${merge_commit}^{tree}'), 2)
         self.assertEqual(workflow.count('${merge_commit}^1'), 2)
         self.assertEqual(workflow.count('${merge_commit}^2'), 2)
+        self.assertEqual(workflow.count('test "$merge_commit" ='), 2)
+        self.assertIn('test -n "${{ inputs.release_commit }}"', workflow)
+        self.assertIn('test -z "${{ inputs.release_commit }}"', workflow)
         self.assertIn("anchore/sbom-action/download-syft@", workflow)
         self.assertIn("syft-version: v1.46.0", workflow)
         scan = workflow.index('scan dir:. -o "syft-json=${native_sbom}"')
@@ -397,6 +437,31 @@ class PackageTests(unittest.TestCase):
                 workflow_source,
             )
             self.assertIn("'FETCH_HEAD^{tree}'", workflow_source)
+
+    def test_release_control_plane_can_target_an_exact_source_checkout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hyphae-release-source-") as source:
+            environment = os.environ.copy()
+            environment["HYPHAE_RELEASE_SOURCE_ROOT"] = source
+            environment["PYTHONPATH"] = str(ROOT / "packaging")
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import conclude_release_sbom_licenses as c; "
+                    "import g8_release_verification as g; "
+                    "import provenance as p; import release_evidence as r; "
+                    "print(c.ROOT, g.ROOT, p.ROOT, r.ROOT, sep='\\n')",
+                ),
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                completed.stdout.splitlines(),
+                [str(Path(source).resolve())] * 4,
+            )
 
     def test_ci_binds_major_semver_check_to_latest_release_baseline(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -810,7 +875,9 @@ class PackageTests(unittest.TestCase):
             identity, workflow_ref, _ = write_test_primary_payloads(
                 root,
                 tag_release=True,
-                include_required_checks=False,
+                include_required_checks=True,
+                workflow_ref_override="refs/heads/main",
+                event_override="workflow_dispatch",
             )
             document = build_release_evidence(
                 directory=root,
@@ -823,7 +890,7 @@ class PackageTests(unittest.TestCase):
                 tag_object=identity.commit,
                 tag_target=identity.commit,
             )
-            self.assertNotIn(
+            self.assertIn(
                 "required-checks",
                 {artifact["role"] for artifact in document["artifacts"]},
             )
@@ -836,12 +903,16 @@ class PackageTests(unittest.TestCase):
             )
 
     def test_required_checks_are_exact_and_latest_prior_run_must_succeed(self) -> None:
-        commit = git_object("HEAD^{commit}")
-        runs = fixture_check_runs(commit)
-        workflow_runs = fixture_workflow_runs(commit, runs)
-        job_runs = fixture_job_runs(commit, runs)
-        pull_requests = fixture_pull_requests(commit)
-        head_pull_requests = fixture_pull_requests(commit)
+        head_commit = git_object("HEAD^{commit}")
+        commit = "c" * 40
+        runs = fixture_check_runs(head_commit, release_commit=commit)
+        workflow_runs = fixture_workflow_runs(head_commit, runs)
+        job_runs = fixture_job_runs(head_commit, runs)
+        pull_requests = fixture_pull_requests(head_commit, merge_commit=commit)
+        head_pull_requests = fixture_pull_requests(
+            head_commit,
+            merge_commit=commit,
+        )
         pull_request_events: list[object] = []
         report = build_report(
             runs,
@@ -881,6 +952,18 @@ class PackageTests(unittest.TestCase):
         )
         self.assertEqual(report["pull_request"]["number"], 14)
         self.assertEqual(report["pull_request"]["base_ref"], "main")
+        self.assertEqual(report["head_sha"], commit)
+        self.assertEqual(report["pull_request"]["head_sha"], head_commit)
+        self.assertEqual(report["pull_request"]["merge_commit_sha"], commit)
+        self.assertEqual(
+            {
+                check["head_sha"]
+                for check in report["checks"]
+                if check["name"] != "Validate all exact-SHA G8 receipts"
+            },
+            {head_commit},
+        )
+        self.assertEqual(report["checks"][-1]["head_sha"], commit)
         self.assertEqual(
             {check["workflow_event"] for check in report["checks"]},
             {"pull_request", "workflow_dispatch"},
@@ -895,7 +978,7 @@ class PackageTests(unittest.TestCase):
         )
         self.assertEqual(
             {check["head_branch"] for check in report["checks"]},
-            {"codex/release-candidate"},
+            {"codex/release-candidate", "main"},
         )
         self.assertEqual(
             {
@@ -996,6 +1079,24 @@ class PackageTests(unittest.TestCase):
         crossed_pull_request["pull_request"]["base_sha"] = "not-a-commit"
         with self.assertRaisesRegex(ValueError, "pull request"):
             validate_report(crossed_pull_request, expected_commit=commit)
+        crossed_merge = copy.deepcopy(report)
+        crossed_merge["pull_request"]["merge_commit_sha"] = "d" * 40
+        with self.assertRaisesRegex(ValueError, "pull request"):
+            validate_report(crossed_merge, expected_commit=commit)
+        crossed_pr_check = copy.deepcopy(report)
+        crossed_pr_check["checks"][0]["head_sha"] = commit
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            validate_report(crossed_pr_check, expected_commit=commit)
+        crossed_closure = copy.deepcopy(report)
+        crossed_closure["checks"][-1]["head_sha"] = head_commit
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            validate_report(crossed_closure, expected_commit=commit)
+        crossed_closure_branch = copy.deepcopy(report)
+        crossed_closure_branch["checks"][-1]["head_branch"] = (
+            "codex/release-candidate"
+        )
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            validate_report(crossed_closure_branch, expected_commit=commit)
         mixed_workflow_runs = copy.deepcopy(report)
         mixed_workflow_runs["checks"][10]["workflow_run_id"] = 39_999
         mixed_workflow_runs["checks"][10]["check_run_url"] = check_run_url(
@@ -1539,12 +1640,18 @@ class PackageTests(unittest.TestCase):
             Draft202012Validator(release_schema).validate(candidate)
             manual_tag = copy.deepcopy(document)
             manual_tag["workflow"]["event"] = "workflow_dispatch"
-            manual_tag["artifacts"] = [
+            manual_tag["workflow"]["ref"] = "refs/heads/main"
+            Draft202012Validator(release_schema).validate(manual_tag)
+            manual_without_checks = copy.deepcopy(manual_tag)
+            manual_without_checks["artifacts"] = [
                 artifact
-                for artifact in manual_tag["artifacts"]
+                for artifact in manual_without_checks["artifacts"]
                 if artifact["role"] != "required-checks"
             ]
-            Draft202012Validator(release_schema).validate(manual_tag)
+            with self.assertRaises(ValidationError):
+                Draft202012Validator(release_schema).validate(
+                    manual_without_checks
+                )
             missing_tag_object = copy.deepcopy(document)
             missing_tag_object["source"]["tag_object"] = None
             with self.assertRaises(ValidationError):
