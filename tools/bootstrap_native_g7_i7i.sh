@@ -68,7 +68,10 @@ cpu_model="$(lscpu -J | jq -r '.lscpu[] | select(.field == "Model name:") | .dat
 socket_count="$(lscpu -p=Socket | grep -v '^#' | sort -u | wc -l | tr -d ' ')"
 physical_cores="$(lscpu -p=Socket,Core | grep -v '^#' | sort -u | wc -l | tr -d ' ')"
 logical_processors="$(nproc)"
-ram_bytes="$(awk '/MemTotal:/ {printf "%.0f\\n", $2 * 1024}' /proc/meminfo)"
+ram_kib="$(awk '$1 == "MemTotal:" {print $2}' /proc/meminfo)"
+[[ "$ram_kib" =~ ^[0-9]+$ ]]
+ram_bytes="$((ram_kib * 1024))"
+(( ram_bytes > 0 ))
 affinity="$(taskset -pc $$ | sed 's/.*: //')"
 storage_model="$(xargs < "/sys/block/$(basename "$data_device")/device/model")"
 jq -n \
