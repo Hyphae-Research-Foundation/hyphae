@@ -20,6 +20,8 @@ use futures_util::future::join_all;
 use hyphae_client::v2::{HyphaeClient, RequestOptions};
 use hyphae_native_catalog::IncrementalVectorLifecycle;
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
+#[cfg(target_os = "linux")]
+use hyphae_native_product::NativeProductService;
 use hyphae_native_product::{
     NativeProduct, ProductAuthorization, ProductDurabilityPolicy, ProductOperation,
     ProductPreparedHandle, ProductPrincipal, ProductRequestContext, ProductResponse,
@@ -42,6 +44,12 @@ use hyphae_native_runtime::{
 use hyphae_native_types::ObjectId;
 use serde_json::json;
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
+
+#[cfg(target_os = "linux")]
+use nix::{
+    sched::{CpuSet, sched_getaffinity, sched_setaffinity},
+    unistd::Pid,
+};
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
@@ -90,13 +98,181 @@ struct LocalDaemonThread {
     worker: Option<thread::JoinHandle<()>>,
     #[cfg(test)]
     server_thread_id: thread::ThreadId,
+    #[cfg(target_os = "linux")]
+    transport_affinity: Option<LocalTransportAffinityEvidence>,
+}
+
+struct LocalDaemonRuntime {
+    daemon: NativeDaemon,
+    transport_affinity: Option<LocalTransportAffinityEvidence>,
+    #[cfg(target_os = "linux")]
+    _daemon_affinity: Option<ThreadAffinityGuard>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalTransportAffinity {
+    client_logical_processor: u32,
+    daemon_logical_processor: u32,
+    owner_logical_processor: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalTransportAffinityEvidence {
+    client_logical_processor: u32,
+    daemon_logical_processor: u32,
+    owner_logical_processor: u32,
+    client_observed_cpu_set: Vec<u32>,
+    daemon_observed_cpu_set: Vec<u32>,
+    owner_observed_cpu_set: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+struct ThreadAffinityGuard {
+    original: CpuSet,
+}
+
+impl LocalTransportAffinity {
+    #[cfg(any(target_os = "linux", test))]
+    fn from_reserved_cpus(
+        hard_affinity: bool,
+        reserved_cpus: impl IntoIterator<Item = Option<u32>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        if !hard_affinity {
+            return Err("local transport requires hard processor affinity".into());
+        }
+        let cpus = reserved_cpus
+            .into_iter()
+            .take(3)
+            .collect::<Vec<Option<u32>>>();
+        let [Some(client), Some(daemon), Some(owner)] = cpus.as_slice() else {
+            return Err("local transport requires three reserved physical cores".into());
+        };
+        if client == daemon || client == owner || daemon == owner {
+            return Err("local transport requires three distinct logical processors".into());
+        }
+        Ok(Self {
+            client_logical_processor: *client,
+            daemon_logical_processor: *daemon,
+            owner_logical_processor: *owner,
+        })
+    }
+}
+
+impl LocalTransportAffinityEvidence {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "schema": "hyphae-native-g7-local-transport-affinity-v1",
+            "status": "measured",
+            "placement_source": "hardware-profile-reserved-physical-cores-v1",
+            "hard_affinity": true,
+            "client_logical_processor": self.client_logical_processor,
+            "daemon_logical_processor": self.daemon_logical_processor,
+            "owner_logical_processor": self.owner_logical_processor,
+            "client_observed_cpu_set": self.client_observed_cpu_set,
+            "daemon_observed_cpu_set": self.daemon_observed_cpu_set,
+            "owner_observed_cpu_set": self.owner_observed_cpu_set,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ThreadAffinityGuard {
+    fn bind(logical_processor: u32) -> Result<Self, Box<dyn Error>> {
+        let original = sched_getaffinity(Pid::from_raw(0))?;
+        let mut selected = CpuSet::new();
+        selected.set(usize::try_from(logical_processor)?)?;
+        sched_setaffinity(Pid::from_raw(0), &selected)?;
+        Ok(Self { original })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ThreadAffinityGuard {
+    fn drop(&mut self) {
+        let _ignored = sched_setaffinity(Pid::from_raw(0), &self.original);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_set_values(cpu_set: &CpuSet) -> Result<Vec<u32>, Box<dyn Error>> {
+    (0..CpuSet::count())
+        .filter_map(|cpu| match cpu_set.is_set(cpu) {
+            Ok(true) => Some(u32::try_from(cpu).map_err(Into::into)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn current_thread_cpu_set() -> Result<Vec<u32>, Box<dyn Error>> {
+    cpu_set_values(&sched_getaffinity(Pid::from_raw(0))?)
+}
+
+#[cfg(target_os = "linux")]
+fn product_owner_threads() -> Result<BTreeSet<i32>, Box<dyn Error>> {
+    let mut owners = BTreeSet::new();
+    for task in fs::read_dir("/proc/self/task")? {
+        let task = task?;
+        let Some(tid) = task
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let name = fs::read_to_string(task.path().join("comm"))?;
+        if name.trim() == "hyphae-native-p" {
+            owners.insert(tid);
+        }
+    }
+    Ok(owners)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_new_product_owner(previous: &BTreeSet<i32>) -> Result<Vec<u32>, Box<dyn Error>> {
+    let deadline = Instant::now() + LOCAL_DAEMON_LIFECYCLE_TIMEOUT;
+    loop {
+        let current = product_owner_threads()?;
+        let created = current.difference(previous).copied().collect::<Vec<_>>();
+        if let [tid] = created.as_slice() {
+            return cpu_set_values(&sched_getaffinity(Pid::from_raw(*tid))?);
+        }
+        if created.len() > 1 {
+            return Err("local daemon created multiple product owner threads".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("local daemon product owner affinity was not observable".into());
+        }
+        thread::yield_now();
+    }
 }
 
 impl LocalDaemonThread {
+    #[cfg(any(not(target_os = "linux"), test))]
     fn start(
         product: NativeProduct,
         endpoint: String,
         config: NativeDaemonConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::start_inner(product, endpoint, config, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_with_affinity(
+        product: NativeProduct,
+        endpoint: String,
+        config: NativeDaemonConfig,
+        affinity: LocalTransportAffinity,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::start_inner(product, endpoint, config, Some(affinity))
+    }
+
+    fn start_inner(
+        product: NativeProduct,
+        endpoint: String,
+        config: NativeDaemonConfig,
+        affinity: Option<LocalTransportAffinity>,
     ) -> Result<Self, Box<dyn Error>> {
         let (ready_send, ready_receive) = mpsc::sync_channel(1);
         let (shutdown_send, shutdown_receive) = mpsc::sync_channel(1);
@@ -108,13 +284,16 @@ impl LocalDaemonThread {
                     product,
                     endpoint,
                     config,
+                    affinity,
                     &ready_send,
                     &shutdown_receive,
                 );
                 let _ignored = completed_send.send(result);
             })?;
-        let server_thread_id = match ready_receive.recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT) {
-            Ok(Ok(thread_id)) => thread_id,
+        let (server_thread_id, _transport_affinity) = match ready_receive
+            .recv_timeout(LOCAL_DAEMON_LIFECYCLE_TIMEOUT)
+        {
+            Ok(Ok(ready)) => ready,
             Ok(Err(error)) => {
                 worker
                     .join()
@@ -143,12 +322,29 @@ impl LocalDaemonThread {
             worker: Some(worker),
             #[cfg(test)]
             server_thread_id,
+            #[cfg(target_os = "linux")]
+            transport_affinity: _transport_affinity,
         })
     }
 
     #[cfg(test)]
     fn server_thread_id(&self) -> thread::ThreadId {
         self.server_thread_id
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transport_affinity_for_client(
+        &self,
+    ) -> Result<LocalTransportAffinityEvidence, Box<dyn Error>> {
+        let mut evidence = self
+            .transport_affinity
+            .clone()
+            .ok_or("local daemon omitted hard-affinity evidence")?;
+        evidence.client_observed_cpu_set = current_thread_cpu_set()?;
+        if evidence.client_observed_cpu_set != vec![evidence.client_logical_processor] {
+            return Err("local client thread did not retain its assigned processor".into());
+        }
+        Ok(evidence)
     }
 
     fn shutdown(mut self) -> Result<(), Box<dyn Error>> {
@@ -189,7 +385,10 @@ fn run_local_daemon_thread(
     product: NativeProduct,
     endpoint: String,
     config: NativeDaemonConfig,
-    ready: &mpsc::SyncSender<Result<thread::ThreadId, String>>,
+    affinity: Option<LocalTransportAffinity>,
+    ready: &mpsc::SyncSender<
+        Result<(thread::ThreadId, Option<LocalTransportAffinityEvidence>), String>,
+    >,
     shutdown: &mpsc::Receiver<()>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -197,7 +396,7 @@ fn run_local_daemon_thread(
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async move {
-        let daemon = match NativeDaemon::start(product, endpoint, config) {
+        let daemon = match start_local_daemon(product, endpoint, config, affinity) {
             Ok(daemon) => daemon,
             Err(error) => {
                 let message = error.to_string();
@@ -206,7 +405,10 @@ fn run_local_daemon_thread(
             }
         };
         ready
-            .send(Ok(thread::current().id()))
+            .send(Ok((
+                thread::current().id(),
+                daemon.transport_affinity.clone(),
+            )))
             .map_err(|_| "local daemon ready receiver disappeared".to_owned())?;
         loop {
             match shutdown.try_recv() {
@@ -215,10 +417,58 @@ fn run_local_daemon_thread(
             }
         }
         daemon
+            .daemon
             .shutdown()
             .await
             .map(drop)
             .map_err(|error| error.to_string())
+    })
+}
+
+fn start_local_daemon(
+    product: NativeProduct,
+    endpoint: String,
+    config: NativeDaemonConfig,
+    _affinity: Option<LocalTransportAffinity>,
+) -> Result<LocalDaemonRuntime, Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    if let Some(affinity) = _affinity {
+        let owners_before = product_owner_threads()?;
+        // Linux threads inherit their creator's affinity mask. Start the sole
+        // owner while only its reserved CPU is admitted, then move the daemon
+        // runtime to its own reserved CPU before binding the listener.
+        let owner_parent_affinity = ThreadAffinityGuard::bind(affinity.owner_logical_processor)?;
+        let service = NativeProductService::start(product, config.product_service)?;
+        let owner_observed_cpu_set = wait_for_new_product_owner(&owners_before)?;
+        drop(owner_parent_affinity);
+        if owner_observed_cpu_set != vec![affinity.owner_logical_processor] {
+            return Err("local product owner did not inherit its assigned processor".into());
+        }
+        let daemon_affinity = ThreadAffinityGuard::bind(affinity.daemon_logical_processor)?;
+        let daemon_observed_cpu_set = current_thread_cpu_set()?;
+        if daemon_observed_cpu_set != vec![affinity.daemon_logical_processor] {
+            return Err("local daemon did not retain its assigned processor".into());
+        }
+        let daemon = NativeDaemon::start_with_service(service, endpoint, config)?;
+        return Ok(LocalDaemonRuntime {
+            daemon,
+            transport_affinity: Some(LocalTransportAffinityEvidence {
+                client_logical_processor: affinity.client_logical_processor,
+                daemon_logical_processor: affinity.daemon_logical_processor,
+                owner_logical_processor: affinity.owner_logical_processor,
+                client_observed_cpu_set: Vec::new(),
+                daemon_observed_cpu_set,
+                owner_observed_cpu_set,
+            }),
+            _daemon_affinity: Some(daemon_affinity),
+        });
+    }
+    let daemon = NativeDaemon::start(product, endpoint, config)?;
+    Ok(LocalDaemonRuntime {
+        daemon,
+        transport_affinity: None,
+        #[cfg(target_os = "linux")]
+        _daemon_affinity: None,
     })
 }
 
@@ -2733,6 +2983,29 @@ impl ExecutionAuthority {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn local_transport_affinity(&self) -> Result<LocalTransportAffinity, Box<dyn Error>> {
+        let execution_cores = self
+            .topology
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.workers)
+            .filter_map(|worker| Some((worker.socket_id?, worker.core_id?)))
+            .collect::<BTreeSet<_>>();
+        let mut reserved_cores = BTreeSet::new();
+        let reserved_cpus = self
+            .profile
+            .cpu
+            .processor_topology
+            .iter()
+            .filter(|processor| {
+                !execution_cores.contains(&(processor.socket_id, processor.core_id))
+                    && reserved_cores.insert((processor.socket_id, processor.core_id))
+            })
+            .map(|processor| Some(processor.logical_id));
+        LocalTransportAffinity::from_reserved_cpus(self.topology.hard_affinity, reserved_cpus)
+    }
+
     fn observation(&self) -> Result<serde_json::Value, Box<dyn Error>> {
         let installations = self
             .installations
@@ -2764,11 +3037,7 @@ fn install_database_execution_authority(
     execution_pool: Arc<NativeExecutionPool>,
 ) -> Result<(), Box<dyn Error>> {
     database
-        .set_resource_governor_with_execution_pool(
-            governor,
-            execution_pool,
-            G7_DATABASE_QUEUE_WAIT,
-        )
+        .set_resource_governor_with_execution_pool(governor, execution_pool, G7_DATABASE_QUEUE_WAIT)
         .map_err(|error| format!("G7 execution authority install failed: {error}").into())
 }
 
@@ -2778,11 +3047,7 @@ fn install_product_execution_authority(
     execution_pool: Arc<NativeExecutionPool>,
 ) -> Result<(), Box<dyn Error>> {
     product
-        .set_resource_governor_with_execution_pool(
-            governor,
-            execution_pool,
-            G7_DATABASE_QUEUE_WAIT,
-        )
+        .set_resource_governor_with_execution_pool(governor, execution_pool, G7_DATABASE_QUEUE_WAIT)
         .map_err(Into::into)
 }
 
@@ -4197,11 +4462,27 @@ async fn run_local_structure(
         .map_err(|error| format!("local structure reopen after migration: {error}"))?;
     authority.install_product(&mut product, "local-structure-daemon")?;
     let endpoint = short_endpoint("structure");
+    #[cfg(target_os = "linux")]
+    let placement = authority.local_transport_affinity()?;
+    #[cfg(target_os = "linux")]
+    let _client_affinity = ThreadAffinityGuard::bind(placement.client_logical_processor)?;
+    #[cfg(target_os = "linux")]
+    let daemon = LocalDaemonThread::start_with_affinity(
+        product,
+        endpoint.to_string_lossy().into_owned(),
+        NativeDaemonConfig::default(),
+        placement,
+    )?;
+    #[cfg(not(target_os = "linux"))]
     let daemon = LocalDaemonThread::start(
         product,
         endpoint.to_string_lossy().into_owned(),
         NativeDaemonConfig::default(),
     )?;
+    #[cfg(target_os = "linux")]
+    let transport_affinity = Some(daemon.transport_affinity_for_client()?);
+    #[cfg(not(target_os = "linux"))]
+    let transport_affinity: Option<LocalTransportAffinityEvidence> = None;
     let result = async {
         let clients = local_clients(&endpoint, concurrency)?;
         let options = RequestOptions::default();
@@ -4252,7 +4533,11 @@ async fn run_local_structure(
     }
     .await;
     daemon.shutdown()?;
-    result
+    let mut result = result?;
+    if let Some(transport_affinity) = transport_affinity {
+        result["local_transport_affinity"] = transport_affinity.json();
+    }
+    Ok(result)
 }
 
 async fn run_local_sql(
@@ -4271,11 +4556,27 @@ async fn run_local_sql(
     authority.install_product(&mut product, "local-sql-daemon")?;
     seed_product_sql(&mut product)?;
     let endpoint = short_endpoint("sql");
+    #[cfg(target_os = "linux")]
+    let placement = authority.local_transport_affinity()?;
+    #[cfg(target_os = "linux")]
+    let _client_affinity = ThreadAffinityGuard::bind(placement.client_logical_processor)?;
+    #[cfg(target_os = "linux")]
+    let daemon = LocalDaemonThread::start_with_affinity(
+        product,
+        endpoint.to_string_lossy().into_owned(),
+        NativeDaemonConfig::default(),
+        placement,
+    )?;
+    #[cfg(not(target_os = "linux"))]
     let daemon = LocalDaemonThread::start(
         product,
         endpoint.to_string_lossy().into_owned(),
         NativeDaemonConfig::default(),
     )?;
+    #[cfg(target_os = "linux")]
+    let transport_affinity = Some(daemon.transport_affinity_for_client()?);
+    #[cfg(not(target_os = "linux"))]
+    let transport_affinity: Option<LocalTransportAffinityEvidence> = None;
     let result = async {
         let clients = local_clients(&endpoint, concurrency)?;
         let options = RequestOptions::default();
@@ -4341,7 +4642,11 @@ async fn run_local_sql(
     }
     .await;
     daemon.shutdown()?;
-    result
+    let mut result = result?;
+    if let Some(transport_affinity) = transport_affinity {
+        result["local_transport_affinity"] = transport_affinity.json();
+    }
+    Ok(result)
 }
 
 fn run_indexed_sql(
@@ -6644,14 +6949,15 @@ mod tests {
                 },
             )?;
             let reader = thread::spawn(move || {
-                product.dispatch(
-                    &mut session,
-                    &context,
-                    ProductOperation::StructureGet {
-                        key: b"queued-product-read".to_vec(),
-                    },
-                )
-                .map_err(|error| error.to_string())
+                product
+                    .dispatch(
+                        &mut session,
+                        &context,
+                        ProductOperation::StructureGet {
+                            key: b"queued-product-read".to_vec(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())
             });
             let queued = wait_for_database_queue(&governor, 1);
             drop(held);
@@ -6952,6 +7258,75 @@ mod tests {
         daemon.shutdown()?;
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_daemon_reports_exact_client_daemon_and_owner_affinity()
+    -> Result<(), Box<dyn Error>> {
+        let original = current_thread_cpu_set()?;
+        if original.len() < 3 {
+            return Ok(());
+        }
+        let placement = LocalTransportAffinity::from_reserved_cpus(
+            true,
+            original.iter().copied().take(3).map(Some),
+        )?;
+        let client = ThreadAffinityGuard::bind(placement.client_logical_processor)?;
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-g7-local-daemon-affinity-{}-{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        let endpoint = short_endpoint("daemon-affinity");
+        let daemon = LocalDaemonThread::start_with_affinity(
+            NativeProduct::create(&root)?,
+            endpoint.to_string_lossy().into_owned(),
+            NativeDaemonConfig::default(),
+            placement,
+        )?;
+
+        assert_eq!(
+            current_thread_cpu_set()?,
+            vec![placement.client_logical_processor]
+        );
+        let evidence = daemon.transport_affinity_for_client()?;
+        assert_eq!(
+            evidence.client_observed_cpu_set,
+            vec![placement.client_logical_processor]
+        );
+        assert_eq!(
+            evidence.daemon_observed_cpu_set,
+            vec![placement.daemon_logical_processor]
+        );
+        assert_eq!(
+            evidence.owner_observed_cpu_set,
+            vec![placement.owner_logical_processor]
+        );
+        daemon.shutdown()?;
+        drop(client);
+        assert_eq!(current_thread_cpu_set()?, original);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_transport_affinity_requires_three_distinct_reserved_processors() {
+        let placement =
+            LocalTransportAffinity::from_reserved_cpus(true, [Some(11), Some(13), Some(17)])
+                .expect("three distinct hard-bound workers");
+        assert_eq!(placement.client_logical_processor, 11);
+        assert_eq!(placement.daemon_logical_processor, 13);
+        assert_eq!(placement.owner_logical_processor, 17);
+        assert!(
+            LocalTransportAffinity::from_reserved_cpus(false, [Some(1), Some(2), Some(3)]).is_err()
+        );
+        assert!(
+            LocalTransportAffinity::from_reserved_cpus(true, [Some(1), Some(1), Some(2)]).is_err()
+        );
+        assert!(
+            LocalTransportAffinity::from_reserved_cpus(true, [Some(1), None, Some(3)]).is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
