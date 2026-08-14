@@ -7,12 +7,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(
+    os.environ.get(
+        "HYPHAE_RELEASE_SOURCE_ROOT",
+        Path(__file__).resolve().parents[1],
+    )
+).resolve()
 REPOSITORY = "https://github.com/celiumsai/hyphae"
 WORKFLOW_PATH = ".github/workflows/release.yml"
 BUILD_TYPE = "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1"

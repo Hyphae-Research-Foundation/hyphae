@@ -5,13 +5,12 @@ verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
 ## Maintainer tag-target invariant
 
-The 18-check release report is bound to the exact pull-request head commit.
-Every required workflow checks out that head rather than GitHub's synthetic
-merge commit, and the Release assemble job separately requires the event's
-synthetic merge tree to equal the checked head tree. `Review dependency
-changes` is PR-only; the five Release jobs run on the candidate PR and also on
-manual candidates and tag pushes, but the tag run is excluded from its own
-required-check report.
+The version tag targets the canonical merge commit for the reviewed release
+PR. The release report binds 17 required PR checks to that PR's exact head
+commit and binds the exact-SHA G8 closure to the tagged merge commit on `main`.
+Every required PR workflow checks out the head rather than GitHub's synthetic
+merge commit, and the Release assemble job separately requires the merge
+commit's second parent and tree to equal that reviewed head.
 Merge a release PR with a merge commit, never squash or rebase it, and retain
 the reviewed candidate as a commit reachable from protected `main`:
 
@@ -20,20 +19,20 @@ git merge-base --is-ancestor CANDIDATE origin/main
 ```
 
 After hosted closure and explicit publication authorization, create the
-version tag on `CANDIDATE`, not on the merge commit. Verify the target before
-push:
+version tag on `MERGE_COMMIT`. Verify the target before push:
 
 ```bash
-test "$(git rev-parse vVERSION^{commit})" = "CANDIDATE"
+test "$(git rev-parse vVERSION^{commit})" = "MERGE_COMMIT"
 ```
 
-The tag workflow excludes every check from its own run and must find all 18
-completed successful prior checks on that candidate SHA. It also fetches the
-remote tag, records both the ref object and its peeled commit, requires that
-commit to equal the candidate and remain reachable from `main`, and repeats
-those checks immediately before publication. Tagging the merge commit, moving
-the tag, or losing reachability through a squash/rebase merge therefore fails
-closed.
+The publication workflow excludes every check from its own run and must find
+all 18 completed successful prior checks on their two exact authority commits.
+It fetches the remote tag, records both the ref object and peeled merge commit,
+requires that commit to remain reachable from `main`, and repeats those checks
+immediately before publication. Moving the tag, crossing PRs, changing the
+reviewed tree, or losing merge ancestry therefore fails closed. If the initial
+tag run fails, recovery must use the existing tag plus its exact peeled commit;
+it never recreates or moves the tag.
 
 ## 1. Verify checksums
 
@@ -57,13 +56,15 @@ with its `SHA256SUMS` entry:
 ## 2. Verify the keyless signature
 
 Use Cosign 3.1.1 or a later compatible verifier. The certificate identity is
-bound to the tagged Hyphae release workflow:
+bound to the exact Release workflow ref recorded in the release evidence. It
+is `refs/tags/vVERSION` for a tag push and `refs/heads/main` for an authorized
+exact-tag recovery:
 
 ```bash
 cosign verify-blob \
   --bundle hyphae-VERSION-TARGET.tar.gz.sigstore.json \
   --certificate-identity \
-    'https://github.com/celiumsai/hyphae/.github/workflows/release.yml@refs/tags/vVERSION' \
+    'https://github.com/celiumsai/hyphae/.github/workflows/release.yml@RELEASE_WORKFLOW_REF' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   hyphae-VERSION-TARGET.tar.gz
 ```
@@ -81,10 +82,10 @@ tag, commit, tree, fetched tag object, peeled tag target, full tag ref, release
 workflow, and GitHub Actions run. Its artifact inventory must contain every
 archive, provenance predicate, SPDX SBOM, CycloneDX SBOM, and the
 required-checks report exactly once. The checks
-report must identify `celiumsai/hyphae`, the same source commit, and exactly
+report must identify `celiumsai/hyphae`, the tagged merge commit, and exactly
 the 18 canonical checks in fixed order. Every record must have a unique
 check-run ID, the matching workflow-run ID, canonical workflow path and
-GitHub job URL, GitHub Actions app ID/slug, the same `head_sha` and head branch,
+GitHub job URL, GitHub Actions app ID/slug, the authoritative `head_sha` and head branch,
 run attempt and
 `status=completed`/`conclusion=success`. All jobs from one workflow path must
 come from one workflow run. The report also identifies the unique merged,
@@ -94,8 +95,8 @@ return that same PR and no other, and its complete issue-event history must
 contain no base-ref change or successful automatic base change. The producer
 verifies each referenced workflow run's exact ID, path, commit, branch, event,
 repository, attempt, state, and conclusion. Seventeen checks require
-`event=pull_request`; the exact-SHA G8 closure requires
-`event=workflow_dispatch` and the same candidate commit. It fetches the Jobs API record for
+`event=pull_request` on the reviewed PR head; the exact-SHA G8 closure requires
+`event=workflow_dispatch` on the tagged merge commit and `main`. It fetches the Jobs API record for
 every selected check and requires the job's exact ID, workflow-run ID, name,
 commit, state, conclusion, and `run_attempt` to agree with the check and the
 workflow run's current attempt. A partial rerun that mixes jobs from different

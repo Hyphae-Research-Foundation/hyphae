@@ -83,23 +83,23 @@
     {
       "if": {
         "properties": {
-          "workflow": {
+          "source": {
             "properties": {
-              "ref": {
-                "pattern": "^refs/tags/"
+              "tag_object": {
+                "type": "string"
               },
-              "event": {
-                "const": "push"
+              "tag_target": {
+                "type": "string"
               }
             },
             "required": [
-              "ref",
-              "event"
+              "tag_object",
+              "tag_target"
             ]
           }
         },
         "required": [
-          "workflow"
+          "source"
         ]
       },
       "then": {
@@ -146,19 +146,19 @@
     {
       "if": {
         "properties": {
-          "workflow": {
+          "source": {
             "properties": {
-              "ref": {
-                "pattern": "^refs/tags/"
+              "tag_object": {
+                "type": "string"
               }
             },
             "required": [
-              "ref"
+              "tag_object"
             ]
           }
         },
         "required": [
-          "workflow"
+          "source"
         ]
       },
       "then": {
@@ -172,6 +172,41 @@
                 "type": "string"
               }
             }
+          },
+          "workflow": {
+            "oneOf": [
+              {
+                "properties": {
+                  "ref": {
+                    "pattern": "^refs/tags/"
+                  },
+                  "event": {
+                    "enum": [
+                      "push",
+                      "workflow_dispatch"
+                    ]
+                  }
+                },
+                "required": [
+                  "ref",
+                  "event"
+                ]
+              },
+              {
+                "properties": {
+                  "ref": {
+                    "const": "refs/heads/main"
+                  },
+                  "event": {
+                    "const": "workflow_dispatch"
+                  }
+                },
+                "required": [
+                  "ref",
+                  "event"
+                ]
+              }
+            ]
           }
         }
       },

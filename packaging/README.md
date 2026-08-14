@@ -52,23 +52,28 @@ and verifies all four proofs offline. A tampered result-proof negative control
 must fail; the smoke cannot report success unless every positive verification
 succeeds and the negative control is rejected.
 
-A manual workflow run, including one dispatched from a tag ref, executes native
-build, provenance, SBOM, signing, and verification, then uploads a candidate
-artifact without publishing a release. Publication is reachable only from a
-`push` event for an explicit `v*` tag, and
+A manual workflow run without recovery inputs executes native build,
+provenance, SBOM, signing, and verification, then uploads a candidate artifact
+without publishing a release. If an immutable tag run fails after the tag is
+created, one manual recovery may name both the existing tag and its exact
+peeled commit. That path re-fetches and verifies the tag, rebuilds every native
+archive from the tagged commit, binds the hosted checks, and may publish without
+moving or recreating the tag. Publication is reachable only from a `v*` tag
+push or that exact-tag recovery path, and
 `finalize_release.py` rejects a tag that does not equal `v` plus the workspace
 version. The workflow binds the fetched tag object and peeled commit, requires
 that commit to remain reachable from `main`, and re-fetches both immediately
 before publication. A tag may be pushed only after the complete gate is green
 and publication is explicitly authorized.
 
-A tagged `push` publication also records exactly 18 required checks. Each check
-is bound to the expected canonical workflow path and to successful workflow-run
-metadata for the same commit; a same-named job from another workflow is
-rejected. Seventeen selected runs must be `pull_request` runs; the exact-SHA
-G8 closure is the sole `workflow_dispatch` run. All use the same head branch,
-every workflow path must resolve to one run, and the commit must belong
-to exactly one merged in-repository PR targeting `main`; the complete PR
+A publication also records exactly 18 required checks. Seventeen checks bind
+the reviewed PR-head commit and its head branch; the exact-SHA G8 closure binds
+the tagged merge commit on `main`. Each check is bound to its expected
+canonical workflow path and successful workflow-run metadata; a same-named job
+from another workflow is rejected. The 17 PR checks must be `pull_request`
+runs, while G8 closure is the sole `workflow_dispatch` run. Every workflow path
+must resolve to one run, and the tagged merge commit must belong to exactly one
+merged in-repository PR targeting `main`; the complete PR
 history for that head branch must contain no second PR, and the PR's complete
 issue-event history must contain no base-ref change or successful automatic
 base change. GitHub's Jobs API must provide the successful job record for every

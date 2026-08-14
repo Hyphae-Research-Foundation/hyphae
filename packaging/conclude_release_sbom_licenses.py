@@ -18,7 +18,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(
+    os.environ.get(
+        "HYPHAE_RELEASE_SOURCE_ROOT",
+        Path(__file__).resolve().parents[1],
+    )
+).resolve()
 SOFTWARE_LICENSE = "AGPL-3.0-only"
 SYFT_VERSION = "1.46.0"
 IGNORED_DIRECTORIES = frozenset({"build", "dist", "node_modules", "target"})
