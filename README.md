@@ -26,18 +26,19 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** Hyphae Native is the active architecture. G0
-through G7 are closed for their versioned, bounded profiles. G7 uses an
-environment-bound operational-scale authority; the exact-commit G8 release evidence is produced
-by the release workflow. The
+**Stable Native release:** [`v1.1.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.1.0)
+is the active architecture. G0 through G8 are closed for their versioned,
+bounded profiles. G7 uses an environment-bound operational-scale authority;
+G8 binds the release archives, SBOMs, signatures, provenance, and fault
+matrices to the exact release commit. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 
-**Release candidate:** `v1.1.0` will distribute the complete 24-crate Native
-Rust ecosystem through crates.io and signed native archives through GitHub
-Releases after its exact-SHA G8 gate closes.
-The prior `0.2.1` compatibility publication receipt is retained at
-[`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
+**Published release:** all 24 Rust crates are available at `1.1.0` on
+crates.io, all 23 library crates built successfully on docs.rs, and the GitHub
+Release contains signed native archives for four platform targets. The exact
+checksums, source identities, workflow runs, and consumer verification are in
+the [1.1.0 publication receipt](docs/release/receipts/1.1.0.md).
 
 G8 release evidence binds publication to the exact release commit. The G7
 closure certifies the C-60 operational-scale control matrix but makes no
@@ -64,10 +65,47 @@ See the [Native capability matrix](docs/product/native-capabilities.md),
 including surface differences, boundaries, and deliberate non-capabilities.
 The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 
+## Operational-scale measurements
+
+The G7 authority exercised all 11 surfaces at C1, C8, and C32 on a DigitalOcean
+`c-60-intel` VM with 60 vCPUs and 120 GiB RAM. Each cell used 1,000,000
+measured observations plus 100,000 warmup observations per surface against
+1,000,000 documents and 1,000,000 384-dimensional vectors. Queueing time is
+included. Values below are observed p50 latency in microseconds.
+
+| Surface | C1 p50 | C8 p50 | C32 p50 |
+|---|---:|---:|---:|
+| Embedded structure point get | 2.634 µs | 352.043 µs | 7,026.185 µs |
+| Embedded prepared SQL primary key | 3.710 µs | 10.867 µs | 7,224.293 µs |
+| Local structure point get | 123.323 µs | 153.425 µs | 303.213 µs |
+| Local prepared SQL primary key | 128.761 µs | 126.416 µs | 287.156 µs |
+| Indexed SQL bounded read | 45.443 µs | 399.870 µs | 8,340.482 µs |
+| Two-index join bounded read | 38.325 µs | 325.779 µs | 8,306.193 µs |
+| BM25 top 10 | 1.595 µs | 3.168 µs | 64.335 µs |
+| Filtered BM25 top 10 | 1.660 µs | 3.250 µs | 65.369 µs |
+| ANN top 10 | 115.995 µs | 139.118 µs | 8,397.640 µs |
+| Hybrid top 10 | 118.190 µs | 141.885 µs | 8,409.802 µs |
+| Strict group commit | 138,586.858 µs | 141,622.215 µs | 130,425.161 µs |
+
+The matrix completed 33/33 surface-concurrency cells: 33,000,000 measured
+observations and 3,300,000 warmups. ANN recall@10 was `1.0` in every cell.
+Strict group commit completed 3,000,000 logical commits with 3,000,000 distinct
+CSNs; recovery reported zero missing and zero mismatched commits.
+
+These VM measurements establish functional concurrency, accounting,
+correctness, recall, and durable recovery at operational scale. They do **not**
+certify portable latency, dedicated hardware, bare metal, or background
+interference. The [machine-readable measurements](docs/gates/evidence/native-g7-provisional-do-c60-2026-08-13.json),
+[method and limitations](docs/gates/evidence/native-g7-provisional-do-c60-2026-08-13.md),
+and [G7 closure authority](docs/gates/evidence/closures/native-g7-ff188af.json)
+retain the exact source, environment, contract, and artifact hashes. The
+machine-readable measurement file has SHA-256
+`95a78beb031de35a3d2532c7536d76491d6273f7b8ce74c6b3976038bc8c3234`.
+
 ## Install
 
 Download the archive for your platform from the
-`v1.1.0` GitHub release after its exact-SHA G8 gate closes,
+[`v1.1.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.1.0),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
@@ -86,7 +124,7 @@ cargo build --release --locked -p hyphae-cli
 The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
 checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
 
-## Published 0.2.1 compatibility flow
+## Legacy 0.2.1 compatibility flow
 
 ```bash
 cargo build --release --locked -p hyphae-cli
@@ -157,8 +195,21 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-The following crates are the published format-2 compatibility libraries at
-`0.2.1`; their crates.io pages do not describe the unpublished Native facade:
+Version `1.1.0` publishes the complete 24-crate graph:
+
+- contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
+  `hyphae-query`, and `hyphae-retrieval`;
+- owned storage and indexing: `hyphae-native-types`, `hyphae-native-ann`,
+  `hyphae-native-catalog`, `hyphae-native-mvcc`, `hyphae-native-pages`,
+  `hyphae-native-records`, `hyphae-native-wal`, `hyphae-native-blobs`,
+  `hyphae-native-btree`, and `hyphae-native-manifest`;
+- runtime and public access: `hyphae-native-runtime`,
+  `hyphae-native-product`, `hyphae-native-protocol`,
+  `hyphae-native-daemon`, `hyphae-engine`, `hyphae-storage`,
+  `hyphae-client`, and `hyphae-server`; and
+- distribution and adapters: `hyphae-cli` and `hyphae-pliegors`.
+
+The compatibility crates remain available as part of that graph:
 
 | Crate | Purpose | Documentation |
 |---|---|---|
@@ -190,15 +241,18 @@ Start at the [documentation index](docs/README.md). Key guides:
 - [Native local ecosystem target](docs/architecture/native-local-ecosystem.md)
 - [Microsecond-first target](docs/performance/microsecond-first.md)
 - [Release verification](docs/release/verification.md)
+- [1.1.0 publication receipt](docs/release/receipts/1.1.0.md)
+- [G7 operational-scale measurements](docs/gates/evidence/native-g7-provisional-do-c60-2026-08-13.md)
 - [0.2.1 publication receipt](docs/release/receipts/0.2.1.md)
 - [crates.io release procedure](docs/release/crates-io.md)
 
 ## Product boundary
 
 Hyphae Native is a local, single-node data ecosystem with Hyphae-owned SQL,
-structures, lexical search, and ANN under one durable authority. G0 through G6
-are closed for their bounded contracts. G8 protects the exact release commit;
-G7 remains a post-release performance certification and is not a release claim.
+structures, lexical search, and ANN under one durable authority. G0 through G8
+are closed for their bounded contracts. G7 is an operational-scale C-60
+authority with the explicit hardware and latency non-claims above; G8 protects
+the exact release commit.
 
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
 runtime, a hosted SaaS, or a framework-specific data layer. The retained

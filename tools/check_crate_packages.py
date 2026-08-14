@@ -94,7 +94,14 @@ def validate_release_graph(
             dependency_name = dependency["name"]
             if dependency_name not in expected_set:
                 continue
-            if dependency["kind"] == "dev":
+            if (
+                dependency["kind"] == "dev"
+                and dependency["req"] == "*"
+                and dependency.get("path") is not None
+            ):
+                # Cargo strips path-only development dependencies from the
+                # published manifest. Versioned development dependencies stay
+                # in the publication graph and must therefore be ordered.
                 continue
             if dependency["req"] != f"={expected_version}":
                 failures.append(
