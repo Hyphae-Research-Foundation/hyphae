@@ -27,21 +27,21 @@ substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
 **Stable Native release:** Hyphae Native is the active architecture. G0
-through G6 are closed for their versioned, bounded profiles. G7 performance
-certification remains open; the exact-commit G8 release evidence is produced
+through G7 are closed for their versioned, bounded profiles. G7 uses an
+environment-bound operational-scale authority; the exact-commit G8 release evidence is produced
 by the release workflow. The
 [native gate status](docs/gates/native-gate-status.md) is the current status
 authority; temporary workflow artifacts alone do not close a gate.
 
-**Current release:** `v1.0.1` distributes the complete 24-crate Native Rust
-ecosystem through crates.io and signed native archives through GitHub Releases.
+**Release candidate:** `v1.1.0` will distribute the complete 24-crate Native
+Rust ecosystem through crates.io and signed native archives through GitHub
+Releases after its exact-SHA G8 gate closes.
 The prior `0.2.1` compatibility publication receipt is retained at
 [`docs/release/receipts/0.2.1.md`](docs/release/receipts/0.2.1.md).
 
-G8 release evidence binds publication to the exact release commit. G7 does
-not block publication, but Hyphae makes no certified latency,
-saturation, or production-scale performance claim until G7 closes on dedicated
-hardware.
+G8 release evidence binds publication to the exact release commit. The G7
+closure certifies the C-60 operational-scale control matrix but makes no
+canonical dedicated-hardware latency, interference, or bare-metal claim.
 
 ## What Hyphae does
 
@@ -67,18 +67,18 @@ The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 ## Install
 
 Download the archive for your platform from the
-[`v1.0.1` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.0.1),
+`v1.1.0` GitHub release after its exact-SHA G8 gate closes,
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 1.0.1 --locked
+cargo install hyphae-cli --version 1.1.0 --locked
 ```
 
 Build and embed the exact release from source with:
 
 ```bash
-git checkout v1.0.1
+git checkout v1.1.0
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```

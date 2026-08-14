@@ -1,6 +1,6 @@
 # Publish the Rust crates
 
-Hyphae `1.0.1` publishes the complete 24-crate Native Rust ecosystem. The
+Hyphae `1.1.0` publishes the complete 24-crate Native Rust ecosystem. The
 version and immutable dependency layers are defined in
 [`config/crates-io-release.json`](../../config/crates-io-release.json).
 Conformance runners and independent verifiers remain private workspace tools
@@ -63,11 +63,11 @@ for the exact crate version before retrying; never assume the upload failed.
 Use clean temporary projects, not workspace paths:
 
 ```bash
-cargo install hyphae-cli --version 1.0.1 --locked
+cargo install hyphae-cli --version 1.1.0 --locked
 hyphae version --json
 ```
 
-Also create a minimal Rust application with exact `=1.0.1` dependencies on
+Also create a minimal Rust application with exact `=1.1.0` dependencies on
 `hyphae-engine`, `hyphae-query`, and `hyphae-native-product`; build it with
 `--locked`. Verify that docs.rs has accepted every library package, then record
 all crates.io URLs, checksums, and the Git tag in the publication receipt.

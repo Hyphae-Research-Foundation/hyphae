@@ -63,7 +63,7 @@ def soak() -> dict:
 
 
 def signed_release() -> dict:
-    version = "1.0.1"
+    version = "1.1.0"
     return {
         "schema": "hyphae-native-g8-signed-release-v1",
         "status": "passed",
@@ -289,8 +289,8 @@ class G8ProducerTests(unittest.TestCase):
             "platform": target,
             "installed_smoke": "passed",
             "native_engines": ["sql", "structures", "search"],
-            "engine_version": "1.0.1",
-            "archive": f"hyphae-1.0.1-{target}.tar.gz",
+            "engine_version": "1.1.0",
+            "archive": f"hyphae-1.1.0-{target}.tar.gz",
             "proofs_verified": 4,
             "archive_sha256": "c" * 64,
         }, platform=target)
