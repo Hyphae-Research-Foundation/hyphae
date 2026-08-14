@@ -321,9 +321,53 @@ def validate_partial_receipt(
     return payload
 
 
+def _matched_serial_warmup_cells(
+    pilot: dict[str, object],
+    serial_warmup_pilot: object | None,
+    *,
+    expected_commit: str,
+    expected_platform: str,
+    expected_state: str,
+    expected_concurrency: int,
+) -> dict[str, object]:
+    if serial_warmup_pilot is None:
+        if expected_concurrency != 1:
+            raise RuntimeBudgetExceeded(
+                "G7 concurrent pilot omitted its matched C1 warmup evidence"
+            )
+        serial_warmup_pilot = pilot
+    if not isinstance(serial_warmup_pilot, dict):
+        raise RuntimeBudgetExceeded(
+            "G7 serial warmup pilot identity or coverage mismatch"
+        )
+    serial_cells = serial_warmup_pilot.get("cells")
+    pilot_background = pilot.get("background_interference")
+    serial_background = serial_warmup_pilot.get("background_interference")
+    if (
+        serial_warmup_pilot.get("source_commit") != expected_commit
+        or serial_warmup_pilot.get("platform") != expected_platform
+        or serial_warmup_pilot.get("state") != expected_state
+        or serial_warmup_pilot.get("concurrency") != 1
+        or serial_warmup_pilot.get("dataset") != pilot.get("dataset")
+        or not isinstance(serial_cells, dict)
+        or set(serial_cells) != set(G7_SURFACES)
+        or isinstance(pilot_background, dict) != isinstance(serial_background, dict)
+        or (
+            isinstance(pilot_background, dict)
+            and isinstance(serial_background, dict)
+            and pilot_background.get("status") != serial_background.get("status")
+        )
+    ):
+        raise RuntimeBudgetExceeded(
+            "G7 serial warmup pilot identity or coverage mismatch"
+        )
+    return serial_cells
+
+
 def derive_cell_runtime_budget(
     pilot: object,
     *,
+    serial_warmup_pilot: object | None = None,
     expected_commit: str,
     expected_platform: str,
     expected_state: str,
@@ -356,6 +400,14 @@ def derive_cell_runtime_budget(
         )
     except RuntimeError as error:
         raise RuntimeBudgetExceeded(f"G7 pilot {error}") from error
+    serial_cells = _matched_serial_warmup_cells(
+        pilot,
+        serial_warmup_pilot,
+        expected_commit=expected_commit,
+        expected_platform=expected_platform,
+        expected_state=expected_state,
+        expected_concurrency=expected_concurrency,
+    )
     wall_seconds = controller.get("wall_seconds")
     if (
         not isinstance(wall_seconds, (int, float))
@@ -407,8 +459,12 @@ def derive_cell_runtime_budget(
     pilot_surface_seconds = 0.0
     for name in G7_SURFACES:
         cell = cells[name]
+        serial_cell = serial_cells[name]
         throughput = cell.get("throughput_per_second") if isinstance(cell, dict) else None
         p99_nanos = cell.get("p99") if isinstance(cell, dict) else None
+        serial_p99_nanos = (
+            serial_cell.get("p99") if isinstance(serial_cell, dict) else None
+        )
         if (
             not isinstance(throughput, (int, float))
             or isinstance(throughput, bool)
@@ -417,6 +473,9 @@ def derive_cell_runtime_budget(
             or not isinstance(p99_nanos, int)
             or isinstance(p99_nanos, bool)
             or p99_nanos <= 0
+            or not isinstance(serial_p99_nanos, int)
+            or isinstance(serial_p99_nanos, bool)
+            or serial_p99_nanos <= 0
         ):
             raise RuntimeBudgetExceeded(f"G7 pilot timing is invalid for {name}")
         pilot_measurement_seconds = PILOT_OBSERVATIONS / throughput
@@ -426,8 +485,10 @@ def derive_cell_runtime_budget(
         pilot_correctness_seconds = 0.0
         full_correctness_seconds = 0.0
         if name != "strict-group-commit" and expected_state == "warm":
-            pilot_warmup_seconds = PILOT_WARMUP * p99_nanos / 1_000_000_000
-            full_warmup_seconds = warmup * p99_nanos / 1_000_000_000
+            pilot_warmup_seconds = (
+                PILOT_WARMUP * serial_p99_nanos / 1_000_000_000
+            )
+            full_warmup_seconds = warmup * serial_p99_nanos / 1_000_000_000
         elif name == "strict-group-commit":
             pilot_correctness_seconds = pilot_commit_correctness_seconds
             full_correctness_seconds = full_commit_correctness_seconds
@@ -454,9 +515,13 @@ def derive_cell_runtime_budget(
             f"slowest_seconds={full_surface_seconds[slowest]:.1f}s"
         )
     return {
-        "schema": "hyphae-native-g7-runtime-budget-v3",
-        "method": "exact-runner-short-pilot-with-bounded-recovery-v3",
+        "schema": "hyphae-native-g7-runtime-budget-v4",
+        "method": "exact-runner-short-pilot-with-matched-c1-warmup-v4",
         "seed_treatment": "measured-after-identical-seed-prime",
+        "warmup_projection": {
+            "method": "matched-state-background-c1-p99-linear-v1",
+            "source_concurrency": 1,
+        },
         "pilot_observations": PILOT_OBSERVATIONS,
         "pilot_warmup": PILOT_WARMUP,
         "full_observations": observations,
@@ -539,7 +604,7 @@ def derive_matrix_runtime_plan(
     for budget in cell_budgets:
         timeout = budget.get("timeout_seconds")
         if (
-            budget.get("schema") != "hyphae-native-g7-runtime-budget-v3"
+            budget.get("schema") != "hyphae-native-g7-runtime-budget-v4"
             or not isinstance(timeout, (int, float))
             or isinstance(timeout, bool)
             or not math.isfinite(timeout)
@@ -1937,6 +2002,7 @@ def main() -> int:
         )
         raise
 
+    serial_warmup_pilots: dict[tuple[str, str], dict[str, object]] = {}
     for plan in plans:
         current_cell = plan.diagnostic("calibration-pilot")
         current_cell["seed_prime_receipt"] = str(prime_receipt_path)
@@ -1993,8 +2059,12 @@ def main() -> int:
                 and plan.concurrency == 1
             ):
                 validate_warm_control_pilot_latency(pilot)
+            warmup_key = (plan.state, plan.background_mode)
+            if plan.concurrency == 1:
+                serial_warmup_pilots[warmup_key] = pilot
             plan.runtime_budget = derive_cell_runtime_budget(
                 pilot,
+                serial_warmup_pilot=serial_warmup_pilots.get(warmup_key),
                 expected_commit=arguments.source_commit,
                 expected_platform=arguments.platform,
                 expected_state=plan.state,

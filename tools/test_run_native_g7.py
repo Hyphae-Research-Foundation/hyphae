@@ -942,7 +942,14 @@ class NativeG7ControllerTests(unittest.TestCase):
         )
         self.assertEqual(
             budget["method"],
-            "exact-runner-short-pilot-with-bounded-recovery-v3",
+            "exact-runner-short-pilot-with-matched-c1-warmup-v4",
+        )
+        self.assertEqual(
+            budget["warmup_projection"],
+            {
+                "method": "matched-state-background-c1-p99-linear-v1",
+                "source_concurrency": 1,
+            },
         )
         self.assertEqual(
             budget["seed_treatment"],
@@ -1025,7 +1032,7 @@ class NativeG7ControllerTests(unittest.TestCase):
             higher_budget["surface_seconds"]["strict-group-commit"],
         )
 
-    def test_budget_keeps_high_concurrency_warmup_serial(self) -> None:
+    def test_budget_projects_serial_warmup_from_the_matched_c1_pilot(self) -> None:
         pilot = self.pilot_receipt(throughput=1_000_000_000.0)
         for cell in pilot["cells"].values():
             cell["p99"] = 1_000_000
@@ -1036,8 +1043,12 @@ class NativeG7ControllerTests(unittest.TestCase):
         pilot["cells"]["strict-group-commit"]["group_commit_evidence"][
             "maximum_active_producers"
         ] = 32
+        serial_pilot = self.pilot_receipt(throughput=1_000_000_000.0)
+        for cell in serial_pilot["cells"].values():
+            cell["p99"] = 100_000
         budget = derive_cell_runtime_budget(
             pilot,
+            serial_warmup_pilot=serial_pilot,
             expected_commit=self.SOURCE_COMMIT,
             expected_platform="linux",
             expected_state="warm",
@@ -1047,10 +1058,60 @@ class NativeG7ControllerTests(unittest.TestCase):
             hard_cap_seconds=7_200,
             seed_primed=True,
         )
-        self.assertGreater(
+        self.assertAlmostEqual(
             budget["surface_seconds"]["embedded-structure-point-get"],
-            100,
+            10.001,
         )
+
+    def test_c32_queue_tail_does_not_inflate_the_serial_warmup_projection(self) -> None:
+        pilot = self.pilot_receipt(throughput=4_000.0)
+        pilot["concurrency"] = 32
+        for cell in pilot["cells"].values():
+            cell["p99"] = 12_000_000
+        pilot["cells"]["strict-group-commit"]["group_commit_evidence"].update({
+            "producer_concurrency": 32,
+            "maximum_active_producers": 32,
+        })
+        serial_pilot = self.pilot_receipt(throughput=500_000.0)
+        for cell in serial_pilot["cells"].values():
+            cell["p99"] = 2_000
+        budget = derive_cell_runtime_budget(
+            pilot,
+            serial_warmup_pilot=serial_pilot,
+            expected_commit=self.SOURCE_COMMIT,
+            expected_platform="linux",
+            expected_state="warm",
+            expected_concurrency=32,
+            observations=1_000_000,
+            warmup=100_000,
+            hard_cap_seconds=7_200,
+            seed_primed=True,
+        )
+        self.assertAlmostEqual(
+            budget["surface_seconds"]["embedded-structure-point-get"],
+            250.2,
+        )
+        self.assertLessEqual(budget["timeout_seconds"], 7_200)
+
+    def test_concurrent_budget_requires_exact_matched_c1_warmup_evidence(self) -> None:
+        pilot = self.pilot_receipt()
+        pilot["concurrency"] = 32
+        pilot["cells"]["strict-group-commit"]["group_commit_evidence"].update({
+            "producer_concurrency": 32,
+            "maximum_active_producers": 32,
+        })
+        with self.assertRaisesRegex(RuntimeBudgetExceeded, "matched C1"):
+            derive_cell_runtime_budget(
+                pilot,
+                expected_commit=self.SOURCE_COMMIT,
+                expected_platform="linux",
+                expected_state="warm",
+                expected_concurrency=32,
+                observations=1_000_000,
+                warmup=100_000,
+                hard_cap_seconds=7_200,
+                seed_primed=True,
+            )
 
     def test_short_pilot_fails_early_when_projection_exceeds_hard_cap(self) -> None:
         with self.assertRaisesRegex(
@@ -1162,7 +1223,7 @@ class NativeG7ControllerTests(unittest.TestCase):
 
     def test_matrix_budget_fails_before_measurement_when_plan_cannot_fit(self) -> None:
         budget = {
-            "schema": "hyphae-native-g7-runtime-budget-v3",
+            "schema": "hyphae-native-g7-runtime-budget-v4",
             "timeout_seconds": 7_200,
         }
         with self.assertRaisesRegex(
@@ -1176,9 +1237,9 @@ class NativeG7ControllerTests(unittest.TestCase):
                 expected_cell_count=6,
             )
 
-    def test_matrix_runtime_plan_rejects_legacy_v2_cell_budget(self) -> None:
+    def test_matrix_runtime_plan_rejects_legacy_v3_cell_budget(self) -> None:
         budget = {
-            "schema": "hyphae-native-g7-runtime-budget-v2",
+            "schema": "hyphae-native-g7-runtime-budget-v3",
             "timeout_seconds": 1,
         }
         with self.assertRaisesRegex(RuntimeBudgetExceeded, "invalid cell budget"):
