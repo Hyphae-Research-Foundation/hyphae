@@ -204,6 +204,13 @@ enum Command {
     Status(LocalDirectory),
     /// Capture bounded process-local native telemetry.
     Telemetry(LocalDirectory),
+    /// Bootstrap or inspect native principals, roles, and API keys.
+    Security {
+        #[command(flatten)]
+        local: LocalDirectory,
+        #[command(subcommand)]
+        operation: SecurityCommand,
+    },
     /// Open, recover, and validate a native directory.
     Doctor(LocalDirectory),
     /// Publish a synchronized all-engine checkpoint.
@@ -439,6 +446,24 @@ struct LocalDirectory {
     /// Native data directory.
     #[arg(long, env = "HYPHAE_DATA_DIR")]
     data_dir: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityCommand {
+    /// Report redacted access-control catalog status.
+    Status,
+    /// Create the unique initial owner and a restricted API-key file.
+    Bootstrap {
+        /// Human-readable owner name; never used as authority.
+        #[arg(long)]
+        name: String,
+        /// Non-secret credential label.
+        #[arg(long, default_value = "bootstrap")]
+        label: String,
+        /// New owner-only API-key file. Existing paths are never overwritten.
+        #[arg(long)]
+        key_out: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1293,6 +1318,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             dispatch(&local, ProductOperation::AdminStatus).map_err(Into::into)
         }
         Command::Telemetry(local) => telemetry(&local).map_err(Into::into),
+        Command::Security { local, operation } => security(&local, operation).map_err(Into::into),
         Command::Doctor(local) => {
             if compatibility(compatibility::directory_family(&local.data_dir))?
                 == DirectoryFamily::Format2
@@ -2835,6 +2861,45 @@ fn explain(local: &LocalDirectory, command: ExplainCommand) -> Result<(), CliFai
 
 fn telemetry(local: &LocalDirectory) -> Result<(), CliFailure> {
     dispatch(local, ProductOperation::Telemetry)
+}
+
+fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliFailure> {
+    let mut product = NativeProduct::open(&local.data_dir)?;
+    match command {
+        SecurityCommand::Status => {
+            let status = product.access_control_status()?;
+            print_json(&json!({
+                "schema": "hyphae-native-access-control-status-v1",
+                "bootstrapped": status.bootstrapped,
+                "authorization_epoch": status.epoch.get(),
+                "principals": status.principals,
+                "assignments": status.assignments,
+                "keys": status.keys,
+                "pending_keys": status.pending_keys,
+            }))
+        }
+        SecurityCommand::Bootstrap {
+            name,
+            label,
+            key_out,
+        } => {
+            let receipt = product.bootstrap_access_control_to_file(
+                &name,
+                &label,
+                &key_out,
+                native::logical_time_micros(),
+            )?;
+            print_json(&json!({
+                "schema": "hyphae-native-access-control-bootstrap-v1",
+                "status": "bootstrapped",
+                "principal_id": receipt.principal_id.to_string(),
+                "key_id": receipt.key_id.to_string(),
+                "authorization_epoch": receipt.authorization_epoch.get(),
+                "key_file": key_out,
+                "commit": commit_json(receipt.commit),
+            }))
+        }
+    }
 }
 
 fn doctor(local: &LocalDirectory) -> Result<(), CliFailure> {
