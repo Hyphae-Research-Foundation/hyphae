@@ -2651,7 +2651,10 @@ mod tests {
         assert!(executed_at.saturating_duration_since(enqueued_at) >= steal_delay);
         assert!(stolen_worker.starts_with("hyphae-numa-0-"));
         let after = wake_returns(&pool);
-        assert_eq!(after[0].saturating_sub(before[0]), 1);
+        // Condvar waits may return spuriously. The causal guarantees are that
+        // the eligible remote pool wakes, the blocked home pool does not, and
+        // exactly one job is stolen after the calibrated delay.
+        assert!(after[0] > before[0]);
         assert_eq!(after[1].saturating_sub(before[1]), 0);
         assert_eq!(pool.stolen_dispatches(), 1);
 
