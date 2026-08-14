@@ -148,6 +148,19 @@ pub struct AuthenticatedAuthority {
     pub authorization: ProductAuthorization,
     /// Current durable authorization generation.
     pub authorization_epoch: AuthorizationEpoch,
+    /// Effective roles after credential narrowing and current assignments.
+    pub effective_roles: Box<[BuiltInRole]>,
+    /// Effective permission sets by stable scope.
+    pub scoped_authorization: Box<[ScopedAuthorization]>,
+}
+
+/// One effective permission set at one stable scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopedAuthorization {
+    /// Stable resource boundary.
+    pub scope: ProductScope,
+    /// Permissions valid within the boundary.
+    pub authorization: ProductAuthorization,
 }
 
 /// Canonical bounded access-control catalog.
@@ -195,6 +208,41 @@ pub struct AccessControlMutationReceipt {
     /// Authorization generation after publication.
     pub authorization_epoch: AuthorizationEpoch,
     /// Strict native commit that published the mutation.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite result of one principal creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityPrincipalMutationReceipt {
+    /// Stable new principal identity.
+    pub principal_id: SecurityId,
+    /// Published authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict native commit.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite result of one built-in role assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoleAssignmentMutationReceipt {
+    /// Stable assignment identity.
+    pub assignment_id: SecurityId,
+    /// Published authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict native commit.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite result of one API-key issue and restricted-file activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiKeyIssueReceipt {
+    /// Public key identity.
+    pub key_id: ApiKeyId,
+    /// Owning principal identity.
+    pub principal_id: SecurityId,
+    /// Published authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict commit that activated the key.
     pub commit: ProductCommitReceipt,
 }
 
@@ -267,6 +315,154 @@ impl AccessControlCatalog {
         Ok((principal_id, issued))
     }
 
+    /// Creates one disabled-by-default durable principal record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid display text, exhausted limits or epoch,
+    /// or unavailable entropy.
+    pub fn create_principal(
+        &mut self,
+        display_name: &str,
+    ) -> Result<(SecurityId, AuthorizationEpoch), AccessCatalogError> {
+        validate_display_name(display_name)?;
+        if self.principals.len() >= AccessControlLimits::V1.principals {
+            return Err(AccessCatalogError::LimitExceeded);
+        }
+        let id = SecurityId::generate().map_err(|_| AccessCatalogError::Entropy)?;
+        if self.principals.contains_key(&id) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let epoch = self.next_epoch()?;
+        self.principals.insert(
+            id,
+            SecurityPrincipalRecord {
+                id,
+                display_name: display_name.into(),
+                enabled: true,
+            },
+        );
+        self.epoch = epoch;
+        Ok((id, epoch))
+    }
+
+    /// Assigns one immutable built-in role at one stable scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent principal, duplicate assignment,
+    /// exhausted limits or epoch, or unavailable entropy.
+    pub fn assign_built_in_role(
+        &mut self,
+        principal_id: SecurityId,
+        role: BuiltInRole,
+        scope: ProductScope,
+    ) -> Result<(SecurityId, AuthorizationEpoch), AccessCatalogError> {
+        if !self.principals.contains_key(&principal_id) {
+            return Err(AccessCatalogError::NotFound);
+        }
+        let current = self
+            .assignments
+            .values()
+            .filter(|assignment| assignment.principal_id == principal_id)
+            .count();
+        if current >= AccessControlLimits::V1.assignments_per_principal {
+            return Err(AccessCatalogError::LimitExceeded);
+        }
+        if self.assignments.values().any(|assignment| {
+            assignment.principal_id == principal_id
+                && assignment.role == role
+                && assignment.scope == scope
+        }) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let id = SecurityId::generate().map_err(|_| AccessCatalogError::Entropy)?;
+        if self.assignments.contains_key(&id) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let epoch = self.next_epoch()?;
+        self.assignments.insert(
+            id,
+            BuiltInRoleAssignment {
+                id,
+                principal_id,
+                role,
+                scope,
+            },
+        );
+        self.epoch = epoch;
+        Ok((id, epoch))
+    }
+
+    /// Begins one API-key issue as an inactive durable verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid labels, roles not assigned to the target,
+    /// invalid expiry, exhausted limits or epoch, or unavailable entropy.
+    pub fn begin_key_issue(
+        &mut self,
+        principal_id: SecurityId,
+        label: &str,
+        roles: impl IntoIterator<Item = BuiltInRole>,
+        permission_ceiling: ProductAuthorization,
+        created_at_micros: i64,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(IssuedApiKey, AuthorizationEpoch), AccessCatalogError> {
+        validate_display_name(label)?;
+        if !self.principals.contains_key(&principal_id) {
+            return Err(AccessCatalogError::NotFound);
+        }
+        if expires_at_micros.is_some_and(|expiry| expiry <= created_at_micros) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let current_keys = self
+            .keys
+            .values()
+            .filter(|key| key.principal_id == principal_id)
+            .count();
+        if current_keys >= AccessControlLimits::V1.keys_per_principal {
+            return Err(AccessCatalogError::LimitExceeded);
+        }
+        let roles: BTreeSet<_> = roles.into_iter().collect();
+        if roles.is_empty() {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        let assigned: BTreeSet<_> = self
+            .assignments
+            .values()
+            .filter(|assignment| assignment.principal_id == principal_id)
+            .map(|assignment| assignment.role)
+            .collect();
+        if !roles.is_subset(&assigned) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let (verifier, issued) =
+            ApiKeyVerifier::issue().map_err(|_| AccessCatalogError::Entropy)?;
+        if self.keys.contains_key(&verifier.id()) {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let epoch = self.next_epoch()?;
+        self.keys.insert(
+            verifier.id(),
+            ApiKeyRecord {
+                id: verifier.id(),
+                principal_id,
+                label: label.into(),
+                verifier,
+                active: false,
+                roles: roles.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                permission_ceiling,
+                created_at_micros,
+                expires_at_micros,
+                revoked: false,
+                published_epoch: epoch,
+            },
+        );
+        self.epoch = epoch;
+        Ok((issued, epoch))
+    }
+
     /// Returns the current durable authorization generation.
     pub const fn epoch(&self) -> AuthorizationEpoch {
         self.epoch
@@ -334,21 +530,26 @@ impl AccessControlCatalog {
             .get(&key.principal_id)
             .filter(|principal| principal.enabled)
             .ok_or(AccessCatalogError::Unauthorized)?;
-        let assigned_roles: BTreeSet<_> = self
+        let requested_roles: BTreeSet<_> = key.roles.iter().copied().collect();
+        let matching_assignments: Vec<_> = self
             .assignments
             .values()
-            .filter(|assignment| assignment.principal_id == principal.id)
+            .copied()
+            .filter(|assignment| {
+                assignment.principal_id == principal.id
+                    && requested_roles.contains(&assignment.role)
+            })
+            .collect();
+        let effective_roles: BTreeSet<_> = matching_assignments
+            .iter()
             .map(|assignment| assignment.role)
             .collect();
-        let authorization = key
-            .roles
+        let scoped_authorization = effective_scopes(&matching_assignments, key.permission_ceiling);
+        let authorization = scoped_authorization
             .iter()
-            .copied()
-            .filter(|role| assigned_roles.contains(role))
-            .fold(ProductAuthorization::NONE, |current, role| {
-                current.union(role.authorization())
-            })
-            .intersect(key.permission_ceiling);
+            .fold(ProductAuthorization::NONE, |current, scoped| {
+                current.union(scoped.authorization)
+            });
         if authorization == ProductAuthorization::NONE {
             return Err(AccessCatalogError::Unauthorized);
         }
@@ -360,6 +561,11 @@ impl AccessControlCatalog {
             principal: product_principal,
             authorization,
             authorization_epoch: self.epoch,
+            effective_roles: effective_roles
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            scoped_authorization: scoped_authorization.into_boxed_slice(),
         })
     }
 
@@ -558,12 +764,47 @@ impl AccessControlCatalog {
         }
         Ok(())
     }
+
+    fn next_epoch(&self) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        self.epoch
+            .checked_next()
+            .ok_or(AccessCatalogError::LimitExceeded)
+    }
 }
 
 impl Default for AccessControlCatalog {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+fn effective_scopes(
+    assignments: &[BuiltInRoleAssignment],
+    permission_ceiling: ProductAuthorization,
+) -> Vec<ScopedAuthorization> {
+    let mut by_scope = BTreeMap::new();
+    for assignment in assignments {
+        let authorization = assignment
+            .role
+            .authorization()
+            .for_scope(assignment.scope)
+            .intersect(permission_ceiling);
+        if authorization != ProductAuthorization::NONE {
+            by_scope
+                .entry(assignment.scope)
+                .and_modify(|current: &mut ProductAuthorization| {
+                    *current = current.union(authorization);
+                })
+                .or_insert(authorization);
+        }
+    }
+    by_scope
+        .into_iter()
+        .map(|(scope, authorization)| ScopedAuthorization {
+            scope,
+            authorization,
+        })
+        .collect()
 }
 
 impl NativeProduct {
@@ -593,6 +834,133 @@ impl NativeProduct {
         self.load_access_control_catalog()?
             .authenticate(candidate, logical_time_micros)
             .map_err(map_catalog_error)
+    }
+
+    /// Creates one durable principal under `security.manage` authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, limit, entropy, durability,
+    /// or corruption error.
+    pub fn create_security_principal(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        display_name: &str,
+        logical_time_micros: i64,
+    ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        require_current_actor(&catalog, actor, ProductPermission::SecurityManage)?;
+        let (principal_id, authorization_epoch) = catalog
+            .create_principal(display_name)
+            .map_err(map_catalog_error)?;
+        let commit = self.commit_access_control_catalog(&catalog, logical_time_micros)?;
+        Ok(SecurityPrincipalMutationReceipt {
+            principal_id,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Assigns one built-in role at one stable scope.
+    ///
+    /// Assigning `owner` additionally requires `ownership.manage`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, not-found, conflict, limit, entropy,
+    /// durability, or corruption error.
+    pub fn assign_built_in_role(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        role: BuiltInRole,
+        scope: ProductScope,
+        logical_time_micros: i64,
+    ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        require_current_actor(&catalog, actor, ProductPermission::SecurityManage)?;
+        if role == BuiltInRole::Owner
+            && !actor
+                .authorization
+                .allows(ProductPermission::OwnershipManage)
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let (assignment_id, authorization_epoch) = catalog
+            .assign_built_in_role(principal_id, role, scope)
+            .map_err(map_catalog_error)?;
+        let commit = self.commit_access_control_catalog(&catalog, logical_time_micros)?;
+        Ok(RoleAssignmentMutationReceipt {
+            assignment_id,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Issues one inactive verifier, writes a new restricted secret file, and
+    /// activates it with a second strict commit.
+    ///
+    /// Self-management cannot widen the caller's effective roles or
+    /// permissions. Issuing for another principal requires `security.manage`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, conflict, limit, I/O,
+    /// entropy, durability, or corruption error. The output is never replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_api_key_to_file(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        label: &str,
+        roles: impl IntoIterator<Item = BuiltInRole>,
+        permission_ceiling: ProductAuthorization,
+        expires_at_micros: Option<i64>,
+        output_path: impl AsRef<Path>,
+        logical_time_micros: i64,
+    ) -> Result<ApiKeyIssueReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        if actor.authorization_epoch != catalog.epoch() {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let roles: BTreeSet<_> = roles.into_iter().collect();
+        authorize_key_issue(actor, principal_id, &roles, permission_ceiling)?;
+        let (issued, _pending_epoch) = catalog
+            .begin_key_issue(
+                principal_id,
+                label,
+                roles,
+                permission_ceiling,
+                logical_time_micros,
+                expires_at_micros,
+            )
+            .map_err(map_catalog_error)?;
+        let output_path = output_path.as_ref();
+        let mut output = create_restricted_output(output_path)?;
+        if let Err(error) = self.commit_access_control_catalog(&catalog, logical_time_micros) {
+            drop(output);
+            remove_empty_output(output_path);
+            return Err(error);
+        }
+        output
+            .write_all(issued.expose_secret().as_bytes())
+            .and_then(|()| output.sync_all())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
+        sync_output_parent(output_path)?;
+        let authorization_epoch = catalog
+            .activate_key(issued.id())
+            .map_err(map_catalog_error)?;
+        let commit = self.commit_access_control_catalog(&catalog, logical_time_micros)?;
+        Ok(ApiKeyIssueReceipt {
+            key_id: issued.id(),
+            principal_id,
+            authorization_epoch,
+            commit,
+        })
     }
 
     /// Revokes one API key under current product authority.
@@ -726,7 +1094,9 @@ fn map_catalog_error(error: AccessCatalogError) -> ProductError {
         AccessCatalogError::AlreadyBootstrapped | AccessCatalogError::Conflict => {
             ProductErrorCode::CatalogConflict
         }
-        AccessCatalogError::InvalidDisplayName => ProductErrorCode::InvalidRequest,
+        AccessCatalogError::InvalidDisplayName | AccessCatalogError::InvalidRequest => {
+            ProductErrorCode::InvalidRequest
+        }
         AccessCatalogError::Entropy => ProductErrorCode::Unavailable,
         AccessCatalogError::LimitExceeded => ProductErrorCode::LimitExceeded,
         AccessCatalogError::NotFound => ProductErrorCode::ObjectNotFound,
@@ -734,6 +1104,53 @@ fn map_catalog_error(error: AccessCatalogError) -> ProductError {
         AccessCatalogError::CorruptCatalog => ProductErrorCode::Corruption,
     };
     ProductError::from_code(code)
+}
+
+fn require_current_actor(
+    catalog: &AccessControlCatalog,
+    actor: &AuthenticatedAuthority,
+    permission: ProductPermission,
+) -> Result<(), ProductError> {
+    if actor.authorization_epoch != catalog.epoch() || !actor.authorization.allows(permission) {
+        Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn authorize_key_issue(
+    actor: &AuthenticatedAuthority,
+    principal_id: SecurityId,
+    requested_roles: &BTreeSet<BuiltInRole>,
+    permission_ceiling: ProductAuthorization,
+) -> Result<(), ProductError> {
+    if principal_id != actor.principal_id {
+        return if actor
+            .authorization
+            .allows(ProductPermission::SecurityManage)
+        {
+            Ok(())
+        } else {
+            Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ))
+        };
+    }
+    let effective_roles: BTreeSet<_> = actor.effective_roles.iter().copied().collect();
+    if actor
+        .authorization
+        .allows(ProductPermission::CredentialSelfManage)
+        && requested_roles.is_subset(&effective_roles)
+        && permission_ceiling.is_subset_of(actor.authorization)
+    {
+        Ok(())
+    } else {
+        Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ))
+    }
 }
 
 fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
@@ -881,6 +1298,8 @@ pub enum AccessCatalogError {
     AlreadyBootstrapped,
     /// Security display text is empty, oversized, or contains control bytes.
     InvalidDisplayName,
+    /// A security mutation request is structurally invalid.
+    InvalidRequest,
     /// The operating-system CSPRNG failed.
     Entropy,
     /// A bounded v1 limit was exceeded.
@@ -902,6 +1321,7 @@ impl std::fmt::Display for AccessCatalogError {
                 formatter.write_str("access control is already bootstrapped")
             }
             Self::InvalidDisplayName => formatter.write_str("invalid security display name"),
+            Self::InvalidRequest => formatter.write_str("invalid access-control request"),
             Self::Entropy => formatter.write_str("security entropy is unavailable"),
             Self::LimitExceeded => formatter.write_str("access-control limit exceeded"),
             Self::NotFound => formatter.write_str("security record not found"),
@@ -1187,6 +1607,57 @@ mod tests {
         drop(reopened);
         fs::remove_dir_all(path)?;
         fs::remove_file(key_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn principal_role_and_narrow_key_mutations_reauthorize_each_epoch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_key_path = path.with_extension("owner-key");
+        let reader_key_path = path.with_extension("reader-key");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_key_path);
+        let _ignored = fs::remove_file(&reader_key_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_key_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_key_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, 2)?;
+        let created = product.create_security_principal(&owner, "Read service", 2)?;
+
+        let owner = product.authenticate_api_key(&owner_secret, 3)?;
+        let assignment = product.assign_built_in_role(
+            &owner,
+            created.principal_id,
+            BuiltInRole::Reader,
+            ProductScope::Instance,
+            3,
+        )?;
+        assert!(assignment.authorization_epoch > created.authorization_epoch);
+
+        let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        let issued = product.issue_api_key_to_file(
+            &owner,
+            created.principal_id,
+            "reader",
+            [BuiltInRole::Reader],
+            BuiltInRole::Reader.authorization(),
+            Some(100),
+            &reader_key_path,
+            4,
+        )?;
+        let reader_secret = fs::read_to_string(&reader_key_path)?;
+        let reader = product.authenticate_api_key(&reader_secret, 5)?;
+        assert_eq!(reader.principal_id, created.principal_id);
+        assert_eq!(reader.effective_roles.as_ref(), &[BuiltInRole::Reader]);
+        assert!(reader.authorization.allows(ProductPermission::DataRead));
+        assert!(!reader.authorization.allows(ProductPermission::DataWrite));
+        assert_eq!(reader.authorization_epoch, issued.authorization_epoch);
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_key_path)?;
+        fs::remove_file(reader_key_path)?;
         Ok(())
     }
 }

@@ -571,6 +571,22 @@ impl ProductPermission {
             _ => None,
         }
     }
+
+    /// Returns whether this permission may be granted at `scope`.
+    pub const fn supports_scope(self, scope: ProductScope) -> bool {
+        match scope {
+            ProductScope::Instance => true,
+            ProductScope::CatalogSubtree(_) | ProductScope::CatalogObject(_) => matches!(
+                self,
+                Self::CatalogRead
+                    | Self::CatalogWrite
+                    | Self::DataRead
+                    | Self::DataWrite
+                    | Self::ProofGenerate
+                    | Self::SearchExecute
+            ),
+        }
+    }
 }
 
 impl ProductAuthorization {
@@ -585,7 +601,44 @@ impl ProductAuthorization {
     pub const fn intersect(self, ceiling: Self) -> Self {
         Self::from_bits(self.bits() & ceiling.bits())
     }
+
+    /// Returns whether every permission is included in `authority`.
+    pub const fn is_subset_of(self, authority: Self) -> bool {
+        authority.allows_all(self)
+    }
+
+    /// Removes permissions that are invalid at the requested scope kind.
+    #[must_use]
+    pub fn for_scope(self, scope: ProductScope) -> Self {
+        ALL_PRODUCT_PERMISSIONS
+            .into_iter()
+            .filter(|permission| self.allows(*permission) && permission.supports_scope(scope))
+            .fold(Self::NONE, |result, permission| {
+                result.union(Self::from_permissions([permission]))
+            })
+    }
 }
+
+const ALL_PRODUCT_PERMISSIONS: [ProductPermission; 18] = [
+    ProductPermission::AuditRead,
+    ProductPermission::BackupCreate,
+    ProductPermission::BackupVerify,
+    ProductPermission::CatalogRead,
+    ProductPermission::CatalogWrite,
+    ProductPermission::CredentialSelfManage,
+    ProductPermission::DataRead,
+    ProductPermission::DataWrite,
+    ProductPermission::Discover,
+    ProductPermission::Maintain,
+    ProductPermission::Observe,
+    ProductPermission::OwnershipManage,
+    ProductPermission::ProofGenerate,
+    ProductPermission::ProofVerify,
+    ProductPermission::Restore,
+    ProductPermission::SearchExecute,
+    ProductPermission::SecurityManage,
+    ProductPermission::SecurityRead,
+];
 
 fn parse_api_key(
     serialized: &str,
