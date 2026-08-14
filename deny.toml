@@ -29,6 +29,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Same-layer workspace dev dependencies are path-only so Cargo excludes them
+# from the published dependency graph. Registry wildcards remain denied.
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

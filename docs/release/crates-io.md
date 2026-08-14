@@ -59,6 +59,9 @@ without a version requirement. Cargo strips those dependencies from the
 published manifest. A versioned development dependency remains part of the
 publication graph and must point to an earlier layer; the package audit rejects
 same-layer or forward edges before publication.
+The dependency policy permits wildcard requirements only when Cargo metadata
+also identifies the edge as a local path; registry wildcard requirements
+remain denied.
 
 For each crate, run `cargo publish --locked -p CRATE`. Do not bypass package
 verification. If a publish returns an ambiguous network result, query crates.io
