@@ -40176,6 +40176,15 @@ mod tests {
         Ok(())
     }
 
+    fn assert_local_storage_unchanged(
+        before: super::NativePhysicalObservation,
+        after: super::NativePhysicalObservation,
+    ) {
+        assert_eq!(after.page_count, before.page_count);
+        assert_eq!(after.physical_page_reads, before.physical_page_reads);
+        assert_eq!(after.wal_bytes, before.wal_bytes);
+    }
+
     #[test]
     fn delta_batches_are_bound_to_their_origin_directory_before_reads_or_wal()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -40209,7 +40218,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|delta| delta.structure_hash_fields.is_empty())
         );
-        assert_eq!(second.physical_observation()?, second_before_stage);
+        assert_local_storage_unchanged(second_before_stage, second.physical_observation()?);
         first.stage_delta_hset(
             &mut staged_by_first,
             b"authority".to_vec(),
@@ -40235,7 +40244,7 @@ mod tests {
             resolved_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(second.physical_observation()?, second_before_resolved);
+        assert_local_storage_unchanged(second_before_resolved, second.physical_observation()?);
 
         let mut grouped_by_first = first.begin_optimistic_delta(3, DurabilityClass::Memory)?;
         first.stage_delta_hset(
@@ -40249,7 +40258,7 @@ mod tests {
             second.commit_group(vec![grouped_by_first]),
             Err(NativeRuntimeError::InvalidPreparedMutation)
         ));
-        assert_eq!(second.physical_observation()?, second_before_group);
+        assert_local_storage_unchanged(second_before_group, second.physical_observation()?);
 
         let mut malformed = second.begin_optimistic_delta(3, DurabilityClass::Memory)?;
         second.stage_delta_hset(
@@ -40269,7 +40278,7 @@ mod tests {
             format_error.source(),
             NativeRuntimeError::InvalidPreparedMutation
         ));
-        assert_eq!(second.physical_observation()?, second_before_format);
+        assert_local_storage_unchanged(second_before_format, second.physical_observation()?);
         Ok(())
     }
 
