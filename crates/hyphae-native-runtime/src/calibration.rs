@@ -4279,9 +4279,16 @@ mod tests {
 
     #[test]
     fn stable_first_attempt_leaves_retry_history_empty() {
+        let policy = CalibrationPolicy {
+            // This test freezes retry bookkeeping, not host timer jitter. A
+            // fully permissive range makes the first correct attempt
+            // deterministically stable even on contended CI runners.
+            maximum_relative_range_ppm: u64::MAX,
+            ..test_policy()
+        };
         let measurement = measure_u64(
             &MeasurementSpec::new("retry-probe", "test-variant", 1, "items", 8),
-            test_policy(),
+            policy,
             || 1_u64,
             1,
         );
