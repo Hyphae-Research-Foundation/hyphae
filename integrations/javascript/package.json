@@ -2,13 +2,16 @@
   "name": "@celiums/hyphae-integrations",
   "version": "1.0.1",
   "description": "Optional Astro, Next, and Vite adapters for Hyphae v1",
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
     "node": ">=20.19"
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "LICENSE-DOCUMENTATION",
+    "LICENSE-POLICY.md"
   ],
   "exports": {
     "./astro": {

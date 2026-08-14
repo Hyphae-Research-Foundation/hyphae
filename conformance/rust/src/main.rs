@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Live Rust-client runner for the shared version 1 conformance fixture.
 

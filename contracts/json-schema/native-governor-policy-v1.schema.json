@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-governor-policy-v1.schema.json",
+  "title": "Hyphae Native resource governor policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "mode", "hardware_fingerprint", "calibration_cache_key", "calibrated_worker_limit", "reserved_system_threads", "schedulable_compute_threads", "io_slots", "memory_bytes", "memory_headroom_percent", "admission_queue_capacity", "foreground_burst_limit", "class_limits"],
+  "properties": {
+    "schema": {"const": "hyphae-native-governor-policy-v1"},
+    "mode": {"enum": ["latency", "bulk", "mixed"]},
+    "hardware_fingerprint": {"$ref": "#/$defs/digest"},
+    "calibration_cache_key": {"$ref": "#/$defs/digest"},
+    "calibrated_worker_limit": {"type": "integer", "minimum": 1},
+    "reserved_system_threads": {"type": "integer", "minimum": 0},
+    "schedulable_compute_threads": {"type": "integer", "minimum": 1},
+    "io_slots": {"type": "integer", "minimum": 1},
+    "memory_bytes": {"type": "integer", "minimum": 1},
+    "memory_headroom_percent": {"const": 15},
+    "admission_queue_capacity": {"type": "integer", "minimum": 64, "maximum": 4096},
+    "foreground_burst_limit": {"const": 16},
+    "class_limits": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/class_limit"}
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "class": {"enum": ["foreground-point", "foreground-bounded", "mutation", "bulk", "maintenance", "recovery", "administrative"]},
+    "class_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "compute_threads", "io_slots", "memory_bytes"],
+      "properties": {
+        "class": {"$ref": "#/$defs/class"},
+        "compute_threads": {"type": "integer", "minimum": 1},
+        "io_slots": {"type": "integer", "minimum": 1},
+        "memory_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bounded, offline backup and restore for the native data directory.
 
@@ -7,14 +7,21 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CheckpointReceipt, NativeDatabase, NativeRuntimeError};
+use crate::{
+    ADMINISTRATIVE_MEMORY_BYTES, CheckpointReceipt, GovernorRequest, NativeDatabase,
+    NativeResourceGovernor, NativeRuntimeError, WorkloadClass, admit_governor_work,
+};
 
 const MANIFEST_FILE: &str = "NATIVE_BACKUP.json";
 const DATA_DIRECTORY: &str = "data";
@@ -168,10 +175,11 @@ impl NativeDatabase {
         destination: impl AsRef<Path>,
         limits: NativeBackupLimits,
     ) -> Result<NativeBackupInfo, NativeBackupError> {
+        let _permit = self.admit_administrative_owned()?;
         let destination = destination.as_ref();
         let parent = prepare_destination(destination)?;
         reject_nested_destination(&self.data_directory, &parent, destination)?;
-        let checkpoint = self.checkpoint()?;
+        let checkpoint = self.checkpoint_at(None)?;
         let staging = staging_path(destination, "backup")?;
         fs::create_dir(&staging).map_err(|source| io_error(&staging, source))?;
         let result = create_staging(self.data_directory(), &staging, checkpoint, limits)
@@ -214,6 +222,27 @@ pub fn verify_native_backup_with_limits(
     path: impl AsRef<Path>,
     limits: NativeBackupLimits,
 ) -> Result<NativeBackupInfo, NativeBackupError> {
+    verify_native_backup_bounded(path.as_ref(), limits)
+}
+
+/// Verifies a native backup while holding administrative governor capacity.
+///
+/// A zero wait preserves fail-fast admission. A positive wait uses the
+/// governor's bounded priority queue. Admission completes before any backup
+/// file is opened.
+///
+/// # Errors
+///
+/// Returns a resource-admission/queue failure wrapped by
+/// [`NativeBackupError::Runtime`], or the same failures as
+/// [`verify_native_backup_with_limits`].
+pub fn verify_native_backup_with_resource_governor(
+    path: impl AsRef<Path>,
+    limits: NativeBackupLimits,
+    governor: &Arc<NativeResourceGovernor>,
+    maximum_wait: Duration,
+) -> Result<NativeBackupInfo, NativeBackupError> {
+    let _permit = admit_backup_work(governor, maximum_wait)?;
     verify_native_backup_bounded(path.as_ref(), limits)
 }
 
@@ -297,6 +326,42 @@ pub fn restore_native_backup_with_limits(
         let _ignored = fs::remove_dir_all(&staging);
     }
     result
+}
+
+/// Restores and logically validates a native backup while holding
+/// administrative governor capacity for the complete operation.
+///
+/// # Errors
+///
+/// Returns a resource-admission/queue failure wrapped by
+/// [`NativeBackupError::Runtime`], or the same failures as
+/// [`restore_native_backup_with_limits`].
+pub fn restore_native_backup_with_resource_governor(
+    backup: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    limits: NativeBackupLimits,
+    governor: &Arc<NativeResourceGovernor>,
+    maximum_wait: Duration,
+) -> Result<NativeRestoreInfo, NativeBackupError> {
+    let _permit = admit_backup_work(governor, maximum_wait)?;
+    restore_native_backup_with_limits(backup, destination, limits)
+}
+
+fn admit_backup_work(
+    governor: &Arc<NativeResourceGovernor>,
+    maximum_wait: Duration,
+) -> Result<crate::DatabaseGovernorPermit, NativeRuntimeError> {
+    admit_governor_work(
+        governor,
+        maximum_wait,
+        WorkloadClass::Administrative,
+        GovernorRequest {
+            compute_threads: 1,
+            io_slots: 1,
+            memory_bytes: ADMINISTRATIVE_MEMORY_BYTES,
+        },
+        None,
+    )
 }
 
 fn create_staging(
@@ -974,14 +1039,21 @@ mod tests {
         fs,
         io::{Seek, SeekFrom, Write},
         path::PathBuf,
+        sync::Arc,
+        time::Duration,
     };
 
     use hyphae_native_types::DurabilityClass;
 
     use super::{
-        NativeBackupError, NativeBackupLimits, restore_native_backup, verify_native_backup,
+        NativeBackupError, NativeBackupLimits, restore_native_backup,
+        restore_native_backup_with_resource_governor, verify_native_backup,
+        verify_native_backup_with_resource_governor,
     };
-    use crate::NativeDatabase;
+    use crate::{
+        GovernorAdmissionError, GovernorRequest, NativeDatabase, NativeResourceGovernor,
+        NativeRuntimeError, WorkloadClass,
+    };
 
     struct TestDirectory(PathBuf);
 
@@ -1022,6 +1094,119 @@ mod tests {
         let reopened = NativeDatabase::open(&restored)?;
         let snapshot = reopened.snapshot(0)?;
         assert_eq!(snapshot.get(b"alpha"), Some(b"value".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_backup_restore_preserves_format_state_and_scalar_writes()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("structure-v3")?;
+        let source = temporary.0.join("source");
+        let backup = temporary.0.join("backup");
+        let restored = temporary.0.join("restored");
+        let mut database = NativeDatabase::create(&source)?;
+        let mut transaction = database.begin(10, DurabilityClass::Strict)?;
+        transaction.set(b"alpha".to_vec(), b"value".to_vec(), Some(100))?;
+        transaction.create_set(b"members".to_vec())?;
+        transaction.sadd(b"members".to_vec(), b"one".to_vec())?;
+        transaction.commit()?;
+        database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+        let created = database.backup(&backup, NativeBackupLimits::default())?;
+        assert_eq!(created, verify_native_backup(&backup)?);
+        drop(database);
+        restore_native_backup(&backup, &restored)?;
+
+        let mut reopened = NativeDatabase::open(&restored)?;
+        assert_eq!(reopened.structure_format, crate::StructureFormat::BTreeV3);
+        let snapshot = reopened.snapshot(11)?;
+        assert_eq!(snapshot.get(b"alpha"), Some(b"value".as_slice()));
+        assert!(snapshot.sismember(b"members", b"one")?);
+        let mut update = reopened.begin(11, DurabilityClass::Strict)?;
+        update.set(b"after-restore".to_vec(), b"value".to_vec(), Some(100))?;
+        update.commit()?;
+        let snapshot = reopened.snapshot(11)?;
+        assert_eq!(snapshot.get(b"after-restore"), Some(b"value".as_slice()));
+        assert_eq!(
+            snapshot.ttl(b"after-restore"),
+            crate::Ttl::RemainingMicros(89)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn backup_holds_administrative_capacity_for_the_complete_copy() -> Result<(), Box<dyn Error>> {
+        let temporary = TestDirectory::new("governed")?;
+        let source = temporary.0.join("source");
+        let backup = temporary.0.join("backup");
+        let mut database = NativeDatabase::create(&source)?;
+        let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+        transaction.set(b"alpha".to_vec(), b"value".to_vec(), None)?;
+        transaction.commit()?;
+        let governor = Arc::new(NativeResourceGovernor::new(
+            crate::tests::engine_admission_test_policy(),
+        ));
+        database.set_resource_governor(Arc::clone(&governor))?;
+        let held = governor.try_admit(
+            WorkloadClass::Administrative,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: crate::ADMINISTRATIVE_MEMORY_BYTES,
+            },
+        )?;
+        assert!(matches!(
+            database.backup(&backup, NativeBackupLimits::default()),
+            Err(NativeBackupError::Runtime(
+                NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+                )
+            ))
+        ));
+        assert!(!backup.exists());
+        drop(held);
+        database.backup(&backup, NativeBackupLimits::default())?;
+        assert!(backup.exists());
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+
+        let held = governor.try_admit(
+            WorkloadClass::Administrative,
+            GovernorRequest {
+                compute_threads: 1,
+                io_slots: 1,
+                memory_bytes: crate::ADMINISTRATIVE_MEMORY_BYTES,
+            },
+        )?;
+        assert!(matches!(
+            verify_native_backup_with_resource_governor(
+                &backup,
+                NativeBackupLimits::default(),
+                &governor,
+                Duration::ZERO,
+            ),
+            Err(NativeBackupError::Runtime(
+                NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+                )
+            ))
+        ));
+        let restored = temporary.0.join("restored");
+        assert!(matches!(
+            restore_native_backup_with_resource_governor(
+                &backup,
+                &restored,
+                NativeBackupLimits::default(),
+                &governor,
+                Duration::ZERO,
+            ),
+            Err(NativeBackupError::Runtime(
+                NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity
+                )
+            ))
+        ));
+        assert!(!restored.exists());
+        drop(held);
         Ok(())
     }
 

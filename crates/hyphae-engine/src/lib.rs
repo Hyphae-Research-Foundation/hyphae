@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Embeddable Hyphae facade over durable storage, structured query, and exact
 //! provider-neutral retrieval.

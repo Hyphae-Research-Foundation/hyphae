@@ -1,6 +1,13 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use hyphae_native_product::{
     BackupRequest, BoundedSearchQuery, CatalogDependencyRequest, CatalogListRequest, DoctorRequest,
@@ -52,7 +59,13 @@ impl Default for RequestOptions {
 /// Cloneable cooperative cancellation handle.
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notification: tokio::sync::Notify,
 }
 
 impl CancellationToken {
@@ -63,13 +76,26 @@ impl CancellationToken {
 
     /// Requests cancellation. Repeating this call is harmless.
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            self.state.notification.notify_waiters();
+        }
     }
 
     /// Returns whether cancellation was requested.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let notified = self.state.notification.notified();
+        tokio::pin!(notified);
+        // Registration must precede the state read or cancellation between
+        // those operations could be lost by `Notify::notify_waiters`.
+        let _notification_ready = notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -498,5 +524,116 @@ impl HyphaeClient {
             options,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+        thread,
+    };
+
+    use super::CancellationToken;
+
+    #[derive(Default)]
+    struct WakeCounter {
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_once<F>(future: Pin<&mut F>, waker: &Waker) -> Poll<()>
+    where
+        F: Future<Output = ()>,
+    {
+        future.poll(&mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn pre_cancelled_token_completes_on_first_poll() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut cancelled = Box::pin(token.cancelled());
+
+        assert_eq!(
+            poll_once(cancelled.as_mut(), Waker::noop()),
+            Poll::Ready(())
+        );
+    }
+
+    #[test]
+    fn cancellation_wakes_every_registered_waiter() {
+        let token = CancellationToken::new();
+        let counters = (0..4)
+            .map(|_| Arc::new(WakeCounter::default()))
+            .collect::<Vec<_>>();
+        let wakers = counters
+            .iter()
+            .cloned()
+            .map(Waker::from)
+            .collect::<Vec<_>>();
+        let mut waiters = (0..counters.len())
+            .map(|_| Box::pin(token.cancelled()))
+            .collect::<Vec<_>>();
+
+        for (waiter, waker) in waiters.iter_mut().zip(&wakers) {
+            assert_eq!(poll_once(waiter.as_mut(), waker), Poll::Pending);
+        }
+        token.cancel();
+
+        for ((waiter, waker), counter) in waiters.iter_mut().zip(&wakers).zip(&counters) {
+            assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+            assert_eq!(poll_once(waiter.as_mut(), waker), Poll::Ready(()));
+        }
+    }
+
+    #[test]
+    fn cancellation_registration_races_do_not_lose_wakeup() {
+        for _ in 0..128 {
+            let token = CancellationToken::new();
+            let waiter_token = token.clone();
+            let start = Arc::new(Barrier::new(2));
+            let first_poll_finished = Arc::new(Barrier::new(2));
+            let cancellation_finished = Arc::new(Barrier::new(2));
+            let waiter = thread::spawn({
+                let start = start.clone();
+                let first_poll_finished = first_poll_finished.clone();
+                let cancellation_finished = cancellation_finished.clone();
+                move || {
+                    let mut cancelled = Box::pin(waiter_token.cancelled());
+                    start.wait();
+                    let first = poll_once(cancelled.as_mut(), Waker::noop());
+                    first_poll_finished.wait();
+                    cancellation_finished.wait();
+                    if first.is_ready() {
+                        first
+                    } else {
+                        poll_once(cancelled.as_mut(), Waker::noop())
+                    }
+                }
+            });
+
+            start.wait();
+            token.cancel();
+            first_poll_finished.wait();
+            cancellation_finished.wait();
+
+            assert!(matches!(waiter.join(), Ok(Poll::Ready(()))));
+        }
     }
 }

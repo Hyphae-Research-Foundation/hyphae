@@ -1,6 +1,6 @@
 # ADR-0002: Apache-2.0 and audited historical porting
 
-- Status: Accepted
+- Status: Superseded in part by ADR-0025
 - Date: 2026-07-14
 - Owners: Celiums Solutions LLC
 
@@ -12,7 +12,9 @@ also contain inconsistent or incomplete license declarations.
 
 ## Decision
 
-All original source and documentation in this repository use Apache-2.0.
+At the time of this decision, all original source and documentation in this
+repository used Apache-2.0. ADR-0025 replaces that license selection for the
+post-`v1.0.1` tree while preserving the provenance and porting controls below.
 Every source file carries an SPDX identifier once it contains executable code.
 
 Historical material may enter only after the ledger records the repository,

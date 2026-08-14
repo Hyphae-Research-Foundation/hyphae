@@ -1,9 +1,10 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Regenerates checked-in JSON Schema 2020-12 public contract files.
 
 use std::{env, error::Error, fs, path::PathBuf};
 
+use hyphae_contracts::generate_json_schema;
 use hyphae_contracts::v1::{
     CapabilitiesV1, CommitReceiptV1, DefineLexicalIndexRequestV1, DefineVectorSpaceRequestV1,
     DeleteRequestV1, DeleteVectorsRequestV1, ErrorV1, ExactRetrievalRequestV1,
@@ -11,7 +12,7 @@ use hyphae_contracts::v1::{
     HybridRetrievalResponseV1, LexicalRetrievalRequestV1, LexicalRetrievalResponseV1, ProofV1,
     PutRequestV1, PutVectorsRequestV1, QueryRequestV1, QueryResponseV1, RetrievalProofV1,
 };
-use schemars::{JsonSchema, SchemaGenerator};
+use schemars::JsonSchema;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let directory = env::args_os().nth(1).map_or_else(
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn write<T: JsonSchema>(directory: &std::path::Path, name: &str) -> Result<(), Box<dyn Error>> {
-    let schema = SchemaGenerator::default().into_root_schema_for::<T>();
+    let schema = generate_json_schema::<T>();
     let mut encoded = serde_json::to_string_pretty(&schema)?;
     encoded.push('\n');
     fs::write(directory.join(name), encoded)?;

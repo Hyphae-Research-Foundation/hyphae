@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """Equivalent high-level Hyphae v2 API over local and HTTP transports."""
 
 from __future__ import annotations

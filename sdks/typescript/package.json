@@ -2,13 +2,16 @@
   "name": "@celiums/hyphae",
   "version": "1.0.1",
   "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "LICENSE-DOCUMENTATION",
+    "LICENSE-POLICY.md"
   ],
   "exports": {
     ".": {

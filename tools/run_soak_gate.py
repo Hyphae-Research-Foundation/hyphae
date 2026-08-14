@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Repeated kill/restart and backup/restore correctness gate."""
 
 from __future__ import annotations

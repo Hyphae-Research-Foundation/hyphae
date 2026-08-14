@@ -19,5 +19,6 @@ hyphae-retrieval = "0.2.1"
 The caller owns vectors and any optional embedding provider. This crate does
 not contact a model, persist embeddings, or introduce a cloud dependency.
 
-Apache-2.0. Source and security policy:
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source and security
+policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

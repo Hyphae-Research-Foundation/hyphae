@@ -27,6 +27,7 @@
   "required_background_interference": true,
   "required_background_modes": ["control", "interference"],
   "minimum_hot_observations": 1000000,
+  "required_hot_warmup": 100000,
   "required_dataset": {"documents": 1000000, "vectors": 1000000, "vector_dimension": 384},
   "required_hardware": {"dedicated": true, "virtualization": "none"},
   "warm_targets_nanoseconds": {

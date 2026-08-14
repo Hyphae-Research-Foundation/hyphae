@@ -74,6 +74,14 @@
       "rationale": "Content identity and authenticated page, WAL, manifest, and root digests."
     },
     {
+      "name": "bitflags",
+      "version": "2.13.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "platform primitive",
+      "rationale": "Typed operating-system flag sets used transitively by nix for Linux affinity and scheduler control."
+    },
+    {
       "name": "bytes",
       "version": "1.12.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -96,6 +104,14 @@
       "license": "MIT OR Apache-2.0",
       "category": "platform primitive",
       "rationale": "Compile-time target selection used transitively by BLAKE3 and getrandom."
+    },
+    {
+      "name": "cfg_aliases",
+      "version": "0.2.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "build primitive",
+      "rationale": "Build-time target aliases used transitively by nix to select reviewed platform adapters."
     },
     {
       "name": "constant_time_eq",
@@ -144,6 +160,14 @@
       "license": "MIT OR Apache-2.0",
       "category": "build primitive",
       "rationale": "MSVC discovery used transitively by the cc build primitive."
+    },
+    {
+      "name": "futures-channel",
+      "version": "0.3.32",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "bounded asynchronous channel primitive",
+      "rationale": "One-shot response completion from the sole synchronous product owner to asynchronous local transport tasks without an executor thread per request."
     },
     {
       "name": "futures-core",
@@ -200,6 +224,14 @@
       "license": "MIT",
       "category": "asynchronous I/O primitive",
       "rationale": "Operating-system event polling used transitively by Tokio for daemon local-socket I/O."
+    },
+    {
+      "name": "nix",
+      "version": "0.31.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "operating-system scheduling primitive",
+      "rationale": "Safe Linux CPU-affinity and scheduler adapters used by hardware-aware native execution; it supplies no storage, query, or search semantics."
     },
     {
       "name": "pin-project-lite",

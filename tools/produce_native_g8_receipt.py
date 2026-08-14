@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Validate one suite-specific G8 artifact and emit a closure-candidate receipt."""
 
@@ -31,6 +31,25 @@ CHECKPOINT_BOUNDARIES = {
 }
 SNAPSHOT_PIN_BOUNDARIES = {"record-synchronized", "record-published"}
 PROMOTION_BOUNDARIES = {"before-rename", "marker-renamed", "parent-synchronized"}
+SOFTWARE_LICENSE = "AGPL-3.0-only"
+
+
+def is_hyphae_component(name: object) -> bool:
+    return isinstance(name, str) and (
+        name == "hyphae"
+        or name.startswith("hyphae-")
+        or name == "@celiums/hyphae"
+        or name.startswith("@celiums/hyphae-")
+    )
+
+
+def is_canonical_component_list(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(is_hyphae_component(component) for component in value)
+        and value == sorted(set(value))
+    )
 
 
 def require_object(value: object, label: str) -> dict[str, Any]:
@@ -394,6 +413,8 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
         payload.get("spdx_sha256"), payload.get("cyclonedx_sha256"),
         payload.get("checksums_sha256"), payload.get("release_evidence_sha256"),
     )
+    spdx_components = payload.get("spdx_hyphae_components")
+    cyclonedx_components = payload.get("cyclonedx_hyphae_components")
     if (
         payload.get("schema") != "hyphae-native-g8-signed-release-v1"
         or payload.get("status") != "passed"
@@ -402,6 +423,13 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
         or not isinstance(payload.get("signature_verifications"), int)
         or payload["signature_verifications"] not in {12, 13}
         or payload.get("attestation_verifications") != 12
+        or payload.get("software_license") != SOFTWARE_LICENSE
+        or payload.get("license_authority")
+        != "tracked-package-manifests-and-local-locks-v1"
+        or payload.get("first_party_artifact_count") != 78
+        or payload.get("first_party_identity_count") != 32
+        or not is_canonical_component_list(spdx_components)
+        or not is_canonical_component_list(cyclonedx_components)
         or not isinstance(payload.get("provenance_targets"), list)
         or set(payload["provenance_targets"]) != expected_targets
         or len(payload["provenance_targets"]) != len(expected_targets)
@@ -413,8 +441,23 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
     ):
         raise GateFailure("signed release artifact is incomplete")
     return {
-        "spdx": f"SPDX SBOM verified ({digests[0]})",
-        "cyclonedx": f"CycloneDX SBOM verified ({digests[1]})",
+        "spdx": (
+            f"SPDX SBOM verified {SOFTWARE_LICENSE} for "
+            f"{len(spdx_components)} Hyphae components ({digests[0]})"
+        ),
+        "cyclonedx": (
+            f"CycloneDX SBOM verified {SOFTWARE_LICENSE} for "
+            f"{len(cyclonedx_components)} Hyphae components ({digests[1]})"
+        ),
+        "manifest-license-authority": (
+            "all first-party license conclusions were bound to tracked package "
+            "manifests and local lock/source evidence"
+        ),
+        "identity-completeness": (
+            f"complete first-party inventory verified: "
+            f"{payload['first_party_artifact_count']} artifacts and "
+            f"{payload['first_party_identity_count']} canonical identities"
+        ),
         "checksums": f"canonical SHA256SUMS verified ({digests[2]})",
         "cosign": f"{payload['signature_verifications']} signatures and 12 attestations cryptographically verified",
         "provenance": "SLSA provenance attestation verified for all four target archives",

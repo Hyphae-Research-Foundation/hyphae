@@ -118,6 +118,45 @@ conditions and version-bearing responses remain target behavior.
 publishes a tombstone. `EXPIRE` returns false under the same absence rule and
 otherwise rewrites the value with an absolute expiry.
 
+On `HYSTRBT3`, scalar set, conditional set, expiry, deletion, and counter
+mutation use the scalar entry namespace directly and maintain the ordered
+expiry backlink in the same immutable root publication. Expiry-only rewrites
+must match the exact prior value; deletion must reach a live scalar; and a
+live typed collection at the same key rejects the complete physical mutation
+before any page is appended. A due Hash, Set, List, Stream, or Sorted Set may
+be reused as a scalar only by retiring its incarnation first in the same WAL
+transaction. Missing/stale identities and malformed expiry backlinks fail
+closed rather than publishing a partial scalar state.
+
+Current-root `HYSTRBT3` point reads capture one immutable structure root,
+decode typed collection metadata, and address children through the selected
+incarnation. The direct surfaces are scalar `GET`/TTL, Hash
+`HGET`/`HGET_MANY`/`HLEN`, Set `SISMEMBER`/`SMISMEMBER`/`SCARD`, List `LLEN`,
+Sorted Set `ZSCORE`/`ZCARD`, all five collection TTL queries, and Hash-field
+TTL. They must not materialize the complete structure root or collection.
+Collection cardinalities use validated metadata directly. A Hash with no field
+expiry entries also answers `HLEN` from metadata; otherwise `HLEN` visits only
+the current incarnation's field prefix, evaluates field visibility at the
+requested logical time, and rejects disagreement with both the durable field
+count and field-expiry count. A collection expiry equal to logical time is
+absent. Missing keys, expired collections, wrong kinds, malformed typed
+metadata, and corrupt reached child values preserve their existing distinct
+failure semantics.
+
+Bounded forward `HSCAN`, reverse `HSCAN_REVERSE`, pattern `HSCAN_MATCH`, and
+forward `SSCAN` use the same captured V3 root and current incarnation. Their
+optional cursor is encoded as an exclusive physical child identity, so retired
+incarnations and unrelated collections are outside the visited prefix. Hash
+scans retain exact field-byte order in the requested direction, omit logically
+expired fields without charging the result limit, and load blobs only for
+reached fields. Set scans retain exact ascending member-byte order and skip
+member tombstones. A zero limit still validates the collection and cursor.
+When an unfiltered request starts at the directional beginning and can cover
+the declared cardinality, the scan must exhaust the prefix and match the
+durable field/member count; Hash also verifies its field-expiry count. Partial
+or filtered pages remain bounded and do not claim complete-cardinality
+validation.
+
 `INCRBY` operates on canonical signed decimal bytes in the exact `i64` domain.
 Missing or expired keys start at zero, an existing TTL is preserved, and the
 result is stored as its canonical decimal representation. Empty input,
@@ -174,7 +213,9 @@ exclusive exact-field cursor, `None` starts at the greatest field, and
 `Some(empty)` has no lower field to return. The physical route maps that cursor
 to an exclusive upper B+tree bound and uses the native reverse visitor; it
 cannot implement descending output by materializing and reversing an
-ascending scan. Its complete contract is
+ascending scan. The current-root `HYSTRBT3` route applies the same
+incarnation, logical-time field visibility, blob validation, and complete
+metadata-summary checks as forward `HSCAN`. Its complete contract is
 [Native reverse hash scan v1](native-hash-reverse-scan-v1.md).
 
 `HSCAN_MATCH` adds binary-glob filtering with separate returned-match,
@@ -182,7 +223,11 @@ physical-visit, and matcher-step bounds. Its continuation is the last visited
 field, including a nonmatch or tombstone when necessary, so an empty
 non-exhausted page still makes forward progress. The physical route derives a
 leading literal prefix for B+tree pruning and falls back to a bounded hash
-prefix scan only for leading-wildcard patterns. Its complete contract is
+prefix scan only for leading-wildcard patterns. The current-root `HYSTRBT3`
+route validates V3-sized literal/cursor identities before metadata lookup,
+uses the current incarnation prefix, preserves TTL/blob semantics, and checks
+the durable physical/expiry summary when an unfiltered page exhausts the
+complete prefix. Its complete contract is
 [Native hash pattern scan v1](native-hash-pattern-scan-v1.md).
 
 Independent absolute field expiry is specified in

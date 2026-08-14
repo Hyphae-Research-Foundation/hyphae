@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bounded multi-producer scheduler for native group durability.
 
@@ -19,13 +19,15 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::CommitBoundary;
 use crate::{
-    CommitReceipt, GroupCommitOutcome, MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE,
-    NativeDatabase, NativeRuntimeError, NativeWriteBatch,
+    CommitReceipt, GovernorCancellation, GroupCommitOutcome, GroupCommitReport,
+    MAX_EXPIRY_SWEEP_KEYS, MAX_GROUP_COMMIT_BATCH_SIZE, NativeCommitBatch, NativeDatabase,
+    NativeDeltaWriteBatch, NativeResourceGovernor, NativeRuntimeError, NativeWriteBatch,
 };
 
 const DEFAULT_GROUP_COMMIT_BATCH_SIZE: usize = 32;
 const DEFAULT_GROUP_COMMIT_WAIT: Duration = Duration::from_micros(200);
 const DEFAULT_GROUP_COMMIT_QUEUE_CAPACITY: usize = 1_024;
+const GROUP_COMMIT_EXECUTION_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 const REQUEST_QUEUED: u8 = 0;
 const REQUEST_EXECUTING: u8 = 1;
 const REQUEST_CANCELLED: u8 = 2;
@@ -40,6 +42,8 @@ pub const MAX_ACTIVE_EXPIRY_FOREGROUND_BUDGET: usize = 4_096;
 
 /// Longest collection interval accepted by the first native scheduler.
 pub const MAX_GROUP_COMMIT_WAIT: Duration = Duration::from_millis(10);
+/// Longest bounded wait accepted for shared cohort execution resources.
+pub const MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT: Duration = Duration::from_secs(60);
 /// Largest bounded submission queue accepted by the first native scheduler.
 pub const MAX_GROUP_COMMIT_QUEUE_CAPACITY: usize = 4_096;
 
@@ -72,12 +76,23 @@ pub enum GroupCommitConfigError {
     },
 }
 
+/// Invalid independent execution-admission wait for a commit cohort.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "native group commit execution admission wait {requested:?} exceeds {MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT:?}"
+)]
+pub struct GroupCommitExecutionAdmissionWaitError {
+    /// Rejected execution admission wait.
+    pub requested: Duration,
+}
+
 /// Validated bounds for one native group-commit scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GroupCommitConfig {
     max_batch_size: usize,
     max_wait: Duration,
     queue_capacity: usize,
+    execution_admission_wait: Duration,
 }
 
 impl GroupCommitConfig {
@@ -113,6 +128,7 @@ impl GroupCommitConfig {
             max_batch_size,
             max_wait,
             queue_capacity,
+            execution_admission_wait: GROUP_COMMIT_EXECUTION_ADMISSION_WAIT,
         })
     }
 
@@ -126,9 +142,32 @@ impl GroupCommitConfig {
         self.max_wait
     }
 
-    /// Returns the bounded multi-producer queue capacity.
+    /// Returns the bounded capacity measured in logical commit requests.
+    ///
+    /// An explicit cohort consumes one slot per member while remaining one
+    /// atomic scheduler command.
     pub const fn queue_capacity(self) -> usize {
         self.queue_capacity
+    }
+
+    /// Sets the bounded wait for the cohort's shared compute and I/O permit.
+    ///
+    /// This bound is independent from the micro-batching collection interval.
+    ///
+    /// # Errors
+    ///
+    /// Rejects waits above [`MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT`].
+    pub const fn with_execution_admission_wait(
+        mut self,
+        maximum_wait: Duration,
+    ) -> Result<Self, GroupCommitExecutionAdmissionWaitError> {
+        if maximum_wait.as_nanos() > MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT.as_nanos() {
+            return Err(GroupCommitExecutionAdmissionWaitError {
+                requested: maximum_wait,
+            });
+        }
+        self.execution_admission_wait = maximum_wait;
+        Ok(self)
     }
 }
 
@@ -138,6 +177,7 @@ impl Default for GroupCommitConfig {
             max_batch_size: DEFAULT_GROUP_COMMIT_BATCH_SIZE,
             max_wait: DEFAULT_GROUP_COMMIT_WAIT,
             queue_capacity: DEFAULT_GROUP_COMMIT_QUEUE_CAPACITY,
+            execution_admission_wait: GROUP_COMMIT_EXECUTION_ADMISSION_WAIT,
         }
     }
 }
@@ -543,6 +583,105 @@ impl Deref for ScheduledCommitReceipt {
     }
 }
 
+/// Scheduler completion with exact physical synchronization counts.
+///
+/// This additive envelope preserves [`ScheduledCommitReceipt`] while exposing
+/// cohort-level evidence that cannot be inferred from synchronization timing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledCommitCompletion {
+    /// Per-request scheduler and transaction receipt.
+    pub receipt: ScheduledCommitReceipt,
+    /// Physical page-file synchronizations performed for the cohort.
+    pub page_synchronizations: usize,
+    /// Physical WAL synchronizations performed for the cohort.
+    pub wal_synchronizations: usize,
+}
+
+impl Deref for ScheduledCommitCompletion {
+    type Target = ScheduledCommitReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
+
+/// Typed ownership of one accepted scheduler request.
+///
+/// The handle exposes exact queued cancellation and a definite wait without
+/// leaking the scheduler's internal response channel. Dropping it requests
+/// cancellation while the request is still queued.
+pub struct NativePendingCommit {
+    receiver: Receiver<Result<ScheduledCommitCompletion, GroupCommitSubmitError>>,
+    state: Arc<AtomicU8>,
+    #[cfg(test)]
+    submitted_at: Instant,
+    queue_deadline: Option<Instant>,
+    poll_cancellation: bool,
+    cancel_on_drop: bool,
+}
+
+impl NativePendingCommit {
+    /// Returns a cloneable cancellation capability for this queued request.
+    pub fn cancellation(&self) -> NativeCommitCancellation {
+        NativeCommitCancellation {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Cancels the request only if physical execution has not claimed it.
+    pub fn cancel(&self) -> CommitCancellationOutcome {
+        cancel_state(&self.state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REQUEST_COMPLETED
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_at_for_test(&self) -> Instant {
+        self.submitted_at
+    }
+
+    /// Waits for the request's definite scheduler outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns the request's typed cancellation, deadline, scheduler, or
+    /// native execution failure.
+    pub fn wait(self) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
+        self.wait_with_evidence()
+            .map(|completion| completion.receipt)
+    }
+
+    /// Waits for the definite outcome and exact cohort synchronization evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the request's typed cancellation, deadline, scheduler, or
+    /// native execution failure. Failed requests never produce completion
+    /// evidence.
+    pub fn wait_with_evidence(
+        mut self,
+    ) -> Result<ScheduledCommitCompletion, GroupCommitSubmitError> {
+        self.cancel_on_drop = false;
+        await_response(
+            &self.receiver,
+            &self.state,
+            self.queue_deadline,
+            self.poll_cancellation,
+        )
+    }
+}
+
+impl Drop for NativePendingCommit {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            cancel_state(&self.state);
+        }
+    }
+}
+
 impl GroupCommitSubmitError {
     fn runtime(source: NativeRuntimeError) -> Self {
         Self::Runtime {
@@ -559,7 +698,7 @@ impl GroupCommitSubmitError {
     }
 }
 
-type CommitResponse = SyncSender<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>;
+type CommitResponse = SyncSender<Result<ScheduledCommitCompletion, GroupCommitSubmitError>>;
 type CommitWaiter = (Instant, Instant, NativeCommitControl, CommitResponse);
 
 struct CommitRequest {
@@ -572,12 +711,22 @@ struct CommitRequest {
 
 enum SchedulerCommand {
     Commit(Box<CommitRequest>),
-    Shutdown,
+    Cohort(Vec<CommitRequest>),
+    Shutdown { return_database: bool },
 }
 
 struct SubmissionGate {
     sender: SyncSender<SchedulerCommand>,
     accepting: bool,
+    queue_capacity: usize,
+    queued_request_slots: usize,
+}
+
+#[cfg(test)]
+struct SchedulerTestGates {
+    cohort_collection: Arc<RwLock<()>>,
+    commit_execution: Arc<RwLock<()>>,
+    completion_return: Arc<RwLock<()>>,
 }
 
 /// Cloneable producer for one native group-commit scheduler.
@@ -585,6 +734,15 @@ struct SubmissionGate {
 pub struct NativeCommitClient {
     gate: Arc<Mutex<SubmissionGate>>,
     database: Arc<RwLock<Option<NativeDatabase>>>,
+    execution_cancellation: Option<GovernorCancellation>,
+    resource_admission_wait: Duration,
+    maximum_explicit_cohort_size: usize,
+    #[cfg(test)]
+    cohort_collection_gate: Arc<RwLock<()>>,
+    #[cfg(test)]
+    commit_execution_gate: Arc<RwLock<()>>,
+    #[cfg(test)]
+    completion_return_gate: Arc<RwLock<()>>,
 }
 
 impl NativeCommitClient {
@@ -612,7 +770,70 @@ impl NativeCommitClient {
         database
             .as_ref()
             .ok_or(GroupCommitSubmitError::Unavailable)?
-            .begin_optimistic(logical_time_micros, durability)
+            .begin_optimistic_scheduled(
+                logical_time_micros,
+                durability,
+                self.resource_admission_wait,
+                self.execution_cancellation.as_ref(),
+            )
+            .map_err(GroupCommitSubmitError::runtime)
+    }
+
+    /// Prepares one point-resolved all-engine delta batch without materializing
+    /// complete engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable after shutdown/failure, or a typed native snapshot
+    /// or physical-format error.
+    pub fn begin_optimistic_delta(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeDeltaWriteBatch, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?
+            .begin_optimistic_delta_scheduled(
+                logical_time_micros,
+                durability,
+                self.resource_admission_wait,
+                self.execution_cancellation.as_ref(),
+            )
+            .map_err(GroupCommitSubmitError::runtime)
+    }
+
+    /// Hydrates and stages one scalar SET in a delta batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable after shutdown/failure, or a typed structure or
+    /// physical corruption error.
+    pub fn stage_delta_set(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?
+            .stage_delta_set(batch, key, value, expires_at_micros)
             .map_err(GroupCommitSubmitError::runtime)
     }
 
@@ -624,9 +845,153 @@ impl NativeCommitClient {
     /// admission/persistence failure.
     pub fn submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, NativeCommitControl::new(), None, false, false)
+        self.enqueue_inner(
+            batch.into().into_inner(),
+            NativeCommitControl::new(),
+            None,
+            false,
+            false,
+        )?
+        .wait()
+    }
+
+    /// Enqueues one detached batch and returns typed wait/cancellation ownership.
+    ///
+    /// Queue ownership retains only the batch's bounded memory allocation;
+    /// compute and I/O admission are acquired once by the executing cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable for a stopped worker, or a typed native failure if
+    /// the prepared batch cannot be converted to memory-only queue ownership.
+    pub fn enqueue(
+        &self,
+        batch: impl Into<NativeCommitBatch>,
+    ) -> Result<NativePendingCommit, GroupCommitSubmitError> {
+        self.enqueue_inner(
+            batch.into().into_inner(),
+            NativeCommitControl::new(),
+            None,
+            false,
+            false,
+        )
+    }
+
+    /// Seals one fully staged group batch for later explicit-cohort submission.
+    ///
+    /// The returned opaque batch can no longer be staged or mutated. It is not
+    /// queued: it retains only its bounded memory while compute and I/O
+    /// capacity are released for preparation of the remaining cohort members.
+    /// [`Self::enqueue_cohort`] remains the single atomic queue boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stopped scheduler, foreign or malformed batch authority,
+    /// non-group durability, or a batch whose admission cannot be reduced to
+    /// its bounded memory-only retained state.
+    pub fn retain_cohort_batch(
+        &self,
+        batch: impl Into<NativeCommitBatch>,
+    ) -> Result<NativeCommitBatch, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let batch = batch.into().into_inner();
+        let database = self
+            .database
+            .read()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+        let database = database
+            .as_ref()
+            .ok_or(GroupCommitSubmitError::Unavailable)?;
+        database
+            .validate_scheduled_cohort_batch(&batch, false)
+            .map_err(GroupCommitSubmitError::runtime)?;
+        let batch = batch
+            .retain_scheduler_queue_memory()
+            .map_err(GroupCommitSubmitError::runtime)?;
+        database
+            .validate_scheduled_cohort_batch(&batch, true)
+            .map_err(GroupCommitSubmitError::runtime)?;
+        Ok(NativeCommitBatch::from(batch))
+    }
+
+    /// Atomically enqueues one explicit group-durability cohort.
+    ///
+    /// The returned handles preserve request order. The worker executes this
+    /// command as an isolated FIFO barrier with one page and WAL synchronization
+    /// for all requests that remain uncancelled when execution is claimed.
+    /// Dropping or cancelling an individual handle before that claim excludes
+    /// only that transaction from the cohort.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or oversized cohort, any non-group batch, any failed
+    /// memory-only retention, or a stopped scheduler before inserting a command.
+    /// Pre-insertion rejection performs no mutation and produces no evidence.
+    pub fn enqueue_cohort(
+        &self,
+        batches: Vec<NativeCommitBatch>,
+    ) -> Result<Vec<NativePendingCommit>, GroupCommitSubmitError> {
+        if !self.accepting()? {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        let batches = batches
+            .into_iter()
+            .map(NativeCommitBatch::into_inner)
+            .collect::<Vec<_>>();
+        validate_explicit_cohort(&batches, self.maximum_explicit_cohort_size)?;
+        let retained_batches = {
+            let database_guard = self
+                .database
+                .read()
+                .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+            let database = database_guard
+                .as_ref()
+                .ok_or(GroupCommitSubmitError::Unavailable)?;
+            let mut retained_batches = Vec::with_capacity(batches.len());
+            for batch in batches {
+                database
+                    .validate_scheduled_cohort_batch(&batch, false)
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                let batch = batch
+                    .retain_scheduler_queue_memory()
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                database
+                    .validate_scheduled_cohort_batch(&batch, true)
+                    .map_err(GroupCommitSubmitError::runtime)?;
+                retained_batches.push(batch);
+            }
+            retained_batches
+        };
+        let submitted_at = Instant::now();
+        let mut requests = Vec::with_capacity(retained_batches.len());
+        let mut pending = Vec::with_capacity(retained_batches.len());
+        for batch in retained_batches {
+            let control = NativeCommitControl::new();
+            let state = Arc::clone(&control.state);
+            let (response, receiver) = mpsc::sync_channel(1);
+            requests.push(CommitRequest {
+                batch,
+                submitted_at,
+                enqueued_at: submitted_at,
+                control,
+                response,
+            });
+            pending.push(NativePendingCommit {
+                receiver,
+                state,
+                #[cfg(test)]
+                submitted_at,
+                queue_deadline: None,
+                poll_cancellation: false,
+                cancel_on_drop: true,
+            });
+        }
+        admit_cohort_command(&self.gate, requests)?;
+        Ok(pending)
     }
 
     /// Attempts immediate bounded admission and waits for a definite outcome.
@@ -637,9 +1002,16 @@ impl NativeCommitClient {
     /// bounded queue has no slot, or the same errors as [`Self::submit`].
     pub fn try_submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, NativeCommitControl::new(), None, true, false)
+        self.enqueue_inner(
+            batch.into().into_inner(),
+            NativeCommitControl::new(),
+            None,
+            true,
+            false,
+        )?
+        .wait()
     }
 
     /// Submits with exact queued cancellation and an optional queue deadline.
@@ -653,22 +1025,32 @@ impl NativeCommitClient {
     /// or the same unavailable/runtime failures as [`Self::submit`].
     pub fn submit_controlled(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         control: NativeCommitControl,
         queue_deadline: Option<Instant>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
-        self.submit_inner(batch, control, queue_deadline, false, true)
+        self.enqueue_inner(
+            batch.into().into_inner(),
+            control,
+            queue_deadline,
+            false,
+            true,
+        )?
+        .wait()
     }
 
-    fn submit_inner(
+    fn enqueue_inner(
         &self,
         batch: NativeWriteBatch,
         control: NativeCommitControl,
         queue_deadline: Option<Instant>,
         immediate: bool,
         poll_cancellation: bool,
-    ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
+    ) -> Result<NativePendingCommit, GroupCommitSubmitError> {
         let submitted_at = Instant::now();
+        let batch = batch
+            .retain_scheduler_queue_memory()
+            .map_err(GroupCommitSubmitError::runtime)?;
         let (response, receiver) = mpsc::sync_channel(1);
         let state = Arc::clone(&control.state);
         admit_command(
@@ -684,11 +1066,15 @@ impl NativeCommitClient {
             queue_deadline,
             immediate,
         )?;
-        let mut result = await_response(&receiver, &state, queue_deadline, poll_cancellation);
-        if let Ok(receipt) = &mut result {
-            receipt.end_to_end = submitted_at.elapsed();
-        }
-        result
+        Ok(NativePendingCommit {
+            receiver,
+            state,
+            #[cfg(test)]
+            submitted_at,
+            queue_deadline,
+            poll_cancellation,
+            cancel_on_drop: true,
+        })
     }
 
     fn accepting(&self) -> Result<bool, GroupCommitSubmitError> {
@@ -706,15 +1092,20 @@ impl NativeCommitClient {
     #[cfg(test)]
     pub(crate) fn enqueue_for_test(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<
-        Receiver<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
+        Receiver<Result<ScheduledCommitCompletion, GroupCommitSubmitError>>,
         GroupCommitSubmitError,
     > {
         let submitted_at = Instant::now();
         let control = NativeCommitControl::new();
         let state = Arc::clone(&control.state);
         let (response, receiver) = mpsc::sync_channel(1);
+        let batch = batch
+            .into()
+            .into_inner()
+            .retain_scheduler_queue_memory()
+            .map_err(GroupCommitSubmitError::runtime)?;
         admit_command(
             &self.gate,
             SchedulerCommand::Commit(Box::new(CommitRequest {
@@ -732,6 +1123,33 @@ impl NativeCommitClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn block_cohort_collection_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, GroupCommitSubmitError> {
+        self.cohort_collection_gate
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_commit_execution_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, GroupCommitSubmitError> {
+        self.commit_execution_gate
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_completion_return_for_test(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, GroupCommitSubmitError> {
+        self.completion_return_gate
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)
+    }
+
+    #[cfg(test)]
     pub(crate) fn block_worker_for_test(
         &self,
     ) -> Result<std::sync::RwLockReadGuard<'_, Option<NativeDatabase>>, GroupCommitSubmitError>
@@ -745,7 +1163,7 @@ impl NativeCommitClient {
 /// Owner of one bounded native group-commit worker and database handle.
 pub struct NativeCommitScheduler {
     client: NativeCommitClient,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<bool>>,
     active_expiry_metrics: Option<Arc<ActiveExpiryMetrics>>,
 }
 
@@ -819,11 +1237,31 @@ impl NativeCommitScheduler {
         let gate = Arc::new(Mutex::new(SubmissionGate {
             sender,
             accepting: true,
+            queue_capacity: config.queue_capacity,
+            queued_request_slots: 0,
         }));
+        let execution_cancellation = database
+            .resource_governor()
+            .map(NativeResourceGovernor::cancellation_token);
         let database = Arc::new(RwLock::new(Some(database)));
+        #[cfg(test)]
+        let test_gates = SchedulerTestGates {
+            cohort_collection: Arc::new(RwLock::new(())),
+            commit_execution: Arc::new(RwLock::new(())),
+            completion_return: Arc::new(RwLock::new(())),
+        };
         let client = NativeCommitClient {
             gate: Arc::clone(&gate),
             database: Arc::clone(&database),
+            execution_cancellation: execution_cancellation.clone(),
+            resource_admission_wait: config.execution_admission_wait,
+            maximum_explicit_cohort_size: config.max_batch_size,
+            #[cfg(test)]
+            cohort_collection_gate: Arc::clone(&test_gates.cohort_collection),
+            #[cfg(test)]
+            commit_execution_gate: Arc::clone(&test_gates.commit_execution),
+            #[cfg(test)]
+            completion_return_gate: Arc::clone(&test_gates.completion_return),
         };
         let (active_expiry, active_expiry_metrics) = active_expiry
             .map_or((None, None), |(runtime, metrics)| {
@@ -831,7 +1269,18 @@ impl NativeCommitScheduler {
             });
         let worker = thread::Builder::new()
             .name("hyphae-commit-scheduler".to_owned())
-            .spawn(move || run_scheduler(&receiver, &database, &gate, config, active_expiry))
+            .spawn(move || {
+                run_scheduler(
+                    &receiver,
+                    &database,
+                    &gate,
+                    config,
+                    execution_cancellation.as_ref(),
+                    active_expiry,
+                    #[cfg(test)]
+                    &test_gates,
+                )
+            })
             .map_err(|source| GroupCommitSubmitError::runtime(NativeRuntimeError::Io(source)))?;
         Ok(Self {
             client,
@@ -873,6 +1322,21 @@ impl NativeCommitScheduler {
             .begin_optimistic(logical_time_micros, durability)
     }
 
+    /// Prepares a detached delta batch through the scheduler's shared database
+    /// view without materializing complete engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`NativeCommitClient::begin_optimistic_delta`].
+    pub fn begin_optimistic_delta(
+        &self,
+        logical_time_micros: i64,
+        durability: DurabilityClass,
+    ) -> Result<NativeDeltaWriteBatch, GroupCommitSubmitError> {
+        self.client
+            .begin_optimistic_delta(logical_time_micros, durability)
+    }
+
     /// Submits one batch through the owned worker.
     ///
     /// # Errors
@@ -880,9 +1344,33 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::submit`].
     pub fn submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
         self.client.submit(batch)
+    }
+
+    /// Enqueues one batch through the owned worker without blocking its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`NativeCommitClient::enqueue`].
+    pub fn enqueue(
+        &self,
+        batch: impl Into<NativeCommitBatch>,
+    ) -> Result<NativePendingCommit, GroupCommitSubmitError> {
+        self.client.enqueue(batch)
+    }
+
+    /// Atomically enqueues one explicit group-durability cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`NativeCommitClient::enqueue_cohort`].
+    pub fn enqueue_cohort(
+        &self,
+        batches: Vec<NativeCommitBatch>,
+    ) -> Result<Vec<NativePendingCommit>, GroupCommitSubmitError> {
+        self.client.enqueue_cohort(batches)
     }
 
     /// Attempts immediate bounded admission through the owned worker.
@@ -892,7 +1380,7 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::try_submit`].
     pub fn try_submit(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
         self.client.try_submit(batch)
     }
@@ -904,7 +1392,7 @@ impl NativeCommitScheduler {
     /// Returns the same errors as [`NativeCommitClient::submit_controlled`].
     pub fn submit_controlled(
         &self,
-        batch: NativeWriteBatch,
+        batch: impl Into<NativeCommitBatch>,
         control: NativeCommitControl,
         queue_deadline: Option<Instant>,
     ) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
@@ -920,12 +1408,28 @@ impl NativeCommitScheduler {
     /// worker terminated abnormally, or the retained typed runtime failure
     /// when active expiry stopped the worker.
     pub fn shutdown(mut self) -> Result<(), GroupCommitSubmitError> {
-        self.stop_and_join()
+        self.stop_and_join(false).map(drop)
     }
 
-    fn stop_and_join(&mut self) -> Result<(), GroupCommitSubmitError> {
+    /// Stops admission, drains accepted work, and returns the exact database
+    /// owner for exclusive post-scheduler maintenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable when the worker did not reach the requested clean
+    /// shutdown marker, or the same retained active-expiry failure as
+    /// [`Self::shutdown`].
+    pub fn shutdown_into_database(mut self) -> Result<NativeDatabase, GroupCommitSubmitError> {
+        self.stop_and_join(true)?
+            .ok_or(GroupCommitSubmitError::Unavailable)
+    }
+
+    fn stop_and_join(
+        &mut self,
+        return_database: bool,
+    ) -> Result<Option<NativeDatabase>, GroupCommitSubmitError> {
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let sender = {
             let mut gate = self
@@ -942,22 +1446,34 @@ impl NativeCommitScheduler {
         };
         if let Some(sender) = sender {
             sender
-                .send(SchedulerCommand::Shutdown)
+                .send(SchedulerCommand::Shutdown { return_database })
                 .map_err(|_| GroupCommitSubmitError::Unavailable)?;
         }
-        worker
+        let database_retained = worker
             .join()
             .map_err(|_| GroupCommitSubmitError::Unavailable)?;
-        match self.active_expiry_failure() {
-            Some(failure) => Err(failure.submit_error()),
-            None => Ok(()),
+        if let Some(failure) = self.active_expiry_failure() {
+            return Err(failure.submit_error());
         }
+        if !return_database {
+            return Ok(None);
+        }
+        if !database_retained {
+            return Err(GroupCommitSubmitError::Unavailable);
+        }
+        self.client
+            .database
+            .write()
+            .map_err(|_| GroupCommitSubmitError::Unavailable)?
+            .take()
+            .ok_or(GroupCommitSubmitError::Unavailable)
+            .map(Some)
     }
 }
 
 impl Drop for NativeCommitScheduler {
     fn drop(&mut self) {
-        drop(self.stop_and_join());
+        drop(self.stop_and_join(false));
     }
 }
 
@@ -971,33 +1487,145 @@ fn admit_command(
     loop {
         check_queued_control(state, queue_deadline)?;
         let attempted_at = Instant::now();
-        if let SchedulerCommand::Commit(request) = &mut command {
-            request.enqueued_at = attempted_at;
-        }
+        stamp_command_enqueued_at(&mut command, attempted_at);
         let admission = {
-            let gate = gate
+            let mut gate = gate
                 .lock()
                 .map_err(|_| GroupCommitSubmitError::Unavailable)?;
             if !gate.accepting {
                 return Err(GroupCommitSubmitError::Unavailable);
             }
-            gate.sender.try_send(command)
+            if gate.queued_request_slots >= gate.queue_capacity {
+                drop(gate);
+                if immediate {
+                    return Err(GroupCommitSubmitError::Saturated);
+                }
+                thread::yield_now();
+                continue;
+            }
+            match gate.sender.try_send(command) {
+                Ok(()) => {
+                    gate.queued_request_slots += 1;
+                    return Ok(());
+                }
+                Err(error) => error,
+            }
         };
         match admission {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Disconnected(_)) => {
+            TrySendError::Disconnected(_) => {
                 return Err(GroupCommitSubmitError::Unavailable);
             }
-            Err(TrySendError::Full(returned)) if immediate => {
+            TrySendError::Full(returned) if immediate => {
                 drop(returned);
                 return Err(GroupCommitSubmitError::Saturated);
             }
-            Err(TrySendError::Full(returned)) => {
+            TrySendError::Full(returned) => {
                 command = returned;
                 thread::yield_now();
             }
         }
     }
+}
+
+fn admit_cohort_command(
+    gate: &Mutex<SubmissionGate>,
+    requests: Vec<CommitRequest>,
+) -> Result<(), GroupCommitSubmitError> {
+    let mut command = SchedulerCommand::Cohort(requests);
+    let request_slots = command_request_slots(&command);
+    loop {
+        stamp_command_enqueued_at(&mut command, Instant::now());
+        let admission = {
+            let mut gate = gate
+                .lock()
+                .map_err(|_| GroupCommitSubmitError::Unavailable)?;
+            if !gate.accepting {
+                return Err(GroupCommitSubmitError::Unavailable);
+            }
+            if gate
+                .queued_request_slots
+                .checked_add(request_slots)
+                .is_none_or(|queued| queued > gate.queue_capacity)
+            {
+                drop(gate);
+                thread::yield_now();
+                continue;
+            }
+            match gate.sender.try_send(command) {
+                Ok(()) => {
+                    gate.queued_request_slots += request_slots;
+                    return Ok(());
+                }
+                Err(error) => error,
+            }
+        };
+        match admission {
+            TrySendError::Disconnected(_) => {
+                return Err(GroupCommitSubmitError::Unavailable);
+            }
+            TrySendError::Full(returned) => {
+                command = returned;
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+fn command_request_slots(command: &SchedulerCommand) -> usize {
+    match command {
+        SchedulerCommand::Commit(_) => 1,
+        SchedulerCommand::Cohort(requests) => requests.len(),
+        SchedulerCommand::Shutdown { .. } => 0,
+    }
+}
+
+fn release_dequeued_request_slots(
+    gate: &Mutex<SubmissionGate>,
+    command: &SchedulerCommand,
+) -> bool {
+    let Ok(mut gate) = gate.lock() else {
+        return false;
+    };
+    let request_slots = command_request_slots(command);
+    let Some(queued) = gate.queued_request_slots.checked_sub(request_slots) else {
+        return false;
+    };
+    gate.queued_request_slots = queued;
+    true
+}
+
+fn stamp_command_enqueued_at(command: &mut SchedulerCommand, enqueued_at: Instant) {
+    match command {
+        SchedulerCommand::Commit(request) => request.enqueued_at = enqueued_at,
+        SchedulerCommand::Cohort(requests) => {
+            for request in requests {
+                request.enqueued_at = enqueued_at;
+            }
+        }
+        SchedulerCommand::Shutdown { .. } => {}
+    }
+}
+
+fn validate_explicit_cohort(
+    batches: &[NativeWriteBatch],
+    maximum_size: usize,
+) -> Result<(), GroupCommitSubmitError> {
+    if batches.is_empty() || batches.len() > maximum_size {
+        return Err(GroupCommitSubmitError::runtime(
+            NativeRuntimeError::InvalidGroupCommitBatchSize {
+                requested: batches.len(),
+            },
+        ));
+    }
+    if batches
+        .iter()
+        .any(|batch| batch.durability != DurabilityClass::Group)
+    {
+        return Err(GroupCommitSubmitError::runtime(
+            NativeRuntimeError::GroupCommitRequiresGroupDurability,
+        ));
+    }
+    Ok(())
 }
 
 fn check_queued_control(
@@ -1025,11 +1653,11 @@ fn check_queued_control(
 }
 
 fn await_response(
-    receiver: &Receiver<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
+    receiver: &Receiver<Result<ScheduledCommitCompletion, GroupCommitSubmitError>>,
     state: &AtomicU8,
     queue_deadline: Option<Instant>,
     poll_cancellation: bool,
-) -> Result<ScheduledCommitReceipt, GroupCommitSubmitError> {
+) -> Result<ScheduledCommitCompletion, GroupCommitSubmitError> {
     if !poll_cancellation {
         return receiver
             .recv()
@@ -1071,98 +1699,344 @@ fn run_scheduler(
     database: &RwLock<Option<NativeDatabase>>,
     gate: &Mutex<SubmissionGate>,
     config: GroupCommitConfig,
+    execution_cancellation: Option<&GovernorCancellation>,
     mut active_expiry: Option<ActiveExpiryRuntime>,
-) {
-    let mut shutdown = false;
+    #[cfg(test)] test_gates: &SchedulerTestGates,
+) -> bool {
+    let mut state = SchedulerLoopState::default();
     let mut pending = None;
-    while !shutdown {
+    while state.is_running() {
         if active_expiry
             .as_ref()
             .is_some_and(ActiveExpiryRuntime::should_force_sweep)
         {
             let Some(expiry) = active_expiry.as_mut() else {
+                state.fail();
                 break;
             };
             if !execute_active_expiry(database, expiry) {
+                state.fail();
                 break;
             }
             continue;
         }
         let first =
-            match receive_scheduler_command(receiver, &mut pending, active_expiry.as_ref()) {
+            match receive_scheduler_command(receiver, gate, &mut pending, active_expiry.as_ref()) {
                 SchedulerWake::Command(SchedulerCommand::Commit(request)) => *request,
-                SchedulerWake::Command(SchedulerCommand::Shutdown)
-                | SchedulerWake::Disconnected => break,
+                SchedulerWake::Command(SchedulerCommand::Cohort(requests)) => {
+                    if !execute_explicit_cohort(
+                        database,
+                        requests,
+                        config,
+                        execution_cancellation,
+                        &mut active_expiry,
+                        #[cfg(test)]
+                        test_gates,
+                    ) {
+                        state.fail();
+                        break;
+                    }
+                    continue;
+                }
+                SchedulerWake::Command(SchedulerCommand::Shutdown {
+                    return_database: requested_return,
+                }) => {
+                    state.request_shutdown(requested_return);
+                    break;
+                }
+                SchedulerWake::Disconnected => break,
                 SchedulerWake::ExpiryDue => {
                     let Some(expiry) = active_expiry.as_mut() else {
+                        state.fail();
                         break;
                     };
                     if !execute_active_expiry(database, expiry) {
+                        state.fail();
                         break;
                     }
                     continue;
                 }
             };
-        let counts_after_due = active_expiry
-            .as_ref()
-            .is_some_and(|expiry| expiry.wait_until_deadline().is_zero());
-        if first.batch.durability != DurabilityClass::Group {
-            if !execute_single_request(database, first) {
-                break;
-            }
-            if counts_after_due {
-                record_expiry_foreground(&mut active_expiry, 1);
-            }
-            continue;
-        }
-        let mut requests = vec![first];
-        let deadline = Instant::now() + config.max_wait;
-        let max_batch_size = active_expiry
-            .as_ref()
-            .map_or(config.max_batch_size, |expiry| {
-                if counts_after_due {
-                    config.max_batch_size.min(
-                        expiry
-                            .config
-                            .foreground_budget
-                            .saturating_sub(expiry.foreground_after_due)
-                            .max(1),
-                    )
-                } else {
-                    config.max_batch_size
-                }
-            });
-        while requests.len() < max_batch_size {
-            let mut remaining = deadline.saturating_duration_since(Instant::now());
-            if !counts_after_due && let Some(expiry) = active_expiry.as_ref() {
-                remaining = remaining.min(expiry.wait_until_deadline());
-            }
-            match receiver.recv_timeout(remaining) {
-                Ok(SchedulerCommand::Commit(request))
-                    if request.batch.durability == DurabilityClass::Group =>
-                {
-                    requests.push(*request);
-                }
-                Ok(command @ SchedulerCommand::Commit(_)) => {
-                    pending = Some(command);
-                    break;
-                }
-                Ok(SchedulerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                    shutdown = true;
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => break,
-            }
-        }
-        let request_count = requests.len();
-        if !execute_group_requests(database, requests) {
-            shutdown = true;
-        } else if counts_after_due {
-            record_expiry_foreground(&mut active_expiry, request_count);
+        if !execute_received_commit(
+            SchedulerExecutionContext {
+                receiver,
+                database,
+                gate,
+                config,
+                execution_cancellation,
+                #[cfg(test)]
+                test_gates,
+            },
+            &mut active_expiry,
+            &mut pending,
+            &mut state,
+            first,
+        ) {
+            break;
         }
     }
     stop_accepting(gate);
-    close_database(database);
+    let retain_database = state.returns_database();
+    if !retain_database {
+        close_database(database);
+    }
+    retain_database
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum SchedulerTermination {
+    #[default]
+    Running,
+    Shutdown,
+    ReturnDatabase,
+    Failed,
+}
+
+#[derive(Default)]
+struct SchedulerLoopState {
+    termination: SchedulerTermination,
+}
+
+impl SchedulerLoopState {
+    fn is_running(&self) -> bool {
+        self.termination == SchedulerTermination::Running
+    }
+
+    fn request_shutdown(&mut self, return_database: bool) {
+        self.termination = if return_database {
+            SchedulerTermination::ReturnDatabase
+        } else {
+            SchedulerTermination::Shutdown
+        };
+    }
+
+    fn fail(&mut self) {
+        self.termination = SchedulerTermination::Failed;
+    }
+
+    fn returns_database(&self) -> bool {
+        self.termination == SchedulerTermination::ReturnDatabase
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerExecutionContext<'scheduler> {
+    receiver: &'scheduler Receiver<SchedulerCommand>,
+    database: &'scheduler RwLock<Option<NativeDatabase>>,
+    gate: &'scheduler Mutex<SubmissionGate>,
+    config: GroupCommitConfig,
+    execution_cancellation: Option<&'scheduler GovernorCancellation>,
+    #[cfg(test)]
+    test_gates: &'scheduler SchedulerTestGates,
+}
+
+fn execute_received_commit(
+    context: SchedulerExecutionContext<'_>,
+    active_expiry: &mut Option<ActiveExpiryRuntime>,
+    pending: &mut Option<SchedulerCommand>,
+    state: &mut SchedulerLoopState,
+    first: CommitRequest,
+) -> bool {
+    let SchedulerExecutionContext {
+        receiver,
+        database,
+        gate,
+        config,
+        execution_cancellation,
+        #[cfg(test)]
+        test_gates,
+    } = context;
+    #[cfg(test)]
+    let Ok(cohort_collection_guard) = test_gates.cohort_collection.read() else {
+        state.fail();
+        return false;
+    };
+    #[cfg(test)]
+    drop(cohort_collection_guard);
+    let counts_after_due = expiry_is_due(active_expiry.as_ref());
+    if first.batch.durability != DurabilityClass::Group {
+        let completed = execute_single_request(
+            database,
+            first,
+            config.execution_admission_wait,
+            execution_cancellation,
+            #[cfg(test)]
+            &test_gates.commit_execution,
+            #[cfg(test)]
+            &test_gates.completion_return,
+        );
+        if !completed {
+            state.fail();
+        }
+        if completed && counts_after_due {
+            record_expiry_foreground(active_expiry, 1);
+        }
+        return completed;
+    }
+    let requests = collect_group_requests(
+        GroupCollectionContext {
+            receiver,
+            gate,
+            active_expiry: active_expiry.as_ref(),
+            config,
+            counts_after_due,
+        },
+        first,
+        pending,
+        state,
+    );
+    let request_count = requests.len();
+    let completed = execute_group_requests(
+        database,
+        requests,
+        config.execution_admission_wait,
+        execution_cancellation,
+        #[cfg(test)]
+        &test_gates.commit_execution,
+        #[cfg(test)]
+        &test_gates.completion_return,
+    );
+    if !completed {
+        state.fail();
+    } else if counts_after_due {
+        record_expiry_foreground(active_expiry, request_count);
+    }
+    completed
+}
+
+fn expiry_is_due(active_expiry: Option<&ActiveExpiryRuntime>) -> bool {
+    active_expiry.is_some_and(|expiry| expiry.wait_until_deadline().is_zero())
+}
+
+fn execute_explicit_cohort(
+    database: &RwLock<Option<NativeDatabase>>,
+    requests: Vec<CommitRequest>,
+    config: GroupCommitConfig,
+    execution_cancellation: Option<&GovernorCancellation>,
+    active_expiry: &mut Option<ActiveExpiryRuntime>,
+    #[cfg(test)] test_gates: &SchedulerTestGates,
+) -> bool {
+    #[cfg(test)]
+    let Ok(cohort_collection_guard) = test_gates.cohort_collection.read() else {
+        return false;
+    };
+    #[cfg(test)]
+    drop(cohort_collection_guard);
+    let request_count = requests.len();
+    if explicit_cohort_exceeds_due_budget(active_expiry.as_ref(), request_count) {
+        let Some(expiry) = active_expiry.as_mut() else {
+            return false;
+        };
+        if !execute_active_expiry(database, expiry) {
+            return false;
+        }
+    }
+    let counts_after_due = active_expiry
+        .as_ref()
+        .is_some_and(|expiry| expiry.wait_until_deadline().is_zero());
+    let completed = execute_group_requests(
+        database,
+        requests,
+        config.execution_admission_wait,
+        execution_cancellation,
+        #[cfg(test)]
+        &test_gates.commit_execution,
+        #[cfg(test)]
+        &test_gates.completion_return,
+    );
+    if completed && counts_after_due {
+        record_expiry_foreground(active_expiry, request_count);
+    }
+    completed
+}
+
+fn explicit_cohort_exceeds_due_budget(
+    active_expiry: Option<&ActiveExpiryRuntime>,
+    request_count: usize,
+) -> bool {
+    active_expiry.is_some_and(|expiry| {
+        expiry.wait_until_deadline().is_zero()
+            && request_count
+                > expiry
+                    .config
+                    .foreground_budget
+                    .saturating_sub(expiry.foreground_after_due)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct GroupCollectionContext<'a> {
+    receiver: &'a Receiver<SchedulerCommand>,
+    gate: &'a Mutex<SubmissionGate>,
+    active_expiry: Option<&'a ActiveExpiryRuntime>,
+    config: GroupCommitConfig,
+    counts_after_due: bool,
+}
+
+fn collect_group_requests(
+    context: GroupCollectionContext<'_>,
+    first: CommitRequest,
+    pending: &mut Option<SchedulerCommand>,
+    state: &mut SchedulerLoopState,
+) -> Vec<CommitRequest> {
+    let GroupCollectionContext {
+        receiver,
+        gate,
+        active_expiry,
+        config,
+        counts_after_due,
+    } = context;
+    let mut requests = vec![first];
+    let deadline = Instant::now() + config.max_wait;
+    let max_batch_size = active_expiry.map_or(config.max_batch_size, |expiry| {
+        if counts_after_due {
+            config.max_batch_size.min(
+                expiry
+                    .config
+                    .foreground_budget
+                    .saturating_sub(expiry.foreground_after_due)
+                    .max(1),
+            )
+        } else {
+            config.max_batch_size
+        }
+    });
+    while requests.len() < max_batch_size {
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
+        if !counts_after_due && let Some(expiry) = active_expiry {
+            remaining = remaining.min(expiry.wait_until_deadline());
+        }
+        let next_command = receiver.recv_timeout(remaining);
+        if let Ok(command) = &next_command
+            && !release_dequeued_request_slots(gate, command)
+        {
+            state.request_shutdown(false);
+            break;
+        }
+        match next_command {
+            Ok(SchedulerCommand::Commit(request))
+                if request.batch.durability == DurabilityClass::Group =>
+            {
+                requests.push(*request);
+            }
+            Ok(command @ (SchedulerCommand::Commit(_) | SchedulerCommand::Cohort(_))) => {
+                *pending = Some(command);
+                break;
+            }
+            Ok(SchedulerCommand::Shutdown {
+                return_database: requested_return,
+            }) => {
+                state.request_shutdown(requested_return);
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                state.request_shutdown(false);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => break,
+        }
+    }
+    requests
 }
 
 enum SchedulerWake {
@@ -1173,13 +2047,14 @@ enum SchedulerWake {
 
 fn receive_scheduler_command(
     receiver: &Receiver<SchedulerCommand>,
+    gate: &Mutex<SubmissionGate>,
     pending: &mut Option<SchedulerCommand>,
     active_expiry: Option<&ActiveExpiryRuntime>,
 ) -> SchedulerWake {
     if let Some(command) = pending.take() {
         return SchedulerWake::Command(command);
     }
-    match active_expiry {
+    let wake = match active_expiry {
         Some(expiry) => match receiver.recv_timeout(expiry.wait_until_deadline()) {
             Ok(command) => SchedulerWake::Command(command),
             Err(RecvTimeoutError::Timeout) => SchedulerWake::ExpiryDue,
@@ -1188,7 +2063,13 @@ fn receive_scheduler_command(
         None => receiver
             .recv()
             .map_or(SchedulerWake::Disconnected, SchedulerWake::Command),
+    };
+    if let SchedulerWake::Command(command) = &wake
+        && !release_dequeued_request_slots(gate, command)
+    {
+        return SchedulerWake::Disconnected;
     }
+    wake
 }
 
 fn record_expiry_foreground(active_expiry: &mut Option<ActiveExpiryRuntime>, requests: usize) {
@@ -1264,6 +2145,10 @@ fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
 fn execute_single_request(
     database: &RwLock<Option<NativeDatabase>>,
     request: CommitRequest,
+    execution_admission_wait: Duration,
+    execution_cancellation: Option<&GovernorCancellation>,
+    #[cfg(test)] commit_execution_gate: &RwLock<()>,
+    #[cfg(test)] completion_return_gate: &RwLock<()>,
 ) -> bool {
     let execution_started = Instant::now();
     let CommitRequest {
@@ -1277,45 +2162,89 @@ fn execute_single_request(
         deliver(&response, Err(GroupCommitSubmitError::Cancelled));
         return true;
     }
-    let Ok(mut database) = database.write() else {
-        control.complete();
-        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
-        return false;
-    };
-    let Some(database) = database.as_mut() else {
-        control.complete();
-        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
-        return false;
-    };
-    match database.commit_optimistic_scheduled(batch) {
-        Ok(report) => {
+    let execution_permit = {
+        let Ok(database) = database.read() else {
             control.complete();
-            deliver(
-                &response,
-                Ok(ScheduledCommitReceipt {
-                    commit: report.commit,
-                    admission_wait: enqueued_at.saturating_duration_since(submitted_at),
-                    queue_wait: execution_started.saturating_duration_since(enqueued_at),
-                    cohort_execution: report.commit.execution_time,
-                    page_synchronization: report.commit.page_synchronization_time,
-                    wal_synchronization: report.commit.wal_synchronization_time,
-                    end_to_end: Duration::ZERO,
-                }),
-            );
-            true
-        }
+            deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+            return false;
+        };
+        let Some(database) = database.as_ref() else {
+            control.complete();
+            deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+            return false;
+        };
+        database.admit_scheduled_commit_execution(execution_admission_wait, execution_cancellation)
+    };
+    let execution_permit = match execution_permit {
+        Ok(permit) => permit,
         Err(source) => {
-            let request_local = scheduler_request_local(&source);
             control.complete();
             deliver(&response, Err(GroupCommitSubmitError::runtime(source)));
-            request_local
+            return true;
         }
-    }
+    };
+    #[cfg(test)]
+    let Ok(commit_execution_guard) = commit_execution_gate.read() else {
+        drop(execution_permit);
+        control.complete();
+        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+        return false;
+    };
+    #[cfg(test)]
+    drop(commit_execution_guard);
+    let Ok(mut database_guard) = database.write() else {
+        drop(execution_permit);
+        control.complete();
+        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+        return false;
+    };
+    let Some(database) = database_guard.as_mut() else {
+        drop(database_guard);
+        drop(execution_permit);
+        control.complete();
+        deliver(&response, Err(GroupCommitSubmitError::Unavailable));
+        return false;
+    };
+    let (result, request_local) = match database.commit_optimistic_scheduled(batch) {
+        Ok(report) => (Ok(report), true),
+        Err(source) => {
+            let request_local = scheduler_request_local(&source);
+            (Err(GroupCommitSubmitError::runtime(source)), request_local)
+        }
+    };
+    drop(database_guard);
+    drop(execution_permit);
+    let result = result.map(|report| ScheduledCommitCompletion {
+        receipt: ScheduledCommitReceipt {
+            commit: report.commit,
+            admission_wait: enqueued_at.saturating_duration_since(submitted_at),
+            queue_wait: execution_started.saturating_duration_since(enqueued_at),
+            cohort_execution: report.commit.execution_time,
+            page_synchronization: report.commit.page_synchronization_time,
+            wal_synchronization: report.commit.wal_synchronization_time,
+            end_to_end: submitted_at.elapsed(),
+        },
+        page_synchronizations: report.page_synchronizations,
+        wal_synchronizations: report.wal_synchronizations,
+    });
+    control.complete();
+    deliver(&response, result);
+    #[cfg(test)]
+    let Ok(completion_return_guard) = completion_return_gate.read() else {
+        return false;
+    };
+    #[cfg(test)]
+    drop(completion_return_guard);
+    request_local
 }
 
 fn execute_group_requests(
     database: &RwLock<Option<NativeDatabase>>,
     requests: Vec<CommitRequest>,
+    execution_admission_wait: Duration,
+    execution_cancellation: Option<&GovernorCancellation>,
+    #[cfg(test)] commit_execution_gate: &RwLock<()>,
+    #[cfg(test)] completion_return_gate: &RwLock<()>,
 ) -> bool {
     let execution_started = Instant::now();
     let mut batches = Vec::with_capacity(requests.len());
@@ -1336,29 +2265,83 @@ fn execute_group_requests(
     if batches.is_empty() {
         return true;
     }
-    let Ok(mut database) = database.write() else {
+    let execution_permit = {
+        let Ok(database) = database.read() else {
+            deliver_all_unavailable(waiters);
+            return false;
+        };
+        let Some(database) = database.as_ref() else {
+            deliver_all_unavailable(waiters);
+            return false;
+        };
+        database.admit_scheduled_commit_execution(execution_admission_wait, execution_cancellation)
+    };
+    let execution_permit = match execution_permit {
+        Ok(permit) => permit,
+        Err(source) => {
+            let failure = GroupCommitSubmitError::runtime(source);
+            for (_submitted_at, _enqueued_at, control, response) in waiters {
+                control.complete();
+                deliver(&response, Err(failure.clone()));
+            }
+            return true;
+        }
+    };
+    #[cfg(test)]
+    let Ok(commit_execution_guard) = commit_execution_gate.read() else {
+        drop(execution_permit);
         deliver_all_unavailable(waiters);
         return false;
     };
-    let Some(database) = database.as_mut() else {
+    #[cfg(test)]
+    drop(commit_execution_guard);
+    let Ok(mut database_guard) = database.write() else {
+        drop(execution_permit);
+        deliver_all_unavailable(waiters);
+        return false;
+    };
+    let Some(database) = database_guard.as_mut() else {
+        drop(database_guard);
+        drop(execution_permit);
         deliver_all_unavailable(waiters);
         return false;
     };
     let report = database.commit_group(batches);
+    drop(database_guard);
+    drop(execution_permit);
+    let completed = deliver_group_report(report, waiters, execution_started);
+    #[cfg(test)]
+    let Ok(completion_return_guard) = completion_return_gate.read() else {
+        return false;
+    };
+    #[cfg(test)]
+    drop(completion_return_guard);
+    completed
+}
+
+fn deliver_group_report(
+    report: Result<GroupCommitReport, NativeRuntimeError>,
+    waiters: Vec<CommitWaiter>,
+    execution_started: Instant,
+) -> bool {
     match report {
         Ok(report) if report.outcomes.len() == waiters.len() => {
             for ((submitted_at, enqueued_at, control, response), outcome) in
                 waiters.into_iter().zip(report.outcomes)
             {
                 let result = match outcome {
-                    GroupCommitOutcome::Committed(commit) => Ok(ScheduledCommitReceipt {
-                        commit,
-                        admission_wait: enqueued_at.saturating_duration_since(submitted_at),
-                        queue_wait: execution_started.saturating_duration_since(enqueued_at),
-                        cohort_execution: report.execution_time,
-                        page_synchronization: report.page_synchronization_time,
-                        wal_synchronization: report.wal_synchronization_time,
-                        end_to_end: Duration::ZERO,
+                    GroupCommitOutcome::Committed(commit) => Ok(ScheduledCommitCompletion {
+                        receipt: ScheduledCommitReceipt {
+                            commit,
+                            admission_wait: enqueued_at.saturating_duration_since(submitted_at),
+                            queue_wait: execution_started.saturating_duration_since(enqueued_at),
+                            cohort_execution: report.execution_time,
+                            page_synchronization: report.page_synchronization_time,
+                            wal_synchronization: report.wal_synchronization_time,
+                            end_to_end: submitted_at.elapsed(),
+                        },
+                        page_synchronizations: report.page_synchronizations,
+                        wal_synchronizations: report.wal_synchronizations,
                     }),
                     GroupCommitOutcome::Rejected(source) => {
                         Err(GroupCommitSubmitError::runtime(source))
@@ -1423,8 +2406,8 @@ fn deliver_all_unavailable(waiters: Vec<CommitWaiter>) {
 }
 
 fn deliver(
-    response: &SyncSender<Result<ScheduledCommitReceipt, GroupCommitSubmitError>>,
-    result: Result<ScheduledCommitReceipt, GroupCommitSubmitError>,
+    response: &SyncSender<Result<ScheduledCommitCompletion, GroupCommitSubmitError>>,
+    result: Result<ScheduledCommitCompletion, GroupCommitSubmitError>,
 ) {
     // A caller may abandon its wait after the transaction already has a durable
     // outcome; that cannot roll the database decision back.
@@ -1447,7 +2430,8 @@ fn close_database(database: &RwLock<Option<NativeDatabase>>) {
 mod tests {
     use super::{
         ActiveExpiryConfig, ActiveExpiryConfigError, CommitCancellationOutcome, GroupCommitConfig,
-        GroupCommitConfigError, GroupCommitSubmitError, MAX_GROUP_COMMIT_QUEUE_CAPACITY,
+        GroupCommitConfigError, GroupCommitExecutionAdmissionWaitError, GroupCommitSubmitError,
+        MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT, MAX_GROUP_COMMIT_QUEUE_CAPACITY,
         MAX_GROUP_COMMIT_WAIT, NativeCommitControl, REQUEST_QUEUED, SchedulerCommand,
         SubmissionGate, admit_command,
     };
@@ -1499,6 +2483,24 @@ mod tests {
                 .map(GroupCommitConfig::max_batch_size),
             Ok(8)
         );
+        assert!(matches!(
+            GroupCommitConfig::new(1, Duration::ZERO, 1),
+            Ok(config)
+                if config.with_execution_admission_wait(
+                    MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT + Duration::from_nanos(1),
+                ) == Err(GroupCommitExecutionAdmissionWaitError {
+                    requested: MAX_GROUP_COMMIT_EXECUTION_ADMISSION_WAIT
+                        + Duration::from_nanos(1),
+                })
+        ));
+        assert!(matches!(
+            GroupCommitConfig::new(1, Duration::ZERO, 1),
+            Ok(config)
+                if config
+                    .with_execution_admission_wait(Duration::from_secs(60))
+                    .map(GroupCommitConfig::queue_capacity)
+                    == Ok(1)
+        ));
     }
 
     #[test]
@@ -1520,15 +2522,31 @@ mod tests {
     #[test]
     fn immediate_admission_reports_saturation_without_holding_the_gate() {
         let (sender, _receiver) = mpsc::sync_channel(1);
-        assert!(sender.send(SchedulerCommand::Shutdown).is_ok());
+        assert!(
+            sender
+                .send(SchedulerCommand::Shutdown {
+                    return_database: false,
+                })
+                .is_ok()
+        );
         let gate = Mutex::new(SubmissionGate {
             sender,
             accepting: true,
+            queue_capacity: 1,
+            queued_request_slots: 0,
         });
         let state = AtomicU8::new(REQUEST_QUEUED);
 
         assert!(matches!(
-            admit_command(&gate, SchedulerCommand::Shutdown, &state, None, true),
+            admit_command(
+                &gate,
+                SchedulerCommand::Shutdown {
+                    return_database: false,
+                },
+                &state,
+                None,
+                true,
+            ),
             Err(GroupCommitSubmitError::Saturated)
         ));
         assert!(gate.try_lock().is_ok());

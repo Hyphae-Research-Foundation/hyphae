@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Explicit shipped format-2 CLI and `/v1` compatibility paths.
 //!

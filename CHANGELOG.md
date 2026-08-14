@@ -3,6 +3,15 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [Unreleased]
+
+### Changed
+
+- License the current software tree and future releases under
+  `AGPL-3.0-only`, while repository documentation and diagrams use
+  `CC-BY-SA-4.0`. Releases through `v1.0.1` retain their original
+  Apache-2.0 grants.
+
 ## [1.0.1] - 2026-08-09
 
 Hyphae 1.0.1 is a distribution follow-up to 1.0.0. It publishes the complete

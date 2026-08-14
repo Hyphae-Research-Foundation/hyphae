@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 
 from __future__ import annotations
 
@@ -370,6 +371,20 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(workflow.count('${merge_commit}^{tree}'), 2)
         self.assertEqual(workflow.count('${merge_commit}^1'), 2)
         self.assertEqual(workflow.count('${merge_commit}^2'), 2)
+        self.assertIn("anchore/sbom-action/download-syft@", workflow)
+        self.assertIn("syft-version: v1.46.0", workflow)
+        scan = workflow.index('scan dir:. -o "syft-json=${native_sbom}"')
+        conclude = workflow.index("packaging/conclude_release_sbom_licenses.py")
+        spdx = workflow.index('convert "$native_sbom" -o "spdx-json=${spdx_sbom}"')
+        cyclonedx = workflow.index(
+            'convert "$native_sbom" -o "cyclonedx-json=${cyclonedx_sbom}"'
+        )
+        evidence = workflow.index("name: Generate post-commit release evidence")
+        self.assertLess(scan, conclude)
+        self.assertLess(conclude, spdx)
+        self.assertLess(conclude, cyclonedx)
+        self.assertLess(spdx, evidence)
+        self.assertLess(cyclonedx, evidence)
         pull_request_workflows = {
             REQUIRED_CHECK_WORKFLOWS[name]
             for name, event in REQUIRED_CHECK_EVENTS.items()

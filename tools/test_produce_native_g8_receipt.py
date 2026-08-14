@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 import json
 import tempfile
@@ -59,6 +59,35 @@ def soak() -> dict:
             "visible_csn": 1,
             "checkpoint_digest": "5" * 64,
         },
+    }
+
+
+def signed_release() -> dict:
+    version = "1.0.1"
+    return {
+        "schema": "hyphae-native-g8-signed-release-v1",
+        "status": "passed",
+        "source_commit": COMMIT,
+        "tag": f"v{version}",
+        "archive_count": 4,
+        "signature_verifications": 12,
+        "attestation_verifications": 12,
+        "software_license": "AGPL-3.0-only",
+        "license_authority": "tracked-package-manifests-and-local-locks-v1",
+        "first_party_artifact_count": 78,
+        "first_party_identity_count": 32,
+        "spdx_hyphae_components": ["hyphae-native-runtime"],
+        "cyclonedx_hyphae_components": ["hyphae-native-runtime"],
+        "spdx_sha256": "1" * 64,
+        "cyclonedx_sha256": "2" * 64,
+        "checksums_sha256": "3" * 64,
+        "release_evidence_sha256": "4" * 64,
+        "provenance_targets": [
+            f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
+            f"hyphae-{version}-x86_64-apple-darwin.tar.gz",
+            f"hyphae-{version}-x86_64-pc-windows-msvc.zip",
+            f"hyphae-{version}-x86_64-unknown-linux-gnu.tar.gz",
+        ],
     }
 
 
@@ -267,42 +296,36 @@ class G8ProducerTests(unittest.TestCase):
         }, platform=target)
 
     def test_signed_release_requires_all_four_provenance_targets(self) -> None:
-        version = "1.0.1"
-        self.assert_valid("sbom-signatures-provenance", {
-            "schema": "hyphae-native-g8-signed-release-v1",
-            "status": "passed",
-            "source_commit": COMMIT,
-            "tag": f"v{version}",
-            "archive_count": 4,
-            "signature_verifications": 12,
-            "attestation_verifications": 12,
-            "spdx_sha256": "1" * 64,
-            "cyclonedx_sha256": "2" * 64,
-            "checksums_sha256": "3" * 64,
-            "release_evidence_sha256": "4" * 64,
-            "provenance_targets": [
-                f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
-                f"hyphae-{version}-x86_64-apple-darwin.tar.gz",
-                f"hyphae-{version}-x86_64-pc-windows-msvc.zip",
-                f"hyphae-{version}-x86_64-unknown-linux-gnu.tar.gz",
-            ],
-        }, platform="release")
+        self.assert_valid(
+            "sbom-signatures-provenance", signed_release(), platform="release"
+        )
+
+    def test_signed_release_requires_semantically_verified_agpl_sboms(self) -> None:
+        for field, value in (
+            ("software_license", "GPL-3.0-only"),
+            ("license_authority", "untrusted"),
+            ("first_party_artifact_count", 77),
+            ("first_party_identity_count", 31),
+            ("spdx_hyphae_components", []),
+            ("cyclonedx_hyphae_components", []),
+            ("spdx_hyphae_components", ["third-party-runtime"]),
+        ):
+            with self.subTest(field=field):
+                payload = signed_release()
+                payload[field] = value
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(GateFailure):
+                        produce(
+                            ROOT,
+                            "sbom-signatures-provenance",
+                            "release",
+                            COMMIT,
+                            write(directory, payload),
+                        )
 
     def test_signed_release_rejects_noncanonical_target_names(self) -> None:
-        payload = {
-            "schema": "hyphae-native-g8-signed-release-v1",
-            "status": "passed",
-            "source_commit": COMMIT,
-            "tag": "v1.0.1",
-            "archive_count": 4,
-            "signature_verifications": 12,
-            "attestation_verifications": 12,
-            "spdx_sha256": "1" * 64,
-            "cyclonedx_sha256": "2" * 64,
-            "checksums_sha256": "3" * 64,
-            "release_evidence_sha256": "4" * 64,
-            "provenance_targets": ["a", "b", "c", "d"],
-        }
+        payload = signed_release()
+        payload["provenance_targets"] = ["a", "b", "c", "d"]
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(GateFailure):
                 produce(

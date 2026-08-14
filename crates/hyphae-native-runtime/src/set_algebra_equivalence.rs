@@ -1,10 +1,15 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -75,6 +80,99 @@ fn set_algebra_matches_private_snapshot_physical_and_reopen() -> Result<(), Box<
     assert_members(
         reopened.set_algebra_latest_at(&union, 11)?.members(),
         &[b"", b"a", b"b", b"c", b"z", b"\xff"],
+    );
+    Ok(())
+}
+
+#[test]
+fn structure_v3_set_algebra_is_direct_bounded_and_reopen_safe() -> Result<(), Box<dyn Error>> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin(10, DurabilityClass::Strict)?;
+    for key in [b"left".as_slice(), b"right".as_slice(), b"third".as_slice()] {
+        seed.create_set(key.to_vec())?;
+    }
+    add_members(&mut seed, b"left", &[b"", b"a", b"c", b"\xff"])?;
+    add_members(&mut seed, b"right", &[b"a", b"b", b"\xff"])?;
+    add_members(&mut seed, b"third", &[b"a", b"z", b"\xff"])?;
+    seed.create_list(b"wrong-kind".to_vec())?;
+    seed.commit()?;
+    database.migrate_structure_to_v3(DurabilityClass::Strict)?;
+
+    let union = request(
+        SetAlgebraOperation::Union,
+        &[b"left", b"right", b"third"],
+        16,
+        128,
+    )?;
+    let intersection = request(
+        SetAlgebraOperation::Intersection,
+        &[b"left", b"right", b"third"],
+        16,
+        128,
+    )?;
+    let difference = request(
+        SetAlgebraOperation::Difference,
+        &[b"left", b"right"],
+        16,
+        128,
+    )?;
+    let missing = request(SetAlgebraOperation::Union, &[b"left", b"missing"], 16, 128)?;
+    let wrong_kind = request(
+        SetAlgebraOperation::Intersection,
+        &[b"missing", b"wrong-kind"],
+        16,
+        128,
+    )?;
+    let output_exhausted = request(SetAlgebraOperation::Union, &[b"left"], 1, 128)?;
+    let visits_exhausted = request(SetAlgebraOperation::Union, &[b"left"], 16, 1)?;
+
+    crate::FAIL_FULL_STATE_LOAD.set(true);
+    crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(true);
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        assert_members(
+            database.set_algebra_latest_at(&union, 11)?.members(),
+            &[b"", b"a", b"b", b"c", b"z", b"\xff"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&intersection, 11)?.members(),
+            &[b"a", b"\xff"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&difference, 11)?.members(),
+            &[b"", b"c"],
+        );
+        assert_members(
+            database.set_algebra_latest_at(&missing, 11)?.members(),
+            &[b"", b"a", b"c", b"\xff"],
+        );
+        assert!(matches!(
+            database.set_algebra_latest_at(&wrong_kind, 11),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        assert!(matches!(
+            database.set_algebra_latest_at(&output_exhausted, 11),
+            Err(NativeRuntimeError::SetAlgebra(
+                SetAlgebraError::OutputLimitExceeded { maximum: 1 }
+            ))
+        ));
+        assert!(matches!(
+            database.set_algebra_latest_at(&visits_exhausted, 11),
+            Err(NativeRuntimeError::SetAlgebra(
+                SetAlgebraError::VisitLimitExceeded { maximum: 1 }
+            ))
+        ));
+        Ok(())
+    })();
+    crate::FAIL_FULL_STRUCTURE_STATE_LOAD.set(false);
+    crate::FAIL_FULL_STATE_LOAD.set(false);
+    result?;
+
+    drop(database);
+    let reopened = NativeDatabase::open(temporary.path())?;
+    assert_members(
+        reopened.set_algebra_latest_at(&intersection, 11)?.members(),
+        &[b"a", b"\xff"],
     );
     Ok(())
 }
@@ -472,26 +570,89 @@ fn assert_members(actual: &[Vec<u8>], expected: &[&[u8]]) {
     );
 }
 
-struct TemporaryDirectory(PathBuf);
+struct TemporaryDirectory {
+    root: PathBuf,
+    database: PathBuf,
+}
 
 impl TemporaryDirectory {
-    fn create() -> Result<Self, Box<dyn Error>> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        Ok(Self(std::env::temp_dir().join(format!(
-            "hyphae-set-algebra-{}-{timestamp}",
+    fn create() -> io::Result<Self> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        Self::create_at(timestamp)
+    }
+
+    fn create_at(timestamp: u128) -> io::Result<Self> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-set-algebra-{}-{timestamp}-{sequence}",
             std::process::id()
-        ))))
+        ));
+        fs::create_dir(&root)?;
+        Ok(Self {
+            database: root.join("database"),
+            root,
+        })
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.database
     }
 }
 
 impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
-        let _ignored = fs::remove_dir_all(&self.0);
+        let _ignored = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn temporary_directories_remain_unique_when_timestamps_collide() -> Result<(), Box<dyn Error>> {
+    const THREADS: usize = 16;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let start = Arc::new(Barrier::new(THREADS));
+    let directories = thread::scope(|scope| -> io::Result<Vec<TemporaryDirectory>> {
+        let workers = (0..THREADS)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                scope.spawn(move || -> io::Result<TemporaryDirectory> {
+                    start.wait();
+                    let directory = TemporaryDirectory::create_at(timestamp)?;
+                    drop(NativeDatabase::create(directory.path()).map_err(io::Error::other)?);
+                    Ok(directory)
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("temporary-directory worker panicked"))?
+            })
+            .collect()
+    })?;
+
+    assert_eq!(
+        directories
+            .iter()
+            .map(TemporaryDirectory::path)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        THREADS
+    );
+    assert!(
+        directories
+            .iter()
+            .all(|directory| directory.path().is_dir())
+    );
+    Ok(())
 }
 
 struct SplitMix64 {

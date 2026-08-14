@@ -1,0 +1,17 @@
+{
+  "schema": "hyphae-native-performance-suite-profile-v1",
+  "suite_schema": "hyphae-native-performance-suite-v1",
+  "name": "native-embedded-structure-baseline-v1",
+  "required_cells": [
+    {
+      "workload_class": "foreground-point",
+      "engines": ["structures"],
+      "operation": "embedded-structure-point-get",
+      "concurrency": 1,
+      "state": "warm",
+      "background_mode": "control"
+    }
+  ],
+  "claims": [],
+  "closure_declared": false
+}

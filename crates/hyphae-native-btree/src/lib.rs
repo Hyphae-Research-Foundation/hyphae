@@ -1,18 +1,19 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Immutable copy-on-write B+tree over verified Hyphae native pages.
 
 use std::{
     collections::BTreeSet,
+    mem::size_of,
     ops::{Bound, ControlFlow, Range},
     sync::Arc,
 };
 
 use hyphae_native_pages::{
-    BufferPool, BufferPoolError, PAGE_PAYLOAD_SIZE, Page, PageFrame, PageKind, PageStore,
-    PageStoreError,
+    BufferPool, BufferPoolError, PAGE_PAYLOAD_SIZE, PAGE_SIZE, Page, PageFrame, PageKind,
+    PageStore, PageStoreError, UnpublishedTail,
 };
-use hyphae_native_types::{Csn, PageId};
+use hyphae_native_types::{Csn, PageGeneration, PageId};
 use thiserror::Error;
 
 const LEAF_MAGIC: &[u8; 8] = b"HYBTLF01";
@@ -21,8 +22,22 @@ const FORMAT_VERSION: u16 = 1;
 const LEAF_HEADER_SIZE: usize = 16;
 const INTERNAL_HEADER_SIZE: usize = 24;
 const MAX_TREE_HEIGHT: usize = 64;
+const ALLOCATOR_ALLOCATION_OVERHEAD_BYTES: usize = 32;
+const MAX_LEAF_ENTRY_COUNT: usize = (PAGE_PAYLOAD_SIZE - LEAF_HEADER_SIZE) / 8;
+const DECODED_NODE_MEMORY_BOUND: usize = PAGE_SIZE
+    + PAGE_PAYLOAD_SIZE
+    + MAX_LEAF_ENTRY_COUNT * size_of::<LeafEntry>()
+    + MAX_LEAF_ENTRY_COUNT * 2 * ALLOCATOR_ALLOCATION_OVERHEAD_BYTES
+    + ALLOCATOR_ALLOCATION_OVERHEAD_BYTES;
 /// Maximum canonical inline B+tree key size.
 pub const BTREE_MAX_KEY_SIZE: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_REPLACEMENT_APPENDED_PAGES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 /// Owned canonical binary key/value pair returned by a materialized scan.
 pub type KeyValue = (Vec<u8>, Vec<u8>);
@@ -98,6 +113,15 @@ pub enum BTreeError {
     /// A reachable node was created after the root's visible commit.
     #[error("native B+tree contains a node from a future commit")]
     FuturePage,
+    /// A planned leaf segment belongs to another immutable tree root.
+    #[error("native B+tree segment belongs to another immutable root")]
+    ForeignSegment,
+    /// Cooperative cancellation interrupted a bounded tree rewrite.
+    #[error("native B+tree mutation was cancelled")]
+    Cancelled,
+    /// Prefix replacement did not observe the caller's exact expected keys.
+    #[error("native B+tree prefix replacement observed unexpected existing keys")]
+    PrefixContentsChanged,
 }
 
 /// Result of one copy-on-write B+tree mutation.
@@ -120,10 +144,189 @@ pub struct BatchMutationResult {
     pub pages_written: usize,
 }
 
+/// Conservatively bounded structural memory for one immutable prefix rewrite.
+///
+/// The plan is authoritative only for the captured page-file generation and
+/// tree root. Payload ownership remains the caller's separate accounting;
+/// this bound covers B+tree traversal, leaf references, exact-key validation,
+/// rewrite headers, parent assembly, allocator overhead, and one decoded node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefixReplacementStructuralPlan {
+    generation: PageGeneration,
+    root: Option<PageId>,
+    leaf_count: usize,
+    reachable_page_count: usize,
+    maximum_stack_depth: usize,
+    leaf_boundary_key_bytes: usize,
+    maximum_key_length: usize,
+    maximum_replacement_entries: usize,
+    maximum_replacement_key_length: usize,
+    structural_peak_memory_bytes: usize,
+}
+
+/// Scalar ceilings used to admit B+tree structural work before replacement
+/// keys and values are materialized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrefixReplacementStructuralLimits {
+    maximum_replacement_entries: usize,
+    maximum_replacement_key_length: usize,
+}
+
+impl PrefixReplacementStructuralLimits {
+    /// Creates conservative scalar ceilings for one later replacement batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a key ceiling larger than the canonical inline B+tree limit.
+    pub fn new(
+        maximum_replacement_entries: usize,
+        maximum_replacement_key_length: usize,
+    ) -> Result<Self, BTreeError> {
+        if maximum_replacement_key_length > BTREE_MAX_KEY_SIZE {
+            return Err(BTreeError::KeyTooLarge);
+        }
+        Ok(Self {
+            maximum_replacement_entries,
+            maximum_replacement_key_length,
+        })
+    }
+
+    /// Returns replacement entries covered by this bound.
+    pub const fn maximum_replacement_entries(self) -> usize {
+        self.maximum_replacement_entries
+    }
+
+    /// Returns replacement key bytes covered per entry.
+    pub const fn maximum_replacement_key_length(self) -> usize {
+        self.maximum_replacement_key_length
+    }
+}
+
+/// Owned replacement payload and borrowed exact-prefix authority for one
+/// planned unpublished-tail rewrite.
+#[derive(Debug)]
+pub struct PrefixReplacementBatch<'a> {
+    /// Commit sequence recorded on newly appended B+tree pages.
+    pub creating_csn: Csn,
+    /// Ordered, non-overlapping prefixes replaced atomically.
+    pub prefixes: &'a [Vec<u8>],
+    /// Exact ordered keys that must currently exist below the prefixes.
+    pub expected_keys: &'a [Vec<u8>],
+    /// Complete ordered replacement key/value set below the prefixes.
+    pub replacements: Vec<KeyValue>,
+}
+
+impl PrefixReplacementStructuralPlan {
+    /// Returns the conservative additional memory required by the B+tree
+    /// rewrite, excluding caller-owned replacement key/value payloads.
+    pub const fn structural_peak_memory_bytes(&self) -> usize {
+        self.structural_peak_memory_bytes
+    }
+
+    /// Returns immutable leaves referenced by this root.
+    pub const fn leaf_count(&self) -> usize {
+        self.leaf_count
+    }
+
+    /// Returns all reachable B+tree pages verified by the streaming planner.
+    pub const fn reachable_page_count(&self) -> usize {
+        self.reachable_page_count
+    }
+
+    /// Returns the planner's maximum DFS stack depth.
+    pub const fn maximum_stack_depth(&self) -> usize {
+        self.maximum_stack_depth
+    }
+}
+
+trait BTreePageRead {
+    fn read_btree_page(&self, page: PageId) -> Result<Page, PageStoreError>;
+}
+
+impl BTreePageRead for PageStore {
+    fn read_btree_page(&self, page: PageId) -> Result<Page, PageStoreError> {
+        self.read(page)
+    }
+}
+
+impl BTreePageRead for UnpublishedTail<'_> {
+    fn read_btree_page(&self, page: PageId) -> Result<Page, PageStoreError> {
+        self.read(page)
+    }
+}
+
+trait BTreePageWrite: BTreePageRead {
+    fn append_btree_page(
+        &mut self,
+        kind: PageKind,
+        creating_csn: Option<Csn>,
+        payload: Vec<u8>,
+    ) -> Result<PageId, PageStoreError>;
+}
+
+impl BTreePageWrite for PageStore {
+    fn append_btree_page(
+        &mut self,
+        kind: PageKind,
+        creating_csn: Option<Csn>,
+        payload: Vec<u8>,
+    ) -> Result<PageId, PageStoreError> {
+        self.append(kind, creating_csn, None, payload)
+    }
+}
+
+impl BTreePageWrite for UnpublishedTail<'_> {
+    fn append_btree_page(
+        &mut self,
+        kind: PageKind,
+        creating_csn: Option<Csn>,
+        payload: Vec<u8>,
+    ) -> Result<PageId, PageStoreError> {
+        self.append(kind, creating_csn, None, payload)
+    }
+}
+
 /// Immutable root identity for one binary B+tree generation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BTree {
     root: Option<PageId>,
+}
+
+/// One immutable leaf segment selected by a bounded B+tree plan.
+///
+/// Construction is private so callers cannot invent a page/range identity.
+/// The originating root is retained and checked again before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BTreeSegment {
+    root: PageId,
+    page: PageId,
+    minimum: Vec<u8>,
+    maximum: Vec<u8>,
+    entry_count: usize,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+}
+
+impl BTreeSegment {
+    /// Immutable leaf-page identity.
+    pub const fn page_id(&self) -> PageId {
+        self.page
+    }
+
+    /// First canonical key physically stored in this leaf.
+    pub fn minimum_key(&self) -> &[u8] {
+        &self.minimum
+    }
+
+    /// Last canonical key physically stored in this leaf.
+    pub fn maximum_key(&self) -> &[u8] {
+        &self.maximum
+    }
+
+    /// Complete physical entries in the leaf before query-bound filtering.
+    pub const fn entry_count(&self) -> usize {
+        self.entry_count
+    }
 }
 
 impl BTree {
@@ -140,6 +343,90 @@ impl BTree {
     /// Returns the immutable physical root, or `None` for an empty tree.
     pub const fn root(self) -> Option<PageId> {
         self.root
+    }
+
+    /// Plans immutable leaf segments intersecting one canonical key range.
+    ///
+    /// Internal separator ranges prune unreachable subtrees before their leaf
+    /// pages are read. Returned segments remain in canonical key order and
+    /// retain the exact query bounds for independent execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt reached pages, cycles, or excessive tree
+    /// height.
+    pub fn plan_range_segments(
+        self,
+        store: &PageStore,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Vec<BTreeSegment>, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(Vec::new());
+        };
+        if range_is_empty(lower, upper) {
+            return Ok(Vec::new());
+        }
+        let mut segments = Vec::new();
+        let mut visited = BTreeSet::new();
+        plan_range_segments_node(
+            store,
+            root,
+            root,
+            lower,
+            upper,
+            0,
+            &mut visited,
+            &mut segments,
+        )?;
+        Ok(segments)
+    }
+
+    /// Executes one previously planned leaf segment.
+    ///
+    /// The page is revalidated against its planned range and summary before
+    /// returning only entries inside the original query bounds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a segment from another root and any changed, missing, corrupt,
+    /// or non-leaf page.
+    pub fn scan_planned_segment(
+        self,
+        store: &PageStore,
+        segment: &BTreeSegment,
+    ) -> Result<Vec<KeyValue>, BTreeError> {
+        if self.root != Some(segment.root) {
+            return Err(BTreeError::ForeignSegment);
+        }
+        let Node::Leaf(entries) = read_node(store, segment.page)? else {
+            return Err(BTreeError::WrongPageKind);
+        };
+        let minimum = entries
+            .first()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        let maximum = entries
+            .last()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        if minimum != segment.minimum
+            || maximum != segment.maximum
+            || entries.len() != segment.entry_count
+        {
+            return Err(BTreeError::InvalidSeparator);
+        }
+        let lower = borrowed_bound(&segment.lower);
+        let upper = borrowed_bound(&segment.upper);
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                key_satisfies_lower(&entry.key, lower) && key_satisfies_upper(&entry.key, upper)
+            })
+            .map(|entry| (entry.key, entry.value))
+            .collect())
     }
 
     /// Verifies the complete tree and returns its node height.
@@ -183,6 +470,31 @@ impl BTree {
     /// Returns an error for corrupt pages/nodes, I/O, cycles, or excessive
     /// height.
     pub fn get(self, store: &PageStore, key: &[u8]) -> Result<Option<Vec<u8>>, BTreeError> {
+        self.get_direct(store, key)
+    }
+
+    /// Performs a direct point lookup against a not-yet-finalized candidate.
+    ///
+    /// The read cannot enter a shared [`BufferPool`], so rolling the candidate
+    /// back cannot leave stale bytes for a reused page identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt pages/nodes, I/O, cycles, or excessive
+    /// height.
+    pub fn get_unpublished(
+        self,
+        unpublished: &UnpublishedTail<'_>,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, BTreeError> {
+        self.get_direct(unpublished, key)
+    }
+
+    fn get_direct<S: BTreePageRead>(
+        self,
+        store: &S,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, BTreeError> {
         let Some(mut page_id) = self.root else {
             return Ok(None);
         };
@@ -192,7 +504,7 @@ impl BTree {
                 return Err(BTreeError::Cycle);
             }
             visited[depth] = page_id.get();
-            let page = store.read(page_id)?;
+            let page = store.read_btree_page(page_id)?;
             match lookup_page(&page, key)? {
                 LookupStep::Value(range) => {
                     return Ok(range.map(|range| page.payload()[range].to_vec()));
@@ -201,6 +513,40 @@ impl BTree {
             }
         }
         Err(BTreeError::HeightExceeded)
+    }
+
+    /// Visits a candidate prefix directly without caching or materializing the
+    /// complete range.
+    ///
+    /// Returning [`ControlFlow::Break`] stops before reading the remaining
+    /// candidate pages. Keys are verified in global canonical order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for page, codec, key-order, cycle, or height failures
+    /// reached before the visitor stops.
+    pub fn visit_prefix_unpublished<F>(
+        self,
+        unpublished: &UnpublishedTail<'_>,
+        prefix: &[u8],
+        visitor: F,
+    ) -> Result<ControlFlow<()>, BTreeError>
+    where
+        F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+    {
+        let Some(root) = self.root else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        let prefix_upper = prefix_upper_bound(prefix);
+        DirectPrefixVisitor {
+            store: unpublished,
+            prefix,
+            prefix_upper: prefix_upper.as_deref(),
+            visited: BTreeSet::new(),
+            last_key: None,
+            visitor,
+        }
+        .visit_node(root, 0)
     }
 
     /// Performs a binary point lookup through a bounded verified buffer pool.
@@ -334,6 +680,205 @@ impl BTree {
             tree,
             pages_written,
         })
+    }
+
+    /// Replaces the exact contents of ordered key prefixes without
+    /// materializing unrelated values.
+    ///
+    /// The caller supplies the exact keys expected below the prefixes. This
+    /// fail-closed precondition is checked before the first page append.
+    /// Unaffected leaf pages are reused byte-for-byte while internal levels
+    /// are rebuilt from bounded leaf references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BTreeError::PrefixContentsChanged`] if the immutable tree no
+    /// longer contains exactly `expected_keys` below `prefixes`,
+    /// [`BTreeError::Cancelled`] when `control` requests cancellation, and the
+    /// normal codec/storage failures for reached pages.
+    pub fn replace_prefixes_sorted_batch_with_control<F>(
+        self,
+        store: &mut PageStore,
+        creating_csn: Csn,
+        prefixes: &[Vec<u8>],
+        expected_keys: &[Vec<u8>],
+        replacements: Vec<KeyValue>,
+        mut control: F,
+    ) -> Result<BatchMutationResult, BTreeError>
+    where
+        F: FnMut() -> ControlFlow<()>,
+    {
+        #[cfg(test)]
+        PREFIX_REPLACEMENT_APPENDED_PAGES.set(0);
+        let plan = self.plan_prefixes_sorted_batch_replacement_with_control(
+            store,
+            prefixes,
+            expected_keys,
+            &replacements,
+            &mut control,
+        )?;
+        let mut unpublished = store.begin_unpublished_tail()?;
+        let result = self.replace_prefixes_sorted_batch_in_unpublished_tail_with_control(
+            &mut unpublished,
+            &plan,
+            PrefixReplacementBatch {
+                creating_csn,
+                prefixes,
+                expected_keys,
+                replacements,
+            },
+            &mut control,
+        );
+        match result {
+            Ok(result) => {
+                unpublished.finalize();
+                Ok(result)
+            }
+            Err(error) => {
+                unpublished.rollback()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Plans and conservatively bounds one exact-prefix structural rewrite.
+    ///
+    /// Planning validates every reachable page, separator, global leaf range,
+    /// balanced depth, and ancestor cycle with a stack bounded by
+    /// `MAX_TREE_HEIGHT`. It does not retain one entry per page.
+    ///
+    /// # Errors
+    ///
+    /// Returns semantic, codec, storage, or cancellation errors before any
+    /// page append occurs.
+    pub fn plan_prefixes_sorted_batch_replacement_with_control<F>(
+        self,
+        store: &PageStore,
+        prefixes: &[Vec<u8>],
+        expected_keys: &[Vec<u8>],
+        replacements: &[KeyValue],
+        control: F,
+    ) -> Result<PrefixReplacementStructuralPlan, BTreeError>
+    where
+        F: FnMut() -> ControlFlow<()>,
+    {
+        validate_prefix_replacement_inputs(prefixes, expected_keys, replacements)?;
+        let limits = PrefixReplacementStructuralLimits::new(
+            replacements.len(),
+            replacements
+                .iter()
+                .map(|(key, _)| key.len())
+                .max()
+                .unwrap_or(0),
+        )?;
+        self.plan_prefixes_sorted_batch_replacement_with_limits_and_control(store, limits, control)
+    }
+
+    /// Plans structural memory from scalar ceilings before the replacement
+    /// batch or exact expected-key set is materialized.
+    ///
+    /// Caller-owned key/value payload memory is intentionally separate. The
+    /// later execution rejects a batch exceeding either scalar ceiling before
+    /// it collects leaf references or appends a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns codec, storage, structural, or cancellation errors while
+    /// streaming the captured root.
+    pub fn plan_prefixes_sorted_batch_replacement_with_limits_and_control<F>(
+        self,
+        store: &PageStore,
+        limits: PrefixReplacementStructuralLimits,
+        mut control: F,
+    ) -> Result<PrefixReplacementStructuralPlan, BTreeError>
+    where
+        F: FnMut() -> ControlFlow<()>,
+    {
+        let stats = inspect_tree_structure_with_control(store, self.root, &mut control)?;
+        Ok(PrefixReplacementStructuralPlan {
+            generation: store.generation(),
+            root: self.root,
+            leaf_count: stats.leaf_count,
+            reachable_page_count: stats.reachable_page_count,
+            maximum_stack_depth: stats.maximum_stack_depth,
+            leaf_boundary_key_bytes: stats.leaf_boundary_key_bytes,
+            maximum_key_length: stats.maximum_key_length,
+            maximum_replacement_entries: limits.maximum_replacement_entries,
+            maximum_replacement_key_length: limits.maximum_replacement_key_length,
+            structural_peak_memory_bytes: prefix_replacement_structural_memory_bound(
+                &stats, limits,
+            ),
+        })
+    }
+
+    /// Replaces ordered prefixes inside a caller-owned unpublished tail.
+    ///
+    /// This is the exterior-validation seam: the caller may validate the
+    /// returned candidate through `unpublished` and only then call
+    /// [`UnpublishedTail::finalize`]. Returning early or dropping the
+    /// capability rolls every page appended since its opaque checkpoint back.
+    /// Candidate pages must not enter a shared buffer pool before finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same semantic, cancellation, codec, and storage errors as
+    /// [`Self::replace_prefixes_sorted_batch_with_control`].
+    pub fn replace_prefixes_sorted_batch_in_unpublished_tail_with_control<F>(
+        self,
+        unpublished: &mut UnpublishedTail<'_>,
+        plan: &PrefixReplacementStructuralPlan,
+        batch: PrefixReplacementBatch<'_>,
+        mut control: F,
+    ) -> Result<BatchMutationResult, BTreeError>
+    where
+        F: FnMut() -> ControlFlow<()>,
+    {
+        let PrefixReplacementBatch {
+            creating_csn,
+            prefixes,
+            expected_keys,
+            replacements,
+        } = batch;
+        validate_prefix_replacement_inputs(prefixes, expected_keys, &replacements)?;
+        if plan.generation != unpublished.generation() || plan.root != self.root {
+            return Err(BTreeError::ForeignSegment);
+        }
+        let actual_maximum_key_length = replacements
+            .iter()
+            .map(|(key, _)| key.len())
+            .max()
+            .unwrap_or(0);
+        if replacements.len() > plan.maximum_replacement_entries
+            || actual_maximum_key_length > plan.maximum_replacement_key_length
+        {
+            return Err(BTreeError::ForeignSegment);
+        }
+        check_mutation_control(&mut control)?;
+
+        let (leaves, observed) = collect_leaf_references_with_control(
+            unpublished,
+            self.root,
+            plan.leaf_count,
+            &mut control,
+        )?;
+        if observed.leaf_count != plan.leaf_count
+            || observed.reachable_page_count != plan.reachable_page_count
+            || observed.maximum_stack_depth != plan.maximum_stack_depth
+            || observed.leaf_boundary_key_bytes != plan.leaf_boundary_key_bytes
+            || observed.maximum_key_length != plan.maximum_key_length
+        {
+            return Err(BTreeError::ForeignSegment);
+        }
+        verify_prefix_contents(unpublished, &leaves, prefixes, expected_keys, &mut control)?;
+        check_mutation_control(&mut control)?;
+        execute_prefix_replacement(
+            unpublished,
+            creating_csn,
+            prefixes,
+            replacements,
+            &leaves,
+            &mut control,
+        )
     }
 
     fn mutate(
@@ -673,6 +1218,22 @@ struct ChildReference {
     page: PageId,
 }
 
+#[derive(Debug)]
+struct ExistingLeafReference {
+    minimum: Vec<u8>,
+    maximum: Vec<u8>,
+    page: PageId,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TreeStructuralStats {
+    leaf_count: usize,
+    reachable_page_count: usize,
+    maximum_stack_depth: usize,
+    leaf_boundary_key_bytes: usize,
+    maximum_key_length: usize,
+}
+
 enum LookupStep {
     Descend(PageId),
     Value(Option<Range<usize>>),
@@ -961,8 +1522,466 @@ fn merge_leaf_updates(entries: Vec<LeafEntry>, updates: &[LeafEntry]) -> Vec<Lea
     merged
 }
 
-fn append_leaf_level(
-    store: &mut PageStore,
+fn validate_prefix_replacement_inputs(
+    prefixes: &[Vec<u8>],
+    expected_keys: &[Vec<u8>],
+    replacements: &[KeyValue],
+) -> Result<(), BTreeError> {
+    if prefixes.is_empty()
+        || prefixes.iter().any(Vec::is_empty)
+        || prefixes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1] || pair[1].starts_with(pair[0].as_slice()))
+        || expected_keys.windows(2).any(|pair| pair[0] >= pair[1])
+        || replacements.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Err(BTreeError::NoncanonicalKeyOrder);
+    }
+    if expected_keys
+        .iter()
+        .any(|key| !key_matches_prefixes(key, prefixes))
+        || replacements
+            .iter()
+            .any(|(key, _)| !key_matches_prefixes(key, prefixes))
+    {
+        return Err(BTreeError::PrefixContentsChanged);
+    }
+    for (key, value) in replacements {
+        ensure_leaf_entry_fits(key, value)?;
+    }
+    Ok(())
+}
+
+fn verify_prefix_contents<S, F>(
+    store: &S,
+    leaves: &[ExistingLeafReference],
+    prefixes: &[Vec<u8>],
+    expected_keys: &[Vec<u8>],
+    control: &mut F,
+) -> Result<(), BTreeError>
+where
+    S: BTreePageRead,
+    F: FnMut() -> ControlFlow<()>,
+{
+    let mut expected = expected_keys.iter();
+    for leaf in leaves
+        .iter()
+        .filter(|leaf| leaf_intersects_prefixes(leaf, prefixes))
+    {
+        check_mutation_control(control)?;
+        let Node::Leaf(entries) = read_node(store, leaf.page)? else {
+            return Err(BTreeError::WrongPageKind);
+        };
+        for entry in entries
+            .into_iter()
+            .filter(|entry| key_matches_prefixes(&entry.key, prefixes))
+        {
+            if expected.next().is_none_or(|key| key != &entry.key) {
+                return Err(BTreeError::PrefixContentsChanged);
+            }
+        }
+    }
+    if expected.next().is_none() {
+        Ok(())
+    } else {
+        Err(BTreeError::PrefixContentsChanged)
+    }
+}
+
+fn key_matches_prefixes(key: &[u8], prefixes: &[Vec<u8>]) -> bool {
+    prefixes
+        .binary_search_by(|prefix| prefix.as_slice().cmp(key))
+        .is_ok_and(|index| key.starts_with(&prefixes[index]))
+        || prefixes
+            .partition_point(|prefix| prefix.as_slice() <= key)
+            .checked_sub(1)
+            .is_some_and(|index| key.starts_with(&prefixes[index]))
+}
+
+fn leaf_intersects_prefixes(leaf: &ExistingLeafReference, prefixes: &[Vec<u8>]) -> bool {
+    prefixes.iter().any(|prefix| {
+        leaf.maximum.as_slice() >= prefix.as_slice()
+            && prefix_upper_bound(prefix)
+                .is_none_or(|upper| leaf.minimum.as_slice() < upper.as_slice())
+    })
+}
+
+fn check_mutation_control<F>(control: &mut F) -> Result<(), BTreeError>
+where
+    F: FnMut() -> ControlFlow<()>,
+{
+    match control() {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(()) => Err(BTreeError::Cancelled),
+    }
+}
+
+fn prefix_replacement_structural_memory_bound(
+    stats: &TreeStructuralStats,
+    limits: PrefixReplacementStructuralLimits,
+) -> usize {
+    prefix_replacement_structural_memory_bound_parts(
+        stats.leaf_count,
+        stats.leaf_boundary_key_bytes,
+        stats.maximum_key_length,
+        limits.maximum_replacement_entries,
+        limits.maximum_replacement_key_length,
+    )
+}
+
+fn prefix_replacement_structural_memory_bound_parts(
+    leaf_count: usize,
+    leaf_boundary_key_bytes: usize,
+    maximum_tree_key_length: usize,
+    maximum_replacement_entries: usize,
+    maximum_replacement_key_length: usize,
+) -> usize {
+    let maximum_key_length = maximum_tree_key_length.max(maximum_replacement_key_length);
+    let leaf_snapshot = allocation_bound(
+        leaf_count,
+        size_of::<ExistingLeafReference>(),
+        leaf_boundary_key_bytes,
+        leaf_count.saturating_mul(2),
+    );
+    let exact_key_validation = 0;
+    let update_headers = allocation_bound(
+        maximum_replacement_entries,
+        size_of::<LeafEntry>().saturating_mul(4),
+        0,
+        2,
+    );
+    let maximum_leaf_references = leaf_count.saturating_add(maximum_replacement_entries);
+    let reference_key_bytes = maximum_leaf_references.saturating_mul(maximum_key_length);
+    let one_reference_level = allocation_bound(
+        maximum_leaf_references,
+        size_of::<ChildReference>(),
+        reference_key_bytes,
+        maximum_leaf_references,
+    );
+    // Parent construction can retain the current level's allocation while a
+    // parent vector and one encoded internal group are live.
+    let internal_assembly = one_reference_level
+        .saturating_mul(2)
+        .saturating_add(DECODED_NODE_MEMORY_BOUND);
+    let leaf_rewrite = update_headers
+        .saturating_add(DECODED_NODE_MEMORY_BOUND.saturating_mul(2))
+        .saturating_add(internal_assembly);
+    let traversal_stack = MAX_TREE_HEIGHT
+        .saturating_mul(size_of::<PageId>())
+        .saturating_add(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES);
+    leaf_snapshot
+        .saturating_add(exact_key_validation.max(leaf_rewrite))
+        .saturating_add(DECODED_NODE_MEMORY_BOUND)
+        .saturating_add(traversal_stack)
+}
+
+fn allocation_bound(
+    elements: usize,
+    element_size: usize,
+    owned_payload_bytes: usize,
+    owned_allocations: usize,
+) -> usize {
+    elements
+        .saturating_mul(element_size)
+        .saturating_add(owned_payload_bytes)
+        .saturating_add(owned_allocations.saturating_mul(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES))
+        .saturating_add(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES)
+}
+
+fn execute_prefix_replacement<F>(
+    unpublished: &mut UnpublishedTail<'_>,
+    creating_csn: Csn,
+    prefixes: &[Vec<u8>],
+    replacements: Vec<KeyValue>,
+    leaves: &[ExistingLeafReference],
+    control: &mut F,
+) -> Result<BatchMutationResult, BTreeError>
+where
+    F: FnMut() -> ControlFlow<()>,
+{
+    let starting_pages = unpublished.page_count();
+    let updates = replacements
+        .into_iter()
+        .map(|(key, value)| LeafEntry { key, value })
+        .collect::<Vec<_>>();
+    let references = if leaves.is_empty() {
+        if updates.is_empty() {
+            Vec::new()
+        } else {
+            let references = append_leaf_level(unpublished, creating_csn, updates)?;
+            observe_prefix_replacement_appends(unpublished, starting_pages);
+            references
+        }
+    } else {
+        rewrite_prefix_leaves(
+            unpublished,
+            creating_csn,
+            prefixes,
+            updates,
+            leaves,
+            starting_pages,
+            control,
+        )?
+    };
+    check_mutation_control(control)?;
+    let tree = if references.is_empty() {
+        BTree::empty()
+    } else {
+        assemble_batch_root(unpublished, creating_csn, references)?
+    };
+    let pages_written = usize::try_from(unpublished.page_count() - starting_pages)
+        .map_err(|_| BTreeError::LengthOverflow)?;
+    Ok(BatchMutationResult {
+        tree,
+        pages_written,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_prefix_leaves<F>(
+    unpublished: &mut UnpublishedTail<'_>,
+    creating_csn: Csn,
+    prefixes: &[Vec<u8>],
+    updates: Vec<LeafEntry>,
+    leaves: &[ExistingLeafReference],
+    starting_pages: u64,
+    control: &mut F,
+) -> Result<Vec<ChildReference>, BTreeError>
+where
+    F: FnMut() -> ControlFlow<()>,
+{
+    let update_count = updates.len();
+    let mut updates = updates.into_iter().peekable();
+    let mut references = Vec::with_capacity(leaves.len().saturating_add(update_count));
+    for (index, leaf) in leaves.iter().enumerate() {
+        check_mutation_control(control)?;
+        let next_minimum = leaves.get(index + 1).map(|next| next.minimum.as_slice());
+        let mut leaf_updates = Vec::new();
+        while updates
+            .peek()
+            .is_some_and(|entry| next_minimum.is_none_or(|next| entry.key.as_slice() < next))
+        {
+            if let Some(update) = updates.next() {
+                leaf_updates.push(update);
+            }
+        }
+        let touches_prefix = leaf_intersects_prefixes(leaf, prefixes);
+        if !touches_prefix && leaf_updates.is_empty() {
+            references.push(ChildReference {
+                minimum: leaf.minimum.clone(),
+                page: leaf.page,
+            });
+        } else {
+            let Node::Leaf(entries) = read_node(unpublished, leaf.page)? else {
+                return Err(BTreeError::WrongPageKind);
+            };
+            let retained = entries
+                .into_iter()
+                .filter(|entry| !key_matches_prefixes(&entry.key, prefixes))
+                .collect::<Vec<_>>();
+            let merged = merge_leaf_updates_owned(retained, leaf_updates);
+            if !merged.is_empty() {
+                references.extend(append_leaf_level(unpublished, creating_csn, merged)?);
+                observe_prefix_replacement_appends(unpublished, starting_pages);
+            }
+        }
+    }
+    if updates.next().is_some() {
+        return Err(BTreeError::NoncanonicalKeyOrder);
+    }
+    Ok(references)
+}
+
+fn merge_leaf_updates_owned(entries: Vec<LeafEntry>, updates: Vec<LeafEntry>) -> Vec<LeafEntry> {
+    let mut existing = entries.into_iter().peekable();
+    let mut merged = Vec::with_capacity(existing.len().saturating_add(updates.len()));
+    for update in updates {
+        while existing.peek().is_some_and(|entry| entry.key < update.key) {
+            if let Some(entry) = existing.next() {
+                merged.push(entry);
+            }
+        }
+        if existing.peek().is_some_and(|entry| entry.key == update.key) {
+            existing.next();
+        }
+        merged.push(update);
+    }
+    merged.extend(existing);
+    merged
+}
+
+fn observe_prefix_replacement_appends(unpublished: &UnpublishedTail<'_>, starting_pages: u64) {
+    #[cfg(test)]
+    PREFIX_REPLACEMENT_APPENDED_PAGES.set(unpublished.page_count().saturating_sub(starting_pages));
+    #[cfg(not(test))]
+    let _ = (unpublished, starting_pages);
+}
+
+fn inspect_tree_structure_with_control<S, F>(
+    store: &S,
+    root: Option<PageId>,
+    control: &mut F,
+) -> Result<TreeStructuralStats, BTreeError>
+where
+    S: BTreePageRead,
+    F: FnMut() -> ControlFlow<()>,
+{
+    let Some(root) = root else {
+        return Ok(TreeStructuralStats::default());
+    };
+    let mut stats = TreeStructuralStats::default();
+    let mut ancestry = Vec::with_capacity(MAX_TREE_HEIGHT);
+    let mut leaf_depth = None;
+    let mut previous_maximum = None;
+    walk_leaf_references_node(
+        store,
+        root,
+        None,
+        0,
+        &mut ancestry,
+        &mut leaf_depth,
+        &mut previous_maximum,
+        &mut stats,
+        control,
+        &mut |_, _, _| {},
+    )?;
+    Ok(stats)
+}
+
+fn collect_leaf_references_with_control<S, F>(
+    store: &S,
+    root: Option<PageId>,
+    leaf_capacity: usize,
+    control: &mut F,
+) -> Result<(Vec<ExistingLeafReference>, TreeStructuralStats), BTreeError>
+where
+    S: BTreePageRead,
+    F: FnMut() -> ControlFlow<()>,
+{
+    let Some(root) = root else {
+        return Ok((Vec::new(), TreeStructuralStats::default()));
+    };
+    let mut output = Vec::with_capacity(leaf_capacity);
+    let mut stats = TreeStructuralStats::default();
+    let mut ancestry = Vec::with_capacity(MAX_TREE_HEIGHT);
+    let mut leaf_depth = None;
+    let mut previous_maximum = None;
+    walk_leaf_references_node(
+        store,
+        root,
+        None,
+        0,
+        &mut ancestry,
+        &mut leaf_depth,
+        &mut previous_maximum,
+        &mut stats,
+        control,
+        &mut |page, minimum, maximum| {
+            output.push(ExistingLeafReference {
+                minimum: minimum.to_vec(),
+                maximum: maximum.to_vec(),
+                page,
+            });
+        },
+    )?;
+    Ok((output, stats))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_leaf_references_node<S, F, V>(
+    store: &S,
+    page_id: PageId,
+    expected_minimum: Option<&[u8]>,
+    depth: usize,
+    ancestry: &mut Vec<PageId>,
+    leaf_depth: &mut Option<usize>,
+    previous_maximum: &mut Option<Vec<u8>>,
+    stats: &mut TreeStructuralStats,
+    control: &mut F,
+    visitor: &mut V,
+) -> Result<Vec<u8>, BTreeError>
+where
+    S: BTreePageRead,
+    F: FnMut() -> ControlFlow<()>,
+    V: FnMut(PageId, &[u8], &[u8]),
+{
+    check_mutation_control(control)?;
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if ancestry.contains(&page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    ancestry.push(page_id);
+    stats.reachable_page_count = stats.reachable_page_count.saturating_add(1);
+    stats.maximum_stack_depth = stats.maximum_stack_depth.max(ancestry.len());
+    let result = match read_node(store, page_id)? {
+        Node::Leaf(entries) => {
+            if leaf_depth.is_some_and(|known| known != depth) {
+                return Err(BTreeError::Unbalanced);
+            }
+            *leaf_depth = Some(depth);
+            let minimum = entries.first().ok_or(BTreeError::InvalidCount)?.key.clone();
+            let maximum = entries.last().ok_or(BTreeError::InvalidCount)?.key.clone();
+            if expected_minimum.is_some_and(|expected| minimum.as_slice() != expected) {
+                return Err(BTreeError::InvalidSeparator);
+            }
+            if previous_maximum
+                .as_ref()
+                .is_some_and(|previous| previous.as_slice() >= minimum.as_slice())
+            {
+                return Err(BTreeError::NoncanonicalKeyOrder);
+            }
+            stats.leaf_count = stats.leaf_count.saturating_add(1);
+            stats.leaf_boundary_key_bytes = stats
+                .leaf_boundary_key_bytes
+                .saturating_add(minimum.len())
+                .saturating_add(maximum.len());
+            stats.maximum_key_length = stats
+                .maximum_key_length
+                .max(minimum.len())
+                .max(maximum.len());
+            visitor(page_id, &minimum, &maximum);
+            *previous_maximum = Some(maximum);
+            Ok(minimum)
+        }
+        Node::Internal { keys, children } => {
+            let mut minimum = None;
+            for (index, child) in children.into_iter().enumerate() {
+                let child_expected = if index == 0 {
+                    expected_minimum
+                } else {
+                    keys.get(index - 1).map(Vec::as_slice)
+                };
+                let child_minimum = walk_leaf_references_node(
+                    store,
+                    child,
+                    child_expected,
+                    depth + 1,
+                    ancestry,
+                    leaf_depth,
+                    previous_maximum,
+                    stats,
+                    control,
+                    visitor,
+                )?;
+                if minimum.is_none() {
+                    minimum = Some(child_minimum);
+                }
+            }
+            let minimum = minimum.ok_or(BTreeError::InvalidCount)?;
+            if expected_minimum.is_some_and(|expected| minimum.as_slice() != expected) {
+                return Err(BTreeError::InvalidSeparator);
+            }
+            Ok(minimum)
+        }
+    };
+    ancestry.pop();
+    result
+}
+
+fn append_leaf_level<S: BTreePageWrite>(
+    store: &mut S,
     creating_csn: Csn,
     entries: Vec<LeafEntry>,
 ) -> Result<Vec<ChildReference>, BTreeError> {
@@ -998,8 +2017,8 @@ fn append_leaf_level(
     Ok(references)
 }
 
-fn append_leaf_reference(
-    store: &mut PageStore,
+fn append_leaf_reference<S: BTreePageWrite>(
+    store: &mut S,
     creating_csn: Csn,
     entries: Vec<LeafEntry>,
 ) -> Result<ChildReference, BTreeError> {
@@ -1011,8 +2030,8 @@ fn append_leaf_reference(
     Ok(ChildReference { minimum, page })
 }
 
-fn append_internal_level(
-    store: &mut PageStore,
+fn append_internal_level<S: BTreePageWrite>(
+    store: &mut S,
     creating_csn: Csn,
     references: Vec<ChildReference>,
 ) -> Result<Vec<ChildReference>, BTreeError> {
@@ -1085,8 +2104,8 @@ fn internal_group_sizes(references: &[ChildReference]) -> Result<Vec<usize>, BTr
     Ok(groups)
 }
 
-fn assemble_batch_root(
-    store: &mut PageStore,
+fn assemble_batch_root<S: BTreePageWrite>(
+    store: &mut S,
     creating_csn: Csn,
     mut references: Vec<ChildReference>,
 ) -> Result<BTree, BTreeError> {
@@ -1102,16 +2121,16 @@ fn assemble_batch_root(
     Err(BTreeError::HeightExceeded)
 }
 
-fn append_node(
-    store: &mut PageStore,
+fn append_node<S: BTreePageWrite>(
+    store: &mut S,
     creating_csn: Csn,
     node: &Node,
 ) -> Result<PageId, BTreeError> {
-    Ok(store.append(node.page_kind(), Some(creating_csn), None, node.encode()?)?)
+    Ok(store.append_btree_page(node.page_kind(), Some(creating_csn), node.encode()?)?)
 }
 
-fn read_node(store: &PageStore, page_id: PageId) -> Result<Node, BTreeError> {
-    let page = store.read(page_id)?;
+fn read_node<S: BTreePageRead>(store: &S, page_id: PageId) -> Result<Node, BTreeError> {
+    let page = store.read_btree_page(page_id)?;
     decode_page(&page)
 }
 
@@ -1440,6 +2459,105 @@ fn scan_node(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_range_segments_node(
+    store: &PageStore,
+    root: PageId,
+    page_id: PageId,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    output: &mut Vec<BTreeSegment>,
+) -> Result<(), BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    match read_node(store, page_id)? {
+        Node::Leaf(entries) => {
+            let minimum = entries.first().ok_or(BTreeError::InvalidCount)?.key.clone();
+            let maximum = entries.last().ok_or(BTreeError::InvalidCount)?.key.clone();
+            if segment_intersects_bounds(&minimum, &maximum, lower, upper) {
+                output.push(BTreeSegment {
+                    root,
+                    page: page_id,
+                    minimum,
+                    maximum,
+                    entry_count: entries.len(),
+                    lower: owned_bound(lower),
+                    upper: owned_bound(upper),
+                });
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                if child_intersects_bounds(child_lower, child_upper, lower, upper) {
+                    plan_range_segments_node(
+                        store,
+                        root,
+                        child,
+                        lower,
+                        upper,
+                        depth + 1,
+                        visited,
+                        output,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn owned_bound(bound: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.to_vec()),
+        Bound::Excluded(value) => Bound::Excluded(value.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn borrowed_bound(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.as_slice()),
+        Bound::Excluded(value) => Bound::Excluded(value.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn range_is_empty(lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+    match (lower, upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
+    }
+}
+
+fn segment_intersects_bounds(
+    minimum: &[u8],
+    maximum: &[u8],
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> bool {
+    let ends_after_lower = match lower {
+        Bound::Included(bound) => maximum >= bound,
+        Bound::Excluded(bound) => maximum > bound,
+        Bound::Unbounded => true,
+    };
+    let starts_before_upper = match upper {
+        Bound::Included(bound) => minimum <= bound,
+        Bound::Excluded(bound) => minimum < bound,
+        Bound::Unbounded => true,
+    };
+    ends_after_lower && starts_before_upper
+}
+
 fn scan_prefix_node(
     store: &PageStore,
     page_id: PageId,
@@ -1479,6 +2597,68 @@ fn scan_prefix_node(
         }
     }
     Ok(())
+}
+
+struct DirectPrefixVisitor<'visit, 'store, F> {
+    store: &'visit UnpublishedTail<'store>,
+    prefix: &'visit [u8],
+    prefix_upper: Option<&'visit [u8]>,
+    visited: BTreeSet<PageId>,
+    last_key: Option<Vec<u8>>,
+    visitor: F,
+}
+
+impl<F> DirectPrefixVisitor<'_, '_, F>
+where
+    F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+{
+    fn visit_node(&mut self, page_id: PageId, depth: usize) -> Result<ControlFlow<()>, BTreeError> {
+        if depth >= MAX_TREE_HEIGHT {
+            return Err(BTreeError::HeightExceeded);
+        }
+        if !self.visited.insert(page_id) {
+            return Err(BTreeError::Cycle);
+        }
+        match read_node(self.store, page_id)? {
+            Node::Leaf(entries) => {
+                for entry in entries
+                    .into_iter()
+                    .skip_while(|entry| entry.key.as_slice() < self.prefix)
+                    .take_while(|entry| entry.key.starts_with(self.prefix))
+                {
+                    if self
+                        .last_key
+                        .as_deref()
+                        .is_some_and(|previous| previous >= entry.key.as_slice())
+                    {
+                        return Err(BTreeError::NoncanonicalKeyOrder);
+                    }
+                    self.last_key.replace(entry.key.clone());
+                    if (self.visitor)(&entry.key, &entry.value).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+            Node::Internal { keys, children } => {
+                for (index, child) in children.into_iter().enumerate() {
+                    let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                    let child_upper = keys.get(index);
+                    let ends_after_prefix =
+                        child_upper.is_none_or(|bound| bound.as_slice() > self.prefix);
+                    let starts_before_prefix_upper = self
+                        .prefix_upper
+                        .is_none_or(|bound| child_lower.is_none_or(|key| key.as_slice() < bound));
+                    if ends_after_prefix
+                        && starts_before_prefix_upper
+                        && self.visit_node(child, depth + 1)?.is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1846,9 +3026,12 @@ mod tests {
     };
 
     use hyphae_native_pages::{BufferPool, PAGE_PAYLOAD_SIZE, PageKind, PageStore};
-    use hyphae_native_types::Csn;
+    use hyphae_native_types::{Csn, PageId};
 
-    use super::{BTree, BTreeError, LeafEntry, Node, encode_leaf};
+    use super::{
+        BTree, BTreeError, LeafEntry, Node, PREFIX_REPLACEMENT_APPENDED_PAGES,
+        PrefixReplacementBatch, PrefixReplacementStructuralLimits, encode_leaf,
+    };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -1948,6 +3131,80 @@ mod tests {
             tree.scan_prefix_cached(&store, &pool, &[2])?,
             tree.scan_prefix(&store, &[2])?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_leaf_segments_plan_prune_execute_and_bind_their_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let entries = (0..2_048_u32)
+            .map(|index| {
+                (
+                    index.to_be_bytes().to_vec(),
+                    vec![u8::try_from(index % 251).unwrap_or(u8::MAX); 96],
+                )
+            })
+            .collect::<Vec<_>>();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?
+            .tree;
+        assert!(tree.height(&store)? >= 2);
+
+        let all = tree.plan_range_segments(&store, Bound::Unbounded, Bound::Unbounded)?;
+        let lower = 700_u32.to_be_bytes();
+        let upper = 1_400_u32.to_be_bytes();
+        let planned = tree.plan_range_segments(
+            &store,
+            Bound::Included(lower.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+        )?;
+        assert!(!planned.is_empty());
+        assert!(planned.len() < all.len());
+        assert!(
+            planned
+                .windows(2)
+                .all(|pair| pair[0].maximum_key() < pair[1].minimum_key())
+        );
+        assert!(planned.iter().all(|segment| segment.entry_count() > 0));
+
+        let observed = planned
+            .iter()
+            .map(|segment| tree.scan_planned_segment(&store, segment))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected = tree
+            .scan(&store)?
+            .into_iter()
+            .filter(|(key, _)| {
+                key.as_slice() >= lower.as_slice() && key.as_slice() < upper.as_slice()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        assert!(
+            tree.plan_range_segments(
+                &store,
+                Bound::Excluded(upper.as_slice()),
+                Bound::Included(lower.as_slice()),
+            )?
+            .is_empty()
+        );
+
+        let newer = tree
+            .upsert(
+                &mut store,
+                Csn::new(2)?,
+                2_048_u32.to_be_bytes().to_vec(),
+                b"new-root".to_vec(),
+            )?
+            .tree;
+        assert!(matches!(
+            newer.scan_planned_segment(&store, &planned[0]),
+            Err(BTreeError::ForeignSegment)
+        ));
         Ok(())
     }
 
@@ -2518,6 +3775,424 @@ mod tests {
             BTree::from_root(root).get_cached_pinned(&store, &pool, b"a"),
             Err(BTreeError::NoncanonicalKeyOrder)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prefix_replacement_reuses_unaffected_leaves_and_is_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let entries = (0..3_u8)
+            .flat_map(|namespace| {
+                (0..512_u32).map(move |index| {
+                    let mut key = vec![namespace];
+                    key.extend_from_slice(&index.to_be_bytes());
+                    (key, vec![namespace; 32])
+                })
+            })
+            .collect::<Vec<_>>();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?
+            .tree;
+        let before_unaffected = tree.scan_prefix(&store, &[0])?;
+        let before_pages = tree
+            .plan_range_segments(&store, Bound::Unbounded, Bound::Unbounded)?
+            .into_iter()
+            .filter(|segment| segment.maximum_key().first() == Some(&0))
+            .map(|segment| segment.page_id())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = tree
+            .scan_prefix(&store, &[1])?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let replacements = (0..7_u32)
+            .map(|index| {
+                let mut key = vec![1];
+                key.extend_from_slice(&index.to_be_bytes());
+                (key, b"replacement".to_vec())
+            })
+            .collect::<Vec<_>>();
+        let replacement = tree.replace_prefixes_sorted_batch_with_control(
+            &mut store,
+            Csn::new(2)?,
+            &[vec![1]],
+            &expected,
+            replacements.clone(),
+            || ControlFlow::Continue(()),
+        )?;
+
+        assert_eq!(
+            replacement.tree.scan_prefix(&store, &[0])?,
+            before_unaffected
+        );
+        assert_eq!(replacement.tree.scan_prefix(&store, &[1])?, replacements);
+        let after_pages = replacement
+            .tree
+            .plan_range_segments(&store, Bound::Unbounded, Bound::Unbounded)?
+            .into_iter()
+            .map(|segment| segment.page_id())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(before_pages.iter().all(|page| after_pages.contains(page)));
+        replacement.tree.validate(&store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_replacement_planner_bounds_unrelated_leaf_structure_before_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let small_directory = TestDirectory::create()?;
+        let large_directory = TestDirectory::create()?;
+        let mut small_store = PageStore::create(small_directory.page_file())?;
+        let mut large_store = PageStore::create(large_directory.page_file())?;
+        let target_key = b"target/only".to_vec();
+        let replacement = vec![(target_key.clone(), b"replacement".to_vec())];
+        let small = BTree::empty()
+            .upsert_sorted_batch(
+                &mut small_store,
+                Csn::new(1)?,
+                vec![(target_key.clone(), b"old".to_vec())],
+            )?
+            .tree;
+        let mut large_entries = (0..4_096_u32)
+            .map(|index| {
+                let mut key = b"unrelated/".to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                (key, vec![b'u'; 256])
+            })
+            .collect::<Vec<_>>();
+        large_entries.insert(0, (target_key.clone(), b"old".to_vec()));
+        large_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let large = BTree::empty()
+            .upsert_sorted_batch(&mut large_store, Csn::new(1)?, large_entries)?
+            .tree;
+
+        let small_plan = small.plan_prefixes_sorted_batch_replacement_with_control(
+            &small_store,
+            &[b"target/".to_vec()],
+            std::slice::from_ref(&target_key),
+            &replacement,
+            || ControlFlow::Continue(()),
+        )?;
+        let large_plan = large.plan_prefixes_sorted_batch_replacement_with_limits_and_control(
+            &large_store,
+            PrefixReplacementStructuralLimits::new(1, target_key.len())?,
+            || ControlFlow::Continue(()),
+        )?;
+
+        assert!(large_plan.leaf_count() > small_plan.leaf_count());
+        assert!(large_plan.reachable_page_count() > large_plan.leaf_count());
+        assert!(large_plan.maximum_stack_depth() <= super::MAX_TREE_HEIGHT);
+        assert!(
+            large_plan.structural_peak_memory_bytes() > small_plan.structural_peak_memory_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_candidate_supports_direct_validation_and_scalar_limit_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let target_key = b"target/only".to_vec();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(1)?,
+                vec![(target_key.clone(), b"old".to_vec())],
+            )?
+            .tree;
+        let plan = tree.plan_prefixes_sorted_batch_replacement_with_limits_and_control(
+            &store,
+            PrefixReplacementStructuralLimits::new(1, target_key.len())?,
+            || ControlFlow::Continue(()),
+        )?;
+        let pages_before = store.page_count();
+        {
+            let mut unpublished = store.begin_unpublished_tail()?;
+            let candidate = tree.replace_prefixes_sorted_batch_in_unpublished_tail_with_control(
+                &mut unpublished,
+                &plan,
+                PrefixReplacementBatch {
+                    creating_csn: Csn::new(2)?,
+                    prefixes: &[b"target/".to_vec()],
+                    expected_keys: std::slice::from_ref(&target_key),
+                    replacements: vec![(target_key.clone(), b"replacement".to_vec())],
+                },
+                || ControlFlow::Continue(()),
+            )?;
+            let candidate_stats = super::inspect_tree_structure_with_control(
+                &unpublished,
+                candidate.tree.root(),
+                &mut || ControlFlow::Continue(()),
+            )?;
+            assert_eq!(candidate_stats.leaf_count, plan.leaf_count());
+            assert_eq!(
+                candidate.tree.get_unpublished(&unpublished, &target_key)?,
+                Some(b"replacement".to_vec())
+            );
+            let mut visited_target = 0;
+            assert_eq!(
+                candidate.tree.visit_prefix_unpublished(
+                    &unpublished,
+                    b"target/",
+                    |key, value| {
+                        assert_eq!(key, target_key.as_slice());
+                        assert_eq!(value, b"replacement");
+                        visited_target += 1;
+                        ControlFlow::Continue(())
+                    },
+                )?,
+                ControlFlow::Continue(())
+            );
+            assert_eq!(visited_target, 1);
+            unpublished.rollback()?;
+        }
+        assert_eq!(store.page_count(), pages_before);
+        assert_eq!(tree.get(&store, &target_key)?, Some(b"old".to_vec()));
+
+        let mut unpublished = store.begin_unpublished_tail()?;
+        assert!(matches!(
+            tree.replace_prefixes_sorted_batch_in_unpublished_tail_with_control(
+                &mut unpublished,
+                &plan,
+                PrefixReplacementBatch {
+                    creating_csn: Csn::new(2)?,
+                    prefixes: &[b"target/".to_vec()],
+                    expected_keys: std::slice::from_ref(&target_key),
+                    replacements: vec![
+                        (b"target/a".to_vec(), b"one".to_vec()),
+                        (b"target/b".to_vec(), b"two".to_vec()),
+                    ],
+                },
+                || ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::ForeignSegment)
+        ));
+        assert_eq!(unpublished.appended_page_count(), 0);
+        unpublished.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_replacement_planner_rejects_duplicate_children_and_cycles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let duplicate_directory = TestDirectory::create()?;
+        let mut duplicate_store = PageStore::create(duplicate_directory.page_file())?;
+        let leaf = duplicate_store.append(
+            PageKind::BTreeLeaf,
+            Some(Csn::new(1)?),
+            None,
+            Node::Leaf(vec![LeafEntry {
+                key: b"a".to_vec(),
+                value: b"value".to_vec(),
+            }])
+            .encode()?,
+        )?;
+        let duplicate_root = duplicate_store.append(
+            PageKind::BTreeInternal,
+            Some(Csn::new(1)?),
+            None,
+            Node::Internal {
+                keys: vec![b"a".to_vec()],
+                children: vec![leaf, leaf],
+            }
+            .encode()?,
+        )?;
+        assert!(matches!(
+            BTree::from_root(duplicate_root).plan_prefixes_sorted_batch_replacement_with_control(
+                &duplicate_store,
+                &[b"z".to_vec()],
+                &[],
+                &[],
+                || ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::NoncanonicalKeyOrder)
+        ));
+
+        let cycle_directory = TestDirectory::create()?;
+        let mut cycle_store = PageStore::create(cycle_directory.page_file())?;
+        let cycle_leaf = cycle_store.append(
+            PageKind::BTreeLeaf,
+            Some(Csn::new(1)?),
+            None,
+            Node::Leaf(vec![LeafEntry {
+                key: b"a".to_vec(),
+                value: b"value".to_vec(),
+            }])
+            .encode()?,
+        )?;
+        let self_page = PageId::new(cycle_store.page_count() + 1)?;
+        let cycle_root = cycle_store.append(
+            PageKind::BTreeInternal,
+            Some(Csn::new(1)?),
+            None,
+            Node::Internal {
+                keys: vec![b"a".to_vec()],
+                children: vec![self_page, cycle_leaf],
+            }
+            .encode()?,
+        )?;
+        assert_eq!(cycle_root, self_page);
+        assert!(matches!(
+            BTree::from_root(cycle_root).plan_prefixes_sorted_batch_replacement_with_control(
+                &cycle_store,
+                &[b"z".to_vec()],
+                &[],
+                &[],
+                || ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::Cycle)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prefix_replacement_fails_before_append_on_stale_or_cancelled_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let tree = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(1)?,
+                vec![(b"target/a".to_vec(), b"one".to_vec())],
+            )?
+            .tree;
+        let pages_before = store.page_count();
+        assert!(matches!(
+            tree.replace_prefixes_sorted_batch_with_control(
+                &mut store,
+                Csn::new(2)?,
+                &[b"target/".to_vec()],
+                &[b"target/missing".to_vec()],
+                Vec::new(),
+                || ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::PrefixContentsChanged)
+        ));
+        assert_eq!(store.page_count(), pages_before);
+        assert!(matches!(
+            tree.replace_prefixes_sorted_batch_with_control(
+                &mut store,
+                Csn::new(2)?,
+                &[b"target/".to_vec()],
+                &[b"target/a".to_vec()],
+                Vec::new(),
+                || ControlFlow::Break(()),
+            ),
+            Err(BTreeError::Cancelled)
+        ));
+        assert_eq!(store.page_count(), pages_before);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prefix_replacement_rejects_cross_leaf_overlap_before_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let left = store.append(
+            PageKind::BTreeLeaf,
+            Some(Csn::new(1)?),
+            None,
+            Node::Leaf(vec![
+                LeafEntry {
+                    key: b"a".to_vec(),
+                    value: vec![1],
+                },
+                LeafEntry {
+                    key: b"c".to_vec(),
+                    value: vec![1],
+                },
+            ])
+            .encode()?,
+        )?;
+        let right = store.append(
+            PageKind::BTreeLeaf,
+            Some(Csn::new(1)?),
+            None,
+            Node::Leaf(vec![
+                LeafEntry {
+                    key: b"b".to_vec(),
+                    value: vec![2],
+                },
+                LeafEntry {
+                    key: b"d".to_vec(),
+                    value: vec![2],
+                },
+            ])
+            .encode()?,
+        )?;
+        let root = store.append(
+            PageKind::BTreeInternal,
+            Some(Csn::new(1)?),
+            None,
+            Node::Internal {
+                keys: vec![b"b".to_vec()],
+                children: vec![left, right],
+            }
+            .encode()?,
+        )?;
+        let pages_before = store.page_count();
+        assert!(matches!(
+            BTree::from_root(root).replace_prefixes_sorted_batch_with_control(
+                &mut store,
+                Csn::new(2)?,
+                &[b"z".to_vec()],
+                &[],
+                Vec::new(),
+                || ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::NoncanonicalKeyOrder)
+        ));
+        assert_eq!(store.page_count(), pages_before);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_prefix_replacement_rolls_back_a_cancelled_appended_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let page_file = temporary.page_file();
+        let mut store = PageStore::create(&page_file)?;
+        let entries = (0..1_024_u32)
+            .map(|index| {
+                let mut key = b"target/".to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                (key, vec![1; 64])
+            })
+            .collect::<Vec<_>>();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries.clone())?
+            .tree;
+        let expected = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        let pages_before = store.page_count();
+        assert!(matches!(
+            tree.replace_prefixes_sorted_batch_with_control(
+                &mut store,
+                Csn::new(2)?,
+                &[b"target/".to_vec()],
+                &expected,
+                vec![(b"target/replacement".to_vec(), vec![2; 64])],
+                || {
+                    if PREFIX_REPLACEMENT_APPENDED_PAGES.get() == 0 {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                },
+            ),
+            Err(BTreeError::Cancelled)
+        ));
+        assert!(PREFIX_REPLACEMENT_APPENDED_PAGES.get() > 0);
+        assert_eq!(store.page_count(), pages_before);
+        assert_eq!(tree.scan_prefix(&store, b"target/")?.len(), 1_024);
+        drop(store);
+        let reopened = PageStore::open(page_file)?;
+        assert_eq!(reopened.page_count(), pages_before);
+        assert_eq!(tree.scan_prefix(&reopened, b"target/")?.len(), 1_024);
         Ok(())
     }
 

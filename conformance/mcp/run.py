@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Live MCP stdio runner for the shared version 1 fixture."""
 
 from __future__ import annotations

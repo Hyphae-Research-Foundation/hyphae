@@ -170,6 +170,18 @@ Every ANN result names:
 - returned distance/score and stable ID; and
 - measured quality profile applicable to that build, when available.
 
+Explicit partition-routing receipts also bind execution to the persistent
+scheduler. `targeted_single_batches` counts one-item parallel waves accepted by
+the stable worker-local route, while `generic_single_fallback_batches` counts
+one-item waves admitted through the generic queue because that worker slot was
+busy. In one query receipt their sum is bounded by the worker-batch count and
+equals the number of one-item waves. Interval aggregation uses checked sums;
+an interval maximum is not substituted for those totals. Multi-item waves,
+direct serial execution, and a
+single-generation fallback report zero for both. G7 warm/control C1 evidence
+requires one targeted batch per observation and no generic fallback; C8 and C32
+may report bounded fallback honestly.
+
 A proof can attest to execution, inputs, graph identity, candidates and exact
 reranking. It cannot claim global nearest-neighbor optimality unless the query
 used the exact oracle.

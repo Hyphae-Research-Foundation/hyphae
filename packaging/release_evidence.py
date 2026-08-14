@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Generate and verify post-commit release evidence without self-reference."""
 
 from __future__ import annotations

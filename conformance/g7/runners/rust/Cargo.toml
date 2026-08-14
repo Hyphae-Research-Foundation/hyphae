@@ -3,6 +3,7 @@ name = "hyphae-native-g7-runner"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "AGPL-3.0-only"
 
 [dependencies]
 blake3 = "1.8.5"
@@ -13,6 +14,7 @@ hyphae-native-product = { path = "../../../../crates/hyphae-native-product" }
 hyphae-native-runtime = { path = "../../../../crates/hyphae-native-runtime" }
 hyphae-native-types = { path = "../../../../crates/hyphae-native-types" }
 hyphae-client = { path = "../../../../crates/hyphae-client" }
+ring = "0.17.14"
 serde_json = "1.0.150"
 stats_alloc = "0.1.10"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }

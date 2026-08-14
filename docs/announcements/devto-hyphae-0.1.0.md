@@ -174,7 +174,12 @@ Hyphae `0.1.0` includes:
 - Linux, macOS, and Windows archives with checksums, SBOMs, signatures, and provenance;
 - documented disk formats, recovery behavior, threat models, ADRs, and release gates.
 
-The source is licensed under Apache-2.0. The current repository is separate from historical research prototypes and the Hyphae Network project; historical sources remain frozen inputs, and only audited pieces with documented provenance may cross that boundary.
+At the time of the `0.1.0` publication described here, the source was licensed
+under Apache-2.0. The current repository is separate from historical research
+prototypes and the Hyphae Network project; historical sources remain frozen
+inputs, and only audited pieces with documented provenance may cross that
+boundary. Later repository versions may use the licensing policy current at
+their own release.
 
 ## Where I would value feedback
 

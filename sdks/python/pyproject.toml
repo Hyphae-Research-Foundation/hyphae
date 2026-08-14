@@ -7,7 +7,8 @@ name = "hyphae-sdk"
 version = "1.0.1"
 description = "Bounded Python client for Hyphae v1 and Native v2 APIs"
 requires-python = ">=3.11"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "LICENSE-DOCUMENTATION", "LICENSE-POLICY.md"]
 dependencies = []
 
 [tool.setuptools.packages.find]

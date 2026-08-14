@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
   "$id": "https://hyphae.dev/schemas/required-checks-report-v1.json",
   "title": "HyphaeRequiredChecksReportV1",
   "description": "Canonical successful GitHub Actions pull-request check runs bound to one merged Hyphae release candidate.",

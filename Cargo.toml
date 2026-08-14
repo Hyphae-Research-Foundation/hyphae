@@ -36,7 +36,7 @@ version = "1.0.1"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Celiums Solutions LLC"]
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/celiumsai/hyphae"
 homepage = "https://hyphae.dev"
 readme = "README.md"
@@ -52,6 +52,7 @@ blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 crc32c = "0.6.8"
 fs4 = "1.1.0"
+futures-channel = "0.3.31"
 futures-util = "0.3.31"
 getrandom = "0.3.4"
 http = "1.4.0"
@@ -79,6 +80,8 @@ hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=1.0.1" }
 hyphae-server = { path = "crates/hyphae-server", version = "=1.0.1" }
 hyphae-storage = { path = "crates/hyphae-storage", version = "=1.0.1" }
 libm = "0.2.16"
+libc = "0.2.186"
+nix = { version = "0.31.3", default-features = false, features = ["sched"] }
 proptest = "1.6.0"
 redb = "4.1.0"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }

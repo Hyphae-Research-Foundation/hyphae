@@ -2,6 +2,9 @@
 
 This directory is the canonical human documentation for shipped Hyphae
 behavior.
+Its prose, specifications, and diagrams are licensed under
+[`CC-BY-SA-4.0`](../LICENSE-DOCUMENTATION), subject to the trademark and
+third-party boundaries in [`LICENSE-POLICY.md`](../LICENSE-POLICY.md).
 Public wire behavior is normative in `contracts/`; durable encodings and
 reference semantics are normative in the versioned specification documents
 linked below. Tests and checked-in compatibility fixtures enforce both.
@@ -23,6 +26,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Architecture overview](architecture/overview.md)
 - [Native local ecosystem target](architecture/native-local-ecosystem.md)
 - [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
+- [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
 
 ## Build and embed
 
@@ -119,6 +123,21 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Hybrid retrieval semantics v1](retrieval/hybrid-reference-semantics-v1.md)
 - [0.2 retrieval benchmark methodology](performance/retrieval-benchmark-0.2.md)
 - [Microsecond-first performance contract](performance/microsecond-first.md)
+- [Native performance evidence v1](performance/native-performance-evidence-v1.md)
+- [Native hardware profile v1](performance/native-hardware-profile-v1.md)
+- [Native hardware calibration v1](performance/native-hardware-calibration-v1.md)
+- [Native resource governor v1](performance/native-resource-governor-v1.md)
+- [Native scheduler authority v1](performance/native-scheduler-authority-v1.md)
+- [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
+- [Native structure execution v1](performance/native-structure-execution-v1.md)
+- [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)
+- [Native ANN initial bulk publication v1](performance/native-ann-initial-bulk-publication-v1.md)
+- [Native ANN durable routing v1](performance/native-ann-durable-routing-v1.md)
+- [Native ANN retained read view v1](performance/native-ann-read-view-v1.md)
+- [Native hybrid read view v1](performance/native-hybrid-read-view-v1.md)
+- Native ANN durable local qualification v1:
+  [contract](performance/native-ann-durable-qualification-v1.md)
+- [Native SQL vector execution v1](performance/native-sql-vector-execution-v1.md)
 - [Result proof format v1](provenance/result-proof-v1.md)
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
 - [Baseline threat model](security/threat-model.md)
@@ -204,6 +223,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native bounded-WAL-replay evidence — 2026-08-02](gates/evidence/native-wal-replay-2026-08-02.md)
 - [Native manifest-retention evidence — 2026-08-02](gates/evidence/native-manifest-retention-2026-08-02.md)
 - [Native G7/G8 open readiness authority](../config/native-g7-readiness-profile.json)
+- [Native G7 provisional DigitalOcean control qualification — 2026-08-13](gates/evidence/native-g7-provisional-do-c60-2026-08-13.md)
 - [Native immutable-blob collection evidence — 2026-08-02](gates/evidence/native-blob-collection-2026-08-02.md)
 - [Native G6 exact-SHA local-product closure](gates/evidence/closures/native-g6-c57cc07.json)
 - [Native lineage-threading Linux evidence — 2026-08-02](gates/evidence/native-lineage-threading-linux-2026-08-02.md)
@@ -263,6 +283,10 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0021: Native cutover and format evolution](adr/0021-native-cutover-and-format-evolution.md)
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
+- [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
+- [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
+- [ADR-0026: Bounded calibration resampling](adr/0026-calibration-resampling-policy.md)
+- [ADR-0027: Parallel search seed cohorts](adr/0027-parallel-search-seed-cohorts.md)
 
 ## Documentation contract
 

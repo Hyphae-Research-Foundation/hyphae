@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 use hyphae_native_types::{
     CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
@@ -80,6 +80,7 @@ pub(crate) enum Opcode {
     CompactSearch = 39,
     DropSecondaryIndex = 40,
     RenameTable = 41,
+    MigrateStructureV3 = 42,
     DropTable = 43,
     CreateStream = 44,
     AppendStreamEntry = 45,
@@ -89,6 +90,8 @@ pub(crate) enum Opcode {
     ExpireSortedSet = 49,
     ConsolidateAnn = 50,
     CreateCatalogObjectV2 = 51,
+    CleanupStructureRetirementV3 = 52,
+    PublishInitialAnnBulk = 53,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -834,6 +837,12 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::CompactStructure as u8 => {
             (Opcode::CompactStructure, EngineKind::Structure)
         }
+        value if value == Opcode::MigrateStructureV3 as u8 => {
+            (Opcode::MigrateStructureV3, EngineKind::Structure)
+        }
+        value if value == Opcode::CleanupStructureRetirementV3 as u8 => {
+            (Opcode::CleanupStructureRetirementV3, EngineKind::Structure)
+        }
         value if value == Opcode::VacuumPageGeneration as u8 => {
             (Opcode::VacuumPageGeneration, EngineKind::Kernel)
         }
@@ -857,6 +866,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::DeleteVector as u8 => (Opcode::DeleteVector, EngineKind::Search),
         value if value == Opcode::ConsolidateAnn as u8 => {
             (Opcode::ConsolidateAnn, EngineKind::Search)
+        }
+        value if value == Opcode::PublishInitialAnnBulk as u8 => {
+            (Opcode::PublishInitialAnnBulk, EngineKind::Search)
         }
         value if value == Opcode::CreateCatalogObjectV2 as u8 => {
             (Opcode::CreateCatalogObjectV2, EngineKind::Kernel)
@@ -912,7 +924,20 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
         key,
     )?;
     let value = &body[value_start..expected];
+    if opcode == Opcode::CleanupStructureRetirementV3 {
+        let entry_budget = u32::from_le_bytes(
+            value
+                .try_into()
+                .map_err(|_| WalSemanticError::InvalidBody)?,
+        );
+        if !(2..=1_024).contains(&entry_budget) {
+            return Err(WalSemanticError::InvalidBody);
+        }
+    }
     if opcode == Opcode::ConsolidateAnn && !valid_ann_consolidation(value) {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    if opcode == Opcode::PublishInitialAnnBulk && !valid_initial_ann_bulk_publication(value) {
         return Err(WalSemanticError::InvalidBody);
     }
     Ok(Mutation {
@@ -932,21 +957,30 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
-    if opcode == Opcode::ConsolidateAnn {
-        if !has_target || !key.is_empty() || value_length != 112 || expires_at_micros.is_some() {
-            return Err(WalSemanticError::InvalidBody);
-        }
-        return Ok(());
+    if let Some(expected_length) = targeted_ann_maintenance_length(opcode) {
+        return validate_targeted_ann_maintenance_shape(
+            has_target,
+            value_length,
+            expected_length,
+            expires_at_micros,
+            key,
+        );
     }
     if opcode == Opcode::CreateCatalogObjectV2 {
-        if !has_target || key.is_empty() || value_length == 0 || expires_at_micros.is_some() {
+        return validate_catalog_v2_shape(has_target, value_length, expires_at_micros, key);
+    }
+    if opcode == Opcode::CleanupStructureRetirementV3 {
+        if has_target || key.is_empty() || value_length != 4 || expires_at_micros.is_some() {
             return Err(WalSemanticError::InvalidBody);
         }
         return Ok(());
     }
     if matches!(
         opcode,
-        Opcode::CompactStructure | Opcode::VacuumPageGeneration | Opcode::CompactSearch
+        Opcode::CompactStructure
+            | Opcode::MigrateStructureV3
+            | Opcode::VacuumPageGeneration
+            | Opcode::CompactSearch
     ) {
         return validate_empty_maintenance_shape(has_target, value_length, expires_at_micros, key);
     }
@@ -1024,6 +1058,45 @@ fn validate_mutation_shape(
     validate_mutation_identity(opcode, value_length, key)
 }
 
+fn targeted_ann_maintenance_length(opcode: Opcode) -> Option<usize> {
+    match opcode {
+        Opcode::ConsolidateAnn => Some(112),
+        Opcode::PublishInitialAnnBulk => Some(160),
+        _ => None,
+    }
+}
+
+fn validate_catalog_v2_shape(
+    has_target: bool,
+    value_length: usize,
+    expires_at_micros: Option<i64>,
+    key: &[u8],
+) -> Result<(), WalSemanticError> {
+    if has_target && !key.is_empty() && value_length != 0 && expires_at_micros.is_none() {
+        Ok(())
+    } else {
+        Err(WalSemanticError::InvalidBody)
+    }
+}
+
+fn validate_targeted_ann_maintenance_shape(
+    has_target: bool,
+    value_length: usize,
+    expected_length: usize,
+    expires_at_micros: Option<i64>,
+    key: &[u8],
+) -> Result<(), WalSemanticError> {
+    if has_target
+        && key.is_empty()
+        && value_length == expected_length
+        && expires_at_micros.is_none()
+    {
+        Ok(())
+    } else {
+        Err(WalSemanticError::InvalidBody)
+    }
+}
+
 fn valid_ann_consolidation(value: &[u8]) -> bool {
     value.len() == 112
         && value.get(..8) == Some(b"HYANNC01")
@@ -1031,6 +1104,21 @@ fn valid_ann_consolidation(value: &[u8]) -> bool {
         && value[40..72].iter().any(|byte| *byte != 0)
         && value[72..104].iter().any(|byte| *byte != 0)
         && (1..=4_096).contains(&read_u64(&value[104..112]))
+}
+
+fn valid_initial_ann_bulk_publication(value: &[u8]) -> bool {
+    if value.len() != 160 || value.get(..8) != Some(b"HYANNP01") {
+        return false;
+    }
+    let identities_are_nonzero = value[8..136]
+        .chunks_exact(32)
+        .all(|identity| identity.iter().any(|byte| *byte != 0));
+    let partition_count = read_u64(&value[136..144]);
+    let vector_count = read_u64(&value[144..152]);
+    identities_are_nonzero
+        && partition_count != 0
+        && partition_count <= vector_count
+        && Csn::new(read_u64(&value[152..160])).is_ok()
 }
 
 fn validate_mutation_target_shape(
@@ -1086,6 +1174,7 @@ fn validate_mutation_target_shape(
             | Opcode::UpsertVector
             | Opcode::DeleteVector
             | Opcode::ConsolidateAnn
+            | Opcode::PublishInitialAnnBulk
             | Opcode::CreateCatalogObjectV2
             | Opcode::UpdateRow
             | Opcode::DeleteRow
@@ -1430,10 +1519,84 @@ mod tests {
             decode_opcode(41)?,
             (Opcode::RenameTable, EngineKind::Relational)
         );
-        assert!(matches!(
-            decode_opcode(42),
-            Err(WalSemanticError::InvalidBody)
-        ));
+        assert_eq!(
+            decode_opcode(42)?,
+            (Opcode::MigrateStructureV3, EngineKind::Structure)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_migration_opcode_is_append_only_and_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::MigrateStructureV3 as u8, 42);
+        let migration = structure_mutation(Opcode::MigrateStructureV3, b"", b"", None);
+        let encoded = migration.encode()?;
+        assert_eq!(encoded[8], 42);
+        assert_eq!(decode_mutation(EngineKind::Structure, &encoded)?, migration);
+        for invalid in [
+            validate_mutation_shape(Opcode::MigrateStructureV3, true, 0, None, b""),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 1, None, b""),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 0, None, b"key"),
+            validate_mutation_shape(Opcode::MigrateStructureV3, false, 0, Some(1), b""),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structure_v3_retirement_cleanup_opcode_is_append_only_and_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::CleanupStructureRetirementV3 as u8, 52);
+        let cleanup = structure_mutation(
+            Opcode::CleanupStructureRetirementV3,
+            b"retirement",
+            &16_u32.to_le_bytes(),
+            None,
+        );
+        let encoded = cleanup.encode()?;
+        assert_eq!(encoded[8], 52);
+        assert_eq!(decode_mutation(EngineKind::Structure, &encoded)?, cleanup);
+        for invalid in [
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                true,
+                4,
+                None,
+                b"retirement",
+            ),
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                false,
+                0,
+                None,
+                b"retirement",
+            ),
+            validate_mutation_shape(Opcode::CleanupStructureRetirementV3, false, 4, None, b""),
+            validate_mutation_shape(
+                Opcode::CleanupStructureRetirementV3,
+                false,
+                4,
+                Some(1),
+                b"retirement",
+            ),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        for invalid_budget in [1_u32, 1_025] {
+            let invalid = structure_mutation(
+                Opcode::CleanupStructureRetirementV3,
+                b"retirement",
+                &invalid_budget.to_le_bytes(),
+                None,
+            )
+            .encode()?;
+            assert!(matches!(
+                decode_mutation(EngineKind::Structure, &invalid),
+                Err(WalSemanticError::InvalidBody)
+            ));
+        }
         Ok(())
     }
 
@@ -1790,6 +1953,74 @@ mod tests {
             decode_mutation(EngineKind::Search, &bad_magic),
             Err(WalSemanticError::InvalidBody)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_ann_bulk_publication_opcode_and_payload_are_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Opcode::PublishInitialAnnBulk as u8, 53);
+        assert_eq!(
+            decode_opcode(53)?,
+            (Opcode::PublishInitialAnnBulk, EngineKind::Search)
+        );
+        let mut value = Vec::with_capacity(160);
+        value.extend_from_slice(b"HYANNP01");
+        value.extend_from_slice(&[1; 32]);
+        value.extend_from_slice(&[2; 32]);
+        value.extend_from_slice(&[3; 32]);
+        value.extend_from_slice(&[4; 32]);
+        value.extend_from_slice(&8_u64.to_le_bytes());
+        value.extend_from_slice(&1_000_000_u64.to_le_bytes());
+        value.extend_from_slice(&99_u64.to_le_bytes());
+        let mutation = mutation(
+            EngineKind::Search,
+            Opcode::PublishInitialAnnBulk,
+            Some(ObjectId::new(3)?),
+            b"",
+            &value,
+            None,
+        );
+        let encoded = mutation.encode()?;
+        assert_eq!(encoded[8], 53);
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, mutation);
+
+        for invalid in [
+            validate_mutation_shape(Opcode::PublishInitialAnnBulk, false, 160, None, b""),
+            validate_mutation_shape(Opcode::PublishInitialAnnBulk, true, 159, None, b""),
+            validate_mutation_shape(Opcode::PublishInitialAnnBulk, true, 160, None, b"key"),
+            validate_mutation_shape(Opcode::PublishInitialAnnBulk, true, 160, Some(1), b""),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[44] ^= 1;
+        assert!(matches!(
+            decode_mutation(EngineKind::Search, &bad_magic),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        for range in [52..84, 84..116, 116..148, 148..180] {
+            let mut invalid_identity = encoded.clone();
+            invalid_identity[range].fill(0);
+            assert!(matches!(
+                decode_mutation(EngineKind::Search, &invalid_identity),
+                Err(WalSemanticError::InvalidBody)
+            ));
+        }
+        for (range, invalid_count) in [
+            (180..188, 0_u64),
+            (188..196, 0),
+            (180..188, 1_000_001),
+            (196..204, 0),
+        ] {
+            let mut invalid_field = encoded.clone();
+            invalid_field[range].copy_from_slice(&invalid_count.to_le_bytes());
+            assert!(matches!(
+                decode_mutation(EngineKind::Search, &invalid_field),
+                Err(WalSemanticError::InvalidBody)
+            ));
+        }
         Ok(())
     }
 

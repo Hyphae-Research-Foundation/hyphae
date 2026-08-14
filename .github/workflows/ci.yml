@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - dev
   workflow_dispatch:
 
 concurrency:
@@ -47,7 +46,23 @@ jobs:
           PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "$(git rev-parse HEAD)" \
-            --output native-g7-g8-readiness-audit.json
+            --output "$RUNNER_TEMP/native-g7-g8-readiness-audit.json"
+      - name: Verify Native performance evidence contract
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_hardware_profile \
+            tools.test_check_native_g7_i7i_preflight \
+            tools.test_check_native_hardware_calibration \
+            tools.test_check_native_execution_topology \
+            tools.test_check_native_governor_policy \
+            tools.test_check_native_scheduler_authority \
+            tools.test_check_native_performance_receipt \
+            tools.test_check_native_vector_bulk_bakeoff \
+            tools.test_check_native_ann_durable_qualification \
+            tools.test_run_native_ann_durable_qualification \
+            tools.test_run_native_g7 \
+            tools.test_run_native_performance_baseline \
+            -v
       - name: Verify G6 manifests
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
@@ -66,7 +81,12 @@ jobs:
           toolchain: 1.96.0
           components: clippy,rustfmt
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Verify local durable ANN qualification
+        run: |
+          PYTHONPATH=. python tools/run_native_ann_durable_qualification.py \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --output-dir "$RUNNER_TEMP/native-ann-durable-qualification"
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
@@ -75,6 +95,20 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify Linux hardware discovery and calibration receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked -p hyphae-cli -- \
+            hardware discover --data-dir "$RUNNER_TEMP" \
+            > native-hardware-profile.json
+          PYTHONPATH=. python tools/check_native_hardware_profile.py \
+            --profile native-hardware-profile.json
+          cargo run --quiet --locked -p hyphae-cli -- \
+            hardware calibrate --data-dir "$RUNNER_TEMP" --no-cache \
+            > native-hardware-calibration.json
+          PYTHONPATH=. python tools/check_native_hardware_calibration.py \
+            --receipt native-hardware-calibration.json
 
   test:
     name: Test (${{ matrix.name }})
@@ -103,7 +137,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --workspace --all-features --locked
       - name: Run native conformance profile
@@ -128,7 +162,7 @@ jobs:
 
   test-platform-push:
     name: Test (${{ matrix.name }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'))
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     strategy:
       fail-fast: false
       matrix:
@@ -152,7 +186,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run platform tests
         run: cargo test --workspace --all-features --locked
       - name: Run native conformance profile
@@ -186,7 +220,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -197,7 +231,9 @@ jobs:
         with:
           python-version: 3.11.15
       - name: Check generated SDK models
-        run: python tools/generate_sdk_models.py --check
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_generate_sdk_models -v
+          python tools/generate_sdk_models.py --check
       - name: Build and test TypeScript SDK
         working-directory: sdks/typescript
         run: |
@@ -227,7 +263,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -270,7 +306,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install artifact-bound SemVer verifier
         shell: bash
         env:

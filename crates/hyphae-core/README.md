@@ -21,5 +21,6 @@ Most applications should depend on `hyphae-engine` instead. This crate exists
 for consumers that must inspect compatibility without importing storage or
 server behavior.
 
-Apache-2.0. Source and security policy:
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source and security
+policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

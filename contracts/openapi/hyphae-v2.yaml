@@ -6,8 +6,8 @@ info:
     Optional loopback-first adapter over one existing NativeProductService.
     It never opens HyphaeEngine, a second NativeProduct, or format-2 state.
   license:
-    name: Apache-2.0
-    identifier: Apache-2.0
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
 x-hyphae-authority: existing-one-owner-native-product-service
 x-hyphae-v1-compatibility:
   exact-mappings-only: true

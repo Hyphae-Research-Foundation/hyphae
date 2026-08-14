@@ -14,6 +14,7 @@ readme = "README.md"
 
 [dependencies]
 blake3.workspace = true
+futures-channel.workspace = true
 hyphae-native-catalog.workspace = true
 hyphae-native-runtime.workspace = true
 hyphae-native-types.workspace = true

@@ -1,0 +1,56 @@
+{
+  "schema": "hyphae-native-performance-evidence-profile-v1",
+  "receipt_schema": "hyphae-native-performance-receipt-v1",
+  "progress_schema": "hyphae-native-performance-progress-v1",
+  "workload_classes": [
+    "foreground-point",
+    "foreground-bounded",
+    "mutation",
+    "bulk",
+    "maintenance",
+    "recovery",
+    "administrative"
+  ],
+  "engines": [
+    "sql",
+    "structures",
+    "lexical",
+    "vector",
+    "wal",
+    "storage",
+    "convergence"
+  ],
+  "clock_components": [
+    "admission",
+    "queueing",
+    "parse_bind_plan",
+    "engine_execution",
+    "cross_engine_fusion",
+    "wal_append",
+    "physical_synchronization",
+    "transport",
+    "result_proof_encoding",
+    "unattributed"
+  ],
+  "counters": {
+    "cpu_time": "nanoseconds",
+    "cpu_cycles": "cycles",
+    "instructions": "count",
+    "cache_misses": "count",
+    "context_switches": "count",
+    "page_faults": "count",
+    "allocations": "count",
+    "peak_rss": "bytes",
+    "bytes_read": "bytes",
+    "bytes_written": "bytes"
+  },
+  "evidence_classes": [
+    "diagnostic-baseline",
+    "regression-candidate",
+    "qualification-candidate"
+  ],
+  "states": ["warm", "cold-first-touch"],
+  "background_modes": ["control", "interference"],
+  "claims": [],
+  "closure_declared": false
+}

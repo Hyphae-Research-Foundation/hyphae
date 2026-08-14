@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Fail-closed validation for the complete controlled G7 matrix."""
 
@@ -12,7 +12,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tools.check_native_g7_receipt import CELLS, COUNTERS, GateFailure, validate
+from tools.check_native_g7_receipt import (
+    CELLS,
+    COUNTERS,
+    GateFailure,
+    resolve_expected_tree,
+    validate,
+)
 
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -20,14 +26,24 @@ STATES = {"warm"}
 CONCURRENCIES = {1, 8, 32}
 
 
-def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, Any]:
+def validate_matrix(
+    payload: dict[str, Any],
+    expected_commit: str,
+    *,
+    expected_tree: str | None = None,
+) -> dict[str, Any]:
+    source_tree = (
+        resolve_expected_tree(expected_commit)
+        if expected_tree is None
+        else expected_tree
+    )
     if set(payload) != {
         "schema", "gate", "status", "source_commit", "platform", "states",
         "concurrency", "background_modes", "receipts", "claims", "closure_declared",
     }:
         raise GateFailure("G7 matrix fields mismatch")
     if (
-        payload["schema"] != "hyphae-native-g7-matrix-v2"
+        payload["schema"] != "hyphae-native-g7-matrix-v4"
         or payload["gate"] != "G7"
         or payload["status"] != "closure-candidate"
         or payload["source_commit"] != expected_commit
@@ -46,9 +62,15 @@ def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, 
         raise GateFailure("G7 matrix must contain six warm concurrency/background receipts")
     seen: set[tuple[str, int, str]] = set()
     build_identities: set[str] = set()
+    initial_ann_bulk_identities: set[str] = set()
     dataset_digests: set[str] = set()
+    recovered_group_state_digests: set[str] = set()
     for receipt in receipts:
-        audit = validate(receipt, expected_commit)
+        audit = validate(
+            receipt,
+            expected_commit,
+            expected_tree=source_tree,
+        )
         identity = (audit["state"], audit["concurrency"], receipt["background_mode"])
         if identity in seen:
             raise GateFailure("G7 matrix has duplicate state/concurrency receipt")
@@ -58,9 +80,25 @@ def validate_matrix(payload: dict[str, Any], expected_commit: str) -> dict[str, 
         if set(receipt["counters"]) != COUNTERS:
             raise GateFailure("G7 matrix receipt is missing a required counter")
         build_identities.add(json.dumps(receipt["build"], sort_keys=True))
+        initial_ann_bulk_identities.add(
+            json.dumps(receipt["initial_ann_bulk"], sort_keys=True)
+        )
         dataset_digests.add(receipt["dataset"]["digest"])
-    if len(build_identities) != 1 or len(dataset_digests) != 1:
-        raise GateFailure("G7 matrix receipts do not share one build and dataset")
+        recovered_group_state_digests.add(
+            receipt["cells"]["strict-group-commit"]["group_commit_evidence"][
+                "reopen"
+            ]["recovered_state_digest"]
+        )
+    if (
+        len(build_identities) != 1
+        or len(initial_ann_bulk_identities) != 1
+        or len(dataset_digests) != 1
+        or len(recovered_group_state_digests) != 1
+    ):
+        raise GateFailure(
+            "G7 matrix receipts do not share one build, ANN generation, dataset, "
+            "and recovered group-commit state"
+        )
     if seen != {
         (state, concurrency, background)
         for state in STATES
@@ -119,7 +157,11 @@ def validate_closure_aggregate(payload: dict[str, Any], expected_commit: str) ->
 
 
 def validate_closure_bundle(
-    payload: dict[str, Any], evidence_root: Path, expected_commit: str
+    payload: dict[str, Any],
+    evidence_root: Path,
+    expected_commit: str,
+    *,
+    expected_tree: str | None = None,
 ) -> dict[str, Any]:
     result = validate_closure_aggregate(payload, expected_commit)
     matrix_paths = sorted(evidence_root.rglob("native-g7-matrix.json"))
@@ -129,7 +171,11 @@ def validate_closure_bundle(
     if path.is_symlink() or not path.is_file():
         raise GateFailure("G7 raw matrix must be one regular file")
     matrix = json.loads(path.read_text(encoding="utf-8"))
-    audit = validate_matrix(matrix, expected_commit)
+    audit = validate_matrix(
+        matrix,
+        expected_commit,
+        expected_tree=expected_tree,
+    )
     platform = matrix.get("platform")
     if platform not in {"linux", "darwin"} or set(payload["platforms"]) != {platform}:
         raise GateFailure("G7 raw closure matrix platform differs from the aggregate")
@@ -155,6 +201,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-tree")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--closure", action="store_true")
     parser.add_argument("--receipts", type=Path)
@@ -165,10 +212,17 @@ def main() -> int:
             if arguments.receipts is None:
                 raise GateFailure("--closure requires --receipts")
             result = validate_closure_bundle(
-                payload, arguments.receipts, arguments.expected_commit
+                payload,
+                arguments.receipts,
+                arguments.expected_commit,
+                expected_tree=arguments.expected_tree,
             )
         else:
-            result = validate_matrix(payload, arguments.expected_commit)
+            result = validate_matrix(
+                payload,
+                arguments.expected_commit,
+                expected_tree=arguments.expected_tree,
+            )
         arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     except (GateFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"native G7 matrix failed: {error}")

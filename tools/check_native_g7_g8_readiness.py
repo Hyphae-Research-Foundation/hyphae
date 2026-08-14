@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Fail-closed validation for the independent G7/G8 evidence authorities."""
 
@@ -11,9 +11,29 @@ import re
 from pathlib import Path
 from typing import Any
 
+from tools.check_native_g7_receipt import (
+    GateFailure as ReceiptGateFailure,
+    profile_authority,
+)
+
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+G8_SBOM_AUTHORITY = {
+    "id": "sbom-signatures-provenance",
+    "status": "implemented-unhosted",
+    "platforms": ["release"],
+    "runner": "python packaging/g8_release_verification.py",
+    "acceptance": [
+        "spdx",
+        "cyclonedx",
+        "manifest-license-authority",
+        "identity-completeness",
+        "checksums",
+        "cosign",
+        "provenance",
+    ],
+}
 
 
 class GateFailure(ValueError):
@@ -25,6 +45,48 @@ def load(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise GateFailure(f"{path} must contain an object")
     return value
+
+
+def validate_g7_execution_workflow(workflow: str) -> None:
+    qualification_marker = "\n  g7_qualification:\n"
+    matrix_marker = "\n  g7-matrix:\n"
+    aggregate_marker = "\n  g7-aggregate:\n"
+    try:
+        qualification_start = workflow.index(qualification_marker)
+        matrix_start = workflow.index(matrix_marker)
+        aggregate_start = workflow.index(aggregate_marker)
+    except ValueError as error:
+        raise GateFailure("G7 workflow lacks a separate pre-execution qualification job") from error
+    if not qualification_start < matrix_start < aggregate_start:
+        raise GateFailure("G7 qualification must precede dedicated execution")
+    qualification = workflow[qualification_start:matrix_start]
+    matrix = workflow[matrix_start:aggregate_start]
+    for required in (
+        "needs: [authority]",
+        "runs-on: ubuntu-24.04",
+        "needs.authority.result == 'success'",
+        "tools/run_native_ann_durable_qualification.py",
+        '--expected-commit "${{ github.sha }}"',
+    ):
+        if required not in qualification:
+            raise GateFailure("G7 qualification is not a clean exact-SHA hosted prerequisite")
+    for required in (
+        "needs: [authority, g7_qualification]",
+        "runs-on: [self-hosted, hyphae-g7, dedicated",
+        "needs.authority.result == 'success'",
+        "needs.g7_qualification.result == 'success'",
+    ):
+        if required not in matrix:
+            raise GateFailure("dedicated G7 execution is not gated by successful qualification")
+    lowered = workflow.lower()
+    for forbidden in (
+        "aws ec2 run-instances",
+        "aws cloudformation deploy",
+        "terraform apply",
+        "pulumi up",
+    ):
+        if forbidden in lowered:
+            raise GateFailure("G7 readiness workflow must not provision infrastructure")
 
 
 def validate(root: Path, expected_commit: str) -> dict[str, Any]:
@@ -53,13 +115,20 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
         "reason": "cold I/O has no universal latency target and cannot be represented by a million repeated accesses",
     }:
         raise GateFailure("G7 cold diagnostic boundary drifted")
+    try:
+        g7_authority = profile_authority(g7)
+    except ReceiptGateFailure as error:
+        raise GateFailure(str(error)) from error
     if (
         g7.get("required_background_modes") != ["control", "interference"]
-        or g7.get("minimum_hot_observations") != 1_000_000
-        or g7.get("required_dataset") != {"documents": 1_000_000, "vectors": 1_000_000, "vector_dimension": 384}
+        or g7_authority.observations != 1_000_000
+        or g7_authority.warmup != 100_000
+        or (
+            g7_authority.documents,
+            g7_authority.vectors,
+            g7_authority.vector_dimension,
+        ) != (1_000_000, 1_000_000, 384)
         or g7.get("required_hardware") != {"dedicated": True, "virtualization": "none"}
-        or set(g7.get("warm_targets_nanoseconds", {})) != set(cells) - {"strict-group-commit"}
-        or set(g7.get("advisory_targets_nanoseconds", {})) != {"strict-group-commit"}
     ):
         raise GateFailure("G7 normative measurement authority drifted")
     counters = g7.get("required_counters")
@@ -85,6 +154,12 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
             or not row["runner"]
         ):
             raise GateFailure(f"invalid G8 suite definition: {row.get('id')}")
+    sbom = next(
+        (row for row in rows if row.get("id") == "sbom-signatures-provenance"),
+        None,
+    )
+    if sbom != G8_SBOM_AUTHORITY:
+        raise GateFailure("G8 SBOM authority drifted")
     packaging = next((row for row in rows if row.get("id") == "multiplatform-packaging"), None)
     if (
         g8.get("required_platforms") != ["linux", "macos", "windows"]
@@ -107,6 +182,11 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
     for forbidden in ("native-g7-aggregate.json", "check_native_g7_matrix.py"):
         if forbidden in closure_workflow:
             raise GateFailure("G8 closure workflow must remain independent from G7")
+    validate_g7_execution_workflow(
+        (root / ".github/workflows/native-g7-g8-readiness.yml").read_text(
+            encoding="utf-8"
+        )
+    )
     return {
         "schema": "hyphae-native-g7-g8-readiness-audit-v1",
         "status": "passed",

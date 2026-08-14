@@ -1,0 +1,137 @@
+{
+  "canonical_g7_status": "open",
+  "cells": [
+    {
+      "ann_generic_fallback": 0,
+      "ann_recall_at_10": 1.0,
+      "ann_targeted": 1000000,
+      "concurrency": 1,
+      "observations_per_surface": 1000000,
+      "p50_nanos": {
+        "ann-top10-recall-095": 115995,
+        "bm25-top10": 1595,
+        "embedded-prepared-sql-primary-key": 3710,
+        "embedded-structure-point-get": 2634,
+        "filtered-bm25-top10": 1660,
+        "hybrid-top10": 118190,
+        "indexed-sql-bounded-read": 45443,
+        "local-prepared-sql-primary-key": 128761,
+        "local-structure-point-get": 123323,
+        "strict-group-commit": 138586858,
+        "two-index-join-bounded-read": 38325
+      },
+      "recovery_mismatched": 0,
+      "recovery_missing": 0,
+      "status": "passed",
+      "strict_distinct_csns": 1000000,
+      "strict_logical_commits": 1000000,
+      "surfaces": 11,
+      "warmup_per_surface": 100000
+    },
+    {
+      "ann_generic_fallback": 748701,
+      "ann_recall_at_10": 1.0,
+      "ann_targeted": 251299,
+      "concurrency": 8,
+      "observations_per_surface": 1000000,
+      "p50_nanos": {
+        "ann-top10-recall-095": 139118,
+        "bm25-top10": 3168,
+        "embedded-prepared-sql-primary-key": 10867,
+        "embedded-structure-point-get": 352043,
+        "filtered-bm25-top10": 3250,
+        "hybrid-top10": 141885,
+        "indexed-sql-bounded-read": 399870,
+        "local-prepared-sql-primary-key": 126416,
+        "local-structure-point-get": 153425,
+        "strict-group-commit": 141622215,
+        "two-index-join-bounded-read": 325779
+      },
+      "recovery_mismatched": 0,
+      "recovery_missing": 0,
+      "status": "passed",
+      "strict_distinct_csns": 1000000,
+      "strict_logical_commits": 1000000,
+      "surfaces": 11,
+      "warmup_per_surface": 100000
+    },
+    {
+      "ann_generic_fallback": 181458,
+      "ann_recall_at_10": 1.0,
+      "ann_targeted": 818542,
+      "concurrency": 32,
+      "observations_per_surface": 1000000,
+      "p50_nanos": {
+        "ann-top10-recall-095": 8397640,
+        "bm25-top10": 64335,
+        "embedded-prepared-sql-primary-key": 7224293,
+        "embedded-structure-point-get": 7026185,
+        "filtered-bm25-top10": 65369,
+        "hybrid-top10": 8409802,
+        "indexed-sql-bounded-read": 8340482,
+        "local-prepared-sql-primary-key": 287156,
+        "local-structure-point-get": 303213,
+        "strict-group-commit": 130425161,
+        "two-index-join-bounded-read": 8306193
+      },
+      "recovery_mismatched": 0,
+      "recovery_missing": 0,
+      "status": "passed",
+      "strict_distinct_csns": 1000000,
+      "strict_logical_commits": 1000000,
+      "surfaces": 11,
+      "warmup_per_surface": 100000
+    }
+  ],
+  "claims": [
+    "G7-provisional-control"
+  ],
+  "closure_declared": false,
+  "contract": {
+    "background_modes": [
+      "control"
+    ],
+    "cell_timeout_seconds": 9000,
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "database_queue_wait_millis": 60000,
+    "observations_per_surface": 1000000,
+    "stall_timeout_seconds": 1800,
+    "states": [
+      "warm"
+    ],
+    "surfaces": 11,
+    "warmup_per_surface": 100000
+  },
+  "evidence_class": "virtual-machine-control-only-provisional",
+  "generated_unix_nanos": 1786660992274927941,
+  "host": {
+    "dedicated": false,
+    "droplet_id": 592176697,
+    "provider": "DigitalOcean",
+    "ram_gib": 120,
+    "region": "nyc3",
+    "size": "c-60-intel",
+    "vcpus": 60
+  },
+  "latency": {
+    "full_run_threshold_gate": "not asserted",
+    "pilot_envelope": "2x canonical targets",
+    "status": "observed-not-normative"
+  },
+  "limitations": [
+    "virtualized non-dedicated hardware",
+    "control mode only; interference matrix omitted",
+    "quick calibration used after thorough calibration was unstable",
+    "canonical G7 latency and dedicated-hardware closure not claimed"
+  ],
+  "matrix_sha256": "3e4523dadb308a2696fed0462ecf8d4cb166578c430e84744b11bb60a75147e6",
+  "runner_override_sha256": "f8a687ecfa06b3d2433dbe6d5a92ec69cc423c562d7ea9ebc717bf200a3ceccd",
+  "schema": "hyphae-native-g7-provisional-verdict-v1",
+  "source_commit": "ff188af589eff1f6f15ac4f2e782b43f0868fa21",
+  "source_tree": "d9f6493e31b8d4c139937dd57092908421256de6",
+  "status": "provisional-passed"
+}

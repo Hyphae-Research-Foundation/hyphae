@@ -7,11 +7,10 @@ explicitly authorized.
 
 ## Branch flow
 
-`dev` is the default integration branch; every pull request targets `dev`.
-`main` is the protected release branch and only advances through a reviewed
-`dev`-to-`main` pull request once integration is green. Both branches require
-the complete hosted check suite; neither accepts direct pushes, force pushes,
-or deletions.
+`main` is the sole integration and release branch. Every pull request targets
+`main` and must pass the complete hosted check suite before merge. Direct
+pushes, force pushes, and branch deletion remain prohibited by repository
+protection; releases are tags on an exact, verified `main` commit.
 
 ## Development rules
 
@@ -44,3 +43,11 @@ Commits must be focused and must not include generated secrets, data
 directories, benchmark corpora, or attribution trailers added by automation.
 See the [development guide](docs/development.md) for contract, durable-format,
 documentation, compatibility, and release procedures.
+
+## Contribution licensing
+
+Contributors must have authority to submit their work. Unless explicitly
+accepted under different terms, submitted software, tests, machine-readable
+contracts, and tooling are licensed under `AGPL-3.0-only`; submitted
+documentation is licensed under `CC-BY-SA-4.0`. See
+[LICENSE-POLICY.md](LICENSE-POLICY.md) for the complete scope.

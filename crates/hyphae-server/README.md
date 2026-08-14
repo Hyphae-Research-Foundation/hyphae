@@ -27,5 +27,6 @@ engine API with a fixed 256 MiB aggregate scanned-input ceiling. Direct witness
 admission returns HTTP `413` `result_too_large` when the witness policy is
 exhausted.
 
-Apache-2.0. Source, threat model, and security policy:
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source, threat model, and
+security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

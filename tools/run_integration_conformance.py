@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Run optional JavaScript adapters against a live public Hyphae v1 server."""
 
 from __future__ import annotations

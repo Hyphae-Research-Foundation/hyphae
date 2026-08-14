@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-performance-receipt-v1.schema.json",
+  "title": "Hyphae Native performance receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "evidence_class",
+    "source",
+    "environment",
+    "workload",
+    "dataset",
+    "measurement",
+    "counters",
+    "correctness",
+    "claims",
+    "closure_declared"
+  ],
+  "properties": {
+    "schema": {"const": "hyphae-native-performance-receipt-v1"},
+    "status": {"const": "passed"},
+    "evidence_class": {
+      "enum": ["diagnostic-baseline", "regression-candidate", "qualification-candidate"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree", "binary_sha256", "profile_sha256", "clean"],
+      "properties": {
+        "commit": {"$ref": "#/$defs/sha1"},
+        "tree": {"$ref": "#/$defs/sha1"},
+        "binary_sha256": {"$ref": "#/$defs/sha256"},
+        "profile_sha256": {"$ref": "#/$defs/sha256"},
+        "clean": {"type": "boolean"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "target",
+        "os",
+        "compiler",
+        "build_profile",
+        "hardware_fingerprint",
+        "dedicated",
+        "virtualization",
+        "topology",
+        "affinity"
+      ],
+      "properties": {
+        "platform": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "os": {"type": "string", "minLength": 1},
+        "compiler": {"type": "string", "minLength": 1},
+        "build_profile": {"type": "string", "minLength": 1},
+        "hardware_fingerprint": {"$ref": "#/$defs/sha256"},
+        "dedicated": {"type": "boolean"},
+        "virtualization": {"type": "string", "minLength": 1},
+        "topology": {"type": "string", "minLength": 1},
+        "affinity": {"type": "string", "minLength": 1}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "engines", "operation", "parameters_sha256"],
+      "properties": {
+        "class": {
+          "enum": [
+            "foreground-point",
+            "foreground-bounded",
+            "mutation",
+            "bulk",
+            "maintenance",
+            "recovery",
+            "administrative"
+          ]
+        },
+        "engines": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["sql", "structures", "lexical", "vector", "wal", "storage", "convergence"]
+          }
+        },
+        "operation": {"type": "string", "minLength": 1},
+        "parameters_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_commit", "generator", "digest", "records", "bytes"],
+      "properties": {
+        "source_commit": {"$ref": "#/$defs/sha1"},
+        "generator": {"type": "string", "minLength": 1},
+        "digest": {"$ref": "#/$defs/sha256"},
+        "records": {"$ref": "#/$defs/nonnegativeInteger"},
+        "bytes": {"$ref": "#/$defs/nonnegativeInteger"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observations",
+        "warmup",
+        "concurrency",
+        "state",
+        "background_mode",
+        "elapsed_nanos",
+        "clock_totals_nanos"
+      ],
+      "properties": {
+        "observations": {"type": "integer", "minimum": 1},
+        "warmup": {"$ref": "#/$defs/nonnegativeInteger"},
+        "concurrency": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["warm", "cold-first-touch"]},
+        "background_mode": {"enum": ["control", "interference"]},
+        "elapsed_nanos": {"type": "integer", "minimum": 1},
+        "clock_totals_nanos": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "admission",
+            "queueing",
+            "parse_bind_plan",
+            "engine_execution",
+            "cross_engine_fusion",
+            "wal_append",
+            "physical_synchronization",
+            "transport",
+            "result_proof_encoding",
+            "unattributed"
+          ],
+          "properties": {
+            "admission": {"$ref": "#/$defs/nonnegativeInteger"},
+            "queueing": {"$ref": "#/$defs/nonnegativeInteger"},
+            "parse_bind_plan": {"$ref": "#/$defs/nonnegativeInteger"},
+            "engine_execution": {"$ref": "#/$defs/nonnegativeInteger"},
+            "cross_engine_fusion": {"$ref": "#/$defs/nonnegativeInteger"},
+            "wal_append": {"$ref": "#/$defs/nonnegativeInteger"},
+            "physical_synchronization": {"$ref": "#/$defs/nonnegativeInteger"},
+            "transport": {"$ref": "#/$defs/nonnegativeInteger"},
+            "result_proof_encoding": {"$ref": "#/$defs/nonnegativeInteger"},
+            "unattributed": {"$ref": "#/$defs/nonnegativeInteger"}
+          }
+        }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cpu_time",
+        "cpu_cycles",
+        "instructions",
+        "cache_misses",
+        "context_switches",
+        "page_faults",
+        "allocations",
+        "peak_rss",
+        "bytes_read",
+        "bytes_written"
+      ],
+      "properties": {
+        "cpu_time": {"$ref": "#/$defs/counter"},
+        "cpu_cycles": {"$ref": "#/$defs/counter"},
+        "instructions": {"$ref": "#/$defs/counter"},
+        "cache_misses": {"$ref": "#/$defs/counter"},
+        "context_switches": {"$ref": "#/$defs/counter"},
+        "page_faults": {"$ref": "#/$defs/counter"},
+        "allocations": {"$ref": "#/$defs/counter"},
+        "peak_rss": {"$ref": "#/$defs/counter"},
+        "bytes_read": {"$ref": "#/$defs/counter"},
+        "bytes_written": {"$ref": "#/$defs/counter"}
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "oracle", "result_digest"],
+      "properties": {
+        "status": {"const": "passed"},
+        "oracle": {"type": "string", "minLength": 1},
+        "result_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "claims": {"type": "array", "maxItems": 0},
+    "closure_declared": {"const": false}
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegativeInteger": {"type": "integer", "minimum": 0},
+    "counter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value", "unit", "provider", "reason"],
+      "properties": {
+        "status": {"enum": ["measured", "unsupported"]},
+        "value": {"type": ["integer", "null"], "minimum": 0},
+        "unit": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
+        "reason": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

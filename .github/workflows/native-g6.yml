@@ -68,7 +68,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: g6-${{ matrix.platform }}
 
@@ -127,7 +127,7 @@ jobs:
           PY
 
       - name: Upload exact-SHA manifest authority
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g6-manifests-${{ github.event.pull_request.head.sha || github.sha }}
           retention-days: 90
@@ -197,7 +197,7 @@ jobs:
 
       - name: Upload platform receipts
         if: github.event_name == 'push' || inputs.scope == 'candidate'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g6-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
           retention-days: 90
@@ -221,25 +221,25 @@ jobs:
           python-version: 3.13.7
 
       - name: Download exact-SHA manifest authority
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           name: native-g6-manifests-${{ github.event.pull_request.head.sha || github.sha }}
           path: manifest-artifact
 
       - name: Download Linux receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           name: native-g6-linux-${{ github.event.pull_request.head.sha || github.sha }}
           path: platform-artifacts/linux
 
       - name: Download macOS receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           name: native-g6-macos-${{ github.event.pull_request.head.sha || github.sha }}
           path: platform-artifacts/macos
 
       - name: Download Windows receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           name: native-g6-windows-${{ github.event.pull_request.head.sha || github.sha }}
           path: platform-artifacts/windows
@@ -273,7 +273,7 @@ jobs:
           PY
 
       - name: Upload exact-SHA open candidate evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g6-candidate-${{ github.event.pull_request.head.sha || github.sha }}
           retention-days: 90
@@ -307,7 +307,7 @@ jobs:
           python-version: 3.13.7
 
       - name: Download exact-SHA manifest authority
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ inputs.evidence_run_id }}
@@ -315,7 +315,7 @@ jobs:
           path: manifest-artifact
 
       - name: Download exact-SHA platform receipts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v5.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ inputs.evidence_run_id }}
@@ -362,7 +362,7 @@ jobs:
           PY
 
       - name: Upload exact-SHA open candidate evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g6-candidate-${{ inputs.evidence_sha }}
           retention-days: 90

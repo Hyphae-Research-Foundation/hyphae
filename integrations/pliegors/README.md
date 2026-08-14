@@ -28,5 +28,6 @@ mechanism.
 This crate intentionally does not prescribe or copy a PliegoRS internal state
 API. It imports no private PliegoRS API and never opens a Hyphae data directory.
 
-Apache-2.0. Source and integration boundary:
+Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source and integration
+boundary:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

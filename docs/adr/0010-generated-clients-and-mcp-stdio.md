@@ -28,7 +28,7 @@ digest headers.
 
 HTTPS uses rustls with the bundled Mozilla/CCADB trust-anchor dataset from
 `webpki-roots`. Its permissive data license, `CDLA-Permissive-2.0`, is explicit
-in `deny.toml` and `NOTICE`; it does not change Hyphae's Apache-2.0 source
+in `deny.toml` and `NOTICE`; it does not change Hyphae's AGPL-3.0-only source
 license. This avoids a platform-specific OpenSSL runtime dependency while
 keeping one cross-platform client behavior.
 

@@ -4,8 +4,8 @@ Status: normative implemented contract with direct-Linux baseline evidence;
 the lexical replacement/deletion extension has direct-Linux implementation
 and performance receipts and awaits its hosted-stack receipts.
 
-This contract exposes one explicit serial local transaction over the existing
-detached `NativeWriteBatch`. One batch captures a single immutable all-engine
+This contract exposes one explicit serial local transaction over the detached
+`NativeDeltaWriteBatch`. One batch captures a single immutable all-engine
 snapshot, stages relational SQL DML, scalar structure `SET`, and lexical
 document creation/replacement/deletion in process, and publishes every
 affected engine root under one native commit sequence number.
@@ -58,7 +58,7 @@ read-your-writes.
 
 Every request-local decode, handle, resource, or engine-semantic failure
 preserves the active batch and its operation count. A commit attempt consumes
-the batch because optimistic publication consumes `NativeWriteBatch`.
+the batch through the opaque `NativeCommitBatch` commit envelope.
 Success returns to idle. A write conflict also returns to idle and requires a
 new `BEGIN`.
 

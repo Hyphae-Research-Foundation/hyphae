@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/json-schema/native-execution-topology-v1.schema.json",
+  "title": "Hyphae Native persistent execution topology v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "hardware_fingerprint", "schedulable_compute_threads", "hard_affinity", "pools", "numa_steal_policy"],
+  "properties": {
+    "schema": {"const": "hyphae-native-execution-topology-v1"},
+    "hardware_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schedulable_compute_threads": {"type": "integer", "minimum": 1},
+    "hard_affinity": {"type": "boolean"},
+    "numa_steal_policy": {"$ref": "#/$defs/numa_steal_policy"},
+    "pools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/pool"}
+    }
+  },
+  "$defs": {
+    "nullable_id": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0},
+        {"type": "null"}
+      ]
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_index", "numa_node_id", "logical_processor_id", "socket_id", "core_id", "smt_rank"],
+      "properties": {
+        "worker_index": {"type": "integer", "minimum": 0},
+        "numa_node_id": {"$ref": "#/$defs/nullable_id"},
+        "logical_processor_id": {"$ref": "#/$defs/nullable_id"},
+        "socket_id": {"$ref": "#/$defs/nullable_id"},
+        "core_id": {"$ref": "#/$defs/nullable_id"},
+        "smt_rank": {"$ref": "#/$defs/nullable_id"}
+      }
+    },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["numa_node_id", "workers"],
+      "properties": {
+        "numa_node_id": {"$ref": "#/$defs/nullable_id"},
+        "workers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/worker"}
+        }
+      }
+    },
+    "numa_steal_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["home_numa_node_id", "remote_to_local_latency_ppm", "steal_after_nanoseconds"],
+      "properties": {
+        "home_numa_node_id": {"type": "integer", "minimum": 0},
+        "remote_to_local_latency_ppm": {"type": "integer", "minimum": 0},
+        "steal_after_nanoseconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "numa_steal_pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_numa_node_id", "steal_targets"],
+      "properties": {
+        "worker_numa_node_id": {"$ref": "#/$defs/nullable_id"},
+        "steal_targets": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/numa_steal_target"}
+        }
+      }
+    },
+    "numa_steal_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "calibration_cache_key", "status", "working_set_bytes", "foreground_burst_limit", "pools"],
+      "properties": {
+        "schema": {"const": "hyphae-native-numa-steal-policy-v1"},
+        "calibration_cache_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "status": {"enum": ["not-applicable", "disabled", "calibrated"]},
+        "working_set_bytes": {"const": 8388608},
+        "foreground_burst_limit": {"const": 16},
+        "pools": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/numa_steal_pool"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/native-vector-bulk-bakeoff-v1.schema.json",
+  "title": "Hyphae Native vector bulk-build bakeoff v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "source_commit",
+    "hardware_fingerprint",
+    "governor_calibration_cache_key",
+    "dataset",
+    "build",
+    "quality",
+    "missing_gate_evidence",
+    "claims",
+    "closure_declared"
+  ],
+  "properties": {
+    "schema": { "const": "hyphae-native-vector-bulk-bakeoff-v1" },
+    "status": { "const": "diagnostic" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "hardware_fingerprint": { "$ref": "#/$defs/digest" },
+    "governor_calibration_cache_key": { "$ref": "#/$defs/digest" },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generator", "digest", "vectors", "dimension", "metric", "corpus_construction_nanos"],
+      "properties": {
+        "generator": { "const": "hyphae-partitioned-hnsw-bakeoff-v1" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "vectors": { "$ref": "#/$defs/positive" },
+        "dimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "metric": { "const": "squared-l2" },
+        "corpus_construction_nanos": { "$ref": "#/$defs/nonnegative" }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_partitions",
+        "effective_partitions",
+        "serial_hnsw_nanos",
+        "serial_partitioned_nanos",
+        "parallel_partitioned_nanos",
+        "planned_compute_threads",
+        "planned_memory_bytes",
+        "worker_batches",
+        "single_build_identity",
+        "partitioned_build_identity",
+        "deterministic_across_serial_and_parallel",
+        "durable_publication"
+      ],
+      "properties": {
+        "requested_partitions": { "$ref": "#/$defs/positive" },
+        "effective_partitions": { "$ref": "#/$defs/positive" },
+        "serial_hnsw_nanos": { "$ref": "#/$defs/nonnegative" },
+        "serial_partitioned_nanos": { "$ref": "#/$defs/nonnegative" },
+        "parallel_partitioned_nanos": { "$ref": "#/$defs/nonnegative" },
+        "planned_compute_threads": { "$ref": "#/$defs/positive" },
+        "planned_memory_bytes": { "$ref": "#/$defs/positive" },
+        "worker_batches": { "$ref": "#/$defs/positive" },
+        "single_build_identity": { "$ref": "#/$defs/digest" },
+        "partitioned_build_identity": { "$ref": "#/$defs/digest" },
+        "deterministic_across_serial_and_parallel": { "const": true },
+        "durable_publication": { "const": false }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queries",
+        "k",
+        "ef_search",
+        "selected_partitions",
+        "single_hnsw_recall_ppm",
+        "partitioned_hnsw_recall_ppm",
+        "selected_partition_recall_ppm",
+        "minimum_single_query_recall_ppm",
+        "minimum_partitioned_query_recall_ppm",
+        "minimum_selected_query_recall_ppm",
+        "single_query_batch_nanos",
+        "partitioned_query_batch_nanos",
+        "selected_query_batch_nanos",
+        "oracle"
+      ],
+      "properties": {
+        "queries": { "$ref": "#/$defs/positive" },
+        "k": { "$ref": "#/$defs/positive" },
+        "ef_search": { "$ref": "#/$defs/positive" },
+        "selected_partitions": { "$ref": "#/$defs/positive" },
+        "single_hnsw_recall_ppm": { "$ref": "#/$defs/recall" },
+        "partitioned_hnsw_recall_ppm": { "$ref": "#/$defs/recall" },
+        "selected_partition_recall_ppm": { "$ref": "#/$defs/recall" },
+        "minimum_single_query_recall_ppm": { "$ref": "#/$defs/recall" },
+        "minimum_partitioned_query_recall_ppm": { "$ref": "#/$defs/recall" },
+        "minimum_selected_query_recall_ppm": { "$ref": "#/$defs/recall" },
+        "single_query_batch_nanos": { "$ref": "#/$defs/nonnegative" },
+        "partitioned_query_batch_nanos": { "$ref": "#/$defs/nonnegative" },
+        "selected_query_batch_nanos": { "$ref": "#/$defs/nonnegative" },
+        "oracle": { "const": "partitioned-exact-flat-canonical-top-k-v1" }
+      }
+    },
+    "missing_gate_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "claims": { "const": [] },
+    "closure_declared": { "const": false }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "positive": { "type": "integer", "minimum": 1 },
+    "nonnegative": { "type": "integer", "minimum": 0 },
+    "recall": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+  }
+}

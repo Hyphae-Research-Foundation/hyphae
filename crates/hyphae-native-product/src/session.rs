@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Product principals, authorization, sessions, and prepared handles.
 
@@ -21,7 +21,7 @@ pub const DEFAULT_PRODUCT_TRANSACTION_STATUSES: usize = 1_024;
 /// Default simultaneous explicit all-engine transactions in one session.
 pub const DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS: usize = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ActiveProductTransaction {
     pub(crate) batch: NativeWriteBatch,
     pub(crate) staged_operations: usize,
@@ -354,6 +354,10 @@ impl ProductSession {
         handle: ProductTransactionHandle,
     ) -> Option<&ActiveProductTransaction> {
         self.active_transactions.get(&handle)
+    }
+
+    pub(crate) fn has_active_transactions(&self) -> bool {
+        !self.active_transactions.is_empty()
     }
 
     pub(crate) fn replace_active_transaction(

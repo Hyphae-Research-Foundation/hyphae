@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Native copy-on-write page codec, page file, and partitioned buffer pool.
 
@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
+    ops::Deref,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -347,6 +348,17 @@ pub enum PageStoreError {
     /// Page-ID space is exhausted.
     #[error("native page ID space is exhausted")]
     PageIdExhausted,
+    /// A read targets a page outside this handle's captured complete boundary.
+    #[error("native page {0} is outside the captured page-file boundary")]
+    PageOutsideBoundary(PageId),
+    /// An unpublished-tail rollback exceeds the current complete boundary.
+    #[error("native page rollback boundary {requested} exceeds current page count {current}")]
+    InvalidRollbackBoundary {
+        /// Requested retained complete-page count.
+        requested: u64,
+        /// Current complete-page count.
+        current: u64,
+    },
 }
 
 /// Page store reopened after repairing only an incomplete final page.
@@ -366,6 +378,36 @@ pub struct PageStore {
     next_page_id: u64,
     physical_reads: AtomicU64,
     poisoned: bool,
+}
+
+/// Scoped authority over pages appended after one opaque checkpoint.
+///
+/// The capability deliberately does not expose synchronization or the
+/// underlying mutable [`PageStore`]. Candidate pages can therefore be read
+/// directly for validation, but cannot enter a shared [`BufferPool`] before
+/// [`Self::finalize`] makes their page identities stable. Dropping an
+/// unfinished capability rolls its tail back; an uncertain rollback poisons
+/// the writer fail-closed.
+#[derive(Debug)]
+pub struct UnpublishedTail<'a> {
+    store: &'a mut PageStore,
+    retained_page_count: u64,
+    finalized: bool,
+}
+
+/// Shareable immutable view of one open page-file generation.
+///
+/// This wrapper exposes only `&PageStore`, so execution workers cannot append,
+/// synchronize, truncate, or otherwise acquire mutable storage authority.
+#[derive(Debug)]
+pub struct PageStoreReader(PageStore);
+
+impl Deref for PageStoreReader {
+    type Target = PageStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl PageStore {
@@ -497,6 +539,46 @@ impl PageStore {
         self.physical_reads.load(Ordering::Relaxed)
     }
 
+    /// Duplicates the operating-system file handle as an immutable worker view.
+    ///
+    /// The reader captures the current generation and complete-page boundary.
+    /// Later appends by the sole writer remain outside that captured boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file handle cannot be duplicated.
+    pub fn read_handle(&self) -> Result<PageStoreReader, PageStoreError> {
+        Ok(PageStoreReader(PageStore {
+            file: self.file.try_clone()?,
+            generation: self.generation,
+            next_page_id: self.next_page_id,
+            physical_reads: AtomicU64::new(0),
+            poisoned: self.poisoned,
+        }))
+    }
+
+    /// Starts one scoped unpublished append transaction.
+    ///
+    /// The returned capability owns an opaque rollback checkpoint. While it
+    /// is alive, Rust's exclusive borrow prevents synchronization or direct
+    /// mutation through this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageStoreError::Poisoned`] when a prior write, sync, or
+    /// rollback left durability uncertain.
+    pub fn begin_unpublished_tail(&mut self) -> Result<UnpublishedTail<'_>, PageStoreError> {
+        if self.poisoned {
+            return Err(PageStoreError::Poisoned);
+        }
+        let retained_page_count = self.page_count();
+        Ok(UnpublishedTail {
+            store: self,
+            retained_page_count,
+            finalized: false,
+        })
+    }
+
     /// Appends one unpublished or committed copy-on-write page.
     ///
     /// # Errors
@@ -530,12 +612,46 @@ impl PageStore {
         Ok(id)
     }
 
+    fn rollback_unpublished_tail(
+        &mut self,
+        retained_page_count: u64,
+    ) -> Result<(), PageStoreError> {
+        if self.poisoned {
+            return Err(PageStoreError::Poisoned);
+        }
+        let current = self.page_count();
+        if retained_page_count > current {
+            return Err(PageStoreError::InvalidRollbackBoundary {
+                requested: retained_page_count,
+                current,
+            });
+        }
+        if retained_page_count == current {
+            return Ok(());
+        }
+        let retained_bytes = retained_page_count
+            .checked_mul(PAGE_SIZE_U64)
+            .ok_or(PageStoreError::PageIdExhausted)?;
+        self.poisoned = true;
+        if let Err(source) = self.file.set_len(retained_bytes) {
+            return Err(PageStoreError::Io(source));
+        }
+        self.next_page_id = retained_page_count
+            .checked_add(1)
+            .ok_or(PageStoreError::PageIdExhausted)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     /// Reads and verifies one page by physical identity.
     ///
     /// # Errors
     ///
     /// Returns an error for I/O, truncation, corruption, or ID mismatch.
     pub fn read(&self, id: PageId) -> Result<Page, PageStoreError> {
+        if id.get() >= self.next_page_id {
+            return Err(PageStoreError::PageOutsideBoundary(id));
+        }
         let offset = id
             .get()
             .checked_sub(1)
@@ -562,6 +678,84 @@ impl PageStore {
             return Err(PageStoreError::Io(source));
         }
         Ok(())
+    }
+}
+
+impl UnpublishedTail<'_> {
+    /// Returns this immutable page-file generation.
+    pub const fn generation(&self) -> PageGeneration {
+        self.store.generation()
+    }
+
+    /// Returns the current number of complete physical pages, including this
+    /// capability's unpublished tail.
+    pub const fn page_count(&self) -> u64 {
+        self.store.page_count()
+    }
+
+    /// Returns pages appended through this capability.
+    pub const fn appended_page_count(&self) -> u64 {
+        self.page_count() - self.retained_page_count
+    }
+
+    /// Appends one page to this unpublished tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid payload or uncertain filesystem write.
+    pub fn append(
+        &mut self,
+        kind: PageKind,
+        creating_csn: Option<Csn>,
+        next: Option<PageId>,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<PageId, PageStoreError> {
+        self.store.append(kind, creating_csn, next, payload)
+    }
+
+    /// Reads and verifies a committed or candidate page directly.
+    ///
+    /// Candidate reads intentionally cannot use [`BufferPool`]. This prevents
+    /// a rolled-back page identity from leaving stale cached bytes when that
+    /// identity is reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O, truncation, corruption, or ID mismatch.
+    pub fn read(&self, id: PageId) -> Result<Page, PageStoreError> {
+        self.store.read(id)
+    }
+
+    /// Keeps the appended tail after external candidate validation succeeds.
+    ///
+    /// This only stabilizes physical page identities; the caller remains
+    /// responsible for the ordinary root publication protocol.
+    pub fn finalize(mut self) {
+        self.finalized = true;
+    }
+
+    /// Explicitly discards this unpublished tail and reports truncation
+    /// failure to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and leaves the writer poisoned when truncation is
+    /// uncertain.
+    pub fn rollback(mut self) -> Result<(), PageStoreError> {
+        self.store
+            .rollback_unpublished_tail(self.retained_page_count)?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for UnpublishedTail<'_> {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _rollback = self
+                .store
+                .rollback_unpublished_tail(self.retained_page_count);
+        }
     }
 }
 
@@ -849,6 +1043,75 @@ mod tests {
         let store = PageStore::open(&path)?;
         assert_eq!(store.page_count(), 1);
         assert_eq!(store.read(first_id)?.payload(), b"root");
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_read_handle_freezes_the_complete_page_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let first = store.append(PageKind::HeapLeaf, None, None, b"first".to_vec())?;
+        let reader = store.read_handle()?;
+        let second = store.append(PageKind::HeapLeaf, None, None, b"second".to_vec())?;
+
+        assert_eq!(reader.page_count(), 1);
+        assert_eq!(reader.read(first)?.payload(), b"first");
+        assert!(matches!(
+            reader.read(second),
+            Err(PageStoreError::PageOutsideBoundary(page)) if page == second
+        ));
+        assert_eq!(store.read(second)?.payload(), b"second");
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_tail_rollback_preserves_published_pages_and_reuses_clean_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let path = temporary.page_file();
+        let mut store = PageStore::create(&path)?;
+        let published = store.append(PageKind::CatalogRoot, None, None, b"root".to_vec())?;
+        store.sync_data()?;
+
+        let candidate;
+        {
+            let mut unpublished = store.begin_unpublished_tail()?;
+            candidate =
+                unpublished.append(PageKind::HeapLeaf, None, None, b"discarded".to_vec())?;
+            assert_eq!(unpublished.read(candidate)?.payload(), b"discarded");
+            assert_eq!(unpublished.appended_page_count(), 1);
+            unpublished.rollback()?;
+        }
+
+        assert_eq!(store.page_count(), 1);
+        assert_eq!(store.read(published)?.payload(), b"root");
+        assert!(matches!(
+            store.read(candidate),
+            Err(PageStoreError::PageOutsideBoundary(page)) if page == candidate
+        ));
+
+        let reused = store.append(PageKind::HeapLeaf, None, None, b"replacement".to_vec())?;
+        assert_eq!(reused, candidate);
+        let pool = BufferPool::new(1, 1)?;
+        assert_eq!(
+            pool.get_or_load(&store, reused)?.page().payload(),
+            b"replacement"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_unpublished_tail_rolls_back_on_drop() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let published = store.append(PageKind::CatalogRoot, None, None, b"root".to_vec())?;
+        {
+            let mut unpublished = store.begin_unpublished_tail()?;
+            unpublished.append(PageKind::HeapLeaf, None, None, b"candidate".to_vec())?;
+        }
+        assert_eq!(store.page_count(), 1);
+        assert_eq!(store.read(published)?.payload(), b"root");
         Ok(())
     }
 

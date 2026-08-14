@@ -1,8 +1,15 @@
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
+
 # Native delta all-engine transaction v1
 
-Status: implemented and verified by
+Status: the base point-resolved execution is implemented and verified by
 [`native-delta-all-engine-transaction-linux-2026-08-03.md`](../gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md).
-The bounded delta gates pass; the wider native phase gates remain open.
+The current worktree additionally gives the point-resolved SQL, scalar,
+lexical, and exact-field V3 Hash slices a conservative batch-wide
+retained-memory ledger under the 32 MiB mutation allocation. Hash-field state
+also has an 8 MiB sub-budget inside that parent bound. The linked evidence
+predates this ledger; exact-SHA phase qualification remains required. This is
+not allocation-exact or complete P6 evidence, and G7 remains open.
 
 This contract replaces the materialized hot path behind the local
 SQL-plus-structure-plus-search transaction with a Hyphae-owned physical delta
@@ -56,7 +63,10 @@ open-time corruption detection or page verification on a buffer-pool miss.
 
 The implementation introduces one detached native delta batch captured from
 one immutable `Snapshot`. It owns no file descriptor and holds no writer
-guard between requests.
+guard between requests. It remains bound to the exact live `NativeDatabase`
+handle that created it. Staging or committing through a peer handle, a handle
+for another directory, or a reopened handle fails closed; dropping the owner
+invalidates its detached batches.
 
 The batch contains:
 
@@ -67,8 +77,18 @@ The batch contains:
   operations;
 - a relational overlay keyed by relation and encoded primary key;
 - a scalar-structure overlay keyed by binary structure key;
-- a lexical overlay keyed by search collection and document ID; and
-- exact staged-operation and byte accounting.
+- a lexical overlay keyed by search collection and document ID;
+- a conservative retained-memory ledger covering the in-scope catalog,
+  relational, scalar, lexical, mutation, identity, and container capacities;
+  and
+- an 8 MiB retained sub-ledger for the V3 Hash-field slice.
+
+The ledger uses retained input capacities and conservative container and
+mutation overheads, not an allocation-exact heap measurement. It fails closed
+when the computed upper bound exceeds the batch's admitted parent memory,
+which is at most 32 MiB. Saturating arithmetic is rejection, not permission.
+Commit replays the same retained-memory model and rejects a mismatched or
+over-cap batch before blob, page, or WAL publication.
 
 Overlay entries distinguish missing, live, expired, deleted, and replaced
 states. A later operation in the same transaction resolves against the
@@ -76,9 +96,25 @@ overlay before the immutable snapshot. This preserves sequential private
 semantics without materializing unrelated data.
 
 The batch retains the existing limit of 1,024 successfully staged local
-operations. Resource admission is fail-before-mutation: an operation that
-would exceed an operation, key, value, text, parameter, token, or aggregate
-batch bound leaves the overlay and mutation sequence unchanged.
+operations. SQL, scalar, lexical, and V3 Hash-field staging preflight the
+candidate against the aggregate parent ledger. A rejected stage restores any
+private hydration and leaves earlier staged operations committable. Hash-field
+staging must additionally fit its identity, envelope, mutation, and retained
+payload inside the 8 MiB Hash sub-budget. These are conservative checked
+bounds; they must not be described as exact request-plan or RSS accounting.
+
+`NativeDatabase::begin_optimistic_delta` returns the opaque
+`NativeDeltaWriteBatch` authority. It does not dereference, borrow, or convert
+back to the materialized `NativeWriteBatch`, so materialized reads and mutators
+are absent at compile time. Delta mutation is available only through the
+`NativeDatabase::stage_delta_*` surfaces, and delta callers use the explicit
+`Result`-returning point APIs. Internal mode and shape guards remain mandatory
+defense in depth.
+
+Detached commit entrypoints consume either batch kind through the opaque
+`NativeCommitBatch` envelope. Homogeneous singleton and group calls convert
+implicitly. A mixed materialized/delta group converts each member explicitly;
+the envelope exposes no operation or conversion back to either batch kind.
 
 ## Point-resolved staging
 
@@ -99,11 +135,13 @@ exact-primary-key requirement. Planning resolves only:
 Planning may traverse catalog and secondary-index B+tree paths, but it may not
 scan an unrelated relation or reconstruct a `RelationState`.
 
-The current named-column, parameter, type, nullability, uniqueness, and
-foreign-key failure semantics remain unchanged. If an existing semantic
-requires a bounded exact lookup, that lookup becomes part of the validation
-set. A semantic that would require a table scan remains unsupported in this
-slice rather than silently materializing the table.
+SQL delta staging requires a `HYCAT006` catalog root. An older catalog format
+is rejected as an invalid prepared mutation; staging does not rebuild or
+upgrade it implicitly. The current named-column, parameter, type, nullability,
+and uniqueness semantics remain in scope. Relations with either outbound or
+inbound foreign-key dependencies are deliberately unsupported by this delta
+slice and fail closed before mutation. They must use a separately supported
+path until bounded foreign-key validation is implemented.
 
 For a latest-snapshot update, only the version-chain head required to decode
 the current row is visited. Historical snapshot reads may follow older links
@@ -118,18 +156,34 @@ structure root. It preserves the current scalar-versus-hash/set/list/sorted
 set collision rules and computes absolute expiry from the one logical time
 sample captured at `BEGIN`.
 
-Only the addressed structure key and its expiry-index entries may be read or
-changed.
+For both `HYSTRBT2` and `HYSTRBT3`, replacement resolves the durable scalar
+envelope without reading or retaining the old payload, including an old blob.
+Only the addressed structure key, the replacement payload, and its
+expiry-index entries may be read or changed.
 
-### Immutable lexical document
+### V3 Hash points
 
-Document staging resolves the exact search collection definition and probes
-the exact document identity. It tokenizes the supplied text once and records
-only the document metadata, document terms, term metadata, and posting deltas
-required for that document.
+`HSET`, `HDEL`, and `HINCRBY` resolve one V3 Hash field without materializing
+the collection. `NativeDatabase::delta_hget` and
+`NativeDatabase::delta_ttl_hash_field` are the exact read-your-writes surfaces
+for its value and field TTL. `NativeDatabase::delta_ttl_hash` reads exact V3
+point metadata for the whole-Hash TTL, validates the typed identity and
+backlink, and returns missing, persistent, or remaining time without building
+a partial Hash map. Field `HSET` and `HINCRBY` preserve that whole-Hash TTL.
+Aggregate and scanning Hash reads remain unsupported on a delta batch.
 
-Document IDs remain immutable in this contract. Replacement and deletion are
-separate later product work; the benchmark must continue to disclose lexical
+### Exact lexical document lifecycle
+
+Create, replacement, and deletion staging resolve the exact search collection
+definition and document identity. Create rejects an already-live identity;
+replacement and deletion require one. Create and replacement tokenize the
+supplied text once and record only the document metadata, document terms, term
+metadata, and posting deltas required for that identity. Sequential lifecycle
+operations resolve through the private overlay, including replace-delete-create
+and create-delete sequences, without loading unrelated documents.
+
+Document identities are never renamed. Deletion followed by creation may reuse
+the same exact identity; the benchmark must continue to disclose lexical
 identity growth.
 
 ## Commit admission and publication
@@ -184,6 +238,8 @@ No boundary may expose a mixed engine state.
 This slice does not:
 
 - add joins, scans, DDL, prepared DML, or transaction-private reads;
+- validate inbound or outbound SQL foreign keys in a delta batch;
+- expose aggregate or scanning Hash reads on a delta batch;
 - make lexical document identities mutable;
 - change group durability;
 - remove full validation from recovery or explicit verification;
@@ -207,6 +263,16 @@ benchmark-only helper.
 ### Deterministic correctness
 
 - exact mutation, conflict-key, and overlay canonicality tests;
+- replayed conservative memory-ledger equality and parent-capacity rejection;
+- single-engine, hidden-capacity, and mixed SQL/scalar/lexical/Hash memory
+  rejection before mutation, with earlier stages still committable;
+- V2 and V3 scalar replacement without hydrating an oversized old payload;
+- `HYCAT006` SQL admission and fail-closed inbound/outbound foreign-key cases;
+- same-live-handle batch ownership across staging, commit, drop, and reopen;
+- the public delta type cannot access materialized reads or mutators, while
+  internal mode guards still prevent bypassing delta staging or its ledger;
+- exact whole-Hash TTL for persistent, due, missing, and wrong-kind V3 points,
+  preserved across staged field writes without a full-state load;
 - later-in-batch read-your-prior-write semantics for each engine;
 - semantic failure leaves the earlier overlay and operation ordinal intact;
 - latest SQL update touches only the row-version head;

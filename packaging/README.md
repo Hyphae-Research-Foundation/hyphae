@@ -1,8 +1,9 @@
 # Packaging
 
 `package.py` produces a deterministic archive containing one native `hyphae`
-binary plus the license, readme, and third-party notices. It never bundles a
-database, cache, model, provider credential, or runtime installer.
+binary plus the AGPLv3 code license, CC BY-SA documentation license, licensing
+scope policy, readme, and third-party notices. It never bundles a database,
+cache, model, provider credential, or runtime installer.
 
 ```bash
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
@@ -16,7 +17,32 @@ The release workflow builds native archives for Linux x64, macOS x64/arm64,
 and Windows x64. It emits a SHA-256 checksum file, SPDX JSON and
 CycloneDX JSON SBOMs, Sigstore bundles for every release asset, and GitHub
 Actions SLSA v1 provenance plus SBOM attestations for every native archive
-before creating a release. Every package job also extracts its own archive and
+before creating a release.
+
+The SBOM pipeline scans the exact checkout once with the pinned Syft version
+and retains Syft JSON as the pre-conversion inventory. Before producing either
+published format, [`conclude_release_sbom_licenses.py`](conclude_release_sbom_licenses.py)
+resolves every supported discovered first-party Hyphae artifact against its
+exact tracked package-manifest authority and the applicable local lock/source
+evidence. It then records `AGPL-3.0-only` as both the declared and concluded
+first-party license. Because pinned Syft does not catalog the source
+`pyproject.toml`, the same step adds the `hyphae-sdk` component explicitly with
+`foundBy = hyphae-manifest-cataloger` and that manifest as its primary evidence;
+it does not represent this component as a Syft discovery. An unsupported
+first-party package type, conflicting
+license, unknown identity, non-local first-party source, or unresolved linked
+npm package fails closed. Third-party artifacts and their observed licenses
+are never rewritten.
+
+SPDX and CycloneDX are converted from that same normalized Syft document. The
+G8 release verifier requires `AGPL-3.0-only` in every emitted first-party
+license field and exact multiset equality with the lock-derived Rust/npm
+inventory plus the explicit Python manifest component. It independently
+requires the same first-party `(name, version, purl)` multiset in both output
+formats, including duplicate observations. Thus neither published format may
+silently add, omit, or substitute a first-party identity.
+
+Every package job also extracts its own archive and
 uses only its installed binary to execute native initialization, structures,
 SQL, checkpoint, compaction, backup/restore, and doctor. The same installed
 binary exercises the retained format-2 compatibility proof path: it generates

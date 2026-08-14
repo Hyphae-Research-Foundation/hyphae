@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Command-line entry point for the single native Hyphae executable.
 
@@ -54,9 +54,10 @@ use hyphae_native_product::{
     StructureKind, VerifyBackupRequest, capabilities, verify_backup,
 };
 use hyphae_native_runtime::{
-    MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
-    MigrationObject, MigrationProofAnchor, MigrationReceipt, MigrationSource, MigrationTarget,
-    MigrationVectorSpace,
+    CalibrationMode, CalibrationRequest, GovernorMode, GovernorPolicyError, HardwareCalibration,
+    HardwareProfile, MigrationDocument, MigrationLexicalField, MigrationLexicalIndex,
+    MigrationManifest, MigrationObject, MigrationProofAnchor, MigrationReceipt, MigrationSource,
+    MigrationTarget, MigrationVectorSpace, NativeExecutionTopology, NativeGovernorPolicy,
 };
 use hyphae_query::Value as LegacyValue;
 use hyphae_storage::{
@@ -194,6 +195,11 @@ enum Command {
         #[command(subcommand)]
         operation: ExplainCommand,
     },
+    /// Discover read-only hardware capabilities for Native scheduling.
+    Hardware {
+        #[command(subcommand)]
+        operation: HardwareCommand,
+    },
     /// Report current all-engine native status.
     Status(LocalDirectory),
     /// Capture bounded process-local native telemetry.
@@ -296,6 +302,93 @@ enum Command {
         #[arg(long, env = "HYPHAE_BEARER_TOKEN_FILE")]
         bearer_token_file: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HardwareCommand {
+    /// Emit a stable hardware fingerprint and current resource snapshot.
+    Discover {
+        /// Data path whose filesystem and block device should be resolved.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Measure bounded CPU, memory, engine, storage, and WAL primitives.
+    Calibrate {
+        /// Data path whose static hardware profile identifies the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        /// Calibration duration and sample policy.
+        #[arg(long, value_enum, default_value_t = HardwareCalibrationMode::Quick)]
+        mode: HardwareCalibrationMode,
+        /// Override the per-user immutable calibration cache directory.
+        #[arg(long, conflicts_with = "no_cache")]
+        cache_dir: Option<PathBuf>,
+        /// Run without reading or writing the calibration cache.
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// Derive an inspectable resource policy from one calibration receipt.
+    GovernorPolicy {
+        /// Data path whose current static profile must match the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR", conflicts_with = "profile")]
+        data_dir: Option<PathBuf>,
+        /// Exact discovery receipt used as immutable policy authority.
+        #[arg(long, conflicts_with = "data_dir")]
+        profile: Option<PathBuf>,
+        /// Hardware calibration receipt used as the decision evidence.
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Scheduler objective used for class limits.
+        #[arg(long, value_enum, default_value_t = HardwareGovernorMode::Mixed)]
+        mode: HardwareGovernorMode,
+    },
+    /// Derive inspectable persistent worker and NUMA placement.
+    ExecutionTopology {
+        /// Data path whose current static profile must match the calibration.
+        #[arg(long, env = "HYPHAE_DATA_DIR", conflicts_with = "profile")]
+        data_dir: Option<PathBuf>,
+        /// Exact discovery receipt used as immutable topology authority.
+        #[arg(long, conflicts_with = "data_dir")]
+        profile: Option<PathBuf>,
+        /// Hardware calibration receipt used to derive the governor budget.
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Scheduler objective used for the worker budget.
+        #[arg(long, value_enum, default_value_t = HardwareGovernorMode::Mixed)]
+        mode: HardwareGovernorMode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareCalibrationMode {
+    Quick,
+    Thorough,
+}
+
+impl From<HardwareCalibrationMode> for CalibrationMode {
+    fn from(value: HardwareCalibrationMode) -> Self {
+        match value {
+            HardwareCalibrationMode::Quick => Self::Quick,
+            HardwareCalibrationMode::Thorough => Self::Thorough,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareGovernorMode {
+    Latency,
+    Bulk,
+    Mixed,
+}
+
+impl From<HardwareGovernorMode> for GovernorMode {
+    fn from(value: HardwareGovernorMode) -> Self {
+        match value {
+            HardwareGovernorMode::Latency => Self::Latency,
+            HardwareGovernorMode::Bulk => Self::Bulk,
+            HardwareGovernorMode::Mixed => Self::Mixed,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1195,6 +1288,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             transaction(&local, operation).map_err(Into::into)
         }
         Command::Explain { local, operation } => explain(&local, operation).map_err(Into::into),
+        Command::Hardware { operation } => hardware(operation).map_err(Into::into),
         Command::Status(local) => {
             dispatch(&local, ProductOperation::AdminStatus).map_err(Into::into)
         }
@@ -1296,6 +1390,208 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             bearer_token_file,
         } => compatibility(compatibility::run_mcp(&base_url, bearer_token_file.as_deref()).await),
     }
+}
+
+fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
+    let mut output = BufWriter::new(stdout().lock());
+    let mut diagnostic = BufWriter::new(stderr().lock());
+    hardware_with_writers(command, &mut output, &mut diagnostic)
+}
+
+fn hardware_with_writers(
+    command: HardwareCommand,
+    output: &mut impl Write,
+    diagnostic: &mut impl Write,
+) -> Result<(), CliFailure> {
+    match command {
+        HardwareCommand::Discover { data_dir } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            write_json(output, &serde_json::to_value(profile)?)
+        }
+        HardwareCommand::Calibrate {
+            data_dir,
+            mode,
+            cache_dir,
+            no_cache,
+        } => {
+            let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+            let profile = HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())?;
+            let request = CalibrationRequest::for_current_executable(
+                mode.into(),
+                env!("HYPHAE_RUSTC_IDENTITY"),
+                concat!("hyphae-cli/", env!("CARGO_PKG_VERSION")),
+            )
+            .map_err(|_| CliFailure::io())?;
+            let calibration = if no_cache {
+                HardwareCalibration::run(&profile, &request)
+            } else {
+                let cache_directory =
+                    cache_dir.map_or_else(default_hardware_cache_directory, Ok)?;
+                HardwareCalibration::run_cached(&profile, &request, cache_directory)
+            }
+            .map_err(|_| CliFailure::io())?;
+            write_json(output, &serde_json::to_value(calibration)?)
+        }
+        HardwareCommand::GovernorPolicy {
+            data_dir,
+            profile,
+            calibration,
+            mode,
+        } => hardware_governor_policy(data_dir, profile, &calibration, mode, output, diagnostic),
+        HardwareCommand::ExecutionTopology {
+            data_dir,
+            profile,
+            calibration,
+            mode,
+        } => hardware_execution_topology(data_dir, profile, &calibration, mode, output, diagnostic),
+    }
+}
+
+fn hardware_governor_policy(
+    data_dir: Option<PathBuf>,
+    profile_path: Option<PathBuf>,
+    calibration_path: &Path,
+    mode: HardwareGovernorMode,
+    output: &mut impl Write,
+    diagnostic: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let profile = load_or_discover_hardware_profile(data_dir, profile_path)?;
+    let calibration = read_hardware_calibration(calibration_path, diagnostic)?;
+    let policy = NativeGovernorPolicy::derive(&profile, &calibration, mode.into())
+        .map_err(|error| governor_policy_failure(&calibration, error, diagnostic))?;
+    write_json(output, &serde_json::to_value(policy)?)
+}
+
+fn hardware_execution_topology(
+    data_dir: Option<PathBuf>,
+    profile_path: Option<PathBuf>,
+    calibration_path: &Path,
+    mode: HardwareGovernorMode,
+    output: &mut impl Write,
+    diagnostic: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let profile = load_or_discover_hardware_profile(data_dir, profile_path)?;
+    let calibration = read_hardware_calibration(calibration_path, diagnostic)?;
+    let policy = NativeGovernorPolicy::derive(&profile, &calibration, mode.into())
+        .map_err(|error| governor_policy_failure(&calibration, error, diagnostic))?;
+    let topology =
+        NativeExecutionTopology::derive_with_calibration(&profile, &policy, &calibration).map_err(
+            |error| {
+                let _ignored = writeln!(
+                    diagnostic,
+                    "execution topology derivation rejected: {error}"
+                );
+                CliFailure::invalid()
+            },
+        )?;
+    write_json(output, &serde_json::to_value(topology)?)
+}
+
+fn read_hardware_calibration(
+    path: &Path,
+    diagnostic: &mut impl Write,
+) -> Result<HardwareCalibration, CliFailure> {
+    let encoded = fs::read(path).map_err(|error| {
+        let _ignored = writeln!(
+            diagnostic,
+            "cannot read hardware calibration receipt {}: {error}",
+            path.display()
+        );
+        CliFailure::io()
+    })?;
+    serde_json::from_slice(&encoded).map_err(|error| {
+        let _ignored = writeln!(
+            diagnostic,
+            "hardware calibration receipt {} is malformed: {error}",
+            path.display()
+        );
+        CliFailure::invalid()
+    })
+}
+
+fn governor_policy_failure(
+    calibration: &HardwareCalibration,
+    error: GovernorPolicyError,
+    diagnostic: &mut impl Write,
+) -> CliFailure {
+    let _ignored = writeln!(
+        diagnostic,
+        "{}",
+        governor_policy_diagnostic(calibration, error)
+    );
+    CliFailure::invalid()
+}
+
+fn governor_policy_diagnostic(
+    calibration: &HardwareCalibration,
+    error: GovernorPolicyError,
+) -> String {
+    let scaling = &calibration.thread_scaling;
+    format!(
+        "governor policy derivation rejected: {error}; thread_scaling.status={} \
+         recommended_worker_count={:?}; unstable measurements: {}",
+        scaling.status,
+        scaling.recommended_worker_count,
+        unstable_measurement_summaries(calibration).join(", ")
+    )
+}
+
+fn unstable_measurement_summaries(calibration: &HardwareCalibration) -> Vec<String> {
+    let unstable = calibration
+        .measurements
+        .iter()
+        .filter(|measurement| measurement.status != "stable")
+        .map(|measurement| {
+            format!(
+                "{}@{} ({}, mad={}ppm range={}ppm)",
+                measurement.primitive,
+                measurement.input_size,
+                measurement.status,
+                measurement.statistics.relative_mad_ppm,
+                measurement.statistics.relative_range_ppm
+            )
+        })
+        .collect::<Vec<_>>();
+    if unstable.is_empty() {
+        vec!["none".to_owned()]
+    } else {
+        unstable
+    }
+}
+
+fn load_or_discover_hardware_profile(
+    data_dir: Option<PathBuf>,
+    profile: Option<PathBuf>,
+) -> Result<HardwareProfile, CliFailure> {
+    if let Some(profile) = profile {
+        let encoded = fs::read(profile)?;
+        return HardwareProfile::from_json_slice(&encoded).map_err(|_| CliFailure::invalid());
+    }
+    let data_path = data_dir.map_or_else(std::env::current_dir, Ok)?;
+    HardwareProfile::discover(data_path).map_err(|_| CliFailure::io())
+}
+
+fn default_hardware_cache_directory() -> Result<PathBuf, CliFailure> {
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Caches"));
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        });
+
+    root.map(|root| root.join("hyphae").join("calibration"))
+        .ok_or_else(CliFailure::io)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4091,7 +4387,11 @@ const fn restore_phase(phase: RestorePhase) -> &'static str {
 
 fn print_json(value: &Value) -> Result<(), CliFailure> {
     let mut output = BufWriter::new(stdout().lock());
-    serde_json::to_writer_pretty(&mut output, value)?;
+    write_json(&mut output, value)
+}
+
+fn write_json(output: &mut impl Write, value: &Value) -> Result<(), CliFailure> {
+    serde_json::to_writer_pretty(&mut *output, value)?;
     writeln!(output)?;
     Ok(())
 }
@@ -4104,7 +4404,51 @@ fn print_error(failure: &CliFailure) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex, encode_hex, qualified_name};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{
+        Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode, decode_hex,
+        encode_hex, hardware_with_writers, qualified_name,
+    };
+    use clap::Parser;
+    use hyphae_native_runtime::{
+        CalibrationCacheStatus, CalibrationCorrectness, CalibrationCoverage,
+        CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling,
+        CalibrationMeasurement, CalibrationMode, CalibrationPolicy, CalibrationStatistics,
+        CalibrationThreadScaling, GovernorMode, HardwareCalibration, HardwareProfile,
+        NativeGovernorPolicy, SelectedCalibrationKernel, UnsupportedCalibration,
+    };
+
+    struct TemporaryDirectory(PathBuf);
+
+    static TEMPORARY_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    impl TemporaryDirectory {
+        fn create(label: &str) -> Result<Self, std::io::Error> {
+            let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "hyphae-cli-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.0.join(path)
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ignored = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn native_cli_hex_and_names_are_canonical() {
@@ -4119,5 +4463,349 @@ mod tests {
             Some("main.public.items")
         );
         assert!(qualified_name("items").is_err());
+    }
+
+    #[test]
+    fn hardware_discovery_does_not_require_a_data_directory() {
+        let cli = Cli::try_parse_from(["hyphae", "hardware", "discover"]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::Discover { data_dir: None }
+            })
+        ));
+    }
+
+    #[test]
+    fn hardware_calibration_defaults_to_quick_mode() {
+        let cli = Cli::try_parse_from(["hyphae", "hardware", "calibrate"]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::Calibrate {
+                    data_dir: None,
+                    mode: HardwareCalibrationMode::Quick,
+                    cache_dir: None,
+                    no_cache: false
+                }
+            })
+        ));
+    }
+
+    fn effective_processor_boundaries(profile: &HardwareProfile) -> (u64, u64) {
+        let logical = profile.cpu.quota_millicores.map_or(
+            profile.cpu.logical_processors_available.max(1),
+            |quota| {
+                profile.cpu.logical_processors_available.max(1).min(
+                    usize::try_from(quota.div_ceil(1_000))
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                )
+            },
+        );
+        let physical = profile
+            .cpu
+            .physical_cores_visible
+            .unwrap_or(logical)
+            .min(logical)
+            .max(1);
+        (
+            u64::try_from(physical).unwrap_or(u64::MAX),
+            u64::try_from(logical).unwrap_or(u64::MAX),
+        )
+    }
+
+    fn stable_thread_measurement(digest: &str) -> CalibrationMeasurement {
+        CalibrationMeasurement {
+            primitive: "thread-scaling-memory-scan".to_owned(),
+            variant: "persistent-workers-physical-range-unbound".to_owned(),
+            input_size: 1,
+            input_unit: "threads".to_owned(),
+            bytes_per_operation: 1_048_576,
+            operations_per_sample: 500,
+            maximum_operations_per_sample: 1 << 20,
+            sample_count: 31,
+            statistics: CalibrationStatistics {
+                unit: "picoseconds_per_operation".to_owned(),
+                minimum: 450_000_000,
+                median: 450_000_000,
+                maximum: 450_000_000,
+                median_absolute_deviation: 0,
+                relative_mad_ppm: 0,
+                relative_range_ppm: 0,
+                median_bytes_per_second: Some(2_330_168_888),
+            },
+            correctness: CalibrationCorrectness {
+                status: "passed".to_owned(),
+                result_digest_blake3: digest.to_owned(),
+                reference_digest_blake3: digest.to_owned(),
+            },
+            status: "stable".to_owned(),
+            retry_history: Vec::new(),
+        }
+    }
+
+    fn stable_io_measurement(digest: &str) -> CalibrationMeasurement {
+        CalibrationMeasurement {
+            primitive: "queue-depth-random-read".to_owned(),
+            variant: "buffered-sync-workers".to_owned(),
+            input_size: 1,
+            input_unit: "outstanding_reads".to_owned(),
+            bytes_per_operation: 4_096,
+            operations_per_sample: 64,
+            maximum_operations_per_sample: 64,
+            sample_count: 31,
+            statistics: CalibrationStatistics {
+                unit: "picoseconds_per_operation".to_owned(),
+                minimum: 3_515_625_000,
+                median: 3_515_625_000,
+                maximum: 3_515_625_000,
+                median_absolute_deviation: 0,
+                relative_mad_ppm: 0,
+                relative_range_ppm: 0,
+                median_bytes_per_second: Some(1_165_084),
+            },
+            correctness: CalibrationCorrectness {
+                status: "passed".to_owned(),
+                result_digest_blake3: digest.to_owned(),
+                reference_digest_blake3: digest.to_owned(),
+            },
+            status: "stable".to_owned(),
+            retry_history: Vec::new(),
+        }
+    }
+
+    fn current_valid_calibration_receipt(profile: &HardwareProfile) -> HardwareCalibration {
+        let digest = "ab".repeat(32);
+        let thread_measurement = stable_thread_measurement(&digest);
+        let io_measurement = stable_io_measurement(&digest);
+        let (physical_core_boundary, logical_processor_boundary) =
+            effective_processor_boundaries(profile);
+        HardwareCalibration {
+            schema: "hyphae-native-hardware-calibration-v1".to_owned(),
+            mode: CalibrationMode::Thorough,
+            status: "stable".to_owned(),
+            accepted_for_scheduling: true,
+            cache_status: CalibrationCacheStatus::Disabled,
+            elapsed_ms: 180_000,
+            identity: CalibrationIdentity {
+                hardware_fingerprint: profile.fingerprint.clone(),
+                kernel_release: profile.operating_system.kernel_release.clone(),
+                filesystem: profile.storage.filesystem.clone(),
+                compiler_identity: "rustc-test".to_owned(),
+                hyphae_build_identity: "hyphae-cli-test".to_owned(),
+                executable_blake3: digest,
+                cache_key: "cd".repeat(32),
+            },
+            policy: CalibrationPolicy {
+                minimum_duration_ms: 180_000,
+                maximum_duration_ms: 600_000,
+                warmup_batches: 4,
+                samples_per_measurement: 31,
+                target_sample_duration_ms: 225,
+                maximum_relative_mad_ppm: 40_000,
+                maximum_relative_range_ppm: 300_000,
+                measurement_retry_limit: 3,
+            },
+            feature_detection: CalibrationFeatureDetection {
+                instruction_sets: profile.cpu.instruction_sets.clone(),
+                differential_tests_passed: true,
+            },
+            measurements: vec![thread_measurement, io_measurement],
+            selected_kernels: vec![
+                SelectedCalibrationKernel {
+                    primitive: "thread-scaling-memory-scan".to_owned(),
+                    input_size: 1,
+                    input_unit: "threads".to_owned(),
+                    variant: "persistent-workers-physical-range-unbound".to_owned(),
+                    reason: "candidate passed correctness and variance policy".to_owned(),
+                },
+                SelectedCalibrationKernel {
+                    primitive: "queue-depth-random-read".to_owned(),
+                    input_size: 1,
+                    input_unit: "outstanding_reads".to_owned(),
+                    variant: "buffered-sync-workers".to_owned(),
+                    reason: "candidate passed correctness and variance policy".to_owned(),
+                },
+            ],
+            thread_scaling: CalibrationThreadScaling {
+                binding: "unbound".to_owned(),
+                physical_core_boundary,
+                logical_processor_boundary,
+                measured_thread_counts: vec![1],
+                status: "stable".to_owned(),
+                physical_peak_threads: Some(1),
+                physical_peak_bytes_per_second: Some(2_330_168_888),
+                smt_peak_threads: None,
+                smt_peak_bytes_per_second: None,
+                smt_to_physical_throughput_ppm: None,
+                smt_recommended: false,
+                recommended_worker_count: Some(1),
+                recommendation: "SMT did not clear the frozen five-percent throughput-gain threshold; use the measured physical-range peak for the recorded placement adapter".to_owned(),
+            },
+            io_scaling: CalibrationIoScaling {
+                binding: "buffered-sync-workers".to_owned(),
+                measured_queue_depths: vec![1],
+                status: "stable".to_owned(),
+                peak_queue_depth: Some(1),
+                peak_bytes_per_second: Some(1_165_084),
+                recommended_io_slots: Some(1),
+                recommendation: "use the smallest measured outstanding-read depth within five percent of peak buffered-read throughput".to_owned(),
+            },
+            coverage: CalibrationCoverage {
+                measured: vec![
+                    "queue-depth-random-read".to_owned(),
+                    "thread-scaling-memory-scan".to_owned(),
+                ],
+                unsupported: vec![
+                    UnsupportedCalibration {
+                        primitive: "simd-vector-kernels".to_owned(),
+                        reason: "safe instruction-specific candidates and differential tests are not implemented".to_owned(),
+                    },
+                    UnsupportedCalibration {
+                        primitive: "asynchronous-io-adapters".to_owned(),
+                        reason: "io_uring, IOCP, and equivalent platform-specific adapters are pending".to_owned(),
+                    },
+                ],
+            },
+            claims: Vec::new(),
+        }
+    }
+
+    fn make_thread_scaling_unavailable(
+        mut calibration: HardwareCalibration,
+    ) -> Option<HardwareCalibration> {
+        let thread_measurement = calibration
+            .measurements
+            .iter_mut()
+            .find(|measurement| measurement.primitive == "thread-scaling-memory-scan")?;
+        thread_measurement.statistics.minimum = 427_500_000;
+        thread_measurement.statistics.maximum = 477_000_000;
+        thread_measurement.statistics.median_absolute_deviation = 22_500_000;
+        thread_measurement.statistics.relative_mad_ppm = 50_000;
+        thread_measurement.statistics.relative_range_ppm = 110_000;
+        thread_measurement.status = "unstable".to_owned();
+        calibration.status = "unstable".to_owned();
+        calibration.accepted_for_scheduling = false;
+        calibration.selected_kernels.clear();
+        calibration.thread_scaling.status = "unavailable".to_owned();
+        calibration.thread_scaling.physical_peak_threads = None;
+        calibration.thread_scaling.physical_peak_bytes_per_second = None;
+        calibration.thread_scaling.smt_peak_threads = None;
+        calibration.thread_scaling.smt_peak_bytes_per_second = None;
+        calibration.thread_scaling.smt_to_physical_throughput_ppm = None;
+        calibration.thread_scaling.smt_recommended = false;
+        calibration.thread_scaling.recommended_worker_count = None;
+        calibration.thread_scaling.recommendation = "thread scaling is unavailable because at least one curve point is missing, incorrect, or unstable".to_owned();
+        Some(calibration)
+    }
+
+    #[test]
+    fn hardware_governor_policy_reports_scaling_rejection_without_stdout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TemporaryDirectory::create("governor-scaling-unavailable")?;
+        let profile = HardwareProfile::discover(&directory.0)?;
+        let profile_path = directory.join("profile.json");
+        let calibration_path = directory.join("calibration.json");
+        fs::write(&profile_path, serde_json::to_vec_pretty(&profile)?)?;
+        let valid_calibration = current_valid_calibration_receipt(&profile);
+        NativeGovernorPolicy::derive(&profile, &valid_calibration, GovernorMode::Mixed)?;
+        let rejected_calibration = make_thread_scaling_unavailable(valid_calibration)
+            .ok_or("current receipt has no thread-scaling measurement")?;
+        fs::write(
+            &calibration_path,
+            serde_json::to_vec_pretty(&rejected_calibration)?,
+        )?;
+
+        let cli = Cli::try_parse_from([
+            OsString::from("hyphae"),
+            OsString::from("hardware"),
+            OsString::from("governor-policy"),
+            OsString::from("--profile"),
+            profile_path.into_os_string(),
+            OsString::from("--calibration"),
+            calibration_path.into_os_string(),
+        ])?;
+        let Command::Hardware { operation } = cli.command else {
+            return Err("expected hardware command".into());
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let Err(failure) = hardware_with_writers(operation, &mut stdout, &mut stderr) else {
+            return Err("unstable thread scaling did not fail closed".into());
+        };
+
+        assert_eq!(failure.exit_class(), 2);
+        assert_eq!(failure.error().code().as_str(), "invalid_request");
+        assert!(stdout.is_empty(), "rejected policy emitted stdout");
+        let diagnostic = String::from_utf8(stderr)?;
+        assert!(diagnostic.contains("stable thread-scaling recommendation is unavailable"));
+        assert!(diagnostic.contains("thread_scaling.status=unavailable"));
+        assert!(
+            diagnostic
+                .contains("thread-scaling-memory-scan@1 (unstable, mad=50000ppm range=110000ppm)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hardware_governor_policy_defaults_to_mixed_mode() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "governor-policy",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::GovernorPolicy {
+                    data_dir: None,
+                    profile: None,
+                    calibration,
+                    mode: HardwareGovernorMode::Mixed,
+                }
+            }) if calibration == Path::new("receipt.json")
+        ));
+    }
+
+    #[test]
+    fn hardware_execution_topology_defaults_to_mixed_mode() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "execution-topology",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(matches!(
+            cli.map(|value| value.command),
+            Ok(Command::Hardware {
+                operation: HardwareCommand::ExecutionTopology {
+                    data_dir: None,
+                    profile: None,
+                    calibration,
+                    mode: HardwareGovernorMode::Mixed,
+                }
+            }) if calibration == Path::new("receipt.json")
+        ));
+    }
+
+    #[test]
+    fn hardware_policy_profile_conflicts_with_live_discovery() {
+        let cli = Cli::try_parse_from([
+            "hyphae",
+            "hardware",
+            "governor-policy",
+            "--data-dir",
+            "data",
+            "--profile",
+            "profile.json",
+            "--calibration",
+            "receipt.json",
+        ]);
+        assert!(cli.is_err());
     }
 }

@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/contracts/native-ann-durable-qualification-v1.schema.json",
+  "title": "Hyphae Native ANN durable local qualification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "source",
+    "dataset",
+    "build",
+    "quality",
+    "lifecycle",
+    "missing_gate_evidence",
+    "claims",
+    "closure_declared"
+  ],
+  "properties": {
+    "schema": { "const": "hyphae-native-ann-durable-qualification-v1" },
+    "status": { "const": "diagnostic" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree", "clean"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/sha" },
+        "tree": { "$ref": "#/$defs/sha" },
+        "clean": { "const": true }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generator", "digest", "vectors", "dimension", "metric"],
+      "properties": {
+        "generator": { "const": "hyphae-ann-durable-qualification-corpus-v2" },
+        "digest": { "$ref": "#/$defs/identity" },
+        "vectors": { "const": 512 },
+        "dimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "metric": { "enum": ["squared-l2", "cosine", "negative-dot"] }
+      }
+    },
+    "build": { "$ref": "#/$defs/build" },
+    "quality": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/quality" }
+      ]
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial_reopen", "delta", "consolidation", "final_reopen"],
+      "properties": {
+        "initial_reopen": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/initial_reopen" }
+          ]
+        },
+        "delta": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/delta" }
+          ]
+        },
+        "consolidation": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/consolidation" }
+          ]
+        },
+        "final_reopen": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/final_reopen" }
+          ]
+        }
+      }
+    },
+    "missing_gate_evidence": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "adaptive-routing-certification",
+          "consolidation-visibility",
+          "delta-visibility",
+          "durable-reopen",
+          "full-fanout-equality",
+          "post-consolidation-reopen",
+          "selected-recall-floor"
+        ]
+      }
+    },
+    "claims": { "const": [] },
+    "closure_declared": { "const": false }
+  },
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "positive": { "type": "integer", "minimum": 1 },
+    "nonnegative": { "type": "integer", "minimum": 0 },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "builder",
+        "input_identity",
+        "aggregate_identity",
+        "expected_base_identity",
+        "expected_view_identity",
+        "published_base_identity",
+        "published_view_identity",
+        "vector_count",
+        "logical_partitions",
+        "planned_workers",
+        "planned_memory_bytes",
+        "worker_batches",
+        "routing_policy"
+      ],
+      "properties": {
+        "builder": { "const": "partitioned-hnsw-v1" },
+        "input_identity": { "$ref": "#/$defs/identity" },
+        "aggregate_identity": { "$ref": "#/$defs/identity" },
+        "expected_base_identity": { "$ref": "#/$defs/identity" },
+        "expected_view_identity": { "$ref": "#/$defs/identity" },
+        "published_base_identity": { "$ref": "#/$defs/identity" },
+        "published_view_identity": { "$ref": "#/$defs/identity" },
+        "vector_count": { "$ref": "#/$defs/positive" },
+        "logical_partitions": { "const": 64 },
+        "planned_workers": { "$ref": "#/$defs/positive" },
+        "planned_memory_bytes": { "$ref": "#/$defs/positive" },
+        "worker_batches": { "$ref": "#/$defs/positive" },
+        "routing_policy": { "const": "metric-bound-adaptive-v1" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query_set_identity",
+        "queries",
+        "k",
+        "ef_search",
+        "selected_partitions",
+        "certified_selected_queries",
+        "full_fanout_fallback_queries",
+        "maximum_searched_partitions",
+        "selected_query_recall_ppm",
+        "minimum_selected_query_recall_ppm",
+        "oracle_result_identity",
+        "default_result_identity",
+        "full_fanout_result_identity",
+        "selected_result_identity",
+        "full_fanout_equals_default"
+      ],
+      "properties": {
+        "query_set_identity": { "$ref": "#/$defs/identity" },
+        "queries": { "$ref": "#/$defs/positive" },
+        "k": { "$ref": "#/$defs/positive" },
+        "ef_search": { "$ref": "#/$defs/positive" },
+        "selected_partitions": { "const": 32 },
+        "certified_selected_queries": { "$ref": "#/$defs/positive" },
+        "full_fanout_fallback_queries": { "const": 0 },
+        "maximum_searched_partitions": { "const": 32 },
+        "selected_query_recall_ppm": {
+          "type": "integer",
+          "minimum": 950000,
+          "maximum": 1000000
+        },
+        "minimum_selected_query_recall_ppm": {
+          "type": "integer",
+          "minimum": 950000,
+          "maximum": 1000000
+        },
+        "oracle_result_identity": { "$ref": "#/$defs/identity" },
+        "default_result_identity": { "$ref": "#/$defs/identity" },
+        "full_fanout_result_identity": { "$ref": "#/$defs/identity" },
+        "selected_result_identity": { "$ref": "#/$defs/identity" },
+        "full_fanout_equals_default": { "const": true }
+      }
+    },
+    "initial_reopen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_identity", "view_identity", "selected_result_identity"],
+      "properties": {
+        "base_identity": { "$ref": "#/$defs/identity" },
+        "view_identity": { "$ref": "#/$defs/identity" },
+        "selected_result_identity": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before_base_identity",
+        "before_view_identity",
+        "after_base_identity",
+        "after_view_identity",
+        "upserted_vectors",
+        "deleted_vectors",
+        "upserts_visible",
+        "deletes_hidden",
+        "visible_result_identity"
+      ],
+      "properties": {
+        "before_base_identity": { "$ref": "#/$defs/identity" },
+        "before_view_identity": { "$ref": "#/$defs/identity" },
+        "after_base_identity": { "$ref": "#/$defs/identity" },
+        "after_view_identity": { "$ref": "#/$defs/identity" },
+        "upserted_vectors": { "$ref": "#/$defs/positive" },
+        "deleted_vectors": { "$ref": "#/$defs/positive" },
+        "upserts_visible": { "const": true },
+        "deletes_hidden": { "const": true },
+        "visible_result_identity": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "consolidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before_base_identity",
+        "before_view_identity",
+        "after_base_identity",
+        "after_view_identity",
+        "remaining_delta_records",
+        "view_preserved",
+        "visible_result_identity",
+        "partitioned_base_preserved",
+        "routing_outcome_after",
+        "total_partitions_after"
+      ],
+      "properties": {
+        "before_base_identity": { "$ref": "#/$defs/identity" },
+        "before_view_identity": { "$ref": "#/$defs/identity" },
+        "after_base_identity": { "$ref": "#/$defs/identity" },
+        "after_view_identity": { "$ref": "#/$defs/identity" },
+        "remaining_delta_records": { "const": 0 },
+        "view_preserved": { "const": true },
+        "visible_result_identity": { "$ref": "#/$defs/identity" },
+        "partitioned_base_preserved": { "const": true },
+        "routing_outcome_after": { "const": "selected-certified" },
+        "total_partitions_after": { "type": "integer", "minimum": 2, "maximum": 221 }
+      }
+    },
+    "final_reopen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_identity",
+        "view_identity",
+        "delta_records",
+        "view_preserved",
+        "visible_result_identity",
+        "routing_outcome",
+        "total_partitions"
+      ],
+      "properties": {
+        "base_identity": { "$ref": "#/$defs/identity" },
+        "view_identity": { "$ref": "#/$defs/identity" },
+        "delta_records": { "const": 0 },
+        "view_preserved": { "const": true },
+        "visible_result_identity": { "$ref": "#/$defs/identity" },
+        "routing_outcome": { "const": "selected-certified" },
+        "total_partitions": { "type": "integer", "minimum": 2, "maximum": 221 }
+      }
+    }
+  }
+}

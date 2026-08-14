@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: AGPL-3.0-only
 // TypeScript SDK G6 lane runner over native-local or HTTP v2.
 
 import { execFileSync, spawn } from "node:child_process";

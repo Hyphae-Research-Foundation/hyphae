@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Equivalent high-level API over HTTP `/v2` and exact `HYPHLCL1` local transport.
 

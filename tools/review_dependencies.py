@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """Review dependency changes without requiring a hosted dependency-graph API."""
 
 from __future__ import annotations

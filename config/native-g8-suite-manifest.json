@@ -55,8 +55,8 @@
       "id": "sbom-signatures-provenance",
       "status": "implemented-unhosted",
       "platforms": ["release"],
-      "runner": "python packaging/release_evidence.py verify",
-      "acceptance": ["spdx", "cyclonedx", "checksums", "cosign", "provenance"]
+      "runner": "python packaging/g8_release_verification.py",
+      "acceptance": ["spdx", "cyclonedx", "manifest-license-authority", "identity-completeness", "checksums", "cosign", "provenance"]
     },
     {
       "id": "independent-restore-verification",

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Cross-family G3 atomicity, controlled-expiry, and restart matrices.
 
