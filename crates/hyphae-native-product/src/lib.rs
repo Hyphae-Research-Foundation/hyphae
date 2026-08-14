@@ -9,6 +9,8 @@
 
 #![allow(clippy::result_large_err)]
 
+mod access_catalog;
+mod access_control;
 mod admin;
 mod backup;
 mod cancellation;
@@ -29,6 +31,8 @@ mod telemetry;
 
 use std::path::Path;
 
+pub use access_catalog::*;
+pub use access_control::*;
 pub use admin::*;
 pub use backup::*;
 pub use cancellation::*;

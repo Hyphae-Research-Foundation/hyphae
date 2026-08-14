@@ -8,7 +8,7 @@ use hyphae_native_runtime::NativeWriteBatch;
 use hyphae_native_types::TransactionId;
 
 use crate::{
-    ProductCommitReceipt, ProductDurability, ProductExplicitTransactionStatus,
+    AuthorizationEpoch, ProductCommitReceipt, ProductDurability, ProductExplicitTransactionStatus,
     ProductPreparedStatement, ProductTransactionHandle,
 };
 
@@ -68,55 +68,102 @@ impl ProductPrincipal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ProductPermission {
-    /// Capability discovery.
-    Discover = 0,
+    /// Read bounded durable security events.
+    AuditRead = 0,
+    /// Create and verify a new backup.
+    BackupCreate = 1,
+    /// Verify a backup without activating it.
+    BackupVerify = 2,
     /// Catalog reads.
-    CatalogRead = 1,
+    CatalogRead = 3,
     /// Catalog mutation.
-    CatalogWrite = 2,
+    CatalogWrite = 4,
+    /// Create, rotate, or revoke the caller's narrowed credentials.
+    CredentialSelfManage = 5,
     /// SQL and structure reads.
-    DataRead = 3,
-    /// SQL and structure mutation.
-    DataWrite = 4,
-    /// Search execution.
-    Search = 5,
-    /// Administration and doctor.
-    Admin = 6,
-    /// Backup creation.
-    Backup = 7,
+    DataRead = 6,
+    /// SQL, structure, and search-data mutation.
+    DataWrite = 7,
+    /// Capability discovery.
+    Discover = 8,
+    /// Checkpoint, doctor, compaction, vacuum, and retention operations.
+    Maintain = 9,
+    /// Status, telemetry, and bounded explain observation.
+    Observe = 10,
+    /// Ownership transfer and recovery policy.
+    OwnershipManage = 11,
+    /// Generate a proof for an otherwise-authorized read.
+    ProofGenerate = 12,
     /// Offline proof verification.
-    ProofVerify = 8,
+    ProofVerify = 13,
+    /// Restore a verified backup into a new directory.
+    Restore = 14,
+    /// Lexical, vector, ANN, and hybrid search execution.
+    SearchExecute = 15,
+    /// Mutate principals, roles, assignments, and credentials.
+    SecurityManage = 16,
+    /// Read redacted security metadata.
+    SecurityRead = 17,
 }
 
 /// Closed permission set supplied by the authentication boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProductAuthorization(u16);
+pub struct ProductAuthorization(u64);
 
 impl ProductAuthorization {
     /// No permissions.
     pub const NONE: Self = Self(0);
     /// Every permission known to this product version.
-    pub const ALL: Self = Self((1 << 9) - 1);
-    /// Discovery plus all immutable read operations.
+    pub const ALL: Self = Self((1 << 18) - 1);
+    /// Discovery plus ordinary application read, search, and proof operations.
     pub const READ_ONLY: Self = Self(
         (1 << ProductPermission::Discover as u8)
             | (1 << ProductPermission::CatalogRead as u8)
             | (1 << ProductPermission::DataRead as u8)
-            | (1 << ProductPermission::Search as u8),
+            | (1 << ProductPermission::SearchExecute as u8)
+            | (1 << ProductPermission::ProofGenerate as u8)
+            | (1 << ProductPermission::ProofVerify as u8),
     );
 
     /// Builds an authorization set from explicit permissions.
     pub fn from_permissions(permissions: impl IntoIterator<Item = ProductPermission>) -> Self {
-        let mut bits = 0_u16;
+        let mut bits = 0_u64;
         for permission in permissions {
-            bits |= 1_u16 << permission as u8;
+            bits |= 1_u64 << permission as u8;
         }
         Self(bits)
     }
 
     /// Returns whether the permission is granted.
     pub const fn allows(self, permission: ProductPermission) -> bool {
-        self.0 & (1_u16 << permission as u8) != 0
+        self.0 & (1_u64 << permission as u8) != 0
+    }
+
+    /// Returns whether every permission in `required` is granted.
+    pub const fn allows_all(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    /// Combines two additive permission sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub(crate) const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    pub(crate) const fn from_known_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 }
 
@@ -198,6 +245,7 @@ pub struct ProductSession {
     id: ProductSessionId,
     principal: ProductPrincipal,
     authorization: ProductAuthorization,
+    authorization_epoch: AuthorizationEpoch,
     prepared: BTreeMap<ProductPreparedHandle, ProductPreparedStatement>,
     next_prepared: u64,
     maximum_prepared: usize,
@@ -218,10 +266,21 @@ impl ProductSession {
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
     ) -> Self {
+        Self::new_at_epoch(id, principal, authorization, AuthorizationEpoch::UNMANAGED)
+    }
+
+    /// Creates one direct embedded session at a durable authorization epoch.
+    pub fn new_at_epoch(
+        id: ProductSessionId,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
+    ) -> Self {
         Self::with_limits(
             id,
             principal,
             authorization,
+            authorization_epoch,
             DEFAULT_PRODUCT_PREPARED_HANDLES,
             DEFAULT_PRODUCT_TRANSACTION_STATUSES,
             DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
@@ -232,6 +291,7 @@ impl ProductSession {
         id: ProductSessionId,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
         maximum_prepared: usize,
         maximum_transactions: usize,
         maximum_active_transactions: usize,
@@ -240,6 +300,7 @@ impl ProductSession {
             id,
             principal,
             authorization,
+            authorization_epoch,
             prepared: BTreeMap::new(),
             next_prepared: 1,
             maximum_prepared,
@@ -267,6 +328,11 @@ impl ProductSession {
     /// Returns immutable authorization bound at session creation.
     pub const fn authorization(&self) -> ProductAuthorization {
         self.authorization
+    }
+
+    /// Returns the durable authorization generation bound at authentication.
+    pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
+        self.authorization_epoch
     }
 
     pub(crate) fn retain_prepared(

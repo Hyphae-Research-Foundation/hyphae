@@ -488,7 +488,7 @@ async fn serve_connection(
         return Ok(());
     }
     let authorization = if denied_client_identity.as_deref() == Some(&hello.client_identity) {
-        ProductAuthorization::from_permissions([ProductPermission::Admin])
+        ProductAuthorization::from_permissions([ProductPermission::Observe])
     } else {
         ProductAuthorization::ALL
     };

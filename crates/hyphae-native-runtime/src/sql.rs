@@ -629,6 +629,41 @@ enum Statement {
     SelectWindow(ParsedWindowSelect),
 }
 
+/// Authorization-relevant class produced by the canonical SQL parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlStatementClass {
+    /// A statement that reads an existing catalog snapshot without publishing data.
+    Read,
+    /// A statement that mutates data under existing catalog definitions.
+    DataMutation,
+    /// A statement that creates, changes, renames, or drops catalog definitions.
+    CatalogMutation,
+}
+
+/// Classifies one complete SQL statement through the same parser used for execution.
+///
+/// # Errors
+///
+/// Returns the canonical SQL parse error for malformed or unsupported input.
+pub fn classify_sql_statement(statement: &str) -> Result<SqlStatementClass, SqlError> {
+    Ok(match parse(statement)? {
+        Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_)
+        | Statement::WithSelect(_)
+        | Statement::SelectWindow(_) => SqlStatementClass::Read,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+            SqlStatementClass::DataMutation
+        }
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::AlterTableRename { .. }
+        | Statement::DropTable { .. }
+        | Statement::DropIndex { .. } => SqlStatementClass::CatalogMutation,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowFunction {
     RowNumber,
@@ -8685,9 +8720,53 @@ mod tests {
     use super::{
         ColumnOperand, ComparisonOperator, FilterExpression, MAX_SQL_JOIN_CANDIDATES,
         MAX_SQL_SCAN_CANDIDATES, ParsedJoinEquality, Projection, SQL_VECTOR_BATCH_ROWS,
-        ScalarOperand, SqlError, Statement, TruthValue, binary_prefix_successor,
-        consume_join_candidate, consume_scan_candidates, key_range_is_empty, parse,
+        ScalarOperand, SqlError, SqlStatementClass, Statement, TruthValue, binary_prefix_successor,
+        classify_sql_statement, consume_join_candidate, consume_scan_candidates,
+        key_range_is_empty, parse,
     };
+
+    #[test]
+    fn canonical_parser_classifies_authorization_boundaries() {
+        for statement in [
+            "SELECT value FROM items WHERE id = ?",
+            "WITH current AS (SELECT value FROM items WHERE id = ?) SELECT value FROM current WHERE id = ?",
+            "EXPLAIN SELECT value FROM items WHERE id = ?",
+        ] {
+            assert_eq!(
+                classify_sql_statement(statement).expect("read statement must parse"),
+                SqlStatementClass::Read,
+                "{statement}"
+            );
+        }
+        for statement in [
+            "INSERT INTO items (id, value) VALUES (?, ?)",
+            "UPDATE items SET value = ? WHERE id = ?",
+            "DELETE FROM items WHERE id = ?",
+        ] {
+            assert_eq!(
+                classify_sql_statement(statement).expect("data mutation must parse"),
+                SqlStatementClass::DataMutation,
+                "{statement}"
+            );
+        }
+        for statement in [
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, value TEXT)",
+            "CREATE INDEX items_value ON items (value)",
+            "ALTER TABLE items RENAME TO archived_items",
+            "DROP INDEX items_value",
+            "DROP TABLE items",
+        ] {
+            assert_eq!(
+                classify_sql_statement(statement).expect("catalog mutation must parse"),
+                SqlStatementClass::CatalogMutation,
+                "{statement}"
+            );
+        }
+        assert!(matches!(
+            classify_sql_statement("SELECT FROM"),
+            Err(SqlError::InvalidSyntax)
+        ));
+    }
 
     #[test]
     fn join_candidate_budget_accepts_the_boundary_and_then_fails_closed() {

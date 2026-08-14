@@ -14,6 +14,13 @@ The Rust wire models in `hyphae-contracts` generate every checked-in schema.
 tests fail when generated and checked-in models differ. TypeScript and Python
 SDK generation consumes only these versioned public documents.
 
+`native-access-control-v1.json` is the contract-first Native identity,
+permission, built-in-role, operation, scope, and API-key authority. It is not a
+wire payload schema and remains honestly labelled implementation-pending until
+the durable RBAC surfaces and cross-transport conformance close. The
+fail-closed `tools/check_native_access_control.py` checker binds every current
+`ProductOperation` variant to a nonempty permission rule.
+
 ## Structured values
 
 The natural JSON surface accepts null, booleans, signed 64-bit integers,

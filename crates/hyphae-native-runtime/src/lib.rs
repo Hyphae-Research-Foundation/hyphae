@@ -221,7 +221,8 @@ pub use set_algebra::{
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{
     MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
-    NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlValue,
+    NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlStatementClass, SqlValue,
+    classify_sql_statement,
 };
 
 use std::{

@@ -88,6 +88,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native ANN semantics v1](native/ann-semantics-v1.md)
 - [Native local protocol v1](native/local-protocol-v1.md)
 - [Native local product contract v1](native/local-product-v1.md)
+- [Native access control v1](native/access-control-v1.md)
 - [Native product error model v1](native/product-error-v1.md)
 - [Native catalog API v1](native/catalog-api-v1.md)
 - [Native product EXPLAIN v1](native/explain-v1.md)
@@ -143,6 +144,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
 - [Baseline threat model](security/threat-model.md)
 - [Server threat model](security/server-threat-model.md)
+- [Native access-control threat model](security/native-access-control-threat-model.md)
 
 ### Durable formats
 

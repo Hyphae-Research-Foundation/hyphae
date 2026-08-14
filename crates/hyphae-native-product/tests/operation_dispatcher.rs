@@ -12,10 +12,11 @@ use std::{
 };
 
 use hyphae_native_product::{
-    MetricId, MetricValue, NativeProduct, NativeProductService, NativeProductServiceConfig,
-    ProductAuthorization, ProductCommitOutcome, ProductDurability, ProductDurabilityPolicy,
-    ProductErrorCode, ProductOperation, ProductPermission, ProductPrincipal, ProductRequestContext,
-    ProductResponse, ProductSession, ProductSessionId, ProductSqlResult, ProductValue,
+    AuthorizationEpoch, MetricId, MetricValue, NativeProduct, NativeProductService,
+    NativeProductServiceConfig, ProductAuthorization, ProductCommitOutcome, ProductDurability,
+    ProductDurabilityPolicy, ProductErrorCode, ProductOperation, ProductPermission,
+    ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession, ProductSessionId,
+    ProductSqlResult, ProductValue, RestoreRequest,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +66,30 @@ fn memory_context(
     let mut context = context(session, request_id, logical_time_micros);
     context.durability = ProductDurabilityPolicy::MEMORY;
     context
+}
+
+#[test]
+fn stale_authorization_epoch_fails_before_operation_execution() -> Result<(), Box<dyn Error>> {
+    let path = temporary("stale-authorization-epoch");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let identity = principal("epoch-owner")?;
+    let mut session = ProductSession::new_at_epoch(
+        ProductSessionId::new(9).ok_or("zero session")?,
+        identity.clone(),
+        ProductAuthorization::ALL,
+        AuthorizationEpoch::new(4),
+    );
+    let stale = ProductRequestContext::new(1, session.id(), 0, identity, ProductAuthorization::ALL)
+        .with_authorization_epoch(AuthorizationEpoch::new(3));
+
+    let error = product
+        .dispatch(&mut session, &stale, ProductOperation::Capabilities)
+        .expect_err("stale epoch must be denied");
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
 }
 
 #[test]
@@ -212,6 +237,116 @@ fn cancellation_deadline_and_authorization_fail_before_mutation() -> Result<(), 
     assert_eq!(snapshot.structure_get(b"expired"), None);
     assert_eq!(snapshot.structure_get(b"denied"), None);
     assert_eq!(snapshot.structure_get(b"response-limited"), None);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn authorization_distinguishes_sql_observation_maintenance_backup_and_restore()
+-> Result<(), Box<dyn Error>> {
+    let path = temporary("rbac-boundaries");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut owner = direct_session("owner", ProductAuthorization::ALL)?;
+
+    let create_context = memory_context(&owner, 20, 100);
+    product.dispatch(
+        &mut owner,
+        &create_context,
+        ProductOperation::ExecuteSql {
+            statement: "CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)".to_owned(),
+            parameters: vec![],
+        },
+    )?;
+
+    let writer_authorization = ProductAuthorization::from_permissions([
+        ProductPermission::CatalogRead,
+        ProductPermission::DataWrite,
+    ]);
+    assert!(
+        writer_authorization.allows_all(ProductAuthorization::from_permissions([
+            ProductPermission::CatalogRead,
+            ProductPermission::DataWrite,
+        ]))
+    );
+    assert!(!writer_authorization.allows(ProductPermission::CatalogWrite));
+    let mut writer = ProductSession::new(
+        ProductSessionId::new(21).expect("nonzero session"),
+        principal("writer")?,
+        writer_authorization,
+    );
+    let denied_ddl_context = memory_context(&writer, 21, 100);
+    let denied = product
+        .dispatch(
+            &mut writer,
+            &denied_ddl_context,
+            ProductOperation::ExecuteSql {
+                statement: "CREATE TABLE forbidden (id BIGINT PRIMARY KEY)".to_owned(),
+                parameters: vec![],
+            },
+        )
+        .expect_err("data writer received catalog mutation authority");
+    assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+    let insert_context = memory_context(&writer, 22, 100);
+    product.dispatch(
+        &mut writer,
+        &insert_context,
+        ProductOperation::ExecuteSql {
+            statement: "INSERT INTO items (id, label) VALUES (?, ?)".to_owned(),
+            parameters: vec![
+                ProductValue::Signed(1),
+                ProductValue::Text("one".to_owned()),
+            ],
+        },
+    )?;
+
+    let observer_authorization =
+        ProductAuthorization::from_permissions([ProductPermission::Observe]);
+    let mut observer = ProductSession::new(
+        ProductSessionId::new(22).expect("nonzero session"),
+        principal("observer")?,
+        observer_authorization,
+    );
+    let status_context = context(&observer, 23, 100);
+    assert!(matches!(
+        product.dispatch(
+            &mut observer,
+            &status_context,
+            ProductOperation::AdminStatus,
+        )?,
+        ProductResponse::AdminStatus(_)
+    ));
+    let checkpoint_context = context(&observer, 24, 100);
+    let denied = product
+        .dispatch(
+            &mut observer,
+            &checkpoint_context,
+            ProductOperation::AdminCheckpoint,
+        )
+        .expect_err("observer received maintenance authority");
+    assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+
+    let backup_authorization =
+        ProductAuthorization::from_permissions([ProductPermission::BackupCreate]);
+    let mut backup = ProductSession::new(
+        ProductSessionId::new(23).expect("nonzero session"),
+        principal("backup")?,
+        backup_authorization,
+    );
+    let restore_context = context(&backup, 25, 100);
+    let denied = product
+        .dispatch(
+            &mut backup,
+            &restore_context,
+            ProductOperation::Restore(RestoreRequest::new(
+                temporary("source-backup"),
+                temporary("restore-destination"),
+            )?),
+        )
+        .expect_err("backup creator received restore authority");
+    assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())

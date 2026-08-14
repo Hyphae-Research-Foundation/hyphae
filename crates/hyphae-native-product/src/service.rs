@@ -71,6 +71,7 @@ enum ServiceCommand {
         session_id: ProductSessionId,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
+        authorization_epoch: crate::AuthorizationEpoch,
         reply: SyncSender<Result<ProductSessionId, ProductError>>,
     },
     Dispatch {
@@ -188,6 +189,25 @@ impl NativeProductHandle {
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
     ) -> Result<NativeProductClient, ProductError> {
+        self.open_session_at_epoch(
+            principal,
+            authorization,
+            crate::AuthorizationEpoch::UNMANAGED,
+        )
+    }
+
+    /// Opens one bounded session at a durable authorization generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `unavailable` when admission is closed, or `limit_exceeded`
+    /// when the session bound is full.
+    pub fn open_session_at_epoch(
+        &self,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: crate::AuthorizationEpoch,
+    ) -> Result<NativeProductClient, ProductError> {
         let session_id = {
             let mut next = self
                 .shared
@@ -207,6 +227,7 @@ impl NativeProductHandle {
             session_id,
             principal: principal.clone(),
             authorization,
+            authorization_epoch,
             reply,
         })?;
         receive.recv().map_err(|_| unavailable())??;
@@ -215,6 +236,7 @@ impl NativeProductHandle {
             session_id,
             principal,
             authorization,
+            authorization_epoch,
         })
     }
 
@@ -417,6 +439,7 @@ pub struct NativeProductClient {
     session_id: ProductSessionId,
     principal: ProductPrincipal,
     authorization: ProductAuthorization,
+    authorization_epoch: crate::AuthorizationEpoch,
 }
 
 impl Drop for NativeProductClient {
@@ -453,6 +476,7 @@ impl NativeProductClient {
             self.principal.clone(),
             self.authorization,
         )
+        .with_authorization_epoch(self.authorization_epoch)
     }
 
     /// Admits and waits for one operation result.
@@ -795,6 +819,7 @@ fn owner_loop(
                 session_id,
                 principal,
                 authorization,
+                authorization_epoch,
                 reply,
             } => {
                 let result = if sessions.len() >= config.max_sessions {
@@ -804,6 +829,7 @@ fn owner_loop(
                         session_id,
                         principal,
                         authorization,
+                        authorization_epoch,
                         config.max_prepared_per_session,
                         config.max_transaction_statuses_per_session,
                         config.max_active_transactions_per_session,

@@ -754,6 +754,7 @@ version = "1.1.0"
 dependencies = [
  "blake3",
  "futures-channel",
+ "getrandom 0.3.4",
  "hyphae-native-blobs",
  "hyphae-native-btree",
  "hyphae-native-catalog",
@@ -763,6 +764,7 @@ dependencies = [
  "hyphae-native-runtime",
  "hyphae-native-types",
  "hyphae-native-wal",
+ "subtle",
 ]
 
 [[package]]

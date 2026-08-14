@@ -11,7 +11,7 @@ use hyphae_native_catalog::{CatalogObjectV2, LogicalCatalogObject, StructureKind
 use hyphae_native_runtime::{
     BoundedSearchError, BoundedSearchLimits, BoundedSearchQuery, NativeDatabase,
     NativeExecutionPool, NativeResourceGovernor, NativeTransaction, NativeWriteBatch,
-    SetAlgebraRequest,
+    SetAlgebraRequest, SqlStatementClass, classify_sql_statement,
 };
 use hyphae_native_types::TransactionId;
 
@@ -20,7 +20,7 @@ pub use hyphae_native_runtime::CommitBoundary;
 use crate::proof::{NativeOperationProofArtifact, NativeProofGenerationLimits};
 
 use crate::{
-    AdminStatus, BackupInfo, BackupPhase, BackupProductError, BackupRequest,
+    AdminStatus, AuthorizationEpoch, BackupInfo, BackupPhase, BackupProductError, BackupRequest,
     CatalogDependencyRequest, CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage,
     DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
@@ -89,6 +89,8 @@ pub struct ProductRequestContext {
     pub principal: ProductPrincipal,
     /// Authorization grants fixed by the authentication boundary.
     pub authorization: ProductAuthorization,
+    /// Durable authorization generation fixed by the authentication boundary.
+    pub authorization_epoch: AuthorizationEpoch,
     /// Durability policy for every mutating operation.
     pub durability: ProductDurabilityPolicy,
 }
@@ -112,8 +114,16 @@ impl ProductRequestContext {
             limits: ProductLimits::default(),
             principal,
             authorization,
+            authorization_epoch: AuthorizationEpoch::UNMANAGED,
             durability: ProductDurabilityPolicy::default(),
         }
+    }
+
+    /// Binds this request to a durable authorization generation.
+    #[must_use]
+    pub const fn with_authorization_epoch(mut self, epoch: AuthorizationEpoch) -> Self {
+        self.authorization_epoch = epoch;
+        self
     }
 
     /// Attaches a stable nonzero idempotency token for one mutation attempt.
@@ -1072,7 +1082,10 @@ fn admit_operation(
 ) -> Result<(), ProductError> {
     validate_context(session, context)?;
     context.checkpoint()?;
-    if !context.authorization.allows(operation.permission()) {
+    if !context
+        .authorization
+        .allows_all(operation.required_permissions()?)
+    {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
     let (count, bytes, work, memory) = operation.request_cost();
@@ -1097,6 +1110,9 @@ fn validate_context(
     {
         return Err(context.error(ProductErrorCode::InvalidRequest));
     }
+    if context.authorization_epoch != session.authorization_epoch() {
+        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    }
     context.limits.validate()
 }
 
@@ -1119,7 +1135,7 @@ fn execute_sql(
             parameters.len(),
         ));
     }
-    if sql_is_read(statement) {
+    if sql_statement_class(statement)? == SqlStatementClass::Read {
         let prepared = product.prepare_sql(statement)?;
         if prepared.maximum_result_rows() > context.limits.max_count {
             return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
@@ -1914,7 +1930,7 @@ fn stage_transaction(
 fn validate_transaction_sql(mutation: &ProductTransactionSqlMutation) -> Result<(), ProductError> {
     if mutation.statement.len() > crate::MAX_PRODUCT_SQL_STATEMENT_BYTES
         || mutation.parameters.len() > crate::MAX_PRODUCT_SQL_PARAMETERS
-        || sql_is_read(&mutation.statement)
+        || sql_statement_class(&mutation.statement)? != SqlStatementClass::DataMutation
     {
         return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
     }
@@ -2088,51 +2104,70 @@ impl ProductOperation {
         }
     }
 
-    fn permission(&self) -> ProductPermission {
-        match self {
-            Self::Capabilities => ProductPermission::Discover,
+    fn required_permissions(&self) -> Result<ProductAuthorization, ProductError> {
+        let required = match self {
+            Self::Capabilities => authorization([ProductPermission::Discover]),
             Self::CatalogObject { .. }
             | Self::CatalogObjectNamed { .. }
             | Self::CatalogList(_)
             | Self::CatalogDependencies(_)
             | Self::CatalogDescribe { .. }
-            | Self::CatalogResolve { .. } => ProductPermission::CatalogRead,
-            Self::CatalogCreate { .. } => ProductPermission::CatalogWrite,
-            Self::PrepareSql { .. }
-            | Self::DeallocatePrepared { .. }
-            | Self::ExecutePrepared { .. }
+            | Self::CatalogResolve { .. } => authorization([ProductPermission::CatalogRead]),
+            Self::CatalogCreate { .. } => authorization([ProductPermission::CatalogWrite]),
+            Self::PrepareSql { .. } | Self::ExecutePrepared { .. } => {
+                authorization([ProductPermission::CatalogRead, ProductPermission::DataRead])
+            }
+            Self::DeallocatePrepared { .. }
             | Self::StructureGet { .. }
             | Self::StructureTtl { .. }
             | Self::StructureRead(_)
             | Self::TransactionStatus { .. }
             | Self::TransactionStatusByIdempotency { .. }
-            | Self::ExplicitTransactionStatus { .. } => ProductPermission::DataRead,
-            Self::ExecuteSql { statement, .. } if sql_is_read(statement) => {
-                ProductPermission::DataRead
+            | Self::ExplicitTransactionStatus { .. } => {
+                authorization([ProductPermission::DataRead])
             }
-            Self::ExecuteSql { .. }
-            | Self::StructureSet { .. }
+            Self::ExecuteSql { statement, .. } => match sql_statement_class(statement)? {
+                SqlStatementClass::Read => {
+                    authorization([ProductPermission::CatalogRead, ProductPermission::DataRead])
+                }
+                SqlStatementClass::DataMutation => {
+                    authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite])
+                }
+                SqlStatementClass::CatalogMutation => {
+                    authorization([ProductPermission::CatalogWrite])
+                }
+            },
+            Self::StructureSet { .. }
             | Self::StructureMutate { .. }
             | Self::TransactionBegin
-            | Self::TransactionStageSql { .. }
             | Self::TransactionStageStructure { .. }
+            | Self::TransactionCommit { .. }
+            | Self::TransactionRollback { .. } => authorization([ProductPermission::DataWrite]),
+            Self::TransactionStageSql { .. }
             | Self::TransactionStageSearch { .. }
             | Self::TransactionStageVector { .. }
-            | Self::TransactionCommit { .. }
-            | Self::TransactionRollback { .. }
             | Self::SearchIngest { .. }
             | Self::SearchDocumentUpdate { .. }
-            | Self::SearchDocumentDelete { .. } => ProductPermission::DataWrite,
-            Self::Search { .. } | Self::SearchCollection { .. } => ProductPermission::Search,
-            Self::AdminStatus
-            | Self::AdminCheckpoint
-            | Self::AdminExplainSql { .. }
-            | Self::Doctor(_)
-            | Self::Telemetry => ProductPermission::Admin,
-            Self::Backup(_) | Self::Restore(_) => ProductPermission::Backup,
-            Self::VerifyProof { .. } => ProductPermission::ProofVerify,
-            Self::Prove { operation, .. } => operation.permission(),
-        }
+            | Self::SearchDocumentDelete { .. } => {
+                authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite])
+            }
+            Self::Search { .. } | Self::SearchCollection { .. } => authorization([
+                ProductPermission::CatalogRead,
+                ProductPermission::SearchExecute,
+            ]),
+            Self::AdminStatus | Self::Telemetry => authorization([ProductPermission::Observe]),
+            Self::AdminCheckpoint | Self::Doctor(_) => authorization([ProductPermission::Maintain]),
+            Self::AdminExplainSql { .. } => {
+                authorization([ProductPermission::CatalogRead, ProductPermission::Observe])
+            }
+            Self::Backup(_) => authorization([ProductPermission::BackupCreate]),
+            Self::Restore(_) => authorization([ProductPermission::Restore]),
+            Self::VerifyProof { .. } => authorization([ProductPermission::ProofVerify]),
+            Self::Prove { operation, .. } => operation
+                .required_permissions()?
+                .union(authorization([ProductPermission::ProofGenerate])),
+        };
+        Ok(required)
     }
 
     /// Returns whether this operation is a side-effect-free read eligible for
@@ -2165,7 +2200,12 @@ impl ProductOperation {
             | Self::Doctor(_)
             | Self::Telemetry
             | Self::VerifyProof { .. } => true,
-            Self::ExecuteSql { statement, .. } => sql_is_read(statement),
+            Self::ExecuteSql { statement, .. } => {
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::Read)
+                )
+            }
             Self::Prove { operation, .. } => operation.is_read_only(),
             Self::CatalogCreate { .. }
             | Self::PrepareSql { .. }
@@ -2201,8 +2241,14 @@ impl ProductOperation {
                 | Self::AdminCheckpoint
                 | Self::Backup(_)
                 | Self::Restore(_)
-        ) || matches!(self, Self::ExecuteSql { statement, .. } if !sql_is_read(statement))
-            || matches!(self, Self::Prove { operation, .. } if operation.is_mutating())
+        ) || matches!(
+            self,
+            Self::ExecuteSql { statement, .. }
+                if matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::DataMutation | SqlStatementClass::CatalogMutation)
+                )
+        ) || matches!(self, Self::Prove { operation, .. } if operation.is_mutating())
     }
 
     fn request_cost(&self) -> (usize, usize, usize, usize) {
@@ -2449,15 +2495,12 @@ impl ProductResponse {
     }
 }
 
-fn sql_is_read(statement: &str) -> bool {
-    let first = statement
-        .trim_start()
-        .split(|character: char| character.is_ascii_whitespace() || character == '(')
-        .next()
-        .unwrap_or_default();
-    first.eq_ignore_ascii_case("select")
-        || first.eq_ignore_ascii_case("with")
-        || first.eq_ignore_ascii_case("explain")
+fn authorization<const N: usize>(permissions: [ProductPermission; N]) -> ProductAuthorization {
+    ProductAuthorization::from_permissions(permissions)
+}
+
+fn sql_statement_class(statement: &str) -> Result<SqlStatementClass, ProductError> {
+    classify_sql_statement(statement).map_err(ProductError::from)
 }
 
 fn sql_command_can_be_noop(statement: &str) -> bool {
