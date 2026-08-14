@@ -54,6 +54,12 @@ to expose that exact version before starting the next layer:
 7. `hyphae-client`, `hyphae-native-daemon`, `hyphae-server`
 8. `hyphae-cli`, `hyphae-pliegors`
 
+Any development dependency between crates in the same layer must be path-only,
+without a version requirement. Cargo strips those dependencies from the
+published manifest. A versioned development dependency remains part of the
+publication graph and must point to an earlier layer; the package audit rejects
+same-layer or forward edges before publication.
+
 For each crate, run `cargo publish --locked -p CRATE`. Do not bypass package
 verification. If a publish returns an ambiguous network result, query crates.io
 for the exact crate version before retrying; never assume the upload failed.

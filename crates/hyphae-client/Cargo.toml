@@ -26,8 +26,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-hyphae-native-daemon.workspace = true
-hyphae-server.workspace = true
+hyphae-native-daemon = { path = "../hyphae-native-daemon" }
+hyphae-server = { path = "../hyphae-server" }
 
 [lints]
 workspace = true

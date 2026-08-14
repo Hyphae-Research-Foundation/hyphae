@@ -36,9 +36,9 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-hyphae-client.workspace = true
+hyphae-client = { path = "../hyphae-client" }
 hyphae-native-catalog.workspace = true
-hyphae-native-daemon.workspace = true
+hyphae-native-daemon = { path = "../hyphae-native-daemon" }
 hyphae-native-types.workspace = true
 tower.workspace = true
 

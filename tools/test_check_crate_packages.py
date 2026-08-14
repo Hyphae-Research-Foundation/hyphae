@@ -6,7 +6,11 @@ import unittest
 from tools.check_crate_packages import validate_release_graph
 
 
-def package(name: str, version: str, dependencies: list[dict[str, str]] | None = None):
+def package(
+    name: str,
+    version: str,
+    dependencies: list[dict[str, object]] | None = None,
+):
     return {
         "name": name,
         "version": version,
@@ -47,8 +51,8 @@ class ReleaseGraphTests(unittest.TestCase):
         self.assertTrue(any("requirement ^1.0" in failure for failure in failures))
         self.assertTrue(any("earlier release layer" in failure for failure in failures))
 
-    def test_rejects_publishable_set_drift_but_ignores_dev_cycles(self) -> None:
-        release = {"version": "1.0.1", "layers": [["base"], ["product"]]}
+    def test_rejects_versioned_development_dependency_cycle(self) -> None:
+        release = {"version": "1.0.1", "layers": [["base", "product"]]}
         packages = {
             "base": package(
                 "base",
@@ -57,9 +61,29 @@ class ReleaseGraphTests(unittest.TestCase):
             ),
             "product": package("product", "1.0.1"),
         }
-        _, failures = validate_release_graph(release, packages, ("base",))
+        _, failures = validate_release_graph(release, packages, ("base", "product"))
         self.assertEqual(len(failures), 1)
-        self.assertIn("publishable crate set differs", failures[0])
+        self.assertIn("must be in an earlier release layer", failures[0])
+
+    def test_accepts_path_only_development_dependency(self) -> None:
+        release = {"version": "1.0.1", "layers": [["base", "product"]]}
+        packages = {
+            "base": package(
+                "base",
+                "1.0.1",
+                [
+                    {
+                        "name": "product",
+                        "kind": "dev",
+                        "req": "*",
+                        "path": "/workspace/product",
+                    }
+                ],
+            ),
+            "product": package("product", "1.0.1"),
+        }
+        _, failures = validate_release_graph(release, packages, ("base", "product"))
+        self.assertEqual(failures, [])
 
     def test_rejects_invalid_semver_baseline_packages(self) -> None:
         release = {

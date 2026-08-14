@@ -46,6 +46,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Troubleshoot common failures](operations/troubleshooting.md)
 - [Verify a release](release/verification.md)
 - [0.2.1 publication receipt](release/receipts/0.2.1.md)
+- [1.1.0 publication receipt](release/receipts/1.1.0.md)
 - [Publish the Rust crates](release/crates-io.md)
 - [Compatibility and versioning](compatibility/versioning.md)
 
