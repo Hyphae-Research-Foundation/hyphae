@@ -3,7 +3,20 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [Unreleased]
+## [1.1.0] - 2026-08-14
+
+Hyphae 1.1.0 completes the Native local-engine readiness program through G7
+and prepares one exact source candidate for the independent G8 release gate.
+It does not change the Native format.
+
+### Added
+
+- Added calibrated execution topology, bounded admission, retained ANN read
+  views, deterministic routing evidence, and fail-closed hardware/bootstrap
+  validation for the controlled performance program.
+- Added a source-bound G7 operational-scale closure over the validated
+  DigitalOcean C-60 control matrix: eleven surfaces at C1, C8, and C32, with
+  1,000,000 observations and 100,000 warmups per surface.
 
 ### Changed
 
@@ -11,6 +24,17 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
   `AGPL-3.0-only`, while repository documentation and diagrams use
   `CC-BY-SA-4.0`. Releases through `v1.0.1` retain their original
   Apache-2.0 grants.
+- Hardened concurrent scheduling, wake observation, queueing, recovery,
+  calibration resampling, ANN publication, and release evidence validation.
+
+### Non-claims
+
+- The G7 closure is environment-bound. It does not certify canonical
+  dedicated-hardware latency, background interference, or bare-metal
+  performance. The final bare-metal attempt failed during toolchain setup
+  before product measurement.
+- G8 and publication remain open until the exact 1.1.0 candidate passes the
+  full release-safety matrix.
 
 ## [1.0.1] - 2026-08-09
 

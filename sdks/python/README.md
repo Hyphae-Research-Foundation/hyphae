@@ -3,7 +3,7 @@
 `hyphae-sdk` is the synchronous, bounded Python client for APIs v1 and Native v2. It requires
 Python 3.11 or newer, uses only the standard library at runtime, and includes
 typed generated models plus a `py.typed` marker. The development source package version is
-`1.0.1`; this guide does not claim PyPI publication without a separate
+`1.1.0`; this guide does not claim PyPI publication without a separate
 registry release and receipt.
 
 ## Test from this repository

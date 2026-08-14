@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "1.0.1",
+  "version": "1.1.0",
   "mirrors": [
     {
       "source": "compatibility/v2/data-directory.json",

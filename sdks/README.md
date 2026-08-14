@@ -2,7 +2,7 @@
 
 Hyphae ships three bounded clients. All expose the published `/v1` API; the
 Rust, TypeScript, and Python clients also expose the Native `/v2` product API
-on the `1.0.1` release line:
+on the `1.1.0` release line:
 
 | Client | Location | Runtime floor | Runtime dependencies |
 |---|---|---:|---|
