@@ -89,6 +89,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local protocol v1](native/local-protocol-v1.md)
 - [Native local product contract v1](native/local-product-v1.md)
 - [Native access control v1](native/access-control-v1.md)
+- [Hyphae 1.2.0 operator and agent experience plan](roadmaps/1.2.0-operator-and-agent-experience.md)
 - [Native product error model v1](native/product-error-v1.md)
 - [Native catalog API v1](native/catalog-api-v1.md)
 - [Native product EXPLAIN v1](native/explain-v1.md)
