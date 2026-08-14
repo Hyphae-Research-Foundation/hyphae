@@ -52,6 +52,7 @@ jobs:
           PYTHONPATH=. python -m unittest \
             tools.test_check_native_hardware_profile \
             tools.test_check_native_g7_i7i_preflight \
+            tools.test_check_native_g7_i7i_bootstrap \
             tools.test_check_native_hardware_calibration \
             tools.test_check_native_execution_topology \
             tools.test_check_native_governor_policy \

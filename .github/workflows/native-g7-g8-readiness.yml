@@ -78,6 +78,7 @@ jobs:
             tools.test_check_native_g7_g8_readiness \
             tools.test_check_native_g8_receipts \
             tools.test_check_native_g7_i7i_preflight \
+            tools.test_check_native_g7_i7i_bootstrap \
             tools.test_check_native_g7_receipt \
             tools.test_check_native_g7_matrix \
             tools.test_check_native_performance_receipt \
@@ -91,11 +92,16 @@ jobs:
           PYTHONPATH=. python tools/check_native_g7_g8_readiness.py \
             --expected-commit "${{ github.sha }}" \
             --output native-g7-g8-readiness-audit.json
+          PYTHONPATH=. python tools/check_native_g7_i7i_bootstrap.py \
+            --bootstrap tools/bootstrap_native_g7_i7i.sh \
+            --output native-g7-i7i-bootstrap-audit.json
       - name: Upload open readiness audit
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-g7-g8-readiness-${{ github.sha }}
-          path: native-g7-g8-readiness-audit.json
+          path: |
+            native-g7-g8-readiness-audit.json
+            native-g7-i7i-bootstrap-audit.json
           if-no-files-found: error
           retention-days: 14
 
