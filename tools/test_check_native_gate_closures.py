@@ -11,6 +11,7 @@ from tools.check_native_gate_closures import (
     GateFailure,
     validate,
     validate_g7_c60_closure,
+    validate_g8_aggregate,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,9 +23,9 @@ class NativeGateClosureTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(
             result["closed"],
-            ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7"],
+            ["G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"],
         )
-        self.assertEqual(result["open"], ["G8"])
+        self.assertEqual(result["open"], [])
 
     def test_g7_c60_closure_rejects_authority_drift(self) -> None:
         closure_path = (
@@ -52,6 +53,34 @@ class NativeGateClosureTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(GateFailure):
                     validate_g7_c60_closure(ROOT, candidate)
+
+    def test_g8_closure_rejects_source_coverage_and_claim_drift(self) -> None:
+        closure_path = (
+            ROOT
+            / "docs/gates/evidence/closures/native-g8-e88f2ea.json"
+        )
+        closure = json.loads(closure_path.read_text(encoding="utf-8"))
+        for path, value in (
+            (("source_commit",), "0" * 40),
+            (("claims",), []),
+            (("closure_declared",), False),
+            (
+                ("requirements", "native-soak", "linux", "receipt_sha256"),
+                "0" * 64,
+            ),
+            (
+                ("requirements", "native-soak", "linux", "audit", "status"),
+                "failed",
+            ),
+        ):
+            candidate = json.loads(json.dumps(closure))
+            target = candidate
+            for segment in path[:-1]:
+                target = target[segment]
+            target[path[-1]] = value
+            with self.subTest(path=path):
+                with self.assertRaises(GateFailure):
+                    validate_g8_aggregate(ROOT, candidate)
 
     def fixture(self, directory: str) -> Path:
         root = Path(directory)

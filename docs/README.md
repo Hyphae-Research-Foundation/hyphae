@@ -225,6 +225,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native G7 controlled-performance profile](../config/native-g7-readiness-profile.json)
 - [Native G7 provisional DigitalOcean control qualification — 2026-08-13](gates/evidence/native-g7-provisional-do-c60-2026-08-13.md)
 - [Native G7 C-60 operational-scale closure](gates/evidence/closures/native-g7-ff188af.json)
+- [Native G8 exact-SHA release closure](gates/evidence/closures/native-g8-e88f2ea.json)
 - [Native immutable-blob collection evidence — 2026-08-02](gates/evidence/native-blob-collection-2026-08-02.md)
 - [Native G6 exact-SHA local-product closure](gates/evidence/closures/native-g6-c57cc07.json)
 - [Native lineage-threading Linux evidence — 2026-08-02](gates/evidence/native-lineage-threading-linux-2026-08-02.md)
