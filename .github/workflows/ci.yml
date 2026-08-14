@@ -252,6 +252,8 @@ jobs:
         env:
           PYTHONPATH: sdks/python/src
         run: |
+          PYTHONPATH=. python -m unittest tools.test_check_python_package -v
+          PYTHONPATH=. python tools/check_python_package.py
           python -m compileall -q sdks/python/src sdks/python/conformance sdks/python/tests
           python -m unittest discover -s sdks/python/tests -v
       - name: Build public Rust clients and single binary

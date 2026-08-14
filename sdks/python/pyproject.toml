@@ -1,15 +1,40 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyphae-sdk"
 version = "1.1.0"
 description = "Bounded Python client for Hyphae v1 and Native v2 APIs"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE", "LICENSE-DOCUMENTATION", "LICENSE-POLICY.md"]
+authors = [
+  { name = "Celiums Solutions LLC" },
+]
+keywords = ["database", "sql", "vector-search", "rag", "local-first"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://hyphae.dev"
+Documentation = "https://github.com/celiumsai/hyphae/tree/main/docs"
+Repository = "https://github.com/celiumsai/hyphae"
+Issues = "https://github.com/celiumsai/hyphae/issues"
+Changelog = "https://github.com/celiumsai/hyphae/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
