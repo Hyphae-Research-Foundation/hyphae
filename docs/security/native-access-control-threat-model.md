@@ -86,7 +86,7 @@ An attacker may:
 | Audit event forges or leaks a secret | Events are product-generated, append under WAL/CSN, and contain public IDs/redacted fields only | Crash, replay, redaction, and canonical-codec tests |
 | Offline bootstrap or recovery while server is active | Exclusive directory lock and no remote endpoint; output path must be a new restricted regular file | Process exclusion and filesystem failure tests |
 | Rollback to an older credential database | Normal manifest/WAL lineage verification plus caller-pinned external anchors where rollback resistance is required | Backup/restore lineage and pinned-anchor tests |
-| Local client spoofs another principal | Kernel peer identity is authority; client-supplied identity is metadata | UDS/named-pipe adversarial handshake tests |
+| Local client spoofs another principal | Before bootstrap, kernel peer identity is trusted-local compatibility metadata; after bootstrap only a durable API key is authority and client-supplied identity remains diagnostic | UDS/named-pipe adversarial handshake and automatic-cutover tests |
 | Resource exhaustion through roles, grants, keys, or audit queries | Finite counts, name bytes, result pages, work budgets, deadlines, and admission | Exact-limit/one-past-limit tests |
 | Error details disclose security state | Stable authorization errors omit principal existence, roles, scopes, key IDs, SQL text, paths, and secrets | Golden errors and unknown-field redaction tests |
 
@@ -128,6 +128,11 @@ role system. Migration never hashes an arbitrary legacy token into the new key
 format or claims that it has a key ID. It issues a new canonical owner key and
 requires an explicit cutover and revocation. Missing legacy configuration does
 not reactivate a previously revoked credential.
+
+The current foundation does not yet activate that compatibility credential.
+Bootstrapped listeners reject a fixed bearer until migration, synthetic-owner
+binding, and revocation ship as one verified slice; this fail-closed interim
+does not consume the one-minor compatibility window.
 
 ## Residual and excluded threats
 

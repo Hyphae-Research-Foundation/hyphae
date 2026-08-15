@@ -61,6 +61,43 @@ fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
         .output()?)
 }
 
+fn assert_authorization_denied(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
+    let denied = output(arguments)?;
+    assert_eq!(denied.status.code(), Some(8));
+    let error: serde_json::Value = serde_json::from_slice(&denied.stderr)?;
+    assert_eq!(error["error"]["code"], "authorization_denied");
+    Ok(denied)
+}
+
+fn run_with_api_key_stdin(
+    data: &Path,
+    credential: &[u8],
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args([
+            "capabilities",
+            "--data-dir",
+            &path(data),
+            "--native-api-key-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write as _;
+
+        let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
+        stdin.write_all(credential)?;
+        stdin.write_all(b"\n")?;
+    }
+    let result = child.wait_with_output()?;
+    if !result.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&result.stderr)).into());
+    }
+    Ok(serde_json::from_slice(&result.stdout)?)
+}
+
 fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1376,7 +1413,7 @@ fn serve_can_share_one_product_service_with_native_http_v2() -> Result<(), Box<d
 
 #[cfg(unix)]
 #[tokio::test]
-async fn serve_native_api_key_auth_selects_managed_without_changing_legacy()
+async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
 -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new()?;
     let data = temporary.0.join("data");
@@ -1432,13 +1469,114 @@ async fn serve_native_api_key_auth_selects_managed_without_changing_legacy()
         let _guard = ChildGuard(&mut child);
 
         let legacy = HyphaeClient::local(path(&legacy_endpoint))?;
+        let denied = match legacy.capabilities(RequestOptions::default()).await {
+            Err(error) => error,
+            Ok(_response) => return Err("default serve accepted a legacy handshake".into()),
+        };
+        let ClientError::Product(denied) = denied else {
+            return Err("default serve did not return a typed authorization denial".into());
+        };
+        assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+
+        let authenticated =
+            HyphaeClient::local_authenticated(path(&legacy_endpoint), &owner_secret)?;
         assert!(matches!(
-            legacy.capabilities(RequestOptions::default()).await?,
+            authenticated
+                .capabilities(RequestOptions::default())
+                .await?,
             ProductResponse::Capabilities(_)
         ));
     }
     let _ignored = fs::remove_file(managed_endpoint);
     let _ignored = fs::remove_file(legacy_endpoint);
+    Ok(())
+}
+
+#[test]
+fn bootstrapped_embedded_cli_requires_a_restricted_api_key_source() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let owner_key = temporary.0.join("owner.key");
+    let wrong_key = temporary.0.join("wrong.key");
+    run(&["init", "--data-dir", &path(&data)])?;
+    run(&[
+        "security",
+        "--data-dir",
+        &path(&data),
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+
+    assert_authorization_denied(&["capabilities", "--data-dir", &path(&data)])?;
+    assert_authorization_denied(&["doctor", "--data-dir", &path(&data)])?;
+    assert_authorization_denied(&["security", "--data-dir", &path(&data), "status"])?;
+
+    let capabilities = run(&[
+        "capabilities",
+        "--data-dir",
+        &path(&data),
+        "--native-api-key-file",
+        &path(&owner_key),
+    ])?;
+    assert_eq!(capabilities["product_api_version"], 1);
+    let doctor = run(&[
+        "doctor",
+        "--data-dir",
+        &path(&data),
+        "--native-api-key-file",
+        &path(&owner_key),
+    ])?;
+    assert_eq!(doctor["status"], "healthy");
+
+    let stdin_capabilities = run_with_api_key_stdin(&data, &fs::read(&owner_key)?)?;
+    assert_eq!(stdin_capabilities["product_api_version"], 1);
+
+    let wrong_secret = format!("hyp1_{}_{}", "0".repeat(32), "0".repeat(64));
+    fs::write(&wrong_key, &wrong_secret)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&wrong_key, fs::Permissions::from_mode(0o600))?;
+    }
+    let wrong = assert_authorization_denied(&[
+        "capabilities",
+        "--data-dir",
+        &path(&data),
+        "--native-api-key-file",
+        &path(&wrong_key),
+    ])?;
+    assert!(!String::from_utf8_lossy(&wrong.stderr).contains(&wrong_secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let insecure_key = temporary.0.join("insecure.key");
+        fs::copy(&owner_key, &insecure_key)?;
+        fs::set_permissions(&insecure_key, fs::Permissions::from_mode(0o644))?;
+        let insecure = output(&[
+            "capabilities",
+            "--data-dir",
+            &path(&data),
+            "--native-api-key-file",
+            &path(&insecure_key),
+        ])?;
+        assert_eq!(insecure.status.code(), Some(8));
+
+        let linked_key = temporary.0.join("linked.key");
+        symlink(&owner_key, &linked_key)?;
+        let linked = output(&[
+            "capabilities",
+            "--data-dir",
+            &path(&data),
+            "--native-api-key-file",
+            &path(&linked_key),
+        ])?;
+        assert_eq!(linked.status.code(), Some(8));
+    }
     Ok(())
 }
 

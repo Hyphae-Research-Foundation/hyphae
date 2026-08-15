@@ -204,7 +204,9 @@ impl NativeDaemon {
     /// Unix endpoints are filesystem UDS paths with mode `0600`. Windows
     /// endpoints are named-pipe namespace identities. The safe audited
     /// `interprocess` wrapper supplies the stable named-pipe server and peer
-    /// credential implementation absent from `std`.
+    /// credential implementation absent from `std`. A bootstrapped access
+    /// catalog automatically requires the authenticated `HELLO`; OS-peer
+    /// compatibility remains available only before bootstrap.
     pub fn start(
         product: NativeProduct,
         endpoint: impl Into<String>,
@@ -226,19 +228,20 @@ impl NativeDaemon {
 
     /// Binds the platform local endpoint around an already-started sole
     /// product service. Edge adapters can clone the service handle before this
-    /// call so every listener dispatches through the same product owner.
+    /// call so every listener dispatches through the same product owner. The
+    /// daemon automatically selects API-key authentication when that owner
+    /// opened a bootstrapped access-control catalog.
     pub fn start_with_service(
         service: NativeProductService,
         endpoint: impl Into<String>,
         config: NativeDaemonConfig,
     ) -> Result<Self, DaemonError> {
-        Self::start_with_service_policy(
-            service,
-            endpoint,
-            config,
-            DaemonAuthentication::UnmanagedPeer,
-            None,
-        )
+        let authentication = if service.handle().access_control_bootstrapped() {
+            DaemonAuthentication::ManagedApiKey
+        } else {
+            DaemonAuthentication::UnmanagedPeer
+        };
+        Self::start_with_service_policy(service, endpoint, config, authentication, None)
     }
 
     /// Binds one API-key-authenticated daemon around an existing product owner.
@@ -280,6 +283,11 @@ impl NativeDaemon {
         authentication: DaemonAuthentication,
         denied_client_identity: Option<String>,
     ) -> Result<Self, DaemonError> {
+        if authentication == DaemonAuthentication::UnmanagedPeer
+            && service.handle().access_control_bootstrapped()
+        {
+            return Err(ProductError::from_code(ProductErrorCode::AuthorizationDenied).into());
+        }
         validate_config(config)?;
         let endpoint = endpoint.into();
         let endpoint = normalize_endpoint(&endpoint)?;

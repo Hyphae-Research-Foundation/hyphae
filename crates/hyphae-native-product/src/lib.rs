@@ -743,6 +743,19 @@ impl NativeProduct {
         report
     }
 
+    pub(crate) fn doctor_opened(&self, logical_time_micros: i64) -> DoctorReport {
+        self.telemetry.increment(MetricId::DoctorRuns, 1);
+        self.telemetry.record_event(TelemetryEvent {
+            captured_at_micros: logical_time_micros,
+            kind: TelemetryEventKind::Doctor,
+        });
+        let mut report = doctor::doctor_opened(&self.database, logical_time_micros);
+        report.telemetry_registry_version = TELEMETRY_REGISTRY_VERSION;
+        report.process_start_identity = self.telemetry.process_start_identity();
+        report.session_start_identity = self.telemetry.session_start_identity();
+        report
+    }
+
     /// Captures one immutable snapshot for a caller-supplied bounded dataset.
     ///
     /// This first G6 slice materializes the admitted engine state. It remains

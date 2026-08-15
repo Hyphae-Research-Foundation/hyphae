@@ -20,6 +20,7 @@ pub(crate) async fn serve(
     let product = NativeProduct::open(&data_dir)?;
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
     let handle = service.handle();
+    let managed = native_api_key_auth || handle.access_control_bootstrapped();
     let endpoint = endpoint.unwrap_or_else(|| default_endpoint(&data_dir));
     let daemon = if native_api_key_auth {
         NativeDaemon::start_with_service_authenticated(
@@ -37,7 +38,7 @@ pub(crate) async fn serve(
                 bind,
                 ..NativeHttpV2Config::default()
             };
-            let server = if native_api_key_auth {
+            let server = if managed {
                 NativeHttpV2Server::new_managed(handle, config)?
             } else {
                 NativeHttpV2Server::new(handle, config)?

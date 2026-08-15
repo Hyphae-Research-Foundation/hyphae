@@ -129,34 +129,47 @@ pub fn doctor(request: &DoctorRequest) -> DoctorReport {
         crate::TelemetryRegistry::new(crate::TelemetryConfig::new(0).unwrap_or_default());
     let identity = telemetry.snapshot(request.logical_time_micros, None);
     match NativeDatabase::open(&request.path) {
-        Ok(database) => {
-            let recovery = database.recovery_report();
-            let evidence = DoctorRecovery {
-                visible_csn: recovery.visible_csn,
-                replayed_transactions: recovery.replayed_transactions,
-                page_tail_bytes_removed: recovery.page_tail_bytes_removed,
-                wal_tail_bytes_removed: recovery.wal_tail_bytes_removed,
-                retained_wal_bytes: recovery.retained_wal_bytes,
-                manifest_count: recovery.manifest_count,
-                blob_count: recovery.blob_count,
-                open_time_micros: duration_micros(recovery.open_time),
-            };
-            let lineage = database.directory_identity().lineage().encode();
-            match database.snapshot(request.logical_time_micros) {
-                Ok(_) => DoctorReport {
-                    status: DoctorStatus::Healthy,
-                    verified_open: true,
-                    snapshot_verified: true,
-                    directory_lineage: Some(lineage),
-                    recovery: Some(evidence),
-                    telemetry_registry_version: identity.registry_version,
-                    process_start_identity: identity.process_start_identity,
-                    session_start_identity: identity.session_start_identity,
-                },
-                Err(error) => classified(&error, true, Some(lineage), Some(evidence), &identity),
-            }
-        }
+        Ok(database) => report_opened(&database, request.logical_time_micros, &identity),
         Err(error) => classified(&error, false, None, None, &identity),
+    }
+}
+
+pub(crate) fn doctor_opened(database: &NativeDatabase, logical_time_micros: i64) -> DoctorReport {
+    let telemetry =
+        crate::TelemetryRegistry::new(crate::TelemetryConfig::new(0).unwrap_or_default());
+    let identity = telemetry.snapshot(logical_time_micros, None);
+    report_opened(database, logical_time_micros, &identity)
+}
+
+fn report_opened(
+    database: &NativeDatabase,
+    logical_time_micros: i64,
+    identity: &crate::TelemetrySnapshot,
+) -> DoctorReport {
+    let recovery = database.recovery_report();
+    let evidence = DoctorRecovery {
+        visible_csn: recovery.visible_csn,
+        replayed_transactions: recovery.replayed_transactions,
+        page_tail_bytes_removed: recovery.page_tail_bytes_removed,
+        wal_tail_bytes_removed: recovery.wal_tail_bytes_removed,
+        retained_wal_bytes: recovery.retained_wal_bytes,
+        manifest_count: recovery.manifest_count,
+        blob_count: recovery.blob_count,
+        open_time_micros: duration_micros(recovery.open_time),
+    };
+    let lineage = database.directory_identity().lineage().encode();
+    match database.snapshot(logical_time_micros) {
+        Ok(_) => DoctorReport {
+            status: DoctorStatus::Healthy,
+            verified_open: true,
+            snapshot_verified: true,
+            directory_lineage: Some(lineage),
+            recovery: Some(evidence),
+            telemetry_registry_version: identity.registry_version,
+            process_start_identity: identity.process_start_identity,
+            session_start_identity: identity.session_start_identity,
+        },
+        Err(error) => classified(&error, true, Some(lineage), Some(evidence), identity),
     }
 }
 

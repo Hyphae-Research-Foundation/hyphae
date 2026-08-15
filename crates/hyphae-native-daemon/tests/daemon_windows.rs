@@ -228,6 +228,71 @@ fn request(operation: ProductOperation) -> WireRequest {
     }
 }
 
+async fn verify_bootstrapped_default_handshake(
+    endpoint: &str,
+    reader_secret: &str,
+) -> Result<(), Box<dyn Error>> {
+    let legacy = handshake_response(endpoint, &encode_hello(&Hello::default())?).await?;
+    if legacy.kind != FrameKind::Failure {
+        return Err("bootstrapped default named pipe accepted a legacy HELLO".into());
+    }
+    if decode_failure(&legacy.payload)?.code() != ProductErrorCode::AuthorizationDenied {
+        return Err("bootstrapped default named pipe returned the wrong legacy denial".into());
+    }
+
+    let authenticated = Client::connect_authenticated(endpoint, reader_secret).await?;
+    authenticated
+        .send_request(
+            1,
+            2,
+            ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            },
+        )
+        .await?;
+    if authenticated.response(1, 2).await?
+        != ProductResponse::StructureValue(Some(b"value".to_vec()))
+    {
+        return Err("bootstrapped default named pipe rejected a valid API key".into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_named_pipe_requires_api_key_after_access_control_bootstrap()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("default-managed-start")?;
+    let fixture = managed_reader_product(&test)?;
+    let daemon = NativeDaemon::start(
+        fixture.product,
+        &test.endpoint,
+        NativeDaemonConfig::default(),
+    )?;
+    let verification =
+        verify_bootstrapped_default_handshake(&test.endpoint, &fixture.reader_secret).await;
+    let shutdown = daemon.shutdown().await;
+    verification?;
+    drop(shutdown?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_named_pipe_with_service_requires_api_key_after_access_control_bootstrap()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("default-managed-service")?;
+    let fixture = managed_reader_product(&test)?;
+    let service =
+        NativeProductService::start(fixture.product, NativeProductServiceConfig::default())?;
+    let daemon =
+        NativeDaemon::start_with_service(service, &test.endpoint, NativeDaemonConfig::default())?;
+    let verification =
+        verify_bootstrapped_default_handshake(&test.endpoint, &fixture.reader_secret).await;
+    let shutdown = daemon.shutdown().await;
+    verification?;
+    drop(shutdown?);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn protected_pipe_supports_peer_identity_and_multiple_owner_clients()
 -> Result<(), Box<dyn Error>> {

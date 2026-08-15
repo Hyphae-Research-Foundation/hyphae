@@ -211,6 +211,24 @@ Unknown or incomplete state fails closed. A transport may cache the result only
 while the global authorization epoch is unchanged. Expiration is evaluated
 even when the epoch did not change.
 
+Once the catalog is bootstrapped, every online CLI/TUI, local-daemon, and Native
+HTTP entry point selects managed API-key authentication automatically. Offline
+bootstrap/recovery and pre-bootstrap redacted status are the only CLI
+exceptions. A public
+transport must never project an operating-system peer, loopback placement, or
+legacy fixed bearer into `ProductAuthorization::ALL` for that directory.
+Unmanaged sessions remain available only to an explicit trusted embedded
+caller and to an unbootstrapped directory before the offline owner bootstrap.
+Online CLI and TUI commands accept the credential only through
+`--native-api-key-file <restricted-path>` (or
+`HYPHAE_NATIVE_API_KEY_FILE`) and `--native-api-key-stdin`. The secret is never
+accepted as an argument value or printed. On Unix, the file must be a regular,
+non-symlink path with no group or other permission bits. Commands whose
+maintenance action has not yet been promoted into the central product
+operation registry fail closed after bootstrap instead of using a raw facade.
+The Unix reader binds pre-open, post-open, and opened-handle device/inode
+identity so a substituted path is rejected before any credential is parsed.
+
 ## Operations
 
 Every current `ProductOperation` variant and each planned security operation
@@ -246,6 +264,12 @@ given a fabricated key ID. Offline migration creates a canonical owner key and
 records the transition. Operators must cut clients over and explicitly revoke
 legacy acceptance. New remote instances reject legacy-only setup after the
 compatibility window.
+
+That compatibility window is a target contract, not a claim of current
+availability. Until the synthetic `legacy-owner` credential, migration
+operation, and explicit revocation are implemented together, a bootstrapped
+catalog rejects the fixed bearer fail-closed; the promised minor window has
+not started.
 
 ## Owner recovery
 

@@ -174,6 +174,7 @@ struct SharedService {
     queue_depth: AtomicU64,
     product: RwLock<Option<NativeProduct>>,
     sessions: Mutex<ServiceSessions>,
+    access_control_bootstrapped: bool,
     #[cfg(test)]
     fast_structure_get_hits: AtomicU64,
     #[cfg(test)]
@@ -237,17 +238,32 @@ pub struct NativeProductHandle {
 }
 
 impl NativeProductHandle {
+    /// Returns whether this service opened a bootstrapped access-control catalog.
+    ///
+    /// Bootstrap is offline and exclusive, so this mode cannot change while
+    /// the sole owner is running.
+    #[must_use]
+    pub fn access_control_bootstrapped(&self) -> bool {
+        self.shared.access_control_bootstrapped
+    }
+
     /// Opens one explicitly unmanaged, trusted-local service session.
     ///
     /// # Errors
     ///
-    /// Returns `unavailable` when admission is closed, or `limit_exceeded`
-    /// when the session bound is full.
+    /// Returns `authorization_denied` when durable access control is already
+    /// bootstrapped, `unavailable` when admission is closed, or
+    /// `limit_exceeded` when the session bound is full.
     pub fn open_session(
         &self,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
     ) -> Result<NativeProductClient, ProductError> {
+        if self.access_control_bootstrapped() {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
         self.open_session_at_epoch(
             principal,
             authorization,
@@ -259,9 +275,47 @@ impl NativeProductHandle {
     ///
     /// # Errors
     ///
+    /// Returns `authorization_denied` when durable access control is already
+    /// bootstrapped, `unavailable` when admission is closed, or
+    /// `limit_exceeded` when the session bound is full.
+    pub fn open_session_at_epoch(
+        &self,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: crate::AuthorizationEpoch,
+    ) -> Result<NativeProductClient, ProductError> {
+        if self.access_control_bootstrapped() {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        self.open_unmanaged_session_at_epoch(principal, authorization, authorization_epoch)
+    }
+
+    /// Opens one explicitly trusted embedded session even when durable access
+    /// control is bootstrapped.
+    ///
+    /// Transport adapters must never call this method. It exists only for a
+    /// process-local embedding that already owns the complete data-directory
+    /// trust boundary.
+    ///
+    /// # Errors
+    ///
     /// Returns `unavailable` when admission is closed, or `limit_exceeded`
     /// when the session bound is full.
-    pub fn open_session_at_epoch(
+    pub fn open_trusted_embedding_session(
+        &self,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+    ) -> Result<NativeProductClient, ProductError> {
+        self.open_unmanaged_session_at_epoch(
+            principal,
+            authorization,
+            crate::AuthorizationEpoch::UNMANAGED,
+        )
+    }
+
+    fn open_unmanaged_session_at_epoch(
         &self,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
@@ -790,6 +844,7 @@ impl NativeProductService {
         config: NativeProductServiceConfig,
     ) -> Result<Self, ProductError> {
         config.validate()?;
+        let access_control_bootstrapped = product.access_control_status()?.bootstrapped;
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let telemetry = product.telemetry().clone();
         let product = RwLock::new(Some(product));
@@ -802,6 +857,7 @@ impl NativeProductService {
             queue_depth: AtomicU64::new(0),
             product,
             sessions: Mutex::new(BTreeMap::new()),
+            access_control_bootstrapped,
             #[cfg(test)]
             fast_structure_get_hits: AtomicU64::new(0),
             #[cfg(test)]
@@ -1233,15 +1289,24 @@ mod tests {
         };
         assert_eq!(wrong_error.code(), ProductErrorCode::AuthorizationDenied);
 
-        let unmanaged = handle.open_session(test_principal(), ProductAuthorization::ALL)?;
+        let ordinary_unmanaged = handle.open_session(test_principal(), ProductAuthorization::ALL);
+        assert_eq!(
+            ordinary_unmanaged
+                .err()
+                .ok_or("bootstrapped service accepted an ordinary unmanaged session")?
+                .code(),
+            ProductErrorCode::AuthorizationDenied
+        );
+        let trusted =
+            handle.open_trusted_embedding_session(test_principal(), ProductAuthorization::ALL)?;
         assert!(matches!(
-            unmanaged.dispatch(
-                unmanaged.request_context(99, 0),
+            trusted.dispatch(
+                trusted.request_context(99, 0),
                 ProductOperation::Capabilities
             )?,
             ProductResponse::Capabilities(_)
         ));
-        unmanaged.close()?;
+        trusted.close()?;
 
         let credential = ApiKeyCredential::new(&secret)?;
         let client = handle.open_authenticated_session(credential)?;
@@ -1540,6 +1605,7 @@ mod tests {
                 queue_depth: AtomicU64::new(0),
                 product: RwLock::new(None),
                 sessions: Mutex::new(BTreeMap::new()),
+                access_control_bootstrapped: false,
                 fast_structure_get_hits: AtomicU64::new(0),
                 fast_structure_get_fallbacks: AtomicU64::new(0),
                 test_hooks: Mutex::new(ServiceTestHooks::default()),

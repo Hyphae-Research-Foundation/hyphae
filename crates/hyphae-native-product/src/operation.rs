@@ -1030,9 +1030,8 @@ fn dispatch_inner(
         ProductOperation::AdminExplainSql { statement } => {
             ProductResponse::Explain(product.administration().explain_sql(&statement)?)
         }
-        ProductOperation::Doctor(mut request) => {
-            request.path = product.data_directory().to_path_buf();
-            ProductResponse::Doctor(product.doctor(&request))
+        ProductOperation::Doctor(request) => {
+            ProductResponse::Doctor(product.doctor_opened(request.logical_time_micros))
         }
         ProductOperation::Backup(request) => {
             context.checkpoint()?;

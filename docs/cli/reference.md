@@ -62,6 +62,24 @@ Commands in the Native `dev` surface never initialize a missing directory on
 open: use `init` first. The format-2 compatibility commands retain their
 published `0.2.1` initialization behavior.
 
+After `security bootstrap`, every online Native CLI command and `console`
+automatically requires the durable API key. Supply it through
+`--native-api-key-file <RESTRICTED_FILE>` (or
+`HYPHAE_NATIVE_API_KEY_FILE`) or pipe it to `--native-api-key-stdin`. The raw
+credential is never accepted in argv. Unix key files must be regular,
+non-symlink files without group or other permission bits. Windows ACL
+restriction and named-pipe parity remain explicit 1.2 release gates; no
+cross-platform file-hygiene claim is made yet.
+On Unix the CLI also compares device/inode identity for the path before and
+after opening and for the opened handle, rejecting substitution rather than
+reading a different credential file.
+
+The offline `security bootstrap` path does not consume a credential. `doctor`
+uses the centrally authorized `maintain` operation whenever the directory can
+open; only a directory that cannot produce a product owner uses the bounded
+offline corruption/busy diagnostic. Native maintenance helpers that do not yet
+have a central product operation fail closed after bootstrap.
+
 ## `console`
 
 ```text
@@ -72,14 +90,15 @@ Opens the interactive native operator console while holding the same exclusive
 directory ownership as other embedded commands. It starts no listener and
 connects to no external service. The console currently provides:
 
-- responsive overview and access-control dashboards;
+- responsive overview and authenticated-session dashboards;
 - an interactive SQL editor and result pane backed by `ProductOperation`;
 - navigation targets for structures, search, and catalog workflows; and
 - bounded input/output rendering that never displays API-key secrets.
 
 Use Tab or the arrow keys to change views. In the SQL view, Enter executes the
-current statement and Backspace edits it. In other views, `r` refreshes the
-native status. Escape or Ctrl-C exits. Terminal state is restored on normal
+current statement and Backspace edits it. In other views, `r` refreshes
+capabilities through the current authenticated session. Escape or Ctrl-C
+exits. Terminal state is restored on normal
 exit and errors. Structure, search, and catalog mutation actions remain
 read-only placeholders until their typed workflows are implemented; the UI
 does not claim those actions are available.
@@ -92,8 +111,11 @@ hyphae security --data-dir <NATIVE_DIRECTORY> bootstrap \
   --name <PRINCIPAL_NAME> --label <KEY_LABEL> --key-out <NEW_FILE>
 ```
 
-`status` reports whether the native access-control catalog is bootstrapped and
-returns only counts and the authorization epoch. `bootstrap` creates the first
+`status` reports an empty, pre-bootstrap access-control catalog. Once the
+catalog is bootstrapped it fails closed until `security.read` is promoted into
+the central product-operation registry; it does not expose durable catalog
+counts through the offline facade. The bootstrap command
+creates the first
 administrator principal and key through the strict native WAL. The output
 credential file must not exist, is created with owner-only permissions on
 Unix, and is activated only after its contents have been synchronized. Hyphae

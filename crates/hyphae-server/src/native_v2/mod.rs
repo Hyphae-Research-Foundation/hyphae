@@ -89,7 +89,7 @@ mod tests {
         );
         assert!(!contract.contains("\"501\""));
         assert!(contract.contains("x-hyphae-authentication-modes:"));
-        assert!(contract.contains("new_managed requires one canonical hyp1 API key"));
+        assert!(contract.contains("After bootstrap, new automatically requires one canonical"));
         assert!(contract.contains("adapter is loopback-only; remote exposure requires a TLS"));
         assert!(
             contract
@@ -279,6 +279,88 @@ mod tests {
             ))
         ));
         drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_server_requires_managed_credentials_for_bootstrapped_catalogs()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("automatic-managed-auth", false)?;
+        let app = NativeHttpV2Server::new(fixture.service.handle(), NativeHttpV2Config::default())?
+            .test_router();
+        let body = request(ProductOperation::Capabilities)?;
+        let wrong_credential = concat!(
+            "hyp1_11111111111111111111111111111111_",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+
+        for (request_id, candidate) in [("214", None), ("215", Some(wrong_credential))] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "/v2/execute",
+                    body.clone(),
+                    Some(request_id),
+                    candidate,
+                    None,
+                )?)
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE],
+                "Bearer realm=\"hyphae-native-v2\""
+            );
+            let denied: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+            assert_eq!(denied["code"], "authorization_denied");
+            assert_eq!(denied["request_id"], request_id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_server_rejects_legacy_bearer_for_bootstrapped_catalogs() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = managed_service("automatic-managed-conflict", false)?;
+        let configured = NativeHttpV2Server::new(
+            fixture.service.handle(),
+            NativeHttpV2Config {
+                bearer_token: Some(BearerToken::new("0123456789abcdef0123456789abcdef")?),
+                ..NativeHttpV2Config::default()
+            },
+        );
+
+        assert!(matches!(
+            configured,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::ManagedAuthenticationConflict
+            ))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_server_preserves_unmanaged_access_for_empty_catalogs()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("automatic-unmanaged-empty")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+        let response = app
+            .oneshot(http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some("216"),
+                None,
+                None,
+            )?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert!(matches!(
+            decode_product_response(&response_bytes(response).await?)?,
+            hyphae_native_product::ProductResponse::Capabilities(_)
+        ));
         Ok(())
     }
 

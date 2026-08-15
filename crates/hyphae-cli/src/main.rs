@@ -452,6 +452,16 @@ struct LocalDirectory {
     /// Native data directory.
     #[arg(long, env = "HYPHAE_DATA_DIR")]
     data_dir: PathBuf,
+    /// Restricted API-key file for a bootstrapped Native directory.
+    #[arg(
+        long,
+        env = "HYPHAE_NATIVE_API_KEY_FILE",
+        conflicts_with = "native_api_key_stdin"
+    )]
+    native_api_key_file: Option<PathBuf>,
+    /// Read the Native API key from standard input without exposing it in argv.
+    #[arg(long, conflicts_with = "native_api_key_file")]
+    native_api_key_stdin: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1058,8 +1068,8 @@ enum ExplainCommand {
 enum BackupCommand {
     /// Create and independently verify a native backup.
     Create {
-        #[arg(long, env = "HYPHAE_DATA_DIR")]
-        data_dir: PathBuf,
+        #[command(flatten)]
+        local: LocalDirectory,
         #[arg(long)]
         out: PathBuf,
     },
@@ -1074,8 +1084,8 @@ enum BackupCommand {
 enum ProofCommand {
     /// Execute an eligible read and write canonical proof and witness artifacts.
     Generate {
-        #[arg(long, env = "HYPHAE_DATA_DIR")]
-        data_dir: PathBuf,
+        #[command(flatten)]
+        local: LocalDirectory,
         /// JSON proof operation (`catalog_list`, `catalog_describe`, or `sql`).
         #[arg(long)]
         operation_json: String,
@@ -1324,7 +1334,11 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             dispatch(&local, ProductOperation::AdminStatus).map_err(Into::into)
         }
         Command::Telemetry(local) => telemetry(&local).map_err(Into::into),
-        Command::Console(local) => tui::run(local.data_dir).map_err(Into::into),
+        Command::Console(local) => {
+            let data_dir = local.data_dir.clone();
+            let client = open_client(&local)?;
+            tui::run(data_dir, client).map_err(Into::into)
+        }
         Command::Security { local, operation } => security(&local, operation).map_err(Into::into),
         Command::Doctor(local) => {
             if compatibility(compatibility::directory_family(&local.data_dir))?
@@ -2258,7 +2272,11 @@ fn verify_migration_product(
 }
 
 fn open_client(local: &LocalDirectory) -> Result<EmbeddedClient, CliFailure> {
-    EmbeddedClient::new(NativeProduct::open(&local.data_dir).map_err(Box::new)?).map_err(Into::into)
+    EmbeddedClient::open(
+        NativeProduct::open(&local.data_dir).map_err(Box::new)?,
+        local.native_api_key_file.as_deref(),
+        local.native_api_key_stdin,
+    )
 }
 
 fn init(local: &LocalDirectory) -> Result<(), CliFailure> {
@@ -2432,8 +2450,10 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                 },
             ));
             objects.push(object);
-            let mut product = NativeProduct::open(&local.data_dir)?;
-            let receipt = product.create_catalog_objects_v2(objects, durability.into())?;
+            let mut client = open_client(local)?;
+            let receipt = client
+                .unmanaged_product_mut()?
+                .create_catalog_objects_v2(objects, durability.into())?;
             return print_json(&response_json(ProductResponse::CatalogCreated(
                 ProductCommitOutcome::Committed(receipt),
             )));
@@ -2539,13 +2559,15 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
         } => {
             let mut client = open_client(local)?;
             let collection = object_id(collection)?;
-            let receipt = client.product_mut().provision_search_collection(
-                collection,
-                native::logical_time_micros(),
-                durability.into(),
-            )?;
+            let receipt = client
+                .unmanaged_product_mut()?
+                .provision_search_collection(
+                    collection,
+                    native::logical_time_micros(),
+                    durability.into(),
+                )?;
             let binding = client
-                .product_mut()
+                .unmanaged_product_mut()?
                 .resolve_search_collection_binding(collection, native::logical_time_micros())?;
             print_json(&json!({
                 "result": response_json(ProductResponse::SearchIngested(receipt)),
@@ -2876,6 +2898,12 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
     match command {
         SecurityCommand::Status => {
             let status = product.access_control_status()?;
+            if status.bootstrapped {
+                return Err(hyphae_native_product::ProductError::from_code(
+                    hyphae_native_product::ProductErrorCode::AuthorizationDenied,
+                )
+                .into());
+            }
             print_json(&json!({
                 "schema": "hyphae-native-access-control-status-v1",
                 "bootstrapped": status.bootstrapped,
@@ -2913,13 +2941,33 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
 fn doctor(local: &LocalDirectory) -> Result<(), CliFailure> {
     let request = DoctorRequest::new(&local.data_dir, native::logical_time_micros())
         .map_err(|_| CliFailure::invalid())?;
-    print_json(&doctor_json(hyphae_native_product::doctor(&request)))
+    let product = match NativeProduct::open(&local.data_dir) {
+        Ok(product) => product,
+        Err(open_error)
+            if matches!(
+                open_error.code(),
+                hyphae_native_product::ProductErrorCode::DataDirectoryLocked
+                    | hyphae_native_product::ProductErrorCode::InvalidDataDirectory
+                    | hyphae_native_product::ProductErrorCode::Io
+            ) =>
+        {
+            return print_json(&doctor_json(hyphae_native_product::doctor(&request)));
+        }
+        Err(open_error) => return Err(open_error.into()),
+    };
+    let mut client = EmbeddedClient::open(
+        product,
+        local.native_api_key_file.as_deref(),
+        local.native_api_key_stdin,
+    )?;
+    let response = client.dispatch(ProductOperation::Doctor(request))?;
+    print_json(&response_json(response))
 }
 
 fn compact(local: &LocalDirectory, target: CompactTarget) -> Result<(), CliFailure> {
     let mut client = open_client(local)?;
     let receipt = client
-        .product_mut()
+        .unmanaged_product_mut()?
         .administration()
         .compact(CompactionRequest {
             target: target.into(),
@@ -2940,7 +2988,10 @@ fn compact(local: &LocalDirectory, target: CompactTarget) -> Result<(), CliFailu
 
 fn vacuum(local: &LocalDirectory) -> Result<(), CliFailure> {
     let mut client = open_client(local)?;
-    let receipt = client.product_mut().administration().vacuum_pages()?;
+    let receipt = client
+        .unmanaged_product_mut()?
+        .administration()
+        .vacuum_pages()?;
     print_json(&json!({
         "status": if receipt.applied { "vacuumed" } else { "no_changes" },
         "previous_generation": receipt.previous_generation,
@@ -2954,8 +3005,7 @@ fn vacuum(local: &LocalDirectory) -> Result<(), CliFailure> {
 
 fn backup(command: BackupCommand) -> Result<(), CliFailure> {
     match command {
-        BackupCommand::Create { data_dir, out } => {
-            let local = LocalDirectory { data_dir };
+        BackupCommand::Create { local, out } => {
             let request = BackupRequest::new(out).map_err(|_| CliFailure::invalid())?;
             dispatch(&local, ProductOperation::Backup(request))
         }
@@ -2985,7 +3035,7 @@ fn restore(backup: &Path, data_dir: &Path) -> Result<(), CliFailure> {
 fn proof(command: ProofCommand) -> Result<(), CliFailure> {
     match command {
         ProofCommand::Generate {
-            data_dir,
+            local,
             operation_json,
             proof_out,
             witness_out,
@@ -2994,7 +3044,6 @@ fn proof(command: ProofCommand) -> Result<(), CliFailure> {
                 return Err(CliFailure::invalid());
             }
             let operation = proof_operation(serde_json::from_str(&operation_json)?)?;
-            let local = LocalDirectory { data_dir };
             let response = open_client(&local)?.dispatch(ProductOperation::Prove {
                 operation: Box::new(operation),
                 limits: NativeProofGenerationLimits::default(),

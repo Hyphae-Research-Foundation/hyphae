@@ -17,10 +17,13 @@ x-hyphae-provisional-streams: >-
   Every application/x-ndjson data record is provisional. Success exists only
   after a terminal completion record with status complete.
 x-hyphae-authentication-modes:
-  unmanaged: Legacy constructor; optional fixed bearer gates trusted full authority.
+  unmanaged: >-
+    Before bootstrap, new preserves the legacy adapter and an optional fixed
+    bearer may gate trusted full authority.
   managed: >-
-    new_managed requires one canonical hyp1 API key on every request and derives
-    product sessions from the durable access-control catalog. The plaintext
+    After bootstrap, new automatically requires one canonical hyp1 API key on
+    every request and derives product sessions from the durable access-control
+    catalog. new_managed forces the same policy before bootstrap. The plaintext
     adapter is loopback-only; remote exposure requires a TLS-terminating proxy.
 servers:
   - url: http://127.0.0.1:8788
@@ -235,8 +238,10 @@ components:
       scheme: bearer
       bearerFormat: hyp1_<32-lowercase-hex-key-id>_<64-lowercase-hex-secret>
       description: >-
-        Mandatory in managed mode and optional only for explicitly unmanaged
-        deployments. Exactly one canonical hyp1 credential is accepted.
+        Automatically mandatory when the Native access-control catalog is
+        bootstrapped, and optional only for a pre-bootstrap unmanaged service.
+        Exactly one canonical hyp1 credential is accepted in managed mode;
+        the planned synthetic legacy-owner migration is not yet active.
   headers:
     RequestId:
       required: true

@@ -9,9 +9,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use hyphae_native_product::{
-    AccessControlStatus, NativeProduct, ProductCapabilities, ProductOperation, ProductValue,
-};
+use hyphae_native_product::{ProductCapabilities, ProductOperation, ProductValue};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -62,7 +60,7 @@ struct App {
     data_dir: PathBuf,
     view_index: usize,
     capabilities: ProductCapabilities,
-    security: AccessControlStatus,
+    managed: bool,
     sql: String,
     output: String,
     should_quit: bool,
@@ -70,13 +68,13 @@ struct App {
 
 impl App {
     fn new(data_dir: PathBuf, client: &mut EmbeddedClient) -> Result<Self, CliFailure> {
-        let capabilities = client.product_mut().capabilities();
-        let security = client.product_mut().access_control_status()?;
+        let capabilities = client.capabilities()?;
+        let managed = client.is_managed();
         Ok(Self {
             data_dir,
             view_index: 0,
             capabilities,
-            security,
+            managed,
             sql: String::new(),
             output: "Ready. Tab changes view; r refreshes; q exits.".to_owned(),
             should_quit: false,
@@ -99,8 +97,8 @@ impl App {
     }
 
     fn refresh(&mut self, client: &mut EmbeddedClient) -> Result<(), CliFailure> {
-        self.security = client.product_mut().access_control_status()?;
-        "Dashboard refreshed from the native product authority.".clone_into(&mut self.output);
+        self.capabilities = client.capabilities()?;
+        "Dashboard refreshed within the authenticated authority.".clone_into(&mut self.output);
         Ok(())
     }
 
@@ -154,9 +152,7 @@ impl App {
 }
 
 /// Runs the interactive console while holding exclusive native ownership.
-pub(crate) fn run(data_dir: PathBuf) -> Result<(), CliFailure> {
-    let product = NativeProduct::open(&data_dir)?;
-    let mut client = EmbeddedClient::new(product)?;
+pub(crate) fn run(data_dir: PathBuf, mut client: EmbeddedClient) -> Result<(), CliFailure> {
     let mut app = App::new(data_dir, &mut client)?;
     enable_raw_mode()?;
     let _guard = TerminalModeGuard;
@@ -301,6 +297,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn overview_lines(app: &App) -> Vec<Line<'static>> {
+    let access_control = if app.managed {
+        "managed API-key session".to_owned()
+    } else {
+        "unmanaged / pre-bootstrap".to_owned()
+    };
     vec![
         metric_line("Data directory", app.data_dir.display().to_string()),
         metric_line(
@@ -312,14 +313,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
             app.capabilities.native_directory_format.to_string(),
         ),
         metric_line("SQL row limit", app.capabilities.max_sql_rows.to_string()),
-        metric_line(
-            "Access control",
-            if app.security.bootstrapped {
-                format!("active / epoch {}", app.security.epoch.get())
-            } else {
-                "not bootstrapped".to_owned()
-            },
-        ),
+        metric_line("Access control", access_control),
         Line::from(""),
         Line::from("One binary. One directory. SQL + structures + lexical/vector search."),
     ]
@@ -327,12 +321,16 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
 
 fn security_lines(app: &App) -> Vec<Line<'static>> {
     vec![
-        metric_line("Bootstrapped", app.security.bootstrapped.to_string()),
-        metric_line("Authorization epoch", app.security.epoch.get().to_string()),
-        metric_line("Principals", app.security.principals.to_string()),
-        metric_line("Assignments", app.security.assignments.to_string()),
-        metric_line("Key records", app.security.keys.to_string()),
-        metric_line("Pending outputs", app.security.pending_keys.to_string()),
+        metric_line(
+            "Session authority",
+            if app.managed {
+                "managed API key"
+            } else {
+                "unmanaged pre-bootstrap"
+            }
+            .to_owned(),
+        ),
+        Line::from("Security catalog details require the forthcoming security.read operation."),
         Line::from(""),
         Line::from("Credential secrets are never rendered in this console."),
     ]
@@ -392,17 +390,7 @@ mod tests {
                 .position(|candidate| *candidate == view)
                 .unwrap_or(0),
             capabilities: hyphae_native_product::capabilities(),
-            security: AccessControlStatus {
-                bootstrapped: true,
-                epoch: hyphae_native_product::AuthorizationEpoch::new(7),
-                principals: 3,
-                assignments: 4,
-                custom_roles: 2,
-                custom_assignments: 2,
-                keys: 5,
-                pending_keys: 0,
-                audit_events: 7,
-            },
+            managed: true,
             sql: "SELECT value FROM items WHERE id = ?".to_owned(),
             output: "ready".to_owned(),
             should_quit: false,
@@ -424,7 +412,8 @@ mod tests {
     fn dashboard_renders_at_compact_and_wide_sizes_without_secrets() -> Result<(), Infallible> {
         for (width, height) in [(80, 24), (120, 36), (200, 60)] {
             let rendered = fixture(width, height, View::Security)?;
-            assert!(rendered.contains("Authorization epoch"));
+            assert!(rendered.contains("managed API key"));
+            assert!(rendered.contains("security.read"));
             assert!(rendered.contains("Credential secrets are never rendered"));
             assert!(!rendered.contains("hyp1_"));
         }

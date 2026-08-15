@@ -129,7 +129,10 @@ pub struct NativeHttpV2Server {
 }
 
 impl NativeHttpV2Server {
-    /// Validates loopback and authentication policy without opening storage authority.
+    /// Selects authentication from the service catalog and validates HTTP policy.
+    ///
+    /// An empty catalog preserves the unmanaged compatibility adapter. A
+    /// bootstrapped catalog automatically selects managed API-key sessions.
     ///
     /// # Errors
     ///
@@ -138,6 +141,9 @@ impl NativeHttpV2Server {
         handle: NativeProductHandle,
         config: NativeHttpV2Config,
     ) -> Result<Self, NativeHttpV2Error> {
+        if handle.access_control_bootstrapped() {
+            return Self::new_managed(handle, config);
+        }
         config.validate()?;
         let session_mode = NativeHttpV2SessionMode::Unmanaged {
             bearer_token: config.bearer_token,
@@ -152,7 +158,7 @@ impl NativeHttpV2Server {
 
     /// Enables catalog-managed `hyp1_` API-key authentication for every request.
     ///
-    /// Unlike [`Self::new`], this mode derives every product session from
+    /// This force-managed constructor derives every product session from
     /// [`NativeProductHandle::open_authenticated_session`]. The legacy fixed
     /// bearer configuration field must be unset so catalog RBAC remains the
     /// sole authentication authority. This plaintext adapter must remain on a

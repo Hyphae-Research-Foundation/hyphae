@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
+use hyphae_native_daemon::{DaemonError, NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
     ApiKeyId, AuthenticatedAuthority, BuiltInRole, NativeProduct, NativeProductService,
     NativeProductServiceConfig, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
@@ -263,6 +263,123 @@ fn request(operation: ProductOperation) -> WireRequest {
         idempotency_token: None,
         limits: ProductLimits::default(),
         durability: ProductDurabilityPolicy::MEMORY,
+    }
+}
+
+async fn verify_bootstrapped_default_handshake(
+    endpoint: &Path,
+    reader_secret: &str,
+) -> Result<(), Box<dyn Error>> {
+    let legacy = handshake_response(endpoint, &encode_hello(&Hello::default())?).await?;
+    if legacy.kind != FrameKind::Failure {
+        return Err("bootstrapped default daemon accepted a legacy HELLO".into());
+    }
+    if decode_failure(&legacy.payload)?.code() != ProductErrorCode::AuthorizationDenied {
+        return Err("bootstrapped default daemon returned the wrong legacy denial".into());
+    }
+
+    let authenticated = Client::connect_authenticated(endpoint, reader_secret).await?;
+    authenticated
+        .send_request(
+            1,
+            2,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    if authenticated.response(1, 2).await?
+        != ProductResponse::StructureValue(Some(b"value".to_vec()))
+    {
+        return Err("bootstrapped default daemon rejected a valid API key".into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_start_requires_api_key_after_access_control_bootstrap()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("default-managed-start")?;
+    let fixture = managed_reader_product(&test)?;
+    let daemon = NativeDaemon::start(
+        fixture.product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let verification =
+        verify_bootstrapped_default_handshake(&test.socket, &fixture.reader_secret).await;
+    let shutdown = daemon.shutdown().await;
+    verification?;
+    drop(shutdown?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_start_with_service_requires_api_key_after_access_control_bootstrap()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("default-managed-service")?;
+    let fixture = managed_reader_product(&test)?;
+    let service =
+        NativeProductService::start(fixture.product, NativeProductServiceConfig::default())?;
+    let daemon = NativeDaemon::start_with_service(
+        service,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let verification =
+        verify_bootstrapped_default_handshake(&test.socket, &fixture.reader_secret).await;
+    let shutdown = daemon.shutdown().await;
+    verification?;
+    drop(shutdown?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_start_preserves_legacy_hello_for_empty_access_control_catalog()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("default-empty-legacy")?;
+    let daemon = NativeDaemon::start(
+        NativeProduct::create(&test.data)?,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let response = handshake_response(&test.socket, &encode_hello(&Hello::default())?).await?;
+    if response.kind != FrameKind::Welcome {
+        return Err("empty default daemon rejected a legacy HELLO".into());
+    }
+    let welcome = decode_welcome(&response.payload)?;
+    assert!(
+        !welcome
+            .capabilities
+            .contains(ProtocolCapabilities::API_KEY_AUTH)
+    );
+    drop(daemon.shutdown().await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_unmanaged_start_rejects_bootstrapped_access_control()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("acceptance-managed-denial")?;
+    let fixture = managed_reader_product(&test)?;
+    let service =
+        NativeProductService::start(fixture.product, NativeProductServiceConfig::default())?;
+    match NativeDaemon::start_with_service_for_acceptance(
+        service,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+        "denied acceptance identity",
+    ) {
+        Err(DaemonError::Product(error))
+            if error.code() == ProductErrorCode::AuthorizationDenied =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("acceptance unmanaged startup returned {error}").into()),
+        Ok(daemon) => {
+            drop(daemon.shutdown().await?);
+            Err("acceptance unmanaged daemon started over a bootstrapped catalog".into())
+        }
     }
 }
 

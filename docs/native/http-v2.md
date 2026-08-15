@@ -14,13 +14,14 @@ default bind is loopback. Remote exposure requires explicit bind,
 authentication, request/response limits, and operator-owned TLS termination or
 a separately accepted in-process TLS decision.
 
-`NativeHttpV2Server::new` preserves the legacy unmanaged adapter. Its optional
-fixed bearer token gates one trusted `ProductAuthorization::ALL` session; it
-does not opt into catalog RBAC. `NativeHttpV2Server::new_managed` enables RBAC
-without changing the public configuration shape. Managed mode rejects an
-ambiguous configuration containing the legacy fixed-bearer field, permits a
-loopback bind only because this adapter does not terminate TLS, and opens
-product sessions only through
+`NativeHttpV2Server::new` preserves the legacy unmanaged adapter only while the
+directory is not bootstrapped. A bootstrapped service automatically selects
+managed authentication; an optional legacy fixed bearer is then an ambiguous
+configuration error rather than authority for an `ALL` session.
+`NativeHttpV2Server::new_managed` can force the same managed policy before
+bootstrap without changing the public configuration shape. Managed mode
+permits a loopback bind only because this adapter does not terminate TLS and
+opens product sessions only through
 `NativeProductHandle::open_authenticated_session`. Remote managed exposure
 must terminate TLS in a proxy that forwards to the loopback listener; a durable
 API key never travels to a non-loopback plaintext bind.

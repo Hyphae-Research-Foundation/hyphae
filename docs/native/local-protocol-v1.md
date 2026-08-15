@@ -64,6 +64,12 @@ public `Hello` value, client identity, diagnostics or `Debug` output. Decoded
 credentials are held only in a redacted, erase-on-drop value until transferred
 to the product authority.
 
+The daemon selects this authenticated `HELLO` automatically whenever its sole
+product service reports a bootstrapped access-control catalog. The legacy
+OS-peer `HELLO` remains byte-identical for unbootstrapped directories, but is
+rejected with the uniform authorization failure after bootstrap. The public
+daemon constructors cannot force OS-peer authority for a bootstrapped service.
+
 The closed capability registry is:
 
 | Bit | Name |
