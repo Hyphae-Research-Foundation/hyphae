@@ -1991,6 +1991,8 @@ fn sync_parent_directory(path: &Path) -> Result<(), CliFailure> {
     {
         std::fs::File::open(path)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
