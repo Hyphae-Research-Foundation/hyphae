@@ -453,7 +453,8 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    canonical = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    path.write_bytes(canonical)
 
 
 def parse_args() -> argparse.Namespace:
