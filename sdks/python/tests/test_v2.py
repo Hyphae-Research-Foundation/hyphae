@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 from unittest.mock import patch
 
-from hyphae_sdk.v2 import HyphaeClient, RequestOptions, Response
+from hyphae_sdk.v2 import HyphaeClient, ProductError, RequestOptions, Response
 from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
 from hyphae_sdk.v2.local import _windows_pipe_namespace, _write_all
 from hyphae_sdk.v2.protocol import (
@@ -72,6 +72,34 @@ class FakeHttpConnection:
 
     def close(self) -> None:
         pass
+
+
+class FakeJsonErrorHttpResponse:
+    status = 409
+
+    def __init__(self) -> None:
+        self._body = (
+            b'{"code":"catalog_conflict","category":"conflict",'
+            b'"retry":"after-refresh","message":"catalog changed",'
+            b'"request_id":19,"trace_id":23,"object_id":29,'
+            b'"transaction_state":"none","transaction_id":null,'
+            b'"details":{"reason":"stale"}}'
+        )
+
+    def getheader(self, name: str) -> str | None:
+        return {
+            "Content-Length": str(len(self._body)),
+            "Content-Type": "application/json",
+            "X-Hyphae-Request-Id": "19",
+        }.get(name)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body[:size]
+
+
+class FakeJsonErrorHttpConnection(FakeHttpConnection):
+    def getresponse(self) -> FakeJsonErrorHttpResponse:
+        return FakeJsonErrorHttpResponse()
 
 
 class ShortWriteStream:
@@ -295,6 +323,20 @@ class V2Tests(unittest.TestCase):
         response = transport.execute("capabilities", {}, RequestOptions(request_id=17))
         self.assertEqual(response.kind, "capabilities")
         self.assertEqual(FakeHttpConnection.last_path, "/v2/execute")
+
+    @patch("http.client.HTTPSConnection", FakeJsonErrorHttpConnection)
+    def test_http_client_decodes_valid_json_product_error(self) -> None:
+        transport = HttpTransport("https://example.test")
+
+        with self.assertRaises(ProductError) as caught:
+            transport.execute("capabilities", {}, RequestOptions(request_id=19))
+
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.code, "catalog_conflict")
+        self.assertEqual(caught.exception.fields.request_id, 19)
+        self.assertEqual(caught.exception.fields.trace_id, 23)
+        self.assertEqual(caught.exception.fields.object_id, 29)
+        self.assertEqual(caught.exception.fields.details, {"reason": "stale"})
 
 
 if __name__ == "__main__":

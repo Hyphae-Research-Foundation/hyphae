@@ -8,7 +8,14 @@ import threading
 import time
 import urllib.parse
 
-from .models import ClientError, ProductError, RequestOptions, Response, product_error
+from .models import (
+    ClientError,
+    ProductError,
+    ProductErrorFields,
+    RequestOptions,
+    Response,
+    product_error,
+)
 from .protocol import decode_product_error, decode_product_response, encode_product_request
 
 
