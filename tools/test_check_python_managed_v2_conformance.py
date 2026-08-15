@@ -94,8 +94,11 @@ class PythonManagedV2ConformanceTests(unittest.TestCase):
             validate_schema_contract(schema)
 
     def test_exact_three_platform_receipts_aggregate(self) -> None:
+        rows = [receipt("linux"), receipt("macos"), receipt("windows")]
+        rows[1]["python_version"] = "3.11.14"
+        rows[2]["python_version"] = "3.11.13"
         result = validate_receipt_set(
-            [receipt("linux"), receipt("macos"), receipt("windows")],
+            rows,
             expected_source_commit=COMMIT,
             expected_source_tree=TREE,
             receipt_sha256s=["1" * 64, "2" * 64, "3" * 64],
@@ -103,7 +106,7 @@ class PythonManagedV2ConformanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["platform_count"], 3)
         self.assertEqual(result["source_commit"], COMMIT)
-        self.assertEqual(result["python_version"], "3.11.15")
+        self.assertEqual(result["python_series"], "3.11")
         self.assertEqual(result["transcript_sha256"], TRANSCRIPT)
         self.assertEqual([lane["platform"] for lane in result["lanes"]], ["linux", "macos", "windows"])
 
@@ -150,15 +153,10 @@ class PythonManagedV2ConformanceTests(unittest.TestCase):
                 receipt_sha256s=["1" * 64, "2" * 64, "3" * 64],
             )
 
-        rows = [receipt("linux"), receipt("macos"), receipt("windows")]
-        rows[1]["python_version"] = "3.14.6"
+        malformed = receipt("macos")
+        malformed["python_version"] = "3.14.6"
         with self.assertRaisesRegex(ConformanceFailure, "Python version"):
-            validate_receipt_set(
-                rows,
-                expected_source_commit=COMMIT,
-                expected_source_tree=TREE,
-                receipt_sha256s=["1" * 64, "2" * 64, "3" * 64],
-            )
+            validate_receipt(malformed)
 
         rows = [receipt("linux"), receipt("macos"), receipt("windows")]
         rows[1]["transcript_sha256"] = "f" * 64

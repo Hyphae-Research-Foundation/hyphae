@@ -26,6 +26,7 @@ CARGO_MANIFESTS = (
     "conformance/g7/runners/rust/Cargo.toml",
     "conformance/g8/independent-backup-verifier/Cargo.toml",
     "conformance/rust/Cargo.toml",
+    "conformance/v2/fixture/Cargo.toml",
     "crates/hyphae-cli/Cargo.toml",
     "crates/hyphae-client/Cargo.toml",
     "crates/hyphae-contracts/Cargo.toml",

@@ -11,7 +11,7 @@
     "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "platform": {"enum": ["linux", "macos", "windows"]},
-    "python_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "python_version": {"type": "string", "pattern": "^3\\.11\\.[0-9]+$"},
     "distribution": {
       "type": "object",
       "additionalProperties": false,

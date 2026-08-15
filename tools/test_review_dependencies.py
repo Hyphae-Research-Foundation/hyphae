@@ -127,6 +127,7 @@ class DependencyReviewTests(unittest.TestCase):
             "conformance/g6/runners/rust/Cargo.toml",
             "conformance/g7/runners/rust/Cargo.toml",
             "conformance/g8/independent-backup-verifier/Cargo.toml",
+            "conformance/v2/fixture/Cargo.toml",
         ):
             self.assertIn(manifest, CARGO_MANIFESTS)
         for lock in (

@@ -146,7 +146,7 @@ def validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     python_version = receipt.get("python_version")
     if (
         not isinstance(python_version, str)
-        or re.fullmatch(r"\d+\.\d+\.\d+", python_version) is None
+        or re.fullmatch(r"3\.11\.\d+", python_version) is None
     ):
         fail("Python version is invalid")
 
@@ -243,15 +243,11 @@ def validate_receipt_set(
     wheels = {(row["wheel_filename"], row["wheel_sha256"]) for row in rows}
     if len(wheels) != 1:
         fail("platform receipts must bind one exact wheel")
-    python_versions = {row["python_version"] for row in rows}
-    if len(python_versions) != 1:
-        fail("platform receipts must bind one exact Python version")
     transcripts = {row["transcript_sha256"] for row in rows}
     if len(transcripts) != 1:
         fail("platform receipts must bind one canonical transcript")
     source_commit, source_tree = next(iter(identities))
     wheel_filename, wheel_sha256 = next(iter(wheels))
-    python_version = next(iter(python_versions))
     transcript_sha256 = next(iter(transcripts))
     lanes = []
     for row, receipt_sha256 in sorted(
@@ -260,6 +256,7 @@ def validate_receipt_set(
         lanes.append(
             {
                 "platform": row["platform"],
+                "python_version": row["python_version"],
                 "receipt_sha256": receipt_sha256,
                 "binary_sha256": row["binary_sha256"],
                 "fixture_binary_sha256": row["fixture_binary_sha256"],
@@ -271,7 +268,7 @@ def validate_receipt_set(
         "status": "passed",
         "source_commit": source_commit,
         "source_tree": source_tree,
-        "python_version": python_version,
+        "python_series": "3.11",
         "distribution": {"filename": wheel_filename, "sha256": wheel_sha256},
         "transcript_sha256": transcript_sha256,
         "platform_count": len(PLATFORMS),
