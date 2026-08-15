@@ -21,14 +21,16 @@ PYTHONPATH=. python3 -m unittest tools.test_check_native_v2_authority_conformanc
 PYTHONPATH=. python3 tools/check_native_v2_authority_conformance.py
 ```
 
-Every evidence row names a locked Rust test command and one or more source
-anchors. The checker verifies that all required cases are covered and that the
-anchors still exist. The Rust commands remain the executable evidence; the
-JSON corpus and checker do not substitute for running them on their declared
-platforms. The role-matrix row is fixed to the exhaustive managed write-plane
-test: durable Admin and Owner credentials execute all six security mutations,
-while durable Auditor, Developer, Operator, Reader, and Writer credentials
-receive the same authorization denial for each mutation.
+Eight evidence rows name locked Rust test commands and one row names the live
+Python managed-client runner. The checker verifies that all required cases are
+covered and that the anchors still exist. The Python row runs the same built
+wheel on Linux, macOS, and Windows against the real `hyphae serve` binary over
+AF_UNIX or a local named pipe and the binary HTTP `/v2/execute` edge. The JSON
+corpus and static checker do not substitute for those hosted executions. The
+role-matrix row remains fixed to the exhaustive managed write-plane test:
+durable Admin and Owner credentials execute all six security mutations, while
+durable Auditor, Developer, Operator, Reader, and Writer credentials receive
+the same authorization denial for each mutation.
 
 The authentication denial shape is deliberately identical for missing,
 malformed, wrong, expired, and revoked credentials. Metadata cursors bind the
@@ -37,3 +39,18 @@ cursors bind retained event identity and fail with `invalid_request` outside
 the retention window. Minor 0 cannot carry security reads or writes, and minor
 1 cannot carry security writes; these shapes are rejected before product
 dispatch.
+
+The live Python receipt binds the source commit and tree, installed wheel,
+product and fixture binaries, negotiated Native 1.2 protocol, exact transport
+inventory, and canonical transcript digest. The aggregate additionally binds
+those receipts to its own checkout and retains every lane's receipt, product,
+fixture, and transcript digest. The live corpus exhausts each bounded page,
+rejects repeated items and cursors, proves a stale cursor after an epoch change,
+walks every response for secret-bearing fields, and reads back the durable
+principal, role, and assignment effects before accepting the transcript. The
+daemon must remain alive until the harness performs its controlled shutdown.
+
+No receipt contains an endpoint, filesystem path, credential, bearer header,
+verifier, or raw response. The Windows lane proves local named-pipe and
+loopback HTTP behavior; it does not claim owner-only Windows ACL enforcement
+for credential files, which remains a separate 1.2 release gate.

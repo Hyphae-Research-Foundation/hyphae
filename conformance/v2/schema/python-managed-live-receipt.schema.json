@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/schema/python-managed-v2-conformance-receipt-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "source_commit", "source_tree", "platform", "python_version", "distribution", "binary", "fixture_binary", "protocol", "transports", "operations", "cases", "transcript_sha256"],
+  "properties": {
+    "schema": {"const": "hyphae-python-managed-v2-conformance-receipt-v1"},
+    "status": {"const": "passed"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "platform": {"enum": ["linux", "macos", "windows"]},
+    "python_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {"type": "string", "pattern": "^hyphae_sdk-[0-9]+\\.[0-9]+\\.[0-9]+-py3-none-any\\.whl$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {"enum": ["hyphae", "hyphae.exe"]},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "fixture_binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {"enum": ["hyphae-v2-fixture", "hyphae-v2-fixture.exe"]},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {"major": {"const": 1}, "minor": {"const": 2}}
+    },
+    "transports": {
+      "oneOf": [
+        {"const": ["af-unix", "http-v2"]},
+        {"const": ["http-v2", "named-pipe"]}
+      ]
+    },
+    "operations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reads", "writes"],
+      "properties": {
+        "reads": {"const": ["security_assignment_list", "security_audit_read", "security_key_list", "security_principal_list", "security_role_list", "security_status"]},
+        "writes": {"const": ["security_assignment_revoke", "security_built_in_assignment_create", "security_custom_assignment_create", "security_custom_role_create", "security_principal_create", "security_principal_set_enabled"]}
+      }
+    },
+    "cases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conflict", "next_operation_revocation", "pagination", "readback", "redaction", "replay", "stale_cursor"],
+      "properties": {
+        "conflict": {"const": true},
+        "next_operation_revocation": {"const": true},
+        "pagination": {"const": true},
+        "readback": {"const": true},
+        "redaction": {"const": true},
+        "replay": {"const": true},
+        "stale_cursor": {"const": true}
+      }
+    },
+    "transcript_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

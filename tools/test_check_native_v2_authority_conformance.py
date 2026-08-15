@@ -31,7 +31,7 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["operations"], 12)
         self.assertEqual(result["authentication_denials"], 5)
-        self.assertEqual(result["evidence_rows"], 8)
+        self.assertEqual(result["evidence_rows"], 9)
 
     def test_operation_drift_from_access_control_contract_fails_closed(self) -> None:
         corpus = payload()
@@ -176,6 +176,27 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(AuthorityConformanceError, "role matrix evidence"):
+            validate(corpus, CONTRACT, ROOT)
+
+    def test_python_managed_live_evidence_is_fixed_and_cross_platform(self) -> None:
+        corpus = payload()
+        evidence = next(
+            row for row in corpus["evidence"] if row["id"] == "python-managed-live"
+        )
+        evidence["platforms"].remove("windows")
+        with self.assertRaisesRegex(
+            AuthorityConformanceError, "Python managed live evidence"
+        ):
+            validate(corpus, CONTRACT, ROOT)
+
+        corpus = payload()
+        evidence = next(
+            row for row in corpus["evidence"] if row["id"] == "python-managed-live"
+        )
+        evidence["command"] = "cargo test --locked -p hyphae-client"
+        with self.assertRaisesRegex(
+            AuthorityConformanceError, "Python managed live evidence"
+        ):
             validate(corpus, CONTRACT, ROOT)
 
     def test_unexpected_fields_fail_closed(self) -> None:

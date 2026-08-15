@@ -4,6 +4,7 @@ exclude = ["fuzz"]
 members = [
     "conformance/g8/independent-backup-verifier",
     "conformance/rust",
+    "conformance/v2/fixture",
     "integrations/pliegors",
     "crates/hyphae-cli",
     "crates/hyphae-client",

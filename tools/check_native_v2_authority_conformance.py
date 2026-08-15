@@ -137,6 +137,13 @@ ROLE_MATRIX_EVIDENCE = {
     "platforms": ["linux", "macos", "windows"],
     "source": "crates/hyphae-native-product/tests/security_write_plane.rs",
 }
+PYTHON_MANAGED_LIVE_COMMAND = (
+    "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae "
+    "--fixture-binary target/debug/hyphae-v2-fixture "
+    "--wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl "
+    "--output python-managed-v2-conformance.json"
+)
+PYTHON_MANAGED_LIVE_ID = "python-managed-live"
 
 
 class AuthorityConformanceError(ValueError):
@@ -424,8 +431,8 @@ def validate_digests(corpus: dict[str, Any], contract_path: Path) -> None:
 
 def validate_evidence(corpus: dict[str, Any], root: Path) -> None:
     rows = corpus.get("evidence")
-    if not isinstance(rows, list) or len(rows) != 8:
-        fail("exactly eight evidence rows are required")
+    if not isinstance(rows, list) or len(rows) != 9:
+        fail("exactly nine evidence rows are required")
     ids = [row.get("id") for row in rows if isinstance(row, dict)]
     if ids != sorted(set(ids)) or len(ids) != len(rows):
         fail("evidence identifiers must be sorted and unique")
@@ -442,13 +449,18 @@ def validate_evidence(corpus: dict[str, Any], root: Path) -> None:
             fail("evidence coverage contains empty or unknown requirements")
         coverage.update(covers)
         command = row["command"]
-        if (
-            not isinstance(command, str)
-            or command in commands
-            or not command.startswith("cargo test ")
-            or "--locked" not in shlex.split(command)
-        ):
-            fail("evidence commands must be unique locked cargo tests")
+        is_python_live = row.get("id") == PYTHON_MANAGED_LIVE_ID
+        if is_python_live and command != PYTHON_MANAGED_LIVE_COMMAND:
+            fail("Python managed live evidence differs")
+        valid_command = isinstance(command, str) and (
+            is_python_live
+            or (
+                command.startswith("cargo test ")
+                and "--locked" in shlex.split(command)
+            )
+        )
+        if command in commands or not valid_command:
+            fail("evidence commands must be unique reviewed commands")
         commands.add(command)
         source = row["source"]
         if not isinstance(source, str) or Path(source).is_absolute():
@@ -463,6 +475,13 @@ def validate_evidence(corpus: dict[str, Any], root: Path) -> None:
         platforms = sorted_unique_strings(row["platforms"], "evidence platforms")
         if not set(platforms) <= {"linux", "macos", "windows"}:
             fail("evidence platforms differ")
+        if is_python_live and (
+            platforms != ["linux", "macos", "windows"]
+            or row.get("source") != "conformance/v2/python_managed_live.py"
+            or row.get("anchors")
+            != ["assert_security_mutations", "assert_security_reads", "run_live_conformance"]
+        ):
+            fail("Python managed live evidence differs")
     if coverage != REQUIREMENTS:
         fail("evidence coverage differs from the required authority cases")
     role_matrix_rows = [

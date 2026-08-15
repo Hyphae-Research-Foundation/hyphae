@@ -79,6 +79,14 @@
       "id": "protocol-wire",
       "platforms": ["linux", "macos", "windows"],
       "source": "crates/hyphae-native-protocol/tests/golden_vectors.rs"
+    },
+    {
+      "anchors": ["assert_security_mutations", "assert_security_reads", "run_live_conformance"],
+      "command": "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae --fixture-binary target/debug/hyphae-v2-fixture --wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl --output python-managed-v2-conformance.json",
+      "covers": ["digests.request", "pagination.audit", "pagination.metadata", "redaction.security-metadata", "revocation.next-operation", "security.assignment_create_built_in", "security.assignment_create_custom", "security.assignment_list", "security.assignment_revoke", "security.audit_read", "security.custom_role_create", "security.key_list", "security.principal_create", "security.principal_list", "security.principal_set_enabled", "security.role_list", "security.status"],
+      "id": "python-managed-live",
+      "platforms": ["linux", "macos", "windows"],
+      "source": "conformance/v2/python_managed_live.py"
     }
   ],
   "limits": {

@@ -47,7 +47,11 @@ jobs:
           PYTHONPATH=. python tools/check_native_access_control.py
       - name: Verify managed Native v2 authority conformance
         run: |
-          PYTHONPATH=. python -m unittest tools.test_check_native_v2_authority_conformance -v
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_v2_authority_conformance \
+            tools.test_check_python_managed_v2_conformance \
+            tools.test_run_python_managed_v2_conformance \
+            -v
           PYTHONPATH=. python tools/check_native_v2_authority_conformance.py
       - name: Verify Claude Code and Codex plugins
         run: |
@@ -267,6 +271,133 @@ jobs:
           PYTHONPATH=. python -m unittest tools.test_run_conformance -v
           python tools/run_conformance.py
 
+  python-managed-v2-wheel:
+    name: Python managed v2 wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Build the exact pure-Python wheel once
+        run: uv build sdks/python --wheel --out-dir dist
+      - name: Upload the exact wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/hyphae_sdk-1.1.0-py3-none-any.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+
+  python-managed-v2:
+    name: Python managed v2 (${{ matrix.name }})
+    needs: python-managed-v2-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            platform: linux
+          - name: macOS
+            os: macos-latest
+            platform: macos
+          - name: Windows
+            os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Download the exact shared wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist
+      - name: Build the product and fixture binaries
+        run: cargo build --locked -p hyphae-cli -p hyphae-v2-fixture
+      - name: Run real managed local and HTTP conformance
+        env:
+          PYTHONPATH: .
+        run: >-
+          python tools/run_python_managed_v2_conformance.py
+          --binary target/debug/hyphae
+          --fixture-binary target/debug/hyphae-v2-fixture
+          --wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl
+          --startup-timeout-seconds 30
+          --output python-managed-v2-conformance-${{ matrix.platform }}.json
+      - name: Upload the platform receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-conformance-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-conformance-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  python-managed-v2-aggregate:
+    name: Python managed v2 aggregate
+    if: always()
+    needs: python-managed-v2
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Download all platform receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: python-managed-v2-conformance-*-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-receipts
+          merge-multiple: true
+      - name: Validate exact-source hosted receipts
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_python_managed_v2_conformance -v
+          python tools/check_python_managed_v2_conformance.py \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-linux.json \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-macos.json \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-windows.json \
+            --expected-source-commit "$(git rev-parse HEAD)" \
+            --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --output python-managed-v2-conformance-aggregate.json
+      - name: Upload the aggregate receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-conformance-aggregate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-conformance-aggregate.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
   optional-integrations:
     name: Optional framework integrations
     runs-on: ubuntu-latest
@@ -312,8 +443,14 @@ jobs:
 
   release-readiness:
     name: Release readiness
+    if: always()
+    needs: python-managed-v2-aggregate
     runs-on: ubuntu-24.04
     steps:
+      - name: Require hosted Python managed conformance
+        env:
+          PYTHON_MANAGED_RESULT: ${{ needs.python-managed-v2-aggregate.result }}
+        run: test "$PYTHON_MANAGED_RESULT" = success
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
