@@ -8732,9 +8732,11 @@ mod tests {
             "WITH current AS (SELECT value FROM items WHERE id = ?) SELECT value FROM current WHERE id = ?",
             "EXPLAIN SELECT value FROM items WHERE id = ?",
         ] {
-            assert_eq!(
-                classify_sql_statement(statement).expect("read statement must parse"),
-                SqlStatementClass::Read,
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::Read)
+                ),
                 "{statement}"
             );
         }
@@ -8743,9 +8745,11 @@ mod tests {
             "UPDATE items SET value = ? WHERE id = ?",
             "DELETE FROM items WHERE id = ?",
         ] {
-            assert_eq!(
-                classify_sql_statement(statement).expect("data mutation must parse"),
-                SqlStatementClass::DataMutation,
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::DataMutation)
+                ),
                 "{statement}"
             );
         }
@@ -8756,9 +8760,11 @@ mod tests {
             "DROP INDEX items_value",
             "DROP TABLE items",
         ] {
-            assert_eq!(
-                classify_sql_statement(statement).expect("catalog mutation must parse"),
-                SqlStatementClass::CatalogMutation,
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::CatalogMutation)
+                ),
                 "{statement}"
             );
         }
