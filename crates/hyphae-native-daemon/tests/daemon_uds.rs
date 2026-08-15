@@ -19,10 +19,13 @@ use std::{
 
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
-    NativeProduct, ProductDurabilityPolicy, ProductLimits, ProductOperation, ProductResponse,
+    ApiKeyId, AuthenticatedAuthority, BuiltInRole, NativeProduct, NativeProductService,
+    NativeProductServiceConfig, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
+    ProductLimits, ProductOperation, ProductResponse, ProductScope,
 };
 use hyphae_native_protocol::{
-    AsyncFrameIo, FrameKind, Hello, ProvisionalStream, WireRequest, decode_end, decode_welcome,
+    AsyncFrameIo, FrameKind, Hello, OwnedFrame, ProtocolCapabilities, ProvisionalStream,
+    WireRequest, decode_end, decode_failure, decode_welcome, encode_authenticated_hello,
     encode_cancel, encode_deadline, encode_frame, encode_hello, encode_product_request,
     encode_window_update,
 };
@@ -78,12 +81,31 @@ impl Client {
     }
 
     async fn connect_with_hello(path: &Path, hello: Hello) -> Result<Self, Box<dyn Error>> {
+        let payload = encode_hello(&hello)?;
+        Self::connect_with_payload(path, hello, &payload).await
+    }
+
+    async fn connect_authenticated(path: &Path, api_key: &str) -> Result<Self, Box<dyn Error>> {
+        let hello = Hello {
+            capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            ..Hello::default()
+        };
+        let payload = encode_authenticated_hello(&hello, api_key)?;
+        Self::connect_with_payload(path, hello, &payload).await
+    }
+
+    async fn connect_with_payload(
+        path: &Path,
+        hello: Hello,
+        payload: &[u8],
+    ) -> Result<Self, Box<dyn Error>> {
         let path = path.to_string_lossy();
         let name = path.to_fs_name::<GenericFilePath>()?;
         let stream = Stream::connect(name).await?;
         let mut codec = AsyncFrameIo::new(16 * 1024 * 1024)?;
         codec
-            .send(&mut &stream, FrameKind::Hello, 0, 1, &encode_hello(&hello)?)
+            .send(&mut &stream, FrameKind::Hello, 0, 1, payload)
             .await?;
         let mut receive = AsyncFrameIo::new(16 * 1024 * 1024)?;
         let welcome = receive
@@ -93,6 +115,17 @@ impl Client {
         assert_eq!(welcome.kind, FrameKind::Welcome);
         let welcome = decode_welcome(&welcome.payload)?;
         assert_eq!(welcome.initial_window, hello.initial_window);
+        if hello
+            .required_capabilities
+            .contains(ProtocolCapabilities::API_KEY_AUTH)
+        {
+            assert!(
+                welcome
+                    .capabilities
+                    .contains(ProtocolCapabilities::API_KEY_AUTH)
+            );
+            assert_eq!(welcome.catalog_version, 0);
+        }
         codec = AsyncFrameIo::new(usize::try_from(welcome.maximum_frame_payload)?)?;
         Ok(Self { stream, codec })
     }
@@ -160,6 +193,66 @@ impl Client {
             }
         }
     }
+}
+
+async fn handshake_response(path: &Path, payload: &[u8]) -> Result<OwnedFrame, Box<dyn Error>> {
+    let path = path.to_string_lossy();
+    let name = path.to_fs_name::<GenericFilePath>()?;
+    let stream = Stream::connect(name).await?;
+    let codec = AsyncFrameIo::new(16 * 1024 * 1024)?;
+    codec
+        .send(&mut &stream, FrameKind::Hello, 0, 1, payload)
+        .await?;
+    let mut receive = AsyncFrameIo::new(16 * 1024 * 1024)?;
+    receive
+        .receive(&mut &stream)
+        .await?
+        .ok_or_else(|| "server closed before handshake response".into())
+}
+
+struct ManagedReaderFixture {
+    product: NativeProduct,
+    owner: AuthenticatedAuthority,
+    reader_secret: String,
+    reader_key_id: ApiKeyId,
+}
+
+fn managed_reader_product(test: &TestDirectory) -> Result<ManagedReaderFixture, Box<dyn Error>> {
+    let owner_path = test.root.join("owner.key");
+    let reader_path = test.root.join("reader.key");
+    let mut product = NativeProduct::create(&test.data)?;
+    product.migration_store_public_entries(&[(b"shared".to_vec(), b"value".to_vec())])?;
+    product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+    let owner_secret = fs::read_to_string(&owner_path)?;
+    let owner = product.authenticate_api_key(&owner_secret, 2)?;
+    let reader = product.create_security_principal(&owner, "Reader", 2)?;
+    let owner = product.authenticate_api_key(&owner_secret, 3)?;
+    product.assign_built_in_role(
+        &owner,
+        reader.principal_id,
+        BuiltInRole::Reader,
+        ProductScope::Instance,
+        3,
+    )?;
+    let owner = product.authenticate_api_key(&owner_secret, 4)?;
+    let issued = product.issue_api_key_to_file(
+        &owner,
+        reader.principal_id,
+        "reader",
+        [BuiltInRole::Reader],
+        ProductAuthorization::from_permissions([
+            hyphae_native_product::ProductPermission::DataRead,
+        ]),
+        None,
+        &reader_path,
+        4,
+    )?;
+    Ok(ManagedReaderFixture {
+        product,
+        owner,
+        reader_secret: fs::read_to_string(reader_path)?,
+        reader_key_id: issued.key_id,
+    })
 }
 
 fn request(operation: ProductOperation) -> WireRequest {
@@ -262,6 +355,192 @@ async fn multiple_clients_handshake_share_one_product_and_endpoint_is_private()
     drop(second);
     daemon.shutdown().await?;
     assert!(!test.socket.exists());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_missing_malformed_and_wrong_credentials_are_uniform() -> Result<(), Box<dyn Error>>
+{
+    let test = TestDirectory::new("managed-auth-denial")?;
+    let fixture = managed_reader_product(&test)?;
+    let daemon = NativeDaemon::start_authenticated(
+        fixture.product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let authenticated_hello = Hello {
+        capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        ..Hello::default()
+    };
+    let wrong = format!("hyp1_{}_{}", "0".repeat(32), "0".repeat(64));
+    let wrong_namespace_hello = Hello {
+        database: "private".to_owned(),
+        ..authenticated_hello.clone()
+    };
+    let payloads = [
+        encode_hello(&Hello::default())?,
+        encode_authenticated_hello(&authenticated_hello, &"x".repeat(102))?,
+        encode_authenticated_hello(&authenticated_hello, &wrong)?,
+        encode_authenticated_hello(&wrong_namespace_hello, &wrong)?,
+    ];
+    let mut errors = Vec::new();
+    for payload in payloads {
+        let response = handshake_response(&test.socket, &payload).await?;
+        assert_eq!(response.kind, FrameKind::Failure);
+        errors.push(decode_failure(&response.payload)?);
+    }
+    for error in &errors {
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(error.category(), errors[0].category());
+        assert_eq!(error.retry(), errors[0].retry());
+        assert_eq!(error.message(), errors[0].message());
+        assert_eq!(error.transaction_state(), errors[0].transaction_state());
+        assert_eq!(error.details(), errors[0].details());
+    }
+
+    let healthy = Client::connect_authenticated(&test.socket, &fixture.reader_secret).await?;
+    healthy
+        .send_request(
+            1,
+            2,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    assert_eq!(
+        healthy.response(1, 2).await?,
+        ProductResponse::StructureValue(Some(b"value".to_vec()))
+    );
+    drop(healthy);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_reader_reads_and_denied_write_does_not_poison_connection()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("managed-reader")?;
+    let fixture = managed_reader_product(&test)?;
+    let daemon = NativeDaemon::start_authenticated(
+        fixture.product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect_authenticated(&test.socket, &fixture.reader_secret).await?;
+
+    client
+        .send_request(
+            1,
+            2,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    assert_eq!(
+        client.response(1, 2).await?,
+        ProductResponse::StructureValue(Some(b"value".to_vec()))
+    );
+
+    client
+        .send_request(
+            2,
+            3,
+            &request(ProductOperation::StructureSet {
+                key: b"shared".to_vec(),
+                value: b"forbidden".to_vec(),
+                expires_at_micros: None,
+            }),
+        )
+        .await?;
+    let mut receive = AsyncFrameIo::new(16 * 1024 * 1024)?;
+    let denied = receive
+        .receive(&mut &client.stream)
+        .await?
+        .ok_or("server closed after authorization denial")?;
+    assert_eq!(
+        (denied.kind, denied.stream_id, denied.request_id),
+        (FrameKind::Failure, 2, 3)
+    );
+    assert_eq!(
+        decode_failure(&denied.payload)?.code(),
+        ProductErrorCode::AuthorizationDenied
+    );
+
+    client
+        .send_request(
+            3,
+            4,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    assert_eq!(
+        client.response(3, 4).await?,
+        ProductResponse::StructureValue(Some(b"value".to_vec()))
+    );
+    drop(client);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_revocation_denies_the_next_operation_on_the_same_connection()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("managed-revocation")?;
+    let fixture = managed_reader_product(&test)?;
+    let service =
+        NativeProductService::start(fixture.product, NativeProductServiceConfig::default())?;
+    let handle = service.handle();
+    let daemon = NativeDaemon::start_with_service_authenticated(
+        service,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect_authenticated(&test.socket, &fixture.reader_secret).await?;
+    client
+        .send_request(
+            1,
+            2,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    assert_eq!(
+        client.response(1, 2).await?,
+        ProductResponse::StructureValue(Some(b"value".to_vec()))
+    );
+
+    handle.revoke_api_key(fixture.owner, fixture.reader_key_id, 5)?;
+    client
+        .send_request(
+            2,
+            3,
+            &request(ProductOperation::StructureGet {
+                key: b"shared".to_vec(),
+            }),
+        )
+        .await?;
+    let mut receive = AsyncFrameIo::new(16 * 1024 * 1024)?;
+    let denied = receive
+        .receive(&mut &client.stream)
+        .await?
+        .ok_or("server closed after credential revocation")?;
+    assert_eq!(
+        (denied.kind, denied.stream_id, denied.request_id),
+        (FrameKind::Failure, 2, 3)
+    );
+    assert_eq!(
+        decode_failure(&denied.payload)?.code(),
+        ProductErrorCode::AuthorizationDenied
+    );
+
+    drop(client);
+    daemon.shutdown().await?;
     Ok(())
 }
 

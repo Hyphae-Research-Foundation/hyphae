@@ -30,6 +30,55 @@ The server returns `WELCOME` with selected version, session ID, engine
 version, data-format version, limits, capabilities and catalog version.
 Incompatible major versions fail before accepting operations.
 
+### HELLO authentication extension
+
+The canonical legacy `HELLO` remains byte-for-byte unchanged. Its fixed
+58-byte header uses bytes 49 through 51 as zero-valued reserved bytes, and its
+payload ends after the client identity, database and schema UTF-8 fields.
+
+Managed API-key authentication uses a parallel `HELLO` codec with this exact
+extension:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 49 | 1 | authentication kind: `1` for Native API key |
+| 50 | 2 | authentication trailer length, little-endian |
+
+The authenticated payload order is the fixed header, client identity,
+database, schema, then authentication trailer. The trailer is one canonical
+Native API-key candidate: exactly 102 UTF-8 bytes. The combined identity,
+database and schema bound remains 4 KiB and excludes the fixed-size secret.
+No padding or trailing bytes are admitted.
+
+Authenticated `HELLO` requires capability bit 7, `API_KEY_AUTH`, in both the
+supported and required capability masks. Requiring the bit prevents a peer
+from silently downgrading a managed connection to OS-peer authentication.
+The legacy decoder rejects the extension, while the authenticated decoder
+rejects a legacy payload, an unrequired capability, unknown authentication
+kinds, non-canonical lengths, invalid UTF-8, truncation and trailing bytes.
+Credential syntax and verifier failures are intentionally left to the sole
+product authority so they remain indistinguishable as authorization denial.
+
+The raw credential is ephemeral transport material. It is never part of the
+public `Hello` value, client identity, diagnostics or `Debug` output. Decoded
+credentials are held only in a redacted, erase-on-drop value until transferred
+to the product authority.
+
+The closed capability registry is:
+
+| Bit | Name |
+|---:|---|
+| 0 | `STREAM_COMPLETION` |
+| 1 | `FLOW_CONTROL` |
+| 2 | `CANCELLATION` |
+| 3 | `DEADLINES` |
+| 4 | `PREPARED` |
+| 5 | `PEER_IDENTITY` |
+| 6 | `PRODUCT_ERRORS` |
+| 7 | `API_KEY_AUTH` |
+
+Bits 8 through 63 are unknown and fail closed.
+
 ## Frame header
 
 Every frame has a 32-byte header:
@@ -144,9 +193,11 @@ the negotiated minor-version rule.
 ## Authentication boundary
 
 UDS/named-pipe deployments rely on OS peer identity and endpoint ACL by
-default. Loopback TCP requires a configured token or later TLS identity.
-Authentication, authorization and tenant policy are not engine-to-engine
-protocols.
+default. Managed deployments use the authenticated `HELLO` extension and
+revalidate its resulting authority at the product boundary. Any TCP transport
+that carries an API key requires TLS; loopback placement alone does not protect
+the credential. Authentication, authorization and tenant policy are not
+engine-to-engine protocols.
 
 ## Performance
 

@@ -85,6 +85,16 @@ impl NativeHttpV2Config {
         }
         self.limits.validate()
     }
+
+    pub(super) fn validate_managed(&self) -> Result<(), NativeHttpV2ConfigError> {
+        if self.bearer_token.is_some() {
+            return Err(NativeHttpV2ConfigError::ManagedAuthenticationConflict);
+        }
+        if !self.bind.ip().is_loopback() {
+            return Err(NativeHttpV2ConfigError::RemoteManagedBindRequiresTls { bind: self.bind });
+        }
+        self.limits.validate()
+    }
 }
 
 /// Native HTTP v2 configuration rejected before a socket or product session is opened.
@@ -94,6 +104,17 @@ pub enum NativeHttpV2ConfigError {
     #[error("non-loopback Native HTTP v2 bind {bind} requires a bearer token")]
     RemoteBindRequiresAuthentication {
         /// Rejected listener address.
+        bind: SocketAddr,
+    },
+    /// Catalog-managed authentication cannot be combined with a fixed bearer.
+    #[error("catalog-managed Native HTTP v2 authentication rejects the legacy bearer token")]
+    ManagedAuthenticationConflict,
+    /// Durable API-key credentials cannot traverse this plaintext listener remotely.
+    #[error(
+        "non-loopback catalog-managed Native HTTP v2 bind {bind} requires TLS termination; bind this adapter to loopback"
+    )]
+    RemoteManagedBindRequiresTls {
+        /// Rejected plaintext listener address.
         bind: SocketAddr,
     },
     /// Every framing bound must be positive.

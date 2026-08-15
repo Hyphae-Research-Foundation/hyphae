@@ -14,9 +14,10 @@ use std::{
 };
 
 use crate::{
-    AuthenticatedAuthority, MetricId, NativeProduct, ProductAuthorization, ProductError,
-    ProductErrorCode, ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse,
-    ProductSession, ProductSessionId, TelemetryRegistry, TimingClass,
+    AccessControlMutationReceipt, ApiKeyId, AuthenticatedAuthority, MetricId, NativeProduct,
+    ProductAuthorization, ProductError, ProductErrorCode, ProductOperation, ProductPrincipal,
+    ProductRequestContext, ProductResponse, ProductSession, ProductSessionId, TelemetryRegistry,
+    TimingClass,
 };
 
 /// Default bounded product-service request queue.
@@ -123,6 +124,12 @@ enum ServiceCommand {
         session_id: ProductSessionId,
         credential: ApiKeyCredential,
         reply: SyncSender<Result<AuthenticatedAuthority, ProductError>>,
+    },
+    RevokeApiKey {
+        actor: AuthenticatedAuthority,
+        target: ApiKeyId,
+        logical_time_micros: i64,
+        reply: SyncSender<Result<AccessControlMutationReceipt, ProductError>>,
     },
     Dispatch {
         session_id: ProductSessionId,
@@ -309,6 +316,31 @@ impl NativeProductHandle {
             authorization: authority.authorization(),
             authorization_epoch: authority.authorization_epoch(),
         })
+    }
+
+    /// Revokes one API key through the sole product owner.
+    ///
+    /// The unforgeable actor authority is revalidated against the durable
+    /// catalog and trusted clock before the strict mutation commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable authorization, catalog, durability, or service
+    /// admission error produced by the sole owner.
+    pub fn revoke_api_key(
+        &self,
+        actor: AuthenticatedAuthority,
+        target: ApiKeyId,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.send(ServiceCommand::RevokeApiKey {
+            actor,
+            target,
+            logical_time_micros,
+            reply,
+        })?;
+        receive.recv().map_err(|_| unavailable())?
     }
 
     fn allocate_session_id(&self) -> Result<ProductSessionId, ProductError> {
@@ -924,6 +956,10 @@ fn open_managed_session(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one closed command loop preserves sole-owner lock and reply ordering"
+)]
 fn owner_loop(
     receiver: Receiver<ServiceCommand>,
     config: NativeProductServiceConfig,
@@ -973,6 +1009,15 @@ fn owner_loop(
             } => {
                 let result =
                     open_managed_session(product, &mut sessions, config, session_id, &credential);
+                let _ignored = reply.send(result);
+            }
+            ServiceCommand::RevokeApiKey {
+                actor,
+                target,
+                logical_time_micros,
+                reply,
+            } => {
+                let result = product.revoke_api_key(&actor, target, logical_time_micros);
                 let _ignored = reply.send(result);
             }
             ServiceCommand::Dispatch {

@@ -16,9 +16,16 @@ x-hyphae-v1-compatibility:
 x-hyphae-provisional-streams: >-
   Every application/x-ndjson data record is provisional. Success exists only
   after a terminal completion record with status complete.
+x-hyphae-authentication-modes:
+  unmanaged: Legacy constructor; optional fixed bearer gates trusted full authority.
+  managed: >-
+    new_managed requires one canonical hyp1 API key on every request and derives
+    product sessions from the durable access-control catalog. The plaintext
+    adapter is loopback-only; remote exposure requires a TLS-terminating proxy.
 servers:
   - url: http://127.0.0.1:8788
     description: Default loopback-only listener
+security: [{ BearerAuth: [] }, {}]
 tags:
   - name: discovery
   - name: catalog
@@ -32,8 +39,11 @@ paths:
     get:
       tags: [discovery]
       operationId: nativeCapabilitiesV2
+      security: [{ BearerAuth: [] }, {}]
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/execute:
     post:
@@ -43,6 +53,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/catalog:
     post:
@@ -52,6 +64,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/sql:
     post:
@@ -61,6 +75,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/structures:
     post:
@@ -70,6 +86,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/search:
     post:
@@ -79,6 +97,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/search/collection:
     post:
@@ -87,6 +107,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/search/ingest:
     post:
@@ -95,6 +117,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/search/document:
     post:
@@ -104,6 +128,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/admin:
     post:
@@ -113,6 +139,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/telemetry:
     post:
@@ -122,6 +150,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/doctor:
     post:
@@ -131,6 +161,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/backup:
     post:
@@ -140,6 +172,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/restore:
     post:
@@ -149,6 +183,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/proofs/verify:
     post:
@@ -158,6 +194,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/transactions/status:
     post:
@@ -167,6 +205,8 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/ProductRequest" }
       responses:
         "200": { $ref: "#/components/responses/ProductResponse" }
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
   /v2/read-stream:
     post:
@@ -185,12 +225,18 @@ paths:
             application/x-ndjson:
               schema:
                 $ref: "../json-schema/read-stream-v2.schema.json"
+        "401": { $ref: "#/components/responses/AuthenticationRequired" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
         default: { $ref: "#/components/responses/ProductError" }
 components:
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
+      bearerFormat: hyp1_<32-lowercase-hex-key-id>_<64-lowercase-hex-secret>
+      description: >-
+        Mandatory in managed mode and optional only for explicitly unmanaged
+        deployments. Exactly one canonical hyp1 credential is accepted.
   headers:
     RequestId:
       required: true
@@ -206,6 +252,29 @@ components:
             type: string
             format: binary
   responses:
+    AuthenticationRequired:
+      description: Missing, malformed, unknown, or incorrect managed API-key credential
+      headers:
+        X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
+        WWW-Authenticate:
+          required: true
+          schema: { type: string, const: 'Bearer realm="hyphae-native-v2"' }
+      content:
+        application/json:
+          schema:
+            $ref: "../json-schema/product-error-v2.schema.json"
+        application/vnd.hyphae.error-v1:
+          schema: { type: string, format: binary }
+    AuthorizationDenied:
+      description: Authenticated principal lacks permission or retained authority was revoked
+      headers:
+        X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema:
+            $ref: "../json-schema/product-error-v2.schema.json"
+        application/vnd.hyphae.error-v1:
+          schema: { type: string, format: binary }
     ProductResponse:
       description: Canonical HYPRSP01 Product response
       headers:
@@ -219,7 +288,10 @@ components:
             type: string
             format: binary
     ProductError:
-      description: ProductError field parity; binary HYPERR01 is available by Accept negotiation
+      description: >-
+        ProductError field parity; binary HYPERR01 is available by Accept
+        negotiation. Managed authentication failures are HTTP 401 with a Bearer
+        challenge; post-authentication permission or authority loss is HTTP 403.
       headers:
         X-Hyphae-Request-Id: { $ref: "#/components/headers/RequestId" }
       content:

@@ -15,13 +15,21 @@ pub(crate) async fn serve(
     data_dir: PathBuf,
     endpoint: Option<String>,
     http_bind: Option<SocketAddr>,
+    native_api_key_auth: bool,
 ) -> Result<(), CliFailure> {
     let product = NativeProduct::open(&data_dir)?;
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
     let handle = service.handle();
     let endpoint = endpoint.unwrap_or_else(|| default_endpoint(&data_dir));
-    let daemon =
-        NativeDaemon::start_with_service(service, endpoint, NativeDaemonConfig::default())?;
+    let daemon = if native_api_key_auth {
+        NativeDaemon::start_with_service_authenticated(
+            service,
+            endpoint,
+            NativeDaemonConfig::default(),
+        )?
+    } else {
+        NativeDaemon::start_with_service(service, endpoint, NativeDaemonConfig::default())?
+    };
     let (http_shutdown, http_receive) = watch::channel(false);
     let http = match http_bind {
         Some(bind) => {
@@ -29,7 +37,12 @@ pub(crate) async fn serve(
                 bind,
                 ..NativeHttpV2Config::default()
             };
-            let bound = NativeHttpV2Server::new(handle, config)?.bind().await?;
+            let server = if native_api_key_auth {
+                NativeHttpV2Server::new_managed(handle, config)?
+            } else {
+                NativeHttpV2Server::new(handle, config)?
+            };
+            let bound = server.bind().await?;
             let address = bound.local_addr();
             let task = tokio::spawn(async move {
                 bound

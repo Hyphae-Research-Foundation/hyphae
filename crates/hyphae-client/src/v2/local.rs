@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyphae_native_product::{ProductOperation, ProductResponse};
 use hyphae_native_protocol::{
-    AsyncFrameIo, FrameKind, Hello, ProvisionalStream, decode_end, decode_failure, decode_welcome,
+    API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, Hello, ProtocolCapabilities,
+    ProvisionalStream, decode_end, decode_failure, decode_welcome, encode_authenticated_hello,
     encode_cancel, encode_hello, encode_product_request, encode_window_update,
 };
 use tokio::sync::Mutex;
@@ -24,8 +25,38 @@ const WINDOWS_PIPE_PREFIX: &str = r"\\.\pipe\";
 pub struct LocalTransport {
     endpoint: String,
     client_identity: String,
+    api_key: Option<LocalApiKey>,
     state: Mutex<Option<Connection>>,
     next_request_id: AtomicU64,
+}
+
+struct LocalApiKey {
+    bytes: Vec<u8>,
+}
+
+impl LocalApiKey {
+    fn new(value: impl AsRef<str>) -> Result<Self, ClientError> {
+        let bytes = value.as_ref().as_bytes();
+        if bytes.len() != API_KEY_AUTH_TRAILER_BYTES {
+            return Err(ClientError::Local(
+                "local API-key credential is invalid".to_owned(),
+            ));
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    fn expose(&self) -> Result<&str, ClientError> {
+        std::str::from_utf8(&self.bytes)
+            .map_err(|_| ClientError::Local("local API-key credential is invalid".to_owned()))
+    }
+}
+
+impl Drop for LocalApiKey {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
 }
 
 impl std::fmt::Debug for LocalTransport {
@@ -55,6 +86,7 @@ impl LocalTransport {
         Ok(Self {
             endpoint,
             client_identity: CLIENT_IDENTITY.to_owned(),
+            api_key: None,
             state: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
         })
@@ -69,6 +101,12 @@ impl LocalTransport {
             ));
         }
         self.client_identity = identity;
+        Ok(self)
+    }
+
+    /// Requires durable Native API-key authentication during local handshake.
+    pub fn api_key(mut self, api_key: impl AsRef<str>) -> Result<Self, ClientError> {
+        self.api_key = Some(LocalApiKey::new(api_key)?);
         Ok(self)
     }
 
@@ -92,20 +130,29 @@ impl LocalTransport {
             .map_err(|error| ClientError::Local(error.to_string()))?;
         let mut codec = AsyncFrameIo::new(hyphae_native_protocol::DEFAULT_MAX_FRAME_PAYLOAD)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        let hello = Hello {
+        let mut hello = Hello {
             client_identity: self.client_identity.clone(),
             ..Hello::default()
         };
-        codec
+        let mut hello_payload = if let Some(api_key) = &self.api_key {
+            hello.capabilities = ProtocolCapabilities::G6_AUTHENTICATED;
+            hello.required_capabilities = ProtocolCapabilities::G6_AUTHENTICATED;
+            encode_authenticated_hello(&hello, api_key.expose()?)
+        } else {
+            encode_hello(&hello)
+        }
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        let sent = codec
             .send(
                 &mut &stream,
                 FrameKind::Hello,
                 0,
                 handshake_id,
-                &encode_hello(&hello).map_err(|error| ClientError::Protocol(error.to_string()))?,
+                &hello_payload,
             )
-            .await
-            .map_err(|error| ClientError::Local(error.to_string()))?;
+            .await;
+        hello_payload.fill(0);
+        sent.map_err(|error| ClientError::Local(error.to_string()))?;
         let welcome = codec
             .receive(&mut &stream)
             .await
@@ -128,6 +175,15 @@ impl LocalTransport {
         }
         let welcome = decode_welcome(&welcome.payload)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        if self.api_key.is_some()
+            && !welcome
+                .capabilities
+                .contains(ProtocolCapabilities::API_KEY_AUTH)
+        {
+            return Err(ClientError::Protocol(
+                "server downgraded local API-key authentication".to_owned(),
+            ));
+        }
         codec = AsyncFrameIo::new(
             usize::try_from(welcome.maximum_frame_payload)
                 .map_err(|_| ClientError::Protocol("invalid negotiated frame limit".to_owned()))?,

@@ -14,6 +14,17 @@ default bind is loopback. Remote exposure requires explicit bind,
 authentication, request/response limits, and operator-owned TLS termination or
 a separately accepted in-process TLS decision.
 
+`NativeHttpV2Server::new` preserves the legacy unmanaged adapter. Its optional
+fixed bearer token gates one trusted `ProductAuthorization::ALL` session; it
+does not opt into catalog RBAC. `NativeHttpV2Server::new_managed` enables RBAC
+without changing the public configuration shape. Managed mode rejects an
+ambiguous configuration containing the legacy fixed-bearer field, permits a
+loopback bind only because this adapter does not terminate TLS, and opens
+product sessions only through
+`NativeProductHandle::open_authenticated_session`. Remote managed exposure
+must terminate TLS in a proxy that forwards to the loopback listener; a durable
+API key never travels to a non-loopback plaintext bind.
+
 ## Resource families
 
 The versioned contract includes resources for capabilities, catalog, SQL,
@@ -35,6 +46,24 @@ Requests carry or receive a stable request ID. Responses expose visible CSN,
 catalog version, and relevant stable object IDs. Errors use
 [`product-error-v1.md`](product-error-v1.md); HTTP statuses are transport
 mapping, not the stable error identity.
+
+Managed mode requires exactly one `Authorization` header containing the
+canonical `Bearer hyp1_<key-id>_<secret>` form on every request. Missing,
+duplicated, malformed, unknown, and incorrect credentials return the same
+typed `authorization_denied` error with HTTP `401` and
+`WWW-Authenticate: Bearer realm="hyphae-native-v2"`. The candidate is copied
+only into the product's redacted, zero-on-drop credential carrier; the HTTP
+adapter never stores or logs the secret and does not hold its session mutex
+while the sole product owner authenticates it.
+
+A valid credential creates a catalog-managed product session with the key's
+current principal, permissions, scope, epoch, expiry, and directory lineage.
+Retained HTTP sessions are bound to a non-reversible credential fingerprint;
+their product session revalidates durable authority before execution. A
+permission denial, or revocation/expiry after that retained session was
+created, therefore remains a typed `authorization_denied` response with HTTP
+`403` and no authentication challenge. A revoked credential cannot open a new
+session and receives the uniform `401` credential response.
 
 ## `/v1` compatibility
 
@@ -77,3 +106,6 @@ explicitly with `invalid_request` and HTTP 409.
 OpenAPI/JSON Schema synchronization, authentication, body/response bounds,
 timeouts, cancellation, streaming, request-ID correlation, error parity,
 cross-surface result equality, and listener opt-in are mandatory G6 evidence.
+Managed-auth evidence additionally covers exact bearer grammar, uniform
+`401` challenges, permission `403` mapping, credential-bound session reuse,
+and service-level revocation revalidation.

@@ -21,9 +21,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::stream;
 use hyphae_native_product::{
-    NativeProductClient, NativeProductHandle, ProductAuthorization, ProductCancellationToken,
-    ProductErrorCode, ProductOperation, ProductPreparedHandle, ProductPrincipal, ProductResponse,
-    TimingClass,
+    ApiKeyCredential, MAX_API_KEY_CREDENTIAL_BYTES, NativeProductClient, NativeProductHandle,
+    ProductAuthorization, ProductCancellationToken, ProductErrorCode, ProductOperation,
+    ProductPreparedHandle, ProductPrincipal, ProductResponse, TimingClass,
 };
 use tokio::{
     net::TcpListener,
@@ -54,7 +54,7 @@ pub(super) struct AuthenticatedPrincipal(pub(super) [u8; 32]);
 
 pub(super) struct NativeHttpV2State {
     handle: NativeProductHandle,
-    bearer_token: Option<crate::BearerToken>,
+    session_mode: NativeHttpV2SessionMode,
     limits: super::NativeHttpV2Limits,
     sessions: Mutex<BTreeMap<u128, SessionEntry>>,
     prepared_handles: Arc<Mutex<BTreeSet<u64>>>,
@@ -62,6 +62,28 @@ pub(super) struct NativeHttpV2State {
     session_slots: Arc<Semaphore>,
     request_slots: Arc<Semaphore>,
     stream_slots: Arc<Semaphore>,
+}
+
+enum NativeHttpV2SessionMode {
+    Unmanaged {
+        bearer_token: Option<crate::BearerToken>,
+    },
+    Managed,
+}
+
+#[derive(Clone)]
+pub(super) struct RequestAuthentication {
+    principal: AuthenticatedPrincipal,
+    initial_client: Option<Arc<NativeProductClient>>,
+}
+
+impl RequestAuthentication {
+    pub(super) fn unmanaged(principal: AuthenticatedPrincipal) -> Self {
+        Self {
+            principal,
+            initial_client: None,
+        }
+    }
 }
 
 struct SessionEntry {
@@ -117,12 +139,61 @@ impl NativeHttpV2Server {
         config: NativeHttpV2Config,
     ) -> Result<Self, NativeHttpV2Error> {
         config.validate()?;
-        Ok(Self {
-            bind: config.bind,
+        let session_mode = NativeHttpV2SessionMode::Unmanaged {
+            bearer_token: config.bearer_token,
+        };
+        Ok(Self::configured(
+            handle,
+            config.bind,
+            config.limits,
+            session_mode,
+        ))
+    }
+
+    /// Enables catalog-managed `hyp1_` API-key authentication for every request.
+    ///
+    /// Unlike [`Self::new`], this mode derives every product session from
+    /// [`NativeProductHandle::open_authenticated_session`]. The legacy fixed
+    /// bearer configuration field must be unset so catalog RBAC remains the
+    /// sole authentication authority. This plaintext adapter must remain on a
+    /// loopback listener; remote managed exposure requires a TLS-terminating
+    /// proxy in front of that loopback endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when HTTP limits are invalid, a legacy
+    /// fixed bearer is also configured, or the listener is not loopback.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "constructor parity intentionally consumes secret-bearing configuration"
+    )]
+    pub fn new_managed(
+        handle: NativeProductHandle,
+        config: NativeHttpV2Config,
+    ) -> Result<Self, NativeHttpV2Error> {
+        config.validate_managed()?;
+        let bind = config.bind;
+        let limits = config.limits;
+        Ok(Self::configured(
+            handle,
+            bind,
+            limits,
+            NativeHttpV2SessionMode::Managed,
+        ))
+    }
+
+    fn configured(
+        handle: NativeProductHandle,
+        bind: SocketAddr,
+        limits: super::NativeHttpV2Limits,
+        session_mode: NativeHttpV2SessionMode,
+    ) -> Self {
+        Self {
+            bind,
             state: Arc::new(NativeHttpV2State {
                 handle,
-                bearer_token: config.bearer_token,
-                limits: config.limits,
+                session_mode,
+                limits,
                 sessions: Mutex::new(BTreeMap::new()),
                 prepared_handles: Arc::new(Mutex::new(BTreeSet::new())),
                 active_requests: Arc::new(Mutex::new(BTreeMap::new())),
@@ -130,7 +201,7 @@ impl NativeHttpV2Server {
                 request_slots: Arc::new(Semaphore::new(MAX_HTTP_REQUESTS)),
                 stream_slots: Arc::new(Semaphore::new(MAX_HTTP_STREAMS)),
             }),
-        })
+        }
     }
 
     /// Binds the configured listener without opening any storage authority.
@@ -291,30 +362,74 @@ async fn authenticate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = &state.bearer_token else {
-        request.extensions_mut().insert(AuthenticatedPrincipal(
-            *blake3::hash(b"anonymous-loopback").as_bytes(),
-        ));
-        return next.run(request).await;
+    let authentication = match &state.session_mode {
+        NativeHttpV2SessionMode::Unmanaged { bearer_token } => {
+            let principal = match bearer_token {
+                None => Some(*blake3::hash(b"anonymous-loopback").as_bytes()),
+                Some(expected) => bearer_candidate(request.headers()).and_then(|candidate| {
+                    expected
+                        .verifies(candidate)
+                        .then(|| *blake3::hash(candidate).as_bytes())
+                }),
+            };
+            principal
+                .map(|principal| {
+                    RequestAuthentication::unmanaged(AuthenticatedPrincipal(principal))
+                })
+                .ok_or_else(|| NativeApiError::unauthorized(&metadata))
+        }
+        NativeHttpV2SessionMode::Managed => {
+            authenticate_managed_request(&state, request.headers(), &metadata).await
+        }
     };
-    let principal = bearer_candidate(request.headers()).and_then(|candidate| {
-        expected
-            .verifies(candidate)
-            .then(|| *blake3::hash(candidate).as_bytes())
-    });
-    if let Some(principal) = principal {
-        request
-            .extensions_mut()
-            .insert(AuthenticatedPrincipal(principal));
-        return next.run(request).await;
-    }
-    NativeApiError::unauthorized(&metadata).into_response()
+    let authentication = match authentication {
+        Ok(authentication) => authentication,
+        Err(error) => return error.into_response(),
+    };
+    request.extensions_mut().insert(authentication);
+    next.run(request).await
+}
+
+async fn authenticate_managed_request(
+    state: &NativeHttpV2State,
+    headers: &HeaderMap,
+    metadata: &RequestMetadata,
+) -> Result<RequestAuthentication, NativeApiError> {
+    let candidate =
+        managed_bearer_candidate(headers).ok_or_else(|| NativeApiError::unauthorized(metadata))?;
+    let principal = AuthenticatedPrincipal(managed_credential_fingerprint(candidate.as_bytes()));
+    let initial_client = if headers.contains_key(SESSION_ID_HEADER) {
+        None
+    } else {
+        let credential =
+            ApiKeyCredential::new(candidate).map_err(|_| NativeApiError::unauthorized(metadata))?;
+        let handle = state.handle.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            handle
+                .open_authenticated_session(credential)
+                .map_err(Box::new)
+        })
+        .await
+        .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?
+        .map_err(|error| {
+            if error.code() == ProductErrorCode::AuthorizationDenied {
+                NativeApiError::unauthorized(metadata)
+            } else {
+                NativeApiError::product(*error, metadata)
+            }
+        })?;
+        Some(Arc::new(client))
+    };
+    Ok(RequestAuthentication {
+        principal,
+        initial_client,
+    })
 }
 
 async fn capabilities(
     State(state): State<Arc<NativeHttpV2State>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Extension(authentication): Extension<RequestAuthentication>,
 ) -> Result<Response, NativeApiError> {
     execute_operation(
         state,
@@ -329,7 +444,7 @@ async fn capabilities(
         },
         Duration::ZERO,
         false,
-        principal,
+        authentication,
         None,
     )
     .await
@@ -340,7 +455,7 @@ macro_rules! family_handler {
         async fn $name(
             State(state): State<Arc<NativeHttpV2State>>,
             Extension(metadata): Extension<RequestMetadata>,
-            Extension(principal): Extension<AuthenticatedPrincipal>,
+            Extension(authentication): Extension<RequestAuthentication>,
             request: Request,
         ) -> Result<Response, NativeApiError> {
             execute_request(
@@ -349,7 +464,7 @@ macro_rules! family_handler {
                 request,
                 OperationFamily::$family,
                 false,
-                principal,
+                authentication,
             )
             .await
         }
@@ -375,7 +490,7 @@ family_handler!(execute_transaction, Transaction);
 async fn read_stream(
     State(state): State<Arc<NativeHttpV2State>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Extension(authentication): Extension<RequestAuthentication>,
     request: Request,
 ) -> Result<Response, NativeApiError> {
     execute_request(
@@ -384,7 +499,7 @@ async fn read_stream(
         request,
         OperationFamily::Any,
         true,
-        principal,
+        authentication,
     )
     .await
 }
@@ -395,7 +510,7 @@ async fn execute_request(
     request: Request,
     family: OperationFamily,
     stream_response: bool,
-    principal: AuthenticatedPrincipal,
+    authentication: RequestAuthentication,
 ) -> Result<Response, NativeApiError> {
     let deadline_header = parse_deadline_header(request.headers(), &metadata)?;
     let session_id = parse_session_header(request.headers(), &metadata)?;
@@ -439,7 +554,7 @@ async fn execute_request(
         wire,
         decode_time,
         stream_response,
-        principal,
+        authentication,
         session_id,
     )
     .await
@@ -452,7 +567,7 @@ async fn execute_operation(
     wire: hyphae_native_protocol::WireRequest,
     decode_time: Duration,
     stream_response: bool,
-    principal: AuthenticatedPrincipal,
+    authentication: RequestAuthentication,
     requested_session: Option<u128>,
 ) -> Result<Response, NativeApiError> {
     let transport_started = Instant::now();
@@ -464,17 +579,32 @@ async fn execute_operation(
     let session = if operation_requires_existing_session(&operation) {
         let session_id = requested_session
             .ok_or_else(|| NativeApiError::code(ProductErrorCode::SqlInvalidValue, &metadata))?;
-        Some(lookup_session(&state, session_id, &principal, &metadata)?)
+        Some(lookup_session(
+            &state,
+            session_id,
+            &authentication.principal,
+            &metadata,
+        )?)
     } else if operation_starts_session(&operation) {
         if let Some(session_id) = requested_session {
-            Some(lookup_session(&state, session_id, &principal, &metadata)?)
+            Some(lookup_session(
+                &state,
+                session_id,
+                &authentication.principal,
+                &metadata,
+            )?)
         } else {
-            let created = create_session(&state, principal.clone(), &metadata)?;
+            let created = create_session(&state, authentication.clone(), &metadata)?;
             new_session = Some(created.0);
             Some(created.1)
         }
     } else if let Some(session_id) = requested_session {
-        Some(lookup_session(&state, session_id, &principal, &metadata)?)
+        Some(lookup_session(
+            &state,
+            session_id,
+            &authentication.principal,
+            &metadata,
+        )?)
     } else {
         None
     };
@@ -516,7 +646,7 @@ async fn execute_operation(
     let client = if let Some(session) = &session {
         Arc::clone(&session.client)
     } else {
-        Arc::new(open_product_client(&state, &principal, &metadata)?)
+        product_client_for_request(&state, &authentication, &metadata)?
     };
     client.record_timing(TimingClass::RequestDecoding, decode_time);
     let token = ProductCancellationToken::new();
@@ -1050,7 +1180,7 @@ fn parse_session_header(
     Ok(Some(parsed))
 }
 
-fn open_product_client(
+fn open_unmanaged_product_client(
     state: &NativeHttpV2State,
     principal: &AuthenticatedPrincipal,
     metadata: &RequestMetadata,
@@ -1063,9 +1193,27 @@ fn open_product_client(
         .map_err(|error| NativeApiError::product(error, metadata))
 }
 
+fn product_client_for_request(
+    state: &NativeHttpV2State,
+    authentication: &RequestAuthentication,
+    metadata: &RequestMetadata,
+) -> Result<Arc<NativeProductClient>, NativeApiError> {
+    if let Some(client) = &authentication.initial_client {
+        return Ok(Arc::clone(client));
+    }
+    match &state.session_mode {
+        NativeHttpV2SessionMode::Unmanaged { .. } => {
+            open_unmanaged_product_client(state, &authentication.principal, metadata).map(Arc::new)
+        }
+        NativeHttpV2SessionMode::Managed => {
+            Err(NativeApiError::code(ProductErrorCode::Internal, metadata))
+        }
+    }
+}
+
 pub(super) fn create_session(
     state: &NativeHttpV2State,
-    principal: AuthenticatedPrincipal,
+    authentication: RequestAuthentication,
     metadata: &RequestMetadata,
 ) -> Result<(u128, Arc<HttpProductSession>), NativeApiError> {
     cleanup_sessions(state, metadata)?;
@@ -1073,9 +1221,10 @@ pub(super) fn create_session(
     let slot = Arc::clone(&state.session_slots)
         .try_acquire_owned()
         .map_err(|_| NativeApiError::code(ProductErrorCode::LimitExceeded, metadata))?;
+    let client = product_client_for_request(state, &authentication, metadata)?;
     let session = Arc::new(HttpProductSession {
-        client: Arc::new(open_product_client(state, &principal, metadata)?),
-        principal,
+        client,
+        principal: authentication.principal,
         prepared: Mutex::new(BTreeMap::new()),
         prepared_slots: Arc::new(Semaphore::new(MAX_HTTP_PREPARED_PER_SESSION)),
         _slot: slot,
@@ -1130,16 +1279,20 @@ pub(super) fn lookup_session(
         .lock()
         .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?;
     let Some(entry) = sessions.get_mut(&session_id) else {
-        return Err(NativeApiError::code(
-            ProductErrorCode::SqlInvalidValue,
-            metadata,
-        ));
+        return Err(match &state.session_mode {
+            NativeHttpV2SessionMode::Unmanaged { .. } => {
+                NativeApiError::code(ProductErrorCode::SqlInvalidValue, metadata)
+            }
+            NativeHttpV2SessionMode::Managed => NativeApiError::unauthorized(metadata),
+        });
     };
     if &entry.session.principal != principal {
-        return Err(NativeApiError::code(
-            ProductErrorCode::AuthorizationDenied,
-            metadata,
-        ));
+        return Err(match &state.session_mode {
+            NativeHttpV2SessionMode::Unmanaged { .. } => {
+                NativeApiError::code(ProductErrorCode::AuthorizationDenied, metadata)
+            }
+            NativeHttpV2SessionMode::Managed => NativeApiError::unauthorized(metadata),
+        });
     }
     entry.expires_at = Instant::now() + HTTP_SESSION_IDLE_TIMEOUT;
     Ok(Arc::clone(&entry.session))
@@ -1331,4 +1484,46 @@ fn bearer_candidate(headers: &HeaderMap) -> Option<&[u8]> {
     }
     let candidate = &value[separator.saturating_add(1)..];
     (!candidate.is_empty()).then_some(candidate)
+}
+
+fn managed_bearer_candidate(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    let candidate = value.strip_prefix("Bearer ")?;
+    is_canonical_api_key(candidate.as_bytes()).then_some(candidate)
+}
+
+fn is_canonical_api_key(candidate: &[u8]) -> bool {
+    const PREFIX_BYTES: usize = 5;
+    const SEPARATOR_INDEX: usize = 37;
+
+    candidate.len() == MAX_API_KEY_CREDENTIAL_BYTES
+        && candidate.starts_with(b"hyp1_")
+        && candidate.get(SEPARATOR_INDEX) == Some(&b'_')
+        && candidate[PREFIX_BYTES..SEPARATOR_INDEX]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+        && candidate[PREFIX_BYTES..SEPARATOR_INDEX]
+            .iter()
+            .all(|byte| !byte.is_ascii_uppercase())
+        && candidate[SEPARATOR_INDEX + 1..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
+        && candidate[SEPARATOR_INDEX + 1..]
+            .iter()
+            .all(|byte| !byte.is_ascii_uppercase())
+        && candidate[PREFIX_BYTES..SEPARATOR_INDEX]
+            .iter()
+            .any(|byte| *byte != b'0')
+}
+
+fn managed_credential_fingerprint(candidate: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-native-http-v2-managed-credential-v1\0");
+    hasher.update(candidate);
+    *hasher.finalize().as_bytes()
 }

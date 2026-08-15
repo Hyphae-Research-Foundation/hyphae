@@ -289,6 +289,9 @@ enum Command {
         /// Optional loopback native HTTP v2 listener.
         #[arg(long)]
         http_bind: Option<SocketAddr>,
+        /// Require durable Native API keys on local and HTTP v2 transports.
+        #[arg(long)]
+        native_api_key_auth: bool,
         /// Format-2 `/v1` listener. Native HTTP uses `--http-bind`.
         #[arg(long)]
         bind: Option<SocketAddr>,
@@ -1382,6 +1385,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             data_dir,
             endpoint,
             http_bind,
+            native_api_key_auth,
             bind,
             bearer_token_file,
         } => {
@@ -1394,11 +1398,11 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                 if bind.is_some() || bearer_token_file.is_some() {
                     return Err(RunFailure::Native(CliFailure::invalid()));
                 }
-                native_service::serve(data_dir, endpoint, http_bind)
+                native_service::serve(data_dir, endpoint, http_bind, native_api_key_auth)
                     .await
                     .map_err(Into::into)
             } else {
-                if endpoint.is_some() || http_bind.is_some() {
+                if endpoint.is_some() || http_bind.is_some() || native_api_key_auth {
                     return Err(RunFailure::Compatibility(
                         "native serve options cannot be used with a format-2 directory".into(),
                     ));

@@ -17,15 +17,16 @@ use std::{
 };
 
 use hyphae_native_product::{
-    NativeProduct, NativeProductClient, NativeProductService, NativeProductServiceConfig,
-    ProductAuthorization, ProductError, ProductErrorCode, ProductOperation, ProductPermission,
-    ProductPrincipal, ProductResponse, TimingClass,
+    ApiKeyCredential, NativeProduct, NativeProductClient, NativeProductService,
+    NativeProductServiceConfig, ProductAuthorization, ProductError, ProductErrorCode,
+    ProductOperation, ProductPermission, ProductPrincipal, ProductResponse, TimingClass,
 };
 use hyphae_native_protocol::{
     AsyncFrameIo, ControlError, FlowWindow, FrameIoError, FrameKind, HandshakeError, Hello,
-    NegotiationPolicy, ProductCodecError, ProtocolCapabilities, StreamCompletion, decode_cancel,
-    decode_deadline, decode_hello, decode_product_request, decode_window_update, encode_end,
-    encode_failure, encode_product_response, encode_welcome, negotiate,
+    NegotiationPolicy, ProductCodecError, ProtocolCapabilities, StreamCompletion,
+    decode_authenticated_hello, decode_cancel, decode_deadline, decode_hello,
+    decode_product_request, decode_window_update, encode_end, encode_failure,
+    encode_product_response, encode_welcome, negotiate,
 };
 use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{ListenerOptions, PeerCreds};
@@ -96,9 +97,7 @@ pub struct PeerIdentity {
 impl PeerIdentity {
     fn from_credentials(credentials: PeerCreds) -> Self {
         Self {
-            process_id: credentials
-                .pid()
-                .and_then(|value| u32::try_from(value).ok()),
+            process_id: peer_process_id(credentials),
             #[cfg(unix)]
             effective_user_id: credentials.euid(),
             #[cfg(unix)]
@@ -123,6 +122,18 @@ impl PeerIdentity {
         );
         ProductPrincipal::new(identity).ok_or(DaemonError::InvalidPeerIdentity)
     }
+}
+
+#[cfg(unix)]
+fn peer_process_id(credentials: PeerCreds) -> Option<u32> {
+    credentials
+        .pid()
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+#[cfg(windows)]
+fn peer_process_id(credentials: PeerCreds) -> Option<u32> {
+    credentials.pid()
 }
 
 /// Local daemon startup, protocol, or shutdown failure.
@@ -173,6 +184,20 @@ pub struct NativeDaemon {
     service: Option<NativeProductService>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonAuthentication {
+    UnmanagedPeer,
+    ManagedApiKey,
+}
+
+enum ConnectionCredential {
+    Unmanaged {
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+    },
+    Managed(ApiKeyCredential),
+}
+
 impl NativeDaemon {
     /// Binds the platform local endpoint and starts multi-client admission.
     ///
@@ -189,6 +214,16 @@ impl NativeDaemon {
         Self::start_with_service(service, endpoint, config)
     }
 
+    /// Binds one daemon that requires a durable Native API key in `HELLO`.
+    pub fn start_authenticated(
+        product: NativeProduct,
+        endpoint: impl Into<String>,
+        config: NativeDaemonConfig,
+    ) -> Result<Self, DaemonError> {
+        let service = NativeProductService::start(product, config.product_service)?;
+        Self::start_with_service_authenticated(service, endpoint, config)
+    }
+
     /// Binds the platform local endpoint around an already-started sole
     /// product service. Edge adapters can clone the service handle before this
     /// call so every listener dispatches through the same product owner.
@@ -197,7 +232,28 @@ impl NativeDaemon {
         endpoint: impl Into<String>,
         config: NativeDaemonConfig,
     ) -> Result<Self, DaemonError> {
-        Self::start_with_service_policy(service, endpoint, config, None)
+        Self::start_with_service_policy(
+            service,
+            endpoint,
+            config,
+            DaemonAuthentication::UnmanagedPeer,
+            None,
+        )
+    }
+
+    /// Binds one API-key-authenticated daemon around an existing product owner.
+    pub fn start_with_service_authenticated(
+        service: NativeProductService,
+        endpoint: impl Into<String>,
+        config: NativeDaemonConfig,
+    ) -> Result<Self, DaemonError> {
+        Self::start_with_service_policy(
+            service,
+            endpoint,
+            config,
+            DaemonAuthentication::ManagedApiKey,
+            None,
+        )
     }
 
     /// Starts a real daemon that denies data reads for one acceptance-test identity.
@@ -212,6 +268,7 @@ impl NativeDaemon {
             service,
             endpoint,
             config,
+            DaemonAuthentication::UnmanagedPeer,
             Some(denied_client_identity.into()),
         )
     }
@@ -220,10 +277,12 @@ impl NativeDaemon {
         service: NativeProductService,
         endpoint: impl Into<String>,
         config: NativeDaemonConfig,
+        authentication: DaemonAuthentication,
         denied_client_identity: Option<String>,
     ) -> Result<Self, DaemonError> {
         validate_config(config)?;
-        let endpoint = normalize_endpoint(endpoint.into())?;
+        let endpoint = endpoint.into();
+        let endpoint = normalize_endpoint(&endpoint)?;
         let handle = service.handle();
         let listener = create_listener(&endpoint)?;
         let (shutdown, shutdown_receive) = broadcast::channel(1);
@@ -234,6 +293,7 @@ impl NativeDaemon {
                 listener,
                 handle,
                 config,
+                authentication,
                 denied_client_identity,
                 listener_accepting,
                 shutdown_receive,
@@ -297,18 +357,18 @@ pub async fn connect(
         .map_err(DaemonError::Io)
 }
 
-fn normalize_endpoint(endpoint: String) -> Result<String, DaemonError> {
+fn normalize_endpoint(endpoint: &str) -> Result<String, DaemonError> {
     #[cfg(unix)]
     {
         if endpoint.is_empty() {
             Err(DaemonError::InvalidEndpoint)
         } else {
-            Ok(endpoint)
+            Ok(endpoint.to_owned())
         }
     }
     #[cfg(windows)]
     {
-        normalize_windows_endpoint(&endpoint)
+        normalize_windows_endpoint(endpoint)
     }
 }
 
@@ -381,6 +441,7 @@ async fn listener_loop(
     listener: interprocess::local_socket::tokio::Listener,
     service: hyphae_native_product::NativeProductHandle,
     config: NativeDaemonConfig,
+    authentication: DaemonAuthentication,
     denied_client_identity: Option<String>,
     accepting: Arc<AtomicBool>,
     mut shutdown: broadcast::Receiver<()>,
@@ -404,7 +465,15 @@ async fn listener_loop(
                 let client_shutdown = shutdown.resubscribe();
                 let denied_client_identity = denied_client_identity.clone();
                 clients.spawn(async move {
-                    serve_connection(stream, service, config, denied_client_identity, client_shutdown).await
+                    serve_connection(
+                        stream,
+                        service,
+                        config,
+                        authentication,
+                        denied_client_identity,
+                        client_shutdown,
+                    )
+                    .await
                 });
             }
             completed = clients.join_next(), if !clients.is_empty() => {
@@ -455,6 +524,7 @@ async fn serve_connection(
     stream: interprocess::local_socket::tokio::Stream,
     service: hyphae_native_product::NativeProductHandle,
     config: NativeDaemonConfig,
+    authentication: DaemonAuthentication,
     denied_client_identity: Option<String>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), DaemonError> {
@@ -468,41 +538,38 @@ async fn serve_connection(
             return Ok(());
         }
     };
-    let Some(first) = first else {
+    let Some(mut first) = first else {
         return Ok(());
     };
     if first.kind != FrameKind::Hello || first.stream_id != 0 || first.request_id == 0 {
+        first.payload.fill(0);
         return Err(DaemonError::Handshake(HandshakeError::Malformed));
     }
-    let hello = decode_hello(&first.payload)?;
-    if hello.database != "main" || hello.schema != "public" {
-        send_product_error(
-            stream.as_ref(),
-            &codec,
-            &AsyncMutex::new(()),
-            0,
-            first.request_id,
-            ProductError::from_code(ProductErrorCode::InvalidRequest),
-        )
-        .await?;
+    let decoded = decode_connection_credential(
+        authentication,
+        denied_client_identity.as_deref(),
+        peer,
+        &first.payload,
+    );
+    first.payload.fill(0);
+    let opened = open_connection_client(
+        stream.as_ref(),
+        &codec,
+        &service,
+        authentication,
+        decoded,
+        first.request_id,
+    )
+    .await;
+    let Some((hello, client, catalog_version)) = opened? else {
         return Ok(());
-    }
-    let authorization = if denied_client_identity.as_deref() == Some(&hello.client_identity) {
-        ProductAuthorization::from_permissions([ProductPermission::Observe])
-    } else {
-        ProductAuthorization::ALL
     };
-    let principal = peer.principal(&hello)?;
-    let client = Arc::new(service.open_session(principal, authorization)?);
-    let catalog_version = match client.dispatch(
-        client.request_context(u128::from(first.request_id), 0),
-        ProductOperation::AdminStatus,
-    )? {
-        ProductResponse::AdminStatus(status) => status.snapshot.catalog_version.get(),
-        _ => return Err(DaemonError::Task),
-    };
+    let client = Arc::new(client);
     let policy = NegotiationPolicy {
-        capabilities: ProtocolCapabilities::G6,
+        capabilities: match authentication {
+            DaemonAuthentication::UnmanagedPeer => ProtocolCapabilities::G6,
+            DaemonAuthentication::ManagedApiKey => ProtocolCapabilities::G6_AUTHENTICATED,
+        },
         maximum_frame_payload: u32::try_from(config.maximum_frame_payload)
             .map_err(|_| DaemonError::InvalidConfiguration)?,
         maximum_in_flight: config.maximum_in_flight,
@@ -552,6 +619,119 @@ async fn serve_connection(
         let _ignored = client.close();
     }
     result
+}
+
+async fn open_connection_client(
+    stream: &interprocess::local_socket::tokio::Stream,
+    codec: &AsyncFrameIo,
+    service: &hyphae_native_product::NativeProductHandle,
+    authentication: DaemonAuthentication,
+    decoded: Result<(Hello, ConnectionCredential), DaemonError>,
+    request_id: u64,
+) -> Result<Option<(Hello, NativeProductClient, u64)>, DaemonError> {
+    let (hello, credential) = match decoded {
+        Ok(decoded) => decoded,
+        Err(DaemonError::Product(error))
+            if error.code() == ProductErrorCode::AuthorizationDenied =>
+        {
+            send_handshake_error(stream, codec, request_id, error).await?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let requested_namespace_is_supported = hello.database == "main" && hello.schema == "public";
+    if !requested_namespace_is_supported && authentication == DaemonAuthentication::UnmanagedPeer {
+        send_handshake_error(
+            stream,
+            codec,
+            request_id,
+            ProductError::from_code(ProductErrorCode::InvalidRequest),
+        )
+        .await?;
+        return Ok(None);
+    }
+    let client = match credential {
+        ConnectionCredential::Unmanaged {
+            principal,
+            authorization,
+        } => service.open_session(principal, authorization)?,
+        ConnectionCredential::Managed(credential) => {
+            match service.open_authenticated_session(credential) {
+                Ok(client) => client,
+                Err(error) if error.code() == ProductErrorCode::AuthorizationDenied => {
+                    send_handshake_error(stream, codec, request_id, error).await?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    if !requested_namespace_is_supported {
+        let _ignored = client.close();
+        send_handshake_error(
+            stream,
+            codec,
+            request_id,
+            ProductError::from_code(ProductErrorCode::InvalidRequest),
+        )
+        .await?;
+        return Ok(None);
+    }
+    let catalog_version = match authentication {
+        DaemonAuthentication::ManagedApiKey => 0,
+        DaemonAuthentication::UnmanagedPeer => match client.dispatch(
+            client.request_context(u128::from(request_id), 0),
+            ProductOperation::AdminStatus,
+        )? {
+            ProductResponse::AdminStatus(status) => status.snapshot.catalog_version.get(),
+            _ => return Err(DaemonError::Task),
+        },
+    };
+    Ok(Some((hello, client, catalog_version)))
+}
+
+fn decode_connection_credential(
+    authentication: DaemonAuthentication,
+    denied_client_identity: Option<&str>,
+    peer: PeerIdentity,
+    payload: &[u8],
+) -> Result<(Hello, ConnectionCredential), DaemonError> {
+    match authentication {
+        DaemonAuthentication::UnmanagedPeer => {
+            let hello = decode_hello(payload)?;
+            let authorization = if denied_client_identity == Some(hello.client_identity.as_str()) {
+                ProductAuthorization::from_permissions([ProductPermission::Observe])
+            } else {
+                ProductAuthorization::ALL
+            };
+            let principal = peer.principal(&hello)?;
+            Ok((
+                hello,
+                ConnectionCredential::Unmanaged {
+                    principal,
+                    authorization,
+                },
+            ))
+        }
+        DaemonAuthentication::ManagedApiKey => {
+            let authenticated = decode_authenticated_hello(payload).map_err(|_| {
+                DaemonError::Product(ProductError::from_code(
+                    ProductErrorCode::AuthorizationDenied,
+                ))
+            })?;
+            let (hello, credential) = authenticated.into_parts();
+            Ok((hello, ConnectionCredential::Managed(credential)))
+        }
+    }
+}
+
+async fn send_handshake_error(
+    stream: &interprocess::local_socket::tokio::Stream,
+    codec: &AsyncFrameIo,
+    request_id: u64,
+    error: ProductError,
+) -> Result<(), DaemonError> {
+    send_product_error(stream, codec, &AsyncMutex::new(()), 0, request_id, error).await
 }
 
 #[derive(Clone)]
@@ -1222,8 +1402,10 @@ mod windows_tests {
         const DACL_SECURITY_INFORMATION: u32 = 4;
 
         let descriptor = windows_security_descriptor()?;
-        let sddl =
-            descriptor.serialize(DACL_SECURITY_INFORMATION, |value| value.to_string_lossy())?;
+        let sddl = descriptor.serialize(
+            DACL_SECURITY_INFORMATION,
+            widestring::U16CStr::to_string_lossy,
+        )?;
         assert!(sddl.contains("D:P"));
         assert!(sddl.contains("(A;;GA;;;OW)"));
         assert!(sddl.contains("(A;;GA;;;SY)"));

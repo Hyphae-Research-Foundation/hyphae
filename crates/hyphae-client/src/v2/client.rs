@@ -167,6 +167,14 @@ impl HyphaeClient {
         Ok(Self::new(LocalTransport::new(endpoint)?))
     }
 
+    /// Creates an API-key-authenticated local client.
+    pub fn local_authenticated(
+        endpoint: impl Into<String>,
+        api_key: impl AsRef<str>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(LocalTransport::new(endpoint)?.api_key(api_key)?))
+    }
+
     /// Creates a local client with an explicit bounded handshake identity.
     pub fn local_with_identity(
         endpoint: impl Into<String>,

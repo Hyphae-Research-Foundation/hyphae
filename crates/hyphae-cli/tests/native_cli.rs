@@ -14,11 +14,15 @@ use std::{
 #[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
+use hyphae_client::v2::{ClientError, HyphaeClient, RequestOptions};
 use hyphae_native_product::proof::{
     AdmittedProofLimits, CanonicalBytes, CompletionStatus, NativeProof, NativeProofAnchor,
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
     bundle_native_witness, encode_native_proof,
 };
+#[cfg(unix)]
+use hyphae_native_product::{ProductErrorCode, ProductResponse};
 use hyphae_storage::{SnapshotReadLimits, load_snapshot};
 use uuid::Uuid;
 
@@ -1367,6 +1371,108 @@ fn serve_can_share_one_product_service_with_native_http_v2() -> Result<(), Box<d
     assert!(response.starts_with("HTTP/1.1 409"));
     assert!(endpoint.exists());
     let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_native_api_key_auth_selects_managed_without_changing_legacy()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let owner_key = temporary.0.join("owner.key");
+    let managed_endpoint = std::env::temp_dir().join(format!("hcm-{}.sock", Uuid::now_v7()));
+    let legacy_endpoint = std::env::temp_dir().join(format!("hcl-{}.sock", Uuid::now_v7()));
+    run(&["init", "--data-dir", &path(&data)])?;
+    run(&[
+        "security",
+        "--data-dir",
+        &path(&data),
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let owner_secret = fs::read_to_string(owner_key)?;
+
+    {
+        let mut child = spawn_native_serve(&data, &managed_endpoint, &["--native-api-key-auth"])?;
+        wait_for_native_endpoint(&mut child, &managed_endpoint)
+            .map_err(|error| std::io::Error::other(format!("managed serve failed: {error}")))?;
+        let _guard = ChildGuard(&mut child);
+
+        let unauthenticated = HyphaeClient::local(path(&managed_endpoint))?;
+        let denied = match unauthenticated
+            .capabilities(RequestOptions::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(_response) => return Err("managed serve accepted a legacy handshake".into()),
+        };
+        let ClientError::Product(denied) = denied else {
+            return Err("managed serve did not return a typed authorization denial".into());
+        };
+        assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+
+        let authenticated =
+            HyphaeClient::local_authenticated(path(&managed_endpoint), &owner_secret)?;
+        assert!(matches!(
+            authenticated
+                .capabilities(RequestOptions::default())
+                .await?,
+            ProductResponse::Capabilities(_)
+        ));
+    }
+
+    {
+        let mut child = spawn_native_serve(&data, &legacy_endpoint, &[])?;
+        wait_for_native_endpoint(&mut child, &legacy_endpoint)
+            .map_err(|error| std::io::Error::other(format!("legacy serve failed: {error}")))?;
+        let _guard = ChildGuard(&mut child);
+
+        let legacy = HyphaeClient::local(path(&legacy_endpoint))?;
+        assert!(matches!(
+            legacy.capabilities(RequestOptions::default()).await?,
+            ProductResponse::Capabilities(_)
+        ));
+    }
+    let _ignored = fs::remove_file(managed_endpoint);
+    let _ignored = fs::remove_file(legacy_endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_native_serve(
+    data: &Path,
+    endpoint: &Path,
+    extra_arguments: &[&str],
+) -> Result<Child, Box<dyn Error>> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data)
+        .arg("--endpoint")
+        .arg(endpoint)
+        .args(extra_arguments)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?)
+}
+
+#[cfg(unix)]
+fn wait_for_native_endpoint(child: &mut Child, endpoint: &Path) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !endpoint.exists() && Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            let error = read_child_stderr(child)?;
+            return Err(std::io::Error::other(error).into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !endpoint.exists() {
+        return Err("serve did not bind the requested native endpoint".into());
+    }
     Ok(())
 }
 

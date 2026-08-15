@@ -35,8 +35,9 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use hyphae_native_product::{
-        NativeProduct, NativeProductService, NativeProductServiceConfig, ProductDurabilityPolicy,
-        ProductLimits, ProductOperation,
+        ApiKeyId, AuthenticatedAuthority, BuiltInRole, NativeProduct, NativeProductService,
+        NativeProductServiceConfig, ProductDurabilityPolicy, ProductLimits, ProductOperation,
+        ProductScope,
     };
     use hyphae_native_protocol::{WireRequest, decode_product_response, encode_product_request};
     use serde_json::Value;
@@ -49,6 +50,15 @@ mod tests {
     use crate::BearerToken;
 
     struct TestDirectory(PathBuf);
+
+    struct ManagedServiceFixture {
+        service: NativeProductService,
+        credential: String,
+        owner_credential: String,
+        owner_authority: AuthenticatedAuthority,
+        credential_key_id: ApiKeyId,
+        _directory: TestDirectory,
+    }
 
     #[test]
     fn openapi_contract_lists_every_native_http_v2_route() {
@@ -78,6 +88,26 @@ mod tests {
             !contract.contains("Explicitly unsupported until ProductOperation exposes restore")
         );
         assert!(!contract.contains("\"501\""));
+        assert!(contract.contains("x-hyphae-authentication-modes:"));
+        assert!(contract.contains("new_managed requires one canonical hyp1 API key"));
+        assert!(contract.contains("adapter is loopback-only; remote exposure requires a TLS"));
+        assert!(
+            contract
+                .contains("bearerFormat: hyp1_<32-lowercase-hex-key-id>_<64-lowercase-hex-secret>")
+        );
+        assert!(contract.contains("authority loss is HTTP 403"));
+        assert_eq!(
+            contract
+                .matches("\"401\": { $ref: \"#/components/responses/AuthenticationRequired\" }")
+                .count(),
+            17
+        );
+        assert_eq!(
+            contract
+                .matches("\"403\": { $ref: \"#/components/responses/AuthorizationDenied\" }")
+                .count(),
+            17
+        );
     }
 
     impl TestDirectory {
@@ -103,6 +133,54 @@ mod tests {
         let product = NativeProduct::create(&directory.0)?;
         let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
         Ok((directory, service))
+    }
+
+    fn managed_service(name: &str, reader: bool) -> Result<ManagedServiceFixture, Box<dyn Error>> {
+        let directory = TestDirectory::new(name);
+        let data_path = directory.0.join("data");
+        let owner_key_path = directory.0.join("owner.key");
+        let reader_key_path = directory.0.join("reader.key");
+        fs::create_dir_all(&directory.0)?;
+        let mut product = NativeProduct::create(data_path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_key_path, 1)?;
+        let owner_secret = fs::read_to_string(owner_key_path)?;
+        let (credential, credential_key_id) = if reader {
+            let owner = product.authenticate_api_key(&owner_secret, 2)?;
+            let principal = product.create_security_principal(&owner, "HTTP reader", 2)?;
+            let owner = product.authenticate_api_key(&owner_secret, 3)?;
+            product.assign_built_in_role(
+                &owner,
+                principal.principal_id,
+                BuiltInRole::Reader,
+                ProductScope::Instance,
+                3,
+            )?;
+            let owner = product.authenticate_api_key(&owner_secret, 4)?;
+            let issued = product.issue_api_key_to_file(
+                &owner,
+                principal.principal_id,
+                "http-reader",
+                [BuiltInRole::Reader],
+                BuiltInRole::Reader.authorization(),
+                None,
+                &reader_key_path,
+                4,
+            )?;
+            (fs::read_to_string(reader_key_path)?, issued.key_id)
+        } else {
+            let owner = product.authenticate_api_key(&owner_secret, 2)?;
+            (owner_secret.clone(), owner.key_id())
+        };
+        let owner_authority = product.authenticate_api_key(&owner_secret, 5)?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        Ok(ManagedServiceFixture {
+            service,
+            credential,
+            owner_credential: owner_secret,
+            owner_authority,
+            credential_key_id,
+            _directory: directory,
+        })
     }
 
     fn request(operation: ProductOperation) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -161,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_bind_requires_auth_before_session_or_socket() -> Result<(), Box<dyn Error>> {
+    fn remote_bind_policy_is_validated_before_session_or_socket() -> Result<(), Box<dyn Error>> {
         let (_directory, service) = service("remote")?;
         let config = NativeHttpV2Config {
             bind: (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -171,6 +249,33 @@ mod tests {
             NativeHttpV2Server::new(service.handle(), config),
             Err(super::NativeHttpV2Error::Configuration(
                 NativeHttpV2ConfigError::RemoteBindRequiresAuthentication { .. }
+            ))
+        ));
+        let managed = NativeHttpV2Server::new_managed(
+            service.handle(),
+            NativeHttpV2Config {
+                bind: (Ipv4Addr::UNSPECIFIED, 0).into(),
+                ..NativeHttpV2Config::default()
+            },
+        );
+        assert!(matches!(
+            managed,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::RemoteManagedBindRequiresTls { .. }
+            ))
+        ));
+
+        let conflicting = NativeHttpV2Server::new_managed(
+            service.handle(),
+            NativeHttpV2Config {
+                bearer_token: Some(BearerToken::new("0123456789abcdef0123456789abcdef")?),
+                ..NativeHttpV2Config::default()
+            },
+        );
+        assert!(matches!(
+            conflicting,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::ManagedAuthenticationConflict
             ))
         ));
         drop(service);
@@ -203,6 +308,7 @@ mod tests {
         assert_eq!(denied_body["request_id"], "41");
 
         let accepted = app
+            .clone()
             .oneshot(http_request(
                 "/v2/execute",
                 request(ProductOperation::Capabilities).map_err(|error| error.to_string())?,
@@ -218,6 +324,256 @@ mod tests {
             hyphae_native_product::ProductResponse::Capabilities(_)
         ));
         drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_authentication_requires_exact_api_key_bearers() -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("managed-auth", false)?;
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let body = request(ProductOperation::Capabilities)?;
+        let wrong_credential = concat!(
+            "hyp1_11111111111111111111111111111111_",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+
+        for (request_id, candidate) in [
+            ("201", None),
+            ("202", Some("hyp1_short")),
+            ("203", Some(wrong_credential)),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "/v2/execute",
+                    body.clone(),
+                    Some(request_id),
+                    candidate,
+                    None,
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()[header::WWW_AUTHENTICATE],
+                "Bearer realm=\"hyphae-native-v2\""
+            );
+            let denied: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+            assert_eq!(denied["code"], "authorization_denied");
+            assert_eq!(denied["request_id"], request_id);
+        }
+
+        let mut wrong_scheme = http_request("/v2/execute", body.clone(), Some("209"), None, None)?;
+        wrong_scheme.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", fixture.credential).parse()?,
+        );
+        let wrong_scheme = app.clone().oneshot(wrong_scheme).await?;
+        assert_eq!(wrong_scheme.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            wrong_scheme
+                .headers()
+                .contains_key(header::WWW_AUTHENTICATE)
+        );
+
+        let mut duplicated = http_request(
+            "/v2/execute",
+            body.clone(),
+            Some("213"),
+            Some(&fixture.credential),
+            None,
+        )?;
+        duplicated.headers_mut().append(
+            header::AUTHORIZATION,
+            format!("Bearer {}", fixture.credential).parse()?,
+        );
+        let duplicated = app.clone().oneshot(duplicated).await?;
+        assert_eq!(duplicated.status(), StatusCode::UNAUTHORIZED);
+        assert!(duplicated.headers().contains_key(header::WWW_AUTHENTICATE));
+
+        let accepted = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/execute",
+                body,
+                Some("204"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_http_sessions_are_bound_to_the_opening_credential()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("managed-session-binding", false)?;
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let begun = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionBegin)?,
+                "206",
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(begun.status(), StatusCode::OK);
+        let session_id = begun.headers()[hyphae_contracts::v2::SESSION_ID_HEADER_V2]
+            .to_str()?
+            .to_owned();
+        let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
+            hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+        ) = decode_product_response(&response_bytes(begun).await?)?
+        else {
+            return Err("managed transaction begin returned the wrong response".into());
+        };
+
+        let wrong_credential = concat!(
+            "hyp1_11111111111111111111111111111111_",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let wrong_for_session = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionRollback { handle })?,
+                "207",
+                Some(wrong_credential),
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(wrong_for_session.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            wrong_for_session
+                .headers()
+                .contains_key(header::WWW_AUTHENTICATE)
+        );
+
+        let rolled_back = app
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionRollback { handle })?,
+                "208",
+                Some(&fixture.credential),
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(rolled_back.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_permission_denial_is_typed_forbidden_without_challenge()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("managed-permission", true)?;
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let response = app
+            .oneshot(http_request(
+                "/v2/structures",
+                request(ProductOperation::StructureSet {
+                    key: b"denied".to_vec(),
+                    value: b"value".to_vec(),
+                    expires_at_micros: None,
+                })?,
+                Some("205"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        let denied: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+        assert_eq!(denied["code"], "authorization_denied");
+        assert_eq!(denied["request_id"], "205");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_session_reports_post_open_revocation_as_typed_forbidden()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("managed-session-revocation", true)?;
+        let handle = fixture.service.handle();
+        let app = NativeHttpV2Server::new_managed(handle.clone(), NativeHttpV2Config::default())?
+            .test_router();
+
+        let created = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement: "CREATE TABLE revocation_items (id BIGINT PRIMARY KEY)".to_owned(),
+                    parameters: Vec::new(),
+                })?,
+                Some("210"),
+                Some(&fixture.owner_credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let _ = response_bytes(created).await?;
+
+        let prepared = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::PrepareSql {
+                    statement: "SELECT id FROM revocation_items WHERE id = ?".to_owned(),
+                })?,
+                "211",
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let session_id = prepared.headers()[hyphae_contracts::v2::SESSION_ID_HEADER_V2]
+            .to_str()?
+            .to_owned();
+        let hyphae_native_product::ProductResponse::PreparedSql {
+            handle: prepared_handle,
+            ..
+        } = decode_product_response(&response_bytes(prepared).await?)?
+        else {
+            return Err("managed prepare returned the wrong response".into());
+        };
+
+        handle.revoke_api_key(
+            fixture.owner_authority.clone(),
+            fixture.credential_key_id,
+            6,
+        )?;
+        let revoked = app
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecutePrepared {
+                    handle: prepared_handle,
+                    parameters: vec![hyphae_native_product::ProductValue::Signed(1)],
+                })?,
+                "212",
+                Some(&fixture.credential),
+                Some(&session_id),
+            )?)
+            .await?;
+
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+        assert!(!revoked.headers().contains_key(header::WWW_AUTHENTICATE));
+        let denied: Value = serde_json::from_slice(&response_bytes(revoked).await?)?;
+        assert_eq!(denied["code"], "authorization_denied");
+        assert_eq!(denied["request_id"], "212");
         Ok(())
     }
 
@@ -727,8 +1083,10 @@ mod tests {
             request_id: 106,
             binary_errors: false,
         };
-        let (session_id, session) = super::server::create_session(&server.state, first, &metadata)
-            .map_err(|error| error.error.message().to_owned())?;
+        let authentication = super::server::RequestAuthentication::unmanaged(first);
+        let (session_id, session) =
+            super::server::create_session(&server.state, authentication, &metadata)
+                .map_err(|error| error.error.message().to_owned())?;
         super::server::insert_session(&server.state, session_id, session, &metadata)
             .map_err(|error| error.error.message().to_owned())?;
         let Err(error) =
