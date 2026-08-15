@@ -209,7 +209,8 @@ complete lock-derived plus Python-manifest inventory, and any cross-format
 first-party identity drift.
 
 Extract the archive into an empty directory and confirm that it contains one
-executable plus `LICENSE`, `README.md`, and `THIRD_PARTY_NOTICES.md`:
+executable plus `LICENSE`, `LICENSE-DOCUMENTATION`, `LICENSE-POLICY.md`,
+`NOTICE`, `README.md`, and `THIRD_PARTY_NOTICES.md`:
 
 ```bash
 tar -xzf hyphae-VERSION-TARGET.tar.gz

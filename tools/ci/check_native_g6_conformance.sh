@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# SPDX-License-Identifier: AGPL-3.0-only
 set -eu
 
 python3 tools/check_native_g6_conformance.py aggregate \

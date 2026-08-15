@@ -32,14 +32,16 @@ SOFTWARE_ROOTS = (
     "sdks",
     "tools",
 )
-SOURCE_SUFFIXES = frozenset({".rs", ".py", ".ts", ".js", ".mjs"})
+SOURCE_SUFFIXES = frozenset({".rs", ".py", ".ts", ".js", ".mjs", ".sh"})
 IGNORED_GENERATED_DIRECTORIES = frozenset(
     {"build", "dist", "node_modules", "target"}
 )
+IGNORED_GENERATED_ROOTS = frozenset({"website"})
 ARCHIVE_DOCUMENTS = (
     "LICENSE",
     "LICENSE-DOCUMENTATION",
     "LICENSE-POLICY.md",
+    "NOTICE",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
 )
@@ -112,6 +114,7 @@ def manifest_paths(root: Path, name: str) -> list[Path]:
         path
         for path in root.rglob(name)
         if path.is_file()
+        and path.relative_to(root).parts[0] not in IGNORED_GENERATED_ROOTS
         and not IGNORED_GENERATED_DIRECTORIES.intersection(
             path.relative_to(root).parts
         )

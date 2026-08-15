@@ -1,6 +1,7 @@
 # ADR-0025: AGPLv3 code and CC BY-SA documentation
 
-- Status: Accepted
+- Status: Superseded by ADR-0029 for the `1.2.0` target and later; remains
+  effective for `1.1.0` and the current preflight tree
 - Date: 2026-08-10
 - Owners: Celiums Solutions LLC
 - Supersedes: ADR-0002 license selection; its provenance controls remain active
@@ -39,6 +40,11 @@ The root `LICENSE` contains the canonical AGPLv3 text,
 `LICENSE-POLICY.md` is the scope authority. Releases through `v1.0.1` remain
 under their original Apache-2.0 terms; this decision governs the repository
 after adoption and future releases.
+
+Those earlier tags contain the root Apache License 2.0 text and declare
+`Apache-2.0` in the root `README.md` and `Cargo.toml`, but contain no
+`LICENSE-DOCUMENTATION`. Their documentation is therefore recorded as
+`not-separately-specified`, not as an inferred Creative Commons grant.
 
 For future release SBOMs, tracked first-party package manifests are the
 authority for Hyphae package name, version, and license. The release pipeline

@@ -1,0 +1,392 @@
+{
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "schema": "hyphae-relicensing-classification-v1",
+  "target_release": "1.2.0",
+  "licenses": {
+    "software": "Apache-2.0",
+    "normative_specifications": "Apache-2.0",
+    "narrative_documentation": "CC-BY-SA-4.0"
+  },
+  "historical_releases": [
+    {
+      "minimum": "0.1.0",
+      "maximum": "1.0.1",
+      "software": "Apache-2.0",
+      "documentation": "not-separately-specified",
+      "evidence": [
+        "Tags v0.1.0, v0.2.0, v0.2.1, v1.0.0, and v1.0.1 contain a root Apache-2.0 LICENSE.",
+        "The same tags declare Apache-2.0 in root README.md and Cargo.toml.",
+        "The same tags do not contain LICENSE-DOCUMENTATION."
+      ],
+      "immutable": true
+    },
+    {
+      "minimum": "1.1.0",
+      "maximum": "1.1.0",
+      "software": "AGPL-3.0-only",
+      "documentation": "CC-BY-SA-4.0",
+      "evidence": [
+        "Tag v1.1.0 contains a root AGPL-3.0-only LICENSE and CC-BY-SA-4.0 LICENSE-DOCUMENTATION.",
+        "Tag v1.1.0 declares AGPL-3.0-only software and CC-BY-SA-4.0 documentation in root README.md and declares AGPL-3.0-only in Cargo.toml."
+      ],
+      "immutable": true
+    }
+  ],
+  "categories": [
+    {
+      "id": "software",
+      "target_license": "Apache-2.0",
+      "definition": "Executable source, tests, examples, build and release tooling, configuration, machine-enforced data, schemas, generated models, and legal material distributed with software."
+    },
+    {
+      "id": "normative-specification",
+      "target_license": "Apache-2.0",
+      "definition": "A machine-readable contract or implementable normative document that defines public behavior, wire semantics, durable formats, query or retrieval semantics, proofs, or bounded performance contracts."
+    },
+    {
+      "id": "narrative-documentation",
+      "target_license": "CC-BY-SA-4.0",
+      "definition": "Prose-only explanation, governance, planning, architecture, how-to guidance, gates, evidence, release history, nonnormative security threat models, and README material."
+    },
+    {
+      "id": "reserved-trademark-asset",
+      "target_license": null,
+      "definition": "Hyphae marks and visual identity excluded from the project software and documentation grants and governed by TRADEMARKS.md."
+    },
+    {
+      "id": "third-party-material",
+      "target_license": null,
+      "definition": "An explicitly identified third-party work that retains its own terms and is not relicensed by the project classification contract."
+    }
+  ],
+  "mixed_file_rule": {
+    "dominance_order": [
+      "executable-or-machine-enforced",
+      "normative-implementable-prose",
+      "prose-only"
+    ],
+    "executable_or_machine_enforced": "software",
+    "normative_implementable_prose": "normative-specification",
+    "prose_only": "narrative-documentation",
+    "readme_default": "narrative-documentation"
+  },
+  "classification": {
+    "precedence": "The matching rule with the lowest unique integer priority wins; a tie is invalid.",
+    "rules": [
+      {
+        "id": "reserved-trademark-assets",
+        "priority": 10,
+        "category": "reserved-trademark-asset",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            ".github/assets/hyphae-lockup-reversed.svg",
+            ".github/assets/hyphae-lockup.svg"
+          ]
+        }
+      },
+      {
+        "id": "documentation-license-texts",
+        "priority": 20,
+        "category": "narrative-documentation",
+        "match": {
+          "kind": "basename",
+          "paths": [
+            "LICENSE-DOCUMENTATION"
+          ]
+        }
+      },
+      {
+        "id": "license-policy-documents",
+        "priority": 21,
+        "category": "narrative-documentation",
+        "match": {
+          "kind": "basename",
+          "paths": [
+            "LICENSE-POLICY.md"
+          ]
+        }
+      },
+      {
+        "id": "readme-documents",
+        "priority": 22,
+        "category": "narrative-documentation",
+        "match": {
+          "kind": "basename",
+          "paths": [
+            "README.md"
+          ]
+        }
+      },
+      {
+        "id": "software-license-texts",
+        "priority": 23,
+        "category": "software",
+        "match": {
+          "kind": "basename",
+          "paths": [
+            "LICENSE"
+          ]
+        }
+      },
+      {
+        "id": "embedded-normative-markdown-contracts",
+        "priority": 24,
+        "category": "normative-specification",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            "crates/hyphae-native-product/assets/product-error-v1.md"
+          ]
+        }
+      },
+      {
+        "id": "normative-authority-document-exceptions",
+        "priority": 25,
+        "category": "normative-specification",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            "docs/gates/native-local-phase-1.md",
+            "docs/security/native-access-control-threat-model.md"
+          ]
+        }
+      },
+      {
+        "id": "normative-documentation-roots",
+        "priority": 30,
+        "category": "normative-specification",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            "docs/api/",
+            "docs/native/",
+            "docs/performance/",
+            "docs/provenance/",
+            "docs/query/",
+            "docs/retrieval/",
+            "docs/storage/"
+          ]
+        }
+      },
+      {
+        "id": "documentation-machine-contracts",
+        "priority": 31,
+        "category": "normative-specification",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            "docs/release/schema/"
+          ]
+        }
+      },
+      {
+        "id": "machine-enforced-json",
+        "priority": 34,
+        "category": "software",
+        "match": {
+          "kind": "suffix",
+          "paths": [
+            ".json"
+          ]
+        }
+      },
+      {
+        "id": "canonical-public-contracts",
+        "priority": 32,
+        "category": "normative-specification",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            "contracts/"
+          ]
+        }
+      },
+      {
+        "id": "packaged-public-contract-copies",
+        "priority": 33,
+        "category": "normative-specification",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            "crates/hyphae-contracts/assets/"
+          ]
+        }
+      },
+      {
+        "id": "documentation-narrative-default",
+        "priority": 40,
+        "category": "narrative-documentation",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            "docs/"
+          ]
+        }
+      },
+      {
+        "id": "repository-narrative-prose",
+        "priority": 41,
+        "category": "narrative-documentation",
+        "match": {
+          "kind": "suffix",
+          "paths": [
+            ".md"
+          ]
+        }
+      },
+      {
+        "id": "software-distribution-roots",
+        "priority": 50,
+        "category": "software",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            ".agents/",
+            ".claude-plugin/",
+            "compatibility/",
+            "config/",
+            "conformance/",
+            "crates/",
+            "examples/",
+            "fuzz/",
+            "integrations/",
+            "mcp/",
+            "packaging/",
+            "plugins/",
+            "sdks/",
+            "tools/"
+          ]
+        }
+      },
+      {
+        "id": "repository-automation",
+        "priority": 51,
+        "category": "software",
+        "match": {
+          "kind": "prefix",
+          "paths": [
+            ".github/"
+          ]
+        }
+      },
+      {
+        "id": "root-machine-and-build-files",
+        "priority": 60,
+        "category": "software",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            ".editorconfig",
+            ".gitattributes",
+            ".gitignore",
+            "Cargo.lock",
+            "Cargo.toml",
+            "clippy.toml",
+            "deny.toml",
+            "rust-toolchain.toml",
+            "rustfmt.toml"
+          ]
+        }
+      },
+      {
+        "id": "root-software-notice",
+        "priority": 61,
+        "category": "software",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            "NOTICE"
+          ]
+        }
+      }
+    ],
+    "generated_copies": [
+      {
+        "source": "contracts/json-schema/",
+        "copy": "crates/hyphae-contracts/assets/json-schema/",
+        "mode": "packaged-subset",
+        "target_license": "Apache-2.0"
+      },
+      {
+        "source": "contracts/openapi/",
+        "copy": "crates/hyphae-contracts/assets/openapi/",
+        "mode": "packaged-subset",
+        "target_license": "Apache-2.0"
+      },
+      {
+        "source": "contracts/native-mcp-v2.json",
+        "copy": "crates/hyphae-contracts/assets/native-mcp-v2.json",
+        "mode": "exact-copy",
+        "target_license": "Apache-2.0"
+      }
+    ]
+  },
+  "boundaries": {
+    "trademarks": {
+      "policy": "TRADEMARKS.md",
+      "reserved_asset_paths": [
+        ".github/assets/hyphae-lockup-reversed.svg",
+        ".github/assets/hyphae-lockup.svg"
+      ],
+      "statement": "The licenses selected here do not grant rights in Hyphae names, marks, logos, domains, or visual identity."
+    },
+    "third_party": {
+      "notice": "THIRD_PARTY_NOTICES.md",
+      "exact_paths": [],
+      "statement": "Third-party works retain their original terms; dependency, provenance, and historical-license records describe facts and are never rewritten as first-party grants."
+    }
+  },
+  "effective_transition": {
+    "state": "preflight-only-not-effective",
+    "current_software_license": "AGPL-3.0-only",
+    "current_documentation_license": "CC-BY-SA-4.0",
+    "required_event": "one-atomic-relicensing-commit-after-all-preflight-evidence-is-accepted",
+    "requires_all_preflight_evidence": true
+  },
+  "preflight": {
+    "overall_status": "blocked",
+    "completion_claim": false,
+    "evidence_categories": [
+      {
+        "id": "counsel-approval",
+        "required": true,
+        "status": "open-unclaimed",
+        "evidence": []
+      },
+      {
+        "id": "copyright-relicensing-authority",
+        "required": true,
+        "status": "open-unclaimed",
+        "evidence": []
+      },
+      {
+        "id": "prior-commitments",
+        "required": true,
+        "status": "open-unclaimed",
+        "evidence": []
+      },
+      {
+        "id": "dependency-license-exact-sha",
+        "required": true,
+        "status": "open-unclaimed",
+        "evidence": []
+      },
+      {
+        "id": "specification-classification",
+        "required": true,
+        "status": "accepted-decision",
+        "evidence": [
+          "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
+          "config/relicensing-1.2.0-classification.json"
+        ]
+      },
+      {
+        "id": "contribution-governance",
+        "required": true,
+        "status": "open-unclaimed",
+        "evidence": []
+      }
+    ]
+  }
+}

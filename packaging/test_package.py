@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from package import build_archive, product_version
+from package import INCLUDED_DOCUMENTS, build_archive, product_version
 from finalize_release import (
     create_checksums,
     release_assets,
@@ -502,6 +502,19 @@ class PackageTests(unittest.TestCase):
                 second = build_archive(binary, target, second_dir, 1_700_000_000)
                 self.assertEqual(first.read_bytes(), second.read_bytes())
                 self.assertTrue(first.name.startswith(f"hyphae-{product_version()}-"))
+
+    def test_release_archives_include_notice_and_the_complete_document_set(self) -> None:
+        self.assertEqual(
+            INCLUDED_DOCUMENTS,
+            (
+                "LICENSE",
+                "LICENSE-DOCUMENTATION",
+                "LICENSE-POLICY.md",
+                "NOTICE",
+                "README.md",
+                "THIRD_PARTY_NOTICES.md",
+            ),
+        )
 
     def test_checksum_manifest_is_complete_and_tamper_evident(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hyphae-checksums-") as temporary:

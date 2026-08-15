@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tools.check_license_policy import (
     ROOT,
+    source_files,
     validate_package_manifests,
     validate_repository,
     validate_schema_file,
@@ -38,6 +39,25 @@ class LicensePolicyTests(unittest.TestCase):
             missing.write_text("fn main() {}\n", encoding="utf-8")
             self.assertIsNone(validate_spdx_file(valid))
             self.assertIsNotNone(validate_spdx_file(stale))
+            self.assertIsNotNone(validate_spdx_file(missing))
+
+    def test_shell_source_is_discovered_and_requires_the_agpl_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            valid = tools / "valid.sh"
+            valid.write_text(
+                "#!/usr/bin/env sh\n"
+                "# SPDX-License-Identifier: AGPL-3.0-only\n"
+                "set -eu\n",
+                encoding="utf-8",
+            )
+            missing = tools / "missing.sh"
+            missing.write_text("#!/usr/bin/env sh\nset -eu\n", encoding="utf-8")
+
+            self.assertEqual(source_files(root), [missing, valid])
+            self.assertIsNone(validate_spdx_file(valid))
             self.assertIsNotNone(validate_spdx_file(missing))
 
     def test_schema_validation_requires_the_agpl_marker(self) -> None:
@@ -148,6 +168,17 @@ class LicensePolicyTests(unittest.TestCase):
                     for failure in failures
                 )
             )
+
+    def test_gitignored_generated_website_is_outside_manifest_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            website = root / "website"
+            website.mkdir()
+            (website / "package.json").write_text(
+                '{"name":"generated-site","license":"UNLICENSED"}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_package_manifests(root), [])
 
 
 if __name__ == "__main__":
