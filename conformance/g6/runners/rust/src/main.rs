@@ -961,7 +961,7 @@ fn failure_cases(
     let mut denied_session = ProductSession::new(
         ProductSessionId::new(2).expect("nonzero"),
         ProductPrincipal::new("g6-denied").expect("bounded"),
-        ProductAuthorization::from_permissions([ProductPermission::Admin]),
+        ProductAuthorization::from_permissions([ProductPermission::Observe]),
     );
     let denied = context(&denied_session, 6113);
     cases.push(error_case(
