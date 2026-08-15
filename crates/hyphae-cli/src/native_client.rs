@@ -299,6 +299,7 @@ fn validate_open_api_key_file(
         use std::os::windows::fs::MetadataExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
+        let _ = path_metadata;
         if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || hyphae_native_product::validate_windows_restricted_file(file).is_err()
         {

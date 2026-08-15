@@ -5834,13 +5834,13 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::{
             Foundation::GENERIC_WRITE,
-            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
         };
 
         // An exclusive handle prevents another process from acquiring the
         // inherited ACL before the protected DACL is installed and verified.
         options
-            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
             .share_mode(0);
     }
     #[allow(unused_mut)]
@@ -5897,8 +5897,8 @@ fn apply_windows_restricted_acl(file: &mut File) -> std::io::Result<()> {
     wrappers::SetSecurityInfo(
         file,
         SeObjectType::SE_FILE_OBJECT,
-        SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
-        descriptor.owner(),
+        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        None,
         None,
         descriptor.dacl(),
         None,
