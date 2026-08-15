@@ -56,6 +56,11 @@ class FakeHttpConnection:
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del args, kwargs
         self.path = ""
+        self.sock = None
+        self.auto_open = 1
+
+    def connect(self) -> None:
+        pass
 
     def request(self, method: str, path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del method, kwargs

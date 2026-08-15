@@ -335,6 +335,11 @@ class _HttpConnection:
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del args, kwargs
+        self.sock = None
+        self.auto_open = 1
+
+    def connect(self) -> None:
+        pass
 
     def request(self, method: str, path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         if method != "POST" or path != "/v2/execute":

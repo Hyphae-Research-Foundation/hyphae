@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-
 
 DEFAULT_LIMITS = {
     "max_count": 4096,
@@ -39,7 +39,9 @@ class ProductErrorFields:
 class ProductError(Exception):
     """Stable product rejection with fields equal across transports."""
 
-    def __init__(self, fields: ProductErrorFields, *, status: int | None = None) -> None:
+    def __init__(
+        self, fields: ProductErrorFields, *, status: int | None = None
+    ) -> None:
         self.fields = fields
         self.status = status
         self.code = fields.code
@@ -52,7 +54,11 @@ class ProductError(Exception):
 
 
 _PRODUCT_ERROR_DEFAULTS = {
-    "deadline_exceeded": ("deadline", "same-request", "native product request deadline exceeded"),
+    "deadline_exceeded": (
+        "deadline",
+        "same-request",
+        "native product request deadline exceeded",
+    ),
     "cancelled": ("cancelled", "same-request", "native product request was cancelled"),
 }
 
@@ -61,13 +67,15 @@ def product_error(code: str, request_id: int) -> ProductError:
     """Builds one registered terminal client state as a typed product error."""
 
     category, retry, message = _PRODUCT_ERROR_DEFAULTS[code]
-    return ProductError(ProductErrorFields(
-        code=code,
-        category=category,
-        retry=retry,
-        message=message,
-        request_id=request_id,
-    ))
+    return ProductError(
+        ProductErrorFields(
+            code=code,
+            category=category,
+            retry=retry,
+            message=message,
+            request_id=request_id,
+        )
+    )
 
 
 class ClientError(Exception):
@@ -79,9 +87,21 @@ class CancellationToken:
 
     def __init__(self) -> None:
         self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._next_callback_id = 1
 
     def cancel(self) -> None:
-        self._event.set()
+        with self._lock:
+            if self._event.is_set():
+                return
+            self._event.set()
+            callbacks = tuple(self._callbacks.values())
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
 
     @property
     def cancelled(self) -> bool:
@@ -89,6 +109,28 @@ class CancellationToken:
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)
+
+    def _subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        with self._lock:
+            if self._event.is_set():
+                invoke_now = True
+                callback_id = 0
+            else:
+                invoke_now = False
+                callback_id = self._next_callback_id
+                self._next_callback_id += 1
+                self._callbacks[callback_id] = callback
+        if invoke_now:
+            try:
+                callback()
+            except Exception:
+                pass
+
+        def unsubscribe() -> None:
+            with self._lock:
+                self._callbacks.pop(callback_id, None)
+
+        return unsubscribe
 
 
 @dataclass(frozen=True)
@@ -107,7 +149,11 @@ class RequestOptions:
         request_id = self.request_id
         if request_id is None:
             request_id = time.time_ns() & ((1 << 64) - 1)
-        if isinstance(request_id, bool) or not isinstance(request_id, int) or not 0 < request_id < 1 << 64:
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, int)
+            or not 0 < request_id < 1 << 64
+        ):
             raise ClientError("request_id must be an unsigned nonzero 64-bit integer")
         return request_id
 

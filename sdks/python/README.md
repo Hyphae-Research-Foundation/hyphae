@@ -1,10 +1,11 @@
 # Python SDK
 
-`hyphae-sdk` is the synchronous, bounded Python client for APIs v1 and Native
-v2. It requires Python 3.11 or newer, uses only the standard library at runtime,
-and includes typed generated models plus a `py.typed` marker. The development
-source package version is `1.1.0`; this guide does not claim PyPI publication
-without a separate registry release and receipt.
+`hyphae-sdk` is the bounded Python client for APIs v1 and Native v2. It requires
+Python 3.11 or newer, uses only the standard library at runtime, and includes
+typed generated models plus a `py.typed` marker. Native v2 has source-compatible
+synchronous calls and an async adapter with an owned serial worker. The
+development source package version is `1.1.0`; this guide does not claim PyPI
+publication without a separate registry release and receipt.
 
 The distribution is named `hyphae-sdk` and the import package is
 `hyphae_sdk`. The unrelated `hyphae` distribution on PyPI is not this project.
@@ -124,3 +125,59 @@ The same typed security methods work through
 `security_principal_set_enabled`, `security_custom_role_create`,
 `security_built_in_assignment_create`, `security_custom_assignment_create`,
 and `security_assignment_revoke`.
+
+### Native v2 lifecycle and async use
+
+`HyphaeClient.close()`, `LocalTransport.close()`, and `HttpTransport.close()`
+are idempotent and terminal. They overwrite the SDK-owned mutable copy of a
+credential; they cannot overwrite the caller's original Python `str` or
+temporary immutable header bytes. Prefer a context manager and delete the
+caller's credential reference when it is no longer needed.
+
+`AsyncHyphaeClient` owns exactly one worker thread. Cancellation marks the
+request token, aborts only the matching active transport generation, and waits
+for that worker to stop before propagating `CancelledError`. A queued request
+cannot abort the request ahead of it. Page iterators issue the next request only
+after the current page has been consumed.
+
+```python
+import asyncio
+from hyphae_sdk.v2 import AsyncHyphaeClient
+
+
+async def inspect_security(endpoint: str, api_key: str) -> None:
+    async with AsyncHyphaeClient.local_authenticated(endpoint, api_key) as client:
+        async for page in client.security_principal_pages(limit=100):
+            for principal in page.value["items"]:
+                print(principal["display_name"])
+
+        async with await client.begin_transaction() as transaction:
+            await transaction.stage_sql("insert into jobs values (1, 'ready')")
+            await transaction.stage_structure({
+                "kind": "string_set",
+                "key": {"keyspace": 1, "key": b"job:1"},
+                "value": b"ready",
+            })
+            await transaction.commit()
+
+
+asyncio.run(inspect_security("/var/run/hyphae.sock", api_key))
+```
+
+An async transaction left active by its context rolls back. A cancelled or
+transport-failed commit becomes terminal `outcome_unknown`; inspect
+`transaction_id` when present and resolve it through the transaction-status
+operation rather than issuing rollback or commit again. A local transport abort
+during staging invalidates the session-local handle instead of attempting a
+rollback on a replacement connection.
+
+Local abort destroys that local protocol connection and its session-local
+prepared statements and explicit transaction handles; a later operation
+reconnects. HTTP abort closes only matching client-side sockets while preserving
+the local session identity; terminal HTTP close also clears that identity.
+Native HTTP does not yet expose a remote session-close request, so server-side
+session state remains governed by its configured TTL. CPython does not expose a
+portable way to interrupt DNS before a socket exists; after DNS returns, the
+client fails closed before continuing an already cancelled or expired request.
+Windows named-pipe cancellation uses `CancelSynchronousIo`; release evidence
+still requires the Windows cancellation/reconnect lane.

@@ -7,11 +7,19 @@ from typing import Any, Protocol
 
 from .http import HttpTransport
 from .local import LocalTransport
-from .models import ClientError, RequestOptions, Response
+from .models import CancellationToken, ClientError, RequestOptions, Response
 
 
 class Transport(Protocol):
     def execute(self, operation: str, arguments: dict[str, object], options: RequestOptions) -> Response: ...
+
+
+class AbortableTransport(Transport, Protocol):
+    """Transport whose active operation can be interrupted from another thread."""
+
+    def abort(self, cancellation: CancellationToken | None = None) -> None: ...
+
+    def close(self) -> None: ...
 
 
 class HyphaeClient:
@@ -19,6 +27,7 @@ class HyphaeClient:
 
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
+        self._closed = False
 
     @classmethod
     def local(
@@ -47,14 +56,21 @@ class HyphaeClient:
         return cls(HttpTransport(base_url, **kwargs))
 
     def execute(self, operation: str, arguments: dict[str, object] | None = None, *, options: RequestOptions | None = None) -> Response:
+        if self._closed:
+            raise ClientError("Hyphae client is closed")
         return self._transport.execute(operation, arguments or {}, options or RequestOptions())
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         close = getattr(self._transport, "close", None)
         if close is not None:
             close()
 
     def __enter__(self) -> HyphaeClient:
+        if self._closed:
+            raise ClientError("Hyphae client is closed")
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -372,4 +388,4 @@ def _security_mutation_options(options: RequestOptions) -> RequestOptions:
     return options
 
 
-__all__ = ["HyphaeClient", "Transport"]
+__all__ = ["AbortableTransport", "HyphaeClient", "Transport"]
