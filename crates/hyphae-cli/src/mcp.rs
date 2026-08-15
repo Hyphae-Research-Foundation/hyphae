@@ -8,6 +8,7 @@ use std::{
 };
 
 use hyphae_client::v2::{ClientError, HttpTransport, HyphaeClient, RequestOptions};
+use hyphae_contracts::NATIVE_MCP_V2;
 use hyphae_native_product::{
     MAX_API_KEY_CREDENTIAL_BYTES, ProductError, ProductErrorCode, ProductResponse, SecurityCursor,
     SecurityPrincipalListRequest,
@@ -21,7 +22,7 @@ use crate::{
     response_json,
 };
 
-const MCP_CONTRACT: &str = include_str!("../../../contracts/native-mcp-v2.json");
+const MCP_CONTRACT: &str = NATIVE_MCP_V2;
 const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v1";
 const MCP_PROTOCOL: &str = "2025-11-25";
 const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v1";

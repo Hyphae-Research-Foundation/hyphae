@@ -30,6 +30,9 @@ pub const OPENAPI_V2: &str = include_str!("../assets/openapi/hyphae-v2.yaml");
 /// JSON Schema for the complete Native v2 operation vocabulary.
 pub const NATIVE_SCHEMA_V2: &str = include_str!("../assets/json-schema/native-v2.schema.json");
 
+/// Exact bounded tool contract for the managed Native v2 MCP adapter.
+pub const NATIVE_MCP_V2: &str = include_str!("../assets/native-mcp-v2.json");
+
 /// JSON Schema for Native HTTP v2 Product errors.
 pub const PRODUCT_ERROR_SCHEMA_V2: &str =
     include_str!("../assets/json-schema/product-error-v2.schema.json");
@@ -415,8 +418,8 @@ mod v2_tests {
     use serde_yaml_ng::Value as YamlValue;
 
     use super::{
-        NATIVE_SCHEMA_V2, OPENAPI_V2, PRODUCT_ERROR_SCHEMA_V2, READ_STREAM_SCHEMA_V2,
-        V1_COMPATIBILITY_SCHEMA_V2,
+        NATIVE_MCP_V2, NATIVE_SCHEMA_V2, OPENAPI_V2, PRODUCT_ERROR_SCHEMA_V2,
+        READ_STREAM_SCHEMA_V2, V1_COMPATIBILITY_SCHEMA_V2,
     };
 
     #[test]
@@ -470,6 +473,11 @@ mod v2_tests {
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts");
         if root.is_dir() {
+            assert_eq!(
+                fs::read_to_string(root.join("native-mcp-v2.json"))?,
+                NATIVE_MCP_V2,
+                "native-mcp-v2.json"
+            );
             for (path, packaged) in [
                 ("json-schema/native-v2.schema.json", NATIVE_SCHEMA_V2),
                 (
