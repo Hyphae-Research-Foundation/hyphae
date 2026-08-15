@@ -71,6 +71,20 @@ def _reject_credential_fields(value: Any) -> None:
         raise AssertionError("security response contains credential material")
 
 
+def _fingerprint(value: object) -> str:
+    def encode_bytes(candidate: object) -> dict[str, str]:
+        if isinstance(candidate, bytes):
+            return {"$bytes": candidate.hex()}
+        raise TypeError(f"unsupported fingerprint value: {type(candidate).__name__}")
+
+    return json.dumps(
+        value,
+        default=encode_bytes,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _page_sequence(
     local: HyphaeClient,
     http: HyphaeClient,
@@ -92,7 +106,7 @@ def _page_sequence(
         if not isinstance(items, list) or not items:
             raise AssertionError(f"{operation} returned an empty live page")
         for item in items:
-            fingerprint = json.dumps(item, sort_keys=True, separators=(",", ":"))
+            fingerprint = _fingerprint(item)
             if fingerprint in seen_items:
                 raise AssertionError(f"{operation} repeated an item across pages")
             seen_items.add(fingerprint)
@@ -103,9 +117,7 @@ def _page_sequence(
             if first_cursor is None:
                 raise AssertionError(f"{operation} fixture did not produce a continuation")
             return first_cursor
-        cursor_fingerprint = json.dumps(
-            next_cursor, sort_keys=True, separators=(",", ":")
-        )
+        cursor_fingerprint = _fingerprint(next_cursor)
         if cursor_fingerprint in seen_cursors:
             raise AssertionError(f"{operation} cursor did not advance")
         seen_cursors.add(cursor_fingerprint)
