@@ -51,11 +51,12 @@ dependency, performance and replacement-cost review.
 | `unicode-normalization`, `unicode-casefold` | analyzer primitives | allowed primitive |
 | `tokio` | native daemon scheduling and asynchronous local IPC | allowed outside embedded hot path |
 | `futures-channel` | one-shot completion handoff from the sole product owner to asynchronous transport adapters | allowed bounded async primitive |
+| `subtle` | constant-time comparison of durable API-key verifier material | allowed cryptographic primitive |
 | `interprocess` | safe UDS and Windows named-pipe local transport, peer credentials and endpoint ACLs | allowed operating-system IPC wrapper |
 | `widestring` | safe UTF-16 security-descriptor construction for the Windows named-pipe ACL | allowed Windows encoding primitive |
 | `recvmsg` | target-conditioned Windows named-pipe message primitive used by `interprocess` | allowed operating-system IPC wrapper |
 | `doctest-file` | transitive documentation macro used by `interprocess` | allowed build primitive |
-| `bytes`, `futures-core`, `mio`, `socket2`, `signal-hook-registry`, `errno`, `pin-project-lite` | transitive asynchronous and operating-system support for Tokio and IPC | allowed runtime primitives |
+| `bytes`, `futures-core`, `mio`, `log`, `socket2`, `signal-hook-registry`, `errno`, `pin-project-lite` | transitive asynchronous, diagnostic and operating-system support for Tokio and IPC | allowed runtime primitives |
 | `windows-sys`, `windows-link`, `wasi` | target-conditioned operating-system bindings for IPC and async I/O | allowed platform bindings |
 | `r-efi`, `wasip2`, `wit-bindgen` | target-conditioned backends in the `getrandom` entropy closure | allowed platform bindings |
 | `thiserror` | typed errors | allowed primitive |
@@ -84,7 +85,7 @@ The native product daemon target path currently consists of:
 The exact locked normal/build metadata closure is rooted at
 `hyphae-native-daemon`, the local native product entry point. This root includes
 the protocol, product facade, runtime, and every native engine package: 14
-Hyphae-owned packages and 55 external package identities (54 package names) as
+Hyphae-owned packages and 57 external package identities (56 package names) as
 of 2026-08-12. The two identities for `syn` are 2.0.119 on the Tokio macro
 path and 3.0.2 on the serde/thiserror derive paths. Target-conditioned
 dependencies remain in scope even when they are not compiled on the audit

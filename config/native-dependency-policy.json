@@ -210,6 +210,14 @@
       "rationale": "Operating-system bindings used by CPU detection, entropy, Tokio, Mio, interprocess, socket, signal, and error primitives."
     },
     {
+      "name": "log",
+      "version": "0.4.33",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "diagnostic facade primitive",
+      "rationale": "Target-conditioned diagnostic facade selected transitively by Mio; it supplies no storage, query, or logging backend semantics."
+    },
+    {
       "name": "memchr",
       "version": "2.8.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -344,6 +352,14 @@
       "license": "MIT OR Apache-2.0",
       "category": "operating-system socket primitive",
       "rationale": "Cross-platform socket configuration used transitively by Tokio's local I/O runtime."
+    },
+    {
+      "name": "subtle",
+      "version": "2.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "BSD-3-Clause",
+      "category": "constant-time comparison primitive",
+      "rationale": "Constant-time comparison for durable API-key verifier material without supplying credential storage, hashing, or authorization policy."
     },
     {
       "name": "syn",
