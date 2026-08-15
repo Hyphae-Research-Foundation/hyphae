@@ -47,7 +47,7 @@ fail closed. Native access-control v1 defines:
 | `backup.verify` | Verify an existing backup without activation | instance |
 | `catalog.read` | List, resolve, and describe catalog objects | instance, subtree, object |
 | `catalog.write` | Create or mutate catalog definitions | instance, subtree, object |
-| `credential.self_manage` | Create, rotate, or revoke the caller's narrowed keys | instance |
+| `credential.self_manage` | Create, abort pending creation/rotation, rotate, or revoke the caller's narrowed keys | instance |
 | `data.read` | Read SQL and structure data and transaction outcomes | instance, subtree, object |
 | `data.write` | Mutate SQL, structures, search documents, and transactions | instance, subtree, object |
 | `discover` | Read versions and bounded capabilities | instance |
@@ -150,14 +150,25 @@ all verifier bytes in constant time.
 Creation chooses fresh key/secret bytes, validates requested roles and ceilings
 against the principal's current assignments, creates a new restricted output
 file with exclusive creation, and durably publishes the verifier and audit
-event. The secret is returned only through that output file.
+event. The secret is returned only through that output file. If restricted
+output or activation is interrupted after the pending verifier commit, the
+actor can abort the unique pending issue by principal and label before retrying.
+When the per-principal key limit would otherwise block issuance, Hyphae may
+replace only the oldest unlinked revoked or expired record and includes that
+retired public key ID in the issue audit event; live and pending keys are never
+evicted.
 
 ### Rotate
 
 Rotation creates one successor. An optional finite overlap keeps exactly the
 immediate predecessor valid until the earlier of its overlap deadline,
 revocation, expiry, principal disablement, or role removal. A key cannot have
-multiple live successors.
+multiple live successors. An interrupted inactive successor can be aborted by
+its known predecessor ID; abort is durable, audited, and never applies to an
+active successor. Zero-overlap activation removes the retired predecessor;
+later rotations prune only fully retired ancestors and include every pruned
+public key ID in the rotation audit event. A new successor is rejected while
+an older predecessor remains inside a live overlap window.
 
 ### Revoke and expire
 
@@ -271,6 +282,15 @@ Native access-control v1 fixes these positive defaults:
 | verifier candidates per authentication request | 1 |
 | authorization-cache entries | 4,096 |
 
+The unique Owner principal can hold at most 63 ordinary key records. The 64th
+slot is reserved exclusively for the inactive replacement used by offline
+owner recovery, so normal issuance or rotation cannot exhaust the last-resort
+recovery path. Recovery activation atomically retains only the replacement and
+records every retired Owner key ID in the activation event. A catalog with 64
+active Owner keys is rejected as noncanonical; this invariant predates the
+first stable release of the v1 access-control catalog, so no deployed stable
+format is silently reinterpreted.
+
 The key ID is indexed before verifier work, so authentication never scans key
 records. Implementations may expose lower configured limits but cannot silently
 raise these v1 defaults or turn any limit into an unbounded collection.
@@ -293,7 +313,8 @@ least-privilege invariants. Implementation closure additionally requires:
 - parser/binder scope tests across SQL and all three engines;
 - long-lived-session revocation and expiry tests;
 - prepared and explicit-transaction stale-authority tests;
-- crash injection for create, rotate, revoke, assignment, recovery, and audit;
+- crash injection for create, pending-abort, rotate, revoke, assignment,
+  recovery, and audit;
 - backup/restore and legacy-bearer migration fixtures;
 - cross-surface embedded/UDS/named-pipe/HTTP/CLI/SDK/MCP parity;
 - secret canaries across errors, logs, telemetry, TUI, artifacts, and receipts;

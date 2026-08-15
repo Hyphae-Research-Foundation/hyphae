@@ -7,6 +7,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::Path,
+    sync::{Arc, atomic::Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -256,6 +257,7 @@ pub struct AuthenticatedAuthority {
     authorization: ProductAuthorization,
     authorization_epoch: AuthorizationEpoch,
     directory_lineage: [u8; 24],
+    valid_until_micros: Option<i64>,
     effective_roles: Box<[BuiltInRole]>,
     effective_custom_roles: Box<[SecurityId]>,
     scope_ceiling: Box<[ProductScope]>,
@@ -291,6 +293,11 @@ impl AuthenticatedAuthority {
     /// Returns the native directory lineage that issued this capability.
     pub const fn directory_lineage(&self) -> [u8; 24] {
         self.directory_lineage
+    }
+
+    /// Returns the earliest expiry or rotation-overlap deadline, if finite.
+    pub const fn valid_until_micros(&self) -> Option<i64> {
+        self.valid_until_micros
     }
 
     /// Returns effective immutable built-in roles.
@@ -360,6 +367,10 @@ pub enum SecurityAuditAction {
     IssueKey,
     /// API-key rotation.
     RotateKey,
+    /// Explicit cancellation of one inactive rotation successor.
+    AbortKeyRotation,
+    /// Explicit cancellation of one inactive issued key.
+    AbortKeyIssue,
     /// API-key revocation.
     RevokeKey,
     /// Offline owner recovery.
@@ -382,6 +393,8 @@ impl SecurityAuditAction {
             Self::RevokeKey => 8,
             Self::RecoverOwner => 9,
             Self::MigrateLegacyBearer => 10,
+            Self::AbortKeyRotation => 11,
+            Self::AbortKeyIssue => 12,
         }
     }
 
@@ -398,6 +411,8 @@ impl SecurityAuditAction {
             8 => Some(Self::RevokeKey),
             9 => Some(Self::RecoverOwner),
             10 => Some(Self::MigrateLegacyBearer),
+            11 => Some(Self::AbortKeyRotation),
+            12 => Some(Self::AbortKeyIssue),
             _ => None,
         }
     }
@@ -500,6 +515,13 @@ struct SecurityAuditAppend {
     event: SecurityAuditEvent,
     evicted: Option<SecurityAuditIndexEntry>,
 }
+
+type OwnerRecoveryStart = (
+    SecurityId,
+    IssuedApiKey,
+    AuthorizationEpoch,
+    Box<[ApiKeyId]>,
+);
 
 impl SecurityAuditDraft {
     fn offline(
@@ -963,6 +985,35 @@ impl AccessControlCatalog {
         created_at_micros: i64,
         expires_at_micros: Option<i64>,
     ) -> Result<(IssuedApiKey, AuthorizationEpoch), AccessCatalogError> {
+        self.begin_key_issue_with_roles_and_pruning(
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            created_at_micros,
+            expires_at_micros,
+        )
+        .map(|(issued, epoch, _)| (issued, epoch))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fail-atomic key issue keeps validation, retirement, and insertion ordered"
+    )]
+    fn begin_key_issue_with_roles_and_pruning(
+        &mut self,
+        principal_id: SecurityId,
+        label: &str,
+        roles: impl IntoIterator<Item = BuiltInRole>,
+        custom_roles: impl IntoIterator<Item = SecurityId>,
+        permission_ceiling: ProductAuthorization,
+        scope_ceiling: impl IntoIterator<Item = ProductScope>,
+        created_at_micros: i64,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(IssuedApiKey, AuthorizationEpoch, Box<[ApiKeyId]>), AccessCatalogError> {
         validate_display_name(label)?;
         if !self.principals.contains_key(&principal_id) {
             return Err(AccessCatalogError::NotFound);
@@ -970,14 +1021,28 @@ impl AccessControlCatalog {
         if expires_at_micros.is_some_and(|expiry| expiry <= created_at_micros) {
             return Err(AccessCatalogError::Conflict);
         }
+        if self.keys.values().any(|key| {
+            key.principal_id == principal_id
+                && key.label.as_ref() == label
+                && !key.active
+                && !key.revoked
+                && key.predecessor_id.is_none()
+                && key.successor_id.is_none()
+                && key.rotation_overlap_micros.is_none()
+        }) {
+            return Err(AccessCatalogError::Conflict);
+        }
         let current_keys = self
             .keys
             .values()
             .filter(|key| key.principal_id == principal_id)
             .count();
-        if current_keys >= AccessControlLimits::V1.keys_per_principal {
-            return Err(AccessCatalogError::LimitExceeded);
-        }
+        let retired_keys = self.retired_unlinked_keys_for_capacity(
+            principal_id,
+            created_at_micros,
+            current_keys,
+            self.ordinary_key_limit(principal_id),
+        )?;
         let roles: BTreeSet<_> = roles.into_iter().collect();
         let custom_roles: BTreeSet<_> = custom_roles.into_iter().collect();
         let scope_ceiling: BTreeSet<_> = scope_ceiling.into_iter().collect();
@@ -1013,6 +1078,9 @@ impl AccessControlCatalog {
             return Err(AccessCatalogError::Conflict);
         }
         let epoch = self.next_epoch()?;
+        for (_, retired_key_id) in &retired_keys {
+            self.keys.remove(retired_key_id);
+        }
         self.keys.insert(
             verifier.id(),
             ApiKeyRecord {
@@ -1042,7 +1110,56 @@ impl AccessControlCatalog {
             },
         );
         self.epoch = epoch;
-        Ok((issued, epoch))
+        Ok((
+            issued,
+            epoch,
+            retired_keys
+                .into_iter()
+                .map(|(_, key_id)| key_id)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
+    }
+
+    fn retired_unlinked_keys_for_capacity(
+        &self,
+        principal_id: SecurityId,
+        now_micros: i64,
+        current_keys: usize,
+        key_limit: usize,
+    ) -> Result<Vec<(i64, ApiKeyId)>, AccessCatalogError> {
+        let required = current_keys.saturating_add(1).saturating_sub(key_limit);
+        let mut retired: Vec<_> = self
+            .keys
+            .values()
+            .filter(|key| {
+                key.principal_id == principal_id
+                    && key.predecessor_id.is_none()
+                    && key.successor_id.is_none()
+                    && (key.revoked
+                        || key
+                            .expires_at_micros
+                            .is_some_and(|deadline| now_micros >= deadline))
+            })
+            .map(|key| (key.created_at_micros, key.id))
+            .collect();
+        retired.sort_unstable();
+        if retired.len() < required {
+            return Err(AccessCatalogError::LimitExceeded);
+        }
+        retired.truncate(required);
+        Ok(retired)
+    }
+
+    fn ordinary_key_limit(&self, principal_id: SecurityId) -> usize {
+        let is_owner = self.assignments.values().any(|assignment| {
+            assignment.principal_id == principal_id
+                && assignment.role == BuiltInRole::Owner
+                && assignment.scope == ProductScope::Instance
+        });
+        AccessControlLimits::V1
+            .keys_per_principal
+            .saturating_sub(usize::from(is_owner))
     }
 
     /// Returns the current durable authorization generation.
@@ -1198,6 +1315,10 @@ impl AccessControlCatalog {
         }
         let product_principal = ProductPrincipal::new(principal.id.to_string())
             .ok_or(AccessCatalogError::CorruptCatalog)?;
+        let valid_until_micros = [key.expires_at_micros, key.overlap_until_micros]
+            .into_iter()
+            .flatten()
+            .min();
         Ok(AuthenticatedAuthority {
             principal_id: principal.id,
             key_id,
@@ -1205,6 +1326,7 @@ impl AccessControlCatalog {
             authorization,
             authorization_epoch: self.epoch,
             directory_lineage,
+            valid_until_micros,
             effective_roles: effective_roles
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -1225,14 +1347,15 @@ impl AccessControlCatalog {
     /// Returns an error when the key is absent, already revoked, or the epoch
     /// cannot advance.
     pub fn revoke_key(&mut self, id: ApiKeyId) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        let current = self.keys.get(&id).ok_or(AccessCatalogError::NotFound)?;
+        if !current.active || current.revoked {
+            return Err(AccessCatalogError::Conflict);
+        }
         let next_epoch = self
             .epoch
             .checked_next()
             .ok_or(AccessCatalogError::LimitExceeded)?;
         let key = self.keys.get_mut(&id).ok_or(AccessCatalogError::NotFound)?;
-        if key.revoked {
-            return Err(AccessCatalogError::Conflict);
-        }
         key.revoked = true;
         self.epoch = next_epoch;
         Ok(next_epoch)
@@ -1282,6 +1405,9 @@ impl AccessControlCatalog {
         if successor.active
             || successor.revoked
             || activated_at_micros < successor.created_at_micros
+            || successor
+                .expires_at_micros
+                .is_some_and(|expiry| expiry <= activated_at_micros)
         {
             return Err(AccessCatalogError::Conflict);
         }
@@ -1307,19 +1433,28 @@ impl AccessControlCatalog {
             return Err(AccessCatalogError::CorruptCatalog);
         }
         let next_epoch = self.next_epoch()?;
-        let successor = self
-            .keys
-            .get_mut(&id)
-            .ok_or(AccessCatalogError::CorruptCatalog)?;
-        successor.active = true;
-        successor.published_epoch = next_epoch;
-        let predecessor = self
-            .keys
-            .get_mut(&predecessor_id)
-            .ok_or(AccessCatalogError::CorruptCatalog)?;
-        predecessor.overlap_until_micros = Some(overlap_until_micros);
         if overlap_micros == 0 {
-            predecessor.revoked = true;
+            let successor = self
+                .keys
+                .get_mut(&id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            successor.active = true;
+            successor.published_epoch = next_epoch;
+            successor.predecessor_id = None;
+            successor.rotation_overlap_micros = None;
+            self.keys.remove(&predecessor_id);
+        } else {
+            let successor = self
+                .keys
+                .get_mut(&id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            successor.active = true;
+            successor.published_epoch = next_epoch;
+            let predecessor = self
+                .keys
+                .get_mut(&predecessor_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            predecessor.overlap_until_micros = Some(overlap_until_micros);
         }
         self.epoch = next_epoch;
         Ok((next_epoch, overlap_until_micros))
@@ -1339,6 +1474,25 @@ impl AccessControlCatalog {
         created_at_micros: i64,
         expires_at_micros: Option<i64>,
     ) -> Result<(IssuedApiKey, AuthorizationEpoch), AccessCatalogError> {
+        self.begin_key_rotation_with_pruning(
+            predecessor_id,
+            label,
+            overlap_seconds,
+            created_at_micros,
+            expires_at_micros,
+        )
+        .map(|(issued, epoch, _)| (issued, epoch))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_key_rotation_with_pruning(
+        &mut self,
+        predecessor_id: ApiKeyId,
+        label: &str,
+        overlap_seconds: u64,
+        created_at_micros: i64,
+        expires_at_micros: Option<i64>,
+    ) -> Result<(IssuedApiKey, AuthorizationEpoch, Box<[ApiKeyId]>), AccessCatalogError> {
         validate_display_name(label)?;
         if overlap_seconds > AccessControlLimits::V1.maximum_rotation_overlap_seconds
             || expires_at_micros.is_some_and(|expiry| expiry <= created_at_micros)
@@ -1351,12 +1505,15 @@ impl AccessControlCatalog {
             .filter(|key| key.active && !key.revoked && key.successor_id.is_none())
             .cloned()
             .ok_or(AccessCatalogError::Conflict)?;
+        let retired_ancestors =
+            self.retired_rotation_ancestors(predecessor_id, created_at_micros)?;
         let key_count = self
             .keys
             .values()
             .filter(|key| key.principal_id == predecessor.principal_id)
-            .count();
-        if key_count >= AccessControlLimits::V1.keys_per_principal {
+            .count()
+            .saturating_sub(retired_ancestors.len());
+        if key_count >= self.ordinary_key_limit(predecessor.principal_id) {
             return Err(AccessCatalogError::LimitExceeded);
         }
         let overlap_micros = overlap_seconds
@@ -1369,6 +1526,17 @@ impl AccessControlCatalog {
         }
         let epoch = self.next_epoch()?;
         let successor_id = verifier.id();
+        for retired_id in &retired_ancestors {
+            self.keys.remove(retired_id);
+        }
+        if !retired_ancestors.is_empty() {
+            let current = self
+                .keys
+                .get_mut(&predecessor_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            current.predecessor_id = None;
+            current.rotation_overlap_micros = None;
+        }
         self.keys.insert(
             successor_id,
             ApiKeyRecord {
@@ -1397,7 +1565,124 @@ impl AccessControlCatalog {
             .ok_or(AccessCatalogError::CorruptCatalog)?;
         predecessor.successor_id = Some(successor_id);
         self.epoch = epoch;
-        Ok((issued, epoch))
+        Ok((issued, epoch, retired_ancestors.into_boxed_slice()))
+    }
+
+    fn retired_rotation_ancestors(
+        &self,
+        key_id: ApiKeyId,
+        now_micros: i64,
+    ) -> Result<Vec<ApiKeyId>, AccessCatalogError> {
+        let mut child_id = key_id;
+        let mut cursor = self
+            .keys
+            .get(&key_id)
+            .ok_or(AccessCatalogError::NotFound)?
+            .predecessor_id;
+        let mut retired = Vec::new();
+        let mut visited = BTreeSet::new();
+        while let Some(ancestor_id) = cursor {
+            if !visited.insert(ancestor_id) {
+                return Err(AccessCatalogError::CorruptCatalog);
+            }
+            let ancestor = self
+                .keys
+                .get(&ancestor_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            if ancestor.successor_id != Some(child_id) {
+                return Err(AccessCatalogError::CorruptCatalog);
+            }
+            let is_retired = ancestor.revoked
+                || ancestor
+                    .expires_at_micros
+                    .is_some_and(|deadline| now_micros >= deadline)
+                || ancestor
+                    .overlap_until_micros
+                    .is_some_and(|deadline| now_micros >= deadline);
+            if !is_retired {
+                return Err(AccessCatalogError::Conflict);
+            }
+            retired.push(ancestor_id);
+            child_id = ancestor_id;
+            cursor = ancestor.predecessor_id;
+        }
+        Ok(retired)
+    }
+
+    /// Aborts the inactive successor linked from one predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns conflict unless `successor_id` is the exact inactive pending
+    /// successor linked from one live predecessor.
+    pub fn abort_key_rotation(
+        &mut self,
+        successor_id: ApiKeyId,
+    ) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        let successor = self
+            .keys
+            .get(&successor_id)
+            .filter(|key| !key.active && !key.revoked)
+            .cloned()
+            .ok_or(AccessCatalogError::Conflict)?;
+        let predecessor_id = successor
+            .predecessor_id
+            .ok_or(AccessCatalogError::InvalidRequest)?;
+        let predecessor = self
+            .keys
+            .get(&predecessor_id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?;
+        if predecessor.successor_id != Some(successor_id) || successor.successor_id.is_some() {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let next_epoch = self.next_epoch()?;
+        self.keys.remove(&successor_id);
+        self.keys
+            .get_mut(&predecessor_id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?
+            .successor_id = None;
+        self.epoch = next_epoch;
+        Ok(next_epoch)
+    }
+
+    fn pending_key_issue(
+        &self,
+        principal_id: SecurityId,
+        label: &str,
+    ) -> Result<&ApiKeyRecord, AccessCatalogError> {
+        validate_display_name(label)?;
+        let mut matches = self.keys.values().filter(|key| {
+            key.principal_id == principal_id
+                && key.label.as_ref() == label
+                && !key.active
+                && !key.revoked
+                && key.predecessor_id.is_none()
+                && key.successor_id.is_none()
+                && key.rotation_overlap_micros.is_none()
+        });
+        let pending = matches.next().ok_or(AccessCatalogError::NotFound)?;
+        if matches.next().is_some() {
+            return Err(AccessCatalogError::Conflict);
+        }
+        Ok(pending)
+    }
+
+    /// Aborts one uniquely identified inactive issued key.
+    ///
+    /// # Errors
+    ///
+    /// Returns not-found or conflict unless `principal_id` and `label`
+    /// identify exactly one inactive, non-rotation key.
+    pub fn abort_pending_key_issue(
+        &mut self,
+        principal_id: SecurityId,
+        label: &str,
+    ) -> Result<(ApiKeyId, AuthorizationEpoch), AccessCatalogError> {
+        let pending_key_id = self.pending_key_issue(principal_id, label)?.id;
+        let next_epoch = self.next_epoch()?;
+        self.keys.remove(&pending_key_id);
+        self.epoch = next_epoch;
+        Ok((pending_key_id, next_epoch))
     }
 
     /// Begins one replacement owner key without disabling current recovery.
@@ -1410,6 +1695,15 @@ impl AccessControlCatalog {
         label: &str,
         created_at_micros: i64,
     ) -> Result<(SecurityId, IssuedApiKey, AuthorizationEpoch), AccessCatalogError> {
+        self.begin_owner_recovery_with_retired(label, created_at_micros)
+            .map(|(principal_id, issued, epoch, _)| (principal_id, issued, epoch))
+    }
+
+    fn begin_owner_recovery_with_retired(
+        &mut self,
+        label: &str,
+        created_at_micros: i64,
+    ) -> Result<OwnerRecoveryStart, AccessCatalogError> {
         validate_display_name(label)?;
         let owner_principals: BTreeSet<_> = self
             .assignments
@@ -1437,18 +1731,12 @@ impl AccessControlCatalog {
             .map(|key| (key.created_at_micros, key.id))
             .collect();
         removable.sort_unstable();
-        let mut key_count = self
+        let key_count = self
             .keys
             .values()
             .filter(|key| key.principal_id == owner_principal)
-            .count();
-        for (_, key_id) in removable {
-            if key_count < AccessControlLimits::V1.keys_per_principal {
-                break;
-            }
-            self.keys.remove(&key_id);
-            key_count -= 1;
-        }
+            .count()
+            .saturating_sub(removable.len());
         if key_count >= AccessControlLimits::V1.keys_per_principal {
             return Err(AccessCatalogError::LimitExceeded);
         }
@@ -1458,12 +1746,8 @@ impl AccessControlCatalog {
             return Err(AccessCatalogError::Conflict);
         }
         let epoch = self.next_epoch()?;
-        for key in self
-            .keys
-            .values_mut()
-            .filter(|key| key.principal_id == owner_principal && !key.active)
-        {
-            key.revoked = true;
+        for (_, retired_key_id) in &removable {
+            self.keys.remove(retired_key_id);
         }
         self.keys.insert(
             verifier.id(),
@@ -1488,7 +1772,16 @@ impl AccessControlCatalog {
             },
         );
         self.epoch = epoch;
-        Ok((owner_principal, issued, epoch))
+        Ok((
+            owner_principal,
+            issued,
+            epoch,
+            removable
+                .into_iter()
+                .map(|(_, key_id)| key_id)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ))
     }
 
     /// Atomically activates one recovery key and revokes prior owner keys.
@@ -1500,6 +1793,14 @@ impl AccessControlCatalog {
         &mut self,
         id: ApiKeyId,
     ) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        self.activate_recovered_owner_key_with_retired(id)
+            .map(|(epoch, _)| epoch)
+    }
+
+    fn activate_recovered_owner_key_with_retired(
+        &mut self,
+        id: ApiKeyId,
+    ) -> Result<(AuthorizationEpoch, Box<[ApiKeyId]>), AccessCatalogError> {
         let replacement = self.keys.get(&id).ok_or(AccessCatalogError::NotFound)?;
         if replacement.active
             || replacement.revoked
@@ -1522,20 +1823,23 @@ impl AccessControlCatalog {
             .get_mut(&principal_id)
             .ok_or(AccessCatalogError::CorruptCatalog)?
             .enabled = true;
-        for key in self
+        let retired: Vec<_> = self
             .keys
-            .values_mut()
-            .filter(|key| key.principal_id == principal_id)
-        {
-            if key.id == id {
-                key.active = true;
-                key.published_epoch = epoch;
-            } else {
-                key.revoked = true;
-            }
+            .values()
+            .filter(|key| key.principal_id == principal_id && key.id != id)
+            .map(|key| key.id)
+            .collect();
+        for retired_id in &retired {
+            self.keys.remove(retired_id);
         }
+        let replacement = self
+            .keys
+            .get_mut(&id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?;
+        replacement.active = true;
+        replacement.published_epoch = epoch;
         self.epoch = epoch;
-        Ok(epoch)
+        Ok((epoch, retired.into_boxed_slice()))
     }
 
     /// Returns one bounded page after an exclusive retained-event cursor.
@@ -1918,6 +2222,7 @@ impl AccessControlCatalog {
                 return Err(AccessCatalogError::CorruptCatalog);
             }
         }
+        self.validate_rotation_acyclic()?;
         let owner_assignments: Vec<_> = self
             .assignments
             .values()
@@ -1932,6 +2237,30 @@ impl AccessControlCatalog {
                     .is_some_and(SecurityPrincipalRecord::enabled))
         {
             return Err(AccessCatalogError::CorruptCatalog);
+        }
+        if let Some(owner) = owner_assignments.first() {
+            let owner_keys: Vec<_> = self
+                .keys
+                .values()
+                .filter(|key| key.principal_id == owner.principal_id)
+                .collect();
+            if owner_keys.len() == limits.keys_per_principal {
+                let pending_recovery_keys = owner_keys
+                    .iter()
+                    .filter(|key| {
+                        !key.active
+                            && !key.revoked
+                            && key.roles.as_ref() == [BuiltInRole::Owner]
+                            && key.permission_ceiling == ProductAuthorization::ALL
+                            && key.scope_ceiling.as_ref() == [ProductScope::Instance]
+                            && key.predecessor_id.is_none()
+                            && key.successor_id.is_none()
+                    })
+                    .count();
+                if pending_recovery_keys != 1 {
+                    return Err(AccessCatalogError::CorruptCatalog);
+                }
+            }
         }
         if self
             .audit_index
@@ -1960,6 +2289,24 @@ impl AccessControlCatalog {
             }
         } else if self.epoch == AuthorizationEpoch::UNMANAGED {
             return Err(AccessCatalogError::CorruptCatalog);
+        }
+        Ok(())
+    }
+
+    fn validate_rotation_acyclic(&self) -> Result<(), AccessCatalogError> {
+        for start in self.keys.keys().copied() {
+            let mut visited = BTreeSet::new();
+            let mut cursor = Some(start);
+            while let Some(key_id) = cursor {
+                if !visited.insert(key_id) {
+                    return Err(AccessCatalogError::CorruptCatalog);
+                }
+                cursor = self
+                    .keys
+                    .get(&key_id)
+                    .ok_or(AccessCatalogError::CorruptCatalog)?
+                    .predecessor_id;
+            }
         }
         Ok(())
     }
@@ -2052,12 +2399,13 @@ impl NativeProduct {
             None => AccessControlCatalog::empty(),
         };
         let lineage = snapshot.identity().directory_lineage;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         require_current_actor(
             &catalog,
             actor,
             ProductPermission::AuditRead,
             lineage,
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let (indices, next_cursor) = catalog
             .security_audit_indices(cursor, limit)
@@ -2089,12 +2437,68 @@ impl NativeProduct {
     pub fn authenticate_api_key(
         &self,
         candidate: &str,
-        logical_time_micros: i64,
+        _logical_time_micros: i64,
+    ) -> Result<AuthenticatedAuthority, ProductError> {
+        self.authenticate_api_key_at(candidate, self.trusted_authorization_time()?)
+    }
+
+    fn authenticate_api_key_at(
+        &self,
+        candidate: &str,
+        authorization_time_micros: i64,
     ) -> Result<AuthenticatedAuthority, ProductError> {
         let directory_lineage = self.database.directory_identity().lineage().encode();
         self.load_access_control_catalog()?
-            .authenticate_for_lineage(candidate, logical_time_micros, directory_lineage)
+            .authenticate_for_lineage(candidate, authorization_time_micros, directory_lineage)
             .map_err(map_catalog_error)
+    }
+
+    pub(crate) fn authenticate_api_key_trusted(
+        &self,
+        candidate: &str,
+    ) -> Result<AuthenticatedAuthority, ProductError> {
+        self.authenticate_api_key_at(candidate, self.trusted_authorization_time()?)
+    }
+
+    pub(crate) fn revalidate_authenticated_authority(
+        &self,
+        authority: Arc<AuthenticatedAuthority>,
+    ) -> Result<Arc<AuthenticatedAuthority>, ProductError> {
+        if authority.directory_lineage != self.database.directory_identity().lineage().encode() {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let now = self.trusted_authorization_time()?;
+        if self.access_control_epoch_known.load(Ordering::Acquire)
+            && self.access_control_epoch.load(Ordering::Acquire)
+                == authority.authorization_epoch.get()
+            && authority
+                .valid_until_micros
+                .is_none_or(|deadline| now < deadline)
+        {
+            return Ok(authority);
+        }
+        let catalog = self.load_access_control_catalog()?;
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
+        current_actor(
+            &catalog,
+            &authority,
+            self.database.directory_identity().lineage().encode(),
+            now,
+        )
+        .map(Arc::new)
+    }
+
+    fn trusted_authorization_time(&self) -> Result<i64, ProductError> {
+        let sampled = trusted_wall_time_micros()?;
+        Ok(self
+            .authorization_time_watermark
+            .fetch_max(sampled, Ordering::AcqRel)
+            .max(sampled))
     }
 
     /// Creates one durable principal under `security.manage` authority.
@@ -2110,12 +2514,13 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
             &catalog,
             actor,
             ProductPermission::SecurityManage,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let (principal_id, authorization_epoch) = catalog
             .create_principal(display_name)
@@ -2151,12 +2556,13 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
             &catalog,
             actor,
             ProductPermission::SecurityManage,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         if role == BuiltInRole::Owner
             && !actor
@@ -2201,12 +2607,13 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<CustomRoleMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
             &catalog,
             actor,
             ProductPermission::SecurityManage,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let (role_id, authorization_epoch) = catalog
             .create_custom_role(display_name, grants)
@@ -2239,12 +2646,13 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
             &catalog,
             actor,
             ProductPermission::SecurityManage,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let (assignment_id, authorization_epoch) = catalog
             .assign_custom_role(principal_id, role_id)
@@ -2325,11 +2733,12 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<ApiKeyIssueReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = current_actor(
             &catalog,
             actor,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let roles: BTreeSet<_> = roles.into_iter().collect();
         let custom_roles: BTreeSet<_> = custom_roles.into_iter().collect();
@@ -2342,28 +2751,27 @@ impl NativeProduct {
             permission_ceiling,
             &scope_ceiling,
         )?;
-        let (issued, _pending_epoch) = catalog
-            .begin_key_issue_with_roles(
+        let (issued, _pending_epoch, retired_keys) = catalog
+            .begin_key_issue_with_roles_and_pruning(
                 principal_id,
                 label,
                 roles,
                 custom_roles,
                 permission_ceiling,
                 scope_ceiling,
-                logical_time_micros,
+                authorization_time_micros,
                 expires_at_micros,
             )
             .map_err(map_catalog_error)?;
         let output_path = output_path.as_ref();
         let mut output = create_restricted_output(output_path)?;
-        let pending_audit = SecurityAuditDraft::actor(
-            &actor,
-            SecurityAuditAction::IssueKey,
-            [
-                SecurityAuditTarget::Principal(principal_id),
-                SecurityAuditTarget::Key(issued.id()),
-            ],
-        );
+        let mut issue_targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(issued.id()),
+        ];
+        issue_targets.extend(retired_keys.iter().copied().map(SecurityAuditTarget::Key));
+        let pending_audit =
+            SecurityAuditDraft::actor(&actor, SecurityAuditAction::IssueKey, issue_targets);
         if let Err(error) =
             self.commit_access_control_catalog(&mut catalog, logical_time_micros, pending_audit)
         {
@@ -2416,16 +2824,27 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<ApiKeyRotationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = current_actor(
             &catalog,
             actor,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let predecessor_principal = catalog
             .key(predecessor_key_id)
             .map(ApiKeyRecord::principal_id)
             .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        let predecessor_is_owner = catalog
+            .key(predecessor_key_id)
+            .is_some_and(|key| key.roles.contains(&BuiltInRole::Owner));
+        if predecessor_is_owner
+            && !authority_allows_instance(&actor, ProductPermission::OwnershipManage)
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
         let allowed = if predecessor_principal == actor.principal_id {
             authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
                 || authority_allows_instance(&actor, ProductPermission::SecurityManage)
@@ -2437,25 +2856,29 @@ impl NativeProduct {
                 ProductErrorCode::AuthorizationDenied,
             ));
         }
-        let (issued, _pending_epoch) = catalog
-            .begin_key_rotation(
+        let (issued, _pending_epoch, retired_ancestors) = catalog
+            .begin_key_rotation_with_pruning(
                 predecessor_key_id,
                 label,
                 overlap_seconds,
-                logical_time_micros,
+                authorization_time_micros,
                 expires_at_micros,
             )
             .map_err(map_catalog_error)?;
         let output_path = output_path.as_ref();
         let mut output = create_restricted_output(output_path)?;
-        let pending_audit = SecurityAuditDraft::actor(
-            &actor,
-            SecurityAuditAction::RotateKey,
-            [
-                SecurityAuditTarget::Key(predecessor_key_id),
-                SecurityAuditTarget::Key(issued.id()),
-            ],
+        let mut rotation_targets = vec![
+            SecurityAuditTarget::Key(predecessor_key_id),
+            SecurityAuditTarget::Key(issued.id()),
+        ];
+        rotation_targets.extend(
+            retired_ancestors
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
         );
+        let pending_audit =
+            SecurityAuditDraft::actor(&actor, SecurityAuditAction::RotateKey, rotation_targets);
         if let Err(error) =
             self.commit_access_control_catalog(&mut catalog, logical_time_micros, pending_audit)
         {
@@ -2468,7 +2891,7 @@ impl NativeProduct {
             .and_then(|()| output.sync_all())
             .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
         sync_output_parent(output_path)?;
-        let activated_at_micros = trusted_wall_time_micros()?.max(logical_time_micros);
+        let activated_at_micros = self.trusted_authorization_time()?;
         let (authorization_epoch, overlap_until_micros) = catalog
             .activate_rotated_key(issued.id(), activated_at_micros)
             .map_err(map_catalog_error)?;
@@ -2497,6 +2920,145 @@ impl NativeProduct {
         })
     }
 
+    /// Aborts one inactive rotation successor and releases its predecessor.
+    ///
+    /// This is the explicit recovery path when restricted-output I/O or the
+    /// activation commit failed after the pending successor became durable.
+    /// The caller remains responsible for removing any unactivated secret
+    /// file that was already synchronized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, not-found, conflict, durability, or
+    /// corruption error. Active successors cannot be aborted.
+    pub fn abort_api_key_rotation(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        predecessor_key_id: ApiKeyId,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let predecessor = catalog
+            .key(predecessor_key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        let successor_key_id = predecessor
+            .successor_id()
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::CatalogConflict))?;
+        let successor = catalog
+            .key(successor_key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let principal_id = successor.principal_id();
+        let is_owner = successor.roles.contains(&BuiltInRole::Owner);
+        if is_owner && !authority_allows_instance(&actor, ProductPermission::OwnershipManage) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let allowed = if principal_id == actor.principal_id {
+            authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
+                || authority_allows_instance(&actor, ProductPermission::SecurityManage)
+        } else {
+            authority_allows_instance(&actor, ProductPermission::SecurityManage)
+        };
+        if !allowed {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let authorization_epoch = catalog
+            .abort_key_rotation(successor_key_id)
+            .map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::AbortKeyRotation,
+            [
+                SecurityAuditTarget::Key(predecessor_key_id),
+                SecurityAuditTarget::Key(successor_key_id),
+            ],
+        );
+        let commit =
+            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        Ok(AccessControlMutationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Aborts one uniquely identified inactive key issue.
+    ///
+    /// The principal and label remain available to the caller even when the
+    /// restricted output file was empty, partial, or lost after phase one.
+    /// Active keys and rotation successors are never selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, not-found, conflict, durability, or
+    /// corruption error. Ambiguous pending labels fail closed.
+    pub fn abort_pending_api_key_issue(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        label: &str,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let pending = catalog
+            .pending_key_issue(principal_id, label)
+            .map_err(map_catalog_error)?;
+        let pending_key_id = pending.id;
+        let is_owner = pending.roles.contains(&BuiltInRole::Owner);
+        if is_owner && !authority_allows_instance(&actor, ProductPermission::OwnershipManage) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let allowed = if principal_id == actor.principal_id {
+            authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
+                || authority_allows_instance(&actor, ProductPermission::SecurityManage)
+        } else {
+            authority_allows_instance(&actor, ProductPermission::SecurityManage)
+        };
+        if !allowed {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let (aborted_key_id, authorization_epoch) = catalog
+            .abort_pending_key_issue(principal_id, label)
+            .map_err(map_catalog_error)?;
+        if aborted_key_id != pending_key_id {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::AbortKeyIssue,
+            [
+                SecurityAuditTarget::Principal(principal_id),
+                SecurityAuditTarget::Key(pending_key_id),
+            ],
+        );
+        let commit =
+            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        Ok(AccessControlMutationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
     /// Revokes one API key under current product authority.
     ///
     /// A principal may revoke its own credential with `credential.self_manage`;
@@ -2513,16 +3075,26 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<AccessControlMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = current_actor(
             &catalog,
             actor,
             self.database.directory_identity().lineage().encode(),
-            logical_time_micros,
+            authorization_time_micros,
         )?;
         let target_principal = catalog
             .key(target)
             .map(ApiKeyRecord::principal_id)
             .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        let target_is_owner = catalog
+            .key(target)
+            .is_some_and(|key| key.roles.contains(&BuiltInRole::Owner));
+        if target_is_owner && !authority_allows_instance(&actor, ProductPermission::OwnershipManage)
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
         let allowed = if target_principal == actor.principal_id {
             authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
                 || authority_allows_instance(&actor, ProductPermission::SecurityManage)
@@ -2637,8 +3209,8 @@ impl NativeProduct {
         let output_path = output_path.as_ref();
         let mut output = create_restricted_output(output_path)?;
         let mut catalog = self.load_access_control_catalog()?;
-        let (principal_id, issued, _pending_epoch) =
-            match catalog.begin_owner_recovery(key_label, logical_time_micros) {
+        let (principal_id, issued, _pending_epoch, retired_pending_keys) =
+            match catalog.begin_owner_recovery_with_retired(key_label, logical_time_micros) {
                 Ok(value) => value,
                 Err(error) => {
                     drop(output);
@@ -2646,13 +3218,18 @@ impl NativeProduct {
                     return Err(map_catalog_error(error));
                 }
             };
-        let pending_audit = SecurityAuditDraft::offline(
-            SecurityAuditAction::RecoverOwner,
-            [
-                SecurityAuditTarget::Principal(principal_id),
-                SecurityAuditTarget::Key(issued.id()),
-            ],
+        let mut pending_targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(issued.id()),
+        ];
+        pending_targets.extend(
+            retired_pending_keys
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
         );
+        let pending_audit =
+            SecurityAuditDraft::offline(SecurityAuditAction::RecoverOwner, pending_targets);
         if let Err(error) =
             self.commit_access_control_catalog(&mut catalog, logical_time_micros, pending_audit)
         {
@@ -2665,16 +3242,21 @@ impl NativeProduct {
             .and_then(|()| output.sync_all())
             .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
         sync_output_parent(output_path)?;
-        let authorization_epoch = catalog
-            .activate_recovered_owner_key(issued.id())
+        let (authorization_epoch, retired_owner_keys) = catalog
+            .activate_recovered_owner_key_with_retired(issued.id())
             .map_err(map_catalog_error)?;
-        let activation_audit = SecurityAuditDraft::offline(
-            SecurityAuditAction::ActivateKey,
-            [
-                SecurityAuditTarget::Principal(principal_id),
-                SecurityAuditTarget::Key(issued.id()),
-            ],
+        let mut activation_targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(issued.id()),
+        ];
+        activation_targets.extend(
+            retired_owner_keys
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
         );
+        let activation_audit =
+            SecurityAuditDraft::offline(SecurityAuditAction::ActivateKey, activation_targets);
         let commit = self.commit_access_control_catalog(
             &mut catalog,
             logical_time_micros,
@@ -2689,6 +3271,9 @@ impl NativeProduct {
     }
 
     pub(crate) fn load_access_control_catalog(&self) -> Result<AccessControlCatalog, ProductError> {
+        #[cfg(test)]
+        self.access_control_catalog_loads
+            .fetch_add(1, Ordering::Relaxed);
         let snapshot = self.snapshot_bounded(0)?;
         match snapshot.structure_get_internal(ACCESS_CONTROL_STORAGE_KEY) {
             Some(encoded) => AccessControlCatalog::decode(encoded).map_err(map_catalog_error),
@@ -2725,11 +3310,24 @@ impl NativeProduct {
             return Err(ProductError::from_code(ProductErrorCode::Corruption));
         }
         transaction.set(ACCESS_CONTROL_STORAGE_KEY.to_vec(), encoded_catalog, None)?;
-        let receipt = transaction.commit()?;
+        let receipt = match transaction.commit() {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.access_control_epoch_known
+                    .store(false, Ordering::Release);
+                return Err(error.into());
+            }
+        };
         if receipt.commit_csn != pending_csn {
+            self.access_control_epoch_known
+                .store(false, Ordering::Release);
             return Err(ProductError::from_code(ProductErrorCode::Corruption));
         }
         self.observe_commit(&receipt);
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
         Ok(receipt.into())
     }
 }
@@ -2798,6 +3396,13 @@ fn authorize_key_issue(
     permission_ceiling: ProductAuthorization,
     scope_ceiling: &BTreeSet<ProductScope>,
 ) -> Result<(), ProductError> {
+    if requested_roles.contains(&BuiltInRole::Owner)
+        && !authority_allows_instance(actor, ProductPermission::OwnershipManage)
+    {
+        return Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ));
+    }
     if principal_id != actor.principal_id {
         return if authority_allows_instance(actor, ProductPermission::SecurityManage) {
             Ok(())
@@ -3023,7 +3628,8 @@ fn decode_keys_v1(
 ) -> Result<BTreeMap<ApiKeyId, ApiKeyRecord>, AccessCatalogError> {
     let mut keys = BTreeMap::new();
     for _ in 0..count {
-        let id = ApiKeyId::from_bytes(decoder.array()?);
+        let id =
+            ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?;
         let principal_id = decoder.security_id()?;
         let verifier = ApiKeyVerifier::from_digest(id, decoder.array()?);
         let active = decoder.boolean()?;
@@ -3066,7 +3672,8 @@ fn decode_keys_v2(
 ) -> Result<BTreeMap<ApiKeyId, ApiKeyRecord>, AccessCatalogError> {
     let mut keys = BTreeMap::new();
     for _ in 0..count {
-        let id = ApiKeyId::from_bytes(decoder.array()?);
+        let id =
+            ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?;
         let principal_id = decoder.security_id()?;
         let verifier = ApiKeyVerifier::from_digest(id, decoder.array()?);
         let active = decoder.boolean()?;
@@ -3249,7 +3856,9 @@ fn decode_audit_event(encoded: &[u8]) -> Result<SecurityAuditEvent, AccessCatalo
                 SecurityId::new(u128::from_be_bytes(bytes))
                     .ok_or(AccessCatalogError::CorruptCatalog)?,
             ),
-            3 => SecurityAuditTarget::Key(ApiKeyId::from_bytes(bytes)),
+            3 => SecurityAuditTarget::Key(
+                ApiKeyId::from_bytes(bytes).ok_or(AccessCatalogError::CorruptCatalog)?,
+            ),
             _ => return Err(AccessCatalogError::CorruptCatalog),
         });
     }
@@ -3354,7 +3963,9 @@ fn decode_optional_key_id(
 ) -> Result<Option<ApiKeyId>, AccessCatalogError> {
     match decoder.byte()? {
         0 => Ok(None),
-        1 => decoder.array().map(ApiKeyId::from_bytes).map(Some),
+        1 => ApiKeyId::from_bytes(decoder.array()?)
+            .map(Some)
+            .ok_or(AccessCatalogError::CorruptCatalog),
         _ => Err(AccessCatalogError::CorruptCatalog),
     }
 }
@@ -3757,7 +4368,7 @@ mod tests {
             "reader",
             [BuiltInRole::Reader],
             BuiltInRole::Reader.authorization(),
-            Some(100),
+            None,
             &reader_key_path,
             4,
         )?;
@@ -3773,6 +4384,115 @@ mod tests {
         fs::remove_dir_all(path)?;
         fs::remove_file(owner_key_path)?;
         fs::remove_file(reader_key_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_cannot_issue_rotate_or_revoke_owner_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-separation-key");
+        let admin_path = path.with_extension("admin-separation-key");
+        let issue_path = path.with_extension("forbidden-owner-issue-key");
+        let rotate_path = path.with_extension("forbidden-owner-rotation-key");
+        let _ignored = fs::remove_dir_all(&path);
+        for output in [&owner_path, &admin_path, &issue_path, &rotate_path] {
+            let _ignored = fs::remove_file(output);
+        }
+        let mut product = NativeProduct::create(&path)?;
+        let bootstrap =
+            product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, 2)?;
+        let admin_principal = product.create_security_principal(&owner, "Admin", 2)?;
+        let owner = product.authenticate_api_key(&owner_secret, 3)?;
+        product.assign_built_in_role(
+            &owner,
+            admin_principal.principal_id,
+            BuiltInRole::Admin,
+            ProductScope::Instance,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        product.issue_api_key_to_file(
+            &owner,
+            admin_principal.principal_id,
+            "admin",
+            [BuiltInRole::Admin],
+            BuiltInRole::Admin.authorization(),
+            None,
+            &admin_path,
+            4,
+        )?;
+        let admin_secret = fs::read_to_string(&admin_path)?;
+        let admin = product.authenticate_api_key(&admin_secret, 5)?;
+
+        let Err(issue_error) = product.issue_api_key_to_file(
+            &admin,
+            bootstrap.principal_id,
+            "owner-copy",
+            [BuiltInRole::Owner],
+            ProductAuthorization::ALL,
+            None,
+            &issue_path,
+            5,
+        ) else {
+            return Err("Admin unexpectedly minted Owner authority".into());
+        };
+        assert_eq!(issue_error.code(), ProductErrorCode::AuthorizationDenied);
+        assert!(!issue_path.exists());
+
+        let Err(rotate_error) = product.rotate_api_key_to_file(
+            &admin,
+            bootstrap.key_id,
+            "owner-rotation",
+            0,
+            None,
+            &rotate_path,
+            6,
+        ) else {
+            return Err("Admin unexpectedly rotated Owner authority".into());
+        };
+        assert_eq!(rotate_error.code(), ProductErrorCode::AuthorizationDenied);
+        assert!(!rotate_path.exists());
+
+        let Err(revoke_error) = product.revoke_api_key(&admin, bootstrap.key_id, 7) else {
+            return Err("Admin unexpectedly revoked Owner authority".into());
+        };
+        assert_eq!(revoke_error.code(), ProductErrorCode::AuthorizationDenied);
+        assert!(product.authenticate_api_key(&owner_secret, 8).is_ok());
+
+        let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        let mut catalog = product.load_access_control_catalog()?;
+        let (pending_owner, _) = catalog.begin_key_rotation(
+            bootstrap.key_id,
+            "pending-owner",
+            0,
+            product.trusted_authorization_time()?,
+            None,
+        )?;
+        let pending_owner_id = pending_owner.id();
+        let audit = SecurityAuditDraft::actor(
+            &owner,
+            SecurityAuditAction::RotateKey,
+            [
+                SecurityAuditTarget::Key(bootstrap.key_id),
+                SecurityAuditTarget::Key(pending_owner_id),
+            ],
+        );
+        product.commit_access_control_catalog(&mut catalog, 9, audit)?;
+        let Err(abort_error) = product.abort_api_key_rotation(&admin, bootstrap.key_id, 10) else {
+            return Err("Admin unexpectedly aborted an Owner rotation".into());
+        };
+        assert_eq!(abort_error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(product.access_control_status()?.pending_keys, 1);
+        product.abort_api_key_rotation(&owner, bootstrap.key_id, 11)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 0);
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        fs::remove_file(admin_path)?;
         Ok(())
     }
 
@@ -3852,6 +4572,367 @@ mod tests {
         assert!(catalog.authenticate(&successor_secret, deadline).is_ok());
         let encoded = catalog.encode()?;
         assert_eq!(AccessControlCatalog::decode(&encoded)?, catalog);
+
+        let mut expired = AccessControlCatalog::empty();
+        let (_, predecessor) = expired.bootstrap_owner("Owner", "primary", 1)?;
+        let predecessor_id = predecessor.id();
+        let predecessor_secret = predecessor.expose_secret().to_owned();
+        expired.activate_key(predecessor_id)?;
+        let (successor, _) =
+            expired.begin_key_rotation(predecessor_id, "expired", 0, 10, Some(20))?;
+        let expired_successor_id = successor.id();
+        assert_eq!(
+            expired.activate_rotated_key(expired_successor_id, 20),
+            Err(AccessCatalogError::Conflict)
+        );
+        assert!(expired.authenticate(&predecessor_secret, 21).is_ok());
+        expired.abort_key_rotation(expired_successor_id)?;
+        assert!(expired.key(expired_successor_id).is_none());
+        assert_eq!(
+            expired
+                .key(predecessor_id)
+                .ok_or("missing predecessor after abort")?
+                .successor_id(),
+            None
+        );
+        let (retry, _) = expired.begin_key_rotation(predecessor_id, "retry", 0, 22, None)?;
+        expired.activate_rotated_key(retry.id(), 23)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_retirement_is_bounded_and_pending_revoke_is_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (_, initial) = catalog.bootstrap_owner("Owner", "primary", 1)?;
+        let mut current_id = initial.id();
+        catalog.activate_key(current_id)?;
+        for instant in 2_i64..102 {
+            let (successor, _) =
+                catalog.begin_key_rotation(current_id, "rotated", 0, instant, None)?;
+            let successor_id = successor.id();
+            catalog.activate_rotated_key(successor_id, instant)?;
+            assert_eq!(catalog.keys.len(), 1);
+            assert!(catalog.key(current_id).is_none());
+            current_id = successor_id;
+        }
+        let (_, _recovery, _) = catalog.begin_owner_recovery("recovery", 103)?;
+        assert_eq!(catalog.keys.len(), 2);
+
+        let mut overlapping = AccessControlCatalog::empty();
+        let (_, initial) = overlapping.bootstrap_owner("Owner", "primary", 1)?;
+        let initial_id = initial.id();
+        overlapping.activate_key(initial_id)?;
+        let (current, _) = overlapping.begin_key_rotation(initial_id, "current", 1, 2, None)?;
+        let current_id = current.id();
+        let (_, deadline) = overlapping.activate_rotated_key(current_id, 3)?;
+        assert!(matches!(
+            overlapping.begin_key_rotation(current_id, "too-early", 0, deadline - 1, None),
+            Err(AccessCatalogError::Conflict)
+        ));
+        let (pending, _) =
+            overlapping.begin_key_rotation(current_id, "after-overlap", 0, deadline, None)?;
+        let pending_id = pending.id();
+        assert!(overlapping.key(initial_id).is_none());
+        assert_eq!(
+            overlapping.revoke_key(pending_id),
+            Err(AccessCatalogError::Conflict)
+        );
+        overlapping.revoke_key(current_id)?;
+        overlapping.abort_key_rotation(pending_id)?;
+        assert_eq!(
+            overlapping
+                .key(current_id)
+                .ok_or("missing revoked predecessor")?
+                .successor_id(),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_cycles_fail_closed_without_traversal_loops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (_, first) = catalog.bootstrap_owner("Owner", "first", 1)?;
+        let first_id = first.id();
+        catalog.activate_key(first_id)?;
+        let (second, _) = catalog.begin_key_rotation(first_id, "second", 1, 1, None)?;
+        let second_id = second.id();
+        {
+            let first = catalog
+                .keys
+                .get_mut(&first_id)
+                .ok_or("missing first cycle key")?;
+            first.predecessor_id = Some(second_id);
+            first.successor_id = Some(second_id);
+            first.overlap_until_micros = Some(10);
+            first.rotation_overlap_micros = Some(1);
+        }
+        {
+            let second = catalog
+                .keys
+                .get_mut(&second_id)
+                .ok_or("missing second cycle key")?;
+            second.active = true;
+            second.predecessor_id = Some(first_id);
+            second.successor_id = Some(first_id);
+            second.overlap_until_micros = Some(10);
+            second.rotation_overlap_micros = Some(1);
+        }
+        assert_eq!(catalog.validate(), Err(AccessCatalogError::CorruptCatalog));
+        assert_eq!(
+            catalog.retired_rotation_ancestors(first_id, 10),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revoked_unlinked_keys_do_not_exhaust_the_lifetime_quota()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (owner_principal, primary) = catalog.bootstrap_owner("Owner", "primary", 1)?;
+        catalog.activate_key(primary.id())?;
+        for instant in 2_i64..82 {
+            let label = format!("retired-{instant}");
+            let (issued, _) = catalog.begin_key_issue(
+                owner_principal,
+                &label,
+                [BuiltInRole::Owner],
+                ProductAuthorization::ALL,
+                instant,
+                None,
+            )?;
+            catalog.activate_key(issued.id())?;
+            catalog.revoke_key(issued.id())?;
+            assert!(catalog.keys.len() <= AccessControlLimits::V1.keys_per_principal);
+        }
+        assert!(catalog.authenticate(primary.expose_secret(), 82).is_ok());
+        let encoded = catalog.encode()?;
+        assert_eq!(AccessControlCatalog::decode(&encoded)?, catalog);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_principal_reserves_one_offline_recovery_slot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut catalog = AccessControlCatalog::empty();
+        let (owner_principal, primary) = catalog.bootstrap_owner("Owner", "primary", 1)?;
+        catalog.activate_key(primary.id())?;
+        for instant in 2_i64..64 {
+            let label = format!("active-{instant}");
+            let (issued, _) = catalog.begin_key_issue(
+                owner_principal,
+                &label,
+                [BuiltInRole::Owner],
+                ProductAuthorization::ALL,
+                instant,
+                None,
+            )?;
+            catalog.activate_key(issued.id())?;
+        }
+        assert_eq!(catalog.keys.len(), 63);
+        assert!(matches!(
+            catalog.begin_key_issue(
+                owner_principal,
+                "must-reserve-recovery",
+                [BuiltInRole::Owner],
+                ProductAuthorization::ALL,
+                64,
+                None,
+            ),
+            Err(AccessCatalogError::LimitExceeded)
+        ));
+        let (_, recovery, _) = catalog.begin_owner_recovery("recovery", 65)?;
+        assert_eq!(catalog.keys.len(), 64);
+        catalog
+            .keys
+            .get_mut(&recovery.id())
+            .ok_or("missing pending recovery key")?
+            .active = true;
+        assert_eq!(catalog.validate(), Err(AccessCatalogError::CorruptCatalog));
+        catalog
+            .keys
+            .get_mut(&recovery.id())
+            .ok_or("missing pending recovery key")?
+            .active = false;
+        catalog.activate_recovered_owner_key(recovery.id())?;
+        assert_eq!(catalog.keys.len(), 1);
+        assert!(catalog.authenticate(recovery.expose_secret(), 66).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_rotation_can_be_aborted_by_predecessor_and_retried()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-abort-key");
+        let retry_path = path.with_extension("retry-rotation-key");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let _ignored = fs::remove_file(&retry_path);
+        let mut product = NativeProduct::create(&path)?;
+        let bootstrap =
+            product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+
+        let mut catalog = product.load_access_control_catalog()?;
+        let (pending, _) = catalog.begin_key_rotation(
+            bootstrap.key_id,
+            "interrupted",
+            0,
+            product.trusted_authorization_time()?,
+            None,
+        )?;
+        let pending_id = pending.id();
+        let audit = SecurityAuditDraft::actor(
+            &owner,
+            SecurityAuditAction::RotateKey,
+            [
+                SecurityAuditTarget::Key(bootstrap.key_id),
+                SecurityAuditTarget::Key(pending_id),
+            ],
+        );
+        product.commit_access_control_catalog(&mut catalog, 2, audit)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 1);
+
+        product.abort_api_key_rotation(&owner, bootstrap.key_id, 3)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 0);
+        let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        let retry = product.rotate_api_key_to_file(
+            &owner,
+            bootstrap.key_id,
+            "retry",
+            0,
+            None,
+            &retry_path,
+            4,
+        )?;
+        assert_ne!(retry.successor_key_id, pending_id);
+        let successor_secret = fs::read_to_string(&retry_path)?;
+        drop(product);
+
+        let reopened = NativeProduct::open(&path)?;
+        assert_eq!(reopened.access_control_status()?.pending_keys, 0);
+        let successor = reopened.authenticate_api_key(&successor_secret, i64::MIN)?;
+        let audit_page = reopened.read_security_audit(&successor, None, 32, 5)?;
+        assert!(audit_page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::AbortKeyRotation
+                && event.targets().len() == 2
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Key(bootstrap.key_id))
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Key(pending_id))
+        }));
+
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        fs::remove_file(retry_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pending_key_issue_can_be_aborted_by_principal_and_label()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-pending-issue-key");
+        let reader_path = path.with_extension("reader-retry-key");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let _ignored = fs::remove_file(&reader_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let reader = product.create_security_principal(&owner, "Reader", 2)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        product.assign_built_in_role(
+            &owner,
+            reader.principal_id,
+            BuiltInRole::Reader,
+            ProductScope::Instance,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+
+        let mut catalog = product.load_access_control_catalog()?;
+        let created_at = product.trusted_authorization_time()?;
+        let (pending, _) = catalog.begin_key_issue_with_roles(
+            reader.principal_id,
+            "reader",
+            [BuiltInRole::Reader],
+            [],
+            BuiltInRole::Reader.authorization(),
+            [ProductScope::Instance],
+            created_at,
+            None,
+        )?;
+        let pending_id = pending.id();
+        assert!(matches!(
+            catalog.begin_key_issue_with_roles(
+                reader.principal_id,
+                "reader",
+                [BuiltInRole::Reader],
+                [],
+                BuiltInRole::Reader.authorization(),
+                [ProductScope::Instance],
+                created_at,
+                None,
+            ),
+            Err(AccessCatalogError::Conflict)
+        ));
+        let audit = SecurityAuditDraft::actor(
+            &owner,
+            SecurityAuditAction::IssueKey,
+            [
+                SecurityAuditTarget::Principal(reader.principal_id),
+                SecurityAuditTarget::Key(pending_id),
+            ],
+        );
+        product.commit_access_control_catalog(&mut catalog, 4, audit)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 1);
+
+        product.abort_pending_api_key_issue(&owner, reader.principal_id, "reader", 5)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 0);
+        drop(product);
+
+        let mut product = NativeProduct::open(&path)?;
+        assert_eq!(product.access_control_status()?.pending_keys, 0);
+        let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        let retry = product.issue_api_key_to_file(
+            &owner,
+            reader.principal_id,
+            "reader",
+            [BuiltInRole::Reader],
+            BuiltInRole::Reader.authorization(),
+            None,
+            &reader_path,
+            6,
+        )?;
+        assert_ne!(retry.key_id, pending_id);
+        let reader_secret = fs::read_to_string(&reader_path)?;
+        let reader_authority = product.authenticate_api_key(&reader_secret, i64::MAX)?;
+        let audit_page = product.read_security_audit(&owner, None, 32, 7)?;
+        assert!(audit_page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::AbortKeyIssue
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Principal(reader.principal_id))
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Key(pending_id))
+        }));
+        assert_eq!(reader_authority.principal_id(), reader.principal_id);
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        fs::remove_file(reader_path)?;
         Ok(())
     }
 
@@ -3917,6 +4998,28 @@ mod tests {
                 ProductErrorCode::AuthorizationDenied
             ))
         );
+        let mut session = crate::ProductSession::new_authenticated(
+            crate::ProductSessionId::new(1).ok_or("invalid session")?,
+            scoped,
+        );
+        let context = crate::ProductRequestContext::new(
+            1,
+            session.id(),
+            i64::MAX,
+            session.principal().clone(),
+            session.authorization(),
+        )
+        .with_authorization_epoch(session.authorization_epoch());
+        let Err(error) = product.dispatch(
+            &mut session,
+            &context,
+            crate::ProductOperation::StructureGet {
+                key: b"must-not-escape-scope".to_vec(),
+            },
+        ) else {
+            return Err("object scope escaped into the default keyspace".into());
+        };
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
         drop(product);
         fs::remove_dir_all(path)?;
         fs::remove_file(owner_path)?;
@@ -3963,6 +5066,78 @@ mod tests {
         fs::remove_dir_all(path)?;
         fs::remove_file(owner_path)?;
         fs::remove_file(recovery_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_recovery_retry_audits_every_replaced_pending_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-recovery-retry");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+
+        let mut catalog = product.load_access_control_catalog()?;
+        let (principal_id, first_pending, _, first_retired) =
+            catalog.begin_owner_recovery_with_retired("recovery-first", 2)?;
+        assert!(first_retired.is_empty());
+        let first_pending_id = first_pending.id();
+        product.commit_access_control_catalog(
+            &mut catalog,
+            2,
+            SecurityAuditDraft::offline(
+                SecurityAuditAction::RecoverOwner,
+                [
+                    SecurityAuditTarget::Principal(principal_id),
+                    SecurityAuditTarget::Key(first_pending_id),
+                ],
+            ),
+        )?;
+
+        let mut catalog = product.load_access_control_catalog()?;
+        let (retry_principal_id, retry_pending, _, retry_retired) =
+            catalog.begin_owner_recovery_with_retired("recovery-retry", 3)?;
+        assert_eq!(retry_principal_id, principal_id);
+        assert_eq!(retry_retired.as_ref(), &[first_pending_id]);
+        let retry_pending_id = retry_pending.id();
+        let mut retry_targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(retry_pending_id),
+        ];
+        retry_targets.extend(retry_retired.iter().copied().map(SecurityAuditTarget::Key));
+        product.commit_access_control_catalog(
+            &mut catalog,
+            3,
+            SecurityAuditDraft::offline(SecurityAuditAction::RecoverOwner, retry_targets),
+        )?;
+
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let audit_page = product.read_security_audit(&owner, None, 32, 4)?;
+        assert!(audit_page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::RecoverOwner
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Key(first_pending_id))
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Key(retry_pending_id))
+        }));
+        assert_eq!(product.access_control_status()?.pending_keys, 1);
+
+        drop(product);
+        let reopened = NativeProduct::open(&path)?;
+        assert!(
+            reopened
+                .authenticate_api_key(&owner_secret, i64::MIN)
+                .is_ok()
+        );
+        assert_eq!(reopened.access_control_status()?.pending_keys, 1);
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
         Ok(())
     }
 }

@@ -11,7 +11,7 @@ use crate::{ProductAuthorization, ProductPermission};
 
 const API_KEY_PREFIX: &[u8] = b"hyp1_";
 const API_KEY_SEPARATOR_INDEX: usize = 37;
-const API_KEY_BYTES: usize = 102;
+pub(crate) const API_KEY_BYTES: usize = 102;
 const API_KEY_ID_BYTES: usize = 16;
 const API_KEY_SECRET_BYTES: usize = 32;
 const API_KEY_VERIFIER_DOMAIN: &[u8] = b"hyphae-api-key-v1\0";
@@ -184,8 +184,8 @@ impl FromStr for SecurityId {
 pub struct ApiKeyId([u8; API_KEY_ID_BYTES]);
 
 impl ApiKeyId {
-    pub(crate) const fn from_bytes(bytes: [u8; API_KEY_ID_BYTES]) -> Self {
-        Self(bytes)
+    pub(crate) fn from_bytes(bytes: [u8; API_KEY_ID_BYTES]) -> Option<Self> {
+        bytes.iter().any(|byte| *byte != 0).then_some(Self(bytes))
     }
 
     /// Returns the canonical binary identity.
@@ -253,6 +253,9 @@ impl ApiKeyVerifier {
         let mut secret = [0_u8; API_KEY_SECRET_BYTES];
         getrandom::fill(&mut id).map_err(|_| AccessControlError::EntropyUnavailable)?;
         getrandom::fill(&mut secret).map_err(|_| AccessControlError::EntropyUnavailable)?;
+        if id.iter().all(|byte| *byte == 0) {
+            return Err(AccessControlError::EntropyUnavailable);
+        }
         Ok(Self::from_parts(id, secret))
     }
 
@@ -679,6 +682,9 @@ fn parse_api_key(
         return Err(AccessControlError::InvalidApiKey);
     }
     let id = decode_lower_hex::<API_KEY_ID_BYTES>(&bytes[5..API_KEY_SEPARATOR_INDEX])?;
+    if id.iter().all(|byte| *byte == 0) {
+        return Err(AccessControlError::InvalidApiKey);
+    }
     let secret = decode_lower_hex::<API_KEY_SECRET_BYTES>(&bytes[API_KEY_SEPARATOR_INDEX + 1..])?;
     Ok((id, secret))
 }
@@ -771,6 +777,11 @@ mod tests {
         assert!(!verifier.verifies(&format!(" {FIXTURE_KEY}")));
         assert!(!verifier.verifies(&format!("{FIXTURE_KEY}\n")));
         assert!(!verifier.verifies(&FIXTURE_KEY.replacen("hyp1_", "hyp2_", 1)));
+        let zero_id = format!("hyp1_{}_{}", "0".repeat(32), "1".repeat(64));
+        assert!(matches!(
+            ApiKeyVerifier::import(&zero_id),
+            Err(AccessControlError::InvalidApiKey)
+        ));
         Ok(())
     }
 

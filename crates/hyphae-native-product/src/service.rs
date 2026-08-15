@@ -14,15 +14,60 @@ use std::{
 };
 
 use crate::{
-    MetricId, NativeProduct, ProductAuthorization, ProductError, ProductErrorCode,
-    ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession,
-    ProductSessionId, TelemetryRegistry, TimingClass,
+    AuthenticatedAuthority, MetricId, NativeProduct, ProductAuthorization, ProductError,
+    ProductErrorCode, ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse,
+    ProductSession, ProductSessionId, TelemetryRegistry, TimingClass,
 };
 
 /// Default bounded product-service request queue.
 pub const DEFAULT_PRODUCT_SERVICE_QUEUE_CAPACITY: usize = 256;
 /// Default simultaneous product sessions.
 pub const DEFAULT_PRODUCT_SERVICE_SESSIONS: usize = 1_024;
+/// Maximum bytes accepted by one ephemeral credential candidate.
+pub const MAX_API_KEY_CREDENTIAL_BYTES: usize = crate::access_control::API_KEY_BYTES;
+
+/// Ephemeral redacted API-key candidate transferred to the sole owner.
+pub struct ApiKeyCredential {
+    bytes: Vec<u8>,
+}
+
+impl ApiKeyCredential {
+    /// Copies one bounded credential candidate without parsing it at ingress.
+    ///
+    /// # Errors
+    ///
+    /// Returns `authorization_denied` unless the candidate has the exact
+    /// canonical API-key byte length. Syntax and verifier failures remain
+    /// indistinguishable when the sole owner authenticates it.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, ProductError> {
+        let bytes = value.as_ref().as_bytes();
+        if bytes.len() != MAX_API_KEY_CREDENTIAL_BYTES {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    fn expose(&self) -> Result<&str, ProductError> {
+        std::str::from_utf8(&self.bytes)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::AuthorizationDenied))
+    }
+}
+
+impl std::fmt::Debug for ApiKeyCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ApiKeyCredential([REDACTED])")
+    }
+}
+
+impl Drop for ApiKeyCredential {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
 
 /// Service queue and session retention bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +119,11 @@ enum ServiceCommand {
         authorization_epoch: crate::AuthorizationEpoch,
         reply: SyncSender<Result<ProductSessionId, ProductError>>,
     },
+    OpenAuthenticatedSession {
+        session_id: ProductSessionId,
+        credential: ApiKeyCredential,
+        reply: SyncSender<Result<AuthenticatedAuthority, ProductError>>,
+    },
     Dispatch {
         session_id: ProductSessionId,
         context: ProductRequestContext,
@@ -116,7 +166,7 @@ struct SharedService {
     telemetry: TelemetryRegistry,
     queue_depth: AtomicU64,
     product: RwLock<Option<NativeProduct>>,
-    sessions: Mutex<BTreeMap<ProductSessionId, Arc<RwLock<ProductSession>>>>,
+    sessions: Mutex<ServiceSessions>,
     #[cfg(test)]
     fast_structure_get_hits: AtomicU64,
     #[cfg(test)]
@@ -124,6 +174,8 @@ struct SharedService {
     #[cfg(test)]
     test_hooks: Mutex<ServiceTestHooks>,
 }
+
+type ServiceSessions = BTreeMap<ProductSessionId, Arc<RwLock<ProductSession>>>;
 
 #[derive(Default)]
 struct ServiceAdmission {
@@ -178,7 +230,7 @@ pub struct NativeProductHandle {
 }
 
 impl NativeProductHandle {
-    /// Opens one bounded service-owned session.
+    /// Opens one explicitly unmanaged, trusted-local service session.
     ///
     /// # Errors
     ///
@@ -196,7 +248,7 @@ impl NativeProductHandle {
         )
     }
 
-    /// Opens one bounded session at a durable authorization generation.
+    /// Opens one explicitly unmanaged session at a caller generation.
     ///
     /// # Errors
     ///
@@ -208,20 +260,7 @@ impl NativeProductHandle {
         authorization: ProductAuthorization,
         authorization_epoch: crate::AuthorizationEpoch,
     ) -> Result<NativeProductClient, ProductError> {
-        let session_id = {
-            let mut next = self
-                .shared
-                .next_session_id
-                .lock()
-                .map_err(|_| unavailable())?;
-            let id = ProductSessionId::new(*next)
-                .ok_or_else(|| ProductError::from_code(ProductErrorCode::LimitExceeded))?;
-            let following = next
-                .checked_add(1)
-                .ok_or_else(|| ProductError::from_code(ProductErrorCode::LimitExceeded))?;
-            *next = following;
-            id
-        };
+        let session_id = self.allocate_session_id()?;
         let (reply, receive) = mpsc::sync_channel(1);
         self.send(ServiceCommand::OpenSession {
             session_id,
@@ -238,6 +277,52 @@ impl NativeProductHandle {
             authorization,
             authorization_epoch,
         })
+    }
+
+    /// Authenticates one redacted API-key candidate and opens a managed session.
+    ///
+    /// Authentication occurs on the sole product owner against the current
+    /// durable access-control catalog. The credential is erased after the
+    /// owner consumes it and is never retained by the session or client.
+    ///
+    /// # Errors
+    ///
+    /// Returns `authorization_denied` for an invalid, revoked, expired, or
+    /// foreign key, `unavailable` when admission is closed, or
+    /// `limit_exceeded` when the session bound is full.
+    pub fn open_authenticated_session(
+        &self,
+        credential: ApiKeyCredential,
+    ) -> Result<NativeProductClient, ProductError> {
+        let session_id = self.allocate_session_id()?;
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.send(ServiceCommand::OpenAuthenticatedSession {
+            session_id,
+            credential,
+            reply,
+        })?;
+        let authority = receive.recv().map_err(|_| unavailable())??;
+        Ok(NativeProductClient {
+            handle: self.clone(),
+            session_id,
+            principal: authority.principal().clone(),
+            authorization: authority.authorization(),
+            authorization_epoch: authority.authorization_epoch(),
+        })
+    }
+
+    fn allocate_session_id(&self) -> Result<ProductSessionId, ProductError> {
+        let mut next = self
+            .shared
+            .next_session_id
+            .lock()
+            .map_err(|_| unavailable())?;
+        let id = ProductSessionId::new(*next)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::LimitExceeded))?;
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::LimitExceeded))?;
+        Ok(id)
     }
 
     fn send(&self, command: ServiceCommand) -> Result<(), ProductError> {
@@ -606,6 +691,7 @@ impl NativeProductClient {
         if context.session_id != self.session_id
             || context.principal != self.principal
             || context.authorization != self.authorization
+            || context.authorization_epoch != self.authorization_epoch
         {
             Err(ProductError::from_code(ProductErrorCode::InvalidRequest)
                 .with_request_id(context.request_id))
@@ -789,6 +875,54 @@ impl Drop for NativeProductService {
     }
 }
 
+fn open_unmanaged_session(
+    sessions: &mut ServiceSessions,
+    config: NativeProductServiceConfig,
+    session_id: ProductSessionId,
+    principal: ProductPrincipal,
+    authorization: ProductAuthorization,
+    authorization_epoch: crate::AuthorizationEpoch,
+) -> Result<ProductSessionId, ProductError> {
+    if sessions.len() >= config.max_sessions {
+        return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+    }
+    let session = ProductSession::with_limits(
+        session_id,
+        principal,
+        authorization,
+        authorization_epoch,
+        config.max_prepared_per_session,
+        config.max_transaction_statuses_per_session,
+        config.max_active_transactions_per_session,
+    );
+    sessions.insert(session_id, Arc::new(RwLock::new(session)));
+    Ok(session_id)
+}
+
+fn open_managed_session(
+    product: &NativeProduct,
+    sessions: &mut ServiceSessions,
+    config: NativeProductServiceConfig,
+    session_id: ProductSessionId,
+    credential: &ApiKeyCredential,
+) -> Result<AuthenticatedAuthority, ProductError> {
+    if sessions.len() >= config.max_sessions {
+        return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+    }
+    product
+        .authenticate_api_key_trusted(credential.expose()?)
+        .inspect(|authority| {
+            let session = ProductSession::with_authenticated_limits(
+                session_id,
+                (*authority).clone(),
+                config.max_prepared_per_session,
+                config.max_transaction_statuses_per_session,
+                config.max_active_transactions_per_session,
+            );
+            sessions.insert(session_id, Arc::new(RwLock::new(session)));
+        })
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn owner_loop(
     receiver: Receiver<ServiceCommand>,
@@ -822,21 +956,23 @@ fn owner_loop(
                 authorization_epoch,
                 reply,
             } => {
-                let result = if sessions.len() >= config.max_sessions {
-                    Err(ProductError::from_code(ProductErrorCode::LimitExceeded))
-                } else {
-                    let session = ProductSession::with_limits(
-                        session_id,
-                        principal,
-                        authorization,
-                        authorization_epoch,
-                        config.max_prepared_per_session,
-                        config.max_transaction_statuses_per_session,
-                        config.max_active_transactions_per_session,
-                    );
-                    sessions.insert(session_id, Arc::new(RwLock::new(session)));
-                    Ok(session_id)
-                };
+                let result = open_unmanaged_session(
+                    &mut sessions,
+                    config,
+                    session_id,
+                    principal,
+                    authorization,
+                    authorization_epoch,
+                );
+                let _ignored = reply.send(result);
+            }
+            ServiceCommand::OpenAuthenticatedSession {
+                session_id,
+                credential,
+                reply,
+            } => {
+                let result =
+                    open_managed_session(product, &mut sessions, config, session_id, &credential);
                 let _ignored = reply.send(result);
             }
             ServiceCommand::Dispatch {
@@ -1003,6 +1139,347 @@ mod tests {
         let mut context = client.request_context(request_id, 0);
         context.durability = ProductDurabilityPolicy::MEMORY;
         context
+    }
+
+    fn memory_context_for_session(
+        session: &ProductSession,
+        request_id: u128,
+    ) -> ProductRequestContext {
+        let mut context = test_context(session, request_id, 0);
+        context.durability = ProductDurabilityPolicy::MEMORY;
+        context
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end test keeps session, epoch, transaction, and fast-path evidence ordered"
+    )]
+    fn managed_session_revalidates_revocation_on_fast_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TemporaryDirectory::create("managed-revalidation")?;
+        let data_path = directory.0.join("data");
+        let key_path = directory.0.join("owner.key");
+        let mut product = NativeProduct::create(&data_path)?;
+        let mut seed_session = test_session();
+        let seed_context = memory_context_for_session(&seed_session, 90);
+        product.dispatch(
+            &mut seed_session,
+            &seed_context,
+            ProductOperation::ExecuteSql {
+                statement: "CREATE TABLE managed_tx (id INTEGER PRIMARY KEY, body TEXT)".to_owned(),
+                parameters: Vec::new(),
+            },
+        )?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &key_path, 1)?;
+        let secret = fs::read_to_string(&key_path)?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        let handle = service.handle();
+
+        for malformed in ["", "hyp1_short"] {
+            let error = ApiKeyCredential::new(malformed)
+                .expect_err("malformed credential must fail uniformly");
+            assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+        }
+        let wrong = ApiKeyCredential::new("x".repeat(MAX_API_KEY_CREDENTIAL_BYTES))?;
+        assert_eq!(format!("{wrong:?}"), "ApiKeyCredential([REDACTED])");
+        let Err(wrong_error) = handle.open_authenticated_session(wrong) else {
+            return Err("wrong credential unexpectedly opened a session".into());
+        };
+        assert_eq!(wrong_error.code(), ProductErrorCode::AuthorizationDenied);
+
+        let unmanaged = handle.open_session(test_principal(), ProductAuthorization::ALL)?;
+        assert!(matches!(
+            unmanaged.dispatch(
+                unmanaged.request_context(99, 0),
+                ProductOperation::Capabilities
+            )?,
+            ProductResponse::Capabilities(_)
+        ));
+        unmanaged.close()?;
+
+        let credential = ApiKeyCredential::new(&secret)?;
+        let client = handle.open_authenticated_session(credential)?;
+        assert_eq!(
+            client.dispatch(
+                client.request_context(1, 2),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )?,
+            ProductResponse::StructureValue(None)
+        );
+        assert_eq!(
+            handle
+                .shared
+                .fast_structure_get_hits
+                .load(Ordering::Acquire),
+            1
+        );
+
+        let loads_after_unrelated_mutation = {
+            let mut product_slot = handle.shared.product.write().expect("product lock");
+            let product = product_slot.as_mut().expect("live product");
+            let actor = product.authenticate_api_key_trusted(&secret)?;
+            product.create_security_principal(&actor, "Unrelated principal", 2)?;
+            product.access_control_catalog_loads.load(Ordering::Acquire)
+        };
+        assert_eq!(
+            client.dispatch(
+                client.request_context(2, i64::MAX),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )?,
+            ProductResponse::StructureValue(None)
+        );
+        assert_eq!(
+            handle
+                .shared
+                .fast_structure_get_hits
+                .load(Ordering::Acquire),
+            2
+        );
+        let loads_after_refresh = handle
+            .shared
+            .product
+            .read()
+            .expect("product lock")
+            .as_ref()
+            .expect("live product")
+            .access_control_catalog_loads
+            .load(Ordering::Acquire);
+        assert_eq!(loads_after_refresh, loads_after_unrelated_mutation + 1);
+        assert_eq!(
+            client.dispatch(
+                client.request_context(3, i64::MIN),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )?,
+            ProductResponse::StructureValue(None)
+        );
+        assert_eq!(
+            handle
+                .shared
+                .product
+                .read()
+                .expect("product lock")
+                .as_ref()
+                .expect("live product")
+                .access_control_catalog_loads
+                .load(Ordering::Acquire),
+            loads_after_refresh
+        );
+
+        let begin = client.dispatch(
+            memory_context(&client, 10),
+            ProductOperation::TransactionBegin,
+        )?;
+        let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+            handle: tx,
+            ..
+        }) = begin
+        else {
+            return Err("managed transaction did not begin".into());
+        };
+        client.dispatch(
+            memory_context(&client, 11),
+            ProductOperation::TransactionStageSql {
+                handle: tx,
+                mutation: ProductTransactionSqlMutation {
+                    statement: "INSERT INTO managed_tx (id, body) VALUES (?, ?)".to_owned(),
+                    parameters: vec![
+                        ProductValue::Signed(1),
+                        ProductValue::Text("must-rollback".to_owned()),
+                    ],
+                },
+            },
+        )?;
+
+        {
+            let mut product_slot = handle.shared.product.write().expect("product lock");
+            let product = product_slot.as_mut().expect("live product");
+            let actor = product.authenticate_api_key_trusted(&secret)?;
+            product.revoke_api_key(&actor, actor.key_id(), 3)?;
+        }
+
+        let commit_error = client
+            .dispatch(
+                memory_context(&client, 12),
+                ProductOperation::TransactionCommit { handle: tx },
+            )
+            .expect_err("authority loss must reject and roll back commit");
+        assert_eq!(commit_error.code(), ProductErrorCode::AuthorizationDenied);
+        {
+            let sessions = handle.shared.sessions.lock().expect("sessions lock");
+            let session = sessions
+                .get(&client.session_id())
+                .expect("managed session")
+                .read()
+                .expect("managed session read");
+            assert!(!session.has_active_transactions());
+            assert_eq!(
+                session.explicit_transaction_status(tx),
+                ProductExplicitTransactionStatus::RolledBack {
+                    handle: tx,
+                    discarded_operations: 1,
+                }
+            );
+        }
+
+        let error = client
+            .dispatch(
+                client.request_context(2, 4),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )
+            .expect_err("revoked managed session must fail before fast execution");
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(error.request_id(), Some(2));
+        assert_eq!(
+            handle
+                .shared
+                .fast_structure_get_hits
+                .load(Ordering::Acquire),
+            4
+        );
+
+        let invalid = ApiKeyCredential::new(&secret)?;
+        let Err(invalid_error) = handle.open_authenticated_session(invalid) else {
+            return Err("revoked credential unexpectedly opened a session".into());
+        };
+        assert_eq!(invalid_error.code(), ProductErrorCode::AuthorizationDenied);
+        drop(client);
+        service.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_authority_cannot_cross_equal_epoch_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TemporaryDirectory::create("managed-cross-lineage")?;
+        let first_path = directory.0.join("first");
+        let second_path = directory.0.join("second");
+        let first_key_path = directory.0.join("first.key");
+        let second_key_path = directory.0.join("second.key");
+        let mut first = NativeProduct::create(&first_path)?;
+        let mut second = NativeProduct::create(&second_path)?;
+        first.bootstrap_access_control_to_file("First owner", "owner", &first_key_path, 1)?;
+        second.bootstrap_access_control_to_file("Second owner", "owner", &second_key_path, 1)?;
+        assert_eq!(
+            first.access_control_status()?.epoch,
+            second.access_control_status()?.epoch
+        );
+
+        let first_secret = fs::read_to_string(first_key_path)?;
+        let authority = first.authenticate_api_key(&first_secret, i64::MAX)?;
+        let session = ProductSession::new_authenticated(
+            ProductSessionId::new(71).ok_or("invalid test session")?,
+            authority,
+        );
+        let context = memory_context_for_session(&session, 72);
+        let error = crate::operation::dispatch_structure_get_read_only(
+            &second,
+            &session,
+            &context,
+            &ProductOperation::StructureGet {
+                key: b"missing".to_vec(),
+            },
+        )
+        .expect_err("foreign-directory authority must fail before the fast read");
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(error.request_id(), Some(72));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_session_expires_without_an_epoch_change() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TemporaryDirectory::create("managed-expiry")?;
+        let data_path = directory.0.join("data");
+        let owner_path = directory.0.join("owner.key");
+        let successor_path = directory.0.join("successor.key");
+        let mut product = NativeProduct::create(&data_path)?;
+        let bootstrap =
+            product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        let sampled_now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros()
+            .try_into()?;
+        let expires_at = sampled_now + 60_000_000_i64;
+        let rotation = product.rotate_api_key_to_file(
+            &owner,
+            bootstrap.key_id,
+            "successor",
+            10,
+            Some(expires_at),
+            &successor_path,
+            i64::MAX,
+        )?;
+        assert!(rotation.overlap_until_micros < expires_at);
+        let successor_secret = fs::read_to_string(successor_path)?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        let client = service
+            .handle()
+            .open_authenticated_session(ApiKeyCredential::new(successor_secret)?)?;
+        assert_eq!(
+            client.dispatch(
+                client.request_context(81, i64::MAX),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )?,
+            ProductResponse::StructureValue(None)
+        );
+        let epoch_before_expiry = service
+            .handle
+            .shared
+            .product
+            .read()
+            .expect("product lock")
+            .as_ref()
+            .expect("live product")
+            .access_control_epoch
+            .load(Ordering::Acquire);
+        service
+            .handle
+            .shared
+            .product
+            .read()
+            .expect("product lock")
+            .as_ref()
+            .expect("live product")
+            .authorization_time_watermark
+            .store(i64::MAX, Ordering::Release);
+        let error = client
+            .dispatch(
+                client.request_context(82, i64::MIN),
+                ProductOperation::StructureGet {
+                    key: b"missing".to_vec(),
+                },
+            )
+            .expect_err("trusted expiry must invalidate the cached session");
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(error.request_id(), Some(82));
+        assert_eq!(
+            service
+                .handle
+                .shared
+                .product
+                .read()
+                .expect("product lock")
+                .as_ref()
+                .expect("live product")
+                .access_control_epoch
+                .load(Ordering::Acquire),
+            epoch_before_expiry
+        );
+        drop(client);
+        service.shutdown()?;
+        Ok(())
     }
 
     #[test]

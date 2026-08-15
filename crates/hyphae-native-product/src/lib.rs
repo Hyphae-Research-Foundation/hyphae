@@ -29,7 +29,10 @@ mod session;
 mod structures;
 mod telemetry;
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+};
 
 pub use access_catalog::*;
 pub use access_control::*;
@@ -281,6 +284,11 @@ impl ProductSnapshot {
 pub struct NativeProduct {
     pub(crate) database: NativeDatabase,
     pub(crate) telemetry: TelemetryRegistry,
+    pub(crate) access_control_epoch: AtomicU64,
+    pub(crate) access_control_epoch_known: AtomicBool,
+    pub(crate) authorization_time_watermark: AtomicI64,
+    #[cfg(test)]
+    pub(crate) access_control_catalog_loads: AtomicU64,
 }
 
 /// Deterministic explicit-transaction interruption used only by focused recovery tests.
@@ -621,6 +629,11 @@ impl NativeProduct {
             .map(|database| Self {
                 database,
                 telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(true),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
             })
             .map_err(Into::into)
     }
@@ -636,6 +649,11 @@ impl NativeProduct {
             .map(|database| Self {
                 database,
                 telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(true),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
             })
             .map_err(Into::into)
     }
@@ -650,6 +668,11 @@ impl NativeProduct {
             .map(|database| Self {
                 database,
                 telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(false),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
             })
             .map_err(Into::into)
     }
@@ -676,9 +699,24 @@ impl NativeProduct {
                 Self {
                     database,
                     telemetry,
+                    access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                    access_control_epoch_known: AtomicBool::new(false),
+                    authorization_time_watermark: AtomicI64::new(i64::MIN),
+                    #[cfg(test)]
+                    access_control_catalog_loads: AtomicU64::new(0),
                 }
             })
             .map_err(Into::into)
+            .and_then(Self::initialize_access_control_epoch)
+    }
+
+    fn initialize_access_control_epoch(self) -> Result<Self, ProductError> {
+        let catalog = self.load_access_control_catalog()?;
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
+        Ok(self)
     }
 
     /// Returns this instance's bounded process-local telemetry registry.

@@ -2,14 +2,18 @@
 
 //! Product principals, authorization, sessions, and prepared handles.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, RwLock},
+};
 
 use hyphae_native_runtime::NativeWriteBatch;
 use hyphae_native_types::TransactionId;
 
 use crate::{
-    AuthorizationEpoch, ProductCommitReceipt, ProductDurability, ProductExplicitTransactionStatus,
-    ProductPreparedStatement, ProductTransactionHandle,
+    AuthenticatedAuthority, AuthorizationEpoch, ProductCommitReceipt, ProductDurability,
+    ProductError, ProductErrorCode, ProductExplicitTransactionStatus, ProductPreparedStatement,
+    ProductTransactionHandle,
 };
 
 /// Maximum UTF-8 bytes in one product principal identity.
@@ -246,6 +250,7 @@ pub struct ProductSession {
     principal: ProductPrincipal,
     authorization: ProductAuthorization,
     authorization_epoch: AuthorizationEpoch,
+    authority: ProductSessionAuthority,
     prepared: BTreeMap<ProductPreparedHandle, ProductPreparedStatement>,
     next_prepared: u64,
     maximum_prepared: usize,
@@ -259,8 +264,17 @@ pub struct ProductSession {
     maximum_active_transactions: usize,
 }
 
+#[derive(Debug)]
+enum ProductSessionAuthority {
+    Unmanaged,
+    Managed(RwLock<Arc<AuthenticatedAuthority>>),
+}
+
 impl ProductSession {
-    /// Creates one direct embedded session with default retention bounds.
+    /// Creates one explicitly unmanaged embedded session with default bounds.
+    ///
+    /// The caller is the trusted local authority. Remote adapters must use an
+    /// authenticated session and must not derive permissions from peer input.
     pub fn new(
         id: ProductSessionId,
         principal: ProductPrincipal,
@@ -269,7 +283,7 @@ impl ProductSession {
         Self::new_at_epoch(id, principal, authorization, AuthorizationEpoch::UNMANAGED)
     }
 
-    /// Creates one direct embedded session at a durable authorization epoch.
+    /// Creates one explicitly unmanaged embedded session at a caller epoch.
     pub fn new_at_epoch(
         id: ProductSessionId,
         principal: ProductPrincipal,
@@ -287,6 +301,20 @@ impl ProductSession {
         )
     }
 
+    /// Creates one managed embedded session from an unforgeable authority.
+    ///
+    /// Every dispatched operation revalidates the authority against the
+    /// current durable catalog and trusted wall clock.
+    pub fn new_authenticated(id: ProductSessionId, authority: AuthenticatedAuthority) -> Self {
+        Self::with_authenticated_limits(
+            id,
+            authority,
+            DEFAULT_PRODUCT_PREPARED_HANDLES,
+            DEFAULT_PRODUCT_TRANSACTION_STATUSES,
+            DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
+        )
+    }
+
     pub(crate) fn with_limits(
         id: ProductSessionId,
         principal: ProductPrincipal,
@@ -296,11 +324,60 @@ impl ProductSession {
         maximum_transactions: usize,
         maximum_active_transactions: usize,
     ) -> Self {
+        Self::with_limits_and_authority(
+            id,
+            principal,
+            authorization,
+            authorization_epoch,
+            None,
+            maximum_prepared,
+            maximum_transactions,
+            maximum_active_transactions,
+        )
+    }
+
+    pub(crate) fn with_authenticated_limits(
+        id: ProductSessionId,
+        authority: AuthenticatedAuthority,
+        maximum_prepared: usize,
+        maximum_transactions: usize,
+        maximum_active_transactions: usize,
+    ) -> Self {
+        Self::with_limits_and_authority(
+            id,
+            authority.principal().clone(),
+            authority.authorization(),
+            authority.authorization_epoch(),
+            Some(authority),
+            maximum_prepared,
+            maximum_transactions,
+            maximum_active_transactions,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor centralizes every bounded session field"
+    )]
+    fn with_limits_and_authority(
+        id: ProductSessionId,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
+        authenticated_authority: Option<AuthenticatedAuthority>,
+        maximum_prepared: usize,
+        maximum_transactions: usize,
+        maximum_active_transactions: usize,
+    ) -> Self {
         Self {
             id,
             principal,
             authorization,
             authorization_epoch,
+            authority: authenticated_authority
+                .map_or(ProductSessionAuthority::Unmanaged, |value| {
+                    ProductSessionAuthority::Managed(RwLock::new(Arc::new(value)))
+                }),
             prepared: BTreeMap::new(),
             next_prepared: 1,
             maximum_prepared,
@@ -333,6 +410,40 @@ impl ProductSession {
     /// Returns the durable authorization generation bound at authentication.
     pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
         self.authorization_epoch
+    }
+
+    pub(crate) fn authenticated_authority(
+        &self,
+    ) -> Result<Option<Arc<AuthenticatedAuthority>>, ProductError> {
+        match &self.authority {
+            ProductSessionAuthority::Unmanaged => Ok(None),
+            ProductSessionAuthority::Managed(authority) => authority
+                .read()
+                .map(|authority| Some(Arc::clone(&authority)))
+                .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable)),
+        }
+    }
+
+    pub(crate) fn refresh_authenticated_authority(
+        &self,
+        authority: Arc<AuthenticatedAuthority>,
+    ) -> Result<(), ProductError> {
+        match &self.authority {
+            ProductSessionAuthority::Unmanaged => {
+                Err(ProductError::from_code(ProductErrorCode::Internal))
+            }
+            ProductSessionAuthority::Managed(cached) => {
+                *cached
+                    .write()
+                    .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))? =
+                    authority;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        matches!(self.authority, ProductSessionAuthority::Managed(_))
     }
 
     pub(crate) fn retain_prepared(
@@ -449,6 +560,24 @@ impl ProductSession {
         handle: ProductTransactionHandle,
     ) -> Option<ActiveProductTransaction> {
         self.active_transactions.remove(&handle)
+    }
+
+    pub(crate) fn rollback_active_transaction_after_authority_loss(
+        &mut self,
+        handle: ProductTransactionHandle,
+    ) {
+        let Some(transaction) = self.active_transactions.remove(&handle) else {
+            return;
+        };
+        let discarded_operations = transaction.staged_operations;
+        transaction.batch.rollback();
+        self.record_explicit_status(
+            handle,
+            ProductExplicitTransactionStatus::RolledBack {
+                handle,
+                discarded_operations,
+            },
+        );
     }
 
     pub(crate) fn record_explicit_status(

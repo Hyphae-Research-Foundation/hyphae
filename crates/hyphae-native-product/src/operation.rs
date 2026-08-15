@@ -543,7 +543,18 @@ pub(crate) fn dispatch(
     operation: ProductOperation,
 ) -> Result<ProductResponse, ProductError> {
     let telemetry = product.telemetry.clone();
-    let admitted = record_admission(&telemetry, session, context, &operation);
+    let rollback_on_authority_loss = session.is_managed()
+        && validate_context(session, context).is_ok()
+        && matches!(operation, ProductOperation::TransactionCommit { .. });
+    let admitted = record_admission(product, &telemetry, session, context, &operation);
+    if rollback_on_authority_loss
+        && admitted
+            .as_ref()
+            .is_err_and(|error| error.code() == ProductErrorCode::AuthorizationDenied)
+        && let ProductOperation::TransactionCommit { handle } = &operation
+    {
+        session.rollback_active_transaction_after_authority_loss(*handle);
+    }
     let result = admitted.and_then(|()| {
         let execution_started = Instant::now();
         let result = dispatch_inner(product, session, context, operation);
@@ -554,6 +565,7 @@ pub(crate) fn dispatch(
 }
 
 fn record_admission(
+    product: &NativeProduct,
     telemetry: &TelemetryRegistry,
     session: &ProductSession,
     context: &ProductRequestContext,
@@ -561,7 +573,7 @@ fn record_admission(
 ) -> Result<(), ProductError> {
     let admission_started = Instant::now();
     telemetry.increment(MetricId::Requests, 1);
-    let admitted = admit_operation(session, context, operation);
+    let admitted = admit_operation(product, session, context, operation);
     telemetry.record_timing(TimingClass::Admission, admission_started.elapsed());
     admitted
 }
@@ -609,7 +621,7 @@ pub(crate) fn dispatch_structure_get_read_only(
         return Err(context.error(ProductErrorCode::InvalidRequest));
     };
     let telemetry = product.telemetry.clone();
-    let admitted = record_admission(&telemetry, session, context, operation);
+    let admitted = record_admission(product, &telemetry, session, context, operation);
     let result = admitted.and_then(|()| {
         let execution_started = Instant::now();
         let result = (|| {
@@ -1076,16 +1088,15 @@ fn dispatch_inner(
 }
 
 fn admit_operation(
+    product: &NativeProduct,
     session: &ProductSession,
     context: &ProductRequestContext,
     operation: &ProductOperation,
 ) -> Result<(), ProductError> {
     validate_context(session, context)?;
+    let effective_authorization = validate_durable_authority(product, session)?;
     context.checkpoint()?;
-    if !context
-        .authorization
-        .allows_all(operation.required_permissions()?)
-    {
+    if !effective_authorization.allows_all(operation.required_permissions()?) {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
     if operation_uses_internal_structure_namespace(operation) {
@@ -1099,6 +1110,32 @@ fn admit_operation(
         context.limits.admit_response(count, bytes, bytes)?;
     }
     Ok(())
+}
+
+fn validate_durable_authority(
+    product: &NativeProduct,
+    session: &ProductSession,
+) -> Result<ProductAuthorization, ProductError> {
+    let Some(bound) = session.authenticated_authority()? else {
+        return Ok(session.authorization());
+    };
+    let current = product.revalidate_authenticated_authority(Arc::clone(&bound))?;
+    if !Arc::ptr_eq(&bound, &current) {
+        session.refresh_authenticated_authority(Arc::clone(&current))?;
+    }
+    if !current
+        .scope_ceiling()
+        .contains(&crate::ProductScope::Instance)
+    {
+        return Ok(ProductAuthorization::NONE);
+    }
+    Ok(current
+        .scoped_authorization()
+        .iter()
+        .filter(|scoped| scoped.scope == crate::ProductScope::Instance)
+        .fold(ProductAuthorization::NONE, |authorization, scoped| {
+            authorization.union(scoped.authorization)
+        }))
 }
 
 fn operation_uses_internal_structure_namespace(operation: &ProductOperation) -> bool {
