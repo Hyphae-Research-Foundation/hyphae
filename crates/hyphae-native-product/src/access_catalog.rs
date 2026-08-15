@@ -5832,15 +5832,12 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::{
-            Foundation::GENERIC_WRITE,
-            Storage::FileSystem::{READ_CONTROL, WRITE_DAC},
-        };
+        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
 
         // An exclusive handle prevents another process from acquiring the
         // inherited ACL before the protected DACL is installed and verified.
         options
-            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .access_mode(GENERIC_WRITE | READ_CONTROL)
             .share_mode(0);
     }
     #[allow(unused_mut)]
@@ -5848,7 +5845,7 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
         .open(path)
         .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
     #[cfg(windows)]
-    if apply_windows_restricted_acl(&mut file).is_err()
+    if apply_windows_restricted_acl(path).is_err()
         || validate_windows_restricted_file(&file).is_err()
     {
         drop(file);
@@ -5878,29 +5875,38 @@ fn is_windows_named_stream(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn apply_windows_restricted_acl(file: &mut File) -> std::io::Result<()> {
+fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{SeObjectType, SecurityInformation},
         utilities, wrappers,
     };
 
-    let current_user = utilities::current_process_sid()?;
-    let current_user = current_user.to_string();
+    let current_user_sid = utilities::current_process_sid()?;
+    let current_user = current_user_sid.to_string();
     let system = "S-1-5-18";
     let sddl = if current_user == system {
-        format!("O:{system}D:P(A;;FA;;;{system})")
+        format!("D:P(A;;FA;;;{system})")
     } else {
-        format!("O:{current_user}D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
+        format!("D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
     };
     let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
-    wrappers::SetSecurityInfo(
-        file,
+    wrappers::SetNamedSecurityInfo(
+        path.as_os_str(),
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
         None,
         descriptor.dacl(),
+        None,
+    )?;
+    wrappers::SetNamedSecurityInfo(
+        path.as_os_str(),
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner,
+        Some(current_user_sid.as_ref()),
+        None,
+        None,
         None,
     )
 }
@@ -6825,18 +6831,16 @@ mod tests {
 
         let path = temporary_directory().with_extension("key");
         remove_test_files(&[&path]);
-        let mut file = create_restricted_output(&path)?;
+        let file = create_restricted_output(&path)?;
         let current_user = utilities::current_process_sid()?.to_string();
         let descriptor: LocalBox<SecurityDescriptor> =
             format!("O:{current_user}D:P(A;;FA;;;{current_user})(A;;FA;;;SY)(A;;FR;;;WD)")
                 .parse()?;
-        wrappers::SetSecurityInfo(
-            &mut file,
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
             SeObjectType::SE_FILE_OBJECT,
-            SecurityInformation::Owner
-                | SecurityInformation::Dacl
-                | SecurityInformation::ProtectedDacl,
-            descriptor.owner(),
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
             None,
             descriptor.dacl(),
             None,
