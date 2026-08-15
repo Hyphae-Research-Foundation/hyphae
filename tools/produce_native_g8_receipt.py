@@ -32,6 +32,8 @@ CHECKPOINT_BOUNDARIES = {
 SNAPSHOT_PIN_BOUNDARIES = {"record-synchronized", "record-published"}
 PROMOTION_BOUNDARIES = {"before-rename", "marker-renamed", "parent-synchronized"}
 SOFTWARE_LICENSE = "AGPL-3.0-only"
+FIRST_PARTY_ARTIFACT_COUNT = 79
+FIRST_PARTY_IDENTITY_COUNT = 33
 
 
 def is_hyphae_component(name: object) -> bool:
@@ -426,8 +428,8 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
         or payload.get("software_license") != SOFTWARE_LICENSE
         or payload.get("license_authority")
         != "tracked-package-manifests-and-local-locks-v1"
-        or payload.get("first_party_artifact_count") != 78
-        or payload.get("first_party_identity_count") != 32
+        or payload.get("first_party_artifact_count") != FIRST_PARTY_ARTIFACT_COUNT
+        or payload.get("first_party_identity_count") != FIRST_PARTY_IDENTITY_COUNT
         or not is_canonical_component_list(spdx_components)
         or not is_canonical_component_list(cyclonedx_components)
         or not isinstance(payload.get("provenance_targets"), list)
