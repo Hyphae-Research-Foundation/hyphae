@@ -1,0 +1,130 @@
+{
+  "authentication_denial": [
+    {"case": "expired", "error": {"category": "authorization", "code": "authorization_denied", "details": [], "message": "native product operation is not authorized", "retry": "never", "transaction_state": "none"}},
+    {"case": "malformed", "error": {"category": "authorization", "code": "authorization_denied", "details": [], "message": "native product operation is not authorized", "retry": "never", "transaction_state": "none"}},
+    {"case": "missing", "error": {"category": "authorization", "code": "authorization_denied", "details": [], "message": "native product operation is not authorized", "retry": "never", "transaction_state": "none"}},
+    {"case": "revoked", "error": {"category": "authorization", "code": "authorization_denied", "details": [], "message": "native product operation is not authorized", "retry": "never", "transaction_state": "none"}},
+    {"case": "wrong", "error": {"category": "authorization", "code": "authorization_denied", "details": [], "message": "native product operation is not authorized", "retry": "never", "transaction_state": "none"}}
+  ],
+  "digests": {
+    "authentication_error_sha256": "f4a894f0909b4c1ba6a07b51e889f8b682f8cb023d6d6866040e4d124796817c",
+    "authority_contract_sha256": "e1e54a6a7bd78faf944bb9a23fd1772d28717967c59061f387dca5f9adacf007",
+    "operation_matrix_sha256": "9068f742846f4bc1e818aac057e3349f9964b0d495c86a68ab852d425b20aeb6",
+    "role_matrix_sha256": "4eae42035b97dca29157d2607ec6ba8546a6cda594e4d0e91a10ba1a288768d1",
+    "security_read_page_responses_blake3": "67c752f3f510e5b4805e097b284b2ef70fd308fa71dd0778aafc42acdf24dfe8",
+    "security_write_requests_blake3": "94b3aade7ed46f3608da3b30a5516db04a7de0e9013b33ebb3752162f17f1afc",
+    "security_write_responses_blake3": "797963aee6cc4aa65f38b40e08c82a2ff63e71f1e96ef28e2466bc3862e0ce34"
+  },
+  "evidence": [
+    {
+      "anchors": ["security_cursor_tokens_round_trip_canonically_and_fail_closed", "security_key_pages_are_structurally_redacted", "security_list_requests_reject_zero_and_one_past_the_limit"],
+      "command": "cargo test --locked -p hyphae-native-product --lib security_",
+      "covers": ["limits.audit", "limits.metadata", "pagination.audit", "pagination.metadata"],
+      "id": "access-catalog-pages",
+      "platforms": ["linux", "macos", "windows"],
+      "source": "crates/hyphae-native-product/src/access_catalog.rs"
+    },
+    {
+      "anchors": ["assert_audit_pages", "assert_key_pages", "assert_principal_pages", "assert_role_pages", "managed_security_reads_are_identical_and_revalidate_revocation"],
+      "command": "cargo test --locked -p hyphae-client --test v2_security_read_parity",
+      "covers": ["pagination.audit", "pagination.metadata", "revocation.next-operation", "security.assignment_list", "security.audit_read", "security.key_list", "security.principal_list", "security.role_list", "security.status"],
+      "id": "client-read-parity",
+      "platforms": ["linux", "macos"],
+      "source": "crates/hyphae-client/tests/v2_security_read_parity.rs"
+    },
+    {
+      "anchors": ["assert_missing_idempotency_rejected_before_client_dispatch", "assert_mutation_lifecycle", "managed_security_mutations_replay_across_local_and_http_and_reject_conflicts"],
+      "command": "cargo test --locked -p hyphae-client --test v2_security_write_parity",
+      "covers": ["digests.request", "security.assignment_create_built_in", "security.assignment_create_custom", "security.assignment_revoke", "security.custom_role_create", "security.principal_create", "security.principal_set_enabled"],
+      "id": "client-write-parity",
+      "platforms": ["linux", "macos"],
+      "source": "crates/hyphae-client/tests/v2_security_write_parity.rs"
+    },
+    {
+      "anchors": ["managed_missing_malformed_and_wrong_credentials_are_uniform", "managed_revocation_denies_the_next_operation_on_the_same_connection", "security_operations_require_their_minor_and_reject_retired_shapes_before_dispatch"],
+      "command": "cargo test --locked -p hyphae-native-daemon --test daemon_uds",
+      "covers": ["auth.malformed", "auth.missing", "auth.revoked", "auth.wrong", "protocol.minor-0-read", "protocol.minor-1-write", "revocation.next-operation"],
+      "id": "daemon-authority",
+      "platforms": ["linux", "macos"],
+      "source": "crates/hyphae-native-daemon/tests/daemon_uds.rs"
+    },
+    {
+      "anchors": ["managed_named_pipe_authenticates_and_revalidates_revocation", "security_operations_require_their_minor_on_named_pipes"],
+      "command": "cargo test --locked -p hyphae-native-daemon --test daemon_windows",
+      "covers": ["auth.missing", "auth.revoked", "protocol.minor-0-read", "protocol.minor-1-write", "revocation.next-operation"],
+      "id": "daemon-windows-authority",
+      "platforms": ["windows"],
+      "source": "crates/hyphae-native-daemon/tests/daemon_windows.rs"
+    },
+    {
+      "anchors": ["managed_session_expires_without_an_epoch_change", "managed_session_revalidates_revocation_on_fast_reads"],
+      "command": "cargo test --locked -p hyphae-native-product --lib managed_session_",
+      "covers": ["auth.expired", "auth.malformed", "auth.revoked", "auth.wrong"],
+      "id": "product-authentication",
+      "platforms": ["linux", "macos", "windows"],
+      "source": "crates/hyphae-native-product/src/service.rs"
+    },
+    {
+      "anchors": ["built_in_role_matrix_partitions_every_managed_security_write"],
+      "command": "cargo test --locked -p hyphae-native-product --test security_write_plane built_in_role_matrix_partitions_every_managed_security_write",
+      "covers": ["roles.allow-deny"],
+      "id": "product-role-matrix",
+      "platforms": ["linux", "macos", "windows"],
+      "source": "crates/hyphae-native-product/tests/security_write_plane.rs"
+    },
+    {
+      "anchors": ["security_read_plane_nonempty_pages_have_a_redacted_golden_contract", "security_write_plane_requires_minor_two_and_nonzero_context_idempotency", "security_write_plane_responses_use_minor_two_append_only_tags_and_redacted_goldens"],
+      "command": "cargo test --locked -p hyphae-native-protocol --test golden_vectors security_",
+      "covers": ["digests.request", "protocol.minor-0-write", "redaction.security-metadata"],
+      "id": "protocol-wire",
+      "platforms": ["linux", "macos", "windows"],
+      "source": "crates/hyphae-native-protocol/tests/golden_vectors.rs"
+    }
+  ],
+  "limits": {
+    "audit_result_rows": 1000,
+    "authentication_verifiers_per_request": 1,
+    "security_idempotency_records_per_shard": 64,
+    "security_idempotency_shards": 64,
+    "security_result_rows": 1000
+  },
+  "operations": [
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.assignment_create_built_in", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityBuiltInAssignmentCreate"},
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.assignment_create_custom", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityCustomAssignmentCreate"},
+    {"allowed_roles": ["admin", "auditor", "owner"], "denied_roles": ["developer", "operator", "reader", "writer"], "id": "security.assignment_list", "kind": "read", "minimum_minor": 1, "permission": "security.read", "scope": "instance", "source_variant": "SecurityAssignmentList"},
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.assignment_revoke", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityAssignmentRevoke"},
+    {"allowed_roles": ["admin", "auditor", "operator", "owner"], "denied_roles": ["developer", "reader", "writer"], "id": "security.audit_read", "kind": "read", "minimum_minor": 1, "permission": "audit.read", "scope": "instance", "source_variant": "SecurityAuditRead"},
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.custom_role_create", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityCustomRoleCreate"},
+    {"allowed_roles": ["admin", "auditor", "owner"], "denied_roles": ["developer", "operator", "reader", "writer"], "id": "security.key_list", "kind": "read", "minimum_minor": 1, "permission": "security.read", "scope": "instance", "source_variant": "SecurityKeyList"},
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.principal_create", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityPrincipalCreate"},
+    {"allowed_roles": ["admin", "auditor", "owner"], "denied_roles": ["developer", "operator", "reader", "writer"], "id": "security.principal_list", "kind": "read", "minimum_minor": 1, "permission": "security.read", "scope": "instance", "source_variant": "SecurityPrincipalList"},
+    {"allowed_roles": ["admin", "owner"], "denied_roles": ["auditor", "developer", "operator", "reader", "writer"], "id": "security.principal_set_enabled", "kind": "write", "minimum_minor": 2, "permission": "security.manage", "scope": "instance", "source_variant": "SecurityPrincipalSetEnabled"},
+    {"allowed_roles": ["admin", "auditor", "owner"], "denied_roles": ["developer", "operator", "reader", "writer"], "id": "security.role_list", "kind": "read", "minimum_minor": 1, "permission": "security.read", "scope": "instance", "source_variant": "SecurityRoleList"},
+    {"allowed_roles": ["admin", "auditor", "owner"], "denied_roles": ["developer", "operator", "reader", "writer"], "id": "security.status", "kind": "read", "minimum_minor": 1, "permission": "security.read", "scope": "instance", "source_variant": "SecurityStatus"}
+  ],
+  "pagination": {
+    "audit": {"cursor": "retained_event_id", "deterministic": true, "limit": 1000, "operation": "security.audit_read", "outside_retention_error": "invalid_request"},
+    "metadata": {"cursor": "authorization_epoch+after_id", "deterministic": true, "limit": 1000, "operations": ["security.assignment_list", "security.key_list", "security.principal_list", "security.role_list"], "stale_cursor_error": "catalog_conflict"}
+  },
+  "protocol": {
+    "current_major": 1,
+    "current_minor": 2,
+    "rejections_before_dispatch": [
+      {"case": "minor-0-read", "dispatch_reached": false, "error_code": "invalid_request", "minor": 0, "operation_kind": "read"},
+      {"case": "minor-0-write", "dispatch_reached": false, "error_code": "invalid_request", "minor": 0, "operation_kind": "write"},
+      {"case": "minor-1-write", "dispatch_reached": false, "error_code": "invalid_request", "minor": 1, "operation_kind": "write"}
+    ]
+  },
+  "redaction": {"forbidden_fields": ["api_key", "secret", "serialized", "verifier", "verifier_digest"], "key_summary_is_secret_free": true, "wire_is_redacted": true},
+  "revocation": {"connection_reuse": "same-connection", "effective": "next-operation", "error_code": "authorization_denied", "reconnect_required": false},
+  "role_matrix": {
+    "admin": {"read": "allow", "write": "allow"},
+    "auditor": {"read": "allow", "write": "deny"},
+    "developer": {"read": "deny", "write": "deny"},
+    "operator": {"read": "audit-only", "write": "deny"},
+    "owner": {"read": "allow", "write": "allow"},
+    "reader": {"read": "deny", "write": "deny"},
+    "writer": {"read": "deny", "write": "deny"}
+  },
+  "schema": "hyphae-native-v2-authority-cases-v1"
+}

@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from .http import HttpTransport
 from .local import LocalTransport
-from .models import RequestOptions, Response
+from .models import ClientError, RequestOptions, Response
 
 
 class Transport(Protocol):
@@ -21,8 +21,26 @@ class HyphaeClient:
         self._transport = transport
 
     @classmethod
-    def local(cls, endpoint: str, *, client_identity: str = "hyphae-python-sdk-v2") -> HyphaeClient:
-        return cls(LocalTransport(endpoint, client_identity=client_identity))
+    def local(
+        cls,
+        endpoint: str,
+        *,
+        client_identity: str = "hyphae-python-sdk-v2",
+        api_key: str | None = None,
+    ) -> HyphaeClient:
+        return cls(LocalTransport(endpoint, client_identity=client_identity, api_key=api_key))
+
+    @classmethod
+    def local_authenticated(
+        cls,
+        endpoint: str,
+        api_key: str,
+        *,
+        client_identity: str = "hyphae-python-sdk-v2",
+    ) -> HyphaeClient:
+        """Open a managed local session using the Native HELLO credential trailer."""
+
+        return cls.local(endpoint, client_identity=client_identity, api_key=api_key)
 
     @classmethod
     def http(cls, base_url: str, **kwargs: Any) -> HyphaeClient:
@@ -35,6 +53,28 @@ class HyphaeClient:
         close = getattr(self._transport, "close", None)
         if close is not None:
             close()
+
+    def __enter__(self) -> HyphaeClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def _execute_expected(
+        self,
+        operation: str,
+        expected_kind: str,
+        arguments: dict[str, object] | None = None,
+        *,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        response = self.execute(operation, arguments, options=options)
+        if response.kind != expected_kind:
+            raise ClientError(
+                f"{operation} returned unexpected response kind {response.kind}"
+            )
+        return response
 
     def capabilities(self, *, options: RequestOptions | None = None) -> Response:
         return self.execute("capabilities", options=options)
@@ -163,6 +203,173 @@ class HyphaeClient:
             {"idempotency_token": idempotency_token},
             options=options,
         )
+
+    def security_status(self, *, options: RequestOptions | None = None) -> Response:
+        return self._execute_expected(
+            "security_status", "security_status", options=options
+        )
+
+    def security_principal_list(
+        self,
+        *,
+        cursor: dict[str, object] | None = None,
+        limit: int = 1_000,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        return self._execute_expected(
+            "security_principal_list",
+            "security_principal_page",
+            {"cursor": cursor, "limit": limit},
+            options=options,
+        )
+
+    def security_role_list(
+        self,
+        *,
+        cursor: dict[str, object] | None = None,
+        limit: int = 1_000,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        return self._execute_expected(
+            "security_role_list",
+            "security_role_page",
+            {"cursor": cursor, "limit": limit},
+            options=options,
+        )
+
+    def security_assignment_list(
+        self,
+        *,
+        cursor: dict[str, object] | None = None,
+        limit: int = 1_000,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        return self._execute_expected(
+            "security_assignment_list",
+            "security_assignment_page",
+            {"cursor": cursor, "limit": limit},
+            options=options,
+        )
+
+    def security_key_list(
+        self,
+        *,
+        cursor: dict[str, object] | None = None,
+        limit: int = 1_000,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        """Return redacted API-key metadata; secrets and verifiers are absent."""
+
+        return self._execute_expected(
+            "security_key_list",
+            "security_key_page",
+            {"cursor": cursor, "limit": limit},
+            options=options,
+        )
+
+    def security_audit_read(
+        self,
+        *,
+        cursor: int | None = None,
+        limit: int = 1_000,
+        options: RequestOptions | None = None,
+    ) -> Response:
+        return self._execute_expected(
+            "security_audit_read",
+            "security_audit_page",
+            {"cursor": cursor, "limit": limit},
+            options=options,
+        )
+
+    def security_principal_create(
+        self,
+        display_name: str,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_principal_create",
+            "security_principal_mutated",
+            {"display_name": display_name},
+            options=_security_mutation_options(options),
+        )
+
+    def security_principal_set_enabled(
+        self,
+        principal_id: int,
+        enabled: bool,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_principal_set_enabled",
+            "security_mutated",
+            {"principal_id": principal_id, "enabled": enabled},
+            options=_security_mutation_options(options),
+        )
+
+    def security_custom_role_create(
+        self,
+        display_name: str,
+        grants: list[dict[str, object]],
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_custom_role_create",
+            "security_custom_role_mutated",
+            {"display_name": display_name, "grants": grants},
+            options=_security_mutation_options(options),
+        )
+
+    def security_built_in_assignment_create(
+        self,
+        principal_id: int,
+        role: str,
+        scope: dict[str, object],
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_built_in_assignment_create",
+            "security_assignment_mutated",
+            {"principal_id": principal_id, "role": role, "scope": scope},
+            options=_security_mutation_options(options),
+        )
+
+    def security_custom_assignment_create(
+        self,
+        principal_id: int,
+        role_id: int,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_custom_assignment_create",
+            "security_assignment_mutated",
+            {"principal_id": principal_id, "role_id": role_id},
+            options=_security_mutation_options(options),
+        )
+
+    def security_assignment_revoke(
+        self,
+        assignment_id: int,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_assignment_revoke",
+            "security_mutated",
+            {"assignment_id": assignment_id},
+            options=_security_mutation_options(options),
+        )
+
+
+def _security_mutation_options(options: RequestOptions) -> RequestOptions:
+    token = options.idempotency_token
+    if isinstance(token, bool) or not isinstance(token, int) or not 0 < token < 1 << 128:
+        raise ClientError("security mutation requires a nonzero idempotency_token")
+    return options
 
 
 __all__ = ["HyphaeClient", "Transport"]

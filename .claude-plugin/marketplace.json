@@ -11,8 +11,8 @@
     {
       "name": "hyphae",
       "source": "./plugins/hyphae",
-      "description": "Bounded proof-bearing access to a local Hyphae data engine.",
-      "version": "0.1.0",
+      "description": "Bounded read-only Native v2 access with an Instance-scoped Auditor API key.",
+      "version": "0.2.0",
       "category": "development",
       "tags": ["database", "sql", "search", "rag", "mcp"]
     }

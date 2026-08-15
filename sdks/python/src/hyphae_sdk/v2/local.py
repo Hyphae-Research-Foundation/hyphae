@@ -12,8 +12,11 @@ from typing import BinaryIO
 
 from .models import ClientError, ProductError, RequestOptions, Response, product_error
 from .protocol import (
+    API_KEY_AUTH_CAPABILITY,
     FRAME_HEADER_SIZE,
     FRAME_KINDS,
+    G6_CAPABILITIES,
+    PROTOCOL_MINOR,
     blake3,
     decode_end,
     decode_frame,
@@ -21,6 +24,7 @@ from .protocol import (
     decode_product_response,
     decode_welcome,
     encode_cancel,
+    encode_authenticated_hello,
     encode_frame,
     encode_hello,
     encode_product_request,
@@ -34,21 +38,65 @@ _MAXIMUM_FRAME_PAYLOAD = 16 * 1024 * 1024
 class LocalTransport:
     """Exact local byte-stream transport with no wrapper protocol."""
 
-    def __init__(self, endpoint: str, *, client_identity: str = "hyphae-python-sdk-v2") -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        client_identity: str = "hyphae-python-sdk-v2",
+        api_key: str | None = None,
+    ) -> None:
         if not endpoint:
             raise ClientError("local endpoint must not be empty")
         if not client_identity or len(client_identity.encode()) > 4096:
             raise ClientError("local client identity is invalid")
+        credential: bytearray | None = None
+        if api_key is not None:
+            encode_authenticated_hello(api_key, client_identity)
+            credential = bytearray(api_key, "utf-8")
         self._endpoint = _windows_pipe_namespace(endpoint) if os.name == "nt" else endpoint
         self._client_identity = client_identity
+        self._managed = credential is not None
+        self._api_key = credential
+        self._closed = False
         self._stream: socket.socket | BinaryIO | None = None
         self._lock = threading.Lock()
         self._next_stream_id = 1
         self._initial_window = 64 * 1024
         self._maximum_frame_payload = _MAXIMUM_FRAME_PAYLOAD
+        self._negotiated_minor: int | None = None
+
+    def __repr__(self) -> str:
+        authentication = "managed" if self._managed else "unmanaged"
+        return f"LocalTransport(endpoint={self._endpoint!r}, authentication={authentication!r})"
+
+    def __enter__(self) -> LocalTransport:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def __del__(self) -> None:
+        stream = getattr(self, "_stream", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        api_key = getattr(self, "_api_key", None)
+        if api_key is not None:
+            api_key[:] = b"\0" * len(api_key)
+
+    @property
+    def negotiated_minor(self) -> int | None:
+        """Minor selected by the server after the first operation."""
+
+        return self._negotiated_minor
 
     def execute(self, operation: str, arguments: dict[str, object], options: RequestOptions) -> Response:
         with self._lock:
+            if self._closed:
+                raise ClientError("local transport is closed")
             request_id = options.checked_request_id()
             if options.cancellation.cancelled:
                 raise product_error("cancelled", request_id)
@@ -57,7 +105,13 @@ class LocalTransport:
             assert self._stream is not None
             stream_id = self._next_stream_id
             self._next_stream_id = self._next_stream_id % 0xFFFFFFFF + 1
-            payload = encode_product_request(operation, arguments, options)
+            assert self._negotiated_minor is not None
+            payload = encode_product_request(
+                operation,
+                arguments,
+                options,
+                negotiated_minor=self._negotiated_minor,
+            )
             frame_kind = FRAME_KINDS["prepare"] if operation == "sql_prepare" else FRAME_KINDS["deallocate"] if operation == "sql_deallocate" else FRAME_KINDS["execute"]
             self._write(encode_frame(frame_kind, stream_id, request_id, payload))
             provisional = bytearray()
@@ -66,17 +120,17 @@ class LocalTransport:
             while True:
                 if options.cancellation.cancelled:
                     self._write(encode_frame(FRAME_KINDS["cancel"], stream_id, request_id, encode_cancel()))
-                    self.close()
+                    self._disconnect()
                     raise product_error("cancelled", request_id)
                 try:
                     self._check_deadline(options)
                 except ProductError:
                     self._write(encode_frame(FRAME_KINDS["cancel"], stream_id, request_id, encode_cancel(2)))
-                    self.close()
+                    self._disconnect()
                     raise
                 frame = self._read_frame(options)
                 if frame.stream_id != stream_id or frame.request_id != request_id:
-                    self.close()
+                    self._disconnect()
                     raise ClientError("local response correlation mismatch")
                 if frame.kind == FRAME_KINDS["failure"]:
                     raise ProductError(decode_product_error(frame.payload))
@@ -93,12 +147,24 @@ class LocalTransport:
                     total, digest = decode_end(frame.payload)
                     if total != len(provisional) or digest != blake3(provisional):
                         raise ClientError("local provisional response completion mismatch")
-                    return decode_product_response(bytes(provisional), request_id)
-                self.close()
+                    return decode_product_response(
+                        bytes(provisional),
+                        request_id,
+                        negotiated_minor=self._negotiated_minor,
+                    )
+                self._disconnect()
                 raise ClientError("local server returned an invalid response frame")
 
     def close(self) -> None:
+        self._disconnect()
+        self._closed = True
+        if self._api_key is not None:
+            self._api_key[:] = b"\0" * len(self._api_key)
+            self._api_key = None
+
+    def _disconnect(self) -> None:
         stream, self._stream = self._stream, None
+        self._negotiated_minor = None
         if stream is not None:
             try:
                 stream.close()
@@ -114,20 +180,34 @@ class LocalTransport:
                 stream.connect(self._endpoint)
                 stream.settimeout(0.05)
                 self._stream = stream
-            self._write(encode_frame(FRAME_KINDS["hello"], 0, request_id, encode_hello(self._client_identity)))
+            hello = (
+                encode_hello(self._client_identity)
+                if not self._managed
+                else encode_authenticated_hello(
+                    self._api_key or b"",
+                    self._client_identity,
+                    maximum_minor=PROTOCOL_MINOR,
+                )
+            )
+            self._write(encode_frame(FRAME_KINDS["hello"], 0, request_id, hello))
             frame = self._read_frame(RequestOptions(request_id=request_id))
             if frame.kind == FRAME_KINDS["failure"]:
                 raise ProductError(decode_product_error(frame.payload))
             if frame.kind != FRAME_KINDS["welcome"] or frame.stream_id != 0 or frame.request_id != request_id:
                 raise ClientError("local handshake response mismatch")
             welcome = decode_welcome(frame.payload)
+            if welcome["capabilities"] & G6_CAPABILITIES != G6_CAPABILITIES:
+                raise ClientError("local server omitted required Native capabilities")
+            if self._managed and not welcome["capabilities"] & API_KEY_AUTH_CAPABILITY:
+                raise ClientError("local server downgraded managed API-key authentication")
+            self._negotiated_minor = welcome["minor"]
             self._initial_window = welcome["initial_window"]
             maximum_frame_payload = welcome["maximum_frame_payload"]
             if not 0 < maximum_frame_payload <= _MAXIMUM_FRAME_PAYLOAD:
                 raise ClientError("local handshake frame limit is invalid")
             self._maximum_frame_payload = maximum_frame_payload
         except BaseException:
-            self.close()
+            self._disconnect()
             raise
 
     def _read_frame(self, options: RequestOptions):  # type: ignore[no-untyped-def]
@@ -152,10 +232,10 @@ class LocalTransport:
             except socket.timeout:
                 continue
             except OSError as error:
-                self.close()
+                self._disconnect()
                 raise ClientError("native-local transport failed") from error
             if not chunk:
-                self.close()
+                self._disconnect()
                 raise ClientError("native-local stream closed before completion")
             output.extend(chunk)
         return bytes(output)
@@ -172,7 +252,7 @@ class LocalTransport:
             else:
                 _write_all(self._stream, encoded)
         except OSError as error:
-            self.close()
+            self._disconnect()
             raise ClientError("native-local transport failed") from error
 
     @staticmethod

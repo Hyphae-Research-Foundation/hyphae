@@ -7,13 +7,21 @@ host-specific tool implementation.
 ## Prerequisites
 
 1. Install the exact `hyphae` binary and ensure it is on `PATH`.
-2. Start a local format-2 HTTP service on `http://127.0.0.1:8787`.
-3. If authentication is enabled, set `HYPHAE_BEARER_TOKEN_FILE` to a
-   restricted credential file before starting the agent host.
+2. Start a bootstrapped Native HTTP v2 service on `http://127.0.0.1:8787`.
+3. Assign the built-in Auditor role at Instance scope and set
+   `HYPHAE_NATIVE_API_KEY_FILE` to its restricted API-key file before starting
+   the agent host. The inherited variable contains a path, never the credential
+   value.
 
-The first plugin version intentionally targets the shipped `/v1` MCP contract.
-The Native v2/RBAC MCP migration remains an explicit 1.2.0 gate; this package
-does not pretend the legacy bearer is a Native role-scoped API key.
+The checked-in plugin uses plaintext only at the canonical loopback origin.
+If `--base-url` is overridden for a remote service, it must be an `https://`
+origin; the MCP adapter rejects remote plaintext before sending the key.
+
+The plugin targets the versioned Native HTTP v2/RBAC MCP contract. It exposes
+only three bounded read-only tools: capabilities, redacted security status, and a
+paginated redacted principal list. The API key's durable roles remain the sole
+authority; prompt text cannot select a role or widen its permissions. Legacy
+bearers and MCP writes are not accepted.
 
 ## Codex
 

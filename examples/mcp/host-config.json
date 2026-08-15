@@ -5,7 +5,9 @@
       "args": [
         "mcp",
         "--base-url",
-        "http://127.0.0.1:8787"
+        "http://127.0.0.1:8787",
+        "--native-api-key-file",
+        "/absolute/path/to/restricted-auditor.key"
       ]
     }
   }

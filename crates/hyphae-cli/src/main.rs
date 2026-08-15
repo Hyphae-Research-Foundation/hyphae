@@ -315,12 +315,20 @@ enum Command {
         #[command(subcommand)]
         operation: compatibility::RemoteCommand,
     },
-    /// Run the shipped MCP stdio adapter over only the public `/v1` contract.
+    /// Run the bounded read-only MCP adapter over managed Native HTTP v2.
     Mcp {
         #[arg(long, env = "HYPHAE_BASE_URL")]
         base_url: String,
-        #[arg(long, env = "HYPHAE_BEARER_TOKEN_FILE")]
-        bearer_token_file: Option<PathBuf>,
+        /// Restricted file containing one durable Native API key.
+        #[arg(
+            long,
+            env = "HYPHAE_NATIVE_API_KEY_FILE",
+            conflicts_with = "native_api_key_stdin"
+        )]
+        native_api_key_file: Option<PathBuf>,
+        /// Read the Native API key from the first stdin line, then MCP messages.
+        #[arg(long, conflicts_with = "native_api_key_file")]
+        native_api_key_stdin: bool,
     },
 }
 
@@ -1611,8 +1619,15 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
         ),
         Command::Mcp {
             base_url,
-            bearer_token_file,
-        } => compatibility(compatibility::run_mcp(&base_url, bearer_token_file.as_deref()).await),
+            native_api_key_file,
+            native_api_key_stdin,
+        } => mcp::run(
+            &base_url,
+            native_api_key_file.as_deref(),
+            native_api_key_stdin,
+        )
+        .await
+        .map_err(Into::into),
     }
 }
 

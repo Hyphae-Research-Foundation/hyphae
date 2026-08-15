@@ -1,7 +1,7 @@
 {
   "name": "hyphae",
-  "version": "0.1.0",
-  "description": "Query and mutate a local Hyphae data engine through bounded, proof-bearing MCP tools.",
+  "version": "0.2.0",
+  "description": "Inspect a local Hyphae data engine through bounded Native v2 MCP tools.",
   "author": {
     "name": "Celiums Solutions LLC",
     "url": "https://hyphae.dev"
@@ -13,16 +13,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Hyphae",
-    "shortDescription": "Use a local proof-bearing data engine.",
-    "longDescription": "Give Codex bounded SQL, document, lexical, vector, and hybrid retrieval tools backed by one local Hyphae authority.",
+    "shortDescription": "Inspect a local Native Hyphae engine.",
+    "longDescription": "Give Codex bounded read-only Native v2 capability and security metadata tools backed by one durable Hyphae Instance-scoped Auditor API-key authority.",
     "developerName": "Celiums Solutions LLC",
     "category": "Developer Tools",
-    "capabilities": ["Read", "Write"],
+    "capabilities": ["Read"],
     "websiteURL": "https://hyphae.dev",
     "defaultPrompt": [
       "Inspect the capabilities of my local Hyphae instance.",
-      "Query Hyphae and explain the returned proof metadata.",
-      "Store this data in Hyphae after showing the mutation plan."
+      "Show the redacted security status and principals my API key can read."
     ],
     "brandColor": "#24D6A5"
   },

@@ -24,7 +24,8 @@ delete API v1 request files plus commands for `hyphae remote`.
 ## MCP host configuration
 
 [`mcp/host-config.json`](mcp/host-config.json) is a minimal host-neutral stdio
-configuration. The MCP process expects a separately running `/v1` server.
+configuration. The MCP process expects a separately running managed Native
+HTTP v2 service and a restricted durable API-key file.
 
 All JSON files are parsed by the documentation gate. The Rust example is
 compiled by workspace all-target Clippy/tests and run explicitly by the

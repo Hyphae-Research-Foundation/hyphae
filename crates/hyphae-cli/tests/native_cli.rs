@@ -15,7 +15,7 @@ use std::{
 use std::time::Instant;
 
 #[cfg(unix)]
-use hyphae_client::v2::{ClientError, HyphaeClient, RequestOptions};
+use hyphae_client::v2::{ClientError, HttpTransport, HyphaeClient, RequestOptions};
 use hyphae_native_product::proof::{
     AdmittedProofLimits, CanonicalBytes, CompletionStatus, NativeProof, NativeProofAnchor,
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
@@ -136,14 +136,37 @@ impl SecurityWriteFixture {
         principal_id: &str,
         destination: &Path,
     ) -> Result<String, Box<dyn Error>> {
+        self.issue_built_in_key(principal_id, destination, BuiltInRole::Reader, "reader-cli")
+    }
+
+    fn issue_auditor_key(
+        &self,
+        principal_id: &str,
+        destination: &Path,
+    ) -> Result<String, Box<dyn Error>> {
+        self.issue_built_in_key(
+            principal_id,
+            destination,
+            BuiltInRole::Auditor,
+            "auditor-mcp",
+        )
+    }
+
+    fn issue_built_in_key(
+        &self,
+        principal_id: &str,
+        destination: &Path,
+        role: BuiltInRole,
+        label: &str,
+    ) -> Result<String, Box<dyn Error>> {
         let mut product = NativeProduct::open(&self.data)?;
         let authority = product.authenticate_api_key(self.owner_secret.trim(), 0)?;
         product.issue_api_key_to_file(
             &authority,
             principal_id.parse()?,
-            "reader-cli",
-            [BuiltInRole::Reader],
-            BuiltInRole::Reader.authorization(),
+            label,
+            [role],
+            role.authorization(),
             None,
             destination,
             1,
@@ -2141,6 +2164,152 @@ fn security_write_plane_parsers_are_canonical_and_bounded() -> Result<(), Box<dy
 }
 
 #[test]
+fn native_mcp_requires_a_restricted_api_key_source() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let missing = output(&["mcp", "--base-url", "http://127.0.0.1:1"])?;
+    assert_eq!(missing.status.code(), Some(8));
+
+    let accepted_file = output(&[
+        "mcp",
+        "--base-url",
+        "http://127.0.0.1:1",
+        "--native-api-key-file",
+        &path(&fixture.owner_key),
+    ])?;
+    assert!(
+        accepted_file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted_file.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&accepted_file.stderr).contains(fixture.owner_secret.trim()));
+
+    let plaintext_remote = output(&[
+        "mcp",
+        "--base-url",
+        "http://example.test",
+        "--native-api-key-file",
+        &path(&fixture.owner_key),
+    ])?;
+    assert_eq!(plaintext_remote.status.code(), Some(10));
+    assert!(
+        !String::from_utf8_lossy(&plaintext_remote.stderr).contains(fixture.owner_secret.trim())
+    );
+
+    let legacy = output(&[
+        "mcp",
+        "--base-url",
+        "http://127.0.0.1:1",
+        "--bearer-token-file",
+        &path(&fixture.owner_key),
+    ])?;
+    assert_eq!(legacy.status.code(), Some(2));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
+-> Result<(), Box<dyn Error>> {
+    use std::io::Write as _;
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let fixture = SecurityWriteFixture::create()?;
+    let auditor_key = fixture.temporary.0.join("auditor.key");
+    let principal = fixture
+        .owner(&[
+            "principal",
+            "create",
+            "--name",
+            "MCP auditor",
+            "--idempotency-token",
+            "8101",
+        ])
+        .map_err(|error| std::io::Error::other(format!("principal create: {error}")))?;
+    let principal_id = principal["result_id"]
+        .as_str()
+        .ok_or("missing principal identity")?;
+    fixture
+        .owner(&[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            principal_id,
+            "--role",
+            "auditor",
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            "8102",
+        ])
+        .map_err(|error| std::io::Error::other(format!("auditor assignment: {error}")))?;
+    fixture
+        .owner(&[
+            "principal",
+            "set-enabled",
+            "--principal-id",
+            principal_id,
+            "--enabled",
+            "true",
+            "--idempotency-token",
+            "8103",
+        ])
+        .map_err(|error| std::io::Error::other(format!("principal enable: {error}")))?;
+    let auditor_secret = fixture
+        .issue_auditor_key(principal_id, &auditor_key)
+        .map_err(|error| std::io::Error::other(format!("auditor key: {error}")))?;
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmc-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &fixture.data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"hymcpt1:2"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"hyphae_native_security_status","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"hyphae_native_security_principals","arguments":{"limit":1}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hyphae_native_security_status","arguments":{"role":"owner","api_key":auditor_secret.trim()}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"cursor":"hymcpt1:1"}}),
+    ];
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address_text}")])
+        .arg("--native-api-key-file")
+        .arg(&auditor_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    for message in messages {
+        serde_json::to_writer(&mut input, &message)?;
+        input.write_all(b"\n")?;
+    }
+    drop(input);
+    let output = mcp.wait_with_output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!stdout.contains(auditor_secret.trim()));
+    assert!(!stderr.contains(auditor_secret.trim()));
+    assert_mcp_read_only_session(&stdout)?;
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[test]
 fn bootstrapped_embedded_cli_requires_a_restricted_api_key_source() -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new()?;
     let data = temporary.0.join("data");
@@ -2279,6 +2448,134 @@ async fn wait_for_authenticated_native_ready(
             Err(_) => return Err("managed serve did not become ready".into()),
         }
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_authenticated_http_ready(
+    child: &mut Child,
+    address: &str,
+    owner_secret: &str,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let base_url = format!("http://{address}");
+        let transport = HttpTransport::new(&base_url)?.bearer_token(owner_secret.trim())?;
+        let client = HyphaeClient::new(transport);
+        match client.capabilities(RequestOptions::default()).await {
+            Ok(ProductResponse::Capabilities(_)) => return Ok(()),
+            Ok(_) => return Err("managed HTTP returned an unexpected readiness response".into()),
+            Err(_) if Instant::now() < deadline => {
+                if child.try_wait()?.is_some() {
+                    let error = read_child_stderr(child)?;
+                    return Err(std::io::Error::other(error).into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return Err("managed HTTP did not become ready".into()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
+    let responses = stdout
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(responses.len(), 8);
+    let schema_version = &responses[0]["result"]["_meta"]["hyphaeToolSchemaVersion"];
+    let schema_digest = &responses[0]["result"]["_meta"]["hyphaeToolSchemaDigest"];
+    assert_eq!(schema_version, "hyphae-native-mcp-tools-v1");
+    assert_eq!(schema_digest.as_str().map(str::len), Some(64));
+    assert_eq!(
+        responses[1]["result"]["tools"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(responses[1]["result"]["nextCursor"], "hymcpt1:2");
+    assert_eq!(
+        responses[2]["result"]["tools"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(responses[2]["result"]["nextCursor"].is_null());
+    assert_eq!(responses[3]["result"]["isError"], false);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["product_api_version"],
+        1
+    );
+    assert_eq!(responses[4]["result"]["isError"], false);
+    assert_eq!(
+        responses[4]["result"]["structuredContent"]["schema"],
+        "hyphae-native-access-control-status-v1"
+    );
+    assert_eq!(responses[5]["result"]["isError"], false);
+    assert_eq!(
+        responses[5]["result"]["structuredContent"]["schema"],
+        "hyphae-native-security-principals-v1"
+    );
+    assert_eq!(responses[6]["result"]["isError"], true);
+    assert_eq!(
+        responses[6]["result"]["structuredContent"]["error"]["code"],
+        "invalid_request"
+    );
+    assert_json_keys(
+        &responses[6]["result"]["structuredContent"],
+        &["schema", "error"],
+    );
+    assert_json_keys(
+        &responses[6]["result"]["structuredContent"]["error"],
+        &[
+            "code",
+            "category",
+            "message",
+            "retry",
+            "transaction_state",
+            "request_id",
+            "trace_id",
+            "object_id",
+            "transaction_id",
+        ],
+    );
+    assert_eq!(responses[7]["error"]["code"], -32602);
+    for response in &responses[1..7] {
+        assert_eq!(
+            response["result"]["_meta"]["hyphaeToolSchemaVersion"],
+            *schema_version
+        );
+        assert_eq!(
+            response["result"]["_meta"]["hyphaeToolSchemaDigest"],
+            *schema_digest
+        );
+    }
+    for response in &responses[3..7] {
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or("missing MCP text content")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text)?,
+            response["result"]["structuredContent"]
+        );
+    }
+    for tool in responses[1]["result"]["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            responses[2]["result"]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+    {
+        assert_eq!(
+            tool["outputSchema"]["oneOf"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert_eq!(tool["annotations"]["idempotentHint"], true);
+        assert_eq!(tool["annotations"]["openWorldHint"], false);
+    }
+    Ok(())
 }
 
 struct ChildGuard<'a>(&'a mut Child);

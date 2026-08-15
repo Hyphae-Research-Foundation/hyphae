@@ -601,13 +601,31 @@ writing a new file. Example requests live in [`examples/http`](../../examples/ht
 ## `mcp`
 
 ```text
-hyphae mcp --base-url <ROOT_ORIGIN> [--bearer-token-file <PATH>]
+hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-file <RESTRICTED_PATH>
+hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-stdin
 ```
 
 Runs MCP revision `2025-11-25` as newline-delimited JSON-RPC 2.0 over stdio.
 It opens no listener or data directory. The adapter enforces a 4 MiB message
-bound and exposes twelve tools through canonical schemas. See the
+bound and exposes only three Native v2 read tools: capabilities, redacted
+security status, and bounded redacted principal pages. `tools/list` returns at
+most two definitions and uses its own opaque cursor.
+
+Use a restricted key for the built-in Auditor role at Instance scope. It has
+the `security.read` permission required by both security tools without write
+authority.
+
+The key establishes the exact authority for every call. It is accepted only
+from a restricted file or the first stdin line, never an argv value or plain
+environment value. In stdin-key mode every following line is an MCP message.
+Unknown tool arguments, including prompt-supplied roles, permissions, or API
+keys, fail closed. Results expose a version and BLAKE3 digest of the exact tool
+contract; Native failures retain structured `ProductError` fields. See the
 [MCP guide](../../mcp/README.md).
+
+With a durable Native API key, `http://` is limited to canonical loopback
+hosts (`127.0.0.0/8`, `[::1]`, or exact `localhost`). Remote MCP endpoints must
+use `https://`; plaintext remote origins fail before the stdio request loop.
 
 ## Environment summary
 
@@ -617,6 +635,7 @@ bound and exposes twelve tools through canonical schemas. See the
 | `HYPHAE_BASE_URL` | `--base-url` |
 | `HYPHAE_BEARER_TOKEN_FILE` | `--bearer-token-file` |
 | `HYPHAE_BEARER_TOKEN` | Token fallback when no file is selected |
+| `HYPHAE_NATIVE_API_KEY_FILE` | `--native-api-key-file` for Native local commands and MCP |
 
 See the [configuration reference](../configuration.md) for precedence,
 security requirements, and programmatic server/client limits.

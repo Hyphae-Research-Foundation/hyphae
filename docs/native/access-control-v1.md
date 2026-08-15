@@ -296,6 +296,14 @@ land. The CLI exposes exactly these six mutations through the same typed
 remains read-only. Neither surface may call the access-control catalog
 directly.
 
+The canonical managed Native 1.2 authority cases for these twelve operations
+live in [`conformance/v2/authority-cases.json`](../../conformance/v2/authority-cases.json).
+The fail-closed checker binds that corpus to this contract, its exact role
+matrix, uniform authentication denial, pagination and result limits, protocol
+minor admission, request digests, revocation, redaction, and named executable
+Rust evidence. The corpus is an authority inventory, not a second
+authorization implementation.
+
 `backup.verify` remains `planned-1.2` and local-only. It will not enter the
 generic native or HTTP transport until a later contract defines a configured
 backup root and handle-relative, no-follow path resolution. A client-selected

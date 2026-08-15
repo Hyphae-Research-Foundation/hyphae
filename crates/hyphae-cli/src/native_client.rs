@@ -17,11 +17,31 @@ use uuid::Uuid;
 
 use crate::{exit::CliFailure, native::logical_time_micros};
 
-struct ApiKeyBuffer(Vec<u8>);
+pub(crate) struct ApiKeyBuffer(Vec<u8>);
 
 impl ApiKeyBuffer {
-    fn credential(&self) -> Result<&str, CliFailure> {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, CliFailure> {
+        let mut value = Self(bytes);
+        value.normalize()?;
+        Ok(value)
+    }
+
+    pub(crate) fn credential(&self) -> Result<&str, CliFailure> {
         std::str::from_utf8(&self.0).map_err(|_| authorization_denied())
+    }
+
+    fn normalize(&mut self) -> Result<(), CliFailure> {
+        if self.0.ends_with(b"\r\n") {
+            self.0.truncate(self.0.len() - 2);
+        } else if self.0.ends_with(b"\n") {
+            self.0.truncate(self.0.len() - 1);
+        }
+        if self.0.len() != MAX_API_KEY_CREDENTIAL_BYTES
+            || self.0.iter().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        {
+            return Err(authorization_denied());
+        }
+        Ok(())
     }
 }
 
@@ -165,7 +185,7 @@ fn session_id() -> Result<ProductSessionId, CliFailure> {
     ProductSessionId::new(Uuid::now_v7().as_u128()).ok_or_else(CliFailure::internal)
 }
 
-fn authorization_denied() -> CliFailure {
+pub(crate) fn authorization_denied() -> CliFailure {
     ProductError::from_code(ProductErrorCode::AuthorizationDenied).into()
 }
 
@@ -176,38 +196,27 @@ fn read_api_key(
     match (api_key_file, api_key_stdin) {
         (None, false) => Ok(None),
         (Some(_), true) => Err(CliFailure::invalid()),
-        (Some(path), false) => {
-            let path_metadata = fs::symlink_metadata(path)?;
-            if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
-                return Err(authorization_denied());
-            }
-            let file = File::open(path)?;
-            validate_open_api_key_file(path, &path_metadata, &file)?;
-            read_bounded(file).map(Some)
-        }
+        (Some(path), false) => read_api_key_file(path).map(Some),
         (None, true) => read_bounded(io::stdin().lock()).map(Some),
     }
+}
+
+pub(crate) fn read_api_key_file(path: &Path) -> Result<ApiKeyBuffer, CliFailure> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
+        return Err(authorization_denied());
+    }
+    let file = File::open(path)?;
+    validate_open_api_key_file(path, &path_metadata, &file)?;
+    read_bounded(file)
 }
 
 fn read_bounded(reader: impl Read) -> Result<ApiKeyBuffer, CliFailure> {
     let maximum_input =
         u64::try_from(MAX_API_KEY_CREDENTIAL_BYTES + 3).map_err(|_| CliFailure::internal())?;
-    let mut buffer = ApiKeyBuffer(Vec::with_capacity(MAX_API_KEY_CREDENTIAL_BYTES + 2));
-    reader.take(maximum_input).read_to_end(&mut buffer.0)?;
-    if buffer.0.ends_with(b"\r\n") {
-        buffer.0.truncate(buffer.0.len() - 2);
-    } else if buffer.0.ends_with(b"\n") {
-        buffer.0.truncate(buffer.0.len() - 1);
-    }
-    if buffer.0.len() != MAX_API_KEY_CREDENTIAL_BYTES
-        || buffer
-            .0
-            .iter()
-            .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
-    {
-        return Err(authorization_denied());
-    }
-    Ok(buffer)
+    let mut bytes = Vec::with_capacity(MAX_API_KEY_CREDENTIAL_BYTES + 2);
+    reader.take(maximum_input).read_to_end(&mut bytes)?;
+    ApiKeyBuffer::from_bytes(bytes)
 }
 
 fn validate_open_api_key_file(

@@ -311,14 +311,6 @@ pub(crate) async fn serve(
     Ok(())
 }
 
-pub(crate) async fn run_mcp(
-    base_url: &str,
-    bearer_token_file: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
-    let token = load_remote_bearer_token(bearer_token_file)?;
-    crate::mcp::run(base_url, token.as_deref()).await
-}
-
 pub(crate) fn put(
     data_dir: &Path,
     key: String,

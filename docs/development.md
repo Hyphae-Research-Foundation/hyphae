@@ -54,9 +54,12 @@ For a public `/v1` behavior change:
 1. update typed models in `hyphae-contracts`;
 2. update OpenAPI 3.1 and the affected JSON Schema 2020-12 files;
 3. regenerate TypeScript/Python models and require `--check` to be clean;
-4. update server/client/CLI/MCP behavior and common conformance fixtures;
+4. update server/client/CLI behavior and common `/v1` conformance fixtures;
 5. update the human API, client, capability, and example documentation;
 6. use a new API path version for a breaking wire change.
+
+MCP is a separate managed Native v2 surface. Change it only through its
+versioned tool contract, authority cases, and plugin gates.
 
 Generated SDK model files are checked in so consumers can audit exact public
 types. Do not hand-edit them.

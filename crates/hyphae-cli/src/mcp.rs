@@ -1,79 +1,129 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Bounded MCP stdio adapter over the public Hyphae HTTP client.
+//! Bounded read-only MCP stdio adapter over managed Native HTTP v2.
 
 use std::{
-    error::Error,
-    future::Future,
     io::{self, BufRead, BufReader, BufWriter, Write},
+    path::Path,
 };
 
-use hyphae_client::HyphaeClient;
-use hyphae_contracts::{
-    CAPABILITIES_SCHEMA_V1, COMMIT_RECEIPT_SCHEMA_V1, DEFINE_LEXICAL_INDEX_REQUEST_SCHEMA_V1,
-    DEFINE_VECTOR_SPACE_REQUEST_SCHEMA_V1, DELETE_REQUEST_SCHEMA_V1,
-    DELETE_VECTORS_REQUEST_SCHEMA_V1, EXACT_RETRIEVAL_REQUEST_SCHEMA_V1,
-    EXACT_RETRIEVAL_RESPONSE_SCHEMA_V1, GET_REQUEST_SCHEMA_V1, GET_RESPONSE_SCHEMA_V1,
-    HYBRID_RETRIEVAL_REQUEST_SCHEMA_V1, HYBRID_RETRIEVAL_RESPONSE_SCHEMA_V1,
-    LEXICAL_RETRIEVAL_REQUEST_SCHEMA_V1, LEXICAL_RETRIEVAL_RESPONSE_SCHEMA_V1,
-    PUT_REQUEST_SCHEMA_V1, PUT_VECTORS_REQUEST_SCHEMA_V1, QUERY_REQUEST_SCHEMA_V1,
-    QUERY_RESPONSE_SCHEMA_V1,
-    v1::{
-        DefineLexicalIndexRequestV1, DefineVectorSpaceRequestV1, DeleteRequestV1,
-        DeleteVectorsRequestV1, ExactRetrievalRequestV1, GetRequestV1, HybridRetrievalRequestV1,
-        LexicalRetrievalRequestV1, PutRequestV1, PutVectorsRequestV1, QueryRequestV1,
-    },
+use hyphae_client::v2::{ClientError, HttpTransport, HyphaeClient, RequestOptions};
+use hyphae_native_product::{
+    MAX_API_KEY_CREDENTIAL_BYTES, ProductError, ProductErrorCode, ProductResponse, SecurityCursor,
+    SecurityPrincipalListRequest,
 };
-use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::{
+    exit::{CliFailure, error_json},
+    native_client::{ApiKeyBuffer, authorization_denied, read_api_key_file},
+    response_json,
+};
+
+const MCP_CONTRACT: &str = include_str!("../../../contracts/native-mcp-v2.json");
+const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v1";
 const MCP_PROTOCOL: &str = "2025-11-25";
+const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v1";
+const TOOL_PAGE_SIZE: usize = 2;
+const TOOL_NAMES: [&str; 3] = [
+    "hyphae_native_capabilities",
+    "hyphae_native_security_status",
+    "hyphae_native_security_principals",
+];
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-const EMPTY_INPUT_SCHEMA: &str =
-    r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const CAPABILITIES_OUTPUT_SCHEMA: &str = CAPABILITIES_SCHEMA_V1;
-const PUT_INPUT_SCHEMA: &str = PUT_REQUEST_SCHEMA_V1;
-const DELETE_INPUT_SCHEMA: &str = DELETE_REQUEST_SCHEMA_V1;
-const GET_INPUT_SCHEMA: &str = GET_REQUEST_SCHEMA_V1;
-const QUERY_INPUT_SCHEMA: &str = QUERY_REQUEST_SCHEMA_V1;
-const RECEIPT_OUTPUT_SCHEMA: &str = COMMIT_RECEIPT_SCHEMA_V1;
-const GET_OUTPUT_SCHEMA: &str = GET_RESPONSE_SCHEMA_V1;
-const QUERY_OUTPUT_SCHEMA: &str = QUERY_RESPONSE_SCHEMA_V1;
-const DEFINE_VECTOR_SPACE_INPUT_SCHEMA: &str = DEFINE_VECTOR_SPACE_REQUEST_SCHEMA_V1;
-const PUT_VECTORS_INPUT_SCHEMA: &str = PUT_VECTORS_REQUEST_SCHEMA_V1;
-const DELETE_VECTORS_INPUT_SCHEMA: &str = DELETE_VECTORS_REQUEST_SCHEMA_V1;
-const EXACT_RETRIEVAL_INPUT_SCHEMA: &str = EXACT_RETRIEVAL_REQUEST_SCHEMA_V1;
-const EXACT_RETRIEVAL_OUTPUT_SCHEMA: &str = EXACT_RETRIEVAL_RESPONSE_SCHEMA_V1;
-const DEFINE_LEXICAL_INDEX_INPUT_SCHEMA: &str = DEFINE_LEXICAL_INDEX_REQUEST_SCHEMA_V1;
-const LEXICAL_RETRIEVAL_INPUT_SCHEMA: &str = LEXICAL_RETRIEVAL_REQUEST_SCHEMA_V1;
-const LEXICAL_RETRIEVAL_OUTPUT_SCHEMA: &str = LEXICAL_RETRIEVAL_RESPONSE_SCHEMA_V1;
-const HYBRID_RETRIEVAL_INPUT_SCHEMA: &str = HYBRID_RETRIEVAL_REQUEST_SCHEMA_V1;
-const HYBRID_RETRIEVAL_OUTPUT_SCHEMA: &str = HYBRID_RETRIEVAL_RESPONSE_SCHEMA_V1;
+const MAX_CURSOR_BYTES: usize = 128;
+const MAX_TOOL_CURSOR_BYTES: usize = 32;
+
+#[derive(Clone, Copy)]
+enum NativeReadTool {
+    Capabilities,
+    SecurityStatus,
+    SecurityPrincipals,
+}
+
+impl NativeReadTool {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "hyphae_native_capabilities" => Some(Self::Capabilities),
+            "hyphae_native_security_status" => Some(Self::SecurityStatus),
+            "hyphae_native_security_principals" => Some(Self::SecurityPrincipals),
+            _ => None,
+        }
+    }
+}
+
+struct ToolRegistry {
+    protocol: String,
+    schema_version: String,
+    schema_digest: String,
+    page_size: usize,
+    tools: Vec<Value>,
+}
 
 struct Session {
     client: HyphaeClient,
+    registry: ToolRegistry,
     initialize_seen: bool,
     initialized: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsListParams {
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsCallParams {
+    name: String,
+    #[serde(default = "empty_object")]
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyInput {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalListInput {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default = "default_security_limit")]
+    limit: usize,
+}
+
 /// Runs one newline-delimited JSON-RPC 2.0 MCP session over stdio.
+///
+/// In stdin credential mode, the first bounded line is the credential and all
+/// following lines are MCP messages. The credential line is never echoed.
 ///
 /// # Errors
 ///
-/// Returns an error for local client construction or fatal standard-I/O and
-/// response-serialization failures. Malformed peer requests receive JSON-RPC
-/// errors and do not terminate the session.
-pub(crate) async fn run(base_url: &str, bearer_token: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut builder = HyphaeClient::builder(base_url)?;
-    if let Some(token) = bearer_token {
-        builder = builder.bearer_token(token)?;
-    }
+/// Returns a typed CLI failure for missing or invalid credentials, client
+/// construction, fatal standard-I/O, or response serialization failures.
+pub(crate) async fn run(
+    base_url: &str,
+    api_key_file: Option<&Path>,
+    api_key_stdin: bool,
+) -> Result<(), CliFailure> {
+    let mut input = BufReader::new(io::stdin().lock());
+    let credential = read_mcp_credential(api_key_file, api_key_stdin, &mut input)?;
+    let credential_text = credential.credential()?;
+    let transport = HttpTransport::new(base_url)
+        .and_then(|transport| transport.bearer_token(credential_text))
+        .map_err(startup_client_error)?;
+    drop(credential);
+
     let mut session = Session {
-        client: builder.build()?,
+        client: HyphaeClient::new(transport),
+        registry: ToolRegistry::load()?,
         initialize_seen: false,
         initialized: false,
     };
-    let mut input = BufReader::new(io::stdin().lock());
     let mut output = BufWriter::new(io::stdout().lock());
     loop {
         let Some(line) = read_bounded_line(&mut input)? else {
@@ -92,6 +142,174 @@ pub(crate) async fn run(base_url: &str, bearer_token: Option<&str>) -> Result<()
             output.write_all(b"\n")?;
             output.flush()?;
         }
+    }
+}
+
+impl ToolRegistry {
+    fn load() -> Result<Self, CliFailure> {
+        Self::from_contract(MCP_CONTRACT)
+    }
+
+    fn from_contract(source: &str) -> Result<Self, CliFailure> {
+        let contract: Value = serde_json::from_str(source)?;
+        let protocol = required_string(&contract, "mcp_protocol")?.to_owned();
+        let schema_version = required_string(&contract, "tool_schema_version")?.to_owned();
+        let page_size = contract
+            .get("tool_page_size")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value == TOOL_PAGE_SIZE)
+            .ok_or_else(CliFailure::invalid)?;
+        let tools = contract
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(CliFailure::invalid)?;
+        if required_string(&contract, "schema")? != MCP_CONTRACT_SCHEMA
+            || protocol != MCP_PROTOCOL
+            || schema_version != TOOL_SCHEMA_VERSION
+            || tools.len() != TOOL_NAMES.len()
+            || tools
+                .iter()
+                .zip(TOOL_NAMES)
+                .any(|(tool, expected_name)| !valid_tool_contract(tool, expected_name))
+        {
+            return Err(CliFailure::invalid());
+        }
+        Ok(Self {
+            protocol,
+            schema_version,
+            schema_digest: blake3::hash(MCP_CONTRACT.as_bytes()).to_hex().to_string(),
+            page_size,
+            tools,
+        })
+    }
+
+    fn metadata(&self) -> Value {
+        json!({
+            "hyphaeToolSchemaVersion": self.schema_version,
+            "hyphaeToolSchemaDigest": self.schema_digest,
+        })
+    }
+
+    fn list(&self, params: &Value) -> Result<Value, ()> {
+        let params = serde_json::from_value::<ToolsListParams>(params.clone()).map_err(|_| ())?;
+        let offset = match params.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => decode_tool_cursor(cursor).ok_or(())?,
+        };
+        if offset >= self.tools.len() || (offset != 0 && offset % self.page_size != 0) {
+            return Err(());
+        }
+        let end = offset.saturating_add(self.page_size).min(self.tools.len());
+        let next_cursor = (end < self.tools.len()).then(|| encode_tool_cursor(end));
+        Ok(json!({
+            "tools": self.tools[offset..end],
+            "nextCursor": next_cursor,
+            "_meta": self.metadata(),
+        }))
+    }
+}
+
+fn valid_tool_contract(tool: &Value, expected_name: &str) -> bool {
+    let Some(tool) = tool.as_object() else {
+        return false;
+    };
+    let expected_annotations = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+    });
+    if tool
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        != [
+            "annotations",
+            "description",
+            "execution",
+            "inputSchema",
+            "name",
+            "outputSchema",
+        ]
+        .into_iter()
+        .collect()
+        || tool.get("name").and_then(Value::as_str) != Some(expected_name)
+        || tool.get("annotations") != Some(&expected_annotations)
+        || tool.get("execution") != Some(&json!({ "taskSupport": "forbidden" }))
+        || tool
+            .get("inputSchema")
+            .and_then(Value::as_object)
+            .and_then(|schema| schema.get("additionalProperties"))
+            != Some(&Value::Bool(false))
+    {
+        return false;
+    }
+
+    let Some(output) = tool.get("outputSchema").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(branches) = output.get("oneOf").and_then(Value::as_array) else {
+        return false;
+    };
+    output.len() == 1
+        && branches.len() == 2
+        && branches[0].pointer("/additionalProperties") == Some(&Value::Bool(false))
+        && valid_error_schema(&branches[1])
+        && schema_is_redacted(tool.get("inputSchema").unwrap_or(&Value::Null))
+        && schema_is_redacted(tool.get("outputSchema").unwrap_or(&Value::Null))
+}
+
+fn valid_error_schema(schema: &Value) -> bool {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(error) = properties.get("error") else {
+        return false;
+    };
+    let required = json!([
+        "code",
+        "category",
+        "message",
+        "retry",
+        "transaction_state",
+        "request_id",
+        "trace_id",
+        "object_id",
+        "transaction_id",
+    ]);
+    schema.get("additionalProperties") == Some(&Value::Bool(false))
+        && schema.get("required") == Some(&json!(["schema", "error"]))
+        && properties.len() == 2
+        && properties
+            .get("schema")
+            .and_then(|schema| schema.get("const"))
+            .and_then(Value::as_str)
+            == Some("hyphae-native-mcp-tool-error-v1")
+        && error.get("additionalProperties") == Some(&Value::Bool(false))
+        && error.get("required") == Some(&required)
+        && error
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.len() == 9)
+}
+
+fn schema_is_redacted(value: &Value) -> bool {
+    const FORBIDDEN: [&str; 6] = [
+        "api_key",
+        "credential",
+        "credential_hash",
+        "key_hash",
+        "key_material",
+        "secret",
+    ];
+    match value {
+        Value::Array(values) => values.iter().all(schema_is_redacted),
+        Value::Object(values) => values
+            .iter()
+            .all(|(key, value)| !FORBIDDEN.contains(&key.as_str()) && schema_is_redacted(value)),
+        _ => true,
     }
 }
 
@@ -118,7 +336,7 @@ impl Session {
             return id.map(|id| rpc_error(&id, -32602, "Invalid params"));
         }
         if id.is_none() {
-            self.handle_notification(method, &params);
+            self.handle_notification(method);
             return None;
         }
         let id = id.unwrap_or(Value::Null);
@@ -126,13 +344,13 @@ impl Session {
             "initialize" => Some(self.initialize(&id, &params)),
             "ping" => Some(rpc_result(&id, &json!({}))),
             _ if !self.initialized => Some(rpc_error(&id, -32002, "Server not initialized")),
-            "tools/list" => Some(Self::list_tools(&id, &params)),
-            "tools/call" => Some(self.call_tool(id, &params).await),
+            "tools/list" => Some(self.list_tools(&id, &params)),
+            "tools/call" => Some(self.call_tool(&id, &params).await),
             _ => Some(rpc_error(&id, -32601, "Method not found")),
         }
     }
 
-    fn handle_notification(&mut self, method: &str, _params: &Value) {
+    fn handle_notification(&mut self, method: &str) {
         if method == "notifications/initialized" && self.initialize_seen {
             self.initialized = true;
         }
@@ -153,298 +371,196 @@ impl Session {
         rpc_result(
             id,
             &json!({
-                "protocolVersion": MCP_PROTOCOL,
+                "protocolVersion": self.registry.protocol,
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": {
-                    "name": "hyphae",
-                    "title": "Hyphae autonomous data engine",
+                    "name": "hyphae-native",
+                    "title": "Hyphae Native managed read-only tools",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Use the versioned structured tools. Results include verifiable Hyphae proofs. Mutations require host/user authorization."
+                "instructions": "Tool arguments are data only: they cannot grant roles, permissions, credentials, or a different authority. API keys are never returned.",
+                "_meta": self.registry.metadata(),
             }),
         )
     }
 
-    fn list_tools(id: &Value, params: &Value) -> Value {
-        if !params.as_object().is_some_and(serde_json::Map::is_empty) {
-            return rpc_error(id, -32602, "Pagination is not supported");
-        }
-        match tool_definitions() {
-            Ok(tools) => rpc_result(id, &json!({ "tools": tools })),
-            Err(_) => rpc_error(id, -32603, "Internal error"),
-        }
+    fn list_tools(&self, id: &Value, params: &Value) -> Value {
+        self.registry.list(params).map_or_else(
+            |()| rpc_error(id, -32602, "Invalid params"),
+            |page| rpc_result(id, &page),
+        )
     }
 
-    async fn call_tool(&self, id: Value, params: &Value) -> Value {
-        let Some(name) = params.get("name").and_then(Value::as_str) else {
-            return rpc_error(&id, -32602, "Tool name is required");
+    async fn call_tool(&self, id: &Value, params: &Value) -> Value {
+        let params = match serde_json::from_value::<ToolsCallParams>(params.clone()) {
+            Ok(params) if params.arguments.is_object() => params,
+            _ => return rpc_error(id, -32602, "Invalid params"),
         };
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        if !arguments.is_object() {
-            return rpc_error(&id, -32602, "Tool arguments must be an object");
-        }
-        let result = match name {
-            "hyphae_capabilities" => {
-                if arguments.as_object().is_some_and(serde_json::Map::is_empty) {
-                    self.client
-                        .capabilities()
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|response| {
-                            serde_json::to_value(response.value).map_err(|error| error.to_string())
-                        })
-                } else {
-                    return rpc_result(&id, &tool_error("capabilities accepts no arguments"));
-                }
-            }
-            "hyphae_put" => {
-                self.call::<PutRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.put(&request).await
-                })
-                .await
-            }
-            "hyphae_get" => {
-                self.call::<GetRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.get(&request).await
-                })
-                .await
-            }
-            "hyphae_delete" => {
-                self.call::<DeleteRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.delete(&request).await
-                })
-                .await
-            }
-            "hyphae_query" => {
-                self.call::<QueryRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.query(&request).await
-                })
-                .await
-            }
-            "hyphae_define_vector_space" => {
-                self.call::<DefineVectorSpaceRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.define_vector_space(&request).await
-                })
-                .await
-            }
-            "hyphae_put_vectors" => {
-                self.call::<PutVectorsRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.put_vectors(&request).await
-                })
-                .await
-            }
-            "hyphae_delete_vectors" => {
-                self.call::<DeleteVectorsRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.delete_vectors(&request).await
-                })
-                .await
-            }
-            "hyphae_retrieve_exact" => {
-                self.call::<ExactRetrievalRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.retrieve_exact(&request).await
-                })
-                .await
-            }
-            "hyphae_define_lexical_index" => {
-                self.call::<DefineLexicalIndexRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.define_lexical_index(&request).await
-                })
-                .await
-            }
-            "hyphae_retrieve_lexical" => {
-                self.call::<LexicalRetrievalRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.retrieve_lexical(&request).await
-                })
-                .await
-            }
-            "hyphae_retrieve_hybrid" => {
-                self.call::<HybridRetrievalRequestV1, _, _, _>(arguments, |request| async move {
-                    self.client.retrieve_hybrid(&request).await
-                })
-                .await
-            }
-            _ => return rpc_error(&id, -32602, "Unknown tool"),
+        let Some(tool) = NativeReadTool::parse(&params.name) else {
+            return rpc_error(id, -32602, "Unknown tool");
         };
+        let result = self.execute(tool, params.arguments).await;
         match result {
-            Ok(value) => rpc_result(&id, &tool_success(&value)),
-            Err(error) => rpc_result(&id, &tool_error(&error)),
+            Ok(value) => rpc_result(id, &tool_success(&value, &self.registry)),
+            Err(error) => rpc_result(id, &tool_error(&error, &self.registry)),
         }
     }
 
-    async fn call<Request, Response, Function, FutureType>(
+    async fn execute(
         &self,
+        tool: NativeReadTool,
         arguments: Value,
-        function: Function,
-    ) -> Result<Value, String>
-    where
-        Request: DeserializeOwned,
-        Response: serde::Serialize,
-        Function: FnOnce(Request) -> FutureType,
-        FutureType: Future<
-            Output = Result<hyphae_client::ApiResponse<Response>, hyphae_client::ClientError>,
-        >,
-    {
-        let request = serde_json::from_value::<Request>(arguments)
-            .map_err(|error| format!("invalid tool input: {error}"))?;
-        let response = function(request).await.map_err(|error| error.to_string())?;
-        serde_json::to_value(response.value).map_err(|error| error.to_string())
+    ) -> Result<Value, Box<ProductError>> {
+        let response = match tool {
+            NativeReadTool::Capabilities => {
+                strict_input::<EmptyInput>(arguments)?;
+                self.client.capabilities(RequestOptions::default()).await
+            }
+            NativeReadTool::SecurityStatus => {
+                strict_input::<EmptyInput>(arguments)?;
+                self.client.security_status(RequestOptions::default()).await
+            }
+            NativeReadTool::SecurityPrincipals => {
+                let input = strict_input::<PrincipalListInput>(arguments)?;
+                let cursor = input
+                    .cursor
+                    .as_deref()
+                    .map(parse_security_cursor)
+                    .transpose()?;
+                let request = SecurityPrincipalListRequest::new(cursor, input.limit)
+                    .map_err(|_| invalid_request())?;
+                self.client
+                    .security_principal_list(request, RequestOptions::default())
+                    .await
+            }
+        }
+        .map_err(normalize_client_error)?;
+        response_for(tool, response)
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn tool_definitions() -> Result<Vec<Value>, serde_json::Error> {
-    Ok(vec![
-        tool(
-            "hyphae_capabilities",
-            "Inspect versioned Hyphae capabilities and effective limits.",
-            EMPTY_INPUT_SCHEMA,
-            CAPABILITIES_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-        tool(
-            "hyphae_put",
-            "Atomically store a structured record batch. Obtain user authorization before mutation.",
-            PUT_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            false,
-        )?,
-        tool(
-            "hyphae_get",
-            "Get proven key presence or absence by hexadecimal binary key.",
-            GET_INPUT_SCHEMA,
-            GET_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-        tool(
-            "hyphae_delete",
-            "Atomically delete a key batch. Obtain user authorization before mutation.",
-            DELETE_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            false,
-        )?,
-        tool(
-            "hyphae_query",
-            "Execute a deterministic proof-bearing structured query without AI.",
-            QUERY_INPUT_SCHEMA,
-            QUERY_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-        tool(
-            "hyphae_define_vector_space",
-            "Define or exactly reuse one immutable durable vector space.",
-            DEFINE_VECTOR_SPACE_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            true,
-        )?,
-        tool(
-            "hyphae_put_vectors",
-            "Atomically store a durable signed-Q15 vector batch.",
-            PUT_VECTORS_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            false,
-        )?,
-        tool(
-            "hyphae_delete_vectors",
-            "Atomically delete durable vectors by binary key.",
-            DELETE_VECTORS_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            false,
-        )?,
-        tool(
-            "hyphae_retrieve_exact",
-            "Execute proof-bearing exact durable vector retrieval.",
-            EXACT_RETRIEVAL_INPUT_SCHEMA,
-            EXACT_RETRIEVAL_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-        tool(
-            "hyphae_define_lexical_index",
-            "Define or exactly reuse one immutable provider-free lexical index.",
-            DEFINE_LEXICAL_INDEX_INPUT_SCHEMA,
-            RECEIPT_OUTPUT_SCHEMA,
-            false,
-            true,
-            true,
-        )?,
-        tool(
-            "hyphae_retrieve_lexical",
-            "Execute proof-bearing provider-free lexical retrieval.",
-            LEXICAL_RETRIEVAL_INPUT_SCHEMA,
-            LEXICAL_RETRIEVAL_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-        tool(
-            "hyphae_retrieve_hybrid",
-            "Execute proof-bearing deterministic hybrid RRF retrieval.",
-            HYBRID_RETRIEVAL_INPUT_SCHEMA,
-            HYBRID_RETRIEVAL_OUTPUT_SCHEMA,
-            true,
-            false,
-            true,
-        )?,
-    ])
+fn strict_input<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, Box<ProductError>> {
+    serde_json::from_value(value).map_err(|_| invalid_request())
 }
 
-fn tool(
-    name: &str,
-    description: &str,
-    input_schema: &str,
-    output_schema: &str,
-    read_only: bool,
-    destructive: bool,
-    idempotent: bool,
-) -> Result<Value, serde_json::Error> {
-    Ok(json!({
-        "name": name,
-        "description": description,
-        "inputSchema": serde_json::from_str::<Value>(input_schema)?,
-        "outputSchema": serde_json::from_str::<Value>(output_schema)?,
-        "annotations": {
-            "readOnlyHint": read_only,
-            "destructiveHint": destructive,
-            "idempotentHint": idempotent,
-            "openWorldHint": true
-        },
-        "execution": { "taskSupport": "forbidden" }
-    }))
+fn parse_security_cursor(value: &str) -> Result<SecurityCursor, Box<ProductError>> {
+    if value.len() > MAX_CURSOR_BYTES {
+        return Err(invalid_request());
+    }
+    SecurityCursor::from_token(value).map_err(|_| invalid_request())
 }
 
-fn tool_success(value: &Value) -> Value {
+fn response_for(
+    tool: NativeReadTool,
+    response: ProductResponse,
+) -> Result<Value, Box<ProductError>> {
+    let expected = matches!(
+        (tool, &response),
+        (
+            NativeReadTool::Capabilities,
+            ProductResponse::Capabilities(_)
+        ) | (
+            NativeReadTool::SecurityStatus,
+            ProductResponse::SecurityStatus(_)
+        ) | (
+            NativeReadTool::SecurityPrincipals,
+            ProductResponse::SecurityPrincipalPage(_)
+        )
+    );
+    if !expected {
+        return Err(Box::new(ProductError::from_code(
+            ProductErrorCode::Internal,
+        )));
+    }
+    Ok(response_json(response))
+}
+
+fn invalid_request() -> Box<ProductError> {
+    Box::new(ProductError::from_code(ProductErrorCode::InvalidRequest))
+}
+
+fn read_mcp_credential<R: BufRead>(
+    api_key_file: Option<&Path>,
+    api_key_stdin: bool,
+    input: &mut R,
+) -> Result<ApiKeyBuffer, CliFailure> {
+    match (api_key_file, api_key_stdin) {
+        (Some(path), false) => read_api_key_file(path),
+        (None, true) => {
+            let line = read_credential_line(input)?.ok_or_else(authorization_denied)?;
+            ApiKeyBuffer::from_bytes(line)
+        }
+        _ => Err(authorization_denied()),
+    }
+}
+
+fn normalize_client_error(error: ClientError) -> Box<ProductError> {
+    match error {
+        ClientError::Product(error) => error,
+        ClientError::Cancelled => Box::new(ProductError::from_code(ProductErrorCode::Cancelled)),
+        ClientError::Protocol(_) => Box::new(ProductError::from_code(ProductErrorCode::Corruption)),
+        ClientError::Http(_) | ClientError::Local(_) => {
+            Box::new(ProductError::from_code(ProductErrorCode::Unavailable))
+        }
+        ClientError::UnexpectedResponse => {
+            Box::new(ProductError::from_code(ProductErrorCode::Internal))
+        }
+    }
+}
+
+fn startup_client_error(error: ClientError) -> CliFailure {
+    CliFailure::from(normalize_client_error(error))
+}
+
+fn tool_success(value: &Value, registry: &ToolRegistry) -> Value {
     json!({
         "content": [{ "type": "text", "text": compact_json(value) }],
         "structuredContent": value,
-        "isError": false
+        "isError": false,
+        "_meta": registry.metadata(),
     })
 }
 
-fn tool_error(message: &str) -> Value {
+fn tool_error(error: &ProductError, registry: &ToolRegistry) -> Value {
+    let rendered = error_json(error);
+    let structured = json!({
+        "schema": "hyphae-native-mcp-tool-error-v1",
+        "error": rendered["error"],
+    });
     json!({
-        "content": [{ "type": "text", "text": message }],
-        "isError": true
+        "content": [{ "type": "text", "text": compact_json(&structured) }],
+        "structuredContent": structured,
+        "isError": true,
+        "_meta": registry.metadata(),
     })
+}
+
+fn required_string<'value>(value: &'value Value, field: &str) -> Result<&'value str, CliFailure> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(CliFailure::invalid)
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
+
+const fn default_security_limit() -> usize {
+    100
+}
+
+fn encode_tool_cursor(offset: usize) -> String {
+    format!("hymcpt1:{offset}")
+}
+
+fn decode_tool_cursor(value: &str) -> Option<usize> {
+    if value.len() > MAX_TOOL_CURSOR_BYTES {
+        return None;
+    }
+    let offset = value.strip_prefix("hymcpt1:")?.parse::<usize>().ok()?;
+    (encode_tool_cursor(offset) == value).then_some(offset)
 }
 
 fn compact_json(value: &Value) -> String {
@@ -468,6 +584,26 @@ fn request_id(object: &serde_json::Map<String, Value>) -> Value {
 }
 
 fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    read_line_with_bound(
+        reader,
+        MAX_MESSAGE_BYTES,
+        "MCP input exceeds the fixed message bound",
+    )
+}
+
+fn read_credential_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    read_line_with_bound(
+        reader,
+        MAX_API_KEY_CREDENTIAL_BYTES + 2,
+        "Native API-key input exceeds the fixed credential bound",
+    )
+}
+
+fn read_line_with_bound<R: BufRead>(
+    reader: &mut R,
+    maximum_bytes: usize,
+    error_message: &'static str,
+) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf()?;
@@ -482,11 +618,8 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
-        if line.len().saturating_add(consumed) > MAX_MESSAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "MCP message exceeds 4 MiB",
-            ));
+        if line.len().saturating_add(consumed) > maximum_bytes {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, error_message));
         }
         line.extend_from_slice(&available[..consumed]);
         let complete = available.get(consumed.wrapping_sub(1)) == Some(&b'\n');
@@ -501,14 +634,67 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> 
 mod tests {
     use std::io::{BufReader, Cursor};
 
-    use super::{MAX_MESSAGE_BYTES, read_bounded_line, tool_definitions};
+    use super::{
+        MAX_MESSAGE_BYTES, MCP_CONTRACT, ToolRegistry, read_bounded_line, read_mcp_credential,
+    };
 
     #[test]
-    fn embedded_tool_schemas_are_valid_json_objects() -> Result<(), serde_json::Error> {
-        let tools = tool_definitions()?;
-        assert_eq!(tools.len(), 12);
-        assert!(tools.iter().all(|tool| tool["inputSchema"].is_object()));
-        assert!(tools.iter().all(|tool| tool["outputSchema"].is_object()));
+    fn embedded_contract_is_read_only_versioned_and_paginated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ToolRegistry::load()?;
+        assert_eq!(registry.protocol, "2025-11-25");
+        assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v1");
+        assert_eq!(registry.schema_digest.len(), 64);
+        assert_eq!(registry.page_size, 2);
+        assert_eq!(registry.tools.len(), 3);
+        let first = registry
+            .list(&serde_json::json!({}))
+            .map_err(|()| "first page")?;
+        assert_eq!(first["tools"].as_array().map(Vec::len), Some(2));
+        assert_eq!(first["nextCursor"], "hymcpt1:2");
+        let second = registry
+            .list(&serde_json::json!({ "cursor": "hymcpt1:2" }))
+            .map_err(|()| "second page")?;
+        assert_eq!(second["tools"].as_array().map(Vec::len), Some(1));
+        assert!(second["nextCursor"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_contract_rejects_boundary_and_redaction_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original: serde_json::Value = serde_json::from_str(MCP_CONTRACT)?;
+
+        let mut page_size = original.clone();
+        page_size["tool_page_size"] = serde_json::json!(3);
+        assert!(ToolRegistry::from_contract(&serde_json::to_string(&page_size)?).is_err());
+
+        let mut hints = original.clone();
+        hints["tools"][0]["annotations"]["idempotentHint"] = serde_json::json!(false);
+        assert!(ToolRegistry::from_contract(&serde_json::to_string(&hints)?).is_err());
+
+        let mut error_schema = original.clone();
+        let branches = error_schema["tools"][0]["outputSchema"]["oneOf"]
+            .as_array_mut()
+            .ok_or("missing output branches")?;
+        branches.pop();
+        assert!(ToolRegistry::from_contract(&serde_json::to_string(&error_schema)?).is_err());
+
+        let mut secret = original;
+        secret["tools"][1]["outputSchema"]["oneOf"][0]["properties"]["api_key"] =
+            serde_json::json!({ "type": "string" });
+        assert!(ToolRegistry::from_contract(&serde_json::to_string(&secret)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_credential_consumes_only_the_first_bounded_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key = format!("hyp1_{}_{}", "a".repeat(32), "b".repeat(64));
+        let mut input = BufReader::new(Cursor::new(format!("{key}\n{{}}\n")));
+        let credential = read_mcp_credential(None, true, &mut input)?;
+        assert_eq!(credential.credential()?, key);
+        assert_eq!(read_bounded_line(&mut input)?, Some(b"{}\n".to_vec()));
         Ok(())
     }
 

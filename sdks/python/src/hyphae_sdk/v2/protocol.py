@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import struct
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,15 @@ from .models import ClientError, ProductErrorFields, RequestOptions, Response
 
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
+PROTOCOL_MAJOR = 1
+PROTOCOL_MINOR = 2
+G6_CAPABILITIES = 0x7F
+API_KEY_AUTH_CAPABILITY = 1 << 7
+API_KEY_BYTES = 102
+MAX_SECURITY_TEXT_BYTES = 128
+MAX_SECURITY_LIST_ROWS = 1_000
+MAX_SECURITY_GRANTS = 256
+MAX_SECURITY_ASSIGNMENTS = 128
 FRAME_KINDS = {
     "hello": 1,
     "welcome": 2,
@@ -66,7 +76,77 @@ REQUEST_KINDS = {
     "transaction_status_by_idempotency": 39,
     "explicit_transaction_status": 40,
     "proof_generate": 41,
+    "security_status": 42,
+    "security_principal_list": 43,
+    "security_role_list": 44,
+    "security_assignment_list": 45,
+    "security_key_list": 46,
+    "security_audit_read": 47,
+    "security_principal_create": 48,
+    "security_principal_set_enabled": 49,
+    "security_custom_role_create": 50,
+    "security_built_in_assignment_create": 51,
+    "security_custom_assignment_create": 52,
+    "security_assignment_revoke": 53,
 }
+
+SECURITY_READ_OPERATIONS = frozenset({
+    "security_status",
+    "security_principal_list",
+    "security_role_list",
+    "security_assignment_list",
+    "security_key_list",
+    "security_audit_read",
+})
+SECURITY_WRITE_OPERATIONS = frozenset({
+    "security_principal_create",
+    "security_principal_set_enabled",
+    "security_custom_role_create",
+    "security_built_in_assignment_create",
+    "security_custom_assignment_create",
+    "security_assignment_revoke",
+})
+SECURITY_READ_RESPONSE_KINDS = frozenset(range(32, 38))
+SECURITY_WRITE_RESPONSE_KINDS = frozenset(range(38, 42))
+
+BUILT_IN_ROLES = ("owner", "admin", "operator", "developer", "writer", "reader", "auditor")
+PRODUCT_PERMISSIONS = (
+    "audit.read",
+    "backup.create",
+    "backup.verify",
+    "catalog.read",
+    "catalog.write",
+    "credential.self_manage",
+    "data.read",
+    "data.write",
+    "discover",
+    "maintain",
+    "observe",
+    "ownership.manage",
+    "proof.generate",
+    "proof.verify",
+    "restore",
+    "search.execute",
+    "security.manage",
+    "security.read",
+)
+SECURITY_AUDIT_ACTIONS = (
+    "bootstrap_owner",
+    "activate_key",
+    "create_principal",
+    "create_custom_role",
+    "assign_built_in_role",
+    "assign_custom_role",
+    "issue_key",
+    "rotate_key",
+    "revoke_key",
+    "recover_owner",
+    "migrate_legacy_bearer",
+    "abort_key_rotation",
+    "abort_key_issue",
+    "set_principal_enabled",
+    "revoke_assignment",
+)
 
 DEFAULT_PROOF_LIMITS = {
     "result_items": 10_000,
@@ -134,19 +214,34 @@ def decode_frame(encoded: bytes) -> Frame:
     return Frame(kind, stream_id, request_id, encoded[FRAME_HEADER_SIZE:])
 
 
-def encode_hello(client_identity: str = "hyphae-python-sdk-v2") -> bytes:
+def encode_hello(
+    client_identity: str = "hyphae-python-sdk-v2",
+    *,
+    maximum_minor: int = 0,
+) -> bytes:
+    """Encode a legacy-compatible HELLO.
+
+    The default remains the original 1.0 byte sequence. Current transports
+    opt into minor 2 explicitly so old callers and published fixtures do not
+    change beneath them.
+    """
+
+    if not 0 <= maximum_minor <= PROTOCOL_MINOR:
+        raise ClientError("native protocol minor is invalid")
     names = [client_identity.encode(), b"main", b"public"]
+    if not names[0] or sum(map(len, names)) > 4096:
+        raise ClientError("native client identity is invalid")
     total = 58 + sum(map(len, names))
     return struct.pack(
         "<8sIHHHHQQIII B3x HHH",
         b"HYPHEL01",
         total,
-        1,
-        1,
+        PROTOCOL_MAJOR,
+        PROTOCOL_MAJOR,
         0,
-        0,
-        0x7F,
-        0x7F,
+        maximum_minor,
+        G6_CAPABILITIES,
+        G6_CAPABILITIES,
         MAX_PAYLOAD,
         64,
         64 * 1024,
@@ -155,13 +250,74 @@ def encode_hello(client_identity: str = "hyphae-python-sdk-v2") -> bytes:
     ) + b"".join(names)
 
 
+def encode_authenticated_hello(
+    api_key: str | bytes | bytearray,
+    client_identity: str = "hyphae-python-sdk-v2",
+    *,
+    maximum_minor: int = PROTOCOL_MINOR,
+) -> bytes:
+    """Encode one bounded API-key candidate for sole-owner authentication."""
+
+    if isinstance(api_key, str):
+        try:
+            authentication = api_key.encode()
+        except UnicodeEncodeError as error:
+            raise ClientError("local API-key credential is invalid") from error
+    elif isinstance(api_key, (bytes, bytearray)):
+        authentication = bytes(api_key)
+    else:
+        raise ClientError("local API-key credential is invalid")
+    try:
+        authentication.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ClientError("local API-key credential is invalid") from error
+    if len(authentication) != API_KEY_BYTES:
+        raise ClientError("local API-key credential is invalid")
+    if not 0 <= maximum_minor <= PROTOCOL_MINOR:
+        raise ClientError("native protocol minor is invalid")
+    names = [client_identity.encode(), b"main", b"public"]
+    if not names[0] or sum(map(len, names)) > 4096:
+        raise ClientError("native client identity is invalid")
+    total = 58 + sum(map(len, names)) + API_KEY_BYTES
+    capabilities = G6_CAPABILITIES | API_KEY_AUTH_CAPABILITY
+    return struct.pack(
+        "<8sIHHHHQQIII BBH HHH",
+        b"HYPHEL01",
+        total,
+        PROTOCOL_MAJOR,
+        PROTOCOL_MAJOR,
+        0,
+        maximum_minor,
+        capabilities,
+        capabilities,
+        MAX_PAYLOAD,
+        64,
+        64 * 1024,
+        1,
+        1,
+        API_KEY_BYTES,
+        *(len(name) for name in names),
+    ) + b"".join(names) + authentication
+
+
 def decode_welcome(encoded: bytes) -> dict[str, int]:
-    if len(encoded) != 94 or encoded[:8] != b"HYPWEL01" or struct.unpack_from("<I", encoded, 8)[0] != 94:
+    if (
+        len(encoded) != 94
+        or encoded[:8] != b"HYPWEL01"
+        or struct.unpack_from("<I", encoded, 8)[0] != 94
+        or encoded[92:94] != b"\0\0"
+    ):
         raise ClientError("native welcome is malformed")
     major, minor, capabilities = struct.unpack_from("<HHQ", encoded, 12)
     session_id = int.from_bytes(encoded[24:40], "little")
     maximum_frame_payload, maximum_in_flight, initial_window = struct.unpack_from("<III", encoded, 40)
-    if major != 1 or session_id == 0 or not all((maximum_frame_payload, maximum_in_flight, initial_window)):
+    if (
+        major != PROTOCOL_MAJOR
+        or minor > PROTOCOL_MINOR
+        or capabilities & ~(G6_CAPABILITIES | API_KEY_AUTH_CAPABILITY)
+        or session_id == 0
+        or not all((maximum_frame_payload, maximum_in_flight, initial_window))
+    ):
         raise ClientError("native welcome values are invalid")
     return {
         "major": major,
@@ -174,10 +330,41 @@ def decode_welcome(encoded: bytes) -> dict[str, int]:
     }
 
 
-def encode_product_request(operation: str, arguments: dict[str, Any], options: RequestOptions) -> bytes:
+def operation_required_minor(
+    operation: str, arguments: dict[str, Any] | None = None
+) -> int:
+    if operation == "proof_generate" and arguments is not None:
+        nested = arguments.get("operation")
+        return operation_required_minor(nested) if isinstance(nested, str) else 0
+    if operation in SECURITY_WRITE_OPERATIONS:
+        return 2
+    if operation in SECURITY_READ_OPERATIONS:
+        return 1
+    return 0
+
+
+def response_required_minor(kind: int) -> int:
+    if kind in SECURITY_WRITE_RESPONSE_KINDS:
+        return 2
+    if kind in SECURITY_READ_RESPONSE_KINDS:
+        return 1
+    return 0
+
+
+def encode_product_request(
+    operation: str,
+    arguments: dict[str, Any],
+    options: RequestOptions,
+    *,
+    negotiated_minor: int | None = None,
+) -> bytes:
     kind = REQUEST_KINDS.get(operation)
     if kind is None:
         raise ClientError(f"unsupported native operation: {operation}")
+    if negotiated_minor is not None and negotiated_minor < operation_required_minor(
+        operation, arguments
+    ):
+        raise ClientError("native operation is unavailable at the negotiated protocol minor")
     limits = options.limits
     if options.deadline_micros is not None and options.deadline_micros <= 0:
         raise ClientError("deadline_micros must be positive")
@@ -190,6 +377,8 @@ def encode_product_request(operation: str, arguments: dict[str, Any], options: R
         token = options.idempotency_token
         if token is not None and (isinstance(token, bool) or not isinstance(token, int) or not 0 < token < 1 << 128):
             raise ClientError("idempotency_token must be an unsigned 128-bit integer")
+        if operation in SECURITY_WRITE_OPERATIONS and token is None:
+            raise ClientError("security mutation requires a nonzero idempotency_token")
         values = (
             options.logical_time_micros,
             options.deadline_micros or 0,
@@ -233,6 +422,8 @@ def decode_product_request(encoded: bytes) -> tuple[str, dict[str, Any], Request
     operation = next((name for name, value in REQUEST_KINDS.items() if value == kind), None)
     if operation is None:
         raise ClientError("unsupported product request kind")
+    if operation in SECURITY_WRITE_OPERATIONS and token is None:
+        raise ClientError("security mutation requires a nonzero idempotency_token")
     return operation, _decode_operation(operation, payload[offset:]), options
 
 
@@ -351,7 +542,155 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         except (KeyError, struct.error, TypeError) as error:
             raise ClientError("proof generation limits are invalid") from error
         return struct.pack("<HH", REQUEST_KINDS[nested_operation], 0) + _bytes(nested_body) + encoded_limits
+    if operation == "security_status":
+        return b""
+    if operation in {
+        "security_principal_list",
+        "security_role_list",
+        "security_assignment_list",
+        "security_key_list",
+    }:
+        family = operation.removeprefix("security_").removesuffix("_list")
+        return _encode_security_cursor(arguments.get("cursor"), family) + _security_limit(
+            arguments.get("limit", MAX_SECURITY_LIST_ROWS)
+        )
+    if operation == "security_audit_read":
+        return _encode_optional_security_id(arguments.get("cursor")) + _security_limit(
+            arguments.get("limit", MAX_SECURITY_LIST_ROWS)
+        )
+    if operation == "security_principal_create":
+        return _security_text(arguments["display_name"])
+    if operation == "security_principal_set_enabled":
+        enabled = arguments["enabled"]
+        if not isinstance(enabled, bool):
+            raise ClientError("security principal enabled state must be boolean")
+        return _security_id(arguments["principal_id"]) + struct.pack("<B7x", enabled)
+    if operation == "security_custom_role_create":
+        return _security_text(arguments["display_name"]) + _encode_security_grants(
+            arguments["grants"]
+        )
+    if operation == "security_built_in_assignment_create":
+        return (
+            _security_id(arguments["principal_id"])
+            + _built_in_role(arguments["role"])
+            + b"\0" * 7
+            + _encode_product_scope(arguments["scope"])
+        )
+    if operation == "security_custom_assignment_create":
+        return _security_id(arguments["principal_id"]) + _security_id(arguments["role_id"])
+    if operation == "security_assignment_revoke":
+        return _security_id(arguments["assignment_id"])
     raise ClientError(f"binary operation encoder is not implemented for {operation}")
+
+
+def _security_limit(value: Any) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= MAX_SECURITY_LIST_ROWS:
+        raise ClientError("security list limit must be between 1 and 1000")
+    return struct.pack("<Q", value)
+
+
+def _security_id(value: Any) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 1 << 128:
+        raise ClientError("security identity must be a nonzero unsigned 128-bit integer")
+    return value.to_bytes(16, "big")
+
+
+def _security_text(value: Any) -> bytes:
+    if not isinstance(value, str):
+        raise ClientError("security text must be a string")
+    encoded = value.encode("utf-8")
+    if not encoded or len(encoded) > MAX_SECURITY_TEXT_BYTES or any(
+        unicodedata.category(character) == "Cc" for character in value
+    ):
+        raise ClientError("security text is empty, oversized, or contains control characters")
+    return struct.pack("<I", len(encoded)) + encoded
+
+
+def _encode_security_cursor(cursor: Any, family: str) -> bytes:
+    if cursor is None:
+        return b"\0" * 40
+    if not isinstance(cursor, dict):
+        raise ClientError("security cursor is invalid")
+    epoch = cursor.get("authorization_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or not 0 < epoch < 1 << 64:
+        raise ClientError("security cursor authorization_epoch is invalid")
+    kind = cursor.get("kind")
+    after = cursor.get("after")
+    expected = {
+        "principal": {"principal": 1},
+        "role": {"built_in_role": 2, "custom_role": 3},
+        "assignment": {"assignment": 4},
+        "key": {"key": 5},
+    }[family]
+    tag = expected.get(kind)
+    if tag is None:
+        raise ClientError("security cursor family is invalid")
+    if kind == "built_in_role":
+        payload = _built_in_role(after) + b"\0" * 15
+    elif kind == "key":
+        payload = _api_key_id(after)
+    else:
+        payload = _security_id(after)
+    return struct.pack("<B7xQB7x", 1, epoch, tag) + payload
+
+
+def _encode_optional_security_id(value: Any) -> bytes:
+    if value is None:
+        return b"\0" * 24
+    return struct.pack("<B7x", 1) + _security_id(value)
+
+
+def _api_key_id(value: Any) -> bytes:
+    if not isinstance(value, bytes) or len(value) != 16 or value == b"\0" * 16:
+        raise ClientError("API key identity must contain 16 nonzero bytes")
+    return value
+
+
+def _built_in_role(value: Any) -> bytes:
+    try:
+        return bytes((BUILT_IN_ROLES.index(value),))
+    except ValueError as error:
+        raise ClientError("built-in security role is invalid") from error
+
+
+def _encode_product_scope(scope: Any) -> bytes:
+    if not isinstance(scope, dict):
+        raise ClientError("security scope is invalid")
+    kind = scope.get("kind")
+    if kind == "instance":
+        return b"\0" * 24
+    if kind in {"catalog_subtree", "catalog_object"}:
+        object_id = scope.get("object_id")
+        if isinstance(object_id, bool) or not isinstance(object_id, int) or not 0 < object_id < 1 << 128:
+            raise ClientError("security scope object_id is invalid")
+        return bytes((1 if kind == "catalog_subtree" else 2,)) + b"\0" * 7 + object_id.to_bytes(16, "little")
+    raise ClientError("security scope kind is invalid")
+
+
+def _encode_security_grants(value: Any) -> bytes:
+    if not isinstance(value, list) or not 0 < len(value) <= MAX_SECURITY_GRANTS:
+        raise ClientError("custom-role grants must be a nonempty bounded list")
+    encoded: list[tuple[int, tuple[int, int], bytes]] = []
+    for grant in value:
+        if not isinstance(grant, dict):
+            raise ClientError("custom-role grant is invalid")
+        try:
+            permission = PRODUCT_PERMISSIONS.index(grant["permission"])
+        except (KeyError, ValueError) as error:
+            raise ClientError("custom-role permission is invalid") from error
+        if permission == PRODUCT_PERMISSIONS.index("ownership.manage"):
+            raise ClientError("ownership.manage cannot be assigned to a custom role")
+        scope = _encode_product_scope(grant["scope"])
+        if scope[0] != 0 and permission not in {3, 4, 6, 7, 12, 15}:
+            raise ClientError("custom-role permission does not support object scope")
+        scope_order = _scope_order(grant["scope"])
+        encoded.append((permission, scope_order, scope))
+    identities = [(permission, scope_order) for permission, scope_order, _ in encoded]
+    if identities != sorted(identities) or len(set(identities)) != len(identities):
+        raise ClientError("custom-role grants must use strict canonical order")
+    return struct.pack("<I4x", len(encoded)) + b"".join(
+        struct.pack("<B7x", permission) + scope for permission, _, scope in encoded
+    )
 
 
 def _catalog_kind_tag(kind: Any) -> int:
@@ -457,7 +796,14 @@ def _encode_query(query: Any, depth: int = 0) -> bytes:
 
 
 def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
-    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"}:
+    if operation in {
+        "capabilities",
+        "admin_status",
+        "admin_checkpoint",
+        "telemetry",
+        "transaction_begin",
+        "security_status",
+    }:
         if encoded:
             raise ClientError("parameterless request has trailing bytes")
         return {}
@@ -487,10 +833,186 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         result = {"idempotency_token": reader.u128()}
     elif operation == "structure_read":
         result = _decode_structure_read_request(reader)
+    elif operation in {
+        "security_principal_list",
+        "security_role_list",
+        "security_assignment_list",
+        "security_key_list",
+    }:
+        family = operation.removeprefix("security_").removesuffix("_list")
+        result = {
+            "cursor": _decode_security_cursor(reader, family),
+            "limit": _decode_security_limit(reader),
+        }
+    elif operation == "security_audit_read":
+        result = {
+            "cursor": _decode_optional_security_id(reader),
+            "limit": _decode_security_limit(reader),
+        }
+    elif operation == "security_principal_create":
+        result = {"display_name": _decode_security_text(reader)}
+    elif operation == "security_principal_set_enabled":
+        result = {
+            "principal_id": _decode_security_id(reader),
+            "enabled": reader.boolean(),
+        }
+        reader.zeroes(7)
+    elif operation == "security_custom_role_create":
+        result = {
+            "display_name": _decode_security_text(reader),
+            "grants": _decode_security_grants(reader),
+        }
+    elif operation == "security_built_in_assignment_create":
+        result = {
+            "principal_id": _decode_security_id(reader),
+            "role": _decode_built_in_role(reader),
+        }
+        reader.zeroes(7)
+        result["scope"] = _decode_product_scope(reader)
+    elif operation == "security_custom_assignment_create":
+        result = {
+            "principal_id": _decode_security_id(reader),
+            "role_id": _decode_security_id(reader),
+        }
+    elif operation == "security_assignment_revoke":
+        result = {"assignment_id": _decode_security_id(reader)}
     else:
         raise ClientError(f"binary operation decoder is not implemented for {operation}")
     reader.finish()
     return result
+
+
+def _decode_security_limit(reader: _Reader) -> int:
+    limit = reader.u64()
+    if not 0 < limit <= MAX_SECURITY_LIST_ROWS:
+        raise ClientError("security list limit is invalid")
+    return limit
+
+
+def _decode_security_id(reader: _Reader) -> int:
+    value = int.from_bytes(reader.take(16), "big")
+    if value == 0:
+        raise ClientError("security identity is zero")
+    return value
+
+
+def _decode_api_key_id(reader: _Reader) -> bytes:
+    value = reader.take(16)
+    if value == b"\0" * 16:
+        raise ClientError("API key identity is zero")
+    return value
+
+
+def _decode_security_text(reader: _Reader) -> str:
+    length = reader.u32()
+    if not 0 < length <= MAX_SECURITY_TEXT_BYTES:
+        raise ClientError("security text length is invalid")
+    try:
+        value = reader.take(length).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ClientError("security text is not valid UTF-8") from error
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ClientError("security text contains control characters")
+    return value
+
+
+def _decode_security_cursor(reader: _Reader, family: str) -> dict[str, Any] | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    epoch = reader.u64()
+    kind = reader.u8()
+    reader.zeroes(7)
+    payload = reader.take(16)
+    if not present:
+        if epoch != 0 or kind != 0 or payload != b"\0" * 16:
+            raise ClientError("absent security cursor is noncanonical")
+        return None
+    if epoch == 0:
+        raise ClientError("security cursor epoch is zero")
+    expected = {
+        "principal": {1: "principal"},
+        "role": {2: "built_in_role", 3: "custom_role"},
+        "assignment": {4: "assignment"},
+        "key": {5: "key"},
+    }[family]
+    cursor_kind = expected.get(kind)
+    if cursor_kind is None:
+        raise ClientError("security cursor family is invalid")
+    if cursor_kind == "built_in_role":
+        if payload[1:] != b"\0" * 15 or payload[0] >= len(BUILT_IN_ROLES):
+            raise ClientError("security role cursor is invalid")
+        after: Any = BUILT_IN_ROLES[payload[0]]
+    elif cursor_kind == "key":
+        if payload == b"\0" * 16:
+            raise ClientError("security key cursor is zero")
+        after = payload
+    else:
+        after = int.from_bytes(payload, "big")
+        if after == 0:
+            raise ClientError("security cursor identity is zero")
+    return {"authorization_epoch": epoch, "kind": cursor_kind, "after": after}
+
+
+def _decode_optional_security_id(reader: _Reader) -> int | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    payload = reader.take(16)
+    value = int.from_bytes(payload, "big")
+    if not present:
+        if value != 0:
+            raise ClientError("absent security identity is noncanonical")
+        return None
+    if value == 0:
+        raise ClientError("security identity is zero")
+    return value
+
+
+def _decode_built_in_role(reader: _Reader) -> str:
+    tag = reader.u8()
+    if tag >= len(BUILT_IN_ROLES):
+        raise ClientError("built-in security role is invalid")
+    return BUILT_IN_ROLES[tag]
+
+
+def _decode_product_scope(reader: _Reader) -> dict[str, object]:
+    kind = reader.u8()
+    reader.zeroes(7)
+    payload = reader.take(16)
+    if kind == 0:
+        if payload != b"\0" * 16:
+            raise ClientError("instance scope has a nonzero identity")
+        return {"kind": "instance"}
+    object_id = int.from_bytes(payload, "little")
+    if kind not in (1, 2) or object_id == 0:
+        raise ClientError("security object scope is invalid")
+    return {
+        "kind": "catalog_subtree" if kind == 1 else "catalog_object",
+        "object_id": object_id,
+    }
+
+
+def _decode_security_grants(reader: _Reader) -> list[dict[str, object]]:
+    count = reader.u32()
+    reader.zeroes(4)
+    if not 0 < count <= MAX_SECURITY_GRANTS:
+        raise ClientError("custom-role grant count is invalid")
+    grants: list[dict[str, object]] = []
+    canonical: list[tuple[int, tuple[int, int]]] = []
+    for _ in range(count):
+        permission = reader.u8()
+        reader.zeroes(7)
+        if permission >= len(PRODUCT_PERMISSIONS):
+            raise ClientError("custom-role permission is invalid")
+        scope = _decode_product_scope(reader)
+        if permission == 11 or (
+            scope["kind"] != "instance" and permission not in {3, 4, 6, 7, 12, 15}
+        ):
+            raise ClientError("custom-role grant scope is invalid")
+        canonical.append((permission, _scope_order(scope)))
+        grants.append({"permission": PRODUCT_PERMISSIONS[permission], "scope": scope})
+    if canonical != sorted(canonical) or len(set(canonical)) != len(canonical):
+        raise ClientError("custom-role grants are noncanonical")
+    return grants
 
 
 def _decode_structure_key(reader: _Reader) -> dict[str, Any]:
@@ -568,8 +1090,15 @@ def _decode_transaction_vector_mutation(reader: _Reader) -> dict[str, Any]:
     return result
 
 
-def decode_product_response(encoded: bytes, request_id: int) -> Response:
+def decode_product_response(
+    encoded: bytes,
+    request_id: int,
+    *,
+    negotiated_minor: int | None = None,
+) -> Response:
     kind, payload = _envelope(encoded, b"HYPRSP01")
+    if negotiated_minor is not None and negotiated_minor < response_required_minor(kind):
+        raise ClientError("native response is unavailable at the negotiated protocol minor")
     reader = _Reader(payload)
     if kind == 1:
         value = {
@@ -824,7 +1353,9 @@ def decode_product_response(encoded: bytes, request_id: int) -> Response:
         reader.finish()
         return Response("search_ingested", value, request_id)
     if kind == 31:
-        nested = decode_product_response(reader.bytes(), request_id)
+        nested = decode_product_response(
+            reader.bytes(), request_id, negotiated_minor=negotiated_minor
+        )
         value = {
             "response": nested,
             "proof": reader.bytes(),
@@ -833,7 +1364,392 @@ def decode_product_response(encoded: bytes, request_id: int) -> Response:
         }
         reader.finish()
         return Response("proven", value, request_id)
+    if kind == 32:
+        value = _decode_security_status(reader)
+        reader.finish()
+        return Response("security_status", value, request_id)
+    if kind in (33, 34, 35, 36):
+        family = ("principal", "role", "assignment", "key")[kind - 33]
+        value = _decode_security_page(reader, family)
+        reader.finish()
+        return Response(f"security_{family}_page", value, request_id)
+    if kind == 37:
+        value = _decode_security_audit_page(reader)
+        reader.finish()
+        return Response("security_audit_page", value, request_id)
+    if kind in (38, 39, 40):
+        identity_name = ("principal_id", "role_id", "assignment_id")[kind - 38]
+        value = {
+            identity_name: _decode_security_id(reader),
+            "authorization_epoch": _decode_authorization_epoch(reader),
+            "commit": _decode_commit_receipt(reader),
+        }
+        reader.finish()
+        response_name = (
+            "security_principal_mutated",
+            "security_custom_role_mutated",
+            "security_assignment_mutated",
+        )[kind - 38]
+        return Response(response_name, value, request_id)
+    if kind == 41:
+        value = {
+            "authorization_epoch": _decode_authorization_epoch(reader),
+            "commit": _decode_commit_receipt(reader),
+        }
+        reader.finish()
+        return Response("security_mutated", value, request_id)
     raise ClientError(f"unsupported product response kind: {kind}")
+
+
+def _decode_authorization_epoch(reader: _Reader) -> int:
+    value = reader.u64()
+    if value == 0:
+        raise ClientError("authorization epoch is zero")
+    return value
+
+
+def _decode_security_status(reader: _Reader) -> dict[str, Any]:
+    bootstrapped = reader.boolean()
+    reader.zeroes(7)
+    epoch = reader.u64()
+    names = (
+        "principals",
+        "assignments",
+        "custom_roles",
+        "custom_assignments",
+        "keys",
+        "pending_keys",
+        "audit_events",
+    )
+    counts = dict(zip(names, (reader.u64() for _ in names)))
+    empty = all(count == 0 for count in counts.values())
+    if bootstrapped:
+        valid = epoch != 0 and counts["principals"] > 0 and counts["assignments"] > 0
+    else:
+        valid = epoch == 0 and empty
+    maximum_assignments = counts["principals"] * MAX_SECURITY_ASSIGNMENTS
+    if (
+        not valid
+        or counts["principals"] > 4096
+        or counts["assignments"] + counts["custom_assignments"] > maximum_assignments
+        or counts["custom_roles"] > 1024
+        or counts["keys"] > counts["principals"] * 64
+        or counts["pending_keys"] > counts["keys"]
+        or counts["audit_events"] > 100_000
+    ):
+        raise ClientError("security status is invalid")
+    return {"bootstrapped": bootstrapped, "authorization_epoch": epoch, **counts}
+
+
+def _decode_security_page(reader: _Reader, family: str) -> dict[str, Any]:
+    epoch = _decode_authorization_epoch(reader)
+    count = reader.u32()
+    reader.zeroes(4)
+    if count > MAX_SECURITY_LIST_ROWS:
+        raise ClientError("security page item count is invalid")
+    cursor = _decode_security_cursor(reader, family)
+    if cursor is not None and cursor["authorization_epoch"] != epoch:
+        raise ClientError("security page cursor epoch differs from its page")
+    decoders = {
+        "principal": _decode_security_principal,
+        "role": _decode_security_role,
+        "assignment": _decode_security_assignment,
+        "key": _decode_security_key,
+    }
+    items = [decoders[family](reader) for _ in range(count)]
+    identities = [_security_item_order(item, family) for item in items]
+    if identities != sorted(identities) or len(set(identities)) != len(identities):
+        raise ClientError("security page items are noncanonical")
+    if cursor is not None and (
+        not items or _security_cursor_order(cursor, family) != identities[-1]
+    ):
+        raise ClientError("security page cursor does not identify its final item")
+    return {"authorization_epoch": epoch, "items": items, "next_cursor": cursor}
+
+
+def _decode_security_principal(reader: _Reader) -> dict[str, Any]:
+    identity = _decode_security_id(reader)
+    enabled = reader.boolean()
+    reader.zeroes(7)
+    return {
+        "id": identity,
+        "display_name": _decode_security_text(reader),
+        "enabled": enabled,
+    }
+
+
+def _decode_security_role(reader: _Reader) -> dict[str, Any]:
+    kind = reader.u8()
+    if kind == 0:
+        role = _decode_built_in_role(reader)
+        reader.zeroes(6)
+        return {"kind": "built_in", "role": role, "display_name": role, "grants": []}
+    if kind == 1:
+        reader.zeroes(7)
+        return {
+            "kind": "custom",
+            "id": _decode_security_id(reader),
+            "display_name": _decode_security_text(reader),
+            "grants": _decode_security_grants(reader),
+        }
+    raise ClientError("security role kind is invalid")
+
+
+def _decode_security_assignment(reader: _Reader) -> dict[str, Any]:
+    identity = _decode_security_id(reader)
+    principal_id = _decode_security_id(reader)
+    kind = reader.u8()
+    if kind == 0:
+        role = _decode_built_in_role(reader)
+        reader.zeroes(6)
+        scope = _decode_product_scope(reader)
+        if role == "owner" and scope != {"kind": "instance"}:
+            raise ClientError("owner assignment is not instance-scoped")
+        return {
+            "id": identity,
+            "principal_id": principal_id,
+            "kind": "built_in",
+            "role": role,
+            "scope": scope,
+        }
+    if kind == 1:
+        reader.zeroes(7)
+        return {
+            "id": identity,
+            "principal_id": principal_id,
+            "kind": "custom",
+            "role_id": _decode_security_id(reader),
+        }
+    raise ClientError("security assignment kind is invalid")
+
+
+def _decode_security_key(reader: _Reader) -> dict[str, Any]:
+    identity = _decode_api_key_id(reader)
+    principal_id = _decode_security_id(reader)
+    flags = reader.u8()
+    reader.zeroes(7)
+    if flags & ~3:
+        raise ClientError("security key flags are invalid")
+    label = _decode_security_text(reader)
+    role_count = reader.u32()
+    reader.zeroes(4)
+    if role_count > len(BUILT_IN_ROLES):
+        raise ClientError("security key role count is invalid")
+    roles = [_decode_built_in_role(reader) for _ in range(role_count)]
+    if roles != sorted(roles, key=BUILT_IN_ROLES.index) or len(set(roles)) != len(roles):
+        raise ClientError("security key roles are noncanonical")
+    custom_count = reader.u32()
+    reader.zeroes(4)
+    if custom_count > MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("security key custom-role count is invalid")
+    custom_roles = [_decode_security_id(reader) for _ in range(custom_count)]
+    if custom_roles != sorted(custom_roles) or len(set(custom_roles)) != len(custom_roles):
+        raise ClientError("security key custom roles are noncanonical")
+    if not roles and not custom_roles:
+        raise ClientError("security key selects no roles")
+    permission_ceiling = reader.u64()
+    if permission_ceiling >> len(PRODUCT_PERMISSIONS):
+        raise ClientError("security key permission ceiling has unknown bits")
+    scope_count = reader.u32()
+    reader.zeroes(4)
+    if not 0 < scope_count <= MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("security key scope count is invalid")
+    scopes = [_decode_product_scope(reader) for _ in range(scope_count)]
+    scope_order = [_scope_order(scope) for scope in scopes]
+    if scope_order != sorted(scope_order) or len(set(scope_order)) != len(scope_order):
+        raise ClientError("security key scopes are noncanonical")
+    if {"kind": "instance"} in scopes and len(scopes) != 1:
+        raise ClientError("instance security scope must be the only ceiling")
+    created_at = reader.i64()
+    expires_at = _decode_fixed_optional_i64(reader)
+    published_epoch = _decode_authorization_epoch(reader)
+    predecessor_id = _decode_optional_api_key_id(reader)
+    successor_id = _decode_optional_api_key_id(reader)
+    overlap_until = _decode_fixed_optional_i64(reader)
+    rotation_overlap = _decode_optional_u64(reader)
+    if expires_at is not None and expires_at <= created_at:
+        raise ClientError("security key expiry is invalid")
+    if overlap_until is not None and overlap_until <= created_at:
+        raise ClientError("security key overlap deadline is invalid")
+    if rotation_overlap is not None and rotation_overlap > 604_800_000_000:
+        raise ClientError("security key rotation overlap is invalid")
+    rotation_shape = (
+        (predecessor_id is None and overlap_until is None and rotation_overlap is None)
+        or (
+            predecessor_id is not None
+            and successor_id is None
+            and overlap_until is None
+            and rotation_overlap is not None
+        )
+        or (
+            predecessor_id is None
+            and successor_id is not None
+            and overlap_until is not None
+            and rotation_overlap is None
+        )
+    )
+    if not rotation_shape or identity in {predecessor_id, successor_id}:
+        raise ClientError("security key rotation links are invalid")
+    return {
+        "id": identity,
+        "principal_id": principal_id,
+        "label": label,
+        "active": bool(flags & 1),
+        "revoked": bool(flags & 2),
+        "roles": roles,
+        "custom_roles": custom_roles,
+        "permission_ceiling": [
+            permission
+            for tag, permission in enumerate(PRODUCT_PERMISSIONS)
+            if permission_ceiling & 1 << tag
+        ],
+        "scope_ceiling": scopes,
+        "created_at_micros": created_at,
+        "expires_at_micros": expires_at,
+        "published_epoch": published_epoch,
+        "predecessor_id": predecessor_id,
+        "successor_id": successor_id,
+        "overlap_until_micros": overlap_until,
+        "rotation_overlap_micros": rotation_overlap,
+    }
+
+
+def _decode_security_audit_page(reader: _Reader) -> dict[str, Any]:
+    count = reader.u32()
+    reader.zeroes(4)
+    if count > MAX_SECURITY_LIST_ROWS:
+        raise ClientError("security audit page count is invalid")
+    cursor = _decode_optional_security_id(reader)
+    events = [_decode_security_audit_event(reader) for _ in range(count)]
+    ids = [event["id"] for event in events]
+    commit_csns = [event["commit_csn"] for event in events]
+    if len(set(ids)) != len(ids) or commit_csns != sorted(commit_csns) or len(set(commit_csns)) != len(commit_csns):
+        raise ClientError("security audit events are noncanonical")
+    if cursor is not None and (not events or cursor != events[-1]["id"]):
+        raise ClientError("security audit cursor does not identify its final event")
+    return {"events": events, "next_cursor": cursor}
+
+
+def _decode_security_audit_event(reader: _Reader) -> dict[str, Any]:
+    identity = _decode_security_id(reader)
+    commit_csn = reader.u64()
+    if commit_csn == 0:
+        raise ClientError("security audit commit CSN is zero")
+    has_actor = reader.boolean()
+    reader.zeroes(7)
+    principal_wire, key_wire = reader.take(16), reader.take(16)
+    if has_actor:
+        actor_principal_id = int.from_bytes(principal_wire, "big")
+        if actor_principal_id == 0 or key_wire == b"\0" * 16:
+            raise ClientError("security audit actor is invalid")
+        actor_key_id: bytes | None = key_wire
+    elif principal_wire == b"\0" * 16 and key_wire == b"\0" * 16:
+        actor_principal_id = None
+        actor_key_id = None
+    else:
+        raise ClientError("absent security audit actor is noncanonical")
+    action_tag = reader.u8()
+    result_tag = reader.u8()
+    reader.zeroes(6)
+    if action_tag >= len(SECURITY_AUDIT_ACTIONS) or result_tag != 0:
+        raise ClientError("security audit action or result is invalid")
+    target_count = reader.u32()
+    reader.zeroes(4)
+    if not 0 < target_count <= MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("security audit target count is invalid")
+    targets = []
+    for _ in range(target_count):
+        target_kind = reader.u8()
+        reader.zeroes(7)
+        target_wire = reader.take(16)
+        if target_kind > 3 or target_wire == b"\0" * 16:
+            raise ClientError("security audit target is invalid")
+        targets.append({
+            "kind": ("principal", "role", "assignment", "key")[target_kind],
+            "id": target_wire if target_kind == 3 else int.from_bytes(target_wire, "big"),
+        })
+    metadata_count = reader.u32()
+    reader.zeroes(4)
+    if metadata_count > MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("security audit metadata count is invalid")
+    metadata = []
+    for _ in range(metadata_count):
+        metadata_kind = reader.u8()
+        reader.zeroes(7)
+        if metadata_kind > 1:
+            raise ClientError("security audit metadata is invalid")
+        metadata.append({
+            "kind": ("expires_at_micros", "rotation_overlap_until_micros")[metadata_kind],
+            "value": reader.i64(),
+        })
+    return {
+        "id": identity,
+        "commit_csn": commit_csn,
+        "actor_principal_id": actor_principal_id,
+        "actor_key_id": actor_key_id,
+        "action": SECURITY_AUDIT_ACTIONS[action_tag],
+        "result": "succeeded",
+        "targets": targets,
+        "metadata": metadata,
+    }
+
+
+def _decode_optional_api_key_id(reader: _Reader) -> bytes | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    value = reader.take(16)
+    if not present:
+        if value != b"\0" * 16:
+            raise ClientError("absent API key identity is noncanonical")
+        return None
+    if value == b"\0" * 16:
+        raise ClientError("API key identity is zero")
+    return value
+
+
+def _decode_fixed_optional_i64(reader: _Reader) -> int | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    value = reader.i64()
+    if not present:
+        if value != 0:
+            raise ClientError("absent optional instant is noncanonical")
+        return None
+    return value
+
+
+def _decode_optional_u64(reader: _Reader) -> int | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    value = reader.u64()
+    if not present:
+        if value != 0:
+            raise ClientError("absent optional integer is noncanonical")
+        return None
+    return value
+
+
+def _scope_order(scope: dict[str, object]) -> tuple[int, int]:
+    return (
+        ("instance", "catalog_subtree", "catalog_object").index(str(scope["kind"])),
+        int(scope.get("object_id", 0)),
+    )
+
+
+def _security_item_order(item: dict[str, Any], family: str) -> tuple[int, int | bytes]:
+    if family == "role" and item["kind"] == "built_in":
+        return (0, BUILT_IN_ROLES.index(item["role"]))
+    if family == "role":
+        return (1, item["id"])
+    return (0, item["id"])
+
+
+def _security_cursor_order(cursor: dict[str, Any], family: str) -> tuple[int, int | bytes]:
+    if family == "role" and cursor["kind"] == "built_in_role":
+        return (0, BUILT_IN_ROLES.index(cursor["after"]))
+    if family == "role":
+        return (1, cursor["after"])
+    return (0, cursor["after"])
 
 
 def _decode_snapshot(reader: _Reader) -> dict[str, Any]:
@@ -1930,10 +2846,14 @@ def _take_text(encoded: bytes, offset: int, length: int) -> tuple[str, int]:
 
 
 __all__ = [
+    "API_KEY_AUTH_CAPABILITY",
     "FRAME_HEADER_SIZE",
     "FRAME_KINDS",
     "Frame",
+    "G6_CAPABILITIES",
     "MAX_PAYLOAD",
+    "PROTOCOL_MAJOR",
+    "PROTOCOL_MINOR",
     "crc32c",
     "blake3",
     "decode_end",
@@ -1942,8 +2862,11 @@ __all__ = [
     "decode_product_response",
     "decode_welcome",
     "encode_cancel",
+    "encode_authenticated_hello",
     "encode_frame",
     "encode_hello",
     "encode_product_request",
     "encode_window_update",
+    "operation_required_minor",
+    "response_required_minor",
 ]

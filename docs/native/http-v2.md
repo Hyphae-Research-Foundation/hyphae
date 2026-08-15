@@ -25,6 +25,11 @@ opens product sessions only through
 `NativeProductHandle::open_authenticated_session`. Remote managed exposure
 must terminate TLS in a proxy that forwards to the loopback listener; a durable
 API key never travels to a non-loopback plaintext bind.
+The Rust and Python Native v2 HTTP clients enforce the matching egress rule:
+plaintext credentials are accepted only for canonical IPv4/IPv6 loopback or
+the exact `localhost` hostname, while every other managed origin requires
+`https://`. The MCP adapter inherits the Rust check before starting its stdio
+request loop. The separate format-2 `/v1` bearer client is unchanged.
 
 ## Resource families
 

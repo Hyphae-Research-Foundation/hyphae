@@ -81,3 +81,46 @@ or `HyphaeClient.http(origin)`. Local uses exact `HYPHLCL1` bytes over AF_UNIX
 or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
 `/v2/execute`. Both reconstruct `ProductError` typed fields and accept
 `RequestOptions` deadlines and cancellation.
+
+Managed local sessions negotiate Native 1.2 and authenticate in the bounded
+`HELLO` trailer. Security metadata responses contain no credential secret or
+verifier, and every security mutation requires a caller-selected nonzero
+idempotency token:
+
+```python
+import os
+from pathlib import Path
+from hyphae_sdk.v2 import HyphaeClient, RequestOptions
+
+api_key_path = Path(os.environ["HYPHAE_NATIVE_API_KEY_FILE"])
+api_key = api_key_path.read_text(encoding="ascii").removesuffix("\n")
+
+with HyphaeClient.local_authenticated(
+    "/var/run/hyphae.sock",
+    api_key,
+) as client:
+    status = client.security_status()
+    principal = client.security_principal_create(
+        "analytics",
+        options=RequestOptions(idempotency_token=1),
+    )
+```
+
+`HYPHAE_NATIVE_API_KEY_FILE` must name a caller-controlled restricted regular
+file (owner-only permissions on Unix, or an equivalent owning-account ACL on
+Windows). The SDK receives the credential in memory but does not configure or
+audit filesystem permissions. Do not place the credential value in argv,
+logs, exceptions, or source control.
+
+For Native v2 HTTP, a bearer credential may use `http://` only with a
+canonical loopback host (`127.0.0.0/8`, `[::1]`, or exact `localhost`). Every
+other managed origin requires `https://` and is rejected before a request can
+carry the key. This rule does not alter the separate `/v1` Python client.
+
+The same typed security methods work through
+`HyphaeClient.http(origin, bearer_token=...)`: `security_status`,
+`security_principal_list`, `security_role_list`, `security_assignment_list`,
+`security_key_list`, `security_audit_read`, `security_principal_create`,
+`security_principal_set_enabled`, `security_custom_role_create`,
+`security_built_in_assignment_create`, `security_custom_assignment_create`,
+and `security_assignment_revoke`.

@@ -45,6 +45,10 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_access_control -v
           PYTHONPATH=. python tools/check_native_access_control.py
+      - name: Verify managed Native v2 authority conformance
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_v2_authority_conformance -v
+          PYTHONPATH=. python tools/check_native_v2_authority_conformance.py
       - name: Verify Claude Code and Codex plugins
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_agent_plugins -v
@@ -259,7 +263,9 @@ jobs:
       - name: Build public Rust clients and single binary
         run: cargo build -p hyphae-cli -p hyphae-conformance-rust --locked
       - name: Run common live conformance suite
-        run: python tools/run_conformance.py
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_run_conformance -v
+          python tools/run_conformance.py
 
   optional-integrations:
     name: Optional framework integrations

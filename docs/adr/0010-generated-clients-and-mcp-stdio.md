@@ -68,8 +68,10 @@ surface supports binary transfer.
 
 ## Verification
 
-`tools/run_conformance.py` starts a fresh loopback server for Rust, TypeScript,
-Python, CLI, and MCP, then requires the same versioned fixture to pass. SDK unit
-tests cover origin/secret validation, error correlation, stream bounds, and
-lossless signed-64-bit TypeScript JSON. Rust stable/MSRV tests and Clippy cover
-the single-binary CLI/MCP implementation.
+`tools/run_conformance.py` starts a fresh loopback server for the Rust,
+TypeScript, Python, and CLI `/v1` clients, then requires the same versioned
+fixture to pass. MCP has since moved to a managed Native v2 contract and is
+verified by its authority, plugin, and live CLI gates. SDK unit tests cover
+origin/secret validation, error correlation, stream bounds, and lossless
+signed-64-bit TypeScript JSON. Rust stable/MSRV tests and Clippy cover the
+single-binary CLI/MCP implementation.

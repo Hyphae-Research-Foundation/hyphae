@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::{sync::Arc, time::Duration};
+use std::{net::IpAddr, sync::Arc, time::Duration};
 
 use hyphae_native_product::{ProductErrorCode, ProductOperation, ProductResponse};
 use reqwest::{StatusCode, Url, header};
@@ -54,8 +54,13 @@ impl HttpTransport {
         })
     }
 
-    /// Adds one opaque bearer token.
+    /// Adds one opaque bearer token over TLS or a canonical loopback origin.
     pub fn bearer_token(mut self, token: &str) -> Result<Self, ClientError> {
+        if self.origin.scheme() == "http" && !is_loopback_origin(&self.origin) {
+            return Err(ClientError::Http(
+                "durable API keys require HTTPS outside loopback".to_owned(),
+            ));
+        }
         if token.is_empty() {
             return Err(ClientError::Http("bearer token is empty".to_owned()));
         }
@@ -262,6 +267,20 @@ fn unique_request_id() -> u64 {
     u64::try_from(nanos & u128::from(u64::MAX)).unwrap_or(1)
 }
 
+fn is_loopback_origin(origin: &Url) -> bool {
+    let Some(host) = origin.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn unix_time_micros() -> i64 {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -285,5 +304,55 @@ trait ProductCodeExt {
 impl ProductCodeExt for ProductErrorCode {
     fn into_product_error(self) -> ClientError {
         Box::new(hyphae_native_product::ProductError::from_code(self)).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientError, HttpTransport};
+
+    #[test]
+    fn durable_bearer_requires_tls_outside_canonical_loopback() {
+        for origin in [
+            "http://127.0.0.1:8787",
+            "http://127.1:8787",
+            "http://[::1]:8787",
+            "http://localhost:8787",
+            "http://LOCALHOST:8787",
+            "https://example.test",
+        ] {
+            assert!(
+                HttpTransport::new(origin)
+                    .and_then(|transport| transport.bearer_token("candidate"))
+                    .is_ok(),
+                "expected bearer origin to be accepted: {origin}"
+            );
+        }
+
+        for origin in [
+            "http://example.test",
+            "http://localhost.example",
+            "http://192.168.1.10",
+            "http://[::ffff:127.0.0.1]",
+        ] {
+            let result = HttpTransport::new(origin)
+                .and_then(|transport| transport.bearer_token("candidate"));
+            assert!(
+                result.is_err(),
+                "plaintext remote bearer must fail: {origin}"
+            );
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error,
+                        ClientError::Http(ref message)
+                            if message == "durable API keys require HTTPS outside loopback"
+                    ),
+                    "unexpected rejection for {origin}: {error}"
+                );
+            }
+        }
+
+        assert!(HttpTransport::new("http://example.test").is_ok());
     }
 }

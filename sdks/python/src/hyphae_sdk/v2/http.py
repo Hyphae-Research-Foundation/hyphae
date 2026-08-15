@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import threading
 import time
 import urllib.parse
@@ -47,13 +48,31 @@ class HttpTransport:
             raise ClientError("base URL must be a root HTTP(S) origin")
         if timeout_seconds <= 0 or not 0 < response_bytes <= 16 * 1024 * 1024:
             raise ClientError("HTTP timeout and response bound must be positive")
-        if bearer_token is not None and (not bearer_token or "\r" in bearer_token or "\n" in bearer_token):
-            raise ClientError("invalid bearer token")
+        if bearer_token is not None:
+            if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+                raise ClientError("durable API keys require HTTPS outside loopback")
+            if not bearer_token or "\r" in bearer_token or "\n" in bearer_token:
+                raise ClientError("invalid bearer token")
         self._parsed = parsed
         self._bearer_token = bearer_token
         self._timeout_seconds = timeout_seconds
         self._response_bytes = response_bytes
         self._session_id: str | None = None
+
+    def __repr__(self) -> str:
+        authentication = "bearer" if self._bearer_token is not None else "none"
+        origin = f"{self._parsed.scheme}://{self._parsed.netloc}"
+        return f"HttpTransport(base_url={origin!r}, authentication={authentication!r})"
+
+    def __enter__(self) -> HttpTransport:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def close(self) -> None:
+        self._session_id = None
 
     def execute(self, operation: str, arguments: dict[str, object], options: RequestOptions) -> Response:
         request_id = options.checked_request_id()
@@ -113,6 +132,20 @@ class HttpTransport:
             raise ClientError("Hyphae HTTP v2 transport failed") from error
         finally:
             connection.close()
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.casefold() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return (
+        isinstance(address, ipaddress.IPv4Address) and address.is_loopback
+    ) or address == ipaddress.IPv6Address("::1")
 
 
 def _decode_json_error(encoded: bytes) -> ProductErrorFields:

@@ -25,6 +25,13 @@ operations over canonical HTTP `/v2/execute` product envelopes and exact
 types and preserves typed product errors, deadlines, cancellation, and
 transaction outcome state.
 
+Native v2 bearer credentials may use plaintext `http://` only with a canonical
+loopback host (`127.0.0.0/8`, `[::1]`, or exact `localhost`).
+`HttpTransport::bearer_token` rejects every other plaintext origin before a
+credential can be sent; remote managed endpoints require `https://`. This
+restriction is additive to `hyphae_client::v2` and does not change the
+published `/v1` client.
+
 Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source, examples, and
 security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

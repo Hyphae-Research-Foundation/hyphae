@@ -24,6 +24,7 @@ struct SecurityWriteFixture {
     directory: PathBuf,
     owner_key: PathBuf,
     owner_secret: String,
+    role_keys: Vec<PathBuf>,
 }
 
 impl SecurityWriteFixture {
@@ -44,6 +45,7 @@ impl SecurityWriteFixture {
             directory,
             owner_key,
             owner_secret,
+            role_keys: Vec::new(),
         })
     }
 
@@ -54,12 +56,135 @@ impl SecurityWriteFixture {
             authority,
         ))
     }
+
+    fn role_session(
+        &mut self,
+        role: BuiltInRole,
+        id: u128,
+    ) -> Result<ProductSession, Box<dyn Error>> {
+        if role == BuiltInRole::Owner {
+            return self.owner_session(id);
+        }
+        let actor_name = format!("{} actor", role.as_str());
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let principal = self
+            .product
+            .create_security_principal(&owner, &actor_name, 10)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 11)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product.assign_built_in_role(
+            &owner,
+            principal.principal_id,
+            role,
+            ProductScope::Instance,
+            12,
+        )?;
+        let key_path = self
+            .directory
+            .with_extension(format!("{}-key", role.as_str()));
+        let _ignored = fs::remove_file(&key_path);
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product.issue_api_key_to_file(
+            &owner,
+            principal.principal_id,
+            role.as_str(),
+            [role],
+            role.authorization(),
+            None,
+            &key_path,
+            13,
+        )?;
+        let secret = fs::read_to_string(&key_path)?;
+        let authority = self.product.authenticate_api_key(&secret, 0)?;
+        self.role_keys.push(key_path);
+        Ok(ProductSession::new_authenticated(
+            ProductSessionId::new(id).ok_or("zero role session")?,
+            authority,
+        ))
+    }
+
+    fn valid_write_operations(
+        &mut self,
+    ) -> Result<Vec<(&'static str, ProductOperation)>, Box<dyn Error>> {
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let principal =
+            self.product
+                .create_security_principal(&owner, "Denied-operation target", 20)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 21)?;
+        let grant = CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+            .ok_or("invalid role grant")?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let custom_role = self.product.create_custom_security_role(
+            &owner,
+            "Denied-operation role",
+            [grant],
+            22,
+        )?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let assignment = self.product.assign_built_in_role(
+            &owner,
+            principal.principal_id,
+            BuiltInRole::Reader,
+            ProductScope::Instance,
+            23,
+        )?;
+        Ok(vec![
+            (
+                "principal create",
+                ProductOperation::SecurityPrincipalCreate {
+                    display_name: "Denied principal".to_owned(),
+                },
+            ),
+            (
+                "principal set enabled",
+                ProductOperation::SecurityPrincipalSetEnabled {
+                    principal_id: principal.principal_id,
+                    enabled: false,
+                },
+            ),
+            (
+                "custom role create",
+                ProductOperation::SecurityCustomRoleCreate {
+                    display_name: "Denied role".to_owned(),
+                    grants: vec![grant],
+                },
+            ),
+            (
+                "built-in assignment create",
+                ProductOperation::SecurityBuiltInAssignmentCreate {
+                    principal_id: principal.principal_id,
+                    role: BuiltInRole::Writer,
+                    scope: ProductScope::Instance,
+                },
+            ),
+            (
+                "custom assignment create",
+                ProductOperation::SecurityCustomAssignmentCreate {
+                    principal_id: principal.principal_id,
+                    role_id: custom_role.role_id,
+                },
+            ),
+            (
+                "assignment revoke",
+                ProductOperation::SecurityAssignmentRevoke {
+                    assignment_id: assignment.assignment_id,
+                },
+            ),
+        ])
+    }
 }
 
 impl Drop for SecurityWriteFixture {
     fn drop(&mut self) {
         let _ignored = fs::remove_dir_all(&self.directory);
         let _ignored = fs::remove_file(&self.owner_key);
+        for path in &self.role_keys {
+            let _ignored = fs::remove_file(path);
+        }
     }
 }
 
@@ -115,6 +240,135 @@ fn principal_enabled(
         .find(|principal| principal.id() == principal_id)
         .map(hyphae_native_product::SecurityPrincipalSummary::enabled)
         .ok_or_else(|| "created principal is absent".into())
+}
+
+const SECURITY_WRITE_ALLOWED_ROLES: [BuiltInRole; 2] = [BuiltInRole::Admin, BuiltInRole::Owner];
+const SECURITY_WRITE_DENIED_ROLES: [BuiltInRole; 5] = [
+    BuiltInRole::Auditor,
+    BuiltInRole::Developer,
+    BuiltInRole::Operator,
+    BuiltInRole::Reader,
+    BuiltInRole::Writer,
+];
+
+fn assert_security_writes_allowed(role: BuiltInRole) -> Result<(), Box<dyn Error>> {
+    let mut fixture = SecurityWriteFixture::create(&format!("{}-allow", role.as_str()))?;
+    let mut actor = fixture.role_session(role, 100)?;
+    let principal = dispatch(
+        &mut fixture.product,
+        &mut actor,
+        100,
+        Some(1_001),
+        ProductOperation::SecurityPrincipalCreate {
+            display_name: "Role-matrix target".to_owned(),
+        },
+    )?;
+    let ProductResponse::SecurityPrincipalMutated(principal) = principal else {
+        return Err(format!("{} could not create a principal", role.as_str()).into());
+    };
+    assert!(matches!(
+        dispatch(
+            &mut fixture.product,
+            &mut actor,
+            101,
+            Some(1_002),
+            ProductOperation::SecurityPrincipalSetEnabled {
+                principal_id: principal.principal_id,
+                enabled: true,
+            },
+        )?,
+        ProductResponse::SecurityMutated(_)
+    ));
+    let grant = CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+        .ok_or("invalid role-matrix grant")?;
+    let custom_role = dispatch(
+        &mut fixture.product,
+        &mut actor,
+        102,
+        Some(1_003),
+        ProductOperation::SecurityCustomRoleCreate {
+            display_name: "Role-matrix custom role".to_owned(),
+            grants: vec![grant],
+        },
+    )?;
+    let ProductResponse::SecurityCustomRoleMutated(custom_role) = custom_role else {
+        return Err(format!("{} could not create a custom role", role.as_str()).into());
+    };
+    let assignment = dispatch(
+        &mut fixture.product,
+        &mut actor,
+        103,
+        Some(1_004),
+        ProductOperation::SecurityBuiltInAssignmentCreate {
+            principal_id: principal.principal_id,
+            role: BuiltInRole::Reader,
+            scope: ProductScope::Instance,
+        },
+    )?;
+    let ProductResponse::SecurityAssignmentMutated(assignment) = assignment else {
+        return Err(format!("{} could not create an assignment", role.as_str()).into());
+    };
+    assert!(matches!(
+        dispatch(
+            &mut fixture.product,
+            &mut actor,
+            104,
+            Some(1_005),
+            ProductOperation::SecurityCustomAssignmentCreate {
+                principal_id: principal.principal_id,
+                role_id: custom_role.role_id,
+            },
+        )?,
+        ProductResponse::SecurityAssignmentMutated(_)
+    ));
+    assert!(matches!(
+        dispatch(
+            &mut fixture.product,
+            &mut actor,
+            105,
+            Some(1_006),
+            ProductOperation::SecurityAssignmentRevoke {
+                assignment_id: assignment.assignment_id,
+            },
+        )?,
+        ProductResponse::SecurityMutated(_)
+    ));
+    Ok(())
+}
+
+fn assert_security_writes_denied(role: BuiltInRole) -> Result<(), Box<dyn Error>> {
+    let mut fixture = SecurityWriteFixture::create(&format!("{}-deny", role.as_str()))?;
+    let operations = fixture.valid_write_operations()?;
+    let mut actor = fixture.role_session(role, 200)?;
+    for (index, (operation_name, operation)) in operations.into_iter().enumerate() {
+        let Err(error) = dispatch(
+            &mut fixture.product,
+            &mut actor,
+            200 + u128::try_from(index)?,
+            Some(2_001 + u128::try_from(index)?),
+            operation,
+        ) else {
+            return Err(format!("{} unexpectedly executed {operation_name}", role.as_str()).into());
+        };
+        assert_eq!(
+            error.code(),
+            ProductErrorCode::AuthorizationDenied,
+            "{} received the wrong denial for {operation_name}",
+            role.as_str()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn built_in_role_matrix_partitions_every_managed_security_write() -> Result<(), Box<dyn Error>> {
+    for role in SECURITY_WRITE_ALLOWED_ROLES {
+        assert_security_writes_allowed(role)?;
+    }
+    for role in SECURITY_WRITE_DENIED_ROLES {
+        assert_security_writes_denied(role)?;
+    }
+    Ok(())
 }
 
 #[test]

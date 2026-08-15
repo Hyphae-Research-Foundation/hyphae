@@ -21,6 +21,13 @@ the durable RBAC surfaces and cross-transport conformance close. The
 fail-closed `tools/check_native_access_control.py` checker binds every current
 `ProductOperation` variant to a nonempty permission rule.
 
+`native-mcp-v2.json` is the exact bounded tool contract for the read-only
+Native MCP adapter. Its bytes are embedded in the CLI and their BLAKE3 digest,
+together with `tool_schema_version`, is returned by initialization, tool-list
+pages, and tool results. Every output schema admits exactly one bounded success
+DTO or the typed redacted MCP `ProductError` envelope. It intentionally
+contains no mutation tool.
+
 ## Structured values
 
 The natural JSON surface accepts null, booleans, signed 64-bit integers,
