@@ -97,6 +97,8 @@ thiserror = "2.0.18"
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1.25"
 widestring = "1.2.1"
+windows-permissions = "=0.2.4"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 tower = "0.5.3"

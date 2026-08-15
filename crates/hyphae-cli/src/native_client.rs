@@ -8,6 +8,9 @@ use std::{
     path::Path,
 };
 
+#[cfg(windows)]
+use std::fs::OpenOptions;
+
 use hyphae_native_product::{
     MAX_API_KEY_CREDENTIAL_BYTES, NativeProduct, ProductAuthorization, ProductDurability,
     ProductError, ProductErrorCode, ProductOperation, ProductPrincipal, ProductResponse,
@@ -202,13 +205,60 @@ fn read_api_key(
 }
 
 pub(crate) fn read_api_key_file(path: &Path) -> Result<ApiKeyBuffer, CliFailure> {
-    let path_metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    if is_windows_named_stream(path) {
+        return Err(authorization_denied());
+    }
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        #[cfg(windows)]
+        {
+            let _ = error;
+            authorization_denied()
+        }
+        #[cfg(not(windows))]
+        {
+            CliFailure::from(error)
+        }
+    })?;
     if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
         return Err(authorization_denied());
     }
+    #[cfg(not(windows))]
     let file = File::open(path)?;
-    validate_open_api_key_file(path, &path_metadata, &file)?;
-    read_bounded(file)
+    #[cfg(windows)]
+    let file = (|| -> Result<File, CliFailure> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, SECURITY_IDENTIFICATION,
+            },
+        };
+
+        Ok(OpenOptions::new()
+            .access_mode(GENERIC_READ | READ_CONTROL)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(path)?)
+    })()
+    .map_err(|_| authorization_denied())?;
+    validate_open_api_key_file(path, &path_metadata, &file).map_err(|_| authorization_denied())?;
+    read_bounded(file).map_err(|_| authorization_denied())
+}
+
+#[cfg(windows)]
+fn is_windows_named_stream(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    path.components().any(|component| match component {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => false,
+            _ => prefix.as_os_str().to_string_lossy().contains(':'),
+        },
+        Component::Normal(value) => value.to_string_lossy().contains(':'),
+        Component::RootDir | Component::CurDir | Component::ParentDir => false,
+    })
 }
 
 fn read_bounded(reader: impl Read) -> Result<ApiKeyBuffer, CliFailure> {
@@ -240,6 +290,17 @@ fn validate_open_api_key_file(
         if identity != (path_metadata.dev(), path_metadata.ino())
             || identity != (current_path_metadata.dev(), current_path_metadata.ino())
             || opened_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(authorization_denied());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || hyphae_native_product::validate_windows_restricted_file(file).is_err()
         {
             return Err(authorization_denied());
         }
@@ -302,6 +363,45 @@ mod tests {
         let error = validate_open_api_key_file(&first, &first_metadata, &second_handle)
             .err()
             .ok_or("mismatched key-file handle was accepted")?;
+        assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_file_rejects_a_reparse_point() -> Result<(), Box<dyn Error>> {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = std::env::temp_dir().join(format!("hyphae-key-link-{}", Uuid::now_v7()));
+        fs::create_dir(&directory)?;
+        let target = directory.join("target.key");
+        let link = directory.join("link.key");
+        fs::write(&target, vec![b'a'; MAX_API_KEY_CREDENTIAL_BYTES])?;
+        if symlink_file(&target, &link).is_err() {
+            fs::remove_dir_all(directory)?;
+            return Ok(());
+        }
+        let error = read_api_key_file(&link)
+            .err()
+            .ok_or("reparse-point key file was accepted")?;
+        assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_file_rejects_a_named_stream() -> Result<(), Box<dyn Error>> {
+        let directory = std::env::temp_dir().join(format!("hyphae-key-ads-{}", Uuid::now_v7()));
+        fs::create_dir(&directory)?;
+        let carrier = directory.join("carrier");
+        let stream = std::path::PathBuf::from(format!("{}:owner.key", carrier.display()));
+        fs::write(&carrier, b"carrier")?;
+        fs::write(&stream, vec![b'a'; MAX_API_KEY_CREDENTIAL_BYTES])?;
+        let error = read_api_key_file(&stream)
+            .err()
+            .ok_or("named-stream key file was accepted")?;
         assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
         fs::remove_dir_all(directory)?;
         Ok(())

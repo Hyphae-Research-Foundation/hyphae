@@ -52,6 +52,7 @@ dependency, performance and replacement-cost review.
 | `tokio` | native daemon scheduling and asynchronous local IPC | allowed outside embedded hot path |
 | `futures-channel` | one-shot completion handoff from the sole product owner to asynchronous transport adapters | allowed bounded async primitive |
 | `subtle` | constant-time comparison of durable API-key verifier material | allowed cryptographic primitive |
+| `windows-permissions` | safe process-SID and handle-based ACL operations for Windows credential files | allowed operating-system access-control wrapper |
 | `interprocess` | safe UDS and Windows named-pipe local transport, peer credentials and endpoint ACLs | allowed operating-system IPC wrapper |
 | `widestring` | safe UTF-16 security-descriptor construction for the Windows named-pipe ACL | allowed Windows encoding primitive |
 | `recvmsg` | target-conditioned Windows named-pipe message primitive used by `interprocess` | allowed operating-system IPC wrapper |
@@ -86,7 +87,7 @@ The native product daemon target path currently consists of:
 The exact locked normal/build metadata closure is rooted at
 `hyphae-native-daemon`, the local native product entry point. This root includes
 the protocol, product facade, runtime, and every native engine package: 14
-Hyphae-owned packages and 57 external package identities (56 package names) as
+Hyphae-owned packages and 62 external package identities (60 package names) as
 of 2026-08-14. The two identities for `syn` are 2.0.119 on the Tokio macro
 path and 3.0.2 on the serde/thiserror derive paths. Target-conditioned
 dependencies remain in scope even when they are not compiled on the audit
@@ -112,6 +113,15 @@ treated as safe-Rust-only. Its closure includes `doctest-file`, `futures-core`,
 OS encoding, message, and API primitives rather than data-engine semantics.
 The daemon applies a protected owner/system Windows DACL and a 0600 filesystem
 mode on Unix.
+
+`hyphae-native-product` and the CLI use `windows-permissions` 0.2.4 as the
+reviewed safe adapter for process-token SIDs and file-handle security
+descriptors. Restricted credential outputs retain an exclusive handle while a
+protected current-account/LocalSystem DACL is applied and verified before any
+secret bytes are written. Credential readers open the final component as a
+reparse point with no sharing, reject reparse metadata, and validate that same
+handle's owner and exact DACL before reading. Its target-conditioned closure
+adds `bitflags` 1.3.2, `winapi` 0.3.9, and the GNU target import libraries.
 
 The runtime directly uses `getrandom` 0.3.4 for unpredictable durable
 transaction resolution identities. Its complete target-conditioned closure

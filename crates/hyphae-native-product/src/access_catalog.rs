@@ -5821,17 +5821,180 @@ fn trusted_wall_time_micros() -> Result<i64, ProductError> {
 }
 
 fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
+    #[cfg(windows)]
+    if is_windows_named_stream(path) {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = options
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
+
+        // An exclusive handle prevents another process from acquiring the
+        // inherited ACL before the protected DACL is installed and verified.
+        options
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .share_mode(0);
+    }
+    #[allow(unused_mut)]
+    let mut file = options
         .open(path)
         .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
-    file.sync_all()
-        .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
-    sync_output_parent(path)?;
+    #[cfg(windows)]
+    if apply_windows_restricted_acl(&mut file).is_err()
+        || validate_windows_restricted_file(&file).is_err()
+    {
+        drop(file);
+        remove_empty_output(path);
+        return Err(ProductError::from_code(ProductErrorCode::Io));
+    }
+    if file.sync_all().is_err() || sync_output_parent(path).is_err() {
+        drop(file);
+        remove_empty_output(path);
+        return Err(ProductError::from_code(ProductErrorCode::Io));
+    }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn is_windows_named_stream(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    path.components().any(|component| match component {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => false,
+            _ => prefix.as_os_str().to_string_lossy().contains(':'),
+        },
+        Component::Normal(value) => value.to_string_lossy().contains(':'),
+        Component::RootDir | Component::CurDir | Component::ParentDir => false,
+    })
+}
+
+#[cfg(windows)]
+fn apply_windows_restricted_acl(file: &mut File) -> std::io::Result<()> {
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        utilities, wrappers,
+    };
+
+    let current_user = utilities::current_process_sid()?;
+    let current_user = current_user.to_string();
+    let system = "S-1-5-18";
+    let sddl = if current_user == system {
+        format!("O:{system}D:P(A;;FA;;;{system})")
+    } else {
+        format!("O:{current_user}D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
+    };
+    let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+    wrappers::SetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        descriptor.owner(),
+        None,
+        descriptor.dacl(),
+        None,
+    )
+}
+
+#[cfg(windows)]
+/// Validates the account-only protected DACL on an opened credential file.
+///
+/// # Errors
+///
+/// Returns an I/O or permission error when the owner or DACL differs from the
+/// current process account plus LocalSystem authority.
+pub fn validate_windows_restricted_file(file: &File) -> std::io::Result<()> {
+    use windows_permissions::{
+        constants::{SeObjectType, SecurityInformation},
+        utilities, wrappers,
+    };
+
+    let actual = wrappers::GetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )?;
+    let actual = wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+        &actual,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )?;
+    let current_user = utilities::current_process_sid()?.to_string();
+    if windows_restricted_sddl_matches(&actual.to_string_lossy(), &current_user) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "credential file ACL is not restricted to the current account and LocalSystem",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_restricted_sddl_matches(actual: &str, current_user: &str) -> bool {
+    let current_user_alias = windows_sddl_alias(current_user);
+    let Some(owner_end) = actual.find("D:") else {
+        return false;
+    };
+    let Some(owner) = actual.get(2..owner_end) else {
+        return false;
+    };
+    if owner != current_user && current_user_alias != Some(owner) {
+        return false;
+    }
+    let dacl = &actual[owner_end + 2..];
+    let Some(aces_start) = dacl.find('(') else {
+        return false;
+    };
+    if !dacl[..aces_start].contains('P') {
+        return false;
+    }
+    let mut remaining = &dacl[aces_start..];
+    let mut trustees = BTreeSet::new();
+    while !remaining.is_empty() {
+        let Some(end) = remaining.find(')') else {
+            return false;
+        };
+        let ace = &remaining[1..end];
+        let fields: Vec<_> = ace.split(';').collect();
+        if fields.len() != 6 || fields[0] != "A" || !fields[1].is_empty() || fields[2] != "FA" {
+            return false;
+        }
+        let trustee = if matches!(fields[5], "SY" | "S-1-5-18") {
+            "S-1-5-18"
+        } else if fields[5] == current_user || current_user_alias == Some(fields[5]) {
+            current_user
+        } else {
+            return false;
+        };
+        if !trustees.insert(trustee) {
+            return false;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    if current_user == "S-1-5-18" {
+        trustees == BTreeSet::from(["S-1-5-18"])
+    } else {
+        trustees == BTreeSet::from([current_user, "S-1-5-18"])
+    }
+}
+
+#[cfg(windows)]
+fn windows_sddl_alias(sid: &str) -> Option<&'static str> {
+    match sid {
+        "S-1-5-18" => Some("SY"),
+        "S-1-5-19" => Some("LS"),
+        "S-1-5-20" => Some("NS"),
+        _ => None,
+    }
 }
 
 fn remove_empty_output(path: &Path) {
@@ -6615,6 +6778,128 @@ mod tests {
     fn remove_test_files(paths: &[&Path]) {
         for path in paths {
             let _ignored = fs::remove_file(path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_has_current_account_and_system_dacl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            constants::{SeObjectType, SecurityInformation},
+            utilities, wrappers,
+        };
+
+        let path = temporary_directory().with_extension("key");
+        remove_test_files(&[&path]);
+        let file = create_restricted_output(&path)?;
+        validate_windows_restricted_file(&file)?;
+        let descriptor = wrappers::GetSecurityInfo(
+            &file,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner | SecurityInformation::Dacl,
+        )?;
+        let sddl = wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+            &descriptor,
+            SecurityInformation::Owner | SecurityInformation::Dacl,
+        )?;
+        let current_user = utilities::current_process_sid()?.to_string();
+        let sddl = sddl.to_string_lossy();
+        assert!(sddl.contains("D:P"));
+        assert!(windows_restricted_sddl_matches(&sddl, &current_user));
+        if current_user != "S-1-5-18" {
+            assert!(sddl.contains("(A;;FA;;;SY)") || sddl.contains("(A;;FA;;;S-1-5-18)"));
+        }
+        assert!(!sddl.contains(";;;WD)"));
+        assert!(!sddl.contains(";;;AU)"));
+        drop(file);
+        remove_test_files(&[&path]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_rejects_an_extra_trustee() -> Result<(), Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            LocalBox, SecurityDescriptor,
+            constants::{SeObjectType, SecurityInformation},
+            utilities, wrappers,
+        };
+
+        let path = temporary_directory().with_extension("key");
+        remove_test_files(&[&path]);
+        let mut file = create_restricted_output(&path)?;
+        let current_user = utilities::current_process_sid()?.to_string();
+        let descriptor: LocalBox<SecurityDescriptor> =
+            format!("O:{current_user}D:P(A;;FA;;;{current_user})(A;;FA;;;SY)(A;;FR;;;WD)")
+                .parse()?;
+        wrappers::SetSecurityInfo(
+            &mut file,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner
+                | SecurityInformation::Dacl
+                | SecurityInformation::ProtectedDacl,
+            descriptor.owner(),
+            None,
+            descriptor.dacl(),
+            None,
+        )?;
+        assert!(validate_windows_restricted_file(&file).is_err());
+        drop(file);
+        remove_test_files(&[&path]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_rejects_named_streams() -> Result<(), Box<dyn std::error::Error>> {
+        let base = temporary_directory().with_extension("carrier");
+        let stream = std::path::PathBuf::from(format!("{}:owner.key", base.display()));
+        remove_test_files(&[&base, &stream]);
+        fs::write(&base, b"carrier")?;
+        let error = create_restricted_output(&stream)
+            .err()
+            .ok_or("named-stream credential output was accepted")?;
+        assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+        assert!(!stream.exists());
+        remove_test_files(&[&base, &stream]);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_dacl_parser_accepts_only_current_user_and_system() {
+        #[cfg(windows)]
+        {
+            let user = "S-1-5-21-1-2-3-1001";
+            assert!(windows_restricted_sddl_matches(
+                "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
+                user,
+            ));
+            assert!(windows_restricted_sddl_matches(
+                "O:SYD:P(A;;FA;;;SY)",
+                "S-1-5-18",
+            ));
+            assert!(windows_restricted_sddl_matches(
+                "O:LSD:P(A;;FA;;;LS)(A;;FA;;;SY)",
+                "S-1-5-19",
+            ));
+            assert!(windows_restricted_sddl_matches(
+                "O:NSD:P(A;;FA;;;SY)(A;;FA;;;NS)",
+                "S-1-5-20",
+            ));
+            assert!(windows_restricted_sddl_matches(
+                "O:S-1-5-21-1-2-3-1001D:PAI(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-21-1-2-3-1001)",
+                user,
+            ));
+            for invalid in [
+                "O:S-1-5-21-1-2-3-1001D:(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
+                "O:S-1-5-21-1-2-3-1002D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
+                "O:S-1-5-21-1-2-3-1001D:P(A;;FR;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
+                "O:S-1-5-21-1-2-3-1001D:P(A;ID;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
+                "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)(A;;FR;;;WD)",
+            ] {
+                assert!(!windows_restricted_sddl_matches(invalid, user));
+            }
         }
     }
 

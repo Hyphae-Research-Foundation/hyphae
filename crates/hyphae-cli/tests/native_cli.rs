@@ -2351,6 +2351,9 @@ fn bootstrapped_embedded_cli_requires_a_restricted_api_key_source() -> Result<()
     let stdin_capabilities = run_with_api_key_stdin(&data, &fs::read(&owner_key)?)?;
     assert_eq!(stdin_capabilities["product_api_version"], 1);
 
+    #[cfg(windows)]
+    hyphae_native_product::validate_windows_restricted_file(&fs::File::open(&owner_key)?)?;
+
     let wrong_secret = format!("hyp1_{}_{}", "0".repeat(32), "0".repeat(64));
     fs::write(&wrong_key, &wrong_secret)?;
     #[cfg(unix)]

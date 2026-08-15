@@ -67,9 +67,11 @@ automatically requires the durable API key. Supply it through
 `--native-api-key-file <RESTRICTED_FILE>` (or
 `HYPHAE_NATIVE_API_KEY_FILE`) or pipe it to `--native-api-key-stdin`. The raw
 credential is never accepted in argv. Unix key files must be regular,
-non-symlink files without group or other permission bits. Windows ACL
-restriction and named-pipe parity remain explicit 1.2 release gates; no
-cross-platform file-hygiene claim is made yet.
+non-symlink files without group or other permission bits. Windows key files
+must be regular non-reparse files owned by the current process account, with a
+protected DACL granting full access only to that account and LocalSystem. The
+CLI opens the final component without sharing and validates that opened handle
+before reading any credential bytes.
 On Unix the CLI also compares device/inode identity for the path before and
 after opening and for the opened handle, rejecting substitution rather than
 reading a different credential file.
