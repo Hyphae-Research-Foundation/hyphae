@@ -1023,6 +1023,8 @@ mod tests {
             31,
         )?;
         let owner = product.authenticate_api_key(owner_secret, 0)?;
+        product.set_security_principal_enabled(&owner, reader.principal_id, true, 32)?;
+        let owner = product.authenticate_api_key(owner_secret, 0)?;
         product.issue_api_key_to_file(
             &owner,
             reader.principal_id,
@@ -1031,7 +1033,7 @@ mod tests {
             BuiltInRole::Reader.authorization(),
             None,
             reader_key,
-            32,
+            33,
         )?;
         Ok(())
     }

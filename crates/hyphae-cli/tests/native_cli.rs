@@ -21,6 +21,7 @@ use hyphae_native_product::proof::{
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
     bundle_native_witness, encode_native_proof,
 };
+use hyphae_native_product::{BuiltInRole, NativeProduct};
 #[cfg(unix)]
 use hyphae_native_product::{ProductErrorCode, ProductResponse};
 use hyphae_storage::{SnapshotReadLimits, load_snapshot};
@@ -92,6 +93,81 @@ fn run_security(
         return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr)).into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+struct SecurityWriteFixture {
+    temporary: TestDirectory,
+    data: PathBuf,
+    owner_key: PathBuf,
+    owner_secret: String,
+}
+
+impl SecurityWriteFixture {
+    fn create() -> Result<Self, Box<dyn Error>> {
+        let temporary = TestDirectory::new()?;
+        let data = temporary.0.join("data");
+        let owner_key = temporary.0.join("owner.key");
+        run(&["init", "--data-dir", &path(&data)])?;
+        run(&[
+            "security",
+            "--data-dir",
+            &path(&data),
+            "bootstrap",
+            "--name",
+            "Owner",
+            "--key-out",
+            &path(&owner_key),
+        ])?;
+        let owner_secret = fs::read_to_string(&owner_key)?;
+        Ok(Self {
+            temporary,
+            data,
+            owner_key,
+            owner_secret,
+        })
+    }
+
+    fn owner(&self, operation: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+        run_security(&self.data, &self.owner_key, operation)
+    }
+
+    fn issue_reader_key(
+        &self,
+        principal_id: &str,
+        destination: &Path,
+    ) -> Result<String, Box<dyn Error>> {
+        let mut product = NativeProduct::open(&self.data)?;
+        let authority = product.authenticate_api_key(self.owner_secret.trim(), 0)?;
+        product.issue_api_key_to_file(
+            &authority,
+            principal_id.parse()?,
+            "reader-cli",
+            [BuiltInRole::Reader],
+            BuiltInRole::Reader.authorization(),
+            None,
+            destination,
+            1,
+        )?;
+        Ok(fs::read_to_string(destination)?)
+    }
+}
+
+fn assert_security_mutation_receipt(receipt: &serde_json::Value, operation: &str) {
+    assert_json_keys(
+        receipt,
+        &[
+            "schema",
+            "operation",
+            "result_id",
+            "authorization_epoch",
+            "commit",
+        ],
+    );
+    assert_eq!(receipt["schema"], "hyphae-native-security-mutation-v1");
+    assert_eq!(receipt["operation"], operation);
+    assert!(receipt["result_id"].as_str().is_some());
+    assert_eq!(receipt["commit"]["durability"], "strict");
+    assert!(receipt["authorization_epoch"].as_u64().is_some());
 }
 
 struct SecurityReadPlaneOutput {
@@ -1648,6 +1724,8 @@ async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
             .map_err(|error| std::io::Error::other(format!("managed serve failed: {error}")))?;
         let _guard = ChildGuard(&mut child);
 
+        wait_for_authenticated_native_ready(&managed_endpoint, &owner_secret).await?;
+
         let unauthenticated = HyphaeClient::local(path(&managed_endpoint))?;
         let denied = match unauthenticated
             .capabilities(RequestOptions::default())
@@ -1660,15 +1738,6 @@ async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
             return Err("managed serve did not return a typed authorization denial".into());
         };
         assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
-
-        let authenticated =
-            HyphaeClient::local_authenticated(path(&managed_endpoint), &owner_secret)?;
-        assert!(matches!(
-            authenticated
-                .capabilities(RequestOptions::default())
-                .await?,
-            ProductResponse::Capabilities(_)
-        ));
     }
 
     {
@@ -1676,6 +1745,8 @@ async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
         wait_for_native_endpoint(&mut child, &legacy_endpoint)
             .map_err(|error| std::io::Error::other(format!("legacy serve failed: {error}")))?;
         let _guard = ChildGuard(&mut child);
+
+        wait_for_authenticated_native_ready(&legacy_endpoint, &owner_secret).await?;
 
         let legacy = HyphaeClient::local(path(&legacy_endpoint))?;
         let denied = match legacy.capabilities(RequestOptions::default()).await {
@@ -1686,15 +1757,6 @@ async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
             return Err("default serve did not return a typed authorization denial".into());
         };
         assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
-
-        let authenticated =
-            HyphaeClient::local_authenticated(path(&legacy_endpoint), &owner_secret)?;
-        assert!(matches!(
-            authenticated
-                .capabilities(RequestOptions::default())
-                .await?,
-            ProductResponse::Capabilities(_)
-        ));
     }
     let _ignored = fs::remove_file(managed_endpoint);
     let _ignored = fs::remove_file(legacy_endpoint);
@@ -1745,6 +1807,336 @@ fn managed_security_read_plane_is_paginated_and_secret_safe() -> Result<(), Box<
             .code(),
         Some(2)
     );
+    Ok(())
+}
+
+fn create_principal_with_replay(
+    fixture: &SecurityWriteFixture,
+) -> Result<(serde_json::Value, String, Vec<u8>), Box<dyn Error>> {
+    let created = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "Application Reader",
+        "--idempotency-token",
+        "101",
+    ])?;
+    assert_security_mutation_receipt(&created, "security.principal_create");
+    let principal_id = created["result_id"]
+        .as_str()
+        .ok_or("principal receipt omitted its result ID")?
+        .to_owned();
+    let first_page = fixture.owner(&["principal", "list"])?;
+    assert!(first_page["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["id"] == principal_id.as_str()
+                && item["display_name"] == "Application Reader"
+                && item["enabled"] == false
+        })
+    }));
+
+    let replay = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "Application Reader",
+        "--idempotency-token",
+        "101",
+    ])?;
+    assert_eq!(replay, created);
+    let conflict = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "principal",
+            "create",
+            "--name",
+            "Different payload",
+            "--idempotency-token",
+            "101",
+        ],
+    )?;
+    assert!(!conflict.status.success());
+    let conflict_error: serde_json::Value = serde_json::from_slice(&conflict.stderr)?;
+    assert_eq!(conflict_error["error"]["code"], "idempotency_conflict");
+    Ok((created, principal_id, conflict.stderr))
+}
+
+fn create_role_and_assign(
+    fixture: &SecurityWriteFixture,
+    principal_id: &str,
+) -> Result<(Vec<serde_json::Value>, String), Box<dyn Error>> {
+    let role = fixture.owner(&[
+        "role",
+        "create",
+        "--name",
+        "Scoped Reader",
+        "--grant",
+        "data.read@instance",
+        "--grant",
+        "search.execute@catalog_subtree:13",
+        "--idempotency-token",
+        "102",
+    ])?;
+    assert_security_mutation_receipt(&role, "security.custom_role_create");
+    let role_id = role["result_id"]
+        .as_str()
+        .ok_or("role receipt omitted its result ID")?;
+    let built_in_assignment = fixture.owner(&[
+        "assignment",
+        "create-built-in",
+        "--principal-id",
+        principal_id,
+        "--role",
+        "reader",
+        "--scope",
+        "instance",
+        "--idempotency-token",
+        "103",
+    ])?;
+    assert_security_mutation_receipt(&built_in_assignment, "security.assignment_create_built_in");
+    let custom_assignment = fixture.owner(&[
+        "assignment",
+        "create-custom",
+        "--principal-id",
+        principal_id,
+        "--role-id",
+        role_id,
+        "--idempotency-token",
+        "104",
+    ])?;
+    assert_security_mutation_receipt(&custom_assignment, "security.assignment_create_custom");
+    let custom_assignment_id = custom_assignment["result_id"]
+        .as_str()
+        .ok_or("assignment receipt omitted its result ID")?
+        .to_owned();
+    Ok((
+        vec![role, built_in_assignment, custom_assignment],
+        custom_assignment_id,
+    ))
+}
+
+#[test]
+fn managed_security_write_plane_lifecycle_is_idempotent_and_redacted() -> Result<(), Box<dyn Error>>
+{
+    let fixture = SecurityWriteFixture::create()?;
+    let (created, principal_id, conflict_stderr) = create_principal_with_replay(&fixture)?;
+    let (mut receipts, custom_assignment_id) = create_role_and_assign(&fixture, &principal_id)?;
+    let enabled = fixture.owner(&[
+        "principal",
+        "set-enabled",
+        "--principal-id",
+        &principal_id,
+        "--enabled",
+        "true",
+        "--idempotency-token",
+        "105",
+    ])?;
+    assert_security_mutation_receipt(&enabled, "security.principal_set_enabled");
+    let revoked = fixture.owner(&[
+        "assignment",
+        "revoke",
+        "--assignment-id",
+        &custom_assignment_id,
+        "--idempotency-token",
+        "106",
+    ])?;
+    assert_security_mutation_receipt(&revoked, "security.assignment_revoke");
+
+    receipts.extend([created, enabled, revoked]);
+    let rendered = receipts
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<String>();
+    assert!(!rendered.contains(fixture.owner_secret.trim()));
+    assert!(!rendered.contains("hyp1_"));
+    assert!(!rendered.to_ascii_lowercase().contains("verifier"));
+    assert!(!String::from_utf8_lossy(&conflict_stderr).contains(fixture.owner_secret.trim()));
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_rejects_missing_or_weak_authority() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let missing_token = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &["principal", "create", "--name", "Missing token"],
+    )?;
+    assert_eq!(missing_token.status.code(), Some(2));
+
+    let zero_token = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "principal",
+            "create",
+            "--name",
+            "Zero token",
+            "--idempotency-token",
+            "0",
+        ],
+    )?;
+    assert_eq!(zero_token.status.code(), Some(2));
+
+    let owner_assignment = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            "00000000000000000000000000000001",
+            "--role",
+            "owner",
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            "201",
+        ],
+    )?;
+    assert_eq!(owner_assignment.status.code(), Some(2));
+
+    let created = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "Denied Reader",
+        "--idempotency-token",
+        "202",
+    ])?;
+    let principal_id = created["result_id"]
+        .as_str()
+        .ok_or("principal receipt omitted its result ID")?;
+    fixture.owner(&[
+        "assignment",
+        "create-built-in",
+        "--principal-id",
+        principal_id,
+        "--role",
+        "reader",
+        "--scope",
+        "instance",
+        "--idempotency-token",
+        "203",
+    ])?;
+    fixture.owner(&[
+        "principal",
+        "set-enabled",
+        "--principal-id",
+        principal_id,
+        "--enabled",
+        "true",
+        "--idempotency-token",
+        "204",
+    ])?;
+    let reader_key = fixture.temporary.0.join("reader.key");
+    let reader_secret = fixture.issue_reader_key(principal_id, &reader_key)?;
+    let denied = security_output(
+        &fixture.data,
+        &reader_key,
+        &[
+            "principal",
+            "create",
+            "--name",
+            "Forbidden",
+            "--idempotency-token",
+            "205",
+        ],
+    )?;
+    assert_eq!(denied.status.code(), Some(8));
+    let denied_error: serde_json::Value = serde_json::from_slice(&denied.stderr)?;
+    assert_eq!(denied_error["error"]["code"], "authorization_denied");
+    for secret in [fixture.owner_secret.trim(), reader_secret.trim()] {
+        assert!(!String::from_utf8_lossy(&denied.stderr).contains(secret));
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains(secret));
+    }
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_parsers_are_canonical_and_bounded() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let oversized_name = "x".repeat(129);
+    for operation in [
+        vec![
+            "principal",
+            "create",
+            "--name",
+            oversized_name.as_str(),
+            "--idempotency-token",
+            "301",
+        ],
+        vec![
+            "role",
+            "create",
+            "--name",
+            "Invalid grant",
+            "--grant",
+            "ownership.manage@instance",
+            "--idempotency-token",
+            "302",
+        ],
+        vec![
+            "role",
+            "create",
+            "--name",
+            "Duplicate grant",
+            "--grant",
+            "data.read@instance",
+            "--grant",
+            "data.read@instance",
+            "--idempotency-token",
+            "303",
+        ],
+        vec![
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            "not-a-security-id",
+            "--role",
+            "reader",
+            "--scope",
+            "catalog_object:01",
+            "--idempotency-token",
+            "304",
+        ],
+        vec![
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            "00000000000000000000000000000001",
+            "--role",
+            "reader",
+            "--scope",
+            "catalog_object:01",
+            "--idempotency-token",
+            "305",
+        ],
+    ] {
+        assert_eq!(
+            security_output(&fixture.data, &fixture.owner_key, &operation)?
+                .status
+                .code(),
+            Some(2)
+        );
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hyphae"));
+    command
+        .args(["security", "--data-dir"])
+        .arg(&fixture.data)
+        .arg("--native-api-key-file")
+        .arg(&fixture.owner_key)
+        .args(["role", "create", "--name", "Too many grants"]);
+    for object_id in 1..=257 {
+        command
+            .arg("--grant")
+            .arg(format!("data.read@catalog_object:{object_id}"));
+    }
+    let output = command.args(["--idempotency-token", "306"]).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(fixture.owner_secret.trim()));
     Ok(())
 }
 
@@ -1868,6 +2260,25 @@ fn wait_for_native_endpoint(child: &mut Child, endpoint: &Path) -> Result<(), Bo
         return Err("serve did not bind the requested native endpoint".into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_authenticated_native_ready(
+    endpoint: &Path,
+    owner_secret: &str,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let client = HyphaeClient::local_authenticated(path(endpoint), owner_secret)?;
+        match client.capabilities(RequestOptions::default()).await {
+            Ok(ProductResponse::Capabilities(_)) => return Ok(()),
+            Ok(_) => return Err("managed serve returned an unexpected readiness response".into()),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => return Err("managed serve did not become ready".into()),
+        }
+    }
 }
 
 struct ChildGuard<'a>(&'a mut Child);

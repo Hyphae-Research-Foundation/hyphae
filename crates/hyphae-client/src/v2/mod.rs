@@ -11,12 +11,14 @@ pub use http::*;
 pub use local::*;
 
 pub use hyphae_native_product::{
-    BackupLimits, BoundedSearchQuery, CatalogDependencyRequest, CatalogListRequest, DoctorRequest,
-    ProductCapabilities, ProductCommitOutcome, ProductDurabilityPolicy, ProductError,
-    ProductErrorCategory, ProductErrorCode, ProductLimits, ProductOperation, ProductPreparedHandle,
-    ProductResponse, ProductRetry, ProductSearchRequest, ProductSqlResult, ProductTransactionId,
-    ProductTransactionState, ProductTransactionStatus, ProductTtl, ProductValue,
-    ProductVectorBranch, ProductVectorExecution, SecurityAssignmentListRequest,
-    SecurityAuditReadRequest, SecurityCursor, SecurityCursorId, SecurityKeyListRequest,
-    SecurityPrincipalListRequest, SecurityRoleListRequest,
+    AccessControlMutationReceipt, BackupLimits, BoundedSearchQuery, BuiltInRole,
+    CatalogDependencyRequest, CatalogListRequest, CustomRoleGrant, CustomRoleMutationReceipt,
+    DoctorRequest, ProductCapabilities, ProductCommitOutcome, ProductDurabilityPolicy,
+    ProductError, ProductErrorCategory, ProductErrorCode, ProductLimits, ProductOperation,
+    ProductPermission, ProductPreparedHandle, ProductResponse, ProductRetry, ProductScope,
+    ProductSearchRequest, ProductSqlResult, ProductTransactionId, ProductTransactionState,
+    ProductTransactionStatus, ProductTtl, ProductValue, ProductVectorBranch,
+    ProductVectorExecution, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
+    SecurityAuditReadRequest, SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest,
+    SecurityPrincipalListRequest, SecurityPrincipalMutationReceipt, SecurityRoleListRequest,
 };

@@ -22,28 +22,30 @@ use crate::proof::{NativeOperationProofArtifact, NativeProofGenerationLimits};
 
 use crate::session::ProductAuthorizationRequirement;
 use crate::{
-    AccessControlStatus, AdminStatus, AuthorizationEpoch, BackupInfo, BackupPhase,
-    BackupProductError, BackupRequest, CatalogDependencyRequest, CatalogListRequest, CatalogObject,
-    CatalogObjectSummary, CatalogPage, DoctorReport, DoctorRequest, MetricId, NativeProduct,
-    ObjectId, ProductAuthorization, ProductCancellationToken, ProductCapabilities,
-    ProductCheckpointReceipt, ProductCommitReceipt, ProductDurability, ProductError,
-    ProductErrorCode, ProductExplain, ProductExplicitCommitReceipt,
-    ProductExplicitTransactionStatus, ProductFailureBoundary, ProductHashEntry, ProductLimits,
-    ProductListSide, ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
-    ProductRollbackReceipt, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
-    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchRequest,
-    ProductSearchResult, ProductSession, ProductSessionId, ProductSortedSetEntry,
-    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
-    ProductStructureMutation, ProductStructureMutationResult, ProductStructureRead,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    AccessControlMutationReceipt, AccessControlStatus, AdminStatus, AuthorizationEpoch, BackupInfo,
+    BackupPhase, BackupProductError, BackupRequest, BuiltInRole, CatalogDependencyRequest,
+    CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage, CustomRoleGrant,
+    CustomRoleMutationReceipt, DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId,
+    ProductAuthorization, ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt,
+    ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode, ProductExplain,
+    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
+    ProductHashEntry, ProductLimits, ProductListSide, ProductPermission, ProductPreparedHandle,
+    ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
+    ProductSearchIngestReceipt, ProductSearchRequest, ProductSearchResult, ProductSession,
+    ProductSessionId, ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult,
+    ProductStreamEntry, ProductStructureKey, ProductStructureMutation,
+    ProductStructureMutationResult, ProductStructureRead, ProductStructureReadRequest,
+    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProgressControl, QualifiedName,
-    RestoreRequest, SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditPage,
-    SecurityAuditReadRequest, SecurityKeyListRequest, SecurityKeyPage,
-    SecurityPrincipalListRequest, SecurityPrincipalPage, SecurityRoleListRequest, SecurityRolePage,
-    SnapshotIdentity, StatusRequest, TelemetryEvent, TelemetryEventKind, TelemetryRegistry,
-    TimingClass,
+    RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
+    SecurityAssignmentPage, SecurityAuditPage, SecurityAuditReadRequest, SecurityId,
+    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityRoleListRequest,
+    SecurityRolePage, SnapshotIdentity, StatusRequest, TelemetryEvent, TelemetryEventKind,
+    TelemetryRegistry, TimingClass,
 };
 
 /// Product-owned durability policy applied to every mutation in one request.
@@ -415,6 +417,46 @@ pub enum ProductOperation {
     SecurityKeyList(SecurityKeyListRequest),
     /// Read one bounded security-audit page.
     SecurityAuditRead(SecurityAuditReadRequest),
+    /// Create one disabled durable principal.
+    SecurityPrincipalCreate {
+        /// Bounded display name.
+        display_name: String,
+    },
+    /// Enable or disable one durable principal.
+    SecurityPrincipalSetEnabled {
+        /// Stable principal identity.
+        principal_id: SecurityId,
+        /// New authentication state.
+        enabled: bool,
+    },
+    /// Create one immutable custom role.
+    SecurityCustomRoleCreate {
+        /// Bounded display name.
+        display_name: String,
+        /// Canonical nonempty grants.
+        grants: Vec<CustomRoleGrant>,
+    },
+    /// Create one non-owner built-in role assignment.
+    SecurityBuiltInAssignmentCreate {
+        /// Stable target principal.
+        principal_id: SecurityId,
+        /// Built-in role other than owner.
+        role: BuiltInRole,
+        /// Stable assignment scope.
+        scope: ProductScope,
+    },
+    /// Create one custom-role assignment.
+    SecurityCustomAssignmentCreate {
+        /// Stable target principal.
+        principal_id: SecurityId,
+        /// Stable custom-role identity.
+        role_id: SecurityId,
+    },
+    /// Revoke one non-owner role assignment.
+    SecurityAssignmentRevoke {
+        /// Stable assignment identity.
+        assignment_id: SecurityId,
+    },
     /// Execute one eligible read and retain an offline-verifiable semantic proof.
     Prove {
         /// Read operation to execute exactly once for proof generation.
@@ -516,6 +558,14 @@ pub enum ProductResponse {
     SecurityKeyPage(SecurityKeyPage),
     /// One bounded security-audit page.
     SecurityAuditPage(SecurityAuditPage),
+    /// One durable principal creation receipt.
+    SecurityPrincipalMutated(SecurityPrincipalMutationReceipt),
+    /// One durable custom-role creation receipt.
+    SecurityCustomRoleMutated(CustomRoleMutationReceipt),
+    /// One durable role-assignment creation receipt.
+    SecurityAssignmentMutated(RoleAssignmentMutationReceipt),
+    /// One durable access-control state-change receipt.
+    SecurityMutated(AccessControlMutationReceipt),
     /// Actual read response paired with its complete portable proof artifacts.
     Proven {
         /// Response produced by the operation integrated with proof generation.
@@ -1164,6 +1214,84 @@ fn dispatch_inner(
                 context.logical_time_micros,
             )?)
         }
+        ProductOperation::SecurityPrincipalCreate { display_name } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityPrincipalMutated(
+                product.create_security_principal_idempotent(
+                    &actor,
+                    &display_name,
+                    required_idempotency_token(context)?,
+                    context.logical_time_micros,
+                )?,
+            )
+        }
+        ProductOperation::SecurityPrincipalSetEnabled {
+            principal_id,
+            enabled,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityMutated(product.set_security_principal_enabled_idempotent(
+                &actor,
+                principal_id,
+                enabled,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityCustomRoleCreate {
+            display_name,
+            grants,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityCustomRoleMutated(
+                product.create_custom_security_role_idempotent(
+                    &actor,
+                    &display_name,
+                    grants,
+                    required_idempotency_token(context)?,
+                    context.logical_time_micros,
+                )?,
+            )
+        }
+        ProductOperation::SecurityBuiltInAssignmentCreate {
+            principal_id,
+            role,
+            scope,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityAssignmentMutated(product.assign_built_in_role_idempotent(
+                &actor,
+                principal_id,
+                role,
+                scope,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityCustomAssignmentCreate {
+            principal_id,
+            role_id,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityAssignmentMutated(
+                product.assign_custom_security_role_idempotent(
+                    &actor,
+                    principal_id,
+                    role_id,
+                    required_idempotency_token(context)?,
+                    context.logical_time_micros,
+                )?,
+            )
+        }
+        ProductOperation::SecurityAssignmentRevoke { assignment_id } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityMutated(product.revoke_security_assignment_idempotent(
+                &actor,
+                assignment_id,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+            )?)
+        }
         ProductOperation::Prove { operation, limits } => {
             if operation.requires_managed_authority() {
                 return Err(context.error(ProductErrorCode::InvalidRequest));
@@ -1213,6 +1341,9 @@ fn admit_operation(
     if !has_coarse_permissions {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
+    if operation.requires_idempotency_token() && context.idempotency_token.is_none() {
+        return Err(context.error(ProductErrorCode::InvalidRequest));
+    }
     let requirement = operation_authorization_requirement(
         product,
         session,
@@ -1249,6 +1380,12 @@ fn managed_actor(
     session
         .authenticated_authority()?
         .ok_or_else(|| context.error(ProductErrorCode::AuthorizationDenied))
+}
+
+fn required_idempotency_token(context: &ProductRequestContext) -> Result<u128, ProductError> {
+    context
+        .idempotency_token
+        .ok_or_else(|| context.error(ProductErrorCode::InvalidRequest))
 }
 
 fn mask_sql_classification_error(
@@ -2606,6 +2743,14 @@ impl ProductOperation {
             | Self::SecurityRoleList(_)
             | Self::SecurityAssignmentList(_)
             | Self::SecurityKeyList(_) => authorization([ProductPermission::SecurityRead]),
+            Self::SecurityPrincipalCreate { .. }
+            | Self::SecurityPrincipalSetEnabled { .. }
+            | Self::SecurityCustomRoleCreate { .. }
+            | Self::SecurityBuiltInAssignmentCreate { .. }
+            | Self::SecurityCustomAssignmentCreate { .. }
+            | Self::SecurityAssignmentRevoke { .. } => {
+                authorization([ProductPermission::SecurityManage])
+            }
             Self::SecurityAuditRead(_) => authorization([ProductPermission::AuditRead]),
             Self::VerifyProof { .. } => authorization([ProductPermission::ProofVerify]),
             Self::Prove { operation, .. } => operation
@@ -2675,7 +2820,13 @@ impl ProductOperation {
             | Self::SearchDocumentDelete { .. }
             | Self::AdminCheckpoint
             | Self::Backup(_)
-            | Self::Restore(_) => false,
+            | Self::Restore(_)
+            | Self::SecurityPrincipalCreate { .. }
+            | Self::SecurityPrincipalSetEnabled { .. }
+            | Self::SecurityCustomRoleCreate { .. }
+            | Self::SecurityBuiltInAssignmentCreate { .. }
+            | Self::SecurityCustomAssignmentCreate { .. }
+            | Self::SecurityAssignmentRevoke { .. } => false,
         }
     }
 
@@ -2686,7 +2837,13 @@ impl ProductOperation {
             | Self::SecurityRoleList(_)
             | Self::SecurityAssignmentList(_)
             | Self::SecurityKeyList(_)
-            | Self::SecurityAuditRead(_) => true,
+            | Self::SecurityAuditRead(_)
+            | Self::SecurityPrincipalCreate { .. }
+            | Self::SecurityPrincipalSetEnabled { .. }
+            | Self::SecurityCustomRoleCreate { .. }
+            | Self::SecurityBuiltInAssignmentCreate { .. }
+            | Self::SecurityCustomAssignmentCreate { .. }
+            | Self::SecurityAssignmentRevoke { .. } => true,
             Self::Prove { operation, .. } => operation.requires_managed_authority(),
             _ => false,
         }
@@ -2705,6 +2862,12 @@ impl ProductOperation {
                 | Self::AdminCheckpoint
                 | Self::Backup(_)
                 | Self::Restore(_)
+                | Self::SecurityPrincipalCreate { .. }
+                | Self::SecurityPrincipalSetEnabled { .. }
+                | Self::SecurityCustomRoleCreate { .. }
+                | Self::SecurityBuiltInAssignmentCreate { .. }
+                | Self::SecurityCustomAssignmentCreate { .. }
+                | Self::SecurityAssignmentRevoke { .. }
         ) || matches!(
             self,
             Self::ExecuteSql { statement, .. }
@@ -2713,6 +2876,18 @@ impl ProductOperation {
                     Ok(SqlStatementClass::DataMutation | SqlStatementClass::CatalogMutation)
                 )
         ) || matches!(self, Self::Prove { operation, .. } if operation.is_mutating())
+    }
+
+    fn requires_idempotency_token(&self) -> bool {
+        matches!(
+            self,
+            Self::SecurityPrincipalCreate { .. }
+                | Self::SecurityPrincipalSetEnabled { .. }
+                | Self::SecurityCustomRoleCreate { .. }
+                | Self::SecurityBuiltInAssignmentCreate { .. }
+                | Self::SecurityCustomAssignmentCreate { .. }
+                | Self::SecurityAssignmentRevoke { .. }
+        )
     }
 
     fn request_cost(&self) -> (usize, usize, usize, usize) {
@@ -2738,7 +2913,10 @@ impl ProductOperation {
             Self::AdminExplainSql { statement } | Self::PrepareSql { statement } => {
                 (1, statement.len(), statement.len())
             }
-            Self::CatalogObject { .. } | Self::CatalogDescribe { .. } => (1, 16, 1),
+            Self::CatalogObject { .. }
+            | Self::CatalogDescribe { .. }
+            | Self::SecurityPrincipalSetEnabled { .. }
+            | Self::SecurityAssignmentRevoke { .. } => (1, 16, 1),
             Self::CatalogObjectNamed { name } | Self::CatalogResolve { name } => {
                 (1, qualified_name_bytes(name), 1)
             }
@@ -2806,6 +2984,20 @@ impl ProductOperation {
             Self::SecurityAssignmentList(request) => (request.limit, 0, request.limit.max(1)),
             Self::SecurityKeyList(request) => (request.limit, 0, request.limit.max(1)),
             Self::SecurityAuditRead(request) => (request.limit, 0, request.limit.max(1)),
+            Self::SecurityPrincipalCreate { display_name } => {
+                (1, display_name.len(), display_name.len().max(1))
+            }
+            Self::SecurityCustomRoleCreate {
+                display_name,
+                grants,
+            } => {
+                let bytes = display_name
+                    .len()
+                    .saturating_add(grants.len().saturating_mul(32));
+                (grants.len().max(1), bytes, bytes.max(1))
+            }
+            Self::SecurityBuiltInAssignmentCreate { .. } => (1, 64, 1),
+            Self::SecurityCustomAssignmentCreate { .. } => (1, 32, 1),
             Self::Restore(request) => (
                 1,
                 request
@@ -2843,7 +3035,13 @@ impl ProductOperation {
             | Self::SearchIngest { .. }
             | Self::SearchDocumentUpdate { .. }
             | Self::SearchDocumentDelete { .. }
-            | Self::AdminCheckpoint => Some((1, 256)),
+            | Self::AdminCheckpoint
+            | Self::SecurityPrincipalCreate { .. }
+            | Self::SecurityPrincipalSetEnabled { .. }
+            | Self::SecurityCustomRoleCreate { .. }
+            | Self::SecurityBuiltInAssignmentCreate { .. }
+            | Self::SecurityCustomAssignmentCreate { .. }
+            | Self::SecurityAssignmentRevoke { .. } => Some((1, 256)),
             Self::ExecuteSql { .. } => self.is_mutating().then_some((1, 256)),
             Self::Backup(request) => Some((
                 1,
@@ -2925,7 +3123,11 @@ impl ProductResponse {
             | Self::TransactionRolledBack(_)
             | Self::AdminCheckpoint(_)
             | Self::SearchIngested(_)
-            | Self::ProofVerification(_) => (1, 256),
+            | Self::ProofVerification(_)
+            | Self::SecurityPrincipalMutated(_)
+            | Self::SecurityCustomRoleMutated(_)
+            | Self::SecurityAssignmentMutated(_)
+            | Self::SecurityMutated(_) => (1, 256),
             Self::Explain(explanation) => (1, format!("{explanation:?}").len()),
             Self::Sql { result, .. } => sql_result_cost(result),
             Self::StructureValue(value) => (

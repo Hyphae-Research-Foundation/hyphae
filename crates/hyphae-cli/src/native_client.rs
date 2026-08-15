@@ -83,6 +83,32 @@ impl EmbeddedClient {
         operation: ProductOperation,
         durability: ProductDurability,
     ) -> Result<ProductResponse, Box<ProductError>> {
+        self.dispatch_request(operation, durability, None)
+    }
+
+    pub(crate) fn dispatch_with_idempotency(
+        &mut self,
+        operation: ProductOperation,
+        idempotency_token: u128,
+    ) -> Result<ProductResponse, Box<ProductError>> {
+        if idempotency_token == 0 {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::InvalidRequest,
+            )));
+        }
+        self.dispatch_request(
+            operation,
+            ProductDurability::Strict,
+            Some(idempotency_token),
+        )
+    }
+
+    fn dispatch_request(
+        &mut self,
+        operation: ProductOperation,
+        durability: ProductDurability,
+        idempotency_token: Option<u128>,
+    ) -> Result<ProductResponse, Box<ProductError>> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
             Box::new(ProductError::from_code(
@@ -97,6 +123,9 @@ impl EmbeddedClient {
             self.session.authorization(),
         )
         .with_authorization_epoch(self.session.authorization_epoch());
+        if let Some(idempotency_token) = idempotency_token {
+            context = context.with_idempotency_token(idempotency_token);
+        }
         context.durability.durability = durability;
         self.product
             .dispatch(&mut self.session, &context, operation)

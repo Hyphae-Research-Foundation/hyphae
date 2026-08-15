@@ -253,6 +253,49 @@ bounded canonical pages, redacted CLI/TUI output, protocol minor-1 gating, and
 native-daemon/HTTP/Rust-client parity. Metadata reads require instance-scoped
 `security.read`; audit reads require instance-scoped `audit.read`.
 
+### First secret-free write-plane 1.2 slice
+
+The first write-plane promotion is deliberately limited to these six typed
+mutations:
+
+| Operation | Contract |
+|---|---|
+| `security.principal_create` | Create one fresh principal in the disabled state. Enabling it is a separate mutation. |
+| `security.principal_set_enabled` | Enable or disable one existing principal without changing its stable ID. |
+| `security.custom_role_create` | Create one immutable custom role containing canonical direct grants. Rename, replacement, and drop are not part of this slice. |
+| `security.assignment_create_built_in` | Create one built-in-role assignment at its exact scope. Assigning `owner` is forbidden. |
+| `security.assignment_create_custom` | Create one assignment of an existing immutable custom role to one principal. |
+| `security.assignment_revoke` | Revoke one exact assignment by stable ID. Revoking an `owner` assignment is forbidden. |
+
+Every mutation requires an authenticated managed session with instance-scoped
+`security.manage`. Each request carries a nonzero idempotency token and is
+admitted only with strict durability. The first success commits the canonical
+mutation and its redacted audit event atomically and returns a durable receipt.
+An exact retry returns the retained result without a second mutation, epoch
+advance, or audit event. Reusing the token for a different canonical request
+returns `idempotency_conflict` and changes no state. A transport cannot
+downgrade the durability or substitute a locally synthesized authority.
+Replay retention is bounded to 64 cryptographically selected shards with 64
+FIFO records per shard. Reuse after a record leaves that explicit window is a
+new mutation attempt; clients that require longer recovery retain their final
+receipt as the durable authority.
+
+These operations contain no credential secret, verifier, secret-output path,
+or one-time secret response. Embedded dispatch, the local protocol, and Native
+HTTP use the same `ProductOperation`, managed authorization decision, request
+identity, and receipt semantics. None of the six is eligible for `Prove`;
+wrapping one in proof generation is an invalid request rather than a
+read-authority shortcut.
+
+This slice does not include principal rename; custom-role rename, drop, or
+replacement; API-key issue or other secret delivery; key revocation;
+ownership transfer; legacy-bearer migration; or owner recovery. Those flows
+remain fail-closed until their own complete contracts and transport evidence
+land. The CLI exposes exactly these six mutations through the same typed
+`ProductOperation` variants and emits only redacted durable receipts. The TUI
+remains read-only. Neither surface may call the access-control catalog
+directly.
+
 `backup.verify` remains `planned-1.2` and local-only. It will not enter the
 generic native or HTTP transport until a later contract defines a configured
 backup root and handle-relative, no-follow path resolution. A client-selected

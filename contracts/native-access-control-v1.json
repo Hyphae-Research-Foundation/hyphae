@@ -657,9 +657,19 @@
       "allowed_roles": ["admin", "auditor", "owner"]
     },
     {
-      "id": "security.principal_write",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "id": "security.principal_create",
+      "status": "current",
+      "source_variant": "SecurityPrincipalCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.principal_set_enabled",
+      "status": "current",
+      "source_variant": "SecurityPrincipalSetEnabled",
       "classification": "fixed",
       "required_all": ["security.manage"],
       "scope_resolution": "instance",
@@ -677,9 +687,9 @@
       "allowed_roles": ["admin", "auditor", "owner"]
     },
     {
-      "id": "security.role_write",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "id": "security.custom_role_create",
+      "status": "current",
+      "source_variant": "SecurityCustomRoleCreate",
       "classification": "fixed",
       "required_all": ["security.manage"],
       "scope_resolution": "instance",
@@ -697,9 +707,29 @@
       "allowed_roles": ["admin", "auditor", "owner"]
     },
     {
-      "id": "security.assignment_write",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "id": "security.assignment_create_built_in",
+      "status": "current",
+      "source_variant": "SecurityBuiltInAssignmentCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.assignment_create_custom",
+      "status": "current",
+      "source_variant": "SecurityCustomAssignmentCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.assignment_revoke",
+      "status": "current",
+      "source_variant": "SecurityAssignmentRevoke",
       "classification": "fixed",
       "required_all": ["security.manage"],
       "scope_resolution": "instance",
@@ -815,7 +845,10 @@
     "security_mutations": "durable-wal-csn",
     "authentication_failures": "bounded-telemetry",
     "secrets_allowed": false,
-    "bounded_cursor_reads": true
+    "bounded_cursor_reads": true,
+    "mutation_idempotency": "required-nonzero-actor-key-request-digest",
+    "mutation_replay": "same-receipt-or-conflict",
+    "mutation_durability": "strict"
   },
   "limits": {
     "principals": 4096,
@@ -830,6 +863,8 @@
     "security_result_rows": 1000,
     "maximum_rotation_overlap_seconds": 604800,
     "authentication_verifiers_per_request": 1,
-    "authorization_cache_entries": 4096
+    "authorization_cache_entries": 4096,
+    "security_idempotency_shards": 64,
+    "security_idempotency_records_per_shard": 64
   }
 }

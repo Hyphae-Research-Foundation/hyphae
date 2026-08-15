@@ -10,13 +10,15 @@ use std::{
 };
 
 use hyphae_native_product::{
-    BackupRequest, BoundedSearchQuery, CatalogDependencyRequest, CatalogListRequest, DoctorRequest,
-    ObjectId, ProductDurabilityPolicy, ProductError, ProductLimits, ProductOperation,
-    ProductPreparedHandle, ProductResponse, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchRequest,
-    ProductStructureMutation, ProductStructureReadRequest, ProductValue, RestoreRequest,
-    SecurityAssignmentListRequest, SecurityAuditReadRequest, SecurityKeyListRequest,
-    SecurityPrincipalListRequest, SecurityRoleListRequest,
+    AccessControlMutationReceipt, BackupRequest, BoundedSearchQuery, BuiltInRole,
+    CatalogDependencyRequest, CatalogListRequest, CustomRoleGrant, CustomRoleMutationReceipt,
+    DoctorRequest, ObjectId, ProductDurabilityPolicy, ProductError, ProductLimits,
+    ProductOperation, ProductPreparedHandle, ProductResponse, ProductScope,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
+    ProductSearchRequest, ProductStructureMutation, ProductStructureReadRequest, ProductValue,
+    RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
+    SecurityAuditReadRequest, SecurityId, SecurityKeyListRequest, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityRoleListRequest,
 };
 
 use super::{HttpTransport, LocalTransport};
@@ -488,6 +490,140 @@ impl HyphaeClient {
             .await
     }
 
+    /// Creates one disabled durable principal under a nonzero idempotency token.
+    pub async fn security_principal_create(
+        &self,
+        display_name: impl Into<String>,
+        options: RequestOptions,
+    ) -> Result<SecurityPrincipalMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityPrincipalCreate {
+                    display_name: display_name.into(),
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityPrincipalMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Enables or disables one durable principal under a nonzero idempotency token.
+    pub async fn security_principal_set_enabled(
+        &self,
+        principal_id: SecurityId,
+        enabled: bool,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityPrincipalSetEnabled {
+                    principal_id,
+                    enabled,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Creates one immutable custom role under a nonzero idempotency token.
+    pub async fn security_custom_role_create(
+        &self,
+        display_name: impl Into<String>,
+        grants: Vec<CustomRoleGrant>,
+        options: RequestOptions,
+    ) -> Result<CustomRoleMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityCustomRoleCreate {
+                    display_name: display_name.into(),
+                    grants,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityCustomRoleMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Assigns one built-in role under a nonzero idempotency token.
+    pub async fn security_built_in_assignment_create(
+        &self,
+        principal_id: SecurityId,
+        role: BuiltInRole,
+        scope: ProductScope,
+        options: RequestOptions,
+    ) -> Result<RoleAssignmentMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityBuiltInAssignmentCreate {
+                    principal_id,
+                    role,
+                    scope,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityAssignmentMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Assigns one custom role under a nonzero idempotency token.
+    pub async fn security_custom_assignment_create(
+        &self,
+        principal_id: SecurityId,
+        role_id: SecurityId,
+        options: RequestOptions,
+    ) -> Result<RoleAssignmentMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityCustomAssignmentCreate {
+                    principal_id,
+                    role_id,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityAssignmentMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Revokes one non-owner assignment under a nonzero idempotency token.
+    pub async fn security_assignment_revoke(
+        &self,
+        assignment_id: SecurityId,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityAssignmentRevoke { assignment_id },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Explains one SQL statement.
     pub async fn explain_sql(
         &self,
@@ -593,6 +729,16 @@ impl HyphaeClient {
             options,
         )
         .await
+    }
+}
+
+fn require_security_mutation_idempotency(options: &RequestOptions) -> Result<(), ClientError> {
+    if options.idempotency_token.is_some_and(|token| token != 0) {
+        Ok(())
+    } else {
+        Err(ClientError::Protocol(
+            "security mutations require a nonzero idempotency token".to_owned(),
+        ))
     }
 }
 

@@ -83,6 +83,8 @@ impl ManagedFixture {
             3,
         )?;
         let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        product.set_security_principal_enabled(&owner, auditor.principal_id, true, 4)?;
+        let owner = product.authenticate_api_key(&owner_secret, 5)?;
         let issued = product.issue_api_key_to_file(
             &owner,
             auditor.principal_id,
@@ -91,7 +93,7 @@ impl ManagedFixture {
             BuiltInRole::Auditor.authorization(),
             None,
             &auditor_path,
-            4,
+            5,
         )?;
         let credential = fs::read_to_string(auditor_path)?;
         let owner = product.authenticate_api_key(&owner_secret, 5)?;

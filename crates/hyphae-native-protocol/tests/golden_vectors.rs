@@ -3,19 +3,21 @@
 //! Shared protocol golden vectors and strict completion controls.
 
 use hyphae_native_product::{
-    AccessControlStatus, ApiKeyId, AuthorizationEpoch, BackupRequest, BuiltInRole, CustomRoleGrant,
-    DoctorRequest, ObjectId, ProductAuthorization, ProductDocValue, ProductDocument,
-    ProductDurabilityPolicy, ProductError, ProductErrorCode, ProductExplicitTransactionStatus,
-    ProductLimits, ProductOperation, ProductPermission, ProductResponse, ProductScope,
-    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductTransactionHandle,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
-    ProductTransactionVectorMutation, ProductValue, ProductVector, SecurityAssignmentListRequest,
-    SecurityAssignmentPage, SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent,
-    SecurityAuditMetadata, SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult,
-    SecurityAuditTarget, SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest,
-    SecurityKeyPage, SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
-    SecurityPrincipalPage, SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage,
-    SecurityRoleSummary, SnapshotIdentity,
+    AccessControlMutationReceipt, AccessControlStatus, ApiKeyId, AuthorizationEpoch, BackupRequest,
+    BuiltInRole, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRequest, ObjectId,
+    ProductAuthorization, ProductCommitReceipt, ProductDocValue, ProductDocument,
+    ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCode,
+    ProductExplicitTransactionStatus, ProductLimits, ProductOperation, ProductPermission,
+    ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSearchIngestReceipt,
+    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
+    ProductTransactionSqlMutation, ProductTransactionVectorMutation, ProductValue, ProductVector,
+    RoleAssignmentMutationReceipt, SecurityAssignmentListRequest, SecurityAssignmentPage,
+    SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata,
+    SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget,
+    SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityPrincipalSummary,
+    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
 };
 use hyphae_native_protocol::{
     API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, GOLDEN_STRUCTURE_FRAME_BLAKE3,
@@ -384,7 +386,7 @@ fn security_read_plane_rejects_truncation_trailing_unknown_and_invalid_cursors()
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&49_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&54_u16.to_le_bytes());
     assert!(matches!(
         decode_product_request(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -501,7 +503,7 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&39_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&42_u16.to_le_bytes());
     assert!(matches!(
         decode_product_response(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -543,10 +545,328 @@ fn security_wire_request(operation: ProductOperation) -> WireRequest {
 }
 
 #[test]
-fn protocol_minor_negotiation_preserves_1_0_and_selects_1_1()
+fn security_write_plane_requests_use_minor_two_append_only_tags_and_redacted_goldens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    let role_id = SecurityId::new(2).ok_or("nonzero role")?;
+    let assignment_id = SecurityId::new(3).ok_or("nonzero assignment")?;
+    let operations = [
+        ProductOperation::SecurityPrincipalCreate {
+            display_name: "analytics".to_owned(),
+        },
+        ProductOperation::SecurityPrincipalSetEnabled {
+            principal_id,
+            enabled: true,
+        },
+        ProductOperation::SecurityCustomRoleCreate {
+            display_name: "analytics reader".to_owned(),
+            grants: vec![
+                CustomRoleGrant::new(
+                    ProductPermission::DataRead,
+                    ProductScope::CatalogSubtree(ObjectId::new(9)?),
+                )
+                .ok_or("valid grant")?,
+            ],
+        },
+        ProductOperation::SecurityBuiltInAssignmentCreate {
+            principal_id,
+            role: BuiltInRole::Owner,
+            scope: ProductScope::Instance,
+        },
+        ProductOperation::SecurityCustomAssignmentCreate {
+            principal_id,
+            role_id,
+        },
+        ProductOperation::SecurityAssignmentRevoke { assignment_id },
+    ];
+
+    let mut transcript = Vec::new();
+    for (offset, operation) in operations.into_iter().enumerate() {
+        let expected = format!("{operation:?}");
+        let request = security_mutation_wire_request(operation);
+        let encoded = encode_product_request_for_minor(&request, 2)?;
+        assert_eq!(
+            u16::from_le_bytes(encoded[12..14].try_into()?),
+            48 + u16::try_from(offset)?
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                decode_product_request_for_minor(&encoded, 2)?.operation
+            ),
+            expected
+        );
+        let diagnostic = String::from_utf8_lossy(&encoded);
+        assert!(!diagnostic.contains("hyp1_"));
+        assert!(!diagnostic.contains("verifier"));
+        assert!(!diagnostic.contains("secret"));
+        transcript.extend_from_slice(&encoded);
+    }
+    assert_eq!(
+        blake3::hash(&transcript).to_hex().as_str(),
+        "94b3aade7ed46f3608da3b30a5516db04a7de0e9013b33ebb3752162f17f1afc"
+    );
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_responses_use_minor_two_append_only_tags_and_redacted_goldens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    let role_id = SecurityId::new(2).ok_or("nonzero role")?;
+    let assignment_id = SecurityId::new(3).ok_or("nonzero assignment")?;
+    let epoch = AuthorizationEpoch::new(7);
+    let commit = security_commit_receipt()?;
+    let responses = [
+        ProductResponse::SecurityPrincipalMutated(SecurityPrincipalMutationReceipt {
+            principal_id,
+            authorization_epoch: epoch,
+            commit,
+        }),
+        ProductResponse::SecurityCustomRoleMutated(CustomRoleMutationReceipt {
+            role_id,
+            authorization_epoch: epoch,
+            commit,
+        }),
+        ProductResponse::SecurityAssignmentMutated(RoleAssignmentMutationReceipt {
+            assignment_id,
+            authorization_epoch: epoch,
+            commit,
+        }),
+        ProductResponse::SecurityMutated(AccessControlMutationReceipt {
+            authorization_epoch: epoch,
+            commit,
+        }),
+    ];
+
+    let mut transcript = Vec::new();
+    for (offset, response) in responses.into_iter().enumerate() {
+        for minor in [0, 1] {
+            assert!(matches!(
+                encode_product_response_for_minor(&response, minor),
+                Err(ProductCodecError::Unsupported)
+            ));
+        }
+        let encoded = encode_product_response_for_minor(&response, 2)?;
+        assert_eq!(
+            u16::from_le_bytes(encoded[12..14].try_into()?),
+            38 + u16::try_from(offset)?
+        );
+        assert_eq!(decode_product_response_for_minor(&encoded, 2)?, response);
+        for minor in [0, 1] {
+            assert!(matches!(
+                decode_product_response_for_minor(&encoded, minor),
+                Err(ProductCodecError::Unsupported)
+            ));
+        }
+        let diagnostic = String::from_utf8_lossy(&encoded);
+        assert!(!diagnostic.contains("hyp1_"));
+        assert!(!diagnostic.contains("verifier"));
+        assert!(!diagnostic.contains("secret"));
+        transcript.extend_from_slice(&encoded);
+    }
+    assert_eq!(
+        blake3::hash(&transcript).to_hex().as_str(),
+        "797963aee6cc4aa65f38b40e08c82a2ff63e71f1e96ef28e2466bc3862e0ce34"
+    );
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_requires_minor_two_and_nonzero_context_idempotency()
+-> Result<(), Box<dyn std::error::Error>> {
+    let operation = ProductOperation::SecurityPrincipalCreate {
+        display_name: "analytics".to_owned(),
+    };
+    let request = security_mutation_wire_request(operation);
+    for minor in [0, 1] {
+        assert!(matches!(
+            encode_product_request_for_minor(&request, minor),
+            Err(ProductCodecError::Unsupported)
+        ));
+    }
+    let encoded = encode_product_request_for_minor(&request, 2)?;
+    let mut different_token = request.clone();
+    different_token.idempotency_token = Some(18);
+    let encoded_different_token = encode_product_request_for_minor(&different_token, 2)?;
+    assert_eq!(&encoded[..32], &encoded_different_token[..32]);
+    assert_ne!(&encoded[32..48], &encoded_different_token[32..48]);
+    assert_eq!(&encoded[48..], &encoded_different_token[48..]);
+    for minor in [0, 1] {
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, minor),
+            Err(ProductCodecError::Unsupported)
+        ));
+    }
+
+    let mut absent = request.clone();
+    absent.idempotency_token = None;
+    assert!(matches!(
+        encode_product_request(&absent),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    let legacy_wire = strip_request_idempotency(&encoded)?;
+    assert!(matches!(
+        decode_product_request(&legacy_wire),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let mut zero = encoded;
+    zero[32..48].fill(0);
+    assert!(matches!(
+        decode_product_request(&zero),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_rejects_noncanonical_bodies() -> Result<(), Box<dyn std::error::Error>> {
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    for invalid_name in [String::new(), "bad\nname".to_owned(), "x".repeat(129)] {
+        let request = security_mutation_wire_request(ProductOperation::SecurityPrincipalCreate {
+            display_name: invalid_name,
+        });
+        assert!(encode_product_request(&request).is_err());
+    }
+
+    let grant = CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+        .ok_or("valid grant")?;
+    for grants in [Vec::new(), vec![grant, grant]] {
+        let request = security_mutation_wire_request(ProductOperation::SecurityCustomRoleCreate {
+            display_name: "analytics".to_owned(),
+            grants,
+        });
+        assert!(encode_product_request(&request).is_err());
+    }
+
+    let oversized_grants =
+        security_mutation_wire_request(ProductOperation::SecurityCustomRoleCreate {
+            display_name: "analytics".to_owned(),
+            grants: vec![grant],
+        });
+    let mut oversized_grants = encode_product_request(&oversized_grants)?;
+    oversized_grants[109..113].copy_from_slice(&257_u32.to_le_bytes());
+    assert!(decode_product_request(&oversized_grants).is_err());
+
+    let request = security_mutation_wire_request(ProductOperation::SecurityPrincipalSetEnabled {
+        principal_id,
+        enabled: true,
+    });
+    let encoded = encode_product_request(&request)?;
+    for prefix_length in 0..encoded.len() {
+        assert!(decode_product_request(&encoded[..prefix_length]).is_err());
+    }
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    let trailing_length = u32::try_from(trailing.len())?;
+    trailing[8..12].copy_from_slice(&trailing_length.to_le_bytes());
+    assert!(matches!(
+        decode_product_request(&trailing),
+        Err(ProductCodecError::Malformed)
+    ));
+    let mut unknown = encoded.clone();
+    unknown[12..14].copy_from_slice(&54_u16.to_le_bytes());
+    assert!(matches!(
+        decode_product_request(&unknown),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let mut zero_principal = encoded;
+    zero_principal[96..112].fill(0);
+    assert!(matches!(
+        decode_product_request(&zero_principal),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    Ok(())
+}
+
+#[test]
+fn security_write_plane_responses_reject_truncation_trailing_unknown_and_zero_fields()
+-> Result<(), Box<dyn std::error::Error>> {
+    let response = ProductResponse::SecurityPrincipalMutated(SecurityPrincipalMutationReceipt {
+        principal_id: SecurityId::new(1).ok_or("nonzero principal")?,
+        authorization_epoch: AuthorizationEpoch::new(7),
+        commit: security_commit_receipt()?,
+    });
+    let encoded = encode_product_response(&response)?;
+    for prefix_length in 0..encoded.len() {
+        assert!(decode_product_response(&encoded[..prefix_length]).is_err());
+    }
+
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    let trailing_length = u32::try_from(trailing.len())?;
+    trailing[8..12].copy_from_slice(&trailing_length.to_le_bytes());
+    assert!(matches!(
+        decode_product_response(&trailing),
+        Err(ProductCodecError::Malformed)
+    ));
+
+    let mut unknown = encoded.clone();
+    unknown[12..14].copy_from_slice(&42_u16.to_le_bytes());
+    assert!(matches!(
+        decode_product_response(&unknown),
+        Err(ProductCodecError::Unsupported)
+    ));
+
+    let mut zero_id = encoded.clone();
+    zero_id[16..32].fill(0);
+    assert!(matches!(
+        decode_product_response(&zero_id),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let mut zero_epoch = encoded;
+    zero_epoch[32..40].fill(0);
+    assert!(matches!(
+        decode_product_response(&zero_epoch),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    Ok(())
+}
+
+fn security_mutation_wire_request(operation: ProductOperation) -> WireRequest {
+    WireRequest {
+        operation,
+        logical_time_micros: 10,
+        deadline_micros: None,
+        idempotency_token: Some(17),
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::STRICT,
+    }
+}
+
+fn security_commit_receipt() -> Result<ProductCommitReceipt, Box<dyn std::error::Error>> {
+    Ok(ProductCommitReceipt {
+        transaction_id: ProductTransactionId::new(29).ok_or("nonzero transaction")?,
+        commit_csn: 31,
+        catalog_version: 37,
+        commit_lsn: 41,
+        wal_block_digest: [43; 32],
+        durability: ProductDurability::Strict,
+        durability_cohort_size: 1,
+        durability_cohort_position: 0,
+    })
+}
+
+fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut legacy = encoded.to_vec();
+    legacy.drain(32..48);
+    legacy[73..80].fill(0);
+    let length = u32::try_from(legacy.len())?;
+    legacy[8..12].copy_from_slice(&length.to_le_bytes());
+    Ok(legacy)
+}
+
+#[test]
+fn protocol_minor_negotiation_preserves_1_0_and_1_1_and_selects_1_2()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
+        ..Hello::default()
+    };
+    let minor_one = Hello {
+        maximum_minor: 1,
         ..Hello::default()
     };
     let current = Hello::default();
@@ -563,7 +883,7 @@ fn protocol_minor_negotiation_preserves_1_0_and_selects_1_1()
     );
     assert_eq!(
         negotiate(
-            &current,
+            &minor_one,
             NegotiationPolicy::default(),
             1,
             hyphae_native_product::capabilities(),
@@ -572,10 +892,21 @@ fn protocol_minor_negotiation_preserves_1_0_and_selects_1_1()
         .minor,
         1
     );
+    assert_eq!(
+        negotiate(
+            &current,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        2
+    );
 
     let incompatible = Hello {
-        minimum_minor: 2,
-        maximum_minor: 2,
+        minimum_minor: 3,
+        maximum_minor: 3,
         ..Hello::default()
     };
     assert_eq!(

@@ -32,7 +32,7 @@ Incompatible major versions fail before accepting operations.
 
 Minor negotiation selects the highest version in the intersection of the
 client range and the server range. A 1.0 client therefore remains on minor
-`0` when it connects to a 1.1 server; neither peer may send or accept a payload
+`0` when it connects to a 1.2 server; neither peer may send or accept a payload
 introduced after the selected minor.
 
 ### HELLO authentication extension
@@ -180,6 +180,31 @@ These tags require negotiated minor `1` in both directions. A client that
 negotiated minor `0` rejects them before sending, and a server that negotiated
 minor `0` rejects them before dispatch. Existing minor-0 payload tags and
 golden bytes remain unchanged.
+
+Minor `2` adds the first secret-free managed security write plane. Its
+append-only request tags are `48..53`, in this exact order:
+
+1. `SecurityPrincipalCreate`;
+2. `SecurityPrincipalSetEnabled`;
+3. `SecurityCustomRoleCreate`;
+4. `SecurityBuiltInAssignmentCreate`;
+5. `SecurityCustomAssignmentCreate`; and
+6. `SecurityAssignmentRevoke`.
+
+The corresponding response tags are `38..41`: principal, custom-role,
+assignment, and generic security mutation receipts. Every write request
+requires negotiated minor `2`, a managed session with instance-scoped
+`security.manage`, strict durability, and a nonzero idempotency token in the
+canonical request context. The token is not duplicated inside the operation
+payload. Exact retries return the retained durable receipt; a token reused for
+a different canonical request returns `idempotency_conflict` without dispatching
+a second mutation. Minor `0` and `1` peers reject these request and response
+tags before dispatch or delivery. Existing minor-0 and minor-1 golden bytes
+remain unchanged.
+
+The write payloads contain public IDs and bounded policy metadata only. They
+cannot carry an API-key secret, verifier, output path, caller-selected actor,
+or Owner assignment. They are not eligible for proof wrapping.
 
 Backup verification is not part of this transport extension. It remains a
 local API until a later contract defines a configured backup root and

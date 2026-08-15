@@ -76,6 +76,9 @@ impl ManagedFixture {
             11,
         )?;
         let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 12)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
         let key_path = self.directory.with_extension(format!("{label}-key"));
         let _ignored = fs::remove_file(&key_path);
         self.product.issue_scoped_api_key_to_file(
@@ -88,7 +91,7 @@ impl ManagedFixture {
             [scope],
             None,
             &key_path,
-            12,
+            13,
         )?;
         let secret = fs::read_to_string(&key_path)?;
         let authority = self.product.authenticate_api_key(&secret, 0)?;

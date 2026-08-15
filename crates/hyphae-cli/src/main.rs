@@ -12,7 +12,7 @@ mod native_service;
 mod tui;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{BufWriter, Write, stderr, stdout},
     net::SocketAddr,
@@ -37,28 +37,29 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
-    AccessControlStatus, BackupInfo, BackupRequest, BuiltInRole, CatalogDependencyRequest,
-    CatalogListRequest, CompactionRequest, CompactionTarget, DoctorRequest, DoctorStatus,
-    MetricValue, MigrationLexicalIndexInput, MigrationVectorIndexInput, NativeProduct, ObjectId,
-    ProductAggregation, ProductAuthorization, ProductCommitOutcome, ProductCommitReceipt,
-    ProductDocValue, ProductDocument, ProductDurability, ProductExplain,
-    ProductExplicitTransactionStatus, ProductFacetRequest, ProductHashEntry, ProductLexicalBranch,
-    ProductListSide, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
-    ProductPermission, ProductResponse, ProductScope, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
-    ProductSearchOperator, ProductSearchRequest, ProductSearchResults, ProductSearchSort,
-    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSqlResult,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation, ProductTransactionStageResult,
-    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
-    ProductVector, ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
-    ProgressControl, RestorePhase, RestoreRequest, SecurityAssignmentListRequest,
-    SecurityAssignmentPage, SecurityAuditAction, SecurityAuditMetadata, SecurityAuditPage,
-    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor, SecurityId,
-    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest, SecurityPrincipalPage,
-    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
-    StructureKind, VerifyBackupRequest, capabilities, verify_backup,
+    AccessControlLimits, AccessControlStatus, BackupInfo, BackupRequest, BuiltInRole,
+    CatalogDependencyRequest, CatalogListRequest, CompactionRequest, CompactionTarget,
+    CustomRoleGrant, DoctorRequest, DoctorStatus, MetricValue, MigrationLexicalIndexInput,
+    MigrationVectorIndexInput, NativeProduct, ObjectId, ProductAggregation, ProductAuthorization,
+    ProductCommitOutcome, ProductCommitReceipt, ProductDocValue, ProductDocument,
+    ProductDurability, ProductExplain, ProductExplicitTransactionStatus, ProductFacetRequest,
+    ProductHashEntry, ProductLexicalBranch, ProductListSide, ProductMissingPlacement,
+    ProductNamedAggregation, ProductOperation, ProductPermission, ProductResponse, ProductScope,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductSearchResults,
+    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
+    ProductSqlResult, ProductStructureKey, ProductStructureMutation,
+    ProductStructureMutationResult, ProductStructureReadRequest, ProductStructureReadResult,
+    ProductTransactionHandle, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionStageResult, ProductTransactionStatus, ProductTransactionVectorMutation,
+    ProductTtl, ProductValue, ProductVector, ProductVectorBranch, ProductVectorExecution,
+    ProductVectorStrategy, ProgressControl, RestorePhase, RestoreRequest,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditAction,
+    SecurityAuditMetadata, SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult,
+    SecurityAuditTarget, SecurityCursor, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityPrincipalListRequest, SecurityPrincipalPage, SecurityRoleListRequest, SecurityRolePage,
+    SecurityRoleSummary, SnapshotIdentity, StructureKind, VerifyBackupRequest, capabilities,
+    verify_backup,
 };
 use hyphae_native_runtime::{
     CalibrationMode, CalibrationRequest, GovernorMode, GovernorPolicyError, HardwareCalibration,
@@ -477,17 +478,17 @@ enum SecurityCommand {
     /// Inspect redacted principal metadata.
     Principal {
         #[command(subcommand)]
-        operation: SecurityListCommand,
+        operation: SecurityPrincipalCommand,
     },
     /// Inspect immutable and custom role metadata.
     Role {
         #[command(subcommand)]
-        operation: SecurityListCommand,
+        operation: SecurityRoleCommand,
     },
     /// Inspect direct role assignments.
     Assignment {
         #[command(subcommand)]
-        operation: SecurityListCommand,
+        operation: SecurityAssignmentCommand,
     },
     /// Inspect redacted API-key metadata.
     Key {
@@ -510,6 +511,137 @@ enum SecurityCommand {
         /// New owner-only API-key file. Existing paths are never overwritten.
         #[arg(long)]
         key_out: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityPrincipalCommand {
+    /// Return one bounded page in stable order.
+    List {
+        /// Opaque continuation emitted by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum redacted rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Create one disabled principal.
+    Create {
+        /// Bounded human-readable display name.
+        #[arg(long)]
+        name: String,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Enable or disable one existing principal.
+    SetEnabled {
+        /// Canonical 32-hex principal identity.
+        #[arg(long)]
+        principal_id: String,
+        /// New authentication state.
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityRoleCommand {
+    /// Return one bounded page in stable order.
+    List {
+        /// Opaque continuation emitted by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum redacted rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Create one immutable custom role.
+    Create {
+        /// Bounded human-readable display name.
+        #[arg(long)]
+        name: String,
+        /// Canonical `PERMISSION@SCOPE`; repeat for each grant.
+        #[arg(long, required = true)]
+        grant: Vec<String>,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AssignableBuiltInRole {
+    Admin,
+    Operator,
+    Developer,
+    Writer,
+    Reader,
+    Auditor,
+}
+
+impl AssignableBuiltInRole {
+    const fn product(self) -> BuiltInRole {
+        match self {
+            Self::Admin => BuiltInRole::Admin,
+            Self::Operator => BuiltInRole::Operator,
+            Self::Developer => BuiltInRole::Developer,
+            Self::Writer => BuiltInRole::Writer,
+            Self::Reader => BuiltInRole::Reader,
+            Self::Auditor => BuiltInRole::Auditor,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityAssignmentCommand {
+    /// Return one bounded page in stable order.
+    List {
+        /// Opaque continuation emitted by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum redacted rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Assign one non-owner built-in role.
+    CreateBuiltIn {
+        /// Canonical 32-hex principal identity.
+        #[arg(long)]
+        principal_id: String,
+        /// Assignable built-in role; `owner` is never accepted.
+        #[arg(long, value_enum)]
+        role: AssignableBuiltInRole,
+        /// `instance`, `catalog_subtree:ID`, or `catalog_object:ID`.
+        #[arg(long)]
+        scope: String,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Assign one immutable custom role at its exact grant scopes.
+    CreateCustom {
+        /// Canonical 32-hex principal identity.
+        #[arg(long)]
+        principal_id: String,
+        /// Canonical 32-hex custom-role identity.
+        #[arg(long)]
+        role_id: String,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Revoke one non-owner assignment.
+    Revoke {
+        /// Canonical 32-hex assignment identity.
+        #[arg(long)]
+        assignment_id: String,
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
     },
 }
 
@@ -2940,15 +3072,9 @@ fn telemetry(local: &LocalDirectory) -> Result<(), CliFailure> {
 fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliFailure> {
     match command {
         SecurityCommand::Status => dispatch(local, ProductOperation::SecurityStatus),
-        SecurityCommand::Principal { operation } => {
-            security_metadata(local, SecurityListKind::Principal, operation)
-        }
-        SecurityCommand::Role { operation } => {
-            security_metadata(local, SecurityListKind::Role, operation)
-        }
-        SecurityCommand::Assignment { operation } => {
-            security_metadata(local, SecurityListKind::Assignment, operation)
-        }
+        SecurityCommand::Principal { operation } => security_principal(local, operation),
+        SecurityCommand::Role { operation } => security_role(local, operation),
+        SecurityCommand::Assignment { operation } => security_assignment(local, operation),
         SecurityCommand::Key { operation } => {
             security_metadata(local, SecurityListKind::Key, operation)
         }
@@ -2977,6 +3103,282 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
         }
     }
 }
+
+fn security_principal(
+    local: &LocalDirectory,
+    command: SecurityPrincipalCommand,
+) -> Result<(), CliFailure> {
+    match command {
+        SecurityPrincipalCommand::List { cursor, limit } => security_metadata(
+            local,
+            SecurityListKind::Principal,
+            SecurityListCommand::List { cursor, limit },
+        ),
+        SecurityPrincipalCommand::Create {
+            name,
+            idempotency_token,
+        } => {
+            validate_security_display_name(&name)?;
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityPrincipalCreate { display_name: name },
+                idempotency_token,
+            )?;
+            let ProductResponse::SecurityPrincipalMutated(receipt) = response else {
+                return Err(CliFailure::internal());
+            };
+            print_security_mutation(
+                "security.principal_create",
+                receipt.principal_id,
+                receipt.authorization_epoch.get(),
+                receipt.commit,
+            )
+        }
+        SecurityPrincipalCommand::SetEnabled {
+            principal_id,
+            enabled,
+            idempotency_token,
+        } => {
+            let principal_id = parse_security_id(&principal_id)?;
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityPrincipalSetEnabled {
+                    principal_id,
+                    enabled,
+                },
+                idempotency_token,
+            )?;
+            let ProductResponse::SecurityMutated(receipt) = response else {
+                return Err(CliFailure::internal());
+            };
+            print_security_mutation(
+                "security.principal_set_enabled",
+                principal_id,
+                receipt.authorization_epoch.get(),
+                receipt.commit,
+            )
+        }
+    }
+}
+
+fn security_role(local: &LocalDirectory, command: SecurityRoleCommand) -> Result<(), CliFailure> {
+    match command {
+        SecurityRoleCommand::List { cursor, limit } => security_metadata(
+            local,
+            SecurityListKind::Role,
+            SecurityListCommand::List { cursor, limit },
+        ),
+        SecurityRoleCommand::Create {
+            name,
+            grant,
+            idempotency_token,
+        } => {
+            validate_security_display_name(&name)?;
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityCustomRoleCreate {
+                    display_name: name,
+                    grants: parse_security_grants(&grant)?,
+                },
+                idempotency_token,
+            )?;
+            let ProductResponse::SecurityCustomRoleMutated(receipt) = response else {
+                return Err(CliFailure::internal());
+            };
+            print_security_mutation(
+                "security.custom_role_create",
+                receipt.role_id,
+                receipt.authorization_epoch.get(),
+                receipt.commit,
+            )
+        }
+    }
+}
+
+fn security_assignment(
+    local: &LocalDirectory,
+    command: SecurityAssignmentCommand,
+) -> Result<(), CliFailure> {
+    match command {
+        SecurityAssignmentCommand::List { cursor, limit } => security_metadata(
+            local,
+            SecurityListKind::Assignment,
+            SecurityListCommand::List { cursor, limit },
+        ),
+        SecurityAssignmentCommand::CreateBuiltIn {
+            principal_id,
+            role,
+            scope,
+            idempotency_token,
+        } => {
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityBuiltInAssignmentCreate {
+                    principal_id: parse_security_id(&principal_id)?,
+                    role: role.product(),
+                    scope: parse_product_scope(&scope)?,
+                },
+                idempotency_token,
+            )?;
+            print_security_assignment_receipt(&response, "security.assignment_create_built_in")
+        }
+        SecurityAssignmentCommand::CreateCustom {
+            principal_id,
+            role_id,
+            idempotency_token,
+        } => {
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityCustomAssignmentCreate {
+                    principal_id: parse_security_id(&principal_id)?,
+                    role_id: parse_security_id(&role_id)?,
+                },
+                idempotency_token,
+            )?;
+            print_security_assignment_receipt(&response, "security.assignment_create_custom")
+        }
+        SecurityAssignmentCommand::Revoke {
+            assignment_id,
+            idempotency_token,
+        } => {
+            let assignment_id = parse_security_id(&assignment_id)?;
+            let response = dispatch_security_mutation(
+                local,
+                ProductOperation::SecurityAssignmentRevoke { assignment_id },
+                idempotency_token,
+            )?;
+            let ProductResponse::SecurityMutated(receipt) = response else {
+                return Err(CliFailure::internal());
+            };
+            print_security_mutation(
+                "security.assignment_revoke",
+                assignment_id,
+                receipt.authorization_epoch.get(),
+                receipt.commit,
+            )
+        }
+    }
+}
+
+fn dispatch_security_mutation(
+    local: &LocalDirectory,
+    operation: ProductOperation,
+    idempotency_token: u128,
+) -> Result<ProductResponse, CliFailure> {
+    open_client(local)?
+        .dispatch_with_idempotency(operation, idempotency_token)
+        .map_err(Into::into)
+}
+
+fn print_security_assignment_receipt(
+    response: &ProductResponse,
+    operation: &str,
+) -> Result<(), CliFailure> {
+    let ProductResponse::SecurityAssignmentMutated(receipt) = response else {
+        return Err(CliFailure::internal());
+    };
+    print_security_mutation(
+        operation,
+        receipt.assignment_id,
+        receipt.authorization_epoch.get(),
+        receipt.commit,
+    )
+}
+
+fn print_security_mutation(
+    operation: &str,
+    result_id: SecurityId,
+    authorization_epoch: u64,
+    commit: ProductCommitReceipt,
+) -> Result<(), CliFailure> {
+    print_json(&json!({
+        "schema": "hyphae-native-security-mutation-v1",
+        "operation": operation,
+        "result_id": result_id.to_string(),
+        "authorization_epoch": authorization_epoch,
+        "commit": commit_json(commit),
+    }))
+}
+
+fn parse_nonzero_idempotency_token(value: &str) -> Result<u128, String> {
+    let token = value
+        .parse::<u128>()
+        .map_err(|_| "idempotency token must be a nonzero u128".to_owned())?;
+    if token == 0 {
+        return Err("idempotency token must be nonzero".to_owned());
+    }
+    Ok(token)
+}
+
+fn validate_security_display_name(value: &str) -> Result<(), CliFailure> {
+    if value.is_empty()
+        || value.len() > AccessControlLimits::V1.display_name_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(CliFailure::invalid());
+    }
+    Ok(())
+}
+
+fn parse_security_id(value: &str) -> Result<SecurityId, CliFailure> {
+    value.parse().map_err(|_| CliFailure::invalid())
+}
+
+fn parse_security_grants(values: &[String]) -> Result<Vec<CustomRoleGrant>, CliFailure> {
+    if values.is_empty() || values.len() > AccessControlLimits::V1.grants_per_role {
+        return Err(CliFailure::invalid());
+    }
+    let mut grants = BTreeSet::new();
+    for value in values {
+        if value.len() > MAX_SECURITY_GRANT_BYTES {
+            return Err(CliFailure::invalid());
+        }
+        let Some((permission, scope)) = value.split_once('@') else {
+            return Err(CliFailure::invalid());
+        };
+        if scope.contains('@') {
+            return Err(CliFailure::invalid());
+        }
+        let permission = ProductPermission::parse(permission).ok_or_else(CliFailure::invalid)?;
+        let grant = CustomRoleGrant::new(permission, parse_product_scope(scope)?)
+            .ok_or_else(CliFailure::invalid)?;
+        if !grants.insert(grant) {
+            return Err(CliFailure::invalid());
+        }
+    }
+    Ok(grants.into_iter().collect())
+}
+
+fn parse_product_scope(value: &str) -> Result<ProductScope, CliFailure> {
+    if value == "instance" {
+        return Ok(ProductScope::Instance);
+    }
+    if let Some(object) = value.strip_prefix("catalog_subtree:") {
+        return parse_scope_object(object).map(ProductScope::CatalogSubtree);
+    }
+    if let Some(object) = value.strip_prefix("catalog_object:") {
+        return parse_scope_object(object).map(ProductScope::CatalogObject);
+    }
+    Err(CliFailure::invalid())
+}
+
+fn parse_scope_object(value: &str) -> Result<ObjectId, CliFailure> {
+    if value.is_empty()
+        || value.len() > MAX_DECIMAL_OBJECT_ID_BYTES
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(CliFailure::invalid());
+    }
+    let parsed = value.parse::<u128>().map_err(|_| CliFailure::invalid())?;
+    if parsed.to_string() != value {
+        return Err(CliFailure::invalid());
+    }
+    object_id(parsed)
+}
+
+const MAX_DECIMAL_OBJECT_ID_BYTES: usize = 39;
+const MAX_SECURITY_GRANT_BYTES: usize = 128;
 
 #[derive(Clone, Copy)]
 enum SecurityListKind {
@@ -3646,6 +4048,8 @@ const fn security_audit_action(action: SecurityAuditAction) -> &'static str {
         SecurityAuditAction::RevokeKey => "revoke_key",
         SecurityAuditAction::RecoverOwner => "recover_owner",
         SecurityAuditAction::MigrateLegacyBearer => "migrate_legacy_bearer",
+        SecurityAuditAction::SetPrincipalEnabled => "set_principal_enabled",
+        SecurityAuditAction::RevokeAssignment => "revoke_assignment",
     }
 }
 

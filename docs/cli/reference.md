@@ -146,6 +146,64 @@ output credential file must not exist, is created with owner-only permissions
 on Unix, and is activated only after its contents have been synchronized.
 Hyphae never prints a credential secret or verifier to stdout or logs.
 
+### Security write-plane status
+
+The CLI exposes exactly six secret-free managed mutations:
+
+```text
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  principal create --name <DISPLAY_NAME> --idempotency-token <NONZERO_U128>
+
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  principal set-enabled --principal-id <SECURITY_ID> --enabled <true|false> \
+  --idempotency-token <NONZERO_U128>
+
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  role create --name <DISPLAY_NAME> --grant <PERMISSION@SCOPE> \
+  [--grant <PERMISSION@SCOPE> ...] --idempotency-token <NONZERO_U128>
+
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  assignment create-built-in --principal-id <SECURITY_ID> \
+  --role <admin|operator|developer|writer|reader|auditor> --scope <SCOPE> \
+  --idempotency-token <NONZERO_U128>
+
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  assignment create-custom --principal-id <SECURITY_ID> --role-id <SECURITY_ID> \
+  --idempotency-token <NONZERO_U128>
+
+hyphae security --data-dir <NATIVE_DIRECTORY> \
+  --native-api-key-file <RESTRICTED_FILE> \
+  assignment revoke --assignment-id <SECURITY_ID> \
+  --idempotency-token <NONZERO_U128>
+```
+
+`SECURITY_ID` is canonical lowercase 32-hex. `SCOPE` is exactly `instance`,
+`catalog_subtree:<NONZERO_DECIMAL_OBJECT_ID>`, or
+`catalog_object:<NONZERO_DECIMAL_OBJECT_ID>`. Permission names are the
+canonical dotted identifiers shown by `security role list`. Grants are
+bounded, canonicalized, and must be unique; ownership authority cannot be
+placed in a custom role.
+
+Every mutation requires a managed key with instance-scoped `security.manage`,
+a nonzero idempotency token, and strict durability. An exact retry returns the
+same receipt; reuse of the token with another payload fails with
+`idempotency_conflict`. The versioned JSON receipt contains only the operation,
+public result identity, authorization epoch, and native commit evidence. It
+never contains the credential, verifier, or an actor identity supplied by CLI
+flags. Generic Owner assignment and Owner-assignment revocation remain
+forbidden, and these mutations are not eligible for `Prove`.
+
+The TUI remains read-only for security administration. Principal rename;
+custom-role rename, drop, or replacement; API-key secret delivery or
+revocation; ownership transfer; legacy-bearer migration; and owner recovery
+are outside this slice. The CLI never uses the raw access-control catalog as a
+temporary administration path.
+
 ## `version`
 
 ```text

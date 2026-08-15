@@ -9,39 +9,41 @@ use hyphae_native_product::proof::{
     NativeProofGenerationLimits, ProofCodecLimits, WitnessCodecLimits, decode_native_proof,
 };
 use hyphae_native_product::{
-    AccessControlLimits, AccessControlStatus, AdminStatus, ApiKeyId, AuthorizationEpoch,
-    BackupInfo, BackupLimits, BackupRequest, BoundedSearchQuery, BuiltInRole, CatalogCursor,
-    CatalogDependencyRequest, CatalogListRequest, CatalogObjectSummary, CatalogPage,
-    CatalogVersion, CustomRoleGrant, DoctorRecovery, DoctorReport, DoctorRequest, DoctorStatus,
-    MAX_SECURITY_LIST_ROWS, MetricKind, MetricValue, ObjectId, ProductAnnExplanation,
-    ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization, ProductCheckpointReceipt,
-    ProductCommitOutcome, ProductCommitReceipt, ProductConvergenceExplanation,
-    ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
-    ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
-    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
-    ProductHybridExplanation, ProductHybridVectorStrategy, ProductIntegratedSearchHit,
-    ProductLexicalBranch, ProductLimits, ProductListSide, ProductMissingPlacement,
-    ProductNamedAggregation, ProductNamedAggregationValue, ProductOperation, ProductPermission,
-    ProductPhysicalObservation, ProductPreparedHandle, ProductRead, ProductResponse,
-    ProductRollbackReceipt, ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
-    ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductSearchOperator, ProductSearchRequest, ProductSearchResult, ProductSearchResults,
-    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
-    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    AccessControlLimits, AccessControlMutationReceipt, AccessControlStatus, AdminStatus, ApiKeyId,
+    AuthorizationEpoch, BackupInfo, BackupLimits, BackupRequest, BoundedSearchQuery, BuiltInRole,
+    CatalogCursor, CatalogDependencyRequest, CatalogListRequest, CatalogObjectSummary, CatalogPage,
+    CatalogVersion, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRecovery, DoctorReport,
+    DoctorRequest, DoctorStatus, MAX_SECURITY_LIST_ROWS, MetricKind, MetricValue, ObjectId,
+    ProductAnnExplanation, ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization,
+    ProductCheckpointReceipt, ProductCommitOutcome, ProductCommitReceipt,
+    ProductConvergenceExplanation, ProductConvergenceStrategy, ProductDocValue, ProductDocument,
+    ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCodecError,
+    ProductExplain, ProductExplicitCommitReceipt, ProductExplicitTransactionStatus,
+    ProductHashEntry, ProductHybridExplanation, ProductHybridVectorStrategy,
+    ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
+    ProductMissingPlacement, ProductNamedAggregation, ProductNamedAggregationValue,
+    ProductOperation, ProductPermission, ProductPhysicalObservation, ProductPreparedHandle,
+    ProductRead, ProductResponse, ProductRollbackReceipt, ProductScope,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
+    ProductSearchRequest, ProductSearchResult, ProductSearchResults, ProductSearchSort,
+    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProductVectorBranch,
     ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy, RestoreRequest,
-    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAssignmentSummary,
-    SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata, SecurityAuditPage,
-    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor,
-    SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage, SecurityKeySummary,
-    SecurityKeySummaryInput, SecurityPrincipalListRequest, SecurityPrincipalPage,
-    SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary,
-    SnapshotIdentity, SqlPlanText, TelemetryEvent, TelemetryEventKind, TelemetrySnapshot,
-    decode_product_error, encode_product_error,
+    RoleAssignmentMutationReceipt, SecurityAssignmentListRequest, SecurityAssignmentPage,
+    SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata,
+    SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget,
+    SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityPrincipalSummary,
+    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity, SqlPlanText,
+    TelemetryEvent, TelemetryEventKind, TelemetrySnapshot, decode_product_error,
+    encode_product_error,
 };
 use hyphae_native_runtime::CatalogPageStop;
 use thiserror::Error;
@@ -101,6 +103,12 @@ const REQUEST_SECURITY_ROLE_LIST: u16 = 44;
 const REQUEST_SECURITY_ASSIGNMENT_LIST: u16 = 45;
 const REQUEST_SECURITY_KEY_LIST: u16 = 46;
 const REQUEST_SECURITY_AUDIT_READ: u16 = 47;
+const REQUEST_SECURITY_PRINCIPAL_CREATE: u16 = 48;
+const REQUEST_SECURITY_PRINCIPAL_SET_ENABLED: u16 = 49;
+const REQUEST_SECURITY_CUSTOM_ROLE_CREATE: u16 = 50;
+const REQUEST_SECURITY_BUILT_IN_ASSIGNMENT_CREATE: u16 = 51;
+const REQUEST_SECURITY_CUSTOM_ASSIGNMENT_CREATE: u16 = 52;
+const REQUEST_SECURITY_ASSIGNMENT_REVOKE: u16 = 53;
 
 const RESPONSE_CAPABILITIES: u16 = 1;
 const RESPONSE_PREPARED_SQL: u16 = 2;
@@ -139,6 +147,10 @@ const RESPONSE_SECURITY_ROLE_PAGE: u16 = 34;
 const RESPONSE_SECURITY_ASSIGNMENT_PAGE: u16 = 35;
 const RESPONSE_SECURITY_KEY_PAGE: u16 = 36;
 const RESPONSE_SECURITY_AUDIT_PAGE: u16 = 37;
+const RESPONSE_SECURITY_PRINCIPAL_MUTATED: u16 = 38;
+const RESPONSE_SECURITY_CUSTOM_ROLE_MUTATED: u16 = 39;
+const RESPONSE_SECURITY_ASSIGNMENT_MUTATED: u16 = 40;
+const RESPONSE_SECURITY_MUTATED: u16 = 41;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -182,7 +194,10 @@ pub enum ProductCodecError {
 
 /// Encodes one request and its complete execution envelope.
 pub fn encode_product_request(request: &WireRequest) -> Result<Vec<u8>, ProductCodecError> {
-    if request.idempotency_token == Some(0) {
+    if request.idempotency_token == Some(0)
+        || (operation_requires_idempotency(&request.operation)
+            && request.idempotency_token.is_none())
+    {
         return Err(ProductCodecError::InvalidValue);
     }
     request
@@ -275,6 +290,9 @@ pub fn decode_product_request(encoded: &[u8]) -> Result<WireRequest, ProductCode
         .deadline_micros
         .is_some_and(|deadline| deadline <= 0)
     {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    if operation_requires_idempotency(&request.operation) && request.idempotency_token.is_none() {
         return Err(ProductCodecError::InvalidValue);
     }
     Ok(request)
@@ -581,6 +599,42 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             encode_security_audit_page(&mut body, value)?;
             (RESPONSE_SECURITY_AUDIT_PAGE, body)
         }
+        ProductResponse::SecurityPrincipalMutated(value) => {
+            let mut body = Vec::new();
+            encode_security_mutation_receipt(
+                &mut body,
+                value.principal_id,
+                value.authorization_epoch,
+                value.commit,
+            )?;
+            (RESPONSE_SECURITY_PRINCIPAL_MUTATED, body)
+        }
+        ProductResponse::SecurityCustomRoleMutated(value) => {
+            let mut body = Vec::new();
+            encode_security_mutation_receipt(
+                &mut body,
+                value.role_id,
+                value.authorization_epoch,
+                value.commit,
+            )?;
+            (RESPONSE_SECURITY_CUSTOM_ROLE_MUTATED, body)
+        }
+        ProductResponse::SecurityAssignmentMutated(value) => {
+            let mut body = Vec::new();
+            encode_security_mutation_receipt(
+                &mut body,
+                value.assignment_id,
+                value.authorization_epoch,
+                value.commit,
+            )?;
+            (RESPONSE_SECURITY_ASSIGNMENT_MUTATED, body)
+        }
+        ProductResponse::SecurityMutated(value) => {
+            let mut body = Vec::new();
+            encode_authorization_epoch(&mut body, value.authorization_epoch)?;
+            encode_receipt(&mut body, value.commit)?;
+            (RESPONSE_SECURITY_MUTATED, body)
+        }
         ProductResponse::Proven { response, artifact } => {
             let mut body = Vec::new();
             put_bytes(&mut body, &encode_product_response(response)?)?;
@@ -844,6 +898,39 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
         RESPONSE_SECURITY_AUDIT_PAGE => {
             ProductResponse::SecurityAuditPage(decode_security_audit_page(&mut decoder)?)
         }
+        RESPONSE_SECURITY_PRINCIPAL_MUTATED => {
+            let (principal_id, authorization_epoch, commit) =
+                decode_security_mutation_receipt(&mut decoder)?;
+            ProductResponse::SecurityPrincipalMutated(SecurityPrincipalMutationReceipt {
+                principal_id,
+                authorization_epoch,
+                commit,
+            })
+        }
+        RESPONSE_SECURITY_CUSTOM_ROLE_MUTATED => {
+            let (role_id, authorization_epoch, commit) =
+                decode_security_mutation_receipt(&mut decoder)?;
+            ProductResponse::SecurityCustomRoleMutated(CustomRoleMutationReceipt {
+                role_id,
+                authorization_epoch,
+                commit,
+            })
+        }
+        RESPONSE_SECURITY_ASSIGNMENT_MUTATED => {
+            let (assignment_id, authorization_epoch, commit) =
+                decode_security_mutation_receipt(&mut decoder)?;
+            ProductResponse::SecurityAssignmentMutated(RoleAssignmentMutationReceipt {
+                assignment_id,
+                authorization_epoch,
+                commit,
+            })
+        }
+        RESPONSE_SECURITY_MUTATED => {
+            ProductResponse::SecurityMutated(AccessControlMutationReceipt {
+                authorization_epoch: decode_authorization_epoch(&mut decoder)?,
+                commit: decode_receipt(&mut decoder)?,
+            })
+        }
         RESPONSE_SEARCH_INGESTED => {
             ProductResponse::SearchIngested(decode_search_ingest_receipt(&mut decoder)?)
         }
@@ -904,19 +991,25 @@ fn ensure_operation_minor(
     operation: &ProductOperation,
     negotiated_minor: u16,
 ) -> Result<(), ProductCodecError> {
-    let requires_minor_one = match operation {
+    let required_minor = match operation {
         ProductOperation::SecurityStatus
         | ProductOperation::SecurityPrincipalList(_)
         | ProductOperation::SecurityRoleList(_)
         | ProductOperation::SecurityAssignmentList(_)
         | ProductOperation::SecurityKeyList(_)
-        | ProductOperation::SecurityAuditRead(_) => true,
+        | ProductOperation::SecurityAuditRead(_) => 1,
+        ProductOperation::SecurityPrincipalCreate { .. }
+        | ProductOperation::SecurityPrincipalSetEnabled { .. }
+        | ProductOperation::SecurityCustomRoleCreate { .. }
+        | ProductOperation::SecurityBuiltInAssignmentCreate { .. }
+        | ProductOperation::SecurityCustomAssignmentCreate { .. }
+        | ProductOperation::SecurityAssignmentRevoke { .. } => 2,
         ProductOperation::Prove { operation, .. } => {
             return ensure_operation_minor(operation, negotiated_minor);
         }
-        _ => false,
+        _ => 0,
     };
-    if requires_minor_one && negotiated_minor == 0 {
+    if negotiated_minor < required_minor {
         Err(ProductCodecError::Unsupported)
     } else {
         Ok(())
@@ -927,23 +1020,39 @@ fn ensure_response_minor(
     response: &ProductResponse,
     negotiated_minor: u16,
 ) -> Result<(), ProductCodecError> {
-    let requires_minor_one = match response {
+    let required_minor = match response {
         ProductResponse::SecurityStatus(_)
         | ProductResponse::SecurityPrincipalPage(_)
         | ProductResponse::SecurityRolePage(_)
         | ProductResponse::SecurityAssignmentPage(_)
         | ProductResponse::SecurityKeyPage(_)
-        | ProductResponse::SecurityAuditPage(_) => true,
+        | ProductResponse::SecurityAuditPage(_) => 1,
+        ProductResponse::SecurityPrincipalMutated(_)
+        | ProductResponse::SecurityCustomRoleMutated(_)
+        | ProductResponse::SecurityAssignmentMutated(_)
+        | ProductResponse::SecurityMutated(_) => 2,
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
         }
-        _ => false,
+        _ => 0,
     };
-    if requires_minor_one && negotiated_minor == 0 {
+    if negotiated_minor < required_minor {
         Err(ProductCodecError::Unsupported)
     } else {
         Ok(())
     }
+}
+
+fn operation_requires_idempotency(operation: &ProductOperation) -> bool {
+    matches!(
+        operation,
+        ProductOperation::SecurityPrincipalCreate { .. }
+            | ProductOperation::SecurityPrincipalSetEnabled { .. }
+            | ProductOperation::SecurityCustomRoleCreate { .. }
+            | ProductOperation::SecurityBuiltInAssignmentCreate { .. }
+            | ProductOperation::SecurityCustomAssignmentCreate { .. }
+            | ProductOperation::SecurityAssignmentRevoke { .. }
+    )
 }
 
 /// Encodes a canonical `HYPERR01` product error payload.
@@ -1198,6 +1307,50 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             encode_optional_security_id(&mut body, request.cursor());
             put_u64(&mut body, request.limit())?;
             REQUEST_SECURITY_AUDIT_READ
+        }
+        ProductOperation::SecurityPrincipalCreate { display_name } => {
+            put_security_text(&mut body, display_name)?;
+            REQUEST_SECURITY_PRINCIPAL_CREATE
+        }
+        ProductOperation::SecurityPrincipalSetEnabled {
+            principal_id,
+            enabled,
+        } => {
+            body.extend_from_slice(&principal_id.to_be_bytes());
+            body.push(u8::from(*enabled));
+            body.extend_from_slice(&[0; 7]);
+            REQUEST_SECURITY_PRINCIPAL_SET_ENABLED
+        }
+        ProductOperation::SecurityCustomRoleCreate {
+            display_name,
+            grants,
+        } => {
+            put_security_text(&mut body, display_name)?;
+            encode_custom_role_grants(&mut body, grants)?;
+            REQUEST_SECURITY_CUSTOM_ROLE_CREATE
+        }
+        ProductOperation::SecurityBuiltInAssignmentCreate {
+            principal_id,
+            role,
+            scope,
+        } => {
+            body.extend_from_slice(&principal_id.to_be_bytes());
+            body.push(role.tag());
+            body.extend_from_slice(&[0; 7]);
+            encode_product_scope(&mut body, *scope);
+            REQUEST_SECURITY_BUILT_IN_ASSIGNMENT_CREATE
+        }
+        ProductOperation::SecurityCustomAssignmentCreate {
+            principal_id,
+            role_id,
+        } => {
+            body.extend_from_slice(&principal_id.to_be_bytes());
+            body.extend_from_slice(&role_id.to_be_bytes());
+            REQUEST_SECURITY_CUSTOM_ASSIGNMENT_CREATE
+        }
+        ProductOperation::SecurityAssignmentRevoke { assignment_id } => {
+            body.extend_from_slice(&assignment_id.to_be_bytes());
+            REQUEST_SECURITY_ASSIGNMENT_REVOKE
         }
         ProductOperation::TransactionBegin => REQUEST_TRANSACTION_BEGIN,
         ProductOperation::TransactionStageSql { handle, mutation } => {
@@ -1492,6 +1645,46 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
             )
             .map_err(|_| ProductCodecError::LimitExceeded)?,
         ),
+        REQUEST_SECURITY_PRINCIPAL_CREATE => ProductOperation::SecurityPrincipalCreate {
+            display_name: decode_security_text(&mut decoder)?,
+        },
+        REQUEST_SECURITY_PRINCIPAL_SET_ENABLED => {
+            let principal_id = decode_security_id(decoder.array()?)?;
+            let enabled = decoder.u8()?;
+            if enabled > 1 || decoder.bytes(7)? != [0; 7] {
+                return Err(ProductCodecError::Malformed);
+            }
+            ProductOperation::SecurityPrincipalSetEnabled {
+                principal_id,
+                enabled: enabled == 1,
+            }
+        }
+        REQUEST_SECURITY_CUSTOM_ROLE_CREATE => ProductOperation::SecurityCustomRoleCreate {
+            display_name: decode_security_text(&mut decoder)?,
+            grants: decode_custom_role_grants(&mut decoder)?,
+        },
+        REQUEST_SECURITY_BUILT_IN_ASSIGNMENT_CREATE => {
+            let principal_id = decode_security_id(decoder.array()?)?;
+            let role =
+                BuiltInRole::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
+            if decoder.bytes(7)? != [0; 7] {
+                return Err(ProductCodecError::Malformed);
+            }
+            ProductOperation::SecurityBuiltInAssignmentCreate {
+                principal_id,
+                role,
+                scope: decode_product_scope(&mut decoder)?,
+            }
+        }
+        REQUEST_SECURITY_CUSTOM_ASSIGNMENT_CREATE => {
+            ProductOperation::SecurityCustomAssignmentCreate {
+                principal_id: decode_security_id(decoder.array()?)?,
+                role_id: decode_security_id(decoder.array()?)?,
+            }
+        }
+        REQUEST_SECURITY_ASSIGNMENT_REVOKE => ProductOperation::SecurityAssignmentRevoke {
+            assignment_id: decode_security_id(decoder.array()?)?,
+        },
         REQUEST_TRANSACTION_BEGIN => ProductOperation::TransactionBegin,
         REQUEST_TRANSACTION_STAGE_SQL => ProductOperation::TransactionStageSql {
             handle: decode_transaction_handle(&mut decoder)?,
@@ -1680,6 +1873,48 @@ fn decode_optional_security_id(
 
 fn decode_security_id(payload: [u8; 16]) -> Result<SecurityId, ProductCodecError> {
     SecurityId::new(u128::from_be_bytes(payload)).ok_or(ProductCodecError::InvalidValue)
+}
+
+fn encode_authorization_epoch(
+    encoded: &mut Vec<u8>,
+    epoch: AuthorizationEpoch,
+) -> Result<(), ProductCodecError> {
+    if epoch == AuthorizationEpoch::UNMANAGED {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    encoded.extend_from_slice(&epoch.get().to_le_bytes());
+    Ok(())
+}
+
+fn decode_authorization_epoch(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorizationEpoch, ProductCodecError> {
+    let epoch = AuthorizationEpoch::new(decoder.u64()?);
+    if epoch == AuthorizationEpoch::UNMANAGED {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok(epoch)
+}
+
+fn encode_security_mutation_receipt(
+    encoded: &mut Vec<u8>,
+    id: SecurityId,
+    authorization_epoch: AuthorizationEpoch,
+    commit: ProductCommitReceipt,
+) -> Result<(), ProductCodecError> {
+    encoded.extend_from_slice(&id.to_be_bytes());
+    encode_authorization_epoch(encoded, authorization_epoch)?;
+    encode_receipt(encoded, commit)
+}
+
+fn decode_security_mutation_receipt(
+    decoder: &mut Decoder<'_>,
+) -> Result<(SecurityId, AuthorizationEpoch, ProductCommitReceipt), ProductCodecError> {
+    Ok((
+        decode_security_id(decoder.array()?)?,
+        decode_authorization_epoch(decoder)?,
+        decode_receipt(decoder)?,
+    ))
 }
 
 fn encode_security_status(
@@ -1882,7 +2117,10 @@ fn encode_custom_role_grants(
     encoded: &mut Vec<u8>,
     grants: &[CustomRoleGrant],
 ) -> Result<(), ProductCodecError> {
-    if grants.is_empty() || grants.len() > AccessControlLimits::V1.grants_per_role {
+    if grants.is_empty()
+        || grants.len() > AccessControlLimits::V1.grants_per_role
+        || !grants.windows(2).all(|pair| pair[0] < pair[1])
+    {
         return Err(ProductCodecError::LimitExceeded);
     }
     put_u32(encoded, grants.len())?;
@@ -1914,6 +2152,9 @@ fn decode_custom_role_grants(
             CustomRoleGrant::new(permission, decode_product_scope(decoder)?)
                 .ok_or(ProductCodecError::InvalidValue)?,
         );
+    }
+    if !grants.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ProductCodecError::InvalidValue);
     }
     Ok(grants)
 }
@@ -2401,7 +2642,10 @@ fn decode_security_audit_metadata(
 }
 
 fn put_security_text(encoded: &mut Vec<u8>, value: &str) -> Result<(), ProductCodecError> {
-    if value.is_empty() || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES {
+    if value.is_empty()
+        || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES
+        || value.chars().any(char::is_control)
+    {
         return Err(ProductCodecError::LimitExceeded);
     }
     put_text(encoded, value)
@@ -2409,7 +2653,10 @@ fn put_security_text(encoded: &mut Vec<u8>, value: &str) -> Result<(), ProductCo
 
 fn decode_security_text(decoder: &mut Decoder<'_>) -> Result<String, ProductCodecError> {
     let value = decoder.text()?;
-    if value.is_empty() || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES {
+    if value.is_empty()
+        || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES
+        || value.chars().any(char::is_control)
+    {
         return Err(ProductCodecError::LimitExceeded);
     }
     Ok(value)

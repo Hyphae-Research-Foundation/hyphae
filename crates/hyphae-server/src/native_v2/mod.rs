@@ -156,6 +156,8 @@ mod tests {
                 3,
             )?;
             let owner = product.authenticate_api_key(&owner_secret, 4)?;
+            product.set_security_principal_enabled(&owner, principal.principal_id, true, 4)?;
+            let owner = product.authenticate_api_key(&owner_secret, 5)?;
             let issued = product.issue_api_key_to_file(
                 &owner,
                 principal.principal_id,
@@ -164,7 +166,7 @@ mod tests {
                 BuiltInRole::Reader.authorization(),
                 None,
                 &reader_key_path,
-                4,
+                5,
             )?;
             (fs::read_to_string(reader_key_path)?, issued.key_id)
         } else {

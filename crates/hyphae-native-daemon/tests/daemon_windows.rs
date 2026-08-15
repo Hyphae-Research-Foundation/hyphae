@@ -220,6 +220,8 @@ fn managed_reader_product(test: &TestDirectory) -> Result<ManagedReaderFixture, 
         3,
     )?;
     let owner = product.authenticate_api_key(&owner_secret, 4)?;
+    product.set_security_principal_enabled(&owner, reader.principal_id, true, 4)?;
+    let owner = product.authenticate_api_key(&owner_secret, 5)?;
     let issued = product.issue_api_key_to_file(
         &owner,
         reader.principal_id,
@@ -230,7 +232,7 @@ fn managed_reader_product(test: &TestDirectory) -> Result<ManagedReaderFixture, 
         ]),
         None,
         &reader_path,
-        4,
+        5,
     )?;
     Ok(ManagedReaderFixture {
         product,
@@ -382,7 +384,7 @@ async fn protected_pipe_supports_peer_identity_and_multiple_owner_clients()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn security_reads_require_minor_one_on_named_pipes() -> Result<(), Box<dyn Error>> {
+async fn security_operations_require_their_minor_on_named_pipes() -> Result<(), Box<dyn Error>> {
     let test = TestDirectory::new("security-minor")?;
     let fixture = managed_reader_product(&test)?;
     let owner_secret = std::fs::read_to_string(test.root.join("owner.key"))?;
@@ -394,7 +396,7 @@ async fn security_reads_require_minor_one_on_named_pipes() -> Result<(), Box<dyn
     )?;
 
     let current = Client::connect_authenticated(&test.endpoint, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 1);
+    assert_eq!(current.negotiated_minor, 2);
     current
         .send_request(1, 2, ProductOperation::SecurityStatus)
         .await?;
@@ -423,8 +425,39 @@ async fn security_reads_require_minor_one_on_named_pipes() -> Result<(), Box<dyn
     );
     assert_eq!(request_count(&telemetry)?, requests_after_current);
 
+    let minor_one_hello = Hello {
+        maximum_minor: 1,
+        capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        ..Hello::default()
+    };
+    let minor_one_payload = encode_authenticated_hello(&minor_one_hello, &owner_secret)?;
+    let minor_one =
+        Client::connect_with_payload(&test.endpoint, &minor_one_hello, &minor_one_payload).await?;
+    assert_eq!(minor_one.negotiated_minor, 1);
+    let mut mutation = request(ProductOperation::SecurityPrincipalCreate {
+        display_name: "minor two only".to_owned(),
+    });
+    mutation.idempotency_token = Some(17);
+    minor_one
+        .codec
+        .send(
+            &mut &minor_one.stream,
+            FrameKind::Execute,
+            2,
+            4,
+            &encode_product_request(&mutation)?,
+        )
+        .await?;
+    assert_eq!(
+        minor_one.failure_code(2, 4).await?,
+        ProductErrorCode::InvalidRequest
+    );
+    assert_eq!(request_count(&telemetry)?, requests_after_current);
+
     drop(current);
     drop(legacy);
+    drop(minor_one);
     daemon.shutdown().await?;
     Ok(())
 }

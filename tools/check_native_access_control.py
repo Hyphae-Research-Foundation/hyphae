@@ -124,6 +124,8 @@ EXPECTED_LIMITS = {
     "maximum_rotation_overlap_seconds": 604800,
     "authentication_verifiers_per_request": 1,
     "authorization_cache_entries": 4096,
+    "security_idempotency_shards": 64,
+    "security_idempotency_records_per_shard": 64,
 }
 
 PLANNED_READ_ONLY_OPERATIONS = {
@@ -137,6 +139,21 @@ CURRENT_SECURITY_READ_OPERATIONS = {
     "security.principal_list": "security.read",
     "security.role_list": "security.read",
     "security.status": "security.read",
+}
+
+CURRENT_SECURITY_WRITE_OPERATIONS = {
+    "security.assignment_create_built_in": "SecurityBuiltInAssignmentCreate",
+    "security.assignment_create_custom": "SecurityCustomAssignmentCreate",
+    "security.assignment_revoke": "SecurityAssignmentRevoke",
+    "security.custom_role_create": "SecurityCustomRoleCreate",
+    "security.principal_create": "SecurityPrincipalCreate",
+    "security.principal_set_enabled": "SecurityPrincipalSetEnabled",
+}
+
+AMBIGUOUS_SECURITY_WRITE_FAMILIES = {
+    "security.assignment_write",
+    "security.principal_write",
+    "security.role_write",
 }
 
 
@@ -278,6 +295,8 @@ def validate_operations(
             or operation in seen_ids
         ):
             fail("operation identifier is duplicate or noncanonical")
+        if operation in AMBIGUOUS_SECURITY_WRITE_FAMILIES:
+            fail(f"ambiguous security write family {operation} is forbidden")
         seen_ids.add(operation)
         operations_by_id[operation] = row
         status = row["status"]
@@ -313,6 +332,8 @@ def validate_operations(
         require_planned_rule(operations_by_id, operation, permission)
     for operation, permission in CURRENT_SECURITY_READ_OPERATIONS.items():
         require_current_read_rule(operations_by_id, operation, permission)
+    for operation, variant in CURRENT_SECURITY_WRITE_OPERATIONS.items():
+        require_current_write_rule(operations_by_id, operation, variant)
 
     source_variants = product_operation_variants(source)
     if covered_variants != source_variants:
@@ -371,6 +392,22 @@ def require_current_read_rule(
         or row["inherits_underlying"] is not False
     ):
         fail(f"current security read operation {operation} differs from the 1.2 slice")
+
+
+def require_current_write_rule(
+    operations: dict[str, dict[str, Any]], operation: str, variant: str
+) -> None:
+    row = operations.get(operation)
+    if (
+        row is None
+        or row["status"] != "current"
+        or row["source_variant"] != variant
+        or row["classification"] != "fixed"
+        or row["required_all"] != ["security.manage"]
+        or row["scope_resolution"] != "instance"
+        or row["inherits_underlying"] is not False
+    ):
+        fail(f"current security write operation {operation} differs from the 1.2 slice")
 
 
 def require_variant_rule(
@@ -496,7 +533,14 @@ def validate_policies(contract: dict[str, Any]) -> None:
         or recovery.get("bypasses_integrity_validation") is not False
     ):
         fail("owner recovery weakens the offline fail-closed boundary")
-    if audit.get("secrets_allowed") is not False or audit.get("authentication_failures") != "bounded-telemetry":
+    if (
+        audit.get("secrets_allowed") is not False
+        or audit.get("authentication_failures") != "bounded-telemetry"
+        or audit.get("mutation_idempotency")
+        != "required-nonzero-actor-key-request-digest"
+        or audit.get("mutation_replay") != "same-receipt-or-conflict"
+        or audit.get("mutation_durability") != "strict"
+    ):
         fail("audit policy can leak secrets or amplify unauthenticated writes")
 
 

@@ -34,6 +34,15 @@ CURRENT_SECURITY_READ_SLICE = {
     "security.status": "security.read",
 }
 
+CURRENT_SECURITY_WRITE_SLICE = {
+    "security.assignment_create_built_in": "SecurityBuiltInAssignmentCreate",
+    "security.assignment_create_custom": "SecurityCustomAssignmentCreate",
+    "security.assignment_revoke": "SecurityAssignmentRevoke",
+    "security.custom_role_create": "SecurityCustomRoleCreate",
+    "security.principal_create": "SecurityPrincipalCreate",
+    "security.principal_set_enabled": "SecurityPrincipalSetEnabled",
+}
+
 
 def payload() -> dict:
     return json.loads(CONTRACT.read_text(encoding="utf-8"))
@@ -53,8 +62,8 @@ class NativeAccessControlContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "contract-complete-implementation-pending")
         self.assertEqual(result["permissions"], 18)
         self.assertEqual(result["built_in_roles"], 7)
-        self.assertEqual(result["current_product_variants"], 47)
-        self.assertEqual(result["planned_operations"], 7)
+        self.assertEqual(result["current_product_variants"], 53)
+        self.assertEqual(result["planned_operations"], 4)
 
     def test_backup_verify_remains_planned_and_instance_scoped(self) -> None:
         contract = payload()
@@ -105,6 +114,37 @@ class NativeAccessControlContractTests(unittest.TestCase):
                     f"current security read operation {operation_id}",
                 ):
                     validate(contract, SOURCE)
+
+    def test_security_write_slice_is_action_specific_and_instance_scoped(self) -> None:
+        contract = payload()
+        for operation_id, variant in CURRENT_SECURITY_WRITE_SLICE.items():
+            with self.subTest(operation=operation_id):
+                row = operation(contract, operation_id)
+                self.assertEqual(row["status"], "current")
+                self.assertEqual(row["source_variant"], variant)
+                self.assertEqual(row["classification"], "fixed")
+                self.assertEqual(row["required_all"], ["security.manage"])
+                self.assertEqual(row["scope_resolution"], "instance")
+                self.assertFalse(row["inherits_underlying"])
+
+    def test_security_write_slice_cannot_collapse_back_to_ambiguous_families(self) -> None:
+        contract = payload()
+        contract["operations"].append(
+            {
+                "id": "security.principal_write",
+                "status": "planned-1.2",
+                "source_variant": None,
+                "classification": "fixed",
+                "required_all": ["security.manage"],
+                "scope_resolution": "instance",
+                "inherits_underlying": False,
+                "allowed_roles": ["admin", "owner"],
+            }
+        )
+        with self.assertRaisesRegex(
+            AccessControlValidationError, "ambiguous security write family"
+        ):
+            validate(contract, SOURCE)
 
     def test_every_current_product_variant_has_a_matrix_rule(self) -> None:
         contract = payload()

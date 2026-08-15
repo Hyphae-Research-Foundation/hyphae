@@ -47,6 +47,8 @@ async fn authenticated_local_client_preserves_typed_authorization_and_connection
         3,
     )?;
     let owner = product.authenticate_api_key(&owner_secret, 4)?;
+    product.set_security_principal_enabled(&owner, reader.principal_id, true, 4)?;
+    let owner = product.authenticate_api_key(&owner_secret, 5)?;
     let issued = product.issue_api_key_to_file(
         &owner,
         reader.principal_id,
@@ -55,7 +57,7 @@ async fn authenticated_local_client_preserves_typed_authorization_and_connection
         ProductAuthorization::from_permissions([ProductPermission::DataRead]),
         None,
         &reader_path,
-        4,
+        5,
     )?;
     let reader_secret = std::fs::read_to_string(&reader_path)?;
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;

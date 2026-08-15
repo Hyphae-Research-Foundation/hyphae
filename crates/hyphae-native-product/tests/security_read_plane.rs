@@ -82,6 +82,9 @@ impl SecurityReadFixture {
             12,
         )?;
         let owner = self.product.authenticate_api_key(&self.secrets[0], 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 13)?;
+        let owner = self.product.authenticate_api_key(&self.secrets[0], 0)?;
         let key_path = self.directory.with_extension(format!("{label}-key"));
         let _ignored = fs::remove_file(&key_path);
         self.product.issue_scoped_api_key_to_file(
@@ -94,7 +97,7 @@ impl SecurityReadFixture {
             [ProductScope::Instance],
             None,
             &key_path,
-            13,
+            14,
         )?;
         self.session_from_key(key_path, session_id)
     }
@@ -116,6 +119,9 @@ impl SecurityReadFixture {
             21,
         )?;
         let owner = self.product.authenticate_api_key(&self.secrets[0], 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 22)?;
+        let owner = self.product.authenticate_api_key(&self.secrets[0], 0)?;
         let key_path = self.directory.with_extension(format!("{label}-key"));
         let _ignored = fs::remove_file(&key_path);
         self.product.issue_scoped_api_key_to_file(
@@ -128,7 +134,7 @@ impl SecurityReadFixture {
             [scope],
             None,
             &key_path,
-            22,
+            23,
         )?;
         self.session_from_key(key_path, session_id)
     }

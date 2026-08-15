@@ -15,7 +15,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use hyphae_native_types::ObjectId;
+use hyphae_native_types::{ObjectId, TransactionId};
 use subtle::ConstantTimeEq;
 
 use crate::{
@@ -45,6 +45,17 @@ const BUILT_IN_ROLES: [BuiltInRole; 7] = [
 const ACCESS_CONTROL_STORAGE_KEY: &[u8] = b"\0hyphae.product.access-control.v1\0catalog";
 const AUDIT_EVENT_MAGIC: &[u8; 8] = b"HYAEVT01";
 const AUDIT_EVENT_STORAGE_PREFIX: &[u8] = b"\0hyphae.product.access-control.v1\0audit\0";
+const SECURITY_MUTATION_MARKER_MAGIC: &[u8; 8] = b"HYASID01";
+const SECURITY_MUTATION_INDEX_MAGIC: &[u8; 8] = b"HYASIX01";
+const SECURITY_MUTATION_MARKER_PREFIX: &[u8] =
+    b"\0hyphae.product.access-control.v1\0idempotency\0marker\0";
+const SECURITY_MUTATION_INDEX_PREFIX: &[u8] =
+    b"\0hyphae.product.access-control.v1\0idempotency\0index\0";
+const SECURITY_MUTATION_IDEMPOTENCY_SHARDS: u8 = 64;
+const SECURITY_MUTATION_MARKERS_PER_SHARD: usize = 64;
+const SECURITY_MUTATION_MARKER_BYTES: usize = 145;
+const SECURITY_MUTATION_REQUEST_DOMAIN: &[u8] = b"hyphae-security-mutation-request-v1\0";
+const SECURITY_MUTATION_KEY_DOMAIN: &[u8] = b"hyphae-security-mutation-key-v1\0";
 
 /// Durable principal metadata. Display names are never authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,7 +118,7 @@ impl CustomRoleGrant {
     }
 }
 
-/// One mutable custom role containing direct grants only.
+/// One immutable custom role containing canonical direct grants only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CustomRoleRecord {
     id: SecurityId,
@@ -472,6 +483,10 @@ pub enum SecurityAuditAction {
     RecoverOwner,
     /// Explicit legacy-bearer migration.
     MigrateLegacyBearer,
+    /// Principal authentication-state change.
+    SetPrincipalEnabled,
+    /// Direct role-assignment revocation.
+    RevokeAssignment,
 }
 
 impl SecurityAuditAction {
@@ -491,6 +506,8 @@ impl SecurityAuditAction {
             Self::MigrateLegacyBearer => 10,
             Self::AbortKeyRotation => 11,
             Self::AbortKeyIssue => 12,
+            Self::SetPrincipalEnabled => 13,
+            Self::RevokeAssignment => 14,
         }
     }
 
@@ -510,9 +527,104 @@ impl SecurityAuditAction {
             10 => Some(Self::MigrateLegacyBearer),
             11 => Some(Self::AbortKeyRotation),
             12 => Some(Self::AbortKeyIssue),
+            13 => Some(Self::SetPrincipalEnabled),
+            14 => Some(Self::RevokeAssignment),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecurityMutationOperation {
+    CreatePrincipal,
+    SetPrincipalEnabled,
+    CreateCustomRole,
+    AssignBuiltInRole,
+    AssignCustomRole,
+    RevokeAssignment,
+}
+
+impl SecurityMutationOperation {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::CreatePrincipal => 0,
+            Self::SetPrincipalEnabled => 1,
+            Self::CreateCustomRole => 2,
+            Self::AssignBuiltInRole => 3,
+            Self::AssignCustomRole => 4,
+            Self::RevokeAssignment => 5,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::CreatePrincipal),
+            1 => Some(Self::SetPrincipalEnabled),
+            2 => Some(Self::CreateCustomRole),
+            3 => Some(Self::AssignBuiltInRole),
+            4 => Some(Self::AssignCustomRole),
+            5 => Some(Self::RevokeAssignment),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecurityMutationMarker {
+    operation: SecurityMutationOperation,
+    request_digest: [u8; 32],
+    actor_principal_id: SecurityId,
+    actor_key_id: ApiKeyId,
+    result_id: SecurityId,
+    authorization_epoch: AuthorizationEpoch,
+    transaction_id: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SecurityMutationMarkerIndex {
+    fingerprints: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecurityMutationDraft {
+    operation: SecurityMutationOperation,
+    request_digest: [u8; 32],
+    actor_principal_id: SecurityId,
+    actor_key_id: ApiKeyId,
+    result_id: SecurityId,
+    authorization_epoch: AuthorizationEpoch,
+    fingerprint: [u8; 32],
+}
+
+impl SecurityMutationDraft {
+    fn new(
+        operation: SecurityMutationOperation,
+        request_digest: [u8; 32],
+        actor: &AuthenticatedAuthority,
+        idempotency_token: u128,
+        result_id: SecurityId,
+        authorization_epoch: AuthorizationEpoch,
+    ) -> Result<Self, ProductError> {
+        if idempotency_token == 0 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        Ok(Self {
+            operation,
+            request_digest,
+            actor_principal_id: actor.principal_id,
+            actor_key_id: actor.key_id,
+            result_id,
+            authorization_epoch,
+            fingerprint: security_mutation_fingerprint(actor, idempotency_token),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecurityMutationReplay {
+    result_id: SecurityId,
+    authorization_epoch: AuthorizationEpoch,
+    commit: ProductCommitReceipt,
 }
 
 /// Redacted public target in one security audit event.
@@ -1907,11 +2019,43 @@ impl AccessControlCatalog {
             SecurityPrincipalRecord {
                 id,
                 display_name: display_name.into(),
-                enabled: true,
+                enabled: false,
             },
         );
         self.epoch = epoch;
         Ok((id, epoch))
+    }
+
+    /// Changes whether one principal may authenticate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent principal, a no-op, the owner principal,
+    /// or an exhausted authorization epoch.
+    pub fn set_principal_enabled(
+        &mut self,
+        principal_id: SecurityId,
+        enabled: bool,
+    ) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        if self.assignments.values().any(|assignment| {
+            assignment.principal_id == principal_id && assignment.role == BuiltInRole::Owner
+        }) {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        let principal = self
+            .principals
+            .get(&principal_id)
+            .ok_or(AccessCatalogError::NotFound)?;
+        if principal.enabled == enabled {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let epoch = self.next_epoch()?;
+        self.principals
+            .get_mut(&principal_id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?
+            .enabled = enabled;
+        self.epoch = epoch;
+        Ok(epoch)
     }
 
     /// Assigns one immutable built-in role at one stable scope.
@@ -2066,6 +2210,41 @@ impl AccessControlCatalog {
         );
         self.epoch = epoch;
         Ok((id, epoch))
+    }
+
+    /// Revokes one direct non-owner role assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent assignment, an owner assignment, or an
+    /// exhausted authorization epoch.
+    pub fn revoke_assignment(
+        &mut self,
+        assignment_id: SecurityId,
+    ) -> Result<(SecurityId, AuthorizationEpoch), AccessCatalogError> {
+        if let Some(assignment) = self.assignments.get(&assignment_id) {
+            if assignment.role == BuiltInRole::Owner {
+                return Err(AccessCatalogError::InvalidRequest);
+            }
+            let principal_id = assignment.principal_id;
+            let epoch = self.next_epoch()?;
+            self.assignments
+                .remove(&assignment_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            self.epoch = epoch;
+            return Ok((principal_id, epoch));
+        }
+        let assignment = self
+            .custom_assignments
+            .get(&assignment_id)
+            .ok_or(AccessCatalogError::NotFound)?;
+        let principal_id = assignment.principal_id;
+        let epoch = self.next_epoch()?;
+        self.custom_assignments
+            .remove(&assignment_id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?;
+        self.epoch = epoch;
+        Ok((principal_id, epoch))
     }
 
     /// Begins one API-key issue as an inactive durable verifier.
@@ -2312,6 +2491,17 @@ impl AccessControlCatalog {
     /// Returns one redacted custom-role record.
     pub fn custom_role(&self, id: SecurityId) -> Option<&CustomRoleRecord> {
         self.custom_roles.get(&id)
+    }
+
+    fn assignment_principal_id(&self, id: SecurityId) -> Option<SecurityId> {
+        self.assignments
+            .get(&id)
+            .map(|assignment| assignment.principal_id)
+            .or_else(|| {
+                self.custom_assignments
+                    .get(&id)
+                    .map(|assignment| assignment.principal_id)
+            })
     }
 
     /// Returns redacted aggregate status without credential verifiers.
@@ -3952,6 +4142,44 @@ impl NativeProduct {
         display_name: &str,
         logical_time_micros: i64,
     ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
+        self.create_security_principal_idempotent(
+            actor,
+            display_name,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Creates one disabled principal with an exact durable replay token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn create_security_principal_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        display_name: &str,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
+        self.create_security_principal_idempotent_with_interruption(
+            actor,
+            display_name,
+            idempotency_token,
+            logical_time_micros,
+            None,
+        )
+    }
+
+    fn create_security_principal_idempotent_with_interruption(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        display_name: &str,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        interruption: Option<hyphae_native_runtime::CommitBoundary>,
+    ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
         let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
@@ -3961,6 +4189,26 @@ impl NativeProduct {
             self.database.directory_identity().lineage().encode(),
             authorization_time_micros,
         )?;
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::CreatePrincipal,
+            &actor,
+            idempotency_token,
+            display_name.as_bytes(),
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::CreatePrincipal,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(SecurityPrincipalMutationReceipt {
+                principal_id: replay.result_id,
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        validate_display_name(display_name).map_err(map_catalog_error)?;
         let (principal_id, authorization_epoch) = catalog
             .create_principal(display_name)
             .map_err(map_catalog_error)?;
@@ -3969,8 +4217,20 @@ impl NativeProduct {
             SecurityAuditAction::CreatePrincipal,
             [SecurityAuditTarget::Principal(principal_id)],
         );
-        let commit =
-            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        let commit = self.commit_access_control_catalog_with_marker(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            Some(SecurityMutationDraft::new(
+                SecurityMutationOperation::CreatePrincipal,
+                request_digest,
+                &actor,
+                idempotency_token,
+                principal_id,
+                authorization_epoch,
+            )?),
+            interruption,
+        )?;
         Ok(SecurityPrincipalMutationReceipt {
             principal_id,
             authorization_epoch,
@@ -3994,6 +4254,31 @@ impl NativeProduct {
         scope: ProductScope,
         logical_time_micros: i64,
     ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
+        self.assign_built_in_role_idempotent(
+            actor,
+            principal_id,
+            role,
+            scope,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Assigns one non-owner built-in role with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn assign_built_in_role_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        role: BuiltInRole,
+        scope: ProductScope,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
         let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
@@ -4003,14 +4288,31 @@ impl NativeProduct {
             self.database.directory_identity().lineage().encode(),
             authorization_time_micros,
         )?;
-        if role == BuiltInRole::Owner
-            && !actor
-                .authorization
-                .allows(ProductPermission::OwnershipManage)
-        {
-            return Err(ProductError::from_code(
-                ProductErrorCode::AuthorizationDenied,
-            ));
+        let mut body = Vec::with_capacity(34);
+        body.extend_from_slice(&principal_id.to_be_bytes());
+        body.push(role.tag());
+        encode_scope(&mut body, scope);
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::AssignBuiltInRole,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::AssignBuiltInRole,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(RoleAssignmentMutationReceipt {
+                assignment_id: replay.result_id,
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        if role == BuiltInRole::Owner {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
         }
         let (assignment_id, authorization_epoch) = catalog
             .assign_built_in_role(principal_id, role, scope)
@@ -4023,8 +4325,19 @@ impl NativeProduct {
                 SecurityAuditTarget::Assignment(assignment_id),
             ],
         );
-        let commit =
-            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::AssignBuiltInRole,
+                request_digest,
+                &actor,
+                idempotency_token,
+                assignment_id,
+                authorization_epoch,
+            )?,
+        )?;
         Ok(RoleAssignmentMutationReceipt {
             assignment_id,
             authorization_epoch,
@@ -4045,6 +4358,29 @@ impl NativeProduct {
         grants: impl IntoIterator<Item = CustomRoleGrant>,
         logical_time_micros: i64,
     ) -> Result<CustomRoleMutationReceipt, ProductError> {
+        self.create_custom_security_role_idempotent(
+            actor,
+            display_name,
+            grants,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Creates one immutable custom role with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn create_custom_security_role_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        display_name: &str,
+        grants: impl IntoIterator<Item = CustomRoleGrant>,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<CustomRoleMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
         let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
@@ -4054,6 +4390,39 @@ impl NativeProduct {
             self.database.directory_identity().lineage().encode(),
             authorization_time_micros,
         )?;
+        let grants: BTreeSet<_> = grants.into_iter().collect();
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            &u64::try_from(display_name.len())
+                .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(display_name.as_bytes());
+        push_count(&mut body, grants.len()).map_err(map_catalog_error)?;
+        for grant in &grants {
+            body.push(grant.permission.tag());
+            encode_scope(&mut body, grant.scope);
+        }
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::CreateCustomRole,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::CreateCustomRole,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(CustomRoleMutationReceipt {
+                role_id: replay.result_id,
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        validate_display_name(display_name).map_err(map_catalog_error)?;
         let (role_id, authorization_epoch) = catalog
             .create_custom_role(display_name, grants)
             .map_err(map_catalog_error)?;
@@ -4062,8 +4431,19 @@ impl NativeProduct {
             SecurityAuditAction::CreateCustomRole,
             [SecurityAuditTarget::Role(role_id)],
         );
-        let commit =
-            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::CreateCustomRole,
+                request_digest,
+                &actor,
+                idempotency_token,
+                role_id,
+                authorization_epoch,
+            )?,
+        )?;
         Ok(CustomRoleMutationReceipt {
             role_id,
             authorization_epoch,
@@ -4084,6 +4464,29 @@ impl NativeProduct {
         role_id: SecurityId,
         logical_time_micros: i64,
     ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
+        self.assign_custom_security_role_idempotent(
+            actor,
+            principal_id,
+            role_id,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Assigns one custom role with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn assign_custom_security_role_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        role_id: SecurityId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<RoleAssignmentMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
         let authorization_time_micros = self.trusted_authorization_time()?;
         let actor = require_current_actor(
@@ -4093,6 +4496,28 @@ impl NativeProduct {
             self.database.directory_identity().lineage().encode(),
             authorization_time_micros,
         )?;
+        let mut body = Vec::with_capacity(32);
+        body.extend_from_slice(&principal_id.to_be_bytes());
+        body.extend_from_slice(&role_id.to_be_bytes());
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::AssignCustomRole,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::AssignCustomRole,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(RoleAssignmentMutationReceipt {
+                assignment_id: replay.result_id,
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
         let (assignment_id, authorization_epoch) = catalog
             .assign_custom_role(principal_id, role_id)
             .map_err(map_catalog_error)?;
@@ -4105,10 +4530,210 @@ impl NativeProduct {
                 SecurityAuditTarget::Assignment(assignment_id),
             ],
         );
-        let commit =
-            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::AssignCustomRole,
+                request_digest,
+                &actor,
+                idempotency_token,
+                assignment_id,
+                authorization_epoch,
+            )?,
+        )?;
         Ok(RoleAssignmentMutationReceipt {
             assignment_id,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Enables or disables one non-owner principal with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn set_security_principal_enabled(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        enabled: bool,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        self.set_security_principal_enabled_idempotent(
+            actor,
+            principal_id,
+            enabled,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Enables or disables one non-owner principal with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn set_security_principal_enabled_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        enabled: bool,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = require_current_actor(
+            &catalog,
+            actor,
+            ProductPermission::SecurityManage,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let mut body = Vec::with_capacity(17);
+        body.extend_from_slice(&principal_id.to_be_bytes());
+        body.push(u8::from(enabled));
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::SetPrincipalEnabled,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::SetPrincipalEnabled,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(AccessControlMutationReceipt {
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        if !enabled && principal_id == actor.principal_id {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let authorization_epoch = catalog
+            .set_principal_enabled(principal_id, enabled)
+            .map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::SetPrincipalEnabled,
+            [SecurityAuditTarget::Principal(principal_id)],
+        );
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::SetPrincipalEnabled,
+                request_digest,
+                &actor,
+                idempotency_token,
+                principal_id,
+                authorization_epoch,
+            )?,
+        )?;
+        Ok(AccessControlMutationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Revokes one non-owner direct assignment with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn revoke_security_assignment(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        assignment_id: SecurityId,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        self.revoke_security_assignment_idempotent(
+            actor,
+            assignment_id,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+        )
+    }
+
+    /// Revokes one non-owner direct assignment with exact durable replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable authorization, validation, idempotency, durability,
+    /// or corruption error.
+    pub fn revoke_security_assignment_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        assignment_id: SecurityId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = require_current_actor(
+            &catalog,
+            actor,
+            ProductPermission::SecurityManage,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::RevokeAssignment,
+            &actor,
+            idempotency_token,
+            &assignment_id.to_be_bytes(),
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::RevokeAssignment,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(AccessControlMutationReceipt {
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        if catalog.assignment_principal_id(assignment_id) == Some(actor.principal_id) {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let (principal_id, authorization_epoch) = catalog
+            .revoke_assignment(assignment_id)
+            .map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::RevokeAssignment,
+            [
+                SecurityAuditTarget::Principal(principal_id),
+                SecurityAuditTarget::Assignment(assignment_id),
+            ],
+        );
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::RevokeAssignment,
+                request_digest,
+                &actor,
+                idempotency_token,
+                assignment_id,
+                authorization_epoch,
+            )?,
+        )?;
+        Ok(AccessControlMutationReceipt {
             authorization_epoch,
             commit,
         })
@@ -4720,16 +5345,91 @@ impl NativeProduct {
         }
     }
 
+    fn replay_security_mutation(
+        &self,
+        actor: &AuthenticatedAuthority,
+        idempotency_token: u128,
+        operation: SecurityMutationOperation,
+        request_digest: [u8; 32],
+        logical_time_micros: i64,
+    ) -> Result<Option<SecurityMutationReplay>, ProductError> {
+        if idempotency_token == 0 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let fingerprint = security_mutation_fingerprint(actor, idempotency_token);
+        let snapshot = self.snapshot_bounded(logical_time_micros)?;
+        let Some(encoded) =
+            snapshot.structure_get_internal(&security_mutation_marker_key(fingerprint))
+        else {
+            return Ok(None);
+        };
+        let marker = decode_security_mutation_marker(encoded).map_err(map_catalog_error)?;
+        if marker.actor_principal_id != actor.principal_id
+            || marker.actor_key_id != actor.key_id
+            || marker.operation != operation
+            || marker.request_digest != request_digest
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::IdempotencyConflict,
+            ));
+        }
+        let transaction_id = TransactionId::new(marker.transaction_id)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let commit = self
+            .database
+            .transaction_commit_receipt(transaction_id)
+            .map(Into::into)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        Ok(Some(SecurityMutationReplay {
+            result_id: marker.result_id,
+            authorization_epoch: marker.authorization_epoch,
+            commit,
+        }))
+    }
+
     fn commit_access_control_catalog(
         &mut self,
         catalog: &mut AccessControlCatalog,
         logical_time_micros: i64,
         audit: SecurityAuditDraft,
     ) -> Result<ProductCommitReceipt, ProductError> {
+        self.commit_access_control_catalog_with_marker(
+            catalog,
+            logical_time_micros,
+            audit,
+            None,
+            None,
+        )
+    }
+
+    fn commit_access_control_catalog_idempotent(
+        &mut self,
+        catalog: &mut AccessControlCatalog,
+        logical_time_micros: i64,
+        audit: SecurityAuditDraft,
+        marker: SecurityMutationDraft,
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        self.commit_access_control_catalog_with_marker(
+            catalog,
+            logical_time_micros,
+            audit,
+            Some(marker),
+            None,
+        )
+    }
+
+    fn commit_access_control_catalog_with_marker(
+        &mut self,
+        catalog: &mut AccessControlCatalog,
+        logical_time_micros: i64,
+        audit: SecurityAuditDraft,
+        marker: Option<SecurityMutationDraft>,
+        interruption: Option<hyphae_native_runtime::CommitBoundary>,
+    ) -> Result<ProductCommitReceipt, ProductError> {
         let mut transaction = self
             .database
             .begin(logical_time_micros, ProductDurability::Strict.into())?;
-        let (_, pending_csn) = transaction.pending_commit_identity()?;
+        let (transaction_id, pending_csn) = transaction.pending_commit_identity()?;
         let appended = catalog
             .append_audit_event(pending_csn.get(), audit)
             .map_err(map_catalog_error)?;
@@ -4749,7 +5449,51 @@ impl NativeProduct {
             return Err(ProductError::from_code(ProductErrorCode::Corruption));
         }
         transaction.set(ACCESS_CONTROL_STORAGE_KEY.to_vec(), encoded_catalog, None)?;
-        let receipt = match transaction.commit() {
+        if let Some(marker) = marker {
+            let shard = security_mutation_shard(marker.fingerprint);
+            let index_key = security_mutation_index_key(shard);
+            let mut index = match transaction.get(&index_key) {
+                Some(encoded) => {
+                    decode_security_mutation_index(encoded, shard).map_err(map_catalog_error)?
+                }
+                None => SecurityMutationMarkerIndex {
+                    fingerprints: Vec::new(),
+                },
+            };
+            if index.fingerprints.contains(&marker.fingerprint) {
+                return Err(ProductError::from_code(ProductErrorCode::Corruption));
+            }
+            if index.fingerprints.len() == SECURITY_MUTATION_MARKERS_PER_SHARD {
+                let evicted = index.fingerprints.remove(0);
+                if !transaction.delete_structure(security_mutation_marker_key(evicted))? {
+                    return Err(ProductError::from_code(ProductErrorCode::Corruption));
+                }
+            }
+            index.fingerprints.push(marker.fingerprint);
+            transaction.set(
+                index_key,
+                encode_security_mutation_index(&index, shard).map_err(map_catalog_error)?,
+                None,
+            )?;
+            transaction.set(
+                security_mutation_marker_key(marker.fingerprint),
+                encode_security_mutation_marker(SecurityMutationMarker {
+                    operation: marker.operation,
+                    request_digest: marker.request_digest,
+                    actor_principal_id: marker.actor_principal_id,
+                    actor_key_id: marker.actor_key_id,
+                    result_id: marker.result_id,
+                    authorization_epoch: marker.authorization_epoch,
+                    transaction_id: transaction_id.get(),
+                }),
+                None,
+            )?;
+        }
+        let commit_result = match interruption {
+            Some(boundary) => transaction.commit_with_interruption(boundary),
+            None => transaction.commit(),
+        };
+        let receipt = match commit_result {
             Ok(receipt) => receipt,
             Err(error) => {
                 self.access_control_epoch_known
@@ -4769,6 +5513,196 @@ impl NativeProduct {
             .store(true, Ordering::Release);
         Ok(receipt.into())
     }
+}
+
+fn fresh_security_idempotency_token() -> Result<u128, ProductError> {
+    SecurityId::generate()
+        .map(SecurityId::get)
+        .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))
+}
+
+fn security_mutation_fingerprint(
+    actor: &AuthenticatedAuthority,
+    idempotency_token: u128,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SECURITY_MUTATION_KEY_DOMAIN);
+    hasher.update(&actor.principal_id.to_be_bytes());
+    hasher.update(actor.key_id.as_bytes());
+    hasher.update(&idempotency_token.to_be_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn security_mutation_request_digest(
+    operation: SecurityMutationOperation,
+    actor: &AuthenticatedAuthority,
+    idempotency_token: u128,
+    body: &[u8],
+) -> Result<[u8; 32], ProductError> {
+    if idempotency_token == 0 {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    }
+    let body_len = u64::try_from(body.len())
+        .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SECURITY_MUTATION_REQUEST_DOMAIN);
+    hasher.update(&[operation.tag()]);
+    hasher.update(&actor.principal_id.to_be_bytes());
+    hasher.update(actor.key_id.as_bytes());
+    hasher.update(&idempotency_token.to_be_bytes());
+    hasher.update(&body_len.to_be_bytes());
+    hasher.update(body);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+const fn security_mutation_shard(fingerprint: [u8; 32]) -> u8 {
+    fingerprint[0] % SECURITY_MUTATION_IDEMPOTENCY_SHARDS
+}
+
+fn security_mutation_marker_key(fingerprint: [u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SECURITY_MUTATION_MARKER_PREFIX.len() + 1 + 32);
+    key.extend_from_slice(SECURITY_MUTATION_MARKER_PREFIX);
+    key.push(security_mutation_shard(fingerprint));
+    key.extend_from_slice(&fingerprint);
+    key
+}
+
+fn security_mutation_index_key(shard: u8) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SECURITY_MUTATION_INDEX_PREFIX.len() + 1);
+    key.extend_from_slice(SECURITY_MUTATION_INDEX_PREFIX);
+    key.push(shard);
+    key
+}
+
+fn encode_security_mutation_marker(marker: SecurityMutationMarker) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(SECURITY_MUTATION_MARKER_BYTES);
+    encoded.extend_from_slice(SECURITY_MUTATION_MARKER_MAGIC);
+    encoded.push(marker.operation.tag());
+    encoded.extend_from_slice(&marker.request_digest);
+    encoded.extend_from_slice(&marker.actor_principal_id.to_be_bytes());
+    encoded.extend_from_slice(marker.actor_key_id.as_bytes());
+    encoded.extend_from_slice(&marker.result_id.to_be_bytes());
+    encoded.extend_from_slice(&marker.authorization_epoch.get().to_be_bytes());
+    encoded.extend_from_slice(&marker.transaction_id.to_be_bytes());
+    let digest = blake3::hash(&encoded);
+    encoded.extend_from_slice(digest.as_bytes());
+    encoded
+}
+
+fn decode_security_mutation_marker(
+    encoded: &[u8],
+) -> Result<SecurityMutationMarker, AccessCatalogError> {
+    if encoded.len() != SECURITY_MUTATION_MARKER_BYTES
+        || &encoded[..SECURITY_MUTATION_MARKER_MAGIC.len()] != SECURITY_MUTATION_MARKER_MAGIC
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let content_len = encoded.len() - CATALOG_DIGEST_BYTES;
+    let expected = blake3::hash(&encoded[..content_len]);
+    if expected
+        .as_bytes()
+        .ct_eq(&encoded[content_len..])
+        .unwrap_u8()
+        != 1
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let mut decoder = Decoder::new(&encoded[SECURITY_MUTATION_MARKER_MAGIC.len()..content_len]);
+    let operation = SecurityMutationOperation::from_tag(decoder.byte()?)
+        .ok_or(AccessCatalogError::CorruptCatalog)?;
+    let request_digest = decoder.array::<32>()?;
+    let actor_principal_id = SecurityId::new(u128::from_be_bytes(decoder.array()?))
+        .ok_or(AccessCatalogError::CorruptCatalog)?;
+    let actor_key_id =
+        ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?;
+    let result_id = SecurityId::new(u128::from_be_bytes(decoder.array()?))
+        .ok_or(AccessCatalogError::CorruptCatalog)?;
+    let authorization_epoch = AuthorizationEpoch::new(u64::from_be_bytes(decoder.array()?));
+    let transaction_id = u128::from_be_bytes(decoder.array()?);
+    if !decoder.is_empty()
+        || authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || transaction_id == 0
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    Ok(SecurityMutationMarker {
+        operation,
+        request_digest,
+        actor_principal_id,
+        actor_key_id,
+        result_id,
+        authorization_epoch,
+        transaction_id,
+    })
+}
+
+fn encode_security_mutation_index(
+    index: &SecurityMutationMarkerIndex,
+    shard: u8,
+) -> Result<Vec<u8>, AccessCatalogError> {
+    if shard >= SECURITY_MUTATION_IDEMPOTENCY_SHARDS
+        || index.fingerprints.len() > SECURITY_MUTATION_MARKERS_PER_SHARD
+        || !strictly_unique(&index.fingerprints)
+        || index
+            .fingerprints
+            .iter()
+            .any(|fingerprint| security_mutation_shard(*fingerprint) != shard)
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let mut encoded = Vec::with_capacity(10 + index.fingerprints.len() * 32 + 32);
+    encoded.extend_from_slice(SECURITY_MUTATION_INDEX_MAGIC);
+    encoded.push(shard);
+    encoded.push(
+        u8::try_from(index.fingerprints.len()).map_err(|_| AccessCatalogError::LimitExceeded)?,
+    );
+    for fingerprint in &index.fingerprints {
+        encoded.extend_from_slice(fingerprint);
+    }
+    let digest = blake3::hash(&encoded);
+    encoded.extend_from_slice(digest.as_bytes());
+    Ok(encoded)
+}
+
+fn decode_security_mutation_index(
+    encoded: &[u8],
+    expected_shard: u8,
+) -> Result<SecurityMutationMarkerIndex, AccessCatalogError> {
+    let minimum = SECURITY_MUTATION_INDEX_MAGIC.len() + 2 + CATALOG_DIGEST_BYTES;
+    if encoded.len() < minimum
+        || &encoded[..SECURITY_MUTATION_INDEX_MAGIC.len()] != SECURITY_MUTATION_INDEX_MAGIC
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let content_len = encoded.len() - CATALOG_DIGEST_BYTES;
+    let expected_digest = blake3::hash(&encoded[..content_len]);
+    if expected_digest
+        .as_bytes()
+        .ct_eq(&encoded[content_len..])
+        .unwrap_u8()
+        != 1
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let mut decoder = Decoder::new(&encoded[SECURITY_MUTATION_INDEX_MAGIC.len()..content_len]);
+    let shard = decoder.byte()?;
+    let count = usize::from(decoder.byte()?);
+    if shard != expected_shard
+        || count > SECURITY_MUTATION_MARKERS_PER_SHARD
+        || decoder.remaining.len() != count.saturating_mul(32)
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let fingerprints = (0..count)
+        .map(|_| decoder.array::<32>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let index = SecurityMutationMarkerIndex { fingerprints };
+    encode_security_mutation_index(&index, shard)?;
+    Ok(index)
+}
+
+fn strictly_unique<T: Ord + Clone>(values: &[T]) -> bool {
+    values.iter().cloned().collect::<BTreeSet<_>>().len() == values.len()
 }
 
 fn map_catalog_error(error: AccessCatalogError) -> ProductError {
@@ -5678,6 +6612,12 @@ mod tests {
         ))
     }
 
+    fn remove_test_files(paths: &[&Path]) {
+        for path in paths {
+            let _ignored = fs::remove_file(path);
+        }
+    }
+
     fn scoped_authority(
         permission: ProductPermission,
         grant_scope: ProductScope,
@@ -5895,7 +6835,7 @@ mod tests {
             SecurityAuditAction::from_tag(event.action().tag()),
             Some(event.action())
         );
-        assert_eq!(SecurityAuditAction::from_tag(13), None);
+        assert_write_audit_action_tags();
         assert_eq!(
             SecurityAuditEvent::try_from_wire(
                 event_id,
@@ -5923,6 +6863,18 @@ mod tests {
             Err(AccessCatalogError::InvalidRequest)
         );
         Ok(())
+    }
+
+    fn assert_write_audit_action_tags() {
+        assert_eq!(
+            SecurityAuditAction::from_tag(13),
+            Some(SecurityAuditAction::SetPrincipalEnabled)
+        );
+        assert_eq!(
+            SecurityAuditAction::from_tag(14),
+            Some(SecurityAuditAction::RevokeAssignment)
+        );
+        assert_eq!(SecurityAuditAction::from_tag(15), None);
     }
 
     #[test]
@@ -6719,16 +7671,24 @@ mod tests {
         let created = product.create_security_principal(&owner, "Read service", 2)?;
 
         let owner = product.authenticate_api_key(&owner_secret, 3)?;
+        product.set_security_principal_enabled_idempotent(
+            &owner,
+            created.principal_id,
+            true,
+            1_001,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, 4)?;
         let assignment = product.assign_built_in_role(
             &owner,
             created.principal_id,
             BuiltInRole::Reader,
             ProductScope::Instance,
-            3,
+            4,
         )?;
         assert!(assignment.authorization_epoch > created.authorization_epoch);
 
-        let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        let owner = product.authenticate_api_key(&owner_secret, 5)?;
         let issued = product.issue_api_key_to_file(
             &owner,
             created.principal_id,
@@ -6737,10 +7697,10 @@ mod tests {
             BuiltInRole::Reader.authorization(),
             None,
             &reader_key_path,
-            4,
+            5,
         )?;
         let reader_secret = fs::read_to_string(&reader_key_path)?;
-        let reader = product.authenticate_api_key(&reader_secret, 5)?;
+        let reader = product.authenticate_api_key(&reader_secret, 6)?;
         assert_eq!(reader.principal_id, created.principal_id);
         assert_eq!(reader.effective_roles.as_ref(), &[BuiltInRole::Reader]);
         assert!(reader.authorization.allows(ProductPermission::DataRead));
@@ -6763,9 +7723,7 @@ mod tests {
         let issue_path = path.with_extension("forbidden-owner-issue-key");
         let rotate_path = path.with_extension("forbidden-owner-rotation-key");
         let _ignored = fs::remove_dir_all(&path);
-        for output in [&owner_path, &admin_path, &issue_path, &rotate_path] {
-            let _ignored = fs::remove_file(output);
-        }
+        remove_test_files(&[&owner_path, &admin_path, &issue_path, &rotate_path]);
         let mut product = NativeProduct::create(&path)?;
         let bootstrap =
             product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
@@ -6773,14 +7731,16 @@ mod tests {
         let owner = product.authenticate_api_key(&owner_secret, 2)?;
         let admin_principal = product.create_security_principal(&owner, "Admin", 2)?;
         let owner = product.authenticate_api_key(&owner_secret, 3)?;
-        product.assign_built_in_role(
+        enable_principal(&mut product, &owner, admin_principal.principal_id, 1_002, 3)?;
+        let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        let admin_assignment = product.assign_built_in_role(
             &owner,
             admin_principal.principal_id,
             BuiltInRole::Admin,
             ProductScope::Instance,
-            3,
+            4,
         )?;
-        let owner = product.authenticate_api_key(&owner_secret, 4)?;
+        let owner = product.authenticate_api_key(&owner_secret, 5)?;
         product.issue_api_key_to_file(
             &owner,
             admin_principal.principal_id,
@@ -6789,10 +7749,11 @@ mod tests {
             BuiltInRole::Admin.authorization(),
             None,
             &admin_path,
-            4,
+            5,
         )?;
         let admin_secret = fs::read_to_string(&admin_path)?;
-        let admin = product.authenticate_api_key(&admin_secret, 5)?;
+        let admin = product.authenticate_api_key(&admin_secret, 6)?;
+        assert_self_assignment_revoke_denied(&mut product, &admin, admin_assignment.assignment_id);
 
         let Err(issue_error) = product.issue_api_key_to_file(
             &admin,
@@ -6861,6 +7822,37 @@ mod tests {
         fs::remove_file(owner_path)?;
         fs::remove_file(admin_path)?;
         Ok(())
+    }
+
+    fn assert_self_assignment_revoke_denied(
+        product: &mut NativeProduct,
+        actor: &AuthenticatedAuthority,
+        assignment_id: SecurityId,
+    ) {
+        assert_eq!(
+            product
+                .revoke_security_assignment_idempotent(actor, assignment_id, 1_005, 6)
+                .map(|_| ()),
+            Err(ProductError::from_code(ProductErrorCode::InvalidRequest))
+        );
+    }
+
+    fn enable_principal(
+        product: &mut NativeProduct,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        token: u128,
+        logical_time_micros: i64,
+    ) -> Result<(), ProductError> {
+        product
+            .set_security_principal_enabled_idempotent(
+                actor,
+                principal_id,
+                true,
+                token,
+                logical_time_micros,
+            )
+            .map(|_| ())
     }
 
     #[test]
@@ -7218,12 +8210,20 @@ mod tests {
         let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
         let reader = product.create_security_principal(&owner, "Reader", 2)?;
         let owner = product.authenticate_api_key(&owner_secret, i64::MIN)?;
+        product.set_security_principal_enabled_idempotent(
+            &owner,
+            reader.principal_id,
+            true,
+            1_003,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
         product.assign_built_in_role(
             &owner,
             reader.principal_id,
             BuiltInRole::Reader,
             ProductScope::Instance,
-            3,
+            4,
         )?;
         let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
 
@@ -7319,6 +8319,14 @@ mod tests {
         let principal = product.create_security_principal(&owner, "Scoped reader", 2)?;
         let object = ObjectId::new(42)?;
         let owner = product.authenticate_api_key(&owner_secret, 3)?;
+        product.set_security_principal_enabled_idempotent(
+            &owner,
+            principal.principal_id,
+            true,
+            1_004,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, 4)?;
         let role = product.create_custom_security_role(
             &owner,
             "tenant reader",
@@ -7327,11 +8335,11 @@ mod tests {
                 ProductScope::CatalogObject(object),
             )
             .ok_or("invalid custom grant")?],
-            3,
+            4,
         )?;
-        let owner = product.authenticate_api_key(&owner_secret, 4)?;
-        product.assign_custom_security_role(&owner, principal.principal_id, role.role_id, 4)?;
         let owner = product.authenticate_api_key(&owner_secret, 5)?;
+        product.assign_custom_security_role(&owner, principal.principal_id, role.role_id, 5)?;
+        let owner = product.authenticate_api_key(&owner_secret, 6)?;
         product.issue_scoped_api_key_to_file(
             &owner,
             principal.principal_id,
@@ -7342,10 +8350,10 @@ mod tests {
             [ProductScope::CatalogObject(object)],
             None,
             &scoped_path,
-            5,
+            6,
         )?;
         let scoped_secret = fs::read_to_string(&scoped_path)?;
-        let scoped = product.authenticate_api_key(&scoped_secret, 6)?;
+        let scoped = product.authenticate_api_key(&scoped_secret, 7)?;
         assert_eq!(scoped.effective_roles(), &[]);
         assert_eq!(scoped.effective_custom_roles(), &[role.role_id]);
         assert_eq!(
@@ -7502,6 +8510,527 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(reopened.access_control_status()?.pending_keys, 1);
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn security_mutation_marker_codecs_are_bounded_redacted_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let marker = SecurityMutationMarker {
+            operation: SecurityMutationOperation::CreatePrincipal,
+            request_digest: [7; 32],
+            actor_principal_id: SecurityId::new(1).ok_or("invalid principal")?,
+            actor_key_id: ApiKeyId::from_bytes([2; 16]).ok_or("invalid key")?,
+            result_id: SecurityId::new(3).ok_or("invalid result")?,
+            authorization_epoch: AuthorizationEpoch::new(4),
+            transaction_id: 5,
+        };
+        let encoded = encode_security_mutation_marker(marker);
+        assert_eq!(encoded.len(), SECURITY_MUTATION_MARKER_BYTES);
+        assert_eq!(decode_security_mutation_marker(&encoded)?, marker);
+        let mut corrupt = encoded.clone();
+        corrupt[12] ^= 1;
+        assert_eq!(
+            decode_security_mutation_marker(&corrupt),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+        let mut unknown_operation = encoded.clone();
+        unknown_operation[SECURITY_MUTATION_MARKER_MAGIC.len()] = u8::MAX;
+        let content_len = unknown_operation.len() - CATALOG_DIGEST_BYTES;
+        let digest = blake3::hash(&unknown_operation[..content_len]);
+        unknown_operation[content_len..].copy_from_slice(digest.as_bytes());
+        assert_eq!(
+            decode_security_mutation_marker(&unknown_operation),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+
+        let mut fingerprints = Vec::new();
+        for suffix in 1..=SECURITY_MUTATION_MARKERS_PER_SHARD {
+            let mut fingerprint = [0_u8; 32];
+            fingerprint[31] = u8::try_from(suffix)?;
+            fingerprints.push(fingerprint);
+        }
+        let index = SecurityMutationMarkerIndex { fingerprints };
+        let encoded_index = encode_security_mutation_index(&index, 0)?;
+        assert_eq!(decode_security_mutation_index(&encoded_index, 0)?, index);
+        assert_eq!(
+            decode_security_mutation_index(&encoded_index, 1),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+        let duplicate = SecurityMutationMarkerIndex {
+            fingerprints: vec![[0; 32], [0; 32]],
+        };
+        assert_eq!(
+            encode_security_mutation_index(&duplicate, 0),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_principal_idempotency_replays_exact_receipt_and_conflicts_on_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-write-idempotency");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+
+        let first =
+            product.create_security_principal_idempotent(&owner, "Disabled service", 41, 2)?;
+        let replay =
+            product.create_security_principal_idempotent(&owner, "Disabled service", 41, 3)?;
+        assert_eq!(replay, first);
+        let catalog = product.load_access_control_catalog()?;
+        assert!(
+            !catalog
+                .principal(first.principal_id)
+                .ok_or("missing principal")?
+                .enabled()
+        );
+        let fingerprint = security_mutation_fingerprint(&owner, 41);
+        let snapshot = product.snapshot_bounded(i64::MAX)?;
+        let marker = decode_security_mutation_marker(
+            snapshot
+                .structure_get_internal(&security_mutation_marker_key(fingerprint))
+                .ok_or("missing mutation marker")?,
+        )?;
+        assert_eq!(marker.result_id, first.principal_id);
+        assert_eq!(marker.authorization_epoch, first.authorization_epoch);
+        assert_eq!(marker.transaction_id, first.commit.transaction_id.get());
+        drop(snapshot);
+        let event = product
+            .read_security_audit(&owner, None, 16, 3)?
+            .events
+            .into_iter()
+            .find(|event| {
+                event.action() == SecurityAuditAction::CreatePrincipal
+                    && event
+                        .targets()
+                        .contains(&SecurityAuditTarget::Principal(first.principal_id))
+            })
+            .ok_or("missing create-principal audit")?;
+        assert_eq!(event.commit_csn(), first.commit.commit_csn);
+        let Err(conflict) =
+            product.create_security_principal_idempotent(&owner, "Different request", 41, 4)
+        else {
+            return Err("token reuse did not conflict".into());
+        };
+        assert_eq!(conflict.code(), ProductErrorCode::IdempotencyConflict);
+        let Err(operation_conflict) = product.set_security_principal_enabled_idempotent(
+            &owner,
+            first.principal_id,
+            true,
+            41,
+            4,
+        ) else {
+            return Err("cross-operation token reuse did not conflict".into());
+        };
+        assert_eq!(
+            operation_conflict.code(),
+            ProductErrorCode::IdempotencyConflict
+        );
+        let Err(zero) = product.create_security_principal_idempotent(&owner, "Zero token", 0, 5)
+        else {
+            return Err("zero idempotency token succeeded".into());
+        };
+        assert_eq!(zero.code(), ProductErrorCode::InvalidRequest);
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn security_write_plane_enforces_owner_self_and_epoch_invariants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-write-plane");
+        let reader_path = path.with_extension("reader-write-plane");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let _ignored = fs::remove_file(&reader_path);
+        let mut product = NativeProduct::create(&path)?;
+        let bootstrap =
+            product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let (principal_id, built_in_assignment, custom_assignment) =
+            prepare_security_write_subject(&mut product, &owner_secret, bootstrap)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        product.issue_api_key_to_file(
+            &owner,
+            principal_id,
+            "reader",
+            [BuiltInRole::Reader],
+            BuiltInRole::Reader.authorization(),
+            None,
+            &reader_path,
+            8,
+        )?;
+        let reader_secret = fs::read_to_string(&reader_path)?;
+        let reader = product.authenticate_api_key(&reader_secret, i64::MAX)?;
+
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let revoked =
+            product.revoke_security_assignment_idempotent(&owner, custom_assignment, 56, 9)?;
+        assert_eq!(
+            product.revoke_security_assignment_idempotent(&owner, custom_assignment, 56, 10,)?,
+            revoked
+        );
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        product.set_security_principal_enabled_idempotent(&owner, principal_id, false, 57, 11)?;
+        let mut reader_session = crate::ProductSession::new_authenticated(
+            crate::ProductSessionId::new(701).ok_or("invalid reader session")?,
+            reader,
+        );
+        let reader_context = crate::ProductRequestContext::new(
+            702,
+            reader_session.id(),
+            i64::MAX,
+            reader_session.principal().clone(),
+            reader_session.authorization(),
+        )
+        .with_authorization_epoch(reader_session.authorization_epoch());
+        let Err(session_error) = product.dispatch(
+            &mut reader_session,
+            &reader_context,
+            crate::ProductOperation::StructureGet {
+                key: b"epoch-invalidated".to_vec(),
+            },
+        ) else {
+            return Err("disabled principal retained a managed session".into());
+        };
+        assert_eq!(session_error.code(), ProductErrorCode::AuthorizationDenied);
+        assert_security_write_audits(&product, &owner, built_in_assignment, 12)?;
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        fs::remove_file(reader_path)?;
+        Ok(())
+    }
+
+    fn prepare_security_write_subject(
+        product: &mut NativeProduct,
+        owner_secret: &str,
+        bootstrap: AccessControlBootstrapReceipt,
+    ) -> Result<(SecurityId, SecurityId, SecurityId), Box<dyn std::error::Error>> {
+        let owner = product.authenticate_api_key(owner_secret, i64::MAX)?;
+        let principal = product.create_security_principal_idempotent(&owner, "Reader", 51, 2)?;
+        let owner = product.authenticate_api_key(owner_secret, i64::MAX)?;
+        let enabled = product.set_security_principal_enabled_idempotent(
+            &owner,
+            principal.principal_id,
+            true,
+            52,
+            3,
+        )?;
+        assert_eq!(
+            product.set_security_principal_enabled_idempotent(
+                &owner,
+                principal.principal_id,
+                true,
+                52,
+                4,
+            )?,
+            enabled
+        );
+        assert_write_mutation_owner_guards(product, &owner, bootstrap, 4)?;
+        let owner = product.authenticate_api_key(owner_secret, i64::MAX)?;
+        let built_in = product.assign_built_in_role_idempotent(
+            &owner,
+            principal.principal_id,
+            BuiltInRole::Reader,
+            ProductScope::Instance,
+            53,
+            5,
+        )?;
+        assert_eq!(
+            product.assign_built_in_role_idempotent(
+                &owner,
+                principal.principal_id,
+                BuiltInRole::Reader,
+                ProductScope::Instance,
+                53,
+                5,
+            )?,
+            built_in
+        );
+        let owner = product.authenticate_api_key(owner_secret, i64::MAX)?;
+        let audit_grant =
+            CustomRoleGrant::new(ProductPermission::AuditRead, ProductScope::Instance)
+                .ok_or("invalid grant")?;
+        let role = product.create_custom_security_role_idempotent(
+            &owner,
+            "Audited reader",
+            [audit_grant],
+            54,
+            6,
+        )?;
+        assert_eq!(
+            product.create_custom_security_role_idempotent(
+                &owner,
+                "Audited reader",
+                [audit_grant],
+                54,
+                6,
+            )?,
+            role
+        );
+        let owner = product.authenticate_api_key(owner_secret, i64::MAX)?;
+        let custom = product.assign_custom_security_role_idempotent(
+            &owner,
+            principal.principal_id,
+            role.role_id,
+            55,
+            7,
+        )?;
+        assert_eq!(
+            product.assign_custom_security_role_idempotent(
+                &owner,
+                principal.principal_id,
+                role.role_id,
+                55,
+                7,
+            )?,
+            custom
+        );
+        Ok((
+            principal.principal_id,
+            built_in.assignment_id,
+            custom.assignment_id,
+        ))
+    }
+
+    fn assert_write_mutation_owner_guards(
+        product: &mut NativeProduct,
+        owner: &AuthenticatedAuthority,
+        bootstrap: AccessControlBootstrapReceipt,
+        logical_time_micros: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let owner_assignment = product
+            .load_access_control_catalog()?
+            .assignments
+            .values()
+            .find(|assignment| assignment.principal_id == bootstrap.principal_id)
+            .ok_or("missing owner assignment")?
+            .id;
+        assert_eq!(
+            product
+                .assign_built_in_role_idempotent(
+                    owner,
+                    bootstrap.principal_id,
+                    BuiltInRole::Owner,
+                    ProductScope::Instance,
+                    91,
+                    logical_time_micros,
+                )
+                .map(|_| ()),
+            Err(ProductError::from_code(ProductErrorCode::InvalidRequest))
+        );
+        assert_eq!(
+            product
+                .set_security_principal_enabled_idempotent(
+                    owner,
+                    bootstrap.principal_id,
+                    false,
+                    92,
+                    logical_time_micros,
+                )
+                .map(|_| ()),
+            Err(ProductError::from_code(ProductErrorCode::InvalidRequest))
+        );
+        assert_eq!(
+            product
+                .revoke_security_assignment_idempotent(
+                    owner,
+                    owner_assignment,
+                    93,
+                    logical_time_micros,
+                )
+                .map(|_| ()),
+            Err(ProductError::from_code(ProductErrorCode::InvalidRequest))
+        );
+        Ok(())
+    }
+
+    fn assert_security_write_audits(
+        product: &NativeProduct,
+        owner: &AuthenticatedAuthority,
+        built_in_assignment: SecurityId,
+        logical_time_micros: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let page = product.read_security_audit(owner, None, 32, logical_time_micros)?;
+        assert!(page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::SetPrincipalEnabled
+                && event.actor_key_id() == Some(owner.key_id())
+        }));
+        assert!(page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::RevokeAssignment
+                && event
+                    .targets()
+                    .iter()
+                    .any(|target| matches!(target, SecurityAuditTarget::Assignment(_)))
+        }));
+        assert!(page.events.iter().any(|event| {
+            event.action() == SecurityAuditAction::AssignBuiltInRole
+                && event
+                    .targets()
+                    .contains(&SecurityAuditTarget::Assignment(built_in_assignment))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn security_idempotency_fifo_evicts_only_oldest_marker_in_one_shard()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-idempotency-fifo");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let tokens = same_shard_tokens(&owner, SECURITY_MUTATION_MARKERS_PER_SHARD + 1);
+        let first_shard = security_mutation_shard(security_mutation_fingerprint(&owner, tokens[0]));
+        let mut first_receipt = None;
+        for (index, token) in tokens.iter().copied().enumerate() {
+            let receipt = product.create_security_principal_idempotent(
+                &owner,
+                &format!("retained-{index}"),
+                token,
+                i64::try_from(index + 2)?,
+            )?;
+            first_receipt.get_or_insert(receipt);
+        }
+        let snapshot = product.snapshot_bounded(i64::MAX)?;
+        let index = decode_security_mutation_index(
+            snapshot
+                .structure_get_internal(&security_mutation_index_key(first_shard))
+                .ok_or("missing marker index")?,
+            first_shard,
+        )?;
+        assert_eq!(
+            index.fingerprints.len(),
+            SECURITY_MUTATION_MARKERS_PER_SHARD
+        );
+        assert!(
+            snapshot
+                .structure_get_internal(&security_mutation_marker_key(
+                    security_mutation_fingerprint(&owner, tokens[0],)
+                ))
+                .is_none()
+        );
+        let outside_window =
+            product.create_security_principal_idempotent(&owner, "retained-0", tokens[0], 100)?;
+        assert_ne!(
+            outside_window,
+            first_receipt.ok_or("missing first receipt")?
+        );
+
+        drop(product);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        Ok(())
+    }
+
+    fn same_shard_tokens(actor: &AuthenticatedAuthority, count: usize) -> Vec<u128> {
+        let target_shard = security_mutation_shard(security_mutation_fingerprint(actor, 1));
+        (1_u128..)
+            .filter(|token| {
+                security_mutation_shard(security_mutation_fingerprint(actor, *token))
+                    == target_shard
+            })
+            .take(count)
+            .collect()
+    }
+
+    #[test]
+    fn create_principal_ack_unknown_reopens_to_one_exact_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (index, boundary) in [
+            hyphae_native_runtime::CommitBoundary::WalAppended,
+            hyphae_native_runtime::CommitBoundary::WalSynchronized,
+            hyphae_native_runtime::CommitBoundary::RootPublished,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_create_principal_ack_unknown_replay(boundary, u128::try_from(index + 101)?)?;
+        }
+        Ok(())
+    }
+
+    fn assert_create_principal_ack_unknown_replay(
+        boundary: hyphae_native_runtime::CommitBoundary,
+        token: u128,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension(format!("owner-crash-{token}"));
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let owner_secret = fs::read_to_string(&owner_path)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        assert!(
+            product
+                .create_security_principal_idempotent_with_interruption(
+                    &owner,
+                    "Crash-safe principal",
+                    token,
+                    2,
+                    Some(boundary),
+                )
+                .is_err()
+        );
+        drop(product);
+
+        let mut reopened = NativeProduct::open(&path)?;
+        let owner = reopened.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let receipt = reopened.create_security_principal_idempotent(
+            &owner,
+            "Crash-safe principal",
+            token,
+            3,
+        )?;
+        let catalog = reopened.load_access_control_catalog()?;
+        assert_eq!(
+            catalog
+                .principals
+                .values()
+                .filter(|principal| principal.display_name() == "Crash-safe principal")
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .principal(receipt.principal_id)
+                .map(SecurityPrincipalRecord::enabled),
+            Some(false)
+        );
+        let events = reopened.read_security_audit(&owner, None, 16, 4)?;
+        let matching = events
+            .events
+            .iter()
+            .filter(|event| {
+                event.action() == SecurityAuditAction::CreatePrincipal
+                    && event
+                        .targets()
+                        .contains(&SecurityAuditTarget::Principal(receipt.principal_id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].commit_csn(), receipt.commit.commit_csn);
+
         drop(reopened);
         fs::remove_dir_all(path)?;
         fs::remove_file(owner_path)?;

@@ -110,3 +110,20 @@ cross-surface result equality, and listener opt-in are mandatory G6 evidence.
 Managed-auth evidence additionally covers exact bearer grammar, uniform
 `401` challenges, permission `403` mapping, credential-bound session reuse,
 and service-level revocation revalidation.
+
+## Managed security administration
+
+The generic `/v2/execute` envelope carries the six bounded security reads from
+Native protocol minor 1 and the six secret-free security mutations from minor
+2. The write operations create or enable a principal, create an immutable
+custom role, create a non-Owner built-in or custom-role assignment, or revoke
+a non-Owner assignment. Each mutation requires instance-scoped
+`security.manage`, strict durability, and a nonzero idempotency token in the
+canonical request context. Local and HTTP transports return the same durable
+receipt for an exact replay and the same `idempotency_conflict` for token reuse
+with a different request.
+
+API-key issuance, rotation, secret delivery, key revocation, ownership
+transfer, legacy-bearer migration, owner recovery, and arbitrary server-local
+paths are not representable in this HTTP slice. They remain fail-closed until
+their own authority and secret-delivery contracts land.
