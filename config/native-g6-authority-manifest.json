@@ -35,7 +35,7 @@
     {"reference": "docs/native/native-proof-v1.md", "sha256": "2eec789a1ac258341091013ae2eff367a50fd6347d2fd10aa30a0b5f0f0fe821"},
     {"reference": "docs/native/native-witness-v1.md", "sha256": "57a8e46116e5f8fe014dfa36e39e0b42b290b29595deae9024cf36f5701eb750"},
     {"reference": "docs/native/http-v2.md", "sha256": "d49d7c90539631c6478f8f85cbf753baed2f9e88272c571063d31e959a2448db"},
-    {"reference": "docs/native/local-protocol-v1.md", "sha256": "ea2db1a92cad5cb10a22dd6b92f6a502742a323eb3c4b357e13f95921458f79c"},
+    {"reference": "docs/native/local-protocol-v1.md", "sha256": "ff7557e365e18036c1fd798f3d7bfe7d71ba83def526b30a13c0522445c10910"},
     {"reference": "docs/native/catalog-v1.md", "sha256": "94157ebd1e63a4324f834f079153d73c64d6337a29f04cf2849b33d11f724b4a"},
     {"reference": "docs/native/search-semantics-v1.md", "sha256": "78df63d1fbb29c23c8df607b29401a117f6fb73d73ac1b8ac0c6110c0090b634"},
     {"reference": "docs/native/ann-semantics-v1.md", "sha256": "fed33d9d21219fb8b5c541a1ea5c5500178af5c650cf0fb93b8e59190619c90b"},

@@ -92,34 +92,59 @@ connects to no external service. The console currently provides:
 
 - responsive overview and authenticated-session dashboards;
 - an interactive SQL editor and result pane backed by `ProductOperation`;
+- a read-only Security workspace for status, principals, roles, assignments,
+  key metadata, and retained audit events;
 - navigation targets for structures, search, and catalog workflows; and
 - bounded input/output rendering that never displays API-key secrets.
 
 Use Tab or the arrow keys to change views. In the SQL view, Enter executes the
 current statement and Backspace edits it. In other views, `r` refreshes
-capabilities through the current authenticated session. Escape or Ctrl-C
-exits. Terminal state is restored on normal
-exit and errors. Structure, search, and catalog mutation actions remain
-read-only placeholders until their typed workflows are implemented; the UI
-does not claim those actions are available.
+capabilities through the current authenticated session. Within Security,
+Up/Down selects Status, Principals, Roles, Assignments, Keys, or Audit; `n`
+requests the next page and `r` returns to the first page. Every page is capped
+at 12 rows and retains no cursor history, so terminal memory remains bounded.
+Security views use only the central `ProductOperation` read plane on the
+console's existing managed session. A principal without `security.read` or
+`audit.read` sees the typed denial in the panel rather than a raw-catalog
+fallback. Key rows structurally contain only public identifiers and redacted
+metadata; credentials and verifiers are never rendered. Escape or Ctrl-C
+exits. Terminal state is restored on normal exit and errors. Structure,
+search, and catalog mutation actions remain read-only placeholders until their
+typed workflows are implemented; the UI does not claim those actions are
+available.
 
 ## `security`
 
 ```text
 hyphae security --data-dir <NATIVE_DIRECTORY> status
+hyphae security --data-dir <NATIVE_DIRECTORY> principal list \
+  [--cursor <OPAQUE_CURSOR>] [--limit <ROWS>]
+hyphae security --data-dir <NATIVE_DIRECTORY> role list \
+  [--cursor <OPAQUE_CURSOR>] [--limit <ROWS>]
+hyphae security --data-dir <NATIVE_DIRECTORY> assignment list \
+  [--cursor <OPAQUE_CURSOR>] [--limit <ROWS>]
+hyphae security --data-dir <NATIVE_DIRECTORY> key list \
+  [--cursor <OPAQUE_CURSOR>] [--limit <ROWS>]
+hyphae security --data-dir <NATIVE_DIRECTORY> audit list \
+  [--cursor <EVENT_ID>] [--limit <ROWS>]
 hyphae security --data-dir <NATIVE_DIRECTORY> bootstrap \
   --name <PRINCIPAL_NAME> --label <KEY_LABEL> --key-out <NEW_FILE>
 ```
 
-`status` reports an empty, pre-bootstrap access-control catalog. Once the
-catalog is bootstrapped it fails closed until `security.read` is promoted into
-the central product-operation registry; it does not expose durable catalog
-counts through the offline facade. The bootstrap command
-creates the first
-administrator principal and key through the strict native WAL. The output
-credential file must not exist, is created with owner-only permissions on
-Unix, and is activated only after its contents have been synchronized. Hyphae
-never prints the secret to stdout or writes it to logs.
+`status`, `principal list`, `role list`, `assignment list`, and `key list`
+execute through the current managed session and the central
+`security.read` product operations. `audit list` requires `audit.read`.
+They fail closed without a valid key and expose only redacted metadata. List
+limits are validated by the native product. Metadata cursors are opaque,
+authorization-generation-bound values and must be supplied only to the same
+list command that emitted them; stale and cross-family cursors are rejected.
+Audit cursors are canonical retained event IDs.
+
+The offline `bootstrap` command is the sole unauthenticated exception. It
+creates the first owner principal and key through the strict native WAL. The
+output credential file must not exist, is created with owner-only permissions
+on Unix, and is activated only after its contents have been synchronized.
+Hyphae never prints a credential secret or verifier to stdout or logs.
 
 ## `version`
 

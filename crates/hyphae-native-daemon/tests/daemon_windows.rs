@@ -12,9 +12,10 @@ use std::{
 
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig, connect};
 use hyphae_native_product::{
-    ApiKeyId, AuthenticatedAuthority, BuiltInRole, NativeProduct, NativeProductService,
-    NativeProductServiceConfig, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
-    ProductLimits, ProductOperation, ProductResponse, ProductScope,
+    ApiKeyId, AuthenticatedAuthority, BuiltInRole, MetricId, MetricValue, NativeProduct,
+    NativeProductService, NativeProductServiceConfig, ProductAuthorization,
+    ProductDurabilityPolicy, ProductErrorCode, ProductLimits, ProductOperation, ProductResponse,
+    ProductScope, TelemetryRegistry,
 };
 use hyphae_native_protocol::{
     AsyncFrameIo, FrameKind, Hello, OwnedFrame, ProtocolCapabilities, ProvisionalStream,
@@ -59,6 +60,7 @@ impl Drop for TestDirectory {
 struct Client {
     stream: Stream,
     codec: AsyncFrameIo,
+    negotiated_minor: u16,
 }
 
 impl Client {
@@ -107,7 +109,11 @@ impl Client {
             assert_eq!(welcome.catalog_version, 0);
         }
         codec = AsyncFrameIo::new(usize::try_from(welcome.maximum_frame_payload)?)?;
-        Ok(Self { stream, codec })
+        Ok(Self {
+            stream,
+            codec,
+            negotiated_minor: welcome.minor,
+        })
     }
 
     async fn send_request(
@@ -156,6 +162,23 @@ impl Client {
                 _ => return Err("unexpected response frame".into()),
             }
         }
+    }
+
+    async fn failure_code(
+        &self,
+        stream_id: u32,
+        request_id: u64,
+    ) -> Result<ProductErrorCode, Box<dyn Error>> {
+        let mut receive = AsyncFrameIo::new(self.codec.maximum_payload())?;
+        let frame = receive
+            .receive(&mut &self.stream)
+            .await?
+            .ok_or("stream ended before FAILURE")?;
+        assert_eq!(
+            (frame.kind, frame.stream_id, frame.request_id),
+            (FrameKind::Failure, stream_id, request_id)
+        );
+        Ok(decode_failure(&frame.payload)?.code())
     }
 }
 
@@ -225,6 +248,19 @@ fn request(operation: ProductOperation) -> WireRequest {
         idempotency_token: None,
         limits: ProductLimits::default(),
         durability: ProductDurabilityPolicy::MEMORY,
+    }
+}
+
+fn request_count(telemetry: &TelemetryRegistry) -> Result<u64, Box<dyn Error>> {
+    let snapshot = telemetry.snapshot(0, None);
+    let row = snapshot
+        .metrics
+        .into_iter()
+        .find(|row| row.descriptor.id == MetricId::Requests)
+        .ok_or("request metric is missing")?;
+    match row.value {
+        MetricValue::Counter(value) => Ok(value),
+        _ => Err("request metric is not a counter".into()),
     }
 }
 
@@ -341,6 +377,54 @@ async fn protected_pipe_supports_peer_identity_and_multiple_owner_clients()
 
     drop(first);
     drop(second);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn security_reads_require_minor_one_on_named_pipes() -> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("security-minor")?;
+    let fixture = managed_reader_product(&test)?;
+    let owner_secret = std::fs::read_to_string(test.root.join("owner.key"))?;
+    let telemetry = fixture.product.telemetry().clone();
+    let daemon = NativeDaemon::start_authenticated(
+        fixture.product,
+        &test.endpoint,
+        NativeDaemonConfig::default(),
+    )?;
+
+    let current = Client::connect_authenticated(&test.endpoint, &owner_secret).await?;
+    assert_eq!(current.negotiated_minor, 1);
+    current
+        .send_request(1, 2, ProductOperation::SecurityStatus)
+        .await?;
+    assert!(matches!(
+        current.response(1, 2).await?,
+        ProductResponse::SecurityStatus(_)
+    ));
+    let requests_after_current = request_count(&telemetry)?;
+
+    let legacy_hello = Hello {
+        maximum_minor: 0,
+        capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+        ..Hello::default()
+    };
+    let legacy_payload = encode_authenticated_hello(&legacy_hello, &owner_secret)?;
+    let legacy =
+        Client::connect_with_payload(&test.endpoint, &legacy_hello, &legacy_payload).await?;
+    assert_eq!(legacy.negotiated_minor, 0);
+    legacy
+        .send_request(1, 3, ProductOperation::SecurityStatus)
+        .await?;
+    assert_eq!(
+        legacy.failure_code(1, 3).await?,
+        ProductErrorCode::InvalidRequest
+    );
+    assert_eq!(request_count(&telemetry)?, requests_after_current);
+
+    drop(current);
+    drop(legacy);
     daemon.shutdown().await?;
     Ok(())
 }

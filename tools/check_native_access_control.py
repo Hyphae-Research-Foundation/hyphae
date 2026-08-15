@@ -120,9 +120,23 @@ EXPECTED_LIMITS = {
     "audit_event_bytes": 4096,
     "retained_audit_events": 100000,
     "audit_result_rows": 1000,
+    "security_result_rows": 1000,
     "maximum_rotation_overlap_seconds": 604800,
     "authentication_verifiers_per_request": 1,
     "authorization_cache_entries": 4096,
+}
+
+PLANNED_READ_ONLY_OPERATIONS = {
+    "backup.verify": "backup.verify",
+}
+
+CURRENT_SECURITY_READ_OPERATIONS = {
+    "security.assignment_list": "security.read",
+    "security.audit_read": "audit.read",
+    "security.key_list": "security.read",
+    "security.principal_list": "security.read",
+    "security.role_list": "security.read",
+    "security.status": "security.read",
 }
 
 
@@ -250,6 +264,7 @@ def validate_operations(
     }
     seen_ids: set[str] = set()
     covered_variants: set[str] = set()
+    operations_by_id: dict[str, dict[str, Any]] = {}
     operations_by_variant: dict[str, list[dict[str, Any]]] = {}
     planned = 0
     for row in rows:
@@ -264,6 +279,7 @@ def validate_operations(
         ):
             fail("operation identifier is duplicate or noncanonical")
         seen_ids.add(operation)
+        operations_by_id[operation] = row
         status = row["status"]
         if status not in {"current", "planned-1.2"}:
             fail(f"operation {operation} has an invalid status")
@@ -293,6 +309,11 @@ def validate_operations(
         if not isinstance(row["inherits_underlying"], bool):
             fail(f"operation {operation} has an invalid inheritance flag")
 
+    for operation, permission in PLANNED_READ_ONLY_OPERATIONS.items():
+        require_planned_rule(operations_by_id, operation, permission)
+    for operation, permission in CURRENT_SECURITY_READ_OPERATIONS.items():
+        require_current_read_rule(operations_by_id, operation, permission)
+
     source_variants = product_operation_variants(source)
     if covered_variants != source_variants:
         missing = sorted(source_variants - covered_variants)
@@ -318,6 +339,38 @@ def validate_operations(
     }:
         fail("ExecuteSql must distinguish parsed read, DML, and DDL authority")
     return len(source_variants), planned
+
+
+def require_planned_rule(
+    operations: dict[str, dict[str, Any]], operation: str, permission: str
+) -> None:
+    row = operations.get(operation)
+    if (
+        row is None
+        or row["status"] != "planned-1.2"
+        or row["source_variant"] is not None
+        or row["classification"] != "fixed"
+        or row["required_all"] != [permission]
+        or row["scope_resolution"] != "instance"
+        or row["inherits_underlying"] is not False
+    ):
+        fail(f"planned read-only operation {operation} differs from the 1.2 slice")
+
+
+def require_current_read_rule(
+    operations: dict[str, dict[str, Any]], operation: str, permission: str
+) -> None:
+    row = operations.get(operation)
+    if (
+        row is None
+        or row["status"] != "current"
+        or not isinstance(row["source_variant"], str)
+        or row["classification"] != "fixed"
+        or row["required_all"] != [permission]
+        or row["scope_resolution"] != "instance"
+        or row["inherits_underlying"] is not False
+    ):
+        fail(f"current security read operation {operation} differs from the 1.2 slice")
 
 
 def require_variant_rule(

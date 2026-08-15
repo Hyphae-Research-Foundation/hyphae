@@ -55,10 +55,219 @@ fn run(arguments: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
+    let mut actual = value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut expected = expected.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
 fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
     Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
         .args(arguments)
         .output()?)
+}
+
+fn security_output(data: &Path, key: &Path, operation: &[&str]) -> Result<Output, Box<dyn Error>> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["security", "--data-dir"])
+        .arg(data)
+        .arg("--native-api-key-file")
+        .arg(key)
+        .args(operation)
+        .output()?)
+}
+
+fn run_security(
+    data: &Path,
+    key: &Path,
+    operation: &[&str],
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = security_output(data, key, operation)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr)).into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+struct SecurityReadPlaneOutput {
+    status: serde_json::Value,
+    principals: serde_json::Value,
+    roles_first: serde_json::Value,
+    roles_second: serde_json::Value,
+    assignments: serde_json::Value,
+    keys: serde_json::Value,
+    audit_first: serde_json::Value,
+    audit_second: serde_json::Value,
+}
+
+fn load_security_read_plane(
+    data: &Path,
+    owner_key: &Path,
+) -> Result<SecurityReadPlaneOutput, Box<dyn Error>> {
+    let status = run_security(data, owner_key, &["status"])?;
+    let principals = run_security(data, owner_key, &["principal", "list", "--limit", "1"])?;
+    let roles_first = run_security(data, owner_key, &["role", "list", "--limit", "2"])?;
+    let role_cursor = roles_first["next_cursor"]
+        .as_str()
+        .ok_or("missing role continuation")?;
+    let roles_second = run_security(
+        data,
+        owner_key,
+        &["role", "list", "--cursor", role_cursor, "--limit", "2"],
+    )?;
+    assert_ne!(roles_first["items"], roles_second["items"]);
+    assert_eq!(
+        security_output(data, owner_key, &["key", "list", "--cursor", role_cursor])?
+            .status
+            .code(),
+        Some(2)
+    );
+    let assignments = run_security(data, owner_key, &["assignment", "list", "--limit", "1"])?;
+    let keys = run_security(data, owner_key, &["key", "list", "--limit", "1"])?;
+    let audit_first = run_security(data, owner_key, &["audit", "list", "--limit", "1"])?;
+    let audit_cursor = audit_first["next_cursor"]
+        .as_str()
+        .ok_or("missing audit continuation")?;
+    let audit_second = run_security(
+        data,
+        owner_key,
+        &["audit", "list", "--cursor", audit_cursor, "--limit", "1"],
+    )?;
+    assert_ne!(audit_first["items"], audit_second["items"]);
+    Ok(SecurityReadPlaneOutput {
+        status,
+        principals,
+        roles_first,
+        roles_second,
+        assignments,
+        keys,
+        audit_first,
+        audit_second,
+    })
+}
+
+fn assert_security_page_envelopes(output: &SecurityReadPlaneOutput) {
+    assert_json_keys(
+        &output.status,
+        &[
+            "schema",
+            "bootstrapped",
+            "authorization_epoch",
+            "principals",
+            "assignments",
+            "custom_roles",
+            "custom_assignments",
+            "keys",
+            "pending_keys",
+            "audit_events",
+        ],
+    );
+    assert_eq!(
+        output.status["schema"],
+        "hyphae-native-access-control-status-v1"
+    );
+    for (page, schema) in [
+        (&output.principals, "hyphae-native-security-principals-v1"),
+        (&output.roles_first, "hyphae-native-security-roles-v1"),
+        (&output.assignments, "hyphae-native-security-assignments-v1"),
+        (&output.keys, "hyphae-native-security-keys-v1"),
+    ] {
+        assert_json_keys(
+            page,
+            &["schema", "authorization_epoch", "items", "next_cursor"],
+        );
+        assert_eq!(page["schema"], schema);
+    }
+    for page in [&output.audit_first, &output.audit_second] {
+        assert_json_keys(page, &["schema", "items", "next_cursor"]);
+        assert_eq!(page["schema"], "hyphae-native-security-audit-v1");
+    }
+}
+
+fn assert_security_item_shapes(output: &SecurityReadPlaneOutput) {
+    assert_json_keys(
+        &output.principals["items"][0],
+        &["id", "display_name", "enabled"],
+    );
+    assert_json_keys(
+        &output.roles_first["items"][0],
+        &["kind", "id", "display_name", "permissions", "grants"],
+    );
+    assert_json_keys(
+        &output.assignments["items"][0],
+        &[
+            "id",
+            "principal_id",
+            "built_in_role",
+            "custom_role_id",
+            "scope",
+        ],
+    );
+    assert_json_keys(
+        &output.keys["items"][0],
+        &[
+            "id",
+            "principal_id",
+            "label",
+            "active",
+            "roles",
+            "custom_roles",
+            "permission_ceiling",
+            "scope_ceiling",
+            "created_at_micros",
+            "expires_at_micros",
+            "revoked",
+            "published_epoch",
+            "predecessor_id",
+            "successor_id",
+            "overlap_until_micros",
+            "rotation_overlap_micros",
+        ],
+    );
+    assert_json_keys(
+        &output.audit_first["items"][0],
+        &[
+            "id",
+            "commit_csn",
+            "actor_principal_id",
+            "actor_key_id",
+            "action",
+            "result",
+            "targets",
+            "metadata",
+        ],
+    );
+    assert!(output.principals["next_cursor"].is_null());
+    assert!(
+        output.roles_first["next_cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("hysec1:"))
+    );
+    assert!(output.assignments["items"][0]["custom_role_id"].is_null());
+    assert!(output.keys["items"][0]["expires_at_micros"].is_null());
+}
+
+fn assert_security_output_is_redacted(output: &SecurityReadPlaneOutput, owner_secret: &str) {
+    for response in [
+        &output.status,
+        &output.principals,
+        &output.roles_first,
+        &output.roles_second,
+        &output.assignments,
+        &output.keys,
+        &output.audit_first,
+        &output.audit_second,
+    ] {
+        let rendered = response.to_string();
+        assert!(!rendered.contains(owner_secret.trim()));
+        assert!(!rendered.contains("verifier"));
+        assert!(!rendered.contains("secret"));
+    }
 }
 
 fn assert_authorization_denied(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
@@ -1489,6 +1698,53 @@ async fn serve_bootstrapped_directory_is_managed_with_or_without_force_flag()
     }
     let _ignored = fs::remove_file(managed_endpoint);
     let _ignored = fs::remove_file(legacy_endpoint);
+    Ok(())
+}
+
+#[test]
+fn managed_security_read_plane_is_paginated_and_secret_safe() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let owner_key = temporary.0.join("owner.key");
+    run(&["init", "--data-dir", &path(&data)])?;
+    assert_authorization_denied(&["security", "--data-dir", &path(&data), "status"])?;
+    run(&[
+        "security",
+        "--data-dir",
+        &path(&data),
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let output = load_security_read_plane(&data, &owner_key)?;
+    assert_eq!(output.status["bootstrapped"], true);
+    assert_eq!(output.status["principals"], 1);
+    assert_eq!(output.principals["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        output.assignments["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(output.keys["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        output.audit_first["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        output.audit_second["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_security_page_envelopes(&output);
+    assert_security_item_shapes(&output);
+    let owner_secret = fs::read_to_string(&owner_key)?;
+    assert_security_output_is_redacted(&output, &owner_secret);
+    assert_eq!(
+        security_output(&data, &owner_key, &["key", "list", "--limit", "0"])?
+            .status
+            .code(),
+        Some(2)
+    );
     Ok(())
 }
 

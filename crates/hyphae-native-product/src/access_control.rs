@@ -40,6 +40,8 @@ pub struct AccessControlLimits {
     pub retained_audit_events: usize,
     /// Events returned by one bounded audit read.
     pub audit_result_rows: usize,
+    /// Redacted records returned by one security metadata list.
+    pub security_result_rows: usize,
     /// Maximum immediate-predecessor key overlap.
     pub maximum_rotation_overlap_seconds: u64,
     /// Verifiers evaluated by one authentication request.
@@ -60,6 +62,7 @@ impl AccessControlLimits {
         audit_event_bytes: 4_096,
         retained_audit_events: 100_000,
         audit_result_rows: 1_000,
+        security_result_rows: 1_000,
         maximum_rotation_overlap_seconds: 604_800,
         authentication_verifiers_per_request: 1,
         authorization_cache_entries: 4_096,
@@ -76,6 +79,7 @@ impl AccessControlLimits {
             && self.audit_event_bytes > 0
             && self.retained_audit_events > 0
             && self.audit_result_rows > 0
+            && self.security_result_rows > 0
             && self.maximum_rotation_overlap_seconds > 0
             && self.authentication_verifiers_per_request == 1
             && self.authorization_cache_entries > 0
@@ -184,7 +188,8 @@ impl FromStr for SecurityId {
 pub struct ApiKeyId([u8; API_KEY_ID_BYTES]);
 
 impl ApiKeyId {
-    pub(crate) fn from_bytes(bytes: [u8; API_KEY_ID_BYTES]) -> Option<Self> {
+    /// Reconstructs one nonzero public key identity from canonical wire bytes.
+    pub fn from_bytes(bytes: [u8; API_KEY_ID_BYTES]) -> Option<Self> {
         bytes.iter().any(|byte| *byte != 0).then_some(Self(bytes))
     }
 
@@ -203,6 +208,15 @@ impl fmt::Debug for ApiKeyId {
 impl fmt::Display for ApiKeyId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_lower_hex(formatter, &self.0)
+    }
+}
+
+impl FromStr for ApiKeyId {
+    type Err = AccessControlError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = decode_lower_hex(value.as_bytes())?;
+        Self::from_bytes(bytes).ok_or(AccessControlError::InvalidIdentity)
     }
 }
 
@@ -388,7 +402,8 @@ impl BuiltInRole {
         }
     }
 
-    pub(crate) const fn tag(self) -> u8 {
+    /// Returns the stable append-only wire tag.
+    pub const fn tag(self) -> u8 {
         match self {
             Self::Owner => 0,
             Self::Admin => 1,
@@ -400,7 +415,8 @@ impl BuiltInRole {
         }
     }
 
-    pub(crate) const fn from_tag(tag: u8) -> Option<Self> {
+    /// Reconstructs one built-in role from its stable wire tag.
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(Self::Owner),
             1 => Some(Self::Admin),
@@ -575,11 +591,13 @@ impl ProductPermission {
         }
     }
 
-    pub(crate) const fn tag(self) -> u8 {
+    /// Returns the stable append-only wire tag.
+    pub const fn tag(self) -> u8 {
         self as u8
     }
 
-    pub(crate) const fn from_tag(tag: u8) -> Option<Self> {
+    /// Reconstructs one permission from its stable wire tag.
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(Self::AuditRead),
             1 => Some(Self::BackupCreate),
@@ -837,7 +855,7 @@ mod tests {
 
     #[test]
     fn permission_names_are_exact_and_unknown_values_fail_closed() {
-        for permission in [
+        for (tag, permission) in [
             ProductPermission::AuditRead,
             ProductPermission::BackupCreate,
             ProductPermission::BackupVerify,
@@ -856,13 +874,56 @@ mod tests {
             ProductPermission::SearchExecute,
             ProductPermission::SecurityManage,
             ProductPermission::SecurityRead,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(
                 ProductPermission::parse(permission.as_str()),
+                Some(permission)
+            );
+            assert_eq!(permission.tag(), u8::try_from(tag).unwrap_or(u8::MAX));
+            assert_eq!(
+                ProductPermission::from_tag(permission.tag()),
                 Some(permission)
             );
         }
         assert_eq!(ProductPermission::parse("data.*"), None);
         assert_eq!(ProductPermission::parse("DATA.READ"), None);
+        assert_eq!(ProductPermission::from_tag(18), None);
+    }
+
+    #[test]
+    fn wire_id_role_mask_and_limits_fail_closed() {
+        assert_eq!(ApiKeyId::from_bytes([0; 16]), None);
+        let key_id = ApiKeyId::from_bytes([7; 16]);
+        assert_eq!(key_id.map(|id| *id.as_bytes()), Some([7; 16]));
+        for role in [
+            BuiltInRole::Owner,
+            BuiltInRole::Admin,
+            BuiltInRole::Operator,
+            BuiltInRole::Developer,
+            BuiltInRole::Writer,
+            BuiltInRole::Reader,
+            BuiltInRole::Auditor,
+        ] {
+            assert_eq!(BuiltInRole::from_tag(role.tag()), Some(role));
+        }
+        assert_eq!(BuiltInRole::from_tag(7), None);
+
+        let authorization = ProductAuthorization::from_permissions([
+            ProductPermission::DataRead,
+            ProductPermission::SecurityRead,
+        ]);
+        assert_eq!(
+            ProductAuthorization::from_known_bits(authorization.bits()),
+            Some(authorization)
+        );
+        assert_eq!(ProductAuthorization::from_known_bits(1_u64 << 63), None);
+        assert!(AccessControlLimits::V1.is_valid());
+        assert_eq!(AccessControlLimits::V1.security_result_rows, 1_000);
+        let mut invalid_limits = AccessControlLimits::V1;
+        invalid_limits.security_result_rows = 0;
+        assert!(!invalid_limits.is_valid());
     }
 }

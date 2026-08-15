@@ -3,21 +3,29 @@
 //! Shared protocol golden vectors and strict completion controls.
 
 use hyphae_native_product::{
-    BackupRequest, DoctorRequest, ObjectId, ProductDocValue, ProductDocument,
+    AccessControlStatus, ApiKeyId, AuthorizationEpoch, BackupRequest, BuiltInRole, CustomRoleGrant,
+    DoctorRequest, ObjectId, ProductAuthorization, ProductDocValue, ProductDocument,
     ProductDurabilityPolicy, ProductError, ProductErrorCode, ProductExplicitTransactionStatus,
-    ProductLimits, ProductOperation, ProductResponse, ProductSearchIngestBatch,
-    ProductSearchIngestReceipt, ProductTransactionHandle, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionVectorMutation, ProductValue, ProductVector,
-    SnapshotIdentity,
+    ProductLimits, ProductOperation, ProductPermission, ProductResponse, ProductScope,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductTransactionHandle,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionVectorMutation, ProductValue, ProductVector, SecurityAssignmentListRequest,
+    SecurityAssignmentPage, SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent,
+    SecurityAuditMetadata, SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult,
+    SecurityAuditTarget, SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest,
+    SecurityKeyPage, SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
+    SecurityPrincipalPage, SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage,
+    SecurityRoleSummary, SnapshotIdentity,
 };
 use hyphae_native_protocol::{
     API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, GOLDEN_STRUCTURE_FRAME_BLAKE3,
     HandshakeError, Hello, NegotiationPolicy, ProductCodecError, ProtocolCapabilities,
     ProvisionalStream, StreamCompletion, WireRequest, decode_authenticated_hello, decode_end,
-    decode_failure, decode_hello, decode_product_request, decode_product_response, decode_welcome,
+    decode_failure, decode_hello, decode_product_request, decode_product_request_for_minor,
+    decode_product_response, decode_product_response_for_minor, decode_welcome,
     encode_authenticated_hello, encode_end, encode_failure, encode_frame, encode_hello,
-    encode_product_request, encode_product_response, encode_welcome, golden_structure_frame,
-    negotiate,
+    encode_product_request, encode_product_request_for_minor, encode_product_response,
+    encode_product_response_for_minor, encode_welcome, golden_structure_frame, negotiate,
 };
 use tokio::io::AsyncWriteExt as _;
 
@@ -27,7 +35,10 @@ fn shared_frame_and_handshake_vectors_are_stable() -> Result<(), Box<dyn std::er
         blake3::hash(&golden_structure_frame()?).to_hex().as_str(),
         GOLDEN_STRUCTURE_FRAME_BLAKE3
     );
-    let hello = Hello::default();
+    let hello = Hello {
+        maximum_minor: 0,
+        ..Hello::default()
+    };
     let encoded = encode_hello(&hello)?;
     assert_eq!(decode_hello(&encoded)?, hello);
     assert_eq!(
@@ -46,6 +57,537 @@ fn shared_frame_and_handshake_vectors_are_stable() -> Result<(), Box<dyn std::er
     assert_eq!(
         blake3::hash(&encoded).to_hex().as_str(),
         "1aad5efb68acd602463954756eb2d56cc8c07bba1e48970e4d74f31b0918c310"
+    );
+    Ok(())
+}
+
+#[test]
+fn security_read_plane_requests_use_append_only_tags_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let epoch = AuthorizationEpoch::new(7);
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    let assignment_id = SecurityId::new(2).ok_or("nonzero assignment")?;
+    let key_id = ApiKeyId::from_bytes([3; 16]).ok_or("nonzero key")?;
+    let operations = [
+        ProductOperation::SecurityStatus,
+        ProductOperation::SecurityPrincipalList(SecurityPrincipalListRequest::new(
+            Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::Principal(principal_id),
+            )),
+            1,
+        )?),
+        ProductOperation::SecurityRoleList(SecurityRoleListRequest::new(
+            Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::BuiltInRole(BuiltInRole::Reader),
+            )),
+            1,
+        )?),
+        ProductOperation::SecurityAssignmentList(SecurityAssignmentListRequest::new(
+            Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::Assignment(assignment_id),
+            )),
+            1,
+        )?),
+        ProductOperation::SecurityKeyList(SecurityKeyListRequest::new(
+            Some(SecurityCursor::new(epoch, SecurityCursorId::Key(key_id))),
+            1,
+        )?),
+        ProductOperation::SecurityAuditRead(SecurityAuditReadRequest::new(Some(principal_id), 1)?),
+    ];
+
+    for (offset, operation) in operations.into_iter().enumerate() {
+        let expected = format!("{operation:?}");
+        let request = WireRequest {
+            operation,
+            logical_time_micros: 10,
+            deadline_micros: None,
+            idempotency_token: None,
+            limits: ProductLimits::default(),
+            durability: ProductDurabilityPolicy::MEMORY,
+        };
+        let encoded = encode_product_request(&request)?;
+        assert_eq!(
+            u16::from_le_bytes(encoded[12..14].try_into()?),
+            42 + u16::try_from(offset)?
+        );
+        assert_eq!(
+            format!("{:?}", decode_product_request(&encoded)?.operation),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn security_read_plane_responses_use_append_only_tags_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let epoch = AuthorizationEpoch::new(7);
+    let responses = [
+        ProductResponse::SecurityStatus(AccessControlStatus {
+            bootstrapped: true,
+            epoch,
+            principals: 1,
+            assignments: 2,
+            custom_roles: 3,
+            custom_assignments: 4,
+            keys: 5,
+            pending_keys: 4,
+            audit_events: 7,
+        }),
+        ProductResponse::SecurityPrincipalPage(SecurityPrincipalPage {
+            authorization_epoch: epoch,
+            items: Box::new([]),
+            next_cursor: None,
+        }),
+        ProductResponse::SecurityRolePage(SecurityRolePage {
+            authorization_epoch: epoch,
+            items: Box::new([]),
+            next_cursor: None,
+        }),
+        ProductResponse::SecurityAssignmentPage(SecurityAssignmentPage {
+            authorization_epoch: epoch,
+            items: Box::new([]),
+            next_cursor: None,
+        }),
+        ProductResponse::SecurityKeyPage(SecurityKeyPage {
+            authorization_epoch: epoch,
+            items: Box::new([]),
+            next_cursor: None,
+        }),
+        ProductResponse::SecurityAuditPage(SecurityAuditPage {
+            events: Box::new([]),
+            next_cursor: None,
+        }),
+    ];
+
+    for (offset, response) in responses.into_iter().enumerate() {
+        let encoded = encode_product_response(&response)?;
+        if let Some(bound) = security_page_size_bound(&response) {
+            assert!(encoded.len() <= bound);
+        }
+        assert_eq!(
+            u16::from_le_bytes(encoded[12..14].try_into()?),
+            32 + u16::try_from(offset)?
+        );
+        assert_eq!(decode_product_response(&encoded)?, response);
+    }
+    Ok(())
+}
+
+#[test]
+fn security_read_plane_is_available_only_after_minor_one() -> Result<(), Box<dyn std::error::Error>>
+{
+    let request = security_wire_request(ProductOperation::SecurityStatus);
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 0),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded_request = encode_product_request_for_minor(&request, 1)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded_request, 0),
+        Err(ProductCodecError::Unsupported)
+    ));
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded_request, 1)?.operation,
+        ProductOperation::SecurityStatus
+    ));
+
+    let response = ProductResponse::SecurityStatus(AccessControlStatus {
+        bootstrapped: true,
+        epoch: AuthorizationEpoch::new(1),
+        principals: 1,
+        assignments: 1,
+        custom_roles: 0,
+        custom_assignments: 0,
+        keys: 1,
+        pending_keys: 0,
+        audit_events: 1,
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 0),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded_response = encode_product_response_for_minor(&response, 1)?;
+    assert!(encoded_response.len() <= AccessControlStatus::encoded_size_bound());
+    assert!(matches!(
+        decode_product_response_for_minor(&encoded_response, 0),
+        Err(ProductCodecError::Unsupported)
+    ));
+    assert_eq!(
+        decode_product_response_for_minor(&encoded_response, 1)?,
+        response
+    );
+    Ok(())
+}
+
+#[test]
+fn security_read_plane_nonempty_pages_have_a_redacted_golden_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let responses = nonempty_security_responses()?;
+
+    let mut transcript = Vec::new();
+    for response in responses {
+        let encoded = encode_product_response(&response)?;
+        let bound = security_page_size_bound(&response).ok_or("security page response expected")?;
+        assert!(encoded.len() <= bound);
+        assert_eq!(decode_product_response(&encoded)?, response);
+        let diagnostic = String::from_utf8_lossy(&encoded);
+        assert!(!diagnostic.contains("hyp1_"));
+        assert!(!diagnostic.contains("verifier"));
+        assert!(!diagnostic.contains("secret"));
+        transcript.extend_from_slice(&encoded);
+    }
+    assert_eq!(
+        blake3::hash(&transcript).to_hex().as_str(),
+        "67c752f3f510e5b4805e097b284b2ef70fd308fa71dd0778aafc42acdf24dfe8"
+    );
+    Ok(())
+}
+
+fn security_page_size_bound(response: &ProductResponse) -> Option<usize> {
+    match response {
+        ProductResponse::SecurityPrincipalPage(page) => Some(page.encoded_size_bound()),
+        ProductResponse::SecurityRolePage(page) => Some(page.encoded_size_bound()),
+        ProductResponse::SecurityAssignmentPage(page) => Some(page.encoded_size_bound()),
+        ProductResponse::SecurityKeyPage(page) => Some(page.encoded_size_bound()),
+        ProductResponse::SecurityAuditPage(page) => Some(page.encoded_size_bound()),
+        _ => None,
+    }
+}
+
+fn nonempty_security_responses() -> Result<[ProductResponse; 5], Box<dyn std::error::Error>> {
+    let epoch = AuthorizationEpoch::new(7);
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    let custom_role_id = SecurityId::new(2).ok_or("nonzero custom role")?;
+    let assignment_id = SecurityId::new(3).ok_or("nonzero assignment")?;
+    let event_id = SecurityId::new(4).ok_or("nonzero event")?;
+    let key_id = ApiKeyId::from_bytes([5; 16]).ok_or("nonzero key")?;
+    let custom_role = SecurityRoleSummary::custom(
+        custom_role_id,
+        "analytics reader",
+        vec![
+            CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+                .ok_or("valid grant")?,
+        ],
+    )?;
+    let key = SecurityKeySummary::try_from_wire(SecurityKeySummaryInput {
+        id: key_id,
+        principal_id,
+        label: "analytics sdk".to_owned(),
+        active: true,
+        roles: vec![BuiltInRole::Reader],
+        custom_roles: Vec::new(),
+        permission_ceiling: ProductAuthorization::from_permissions([ProductPermission::DataRead]),
+        scope_ceiling: vec![ProductScope::Instance],
+        created_at_micros: 10,
+        expires_at_micros: Some(20),
+        revoked: false,
+        published_epoch: epoch,
+        predecessor_id: None,
+        successor_id: None,
+        overlap_until_micros: None,
+        rotation_overlap_micros: None,
+    })?;
+    let event = SecurityAuditEvent::try_from_wire(
+        event_id,
+        9,
+        Some(principal_id),
+        Some(key_id),
+        SecurityAuditAction::CreatePrincipal,
+        SecurityAuditResult::Succeeded,
+        vec![SecurityAuditTarget::Principal(principal_id)],
+        vec![SecurityAuditMetadata::ExpiresAtMicros(20)],
+    )?;
+    Ok([
+        ProductResponse::SecurityPrincipalPage(SecurityPrincipalPage {
+            authorization_epoch: epoch,
+            items: vec![SecurityPrincipalSummary::new(
+                principal_id,
+                "analytics",
+                true,
+            )?]
+            .into_boxed_slice(),
+            next_cursor: Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::Principal(principal_id),
+            )),
+        }),
+        ProductResponse::SecurityRolePage(SecurityRolePage {
+            authorization_epoch: epoch,
+            items: vec![
+                SecurityRoleSummary::built_in(BuiltInRole::Reader),
+                custom_role,
+            ]
+            .into_boxed_slice(),
+            next_cursor: Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::CustomRole(custom_role_id),
+            )),
+        }),
+        ProductResponse::SecurityAssignmentPage(SecurityAssignmentPage {
+            authorization_epoch: epoch,
+            items: vec![SecurityAssignmentSummary::new(
+                assignment_id,
+                principal_id,
+                Some(BuiltInRole::Reader),
+                None,
+                Some(ProductScope::CatalogObject(ObjectId::new(8)?)),
+            )?]
+            .into_boxed_slice(),
+            next_cursor: Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::Assignment(assignment_id),
+            )),
+        }),
+        ProductResponse::SecurityKeyPage(SecurityKeyPage {
+            authorization_epoch: epoch,
+            items: vec![key].into_boxed_slice(),
+            next_cursor: Some(SecurityCursor::new(epoch, SecurityCursorId::Key(key_id))),
+        }),
+        ProductResponse::SecurityAuditPage(SecurityAuditPage {
+            events: vec![event].into_boxed_slice(),
+            next_cursor: Some(event_id),
+        }),
+    ])
+}
+
+#[test]
+fn security_read_plane_rejects_truncation_trailing_unknown_and_invalid_cursors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let epoch = AuthorizationEpoch::new(7);
+    let principal_id = SecurityId::new(1).ok_or("nonzero principal")?;
+    let operation = ProductOperation::SecurityPrincipalList(SecurityPrincipalListRequest::new(
+        Some(SecurityCursor::new(
+            epoch,
+            SecurityCursorId::Principal(principal_id),
+        )),
+        1,
+    )?);
+    let encoded = encode_product_request(&security_wire_request(operation))?;
+    for prefix_length in 0..encoded.len() {
+        assert!(
+            decode_product_request(&encoded[..prefix_length]).is_err(),
+            "request prefix length {prefix_length}"
+        );
+    }
+
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    let trailing_length = u32::try_from(trailing.len())?;
+    trailing[8..12].copy_from_slice(&trailing_length.to_le_bytes());
+    assert!(matches!(
+        decode_product_request(&trailing),
+        Err(ProductCodecError::Malformed)
+    ));
+
+    let mut unknown = encoded.clone();
+    unknown[12..14].copy_from_slice(&49_u16.to_le_bytes());
+    assert!(matches!(
+        decode_product_request(&unknown),
+        Err(ProductCodecError::Unsupported)
+    ));
+
+    let mut zero_epoch = encoded.clone();
+    zero_epoch[88..96].fill(0);
+    assert!(matches!(
+        decode_product_request(&zero_epoch),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let mut zero_id = encoded.clone();
+    zero_id[104..120].fill(0);
+    assert!(matches!(
+        decode_product_request(&zero_id),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let mut wrong_cursor_family = encoded.clone();
+    wrong_cursor_family[96] = 4;
+    assert!(matches!(
+        decode_product_request(&wrong_cursor_family),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    for invalid_limit in [0_u64, 1_001] {
+        let mut invalid_count = encoded.clone();
+        invalid_count[120..128].copy_from_slice(&invalid_limit.to_le_bytes());
+        assert!(matches!(
+            decode_product_request(&invalid_count),
+            Err(ProductCodecError::LimitExceeded)
+        ));
+    }
+
+    assert_invalid_security_request_encoders(epoch, principal_id);
+    Ok(())
+}
+
+fn assert_invalid_security_request_encoders(epoch: AuthorizationEpoch, principal_id: SecurityId) {
+    for limit in [0_usize, 1_001] {
+        let request = security_wire_request(ProductOperation::SecurityPrincipalList(
+            SecurityPrincipalListRequest {
+                cursor: None,
+                limit,
+            },
+        ));
+        assert!(matches!(
+            encode_product_request(&request),
+            Err(ProductCodecError::LimitExceeded)
+        ));
+        let audit_request = security_wire_request(ProductOperation::SecurityAuditRead(
+            SecurityAuditReadRequest {
+                cursor: None,
+                limit,
+            },
+        ));
+        assert!(matches!(
+            encode_product_request(&audit_request),
+            Err(ProductCodecError::LimitExceeded)
+        ));
+    }
+    let zero_epoch_request = security_wire_request(ProductOperation::SecurityPrincipalList(
+        SecurityPrincipalListRequest {
+            cursor: Some(SecurityCursor::new(
+                AuthorizationEpoch::UNMANAGED,
+                SecurityCursorId::Principal(principal_id),
+            )),
+            limit: 1,
+        },
+    ));
+    assert!(matches!(
+        encode_product_request(&zero_epoch_request),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    let cross_family_request = security_wire_request(ProductOperation::SecurityPrincipalList(
+        SecurityPrincipalListRequest {
+            cursor: Some(SecurityCursor::new(
+                epoch,
+                SecurityCursorId::Assignment(principal_id),
+            )),
+            limit: 1,
+        },
+    ));
+    assert!(matches!(
+        encode_product_request(&cross_family_request),
+        Err(ProductCodecError::InvalidValue)
+    ));
+}
+
+#[test]
+fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn std::error::Error>>
+{
+    let response = ProductResponse::SecurityPrincipalPage(SecurityPrincipalPage {
+        authorization_epoch: AuthorizationEpoch::new(7),
+        items: Box::new([]),
+        next_cursor: None,
+    });
+    let encoded = encode_product_response(&response)?;
+    for prefix_length in 0..encoded.len() {
+        assert!(
+            decode_product_response(&encoded[..prefix_length]).is_err(),
+            "response prefix length {prefix_length}"
+        );
+    }
+
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    let trailing_length = u32::try_from(trailing.len())?;
+    trailing[8..12].copy_from_slice(&trailing_length.to_le_bytes());
+    assert!(matches!(
+        decode_product_response(&trailing),
+        Err(ProductCodecError::Malformed)
+    ));
+
+    let mut unknown = encoded.clone();
+    unknown[12..14].copy_from_slice(&39_u16.to_le_bytes());
+    assert!(matches!(
+        decode_product_response(&unknown),
+        Err(ProductCodecError::Unsupported)
+    ));
+
+    let mut zero_epoch = encoded.clone();
+    zero_epoch[16..24].fill(0);
+    assert!(matches!(
+        decode_product_response(&zero_epoch),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let mut excessive_count = encoded;
+    excessive_count[24..28].copy_from_slice(&1_001_u32.to_le_bytes());
+    assert!(matches!(
+        decode_product_response(&excessive_count),
+        Err(ProductCodecError::InvalidValue)
+    ));
+
+    let [principal_page, ..] = nonempty_security_responses()?;
+    let mut zero_principal = encode_product_response(&principal_page)?;
+    zero_principal[72..88].fill(0);
+    assert!(matches!(
+        decode_product_response(&zero_principal),
+        Err(ProductCodecError::InvalidValue)
+    ));
+    Ok(())
+}
+
+fn security_wire_request(operation: ProductOperation) -> WireRequest {
+    WireRequest {
+        operation,
+        logical_time_micros: 10,
+        deadline_micros: None,
+        idempotency_token: None,
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::MEMORY,
+    }
+}
+
+#[test]
+fn protocol_minor_negotiation_preserves_1_0_and_selects_1_1()
+-> Result<(), Box<dyn std::error::Error>> {
+    let legacy = Hello {
+        maximum_minor: 0,
+        ..Hello::default()
+    };
+    let current = Hello::default();
+    assert_eq!(
+        negotiate(
+            &legacy,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        0
+    );
+    assert_eq!(
+        negotiate(
+            &current,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        1
+    );
+
+    let incompatible = Hello {
+        minimum_minor: 2,
+        maximum_minor: 2,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &incompatible,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )
+        .err(),
+        Some(HandshakeError::IncompatibleVersion)
     );
     Ok(())
 }
@@ -178,6 +720,7 @@ fn authenticated_hello_reports_every_truncated_prefix() -> Result<(), Box<dyn st
 
 fn authenticated_hello() -> Hello {
     Hello {
+        maximum_minor: 0,
         capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
         required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
         ..Hello::default()

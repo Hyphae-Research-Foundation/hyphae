@@ -37,21 +37,27 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
-    BackupInfo, BackupRequest, CatalogDependencyRequest, CatalogListRequest, CompactionRequest,
-    CompactionTarget, DoctorRequest, DoctorStatus, MetricValue, MigrationLexicalIndexInput,
-    MigrationVectorIndexInput, NativeProduct, ObjectId, ProductAggregation, ProductCommitOutcome,
-    ProductCommitReceipt, ProductDocValue, ProductDocument, ProductDurability, ProductExplain,
+    AccessControlStatus, BackupInfo, BackupRequest, BuiltInRole, CatalogDependencyRequest,
+    CatalogListRequest, CompactionRequest, CompactionTarget, DoctorRequest, DoctorStatus,
+    MetricValue, MigrationLexicalIndexInput, MigrationVectorIndexInput, NativeProduct, ObjectId,
+    ProductAggregation, ProductAuthorization, ProductCommitOutcome, ProductCommitReceipt,
+    ProductDocValue, ProductDocument, ProductDurability, ProductExplain,
     ProductExplicitTransactionStatus, ProductFacetRequest, ProductHashEntry, ProductLexicalBranch,
     ProductListSide, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
-    ProductResponse, ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
-    ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductSearchResults,
-    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
-    ProductSqlResult, ProductStructureKey, ProductStructureMutation,
-    ProductStructureMutationResult, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionHandle, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
-    ProductTransactionStageResult, ProductTransactionStatus, ProductTransactionVectorMutation,
-    ProductTtl, ProductValue, ProductVector, ProductVectorBranch, ProductVectorExecution,
-    ProductVectorStrategy, ProgressControl, RestorePhase, RestoreRequest, SnapshotIdentity,
+    ProductPermission, ProductResponse, ProductScope, ProductSearchDocumentDelete,
+    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchOperator, ProductSearchRequest, ProductSearchResults, ProductSearchSort,
+    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSqlResult,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation, ProductTransactionStageResult,
+    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
+    ProductVector, ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
+    ProgressControl, RestorePhase, RestoreRequest, SecurityAssignmentListRequest,
+    SecurityAssignmentPage, SecurityAuditAction, SecurityAuditMetadata, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor, SecurityId,
+    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest, SecurityPrincipalPage,
+    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
     StructureKind, VerifyBackupRequest, capabilities, verify_backup,
 };
 use hyphae_native_runtime::{
@@ -207,7 +213,7 @@ enum Command {
     Telemetry(LocalDirectory),
     /// Open the interactive native operator console.
     Console(LocalDirectory),
-    /// Bootstrap or inspect native principals, roles, and API keys.
+    /// Bootstrap or inspect security status, principals, roles, assignments, keys, and audit.
     Security {
         #[command(flatten)]
         local: LocalDirectory,
@@ -468,6 +474,31 @@ struct LocalDirectory {
 enum SecurityCommand {
     /// Report redacted access-control catalog status.
     Status,
+    /// Inspect redacted principal metadata.
+    Principal {
+        #[command(subcommand)]
+        operation: SecurityListCommand,
+    },
+    /// Inspect immutable and custom role metadata.
+    Role {
+        #[command(subcommand)]
+        operation: SecurityListCommand,
+    },
+    /// Inspect direct role assignments.
+    Assignment {
+        #[command(subcommand)]
+        operation: SecurityListCommand,
+    },
+    /// Inspect redacted API-key metadata.
+    Key {
+        #[command(subcommand)]
+        operation: SecurityListCommand,
+    },
+    /// Inspect retained durable security events.
+    Audit {
+        #[command(subcommand)]
+        operation: SecurityListCommand,
+    },
     /// Create the unique initial owner and a restricted API-key file.
     Bootstrap {
         /// Human-readable owner name; never used as authority.
@@ -479,6 +510,19 @@ enum SecurityCommand {
         /// New owner-only API-key file. Existing paths are never overwritten.
         #[arg(long)]
         key_out: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityListCommand {
+    /// Return one bounded page in stable order.
+    List {
+        /// Opaque continuation emitted by the preceding page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum redacted rows to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
 }
 
@@ -2894,31 +2938,27 @@ fn telemetry(local: &LocalDirectory) -> Result<(), CliFailure> {
 }
 
 fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliFailure> {
-    let mut product = NativeProduct::open(&local.data_dir)?;
     match command {
-        SecurityCommand::Status => {
-            let status = product.access_control_status()?;
-            if status.bootstrapped {
-                return Err(hyphae_native_product::ProductError::from_code(
-                    hyphae_native_product::ProductErrorCode::AuthorizationDenied,
-                )
-                .into());
-            }
-            print_json(&json!({
-                "schema": "hyphae-native-access-control-status-v1",
-                "bootstrapped": status.bootstrapped,
-                "authorization_epoch": status.epoch.get(),
-                "principals": status.principals,
-                "assignments": status.assignments,
-                "keys": status.keys,
-                "pending_keys": status.pending_keys,
-            }))
+        SecurityCommand::Status => dispatch(local, ProductOperation::SecurityStatus),
+        SecurityCommand::Principal { operation } => {
+            security_metadata(local, SecurityListKind::Principal, operation)
         }
+        SecurityCommand::Role { operation } => {
+            security_metadata(local, SecurityListKind::Role, operation)
+        }
+        SecurityCommand::Assignment { operation } => {
+            security_metadata(local, SecurityListKind::Assignment, operation)
+        }
+        SecurityCommand::Key { operation } => {
+            security_metadata(local, SecurityListKind::Key, operation)
+        }
+        SecurityCommand::Audit { operation } => security_audit(local, operation),
         SecurityCommand::Bootstrap {
             name,
             label,
             key_out,
         } => {
+            let mut product = NativeProduct::open(&local.data_dir)?;
             let receipt = product.bootstrap_access_control_to_file(
                 &name,
                 &label,
@@ -2936,6 +2976,80 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
             }))
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SecurityListKind {
+    Principal,
+    Role,
+    Assignment,
+    Key,
+}
+
+impl SecurityListKind {
+    fn operation(
+        self,
+        cursor: Option<SecurityCursor>,
+        limit: usize,
+    ) -> Result<ProductOperation, CliFailure> {
+        let operation = match self {
+            Self::Principal => ProductOperation::SecurityPrincipalList(
+                SecurityPrincipalListRequest::new(cursor, limit)
+                    .map_err(|_| CliFailure::invalid())?,
+            ),
+            Self::Role => ProductOperation::SecurityRoleList(
+                SecurityRoleListRequest::new(cursor, limit).map_err(|_| CliFailure::invalid())?,
+            ),
+            Self::Assignment => ProductOperation::SecurityAssignmentList(
+                SecurityAssignmentListRequest::new(cursor, limit)
+                    .map_err(|_| CliFailure::invalid())?,
+            ),
+            Self::Key => ProductOperation::SecurityKeyList(
+                SecurityKeyListRequest::new(cursor, limit).map_err(|_| CliFailure::invalid())?,
+            ),
+        };
+        Ok(operation)
+    }
+}
+
+const MAX_SECURITY_CURSOR_BYTES: usize = 128;
+
+fn security_metadata(
+    local: &LocalDirectory,
+    kind: SecurityListKind,
+    command: SecurityListCommand,
+) -> Result<(), CliFailure> {
+    let SecurityListCommand::List { cursor, limit } = command;
+    let cursor = parse_security_cursor(cursor.as_deref())?;
+    let mut client = open_client(local)?;
+    let response = client.dispatch(kind.operation(cursor, limit)?)?;
+    print_json(&response_json(response))
+}
+
+fn parse_security_cursor(requested: Option<&str>) -> Result<Option<SecurityCursor>, CliFailure> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested.len() > MAX_SECURITY_CURSOR_BYTES {
+        return Err(CliFailure::invalid());
+    }
+    SecurityCursor::from_token(requested)
+        .map(Some)
+        .map_err(|_| CliFailure::invalid())
+}
+
+fn security_audit(local: &LocalDirectory, command: SecurityListCommand) -> Result<(), CliFailure> {
+    let SecurityListCommand::List { cursor, limit } = command;
+    let cursor = cursor
+        .map(|value| {
+            value
+                .parse::<SecurityId>()
+                .map_err(|_| CliFailure::invalid())
+        })
+        .transpose()?;
+    let request =
+        SecurityAuditReadRequest::new(cursor, limit).map_err(|_| CliFailure::invalid())?;
+    dispatch(local, ProductOperation::SecurityAuditRead(request))
 }
 
 fn doctor(local: &LocalDirectory) -> Result<(), CliFailure> {
@@ -3266,6 +3380,12 @@ fn response_json(response: ProductResponse) -> Value {
             "verified_open": report.verified_open,
             "snapshot_verified": report.snapshot_verified,
         }),
+        ProductResponse::SecurityStatus(status) => security_status_json(status),
+        ProductResponse::SecurityPrincipalPage(page) => security_principal_page_json(page),
+        ProductResponse::SecurityRolePage(page) => security_role_page_json(&page),
+        ProductResponse::SecurityAssignmentPage(page) => security_assignment_page_json(page),
+        ProductResponse::SecurityKeyPage(page) => security_key_page_json(page),
+        ProductResponse::SecurityAuditPage(page) => security_audit_page_json(page),
         ProductResponse::PreparedSql {
             handle,
             catalog_version,
@@ -3368,6 +3488,194 @@ fn response_json(response: ProductResponse) -> Value {
             },
         }),
         _ => json!({ "status": "ok" }),
+    }
+}
+
+fn security_status_json(status: AccessControlStatus) -> Value {
+    json!({
+        "schema": "hyphae-native-access-control-status-v1",
+        "bootstrapped": status.bootstrapped,
+        "authorization_epoch": status.epoch.get(),
+        "principals": status.principals,
+        "assignments": status.assignments,
+        "custom_roles": status.custom_roles,
+        "custom_assignments": status.custom_assignments,
+        "keys": status.keys,
+        "pending_keys": status.pending_keys,
+        "audit_events": status.audit_events,
+    })
+}
+
+fn security_principal_page_json(page: SecurityPrincipalPage) -> Value {
+    json!({
+        "schema": "hyphae-native-security-principals-v1",
+        "authorization_epoch": page.authorization_epoch.get(),
+        "items": page.items.into_vec().into_iter().map(|principal| json!({
+            "id": principal.id().to_string(),
+            "display_name": principal.display_name(),
+            "enabled": principal.enabled(),
+        })).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor.map(SecurityCursor::to_token),
+    })
+}
+
+fn security_role_page_json(page: &SecurityRolePage) -> Value {
+    json!({
+        "schema": "hyphae-native-security-roles-v1",
+        "authorization_epoch": page.authorization_epoch.get(),
+        "items": page.items.iter().map(security_role_json).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor.map(SecurityCursor::to_token),
+    })
+}
+
+fn security_role_json(role: &SecurityRoleSummary) -> Value {
+    if let Some(built_in) = role.built_in_role() {
+        json!({
+            "kind": "built_in",
+            "id": built_in.as_str(),
+            "display_name": role.display_name(),
+            "permissions": authorization_permissions(built_in.authorization()),
+            "grants": [],
+        })
+    } else {
+        json!({
+            "kind": "custom",
+            "id": role.custom_role_id().map(|id| id.to_string()),
+            "display_name": role.display_name(),
+            "permissions": [],
+            "grants": role.grants().iter().copied().map(|grant| json!({
+                "permission": grant.permission().as_str(),
+                "scope": security_scope_json(grant.scope()),
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn security_assignment_page_json(page: SecurityAssignmentPage) -> Value {
+    json!({
+        "schema": "hyphae-native-security-assignments-v1",
+        "authorization_epoch": page.authorization_epoch.get(),
+        "items": page.items.into_vec().into_iter().map(|assignment| json!({
+            "id": assignment.id().to_string(),
+            "principal_id": assignment.principal_id().to_string(),
+            "built_in_role": assignment.built_in_role().map(BuiltInRole::as_str),
+            "custom_role_id": assignment.custom_role_id().map(|id| id.to_string()),
+            "scope": assignment.scope().map(security_scope_json),
+        })).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor.map(SecurityCursor::to_token),
+    })
+}
+
+fn security_key_page_json(page: SecurityKeyPage) -> Value {
+    json!({
+        "schema": "hyphae-native-security-keys-v1",
+        "authorization_epoch": page.authorization_epoch.get(),
+        "items": page.items.into_vec().into_iter().map(|key| json!({
+            "id": key.id().to_string(),
+            "principal_id": key.principal_id().to_string(),
+            "label": key.label(),
+            "active": key.active(),
+            "roles": key.roles().iter().map(|role| role.as_str()).collect::<Vec<_>>(),
+            "custom_roles": key.custom_roles().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "permission_ceiling": authorization_permissions(key.permission_ceiling()),
+            "scope_ceiling": key.scope_ceiling().iter().copied().map(security_scope_json).collect::<Vec<_>>(),
+            "created_at_micros": key.created_at_micros(),
+            "expires_at_micros": key.expires_at_micros(),
+            "revoked": key.revoked(),
+            "published_epoch": key.published_epoch().get(),
+            "predecessor_id": key.predecessor_id().map(|id| id.to_string()),
+            "successor_id": key.successor_id().map(|id| id.to_string()),
+            "overlap_until_micros": key.overlap_until_micros(),
+            "rotation_overlap_micros": key.rotation_overlap_micros(),
+        })).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor.map(SecurityCursor::to_token),
+    })
+}
+
+fn security_audit_page_json(page: SecurityAuditPage) -> Value {
+    json!({
+        "schema": "hyphae-native-security-audit-v1",
+        "items": page.events.into_vec().into_iter().map(|event| json!({
+            "id": event.id().to_string(),
+            "commit_csn": event.commit_csn(),
+            "actor_principal_id": event.actor_principal_id().map(|id| id.to_string()),
+            "actor_key_id": event.actor_key_id().map(|id| id.to_string()),
+            "action": security_audit_action(event.action()),
+            "result": security_audit_result(event.result()),
+            "targets": event.targets().iter().copied().map(security_audit_target_json).collect::<Vec<_>>(),
+            "metadata": event.metadata().iter().copied().map(security_audit_metadata_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor.map(|cursor| cursor.to_string()),
+    })
+}
+
+fn authorization_permissions(authorization: ProductAuthorization) -> Vec<&'static str> {
+    (0_u8..=u8::MAX)
+        .filter_map(ProductPermission::from_tag)
+        .filter(|permission| authorization.allows(*permission))
+        .map(ProductPermission::as_str)
+        .collect()
+}
+
+fn security_scope_json(scope: ProductScope) -> Value {
+    match scope {
+        ProductScope::Instance => json!({ "kind": "instance" }),
+        ProductScope::CatalogSubtree(object) => json!({
+            "kind": "catalog_subtree",
+            "object_id": object.get().to_string(),
+        }),
+        ProductScope::CatalogObject(object) => json!({
+            "kind": "catalog_object",
+            "object_id": object.get().to_string(),
+        }),
+    }
+}
+
+const fn security_audit_action(action: SecurityAuditAction) -> &'static str {
+    match action {
+        SecurityAuditAction::BootstrapOwner => "bootstrap_owner",
+        SecurityAuditAction::ActivateKey => "activate_key",
+        SecurityAuditAction::CreatePrincipal => "create_principal",
+        SecurityAuditAction::CreateCustomRole => "create_custom_role",
+        SecurityAuditAction::AssignBuiltInRole => "assign_built_in_role",
+        SecurityAuditAction::AssignCustomRole => "assign_custom_role",
+        SecurityAuditAction::IssueKey => "issue_key",
+        SecurityAuditAction::RotateKey => "rotate_key",
+        SecurityAuditAction::AbortKeyRotation => "abort_key_rotation",
+        SecurityAuditAction::AbortKeyIssue => "abort_key_issue",
+        SecurityAuditAction::RevokeKey => "revoke_key",
+        SecurityAuditAction::RecoverOwner => "recover_owner",
+        SecurityAuditAction::MigrateLegacyBearer => "migrate_legacy_bearer",
+    }
+}
+
+const fn security_audit_result(result: SecurityAuditResult) -> &'static str {
+    match result {
+        SecurityAuditResult::Succeeded => "succeeded",
+    }
+}
+
+fn security_audit_target_json(target: SecurityAuditTarget) -> Value {
+    match target {
+        SecurityAuditTarget::Principal(id) => {
+            json!({ "kind": "principal", "id": id.to_string() })
+        }
+        SecurityAuditTarget::Role(id) => json!({ "kind": "role", "id": id.to_string() }),
+        SecurityAuditTarget::Assignment(id) => {
+            json!({ "kind": "assignment", "id": id.to_string() })
+        }
+        SecurityAuditTarget::Key(id) => json!({ "kind": "key", "id": id.to_string() }),
+    }
+}
+
+fn security_audit_metadata_json(metadata: SecurityAuditMetadata) -> Value {
+    match metadata {
+        SecurityAuditMetadata::ExpiresAtMicros(value) => {
+            json!({ "kind": "expires_at_micros", "value": value })
+        }
+        SecurityAuditMetadata::RotationOverlapUntilMicros(value) => {
+            json!({ "kind": "rotation_overlap_until_micros", "value": value })
+        }
     }
 }
 
@@ -4534,10 +4842,11 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode, decode_hex,
-        encode_hex, hardware_with_writers, qualified_name,
+        Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode,
+        authorization_permissions, decode_hex, encode_hex, hardware_with_writers, qualified_name,
     };
     use clap::Parser;
+    use hyphae_native_product::{ProductAuthorization, ProductPermission};
     use hyphae_native_runtime::{
         CalibrationCacheStatus, CalibrationCorrectness, CalibrationCoverage,
         CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling,
@@ -4585,6 +4894,17 @@ mod tests {
             Some("main.public.items")
         );
         assert!(qualified_name("items").is_err());
+    }
+
+    #[test]
+    fn authorization_output_discovers_every_known_tag_and_omits_unknown_tags() {
+        let permissions = authorization_permissions(ProductAuthorization::ALL);
+        let known = (0_u8..=u8::MAX)
+            .filter_map(ProductPermission::from_tag)
+            .map(ProductPermission::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(permissions, known);
+        assert!(ProductPermission::from_tag(u8::MAX).is_none());
     }
 
     #[test]

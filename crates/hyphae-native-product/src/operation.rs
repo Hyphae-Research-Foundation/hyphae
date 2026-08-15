@@ -22,24 +22,28 @@ use crate::proof::{NativeOperationProofArtifact, NativeProofGenerationLimits};
 
 use crate::session::ProductAuthorizationRequirement;
 use crate::{
-    AdminStatus, AuthorizationEpoch, BackupInfo, BackupPhase, BackupProductError, BackupRequest,
-    CatalogDependencyRequest, CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage,
-    DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
-    ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
-    ProductDurability, ProductError, ProductErrorCode, ProductExplain,
-    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
-    ProductHashEntry, ProductLimits, ProductListSide, ProductPermission, ProductPreparedHandle,
-    ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
-    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureRead, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionStageReceipt, ProductTransactionStageResult,
-    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
-    ProgressControl, QualifiedName, RestoreRequest, SnapshotIdentity, StatusRequest,
-    TelemetryEvent, TelemetryEventKind, TelemetryRegistry, TimingClass,
+    AccessControlStatus, AdminStatus, AuthorizationEpoch, BackupInfo, BackupPhase,
+    BackupProductError, BackupRequest, CatalogDependencyRequest, CatalogListRequest, CatalogObject,
+    CatalogObjectSummary, CatalogPage, DoctorReport, DoctorRequest, MetricId, NativeProduct,
+    ObjectId, ProductAuthorization, ProductCancellationToken, ProductCapabilities,
+    ProductCheckpointReceipt, ProductCommitReceipt, ProductDurability, ProductError,
+    ProductErrorCode, ProductExplain, ProductExplicitCommitReceipt,
+    ProductExplicitTransactionStatus, ProductFailureBoundary, ProductHashEntry, ProductLimits,
+    ProductListSide, ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
+    ProductRollbackReceipt, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchRequest,
+    ProductSearchResult, ProductSession, ProductSessionId, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult, ProductStructureRead,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
+    ProductTransactionVectorMutation, ProductTtl, ProductValue, ProgressControl, QualifiedName,
+    RestoreRequest, SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityPrincipalListRequest, SecurityPrincipalPage, SecurityRoleListRequest, SecurityRolePage,
+    SnapshotIdentity, StatusRequest, TelemetryEvent, TelemetryEventKind, TelemetryRegistry,
+    TimingClass,
 };
 
 /// Product-owned durability policy applied to every mutation in one request.
@@ -399,6 +403,18 @@ pub enum ProductOperation {
         /// Independently obtained trusted anchor digest.
         trusted_anchor: [u8; 32],
     },
+    /// Read redacted access-control catalog status.
+    SecurityStatus,
+    /// List one redacted principal page.
+    SecurityPrincipalList(SecurityPrincipalListRequest),
+    /// List one redacted built-in and custom role page.
+    SecurityRoleList(SecurityRoleListRequest),
+    /// List one redacted built-in and custom assignment page.
+    SecurityAssignmentList(SecurityAssignmentListRequest),
+    /// List one redacted API-key metadata page.
+    SecurityKeyList(SecurityKeyListRequest),
+    /// Read one bounded security-audit page.
+    SecurityAuditRead(SecurityAuditReadRequest),
     /// Execute one eligible read and retain an offline-verifiable semantic proof.
     Prove {
         /// Read operation to execute exactly once for proof generation.
@@ -488,6 +504,18 @@ pub enum ProductResponse {
     Telemetry(crate::TelemetrySnapshot),
     /// Origin-independent proof verification report.
     ProofVerification(crate::proof::NativeProofVerificationReport),
+    /// Redacted access-control catalog status.
+    SecurityStatus(AccessControlStatus),
+    /// One bounded principal page.
+    SecurityPrincipalPage(SecurityPrincipalPage),
+    /// One bounded role page.
+    SecurityRolePage(SecurityRolePage),
+    /// One bounded role-assignment page.
+    SecurityAssignmentPage(SecurityAssignmentPage),
+    /// One bounded API-key metadata page.
+    SecurityKeyPage(SecurityKeyPage),
+    /// One bounded security-audit page.
+    SecurityAuditPage(SecurityAuditPage),
     /// Actual read response paired with its complete portable proof artifacts.
     Proven {
         /// Response produced by the operation integrated with proof generation.
@@ -1089,7 +1117,57 @@ fn dispatch_inner(
                 .record_timing(TimingClass::ProofVerification, started.elapsed());
             ProductResponse::ProofVerification(result.map_err(|error| map_proof_error(&error))?)
         }
+        ProductOperation::SecurityStatus => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityStatus(
+                product.read_security_status(&actor, context.logical_time_micros)?,
+            )
+        }
+        ProductOperation::SecurityPrincipalList(request) => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityPrincipalPage(product.read_security_principals(
+                &actor,
+                &request,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityRoleList(request) => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityRolePage(product.read_security_roles(
+                &actor,
+                &request,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityAssignmentList(request) => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityAssignmentPage(product.read_security_assignments(
+                &actor,
+                &request,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityKeyList(request) => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityKeyPage(product.read_security_keys(
+                &actor,
+                &request,
+                context.logical_time_micros,
+            )?)
+        }
+        ProductOperation::SecurityAuditRead(request) => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityAuditPage(product.read_security_audit(
+                &actor,
+                request.cursor,
+                request.limit,
+                context.logical_time_micros,
+            )?)
+        }
         ProductOperation::Prove { operation, limits } => {
+            if operation.requires_managed_authority() {
+                return Err(context.error(ProductErrorCode::InvalidRequest));
+            }
             let started = Instant::now();
             let result = crate::proof::dispatch_proven_operation(
                 product, session, context, &operation, limits,
@@ -1115,6 +1193,9 @@ fn admit_operation(
 ) -> Result<(), ProductError> {
     validate_context(session, context)?;
     let current_authority = validate_durable_authority(product, session)?;
+    if operation.requires_managed_authority() && current_authority.is_none() {
+        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    }
     let coarse_permissions = operation.required_permissions().map_err(|error| {
         if current_authority
             .as_deref()
@@ -1159,6 +1240,15 @@ fn admit_operation(
         context.limits.admit_response(count, bytes, bytes)?;
     }
     Ok(())
+}
+
+fn managed_actor(
+    session: &ProductSession,
+    context: &ProductRequestContext,
+) -> Result<Arc<crate::AuthenticatedAuthority>, ProductError> {
+    session
+        .authenticated_authority()?
+        .ok_or_else(|| context.error(ProductErrorCode::AuthorizationDenied))
 }
 
 fn mask_sql_classification_error(
@@ -2435,6 +2525,11 @@ impl ProductOperation {
                     && *output_member_limit <= limits.max_count
                     && *visit_limit <= limits.max_work_units
             }
+            Self::SecurityPrincipalList(request) => request.limit <= limits.max_count,
+            Self::SecurityRoleList(request) => request.limit <= limits.max_count,
+            Self::SecurityAssignmentList(request) => request.limit <= limits.max_count,
+            Self::SecurityKeyList(request) => request.limit <= limits.max_count,
+            Self::SecurityAuditRead(request) => request.limit <= limits.max_count,
             Self::Prove {
                 operation,
                 limits: _,
@@ -2506,6 +2601,12 @@ impl ProductOperation {
             }
             Self::Backup(_) => authorization([ProductPermission::BackupCreate]),
             Self::Restore(_) => authorization([ProductPermission::Restore]),
+            Self::SecurityStatus
+            | Self::SecurityPrincipalList(_)
+            | Self::SecurityRoleList(_)
+            | Self::SecurityAssignmentList(_)
+            | Self::SecurityKeyList(_) => authorization([ProductPermission::SecurityRead]),
+            Self::SecurityAuditRead(_) => authorization([ProductPermission::AuditRead]),
             Self::VerifyProof { .. } => authorization([ProductPermission::ProofVerify]),
             Self::Prove { operation, .. } => operation
                 .required_permissions()?
@@ -2543,7 +2644,13 @@ impl ProductOperation {
             | Self::AdminExplainSql { .. }
             | Self::Doctor(_)
             | Self::Telemetry
-            | Self::VerifyProof { .. } => true,
+            | Self::VerifyProof { .. }
+            | Self::SecurityStatus
+            | Self::SecurityPrincipalList(_)
+            | Self::SecurityRoleList(_)
+            | Self::SecurityAssignmentList(_)
+            | Self::SecurityKeyList(_)
+            | Self::SecurityAuditRead(_) => true,
             Self::ExecuteSql { statement, .. } => {
                 matches!(
                     classify_sql_statement(statement),
@@ -2569,6 +2676,19 @@ impl ProductOperation {
             | Self::AdminCheckpoint
             | Self::Backup(_)
             | Self::Restore(_) => false,
+        }
+    }
+
+    fn requires_managed_authority(&self) -> bool {
+        match self {
+            Self::SecurityStatus
+            | Self::SecurityPrincipalList(_)
+            | Self::SecurityRoleList(_)
+            | Self::SecurityAssignmentList(_)
+            | Self::SecurityKeyList(_)
+            | Self::SecurityAuditRead(_) => true,
+            Self::Prove { operation, .. } => operation.requires_managed_authority(),
+            _ => false,
         }
     }
 
@@ -2600,6 +2720,7 @@ impl ProductOperation {
         (count, bytes, work, bytes)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn request_cost_parts(&self) -> (usize, usize, usize) {
         match self {
             Self::Capabilities
@@ -2611,7 +2732,8 @@ impl ProductOperation {
             | Self::ExplicitTransactionStatus { .. }
             | Self::TransactionCommit { .. }
             | Self::TransactionRollback { .. }
-            | Self::Telemetry => (1, 0, 1),
+            | Self::Telemetry
+            | Self::SecurityStatus => (1, 0, 1),
             Self::DeallocatePrepared { .. } => (1, 8, 1),
             Self::AdminExplainSql { statement } | Self::PrepareSql { statement } => {
                 (1, statement.len(), statement.len())
@@ -2679,6 +2801,11 @@ impl ProductOperation {
                 request.destination.as_os_str().as_encoded_bytes().len(),
                 1,
             ),
+            Self::SecurityPrincipalList(request) => (request.limit, 0, request.limit.max(1)),
+            Self::SecurityRoleList(request) => (request.limit, 0, request.limit.max(1)),
+            Self::SecurityAssignmentList(request) => (request.limit, 0, request.limit.max(1)),
+            Self::SecurityKeyList(request) => (request.limit, 0, request.limit.max(1)),
+            Self::SecurityAuditRead(request) => (request.limit, 0, request.limit.max(1)),
             Self::Restore(request) => (
                 1,
                 request
@@ -2816,7 +2943,13 @@ impl ProductResponse {
             ),
             Self::IntegratedSearch(result) => (result.hits.len(), format!("{result:?}").len()),
             Self::AdminStatus(_) | Self::Doctor(_) => (1, 512),
+            Self::SecurityStatus(_) => (1, AccessControlStatus::encoded_size_bound()),
             Self::Backup(info) => (1, info.path.as_os_str().as_encoded_bytes().len() + 128),
+            Self::SecurityPrincipalPage(page) => (page.items.len(), page.encoded_size_bound()),
+            Self::SecurityRolePage(page) => (page.items.len(), page.encoded_size_bound()),
+            Self::SecurityAssignmentPage(page) => (page.items.len(), page.encoded_size_bound()),
+            Self::SecurityKeyPage(page) => (page.items.len(), page.encoded_size_bound()),
+            Self::SecurityAuditPage(page) => (page.events.len(), page.encoded_size_bound()),
             Self::Restore(info) => (1, info.data_path.as_os_str().as_encoded_bytes().len() + 512),
             Self::Telemetry(snapshot) => (
                 snapshot.metrics.len().saturating_add(snapshot.events.len()),
@@ -3017,4 +3150,45 @@ fn unix_time_micros() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_micros());
     i64::try_from(micros).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod security_response_cost_tests {
+    use super::*;
+
+    #[test]
+    fn security_response_cost_uses_canonical_encoded_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = AuthorizationEpoch::INITIAL;
+        let principals = SecurityPrincipalPage::try_from_wire(epoch, Vec::new(), None)?;
+        let roles = SecurityRolePage::try_from_wire(epoch, Vec::new(), None)?;
+        let assignments = SecurityAssignmentPage::try_from_wire(epoch, Vec::new(), None)?;
+        let keys = SecurityKeyPage::try_from_wire(epoch, Vec::new(), None)?;
+        let audit = SecurityAuditPage::try_from_wire(Vec::new(), None)?;
+        let status = AccessControlStatus {
+            bootstrapped: false,
+            epoch: AuthorizationEpoch::UNMANAGED,
+            principals: 0,
+            assignments: 0,
+            custom_roles: 0,
+            custom_assignments: 0,
+            keys: 0,
+            pending_keys: 0,
+            audit_events: 0,
+        };
+
+        assert_eq!(ProductResponse::SecurityStatus(status).cost(), (1, 88));
+        assert_eq!(
+            ProductResponse::SecurityPrincipalPage(principals).cost(),
+            (0, 72)
+        );
+        assert_eq!(ProductResponse::SecurityRolePage(roles).cost(), (0, 72));
+        assert_eq!(
+            ProductResponse::SecurityAssignmentPage(assignments).cost(),
+            (0, 72)
+        );
+        assert_eq!(ProductResponse::SecurityKeyPage(keys).cost(), (0, 72));
+        assert_eq!(ProductResponse::SecurityAuditPage(audit).cost(), (0, 48));
+        Ok(())
+    }
 }

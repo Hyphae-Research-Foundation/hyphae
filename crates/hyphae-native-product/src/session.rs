@@ -220,7 +220,8 @@ impl ProductAuthorization {
         Self(self.0 | other.0)
     }
 
-    pub(crate) const fn bits(self) -> u64 {
+    /// Returns the canonical known-permission wire mask.
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
@@ -228,7 +229,8 @@ impl ProductAuthorization {
         Self(bits & Self::ALL.0)
     }
 
-    pub(crate) const fn from_known_bits(bits: u64) -> Option<Self> {
+    /// Reconstructs an authorization mask only when every bit is known.
+    pub const fn from_known_bits(bits: u64) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 {
             Some(Self(bits))
         } else {

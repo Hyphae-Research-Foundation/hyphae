@@ -15,6 +15,8 @@ use hyphae_native_product::{
     ProductPreparedHandle, ProductResponse, ProductSearchDocumentDelete,
     ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchRequest,
     ProductStructureMutation, ProductStructureReadRequest, ProductValue, RestoreRequest,
+    SecurityAssignmentListRequest, SecurityAuditReadRequest, SecurityKeyListRequest,
+    SecurityPrincipalListRequest, SecurityRoleListRequest,
 };
 
 use super::{HttpTransport, LocalTransport};
@@ -425,6 +427,65 @@ impl HyphaeClient {
     /// Captures the bounded process-local telemetry registry.
     pub async fn telemetry(&self, options: RequestOptions) -> Result<ProductResponse, ClientError> {
         self.execute(ProductOperation::Telemetry, options).await
+    }
+
+    /// Reads redacted access-control catalog status.
+    pub async fn security_status(
+        &self,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityStatus, options)
+            .await
+    }
+
+    /// Lists one bounded redacted principal page.
+    pub async fn security_principal_list(
+        &self,
+        request: SecurityPrincipalListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityPrincipalList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted role page.
+    pub async fn security_role_list(
+        &self,
+        request: SecurityRoleListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityRoleList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted assignment page.
+    pub async fn security_assignment_list(
+        &self,
+        request: SecurityAssignmentListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityAssignmentList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted API-key metadata page.
+    pub async fn security_key_list(
+        &self,
+        request: SecurityKeyListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityKeyList(request), options)
+            .await
+    }
+
+    /// Reads one bounded redacted security-audit page.
+    pub async fn security_audit_read(
+        &self,
+        request: SecurityAuditReadRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityAuditRead(request), options)
+            .await
     }
 
     /// Explains one SQL statement.

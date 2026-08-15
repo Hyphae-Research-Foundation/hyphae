@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::Write,
+    ops::Bound::{Excluded, Unbounded},
     path::Path,
     sync::{Arc, atomic::Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,6 +28,20 @@ const CATALOG_V1_MAGIC: &[u8; 8] = b"HYACAT01";
 const CATALOG_MAGIC: &[u8; 8] = b"HYACAT02";
 const CATALOG_DIGEST_BYTES: usize = 32;
 const MAX_ACCESS_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum redacted records returned by one security metadata list.
+pub const MAX_SECURITY_LIST_ROWS: usize = AccessControlLimits::V1.security_result_rows;
+const PRODUCT_RESPONSE_ENVELOPE_BYTES: usize = 16;
+const SECURITY_METADATA_PAGE_HEADER_BYTES: usize = 56;
+const SECURITY_AUDIT_PAGE_HEADER_BYTES: usize = 32;
+const BUILT_IN_ROLES: [BuiltInRole; 7] = [
+    BuiltInRole::Owner,
+    BuiltInRole::Admin,
+    BuiltInRole::Operator,
+    BuiltInRole::Developer,
+    BuiltInRole::Writer,
+    BuiltInRole::Reader,
+    BuiltInRole::Auditor,
+];
 const ACCESS_CONTROL_STORAGE_KEY: &[u8] = b"\0hyphae.product.access-control.v1\0catalog";
 const AUDIT_EVENT_MAGIC: &[u8; 8] = b"HYAEVT01";
 const AUDIT_EVENT_STORAGE_PREFIX: &[u8] = b"\0hyphae.product.access-control.v1\0audit\0";
@@ -460,7 +475,8 @@ pub enum SecurityAuditAction {
 }
 
 impl SecurityAuditAction {
-    const fn tag(self) -> u8 {
+    /// Returns the stable append-only wire tag.
+    pub const fn tag(self) -> u8 {
         match self {
             Self::BootstrapOwner => 0,
             Self::ActivateKey => 1,
@@ -478,7 +494,8 @@ impl SecurityAuditAction {
         }
     }
 
-    const fn from_tag(tag: u8) -> Option<Self> {
+    /// Reconstructs one audit action from its stable wire tag.
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(Self::BootstrapOwner),
             1 => Some(Self::ActivateKey),
@@ -541,6 +558,45 @@ pub struct SecurityAuditEvent {
 }
 
 impl SecurityAuditEvent {
+    /// Reconstructs one bounded canonical redacted event from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero CSN, unpaired actor identities, empty or
+    /// noncanonical targets, noncanonical metadata, or oversized output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_wire(
+        id: SecurityId,
+        commit_csn: u64,
+        actor_principal_id: Option<SecurityId>,
+        actor_key_id: Option<ApiKeyId>,
+        action: SecurityAuditAction,
+        result: SecurityAuditResult,
+        targets: Vec<SecurityAuditTarget>,
+        metadata: Vec<SecurityAuditMetadata>,
+    ) -> Result<Self, AccessCatalogError> {
+        if commit_csn == 0
+            || actor_principal_id.is_some() != actor_key_id.is_some()
+            || targets.is_empty()
+            || !strictly_sorted(&targets)
+            || !strictly_sorted(&metadata)
+        {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        let event = Self {
+            id,
+            commit_csn,
+            actor_principal_id,
+            actor_key_id,
+            action,
+            result,
+            targets: targets.into_boxed_slice(),
+            metadata: metadata.into_boxed_slice(),
+        };
+        encode_audit_event(&event)?;
+        Ok(event)
+    }
+
     /// Returns the stable event identity.
     pub const fn id(&self) -> SecurityId {
         self.id
@@ -579,6 +635,13 @@ impl SecurityAuditEvent {
     /// Returns typed redacted metadata only.
     pub fn metadata(&self) -> &[SecurityAuditMetadata] {
         &self.metadata
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native event.
+    pub fn encoded_size_bound(&self) -> usize {
+        88_usize
+            .saturating_add(self.targets.len().saturating_mul(24))
+            .saturating_add(self.metadata.len().saturating_mul(16))
     }
 }
 
@@ -659,6 +722,938 @@ pub struct AccessControlStatus {
     /// Retained append-only security audit events.
     pub audit_events: usize,
 }
+
+impl AccessControlStatus {
+    /// Validates that the aggregate can represent one canonical access-control
+    /// catalog snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an inconsistent bootstrap generation or any count
+    /// outside the immutable access-control bounds.
+    pub fn validate(&self) -> Result<(), AccessCatalogError> {
+        let limits = AccessControlLimits::V1;
+        let empty = self.principals == 0
+            && self.assignments == 0
+            && self.custom_roles == 0
+            && self.custom_assignments == 0
+            && self.keys == 0
+            && self.pending_keys == 0
+            && self.audit_events == 0;
+        let valid_generation = if self.bootstrapped {
+            self.epoch != AuthorizationEpoch::UNMANAGED
+                && self.principals > 0
+                && self.assignments > 0
+        } else {
+            self.epoch == AuthorizationEpoch::UNMANAGED && empty
+        };
+        let maximum_assignments = self
+            .principals
+            .saturating_mul(limits.assignments_per_principal);
+        if !valid_generation
+            || self.principals > limits.principals
+            || self.assignments.saturating_add(self.custom_assignments) > maximum_assignments
+            || self.custom_roles > limits.custom_roles
+            || self.keys > self.principals.saturating_mul(limits.keys_per_principal)
+            || self.pending_keys > self.keys
+            || self.audit_events > limits.retained_audit_events
+        {
+            Err(AccessCatalogError::InvalidRequest)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native response.
+    pub const fn encoded_size_bound() -> usize {
+        PRODUCT_RESPONSE_ENVELOPE_BYTES + 72
+    }
+}
+
+/// Typed exclusive continuation retained by one security metadata cursor.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SecurityCursorId {
+    /// Stable principal continuation.
+    Principal(SecurityId),
+    /// Immutable built-in role continuation.
+    BuiltInRole(BuiltInRole),
+    /// Stable custom-role continuation.
+    CustomRole(SecurityId),
+    /// Stable role-assignment continuation.
+    Assignment(SecurityId),
+    /// Public API-key continuation.
+    Key(ApiKeyId),
+}
+
+/// Opaque security metadata cursor bound to one authorization generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityCursor {
+    authorization_epoch: AuthorizationEpoch,
+    after_id: SecurityCursorId,
+}
+
+impl SecurityCursor {
+    /// Reconstructs one typed cursor from a previously returned generation and
+    /// exclusive continuation.
+    pub const fn new(authorization_epoch: AuthorizationEpoch, after_id: SecurityCursorId) -> Self {
+        Self {
+            authorization_epoch,
+            after_id,
+        }
+    }
+
+    /// Returns the exact authorization generation required by this cursor.
+    pub const fn authorization_epoch(self) -> AuthorizationEpoch {
+        self.authorization_epoch
+    }
+
+    /// Returns the typed exclusive continuation.
+    pub const fn after_id(self) -> SecurityCursorId {
+        self.after_id
+    }
+
+    /// Encodes this cursor as one bounded opaque command-line token.
+    pub fn to_token(self) -> String {
+        let epoch = self.authorization_epoch.get();
+        match self.after_id {
+            SecurityCursorId::Principal(id) => format!("hysec1:{epoch}:principal:{id}"),
+            SecurityCursorId::BuiltInRole(role) => {
+                format!("hysec1:{epoch}:built-in-role:{role}")
+            }
+            SecurityCursorId::CustomRole(id) => {
+                format!("hysec1:{epoch}:custom-role:{id}")
+            }
+            SecurityCursorId::Assignment(id) => format!("hysec1:{epoch}:assignment:{id}"),
+            SecurityCursorId::Key(id) => format!("hysec1:{epoch}:key:{id}"),
+        }
+    }
+
+    /// Decodes one canonical token previously returned by [`Self::to_token`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessCatalogError::InvalidRequest`] for an unknown version,
+    /// zero generation, unknown cursor kind, noncanonical identity, or any
+    /// missing or trailing field.
+    pub fn from_token(token: &str) -> Result<Self, AccessCatalogError> {
+        let mut fields = token.split(':');
+        let version = fields.next();
+        let epoch = fields.next().and_then(|value| value.parse::<u64>().ok());
+        let kind = fields.next();
+        let value = fields.next();
+        if version != Some("hysec1") || epoch == Some(0) || fields.next().is_some() {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        let epoch = AuthorizationEpoch::new(epoch.ok_or(AccessCatalogError::InvalidRequest)?);
+        let value = value.ok_or(AccessCatalogError::InvalidRequest)?;
+        let after_id = match kind {
+            Some("principal") => SecurityCursorId::Principal(
+                value
+                    .parse()
+                    .map_err(|_| AccessCatalogError::InvalidRequest)?,
+            ),
+            Some("built-in-role") => SecurityCursorId::BuiltInRole(
+                BuiltInRole::parse(value).ok_or(AccessCatalogError::InvalidRequest)?,
+            ),
+            Some("custom-role") => SecurityCursorId::CustomRole(
+                value
+                    .parse()
+                    .map_err(|_| AccessCatalogError::InvalidRequest)?,
+            ),
+            Some("assignment") => SecurityCursorId::Assignment(
+                value
+                    .parse()
+                    .map_err(|_| AccessCatalogError::InvalidRequest)?,
+            ),
+            Some("key") => SecurityCursorId::Key(
+                value
+                    .parse()
+                    .map_err(|_| AccessCatalogError::InvalidRequest)?,
+            ),
+            _ => return Err(AccessCatalogError::InvalidRequest),
+        };
+        let cursor = Self::new(epoch, after_id);
+        if cursor.to_token() != token {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        Ok(cursor)
+    }
+}
+
+macro_rules! security_list_request {
+    ($name:ident) => {
+        /// One bounded security metadata list request.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name {
+            /// Optional exclusive cursor returned by the same list operation.
+            pub cursor: Option<SecurityCursor>,
+            /// Maximum redacted records to return.
+            pub limit: usize,
+        }
+
+        impl $name {
+            /// Constructs one bounded list request.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when `limit` is zero or exceeds the fixed
+            /// security metadata result bound.
+            pub fn new(
+                cursor: Option<SecurityCursor>,
+                limit: usize,
+            ) -> Result<Self, AccessCatalogError> {
+                let request = Self { cursor, limit };
+                request.validate()?;
+                Ok(request)
+            }
+
+            /// Validates the fixed result bound for this request.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when `limit` is zero or exceeds the fixed
+            /// security metadata result bound.
+            pub fn validate(self) -> Result<(), AccessCatalogError> {
+                validate_security_list_limit(self.limit)
+            }
+
+            /// Returns the optional exclusive cursor.
+            pub const fn cursor(self) -> Option<SecurityCursor> {
+                self.cursor
+            }
+
+            /// Returns the maximum records requested.
+            pub const fn limit(self) -> usize {
+                self.limit
+            }
+        }
+    };
+}
+
+security_list_request!(SecurityPrincipalListRequest);
+security_list_request!(SecurityRoleListRequest);
+security_list_request!(SecurityAssignmentListRequest);
+security_list_request!(SecurityKeyListRequest);
+
+/// One bounded security-audit request retaining its v1 event cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityAuditReadRequest {
+    /// Optional exclusive retained-event identity.
+    pub cursor: Option<SecurityId>,
+    /// Maximum retained events to return.
+    pub limit: usize,
+}
+
+impl SecurityAuditReadRequest {
+    /// Constructs one bounded security-audit request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` is zero or exceeds the audit result
+    /// bound.
+    pub fn new(cursor: Option<SecurityId>, limit: usize) -> Result<Self, AccessCatalogError> {
+        let request = Self { cursor, limit };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates the fixed result bound for this request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `limit` is zero or exceeds the audit result
+    /// bound.
+    pub fn validate(self) -> Result<(), AccessCatalogError> {
+        if self.limit == 0 || self.limit > AccessControlLimits::V1.audit_result_rows {
+            Err(AccessCatalogError::InvalidRequest)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns the optional exclusive retained-event cursor.
+    pub const fn cursor(self) -> Option<SecurityId> {
+        self.cursor
+    }
+
+    /// Returns the maximum events requested.
+    pub const fn limit(self) -> usize {
+        self.limit
+    }
+}
+
+/// Redacted principal metadata returned by the security read plane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityPrincipalSummary {
+    id: SecurityId,
+    display_name: Box<str>,
+    enabled: bool,
+}
+
+impl SecurityPrincipalSummary {
+    /// Reconstructs one redacted principal summary from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the display name violates the bounded canonical
+    /// security text contract.
+    pub fn new(
+        id: SecurityId,
+        display_name: impl Into<Box<str>>,
+        enabled: bool,
+    ) -> Result<Self, AccessCatalogError> {
+        let display_name = display_name.into();
+        validate_display_name(&display_name)?;
+        Ok(Self {
+            id,
+            display_name,
+            enabled,
+        })
+    }
+
+    /// Returns the stable principal identity.
+    pub const fn id(&self) -> SecurityId {
+        self.id
+    }
+
+    /// Returns the non-authoritative display name.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Returns whether the principal can authenticate.
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native item.
+    pub fn encoded_size_bound(&self) -> usize {
+        28_usize.saturating_add(self.display_name.len())
+    }
+}
+
+impl From<&SecurityPrincipalRecord> for SecurityPrincipalSummary {
+    fn from(record: &SecurityPrincipalRecord) -> Self {
+        Self {
+            id: record.id,
+            display_name: record.display_name.clone(),
+            enabled: record.enabled,
+        }
+    }
+}
+
+/// Redacted immutable or custom role metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityRoleSummary {
+    kind: SecurityRoleSummaryKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecurityRoleSummaryKind {
+    BuiltIn(BuiltInRole),
+    Custom {
+        id: SecurityId,
+        display_name: Box<str>,
+        grants: Box<[CustomRoleGrant]>,
+    },
+}
+
+impl SecurityRoleSummary {
+    /// Constructs one immutable built-in role summary.
+    pub const fn built_in(role: BuiltInRole) -> Self {
+        Self {
+            kind: SecurityRoleSummaryKind::BuiltIn(role),
+        }
+    }
+
+    /// Constructs one validated custom-role summary from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or reserved display text, empty or
+    /// oversized grants, or noncanonical grant order.
+    pub fn custom(
+        id: SecurityId,
+        display_name: impl Into<Box<str>>,
+        grants: Vec<CustomRoleGrant>,
+    ) -> Result<Self, AccessCatalogError> {
+        let display_name = display_name.into();
+        validate_display_name(&display_name)?;
+        if BuiltInRole::parse(&display_name.to_ascii_lowercase()).is_some()
+            || grants.is_empty()
+            || grants.len() > AccessControlLimits::V1.grants_per_role
+            || !strictly_sorted(&grants)
+            || grants.iter().any(|grant| {
+                grant.permission == ProductPermission::OwnershipManage
+                    || !grant.permission.supports_scope(grant.scope)
+            })
+        {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        Ok(Self {
+            kind: SecurityRoleSummaryKind::Custom {
+                id,
+                display_name,
+                grants: grants.into_boxed_slice(),
+            },
+        })
+    }
+
+    /// Returns the built-in role, when this is immutable metadata.
+    pub const fn built_in_role(&self) -> Option<BuiltInRole> {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(role) => Some(*role),
+            SecurityRoleSummaryKind::Custom { .. } => None,
+        }
+    }
+
+    /// Returns the stable custom-role identity, when applicable.
+    pub const fn custom_role_id(&self) -> Option<SecurityId> {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(_) => None,
+            SecurityRoleSummaryKind::Custom { id, .. } => Some(*id),
+        }
+    }
+
+    /// Returns the stable display name.
+    pub fn display_name(&self) -> &str {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(role) => role.as_str(),
+            SecurityRoleSummaryKind::Custom { display_name, .. } => display_name,
+        }
+    }
+
+    /// Returns direct custom grants. Built-in grants remain represented by
+    /// the returned [`BuiltInRole`] and therefore yield an empty slice here.
+    pub fn grants(&self) -> &[CustomRoleGrant] {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(_) => &[],
+            SecurityRoleSummaryKind::Custom { grants, .. } => grants,
+        }
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native item.
+    pub fn encoded_size_bound(&self) -> usize {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(_) => 8,
+            SecurityRoleSummaryKind::Custom {
+                display_name,
+                grants,
+                ..
+            } => 36_usize
+                .saturating_add(display_name.len())
+                .saturating_add(grants.len().saturating_mul(32)),
+        }
+    }
+
+    fn cursor_id(&self) -> SecurityCursorId {
+        match &self.kind {
+            SecurityRoleSummaryKind::BuiltIn(role) => SecurityCursorId::BuiltInRole(*role),
+            SecurityRoleSummaryKind::Custom { id, .. } => SecurityCursorId::CustomRole(*id),
+        }
+    }
+}
+
+/// Redacted direct role-assignment metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityAssignmentSummary {
+    id: SecurityId,
+    principal_id: SecurityId,
+    built_in_role: Option<BuiltInRole>,
+    custom_role_id: Option<SecurityId>,
+    scope: Option<ProductScope>,
+}
+
+impl SecurityAssignmentSummary {
+    /// Reconstructs one direct assignment summary from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Exactly one role family must be present. Built-in assignments require
+    /// a scope; custom-role assignments must not carry one. Owner remains
+    /// instance-scoped.
+    pub fn new(
+        id: SecurityId,
+        principal_id: SecurityId,
+        built_in_role: Option<BuiltInRole>,
+        custom_role_id: Option<SecurityId>,
+        scope: Option<ProductScope>,
+    ) -> Result<Self, AccessCatalogError> {
+        let canonical = matches!(
+            (built_in_role, custom_role_id, scope),
+            (Some(_), None, Some(_)) | (None, Some(_), None)
+        );
+        if !canonical
+            || built_in_role == Some(BuiltInRole::Owner) && scope != Some(ProductScope::Instance)
+        {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        Ok(Self {
+            id,
+            principal_id,
+            built_in_role,
+            custom_role_id,
+            scope,
+        })
+    }
+
+    /// Returns the stable assignment identity.
+    pub const fn id(self) -> SecurityId {
+        self.id
+    }
+
+    /// Returns the assigned principal identity.
+    pub const fn principal_id(self) -> SecurityId {
+        self.principal_id
+    }
+
+    /// Returns the assigned immutable role, when applicable.
+    pub const fn built_in_role(self) -> Option<BuiltInRole> {
+        self.built_in_role
+    }
+
+    /// Returns the assigned custom-role identity, when applicable.
+    pub const fn custom_role_id(self) -> Option<SecurityId> {
+        self.custom_role_id
+    }
+
+    /// Returns the direct built-in assignment scope. Custom assignments use
+    /// the grants retained by their custom role and therefore return `None`.
+    pub const fn scope(self) -> Option<ProductScope> {
+        self.scope
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native item.
+    pub const fn encoded_size_bound(self) -> usize {
+        if self.built_in_role.is_some() { 64 } else { 56 }
+    }
+}
+
+impl From<BuiltInRoleAssignment> for SecurityAssignmentSummary {
+    fn from(assignment: BuiltInRoleAssignment) -> Self {
+        Self {
+            id: assignment.id,
+            principal_id: assignment.principal_id,
+            built_in_role: Some(assignment.role),
+            custom_role_id: None,
+            scope: Some(assignment.scope),
+        }
+    }
+}
+
+impl From<CustomRoleAssignment> for SecurityAssignmentSummary {
+    fn from(assignment: CustomRoleAssignment) -> Self {
+        Self {
+            id: assignment.id,
+            principal_id: assignment.principal_id,
+            built_in_role: None,
+            custom_role_id: Some(assignment.role_id),
+            scope: None,
+        }
+    }
+}
+
+/// Wire-ready redacted API-key metadata input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityKeySummaryInput {
+    /// Public key identity.
+    pub id: ApiKeyId,
+    /// Owning principal identity.
+    pub principal_id: SecurityId,
+    /// Bounded non-secret label.
+    pub label: String,
+    /// Whether restricted output activation completed durably.
+    pub active: bool,
+    /// Canonically sorted key-selected built-in roles.
+    pub roles: Vec<BuiltInRole>,
+    /// Canonically sorted key-selected custom-role identities.
+    pub custom_roles: Vec<SecurityId>,
+    /// Credential permission ceiling containing known bits only.
+    pub permission_ceiling: ProductAuthorization,
+    /// Canonically sorted credential scope ceiling.
+    pub scope_ceiling: Vec<ProductScope>,
+    /// Durable creation instant.
+    pub created_at_micros: i64,
+    /// Optional exclusive expiry instant.
+    pub expires_at_micros: Option<i64>,
+    /// Whether the credential was durably revoked.
+    pub revoked: bool,
+    /// Authorization generation at publication.
+    pub published_epoch: AuthorizationEpoch,
+    /// Immediate predecessor for a rotation successor.
+    pub predecessor_id: Option<ApiKeyId>,
+    /// Immediate successor when rotation has begun.
+    pub successor_id: Option<ApiKeyId>,
+    /// Predecessor's exclusive overlap deadline.
+    pub overlap_until_micros: Option<i64>,
+    /// Configured successor overlap duration.
+    pub rotation_overlap_micros: Option<u64>,
+}
+
+/// Redacted API-key metadata. The secret and verifier are structurally absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityKeySummary {
+    id: ApiKeyId,
+    principal_id: SecurityId,
+    label: Box<str>,
+    active: bool,
+    roles: Box<[BuiltInRole]>,
+    custom_roles: Box<[SecurityId]>,
+    permission_ceiling: ProductAuthorization,
+    scope_ceiling: Box<[ProductScope]>,
+    created_at_micros: i64,
+    expires_at_micros: Option<i64>,
+    revoked: bool,
+    published_epoch: AuthorizationEpoch,
+    predecessor_id: Option<ApiKeyId>,
+    successor_id: Option<ApiKeyId>,
+    overlap_until_micros: Option<i64>,
+    rotation_overlap_micros: Option<u64>,
+}
+
+impl SecurityKeySummary {
+    /// Reconstructs one canonical redacted key summary from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid labels, empty or noncanonical roles and
+    /// scopes, unknown temporal generations, or incoherent rotation links.
+    pub fn try_from_wire(input: SecurityKeySummaryInput) -> Result<Self, AccessCatalogError> {
+        validate_display_name(&input.label)?;
+        let limits = AccessControlLimits::V1;
+        let selected_role_count = input.roles.len().saturating_add(input.custom_roles.len());
+        let roles_are_canonical = input.roles.is_empty() || strictly_sorted(&input.roles);
+        let custom_roles_are_canonical =
+            input.custom_roles.is_empty() || strictly_sorted(&input.custom_roles);
+        let scopes_are_canonical = !input.scope_ceiling.is_empty()
+            && input.scope_ceiling.len() <= limits.assignments_per_principal
+            && strictly_sorted(&input.scope_ceiling)
+            && (!input.scope_ceiling.contains(&ProductScope::Instance)
+                || input.scope_ceiling.len() == 1);
+        let rotation_shape = matches!(
+            (
+                input.predecessor_id,
+                input.successor_id,
+                input.overlap_until_micros,
+                input.rotation_overlap_micros,
+            ),
+            (None, None | Some(_), None, None)
+                | (Some(_), None, None, Some(_))
+                | (None, Some(_), Some(_), None)
+        );
+        if input.roles.is_empty() && input.custom_roles.is_empty()
+            || selected_role_count > limits.assignments_per_principal
+            || !roles_are_canonical
+            || !custom_roles_are_canonical
+            || !scopes_are_canonical
+            || input
+                .expires_at_micros
+                .is_some_and(|expiry| expiry <= input.created_at_micros)
+            || input.published_epoch == AuthorizationEpoch::UNMANAGED
+            || input.predecessor_id == Some(input.id)
+            || input.successor_id == Some(input.id)
+            || input
+                .overlap_until_micros
+                .is_some_and(|deadline| deadline <= input.created_at_micros)
+            || input.rotation_overlap_micros.is_some_and(|overlap| {
+                overlap
+                    > limits
+                        .maximum_rotation_overlap_seconds
+                        .saturating_mul(1_000_000)
+            })
+            || !rotation_shape
+        {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+        Ok(Self {
+            id: input.id,
+            principal_id: input.principal_id,
+            label: input.label.into_boxed_str(),
+            active: input.active,
+            roles: input.roles.into_boxed_slice(),
+            custom_roles: input.custom_roles.into_boxed_slice(),
+            permission_ceiling: input.permission_ceiling,
+            scope_ceiling: input.scope_ceiling.into_boxed_slice(),
+            created_at_micros: input.created_at_micros,
+            expires_at_micros: input.expires_at_micros,
+            revoked: input.revoked,
+            published_epoch: input.published_epoch,
+            predecessor_id: input.predecessor_id,
+            successor_id: input.successor_id,
+            overlap_until_micros: input.overlap_until_micros,
+            rotation_overlap_micros: input.rotation_overlap_micros,
+        })
+    }
+
+    /// Returns the public key identity.
+    pub const fn id(&self) -> ApiKeyId {
+        self.id
+    }
+
+    /// Returns the owning principal identity.
+    pub const fn principal_id(&self) -> SecurityId {
+        self.principal_id
+    }
+
+    /// Returns the bounded non-secret label.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns whether restricted output activation completed durably.
+    pub const fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Returns key-selected built-in roles.
+    pub fn roles(&self) -> &[BuiltInRole] {
+        &self.roles
+    }
+
+    /// Returns key-selected custom-role identities.
+    pub fn custom_roles(&self) -> &[SecurityId] {
+        &self.custom_roles
+    }
+
+    /// Returns the credential permission ceiling.
+    pub const fn permission_ceiling(&self) -> ProductAuthorization {
+        self.permission_ceiling
+    }
+
+    /// Returns the credential scope ceiling.
+    pub fn scope_ceiling(&self) -> &[ProductScope] {
+        &self.scope_ceiling
+    }
+
+    /// Returns the durable creation instant.
+    pub const fn created_at_micros(&self) -> i64 {
+        self.created_at_micros
+    }
+
+    /// Returns the optional exclusive expiry instant.
+    pub const fn expires_at_micros(&self) -> Option<i64> {
+        self.expires_at_micros
+    }
+
+    /// Returns whether the credential was durably revoked.
+    pub const fn revoked(&self) -> bool {
+        self.revoked
+    }
+
+    /// Returns the authorization generation at publication.
+    pub const fn published_epoch(&self) -> AuthorizationEpoch {
+        self.published_epoch
+    }
+
+    /// Returns the immediate predecessor for a rotation successor.
+    pub const fn predecessor_id(&self) -> Option<ApiKeyId> {
+        self.predecessor_id
+    }
+
+    /// Returns the immediate successor when rotation has begun.
+    pub const fn successor_id(&self) -> Option<ApiKeyId> {
+        self.successor_id
+    }
+
+    /// Returns the predecessor's exclusive overlap deadline.
+    pub const fn overlap_until_micros(&self) -> Option<i64> {
+        self.overlap_until_micros
+    }
+
+    /// Returns the configured rotation overlap duration.
+    pub const fn rotation_overlap_micros(&self) -> Option<u64> {
+        self.rotation_overlap_micros
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native item.
+    pub fn encoded_size_bound(&self) -> usize {
+        188_usize
+            .saturating_add(self.label.len())
+            .saturating_add(self.roles.len())
+            .saturating_add(self.custom_roles.len().saturating_mul(16))
+            .saturating_add(self.scope_ceiling.len().saturating_mul(24))
+    }
+}
+
+impl From<&ApiKeyRecord> for SecurityKeySummary {
+    fn from(record: &ApiKeyRecord) -> Self {
+        Self {
+            id: record.id,
+            principal_id: record.principal_id,
+            label: record.label.clone(),
+            active: record.active,
+            roles: record.roles.clone(),
+            custom_roles: record.custom_roles.clone(),
+            permission_ceiling: record.permission_ceiling,
+            scope_ceiling: record.scope_ceiling.clone(),
+            created_at_micros: record.created_at_micros,
+            expires_at_micros: record.expires_at_micros,
+            revoked: record.revoked,
+            published_epoch: record.published_epoch,
+            predecessor_id: record.predecessor_id,
+            successor_id: record.successor_id,
+            overlap_until_micros: record.overlap_until_micros,
+            rotation_overlap_micros: record.rotation_overlap_micros,
+        }
+    }
+}
+
+trait SecurityPageItem {
+    fn page_cursor_id(&self) -> SecurityCursorId;
+
+    fn valid_for_page_epoch(&self, _authorization_epoch: AuthorizationEpoch) -> bool {
+        true
+    }
+
+    fn page_item_size_bound(&self) -> usize;
+}
+
+impl SecurityPageItem for SecurityPrincipalSummary {
+    fn page_cursor_id(&self) -> SecurityCursorId {
+        SecurityCursorId::Principal(self.id)
+    }
+
+    fn page_item_size_bound(&self) -> usize {
+        self.encoded_size_bound()
+    }
+}
+
+impl SecurityPageItem for SecurityRoleSummary {
+    fn page_cursor_id(&self) -> SecurityCursorId {
+        self.cursor_id()
+    }
+
+    fn page_item_size_bound(&self) -> usize {
+        self.encoded_size_bound()
+    }
+}
+
+impl SecurityPageItem for SecurityAssignmentSummary {
+    fn page_cursor_id(&self) -> SecurityCursorId {
+        SecurityCursorId::Assignment(self.id)
+    }
+
+    fn page_item_size_bound(&self) -> usize {
+        self.encoded_size_bound()
+    }
+}
+
+impl SecurityPageItem for SecurityKeySummary {
+    fn page_cursor_id(&self) -> SecurityCursorId {
+        SecurityCursorId::Key(self.id)
+    }
+
+    fn valid_for_page_epoch(&self, authorization_epoch: AuthorizationEpoch) -> bool {
+        self.published_epoch.get() <= authorization_epoch.get()
+    }
+
+    fn page_item_size_bound(&self) -> usize {
+        self.encoded_size_bound()
+    }
+}
+
+fn validate_security_page<T: SecurityPageItem>(
+    authorization_epoch: AuthorizationEpoch,
+    items: &[T],
+    next_cursor: Option<SecurityCursor>,
+) -> Result<(), AccessCatalogError> {
+    if authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || items.len() > MAX_SECURITY_LIST_ROWS
+        || items
+            .windows(2)
+            .any(|pair| pair[0].page_cursor_id() >= pair[1].page_cursor_id())
+        || items
+            .iter()
+            .any(|item| !item.valid_for_page_epoch(authorization_epoch))
+    {
+        return Err(AccessCatalogError::InvalidRequest);
+    }
+    if let Some(cursor) = next_cursor {
+        let expected = items
+            .last()
+            .map(|item| SecurityCursor::new(authorization_epoch, item.page_cursor_id()));
+        if expected != Some(cursor) {
+            return Err(AccessCatalogError::InvalidRequest);
+        }
+    }
+    Ok(())
+}
+
+macro_rules! security_page {
+    ($name:ident, $item:ty) => {
+        /// One bounded generation-consistent security metadata page.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name {
+            /// Authorization generation shared by every returned item.
+            pub authorization_epoch: AuthorizationEpoch,
+            /// Redacted records in deterministic stable-ID order.
+            pub items: Box<[$item]>,
+            /// Exclusive continuation when more records remain.
+            pub next_cursor: Option<SecurityCursor>,
+        }
+
+        impl $name {
+            /// Reconstructs one bounded canonical page from wire fields.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error for an unmanaged epoch, excessive, duplicated,
+            /// or unordered items, a future item epoch, or a cursor that does
+            /// not identify the final returned item.
+            pub fn try_from_wire(
+                authorization_epoch: AuthorizationEpoch,
+                items: Vec<$item>,
+                next_cursor: Option<SecurityCursor>,
+            ) -> Result<Self, AccessCatalogError> {
+                validate_security_page(authorization_epoch, &items, next_cursor)?;
+                Ok(Self {
+                    authorization_epoch,
+                    items: items.into_boxed_slice(),
+                    next_cursor,
+                })
+            }
+
+            /// Validates this page against the canonical wire invariants.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error for the same noncanonical fields rejected by
+            /// [`Self::try_from_wire`].
+            pub fn validate(&self) -> Result<(), AccessCatalogError> {
+                validate_security_page(self.authorization_epoch, &self.items, self.next_cursor)
+            }
+
+            /// Returns the authorization generation shared by this page.
+            pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
+                self.authorization_epoch
+            }
+
+            /// Returns redacted records in deterministic stable-ID order.
+            pub fn items(&self) -> &[$item] {
+                &self.items
+            }
+
+            /// Returns the exclusive continuation when more records remain.
+            pub const fn next_cursor(&self) -> Option<SecurityCursor> {
+                self.next_cursor
+            }
+
+            /// Returns a saturation-safe upper bound for the canonical Native
+            /// response containing this page.
+            pub fn encoded_size_bound(&self) -> usize {
+                self.items.iter().fold(
+                    PRODUCT_RESPONSE_ENVELOPE_BYTES + SECURITY_METADATA_PAGE_HEADER_BYTES,
+                    |total, item| total.saturating_add(item.page_item_size_bound()),
+                )
+            }
+        }
+    };
+}
+
+security_page!(SecurityPrincipalPage, SecurityPrincipalSummary);
+security_page!(SecurityRolePage, SecurityRoleSummary);
+security_page!(SecurityAssignmentPage, SecurityAssignmentSummary);
+security_page!(SecurityKeyPage, SecurityKeySummary);
 
 /// Definite result of offline owner bootstrap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -750,6 +1745,58 @@ pub struct SecurityAuditPage {
     pub events: Box<[SecurityAuditEvent]>,
     /// Last returned event when more retained rows remain.
     pub next_cursor: Option<SecurityId>,
+}
+
+impl SecurityAuditPage {
+    /// Reconstructs one bounded canonical audit page from wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for excessive, duplicated, or non-monotonic events, or
+    /// a continuation that does not identify the final returned event.
+    pub fn try_from_wire(
+        events: Vec<SecurityAuditEvent>,
+        next_cursor: Option<SecurityId>,
+    ) -> Result<Self, AccessCatalogError> {
+        let page = Self {
+            events: events.into_boxed_slice(),
+            next_cursor,
+        };
+        page.validate()?;
+        Ok(page)
+    }
+
+    /// Validates this page against the canonical wire invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for excessive, duplicated, or non-monotonic events,
+    /// or a continuation that does not identify the final returned event.
+    pub fn validate(&self) -> Result<(), AccessCatalogError> {
+        let ids: BTreeSet<_> = self.events.iter().map(SecurityAuditEvent::id).collect();
+        if self.events.len() > AccessControlLimits::V1.audit_result_rows
+            || ids.len() != self.events.len()
+            || self
+                .events
+                .windows(2)
+                .any(|pair| pair[0].commit_csn() >= pair[1].commit_csn())
+            || self.next_cursor.is_some_and(|cursor| {
+                self.events.last().map(SecurityAuditEvent::id) != Some(cursor)
+            })
+        {
+            Err(AccessCatalogError::InvalidRequest)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns a saturation-safe upper bound for the canonical Native response.
+    pub fn encoded_size_bound(&self) -> usize {
+        self.events.iter().fold(
+            PRODUCT_RESPONSE_ENVELOPE_BYTES + SECURITY_AUDIT_PAGE_HEADER_BYTES,
+            |total, event| total.saturating_add(event.encoded_size_bound()),
+        )
+    }
 }
 
 impl AccessControlCatalog {
@@ -1280,6 +2327,230 @@ impl AccessControlCatalog {
             pending_keys: self.keys.values().filter(|key| !key.active).count(),
             audit_events: self.audit_index.len(),
         }
+    }
+
+    pub(crate) fn list_principals(
+        &self,
+        request: SecurityPrincipalListRequest,
+    ) -> Result<SecurityPrincipalPage, AccessCatalogError> {
+        validate_security_list_limit(request.limit)?;
+        let after = match validate_security_cursor(request.cursor, self.epoch)? {
+            None => None,
+            Some(SecurityCursorId::Principal(id)) if self.principals.contains_key(&id) => Some(id),
+            Some(SecurityCursorId::Principal(_)) => {
+                return Err(AccessCatalogError::InvalidRequest);
+            }
+            Some(_) => return Err(AccessCatalogError::InvalidRequest),
+        };
+        let mut items: Vec<_> = match after {
+            Some(id) => self
+                .principals
+                .range((Excluded(id), Unbounded))
+                .take(request.limit + 1)
+                .map(|(_, record)| SecurityPrincipalSummary::from(record))
+                .collect(),
+            None => self
+                .principals
+                .values()
+                .take(request.limit + 1)
+                .map(SecurityPrincipalSummary::from)
+                .collect(),
+        };
+        let has_more = items.len() > request.limit;
+        items.truncate(request.limit);
+        let next_cursor = if has_more {
+            let last = items.last().ok_or(AccessCatalogError::CorruptCatalog)?;
+            Some(SecurityCursor::new(
+                self.epoch,
+                SecurityCursorId::Principal(last.id),
+            ))
+        } else {
+            None
+        };
+        SecurityPrincipalPage::try_from_wire(self.epoch, items, next_cursor)
+    }
+
+    pub(crate) fn list_roles(
+        &self,
+        request: SecurityRoleListRequest,
+    ) -> Result<SecurityRolePage, AccessCatalogError> {
+        validate_security_list_limit(request.limit)?;
+        let (built_in_start, custom_after) =
+            match validate_security_cursor(request.cursor, self.epoch)? {
+                None => (0, None),
+                Some(SecurityCursorId::BuiltInRole(role)) => {
+                    let position = BUILT_IN_ROLES
+                        .iter()
+                        .position(|candidate| *candidate == role)
+                        .ok_or(AccessCatalogError::InvalidRequest)?;
+                    (position + 1, None)
+                }
+                Some(SecurityCursorId::CustomRole(id)) if self.custom_roles.contains_key(&id) => {
+                    (BUILT_IN_ROLES.len(), Some(id))
+                }
+                Some(SecurityCursorId::CustomRole(_)) => {
+                    return Err(AccessCatalogError::InvalidRequest);
+                }
+                Some(_) => return Err(AccessCatalogError::InvalidRequest),
+            };
+        let mut items = Vec::with_capacity(request.limit + 1);
+        items.extend(
+            BUILT_IN_ROLES
+                .iter()
+                .copied()
+                .skip(built_in_start)
+                .take(request.limit + 1)
+                .map(SecurityRoleSummary::built_in),
+        );
+        if items.len() <= request.limit {
+            let remaining = request.limit + 1 - items.len();
+            match custom_after {
+                Some(id) => items.extend(
+                    self.custom_roles
+                        .range((Excluded(id), Unbounded))
+                        .take(remaining)
+                        .map(|(_, role)| SecurityRoleSummary {
+                            kind: SecurityRoleSummaryKind::Custom {
+                                id: role.id,
+                                display_name: role.display_name.clone(),
+                                grants: role.grants.clone(),
+                            },
+                        }),
+                ),
+                None => items.extend(self.custom_roles.values().take(remaining).map(|role| {
+                    SecurityRoleSummary {
+                        kind: SecurityRoleSummaryKind::Custom {
+                            id: role.id,
+                            display_name: role.display_name.clone(),
+                            grants: role.grants.clone(),
+                        },
+                    }
+                })),
+            }
+        }
+        let has_more = items.len() > request.limit;
+        items.truncate(request.limit);
+        let next_cursor = if has_more {
+            let last = items.last().ok_or(AccessCatalogError::CorruptCatalog)?;
+            Some(SecurityCursor::new(self.epoch, last.cursor_id()))
+        } else {
+            None
+        };
+        SecurityRolePage::try_from_wire(self.epoch, items, next_cursor)
+    }
+
+    pub(crate) fn list_assignments(
+        &self,
+        request: SecurityAssignmentListRequest,
+    ) -> Result<SecurityAssignmentPage, AccessCatalogError> {
+        validate_security_list_limit(request.limit)?;
+        let after = match validate_security_cursor(request.cursor, self.epoch)? {
+            None => None,
+            Some(SecurityCursorId::Assignment(id)) => {
+                let built_in = self.assignments.contains_key(&id);
+                let custom = self.custom_assignments.contains_key(&id);
+                if built_in == custom {
+                    return Err(if built_in {
+                        AccessCatalogError::CorruptCatalog
+                    } else {
+                        AccessCatalogError::InvalidRequest
+                    });
+                }
+                Some(id)
+            }
+            Some(_) => return Err(AccessCatalogError::InvalidRequest),
+        };
+        let mut built_in = match after {
+            Some(id) => self.assignments.range((Excluded(id), Unbounded)).peekable(),
+            None => self.assignments.range::<SecurityId, _>(..).peekable(),
+        };
+        let mut custom = match after {
+            Some(id) => self
+                .custom_assignments
+                .range((Excluded(id), Unbounded))
+                .peekable(),
+            None => self
+                .custom_assignments
+                .range::<SecurityId, _>(..)
+                .peekable(),
+        };
+        let mut items = Vec::with_capacity(request.limit + 1);
+        while items.len() <= request.limit {
+            let built_in_id = built_in.peek().map(|(id, _)| **id);
+            let custom_id = custom.peek().map(|(id, _)| **id);
+            let item = match (built_in_id, custom_id) {
+                (Some(left), Some(right)) if left == right => {
+                    return Err(AccessCatalogError::CorruptCatalog);
+                }
+                (Some(left), Some(right)) if left < right => built_in
+                    .next()
+                    .map(|(_, assignment)| SecurityAssignmentSummary::from(*assignment)),
+                (Some(_), Some(_)) => custom
+                    .next()
+                    .map(|(_, assignment)| SecurityAssignmentSummary::from(*assignment)),
+                (Some(_), None) => built_in
+                    .next()
+                    .map(|(_, assignment)| SecurityAssignmentSummary::from(*assignment)),
+                (None, Some(_)) => custom
+                    .next()
+                    .map(|(_, assignment)| SecurityAssignmentSummary::from(*assignment)),
+                (None, None) => None,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            items.push(item);
+        }
+        let has_more = items.len() > request.limit;
+        items.truncate(request.limit);
+        let next_cursor = if has_more {
+            let last = items.last().ok_or(AccessCatalogError::CorruptCatalog)?;
+            Some(SecurityCursor::new(
+                self.epoch,
+                SecurityCursorId::Assignment(last.id),
+            ))
+        } else {
+            None
+        };
+        SecurityAssignmentPage::try_from_wire(self.epoch, items, next_cursor)
+    }
+
+    pub(crate) fn list_keys(
+        &self,
+        request: SecurityKeyListRequest,
+    ) -> Result<SecurityKeyPage, AccessCatalogError> {
+        validate_security_list_limit(request.limit)?;
+        let after = match validate_security_cursor(request.cursor, self.epoch)? {
+            None => None,
+            Some(SecurityCursorId::Key(id)) if self.keys.contains_key(&id) => Some(id),
+            Some(_) => return Err(AccessCatalogError::InvalidRequest),
+        };
+        let mut items: Vec<_> = match after {
+            Some(id) => self
+                .keys
+                .range((Excluded(id), Unbounded))
+                .take(request.limit + 1)
+                .map(|(_, record)| SecurityKeySummary::from(record))
+                .collect(),
+            None => self
+                .keys
+                .values()
+                .take(request.limit + 1)
+                .map(SecurityKeySummary::from)
+                .collect(),
+        };
+        let has_more = items.len() > request.limit;
+        items.truncate(request.limit);
+        let next_cursor = if has_more {
+            let last = items.last().ok_or(AccessCatalogError::CorruptCatalog)?;
+            Some(SecurityCursor::new(
+                self.epoch,
+                SecurityCursorId::Key(last.id),
+            ))
+        } else {
+            None
+        };
+        SecurityKeyPage::try_from_wire(self.epoch, items, next_cursor)
     }
 
     /// Authenticates one canonical key against current durable authority.
@@ -2448,6 +3719,28 @@ fn effective_scopes(
 }
 
 impl NativeProduct {
+    fn read_authorized_security_catalog<T>(
+        &self,
+        actor: &AuthenticatedAuthority,
+        permission: ProductPermission,
+        logical_time_micros: i64,
+        query: impl FnOnce(&AccessControlCatalog) -> Result<T, AccessCatalogError>,
+    ) -> Result<T, ProductError> {
+        let snapshot = self.snapshot_bounded(logical_time_micros)?;
+        let catalog = match snapshot.structure_get_internal(ACCESS_CONTROL_STORAGE_KEY) {
+            Some(encoded) => AccessControlCatalog::decode(encoded).map_err(map_catalog_error)?,
+            None => AccessControlCatalog::empty(),
+        };
+        require_current_actor(
+            &catalog,
+            actor,
+            permission,
+            snapshot.identity().directory_lineage,
+            self.trusted_authorization_time()?,
+        )?;
+        query(&catalog).map_err(map_catalog_error)
+    }
+
     /// Returns redacted durable access-control status.
     ///
     /// # Errors
@@ -2457,6 +3750,75 @@ impl NativeProduct {
     pub fn access_control_status(&self) -> Result<AccessControlStatus, ProductError> {
         self.load_access_control_catalog()
             .map(|catalog| catalog.status())
+    }
+
+    pub(crate) fn read_security_status(
+        &self,
+        actor: &AuthenticatedAuthority,
+        logical_time_micros: i64,
+    ) -> Result<AccessControlStatus, ProductError> {
+        self.read_authorized_security_catalog(
+            actor,
+            ProductPermission::SecurityRead,
+            logical_time_micros,
+            |catalog| Ok(catalog.status()),
+        )
+    }
+
+    pub(crate) fn read_security_principals(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: &SecurityPrincipalListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityPrincipalPage, ProductError> {
+        self.read_authorized_security_catalog(
+            actor,
+            ProductPermission::SecurityRead,
+            logical_time_micros,
+            |catalog| catalog.list_principals(*request),
+        )
+    }
+
+    pub(crate) fn read_security_roles(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: &SecurityRoleListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityRolePage, ProductError> {
+        self.read_authorized_security_catalog(
+            actor,
+            ProductPermission::SecurityRead,
+            logical_time_micros,
+            |catalog| catalog.list_roles(*request),
+        )
+    }
+
+    pub(crate) fn read_security_assignments(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: &SecurityAssignmentListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityAssignmentPage, ProductError> {
+        self.read_authorized_security_catalog(
+            actor,
+            ProductPermission::SecurityRead,
+            logical_time_micros,
+            |catalog| catalog.list_assignments(*request),
+        )
+    }
+
+    pub(crate) fn read_security_keys(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: &SecurityKeyListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityKeyPage, ProductError> {
+        self.read_authorized_security_catalog(
+            actor,
+            ProductPermission::SecurityRead,
+            logical_time_micros,
+            |catalog| catalog.list_keys(*request),
+        )
     }
 
     /// Reads one bounded, redacted audit page from one immutable snapshot.
@@ -2501,10 +3863,7 @@ impl NativeProduct {
             }
             events.push(event);
         }
-        Ok(SecurityAuditPage {
-            events: events.into_boxed_slice(),
-            next_cursor,
-        })
+        SecurityAuditPage::try_from_wire(events, next_cursor).map_err(map_catalog_error)
     }
 
     /// Authenticates one API key against the current durable catalog.
@@ -4137,6 +5496,26 @@ impl std::fmt::Display for AccessCatalogError {
 
 impl std::error::Error for AccessCatalogError {}
 
+fn validate_security_list_limit(limit: usize) -> Result<(), AccessCatalogError> {
+    if limit == 0 || limit > MAX_SECURITY_LIST_ROWS {
+        return Err(AccessCatalogError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_security_cursor(
+    cursor: Option<SecurityCursor>,
+    current_epoch: AuthorizationEpoch,
+) -> Result<Option<SecurityCursorId>, AccessCatalogError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if cursor.authorization_epoch != current_epoch {
+        return Err(AccessCatalogError::Conflict);
+    }
+    Ok(Some(cursor.after_id))
+}
+
 fn validate_display_name(value: &str) -> Result<(), AccessCatalogError> {
     if value.is_empty()
         || value.len() > AccessControlLimits::V1.display_name_bytes
@@ -4282,6 +5661,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Write as _,
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -4320,6 +5700,757 @@ mod tests {
             }]
             .into_boxed_slice(),
         })
+    }
+
+    fn valid_key_summary_input() -> Result<SecurityKeySummaryInput, Box<dyn std::error::Error>> {
+        Ok(SecurityKeySummaryInput {
+            id: ApiKeyId::from_bytes([1; 16]).ok_or("invalid key")?,
+            principal_id: SecurityId::new(1).ok_or("invalid principal")?,
+            label: "reader-key".to_owned(),
+            active: true,
+            roles: vec![BuiltInRole::Reader],
+            custom_roles: Vec::new(),
+            permission_ceiling: BuiltInRole::Reader.authorization(),
+            scope_ceiling: vec![ProductScope::Instance],
+            created_at_micros: 1,
+            expires_at_micros: Some(2),
+            revoked: false,
+            published_epoch: AuthorizationEpoch::INITIAL,
+            predecessor_id: None,
+            successor_id: None,
+            overlap_until_micros: None,
+            rotation_overlap_micros: None,
+        })
+    }
+
+    fn principal_summary(id: u128) -> Result<SecurityPrincipalSummary, Box<dyn std::error::Error>> {
+        Ok(SecurityPrincipalSummary::new(
+            SecurityId::new(id).ok_or("invalid principal")?,
+            format!("principal-{id}"),
+            true,
+        )?)
+    }
+
+    fn audit_event(
+        id: u128,
+        commit_csn: u64,
+    ) -> Result<SecurityAuditEvent, Box<dyn std::error::Error>> {
+        let id = SecurityId::new(id).ok_or("invalid event")?;
+        Ok(SecurityAuditEvent::try_from_wire(
+            id,
+            commit_csn,
+            None,
+            None,
+            SecurityAuditAction::RecoverOwner,
+            SecurityAuditResult::Succeeded,
+            vec![SecurityAuditTarget::Principal(id)],
+            Vec::new(),
+        )?)
+    }
+
+    #[test]
+    fn wire_summary_constructors_reject_noncanonical_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let principal_id = SecurityId::new(1).ok_or("invalid principal")?;
+        let assignment_id = SecurityId::new(2).ok_or("invalid assignment")?;
+        let role_id = SecurityId::new(3).ok_or("invalid role")?;
+        assert!(SecurityPrincipalSummary::new(principal_id, "Reader", true).is_ok());
+        assert_eq!(
+            SecurityPrincipalSummary::new(principal_id, "", true),
+            Err(AccessCatalogError::InvalidDisplayName)
+        );
+
+        assert!(
+            SecurityAssignmentSummary::new(
+                assignment_id,
+                principal_id,
+                Some(BuiltInRole::Reader),
+                None,
+                Some(ProductScope::Instance),
+            )
+            .is_ok()
+        );
+        assert!(
+            SecurityAssignmentSummary::new(assignment_id, principal_id, None, Some(role_id), None,)
+                .is_ok()
+        );
+        for invalid in [
+            SecurityAssignmentSummary::new(assignment_id, principal_id, None, None, None),
+            SecurityAssignmentSummary::new(
+                assignment_id,
+                principal_id,
+                Some(BuiltInRole::Reader),
+                Some(role_id),
+                Some(ProductScope::Instance),
+            ),
+            SecurityAssignmentSummary::new(
+                assignment_id,
+                principal_id,
+                Some(BuiltInRole::Reader),
+                None,
+                None,
+            ),
+            SecurityAssignmentSummary::new(
+                assignment_id,
+                principal_id,
+                None,
+                Some(role_id),
+                Some(ProductScope::Instance),
+            ),
+        ] {
+            assert_eq!(invalid, Err(AccessCatalogError::InvalidRequest));
+        }
+
+        let catalog_read =
+            CustomRoleGrant::new(ProductPermission::CatalogRead, ProductScope::Instance)
+                .ok_or("invalid catalog grant")?;
+        let data_read = CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+            .ok_or("invalid data grant")?;
+        assert!(
+            SecurityRoleSummary::custom(role_id, "tenant reader", vec![catalog_read, data_read],)
+                .is_ok()
+        );
+        assert_eq!(
+            SecurityRoleSummary::custom(role_id, "reader", vec![catalog_read]),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityRoleSummary::custom(role_id, "tenant reader", vec![data_read, catalog_read],),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_key_and_audit_constructors_round_trip_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = valid_key_summary_input()?;
+        let summary = SecurityKeySummary::try_from_wire(input.clone())?;
+        assert_eq!(summary.id(), input.id);
+        assert_eq!(summary.principal_id(), input.principal_id);
+        assert_eq!(summary.label(), input.label);
+        assert_eq!(summary.roles(), input.roles);
+        assert_eq!(summary.scope_ceiling(), input.scope_ceiling);
+        assert_eq!(summary.expires_at_micros(), input.expires_at_micros);
+
+        let mut invalid = input.clone();
+        invalid.roles.clear();
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        let mut invalid = input.clone();
+        invalid.roles = vec![BuiltInRole::Reader, BuiltInRole::Admin];
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        let mut invalid = input.clone();
+        invalid.scope_ceiling.clear();
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        let mut invalid = input.clone();
+        invalid.expires_at_micros = Some(input.created_at_micros);
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        let mut invalid = input.clone();
+        invalid.predecessor_id = Some(input.id);
+        invalid.rotation_overlap_micros = Some(1);
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        let mut invalid = input.clone();
+        invalid.custom_roles = (1_u128..=128)
+            .map(|value| SecurityId::new(value).ok_or("invalid custom role"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            SecurityKeySummary::try_from_wire(invalid),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+
+        let event_id = SecurityId::new(4).ok_or("invalid event")?;
+        let key_id = ApiKeyId::from_bytes([4; 16]).ok_or("invalid key")?;
+        let targets = vec![
+            SecurityAuditTarget::Principal(input.principal_id),
+            SecurityAuditTarget::Key(key_id),
+        ];
+        let event = SecurityAuditEvent::try_from_wire(
+            event_id,
+            7,
+            Some(input.principal_id),
+            Some(key_id),
+            SecurityAuditAction::IssueKey,
+            SecurityAuditResult::Succeeded,
+            targets.clone(),
+            vec![SecurityAuditMetadata::ExpiresAtMicros(2)],
+        )?;
+        assert_eq!(event.id(), event_id);
+        assert_eq!(event.targets(), targets);
+        assert_eq!(
+            SecurityAuditAction::from_tag(event.action().tag()),
+            Some(event.action())
+        );
+        assert_eq!(SecurityAuditAction::from_tag(13), None);
+        assert_eq!(
+            SecurityAuditEvent::try_from_wire(
+                event_id,
+                7,
+                Some(input.principal_id),
+                None,
+                SecurityAuditAction::IssueKey,
+                SecurityAuditResult::Succeeded,
+                targets.clone(),
+                Vec::new(),
+            ),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditEvent::try_from_wire(
+                event_id,
+                0,
+                None,
+                None,
+                SecurityAuditAction::RecoverOwner,
+                SecurityAuditResult::Succeeded,
+                targets.into_iter().rev().collect(),
+                Vec::new(),
+            ),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_page_constructors_reject_order_cursor_and_epoch_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = AuthorizationEpoch::INITIAL;
+        let first = principal_summary(1)?;
+        let second = principal_summary(2)?;
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(epoch, vec![second.clone(), first.clone()], None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(epoch, vec![first.clone(), first.clone()], None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(
+                epoch,
+                vec![first.clone()],
+                Some(SecurityCursor::new(
+                    epoch,
+                    SecurityCursorId::Principal(second.id()),
+                )),
+            ),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(
+                epoch,
+                Vec::new(),
+                Some(SecurityCursor::new(
+                    epoch,
+                    SecurityCursorId::Principal(first.id()),
+                )),
+            ),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(AuthorizationEpoch::UNMANAGED, vec![first], None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_metadata_page_family_enforces_its_canonical_item_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = AuthorizationEpoch::INITIAL;
+        let role_id = SecurityId::new(3).ok_or("invalid role")?;
+        let grant = CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+            .ok_or("invalid grant")?;
+        let custom = SecurityRoleSummary::custom(role_id, "custom-reader", vec![grant])?;
+        assert_eq!(
+            SecurityRolePage::try_from_wire(
+                epoch,
+                vec![custom, SecurityRoleSummary::built_in(BuiltInRole::Reader)],
+                None,
+            ),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+
+        let assignment_id = SecurityId::new(4).ok_or("invalid assignment")?;
+        let principal_id = SecurityId::new(5).ok_or("invalid principal")?;
+        let assignment = SecurityAssignmentSummary::new(
+            assignment_id,
+            principal_id,
+            Some(BuiltInRole::Reader),
+            None,
+            Some(ProductScope::Instance),
+        )?;
+        assert!(SecurityAssignmentPage::try_from_wire(epoch, vec![assignment], None).is_ok());
+
+        let mut input = valid_key_summary_input()?;
+        input.published_epoch = AuthorizationEpoch::new(epoch.get() + 1);
+        let future_key = SecurityKeySummary::try_from_wire(input)?;
+        assert_eq!(
+            SecurityKeyPage::try_from_wire(epoch, vec![future_key], None),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_page_constructor_rejects_nonmonotonic_duplicate_and_wrong_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = audit_event(1, 10)?;
+        let second = audit_event(2, 11)?;
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(vec![second.clone(), first.clone()], None),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(vec![first.clone(), audit_event(1, 11)?], None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(vec![first.clone(), audit_event(3, 10)?], None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(vec![first.clone()], Some(second.id())),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(Vec::new(), Some(first.id())),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditPage::try_from_wire(vec![first.clone(), second.clone()], Some(first.id()),),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert!(
+            SecurityAuditPage::try_from_wire(vec![first, second.clone()], Some(second.id()),)
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_page_constructors_reject_one_past_the_result_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let items = (1..=MAX_SECURITY_LIST_ROWS + 1)
+            .map(|id| principal_summary(id as u128))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            SecurityPrincipalPage::try_from_wire(AuthorizationEpoch::INITIAL, items, None,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn security_status_validates_combined_assignment_and_principal_bounds() {
+        let valid = AccessControlStatus {
+            bootstrapped: true,
+            epoch: AuthorizationEpoch::INITIAL,
+            principals: 1,
+            assignments: 1,
+            custom_roles: 1,
+            custom_assignments: AccessControlLimits::V1.assignments_per_principal - 1,
+            keys: AccessControlLimits::V1.keys_per_principal,
+            pending_keys: 1,
+            audit_events: 1,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+        assert_eq!(
+            AccessControlStatus {
+                custom_assignments: AccessControlLimits::V1.assignments_per_principal,
+                ..valid
+            }
+            .validate(),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            AccessControlStatus {
+                assignments: 0,
+                custom_assignments: 0,
+                ..valid
+            }
+            .validate(),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn security_response_size_bounds_are_exact_for_canonical_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = AuthorizationEpoch::INITIAL;
+        let principal = principal_summary(1)?;
+        let principal_item_bytes = 28 + principal.display_name().len();
+        let principal_page = SecurityPrincipalPage::try_from_wire(epoch, vec![principal], None)?;
+        assert_eq!(
+            principal_page.encoded_size_bound(),
+            72 + principal_item_bytes
+        );
+
+        let role_page = SecurityRolePage::try_from_wire(
+            epoch,
+            vec![SecurityRoleSummary::built_in(BuiltInRole::Reader)],
+            None,
+        )?;
+        assert_eq!(role_page.encoded_size_bound(), 80);
+
+        let role_id = SecurityId::new(3).ok_or("invalid role")?;
+        let custom_role = SecurityRoleSummary::custom(
+            role_id,
+            "custom-reader",
+            vec![
+                CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+                    .ok_or("invalid grant")?,
+            ],
+        )?;
+        let custom_role_bytes = 36 + custom_role.display_name().len() + 32;
+        let custom_role_page = SecurityRolePage::try_from_wire(epoch, vec![custom_role], None)?;
+        assert_eq!(
+            custom_role_page.encoded_size_bound(),
+            72 + custom_role_bytes
+        );
+
+        let assignment = SecurityAssignmentSummary::new(
+            SecurityId::new(4).ok_or("invalid assignment")?,
+            SecurityId::new(5).ok_or("invalid principal")?,
+            Some(BuiltInRole::Reader),
+            None,
+            Some(ProductScope::Instance),
+        )?;
+        let assignment_page = SecurityAssignmentPage::try_from_wire(epoch, vec![assignment], None)?;
+        assert_eq!(assignment_page.encoded_size_bound(), 72 + 64);
+
+        let key = SecurityKeySummary::try_from_wire(valid_key_summary_input()?)?;
+        let expected_key_bytes = 188
+            + key.label().len()
+            + key.roles().len()
+            + 16 * key.custom_roles().len()
+            + 24 * key.scope_ceiling().len();
+        let key_page = SecurityKeyPage::try_from_wire(epoch, vec![key], None)?;
+        assert_eq!(key_page.encoded_size_bound(), 72 + expected_key_bytes);
+
+        let event = audit_event(2, 10)?;
+        let event_bytes = 88 + 24 * event.targets().len() + 16 * event.metadata().len();
+        let audit_page = SecurityAuditPage::try_from_wire(vec![event], None)?;
+        assert_eq!(audit_page.encoded_size_bound(), 48 + event_bytes);
+        assert_eq!(AccessControlStatus::encoded_size_bound(), 88);
+        Ok(())
+    }
+
+    #[test]
+    fn security_list_requests_reject_zero_and_one_past_the_limit() {
+        assert_eq!(
+            SecurityPrincipalListRequest::new(None, 0),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityRoleListRequest::new(None, MAX_SECURITY_LIST_ROWS + 1),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAssignmentListRequest::new(None, 0),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityKeyListRequest::new(None, MAX_SECURITY_LIST_ROWS + 1),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditReadRequest::new(None, 0),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert_eq!(
+            SecurityAuditReadRequest::new(None, AccessControlLimits::V1.audit_result_rows + 1,),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        assert!(SecurityPrincipalListRequest::new(None, 1).is_ok());
+        assert!(SecurityRoleListRequest::new(None, MAX_SECURITY_LIST_ROWS).is_ok());
+        assert!(SecurityAssignmentListRequest::new(None, 1).is_ok());
+        assert!(SecurityKeyListRequest::new(None, MAX_SECURITY_LIST_ROWS).is_ok());
+        assert!(
+            SecurityAuditReadRequest::new(None, AccessControlLimits::V1.audit_result_rows).is_ok()
+        );
+    }
+
+    #[test]
+    fn security_principal_pages_are_ordered_and_epoch_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (owner_id, owner_key) = catalog.bootstrap_owner("Owner", "owner-key", 1)?;
+        catalog.activate_key(owner_key.id())?;
+        catalog.create_principal("Reader service")?;
+        catalog.create_principal("Writer service")?;
+
+        let principal_page =
+            catalog.list_principals(SecurityPrincipalListRequest::new(None, 2)?)?;
+        assert_eq!(principal_page.authorization_epoch(), catalog.epoch());
+        assert_eq!(principal_page.items().len(), 2);
+        let principal_cursor = principal_page
+            .next_cursor()
+            .ok_or("missing principal cursor")?;
+        assert_eq!(principal_cursor.authorization_epoch(), catalog.epoch());
+        let remaining_principals = catalog.list_principals(SecurityPrincipalListRequest::new(
+            Some(principal_cursor),
+            2,
+        )?)?;
+        let principal_ids: Vec<_> = principal_page
+            .items()
+            .iter()
+            .chain(remaining_principals.items())
+            .map(SecurityPrincipalSummary::id)
+            .collect();
+        assert_eq!(principal_ids.len(), 3);
+        assert!(principal_ids.windows(2).all(|ids| ids[0] < ids[1]));
+        assert!(principal_ids.contains(&owner_id));
+
+        let stale_request = SecurityPrincipalListRequest::new(Some(principal_cursor), 1)?;
+        assert_eq!(
+            catalog.list_keys(SecurityKeyListRequest::new(Some(principal_cursor), 1)?),
+            Err(AccessCatalogError::InvalidRequest)
+        );
+        catalog.create_principal("Epoch change")?;
+        assert_eq!(
+            catalog.list_principals(stale_request),
+            Err(AccessCatalogError::Conflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn security_cursor_tokens_round_trip_canonically_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let principal = SecurityId::new(1).ok_or("missing principal")?;
+        let key = ApiKeyId::from_bytes([7; 16]).ok_or("missing key")?;
+        let cursors = [
+            SecurityCursor::new(
+                AuthorizationEpoch::new(9),
+                SecurityCursorId::Principal(principal),
+            ),
+            SecurityCursor::new(
+                AuthorizationEpoch::new(9),
+                SecurityCursorId::BuiltInRole(BuiltInRole::Auditor),
+            ),
+            SecurityCursor::new(
+                AuthorizationEpoch::new(9),
+                SecurityCursorId::CustomRole(principal),
+            ),
+            SecurityCursor::new(
+                AuthorizationEpoch::new(9),
+                SecurityCursorId::Assignment(principal),
+            ),
+            SecurityCursor::new(AuthorizationEpoch::new(9), SecurityCursorId::Key(key)),
+        ];
+        for cursor in cursors {
+            let token = cursor.to_token();
+            assert_eq!(SecurityCursor::from_token(&token)?, cursor);
+        }
+        for token in [
+            "",
+            "hysec2:9:principal:00000000000000000000000000000001",
+            "hysec1:0:principal:00000000000000000000000000000001",
+            "hysec1:09:principal:00000000000000000000000000000001",
+            "hysec1:9:principal:00000000000000000000000000000000",
+            "hysec1:9:built-in-role:unknown",
+            "hysec1:9:key:00",
+            "hysec1:9:principal:00000000000000000000000000000001:extra",
+        ] {
+            assert_eq!(
+                SecurityCursor::from_token(token),
+                Err(AccessCatalogError::InvalidRequest),
+                "unexpected token acceptance: {token}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn security_role_and_assignment_pages_are_globally_ordered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (_, owner_key) = catalog.bootstrap_owner("Owner", "owner-key", 1)?;
+        catalog.activate_key(owner_key.id())?;
+        let (reader_id, _) = catalog.create_principal("Reader service")?;
+        let (writer_id, _) = catalog.create_principal("Writer service")?;
+        let (custom_role_id, _) = catalog.create_custom_role(
+            "tenant reader",
+            [
+                CustomRoleGrant::new(ProductPermission::DataRead, ProductScope::Instance)
+                    .ok_or("invalid grant")?,
+            ],
+        )?;
+        let (second_custom_role_id, _) = catalog.create_custom_role(
+            "tenant writer",
+            [
+                CustomRoleGrant::new(ProductPermission::DataWrite, ProductScope::Instance)
+                    .ok_or("invalid grant")?,
+            ],
+        )?;
+        catalog.assign_built_in_role(reader_id, BuiltInRole::Reader, ProductScope::Instance)?;
+        catalog.assign_custom_role(writer_id, custom_role_id)?;
+        catalog.assign_custom_role(reader_id, second_custom_role_id)?;
+
+        let role_page = catalog.list_roles(SecurityRoleListRequest::new(None, 8)?)?;
+        assert_eq!(role_page.items().len(), 8);
+        let built_ins: Vec<_> = role_page
+            .items()
+            .iter()
+            .take(7)
+            .map(SecurityRoleSummary::built_in_role)
+            .collect();
+        assert_eq!(
+            built_ins,
+            vec![
+                Some(BuiltInRole::Owner),
+                Some(BuiltInRole::Admin),
+                Some(BuiltInRole::Operator),
+                Some(BuiltInRole::Developer),
+                Some(BuiltInRole::Writer),
+                Some(BuiltInRole::Reader),
+                Some(BuiltInRole::Auditor),
+            ]
+        );
+        let role_cursor = role_page.next_cursor().ok_or("missing role cursor")?;
+        let remaining_roles =
+            catalog.list_roles(SecurityRoleListRequest::new(Some(role_cursor), 8)?)?;
+        let custom_role_ids: Vec<_> = role_page
+            .items()
+            .iter()
+            .chain(remaining_roles.items())
+            .filter_map(SecurityRoleSummary::custom_role_id)
+            .collect();
+        let mut expected_custom_role_ids = vec![custom_role_id, second_custom_role_id];
+        expected_custom_role_ids.sort_unstable();
+        assert_eq!(custom_role_ids, expected_custom_role_ids);
+        assert!(
+            role_page
+                .items()
+                .iter()
+                .chain(remaining_roles.items())
+                .filter(|role| role.custom_role_id().is_some())
+                .all(|role| role.grants().len() == 1)
+        );
+
+        let assignment_page =
+            catalog.list_assignments(SecurityAssignmentListRequest::new(None, 2)?)?;
+        let assignment_cursor = assignment_page
+            .next_cursor()
+            .ok_or("missing assignment cursor")?;
+        let remaining_assignments = catalog.list_assignments(
+            SecurityAssignmentListRequest::new(Some(assignment_cursor), 2)?,
+        )?;
+        let assignments: Vec<_> = assignment_page
+            .items()
+            .iter()
+            .chain(remaining_assignments.items())
+            .copied()
+            .collect();
+        assert_eq!(assignments.len(), 4);
+        assert!(
+            assignments
+                .windows(2)
+                .all(|items| items[0].id() < items[1].id())
+        );
+        assert!(assignments.iter().any(|item| {
+            item.principal_id() == writer_id && item.custom_role_id() == Some(custom_role_id)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn security_key_pages_are_structurally_redacted() -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (owner_id, owner_key) = catalog.bootstrap_owner("Owner", "owner-key", 1)?;
+        catalog.activate_key(owner_key.id())?;
+        let (second_key, _) = catalog.begin_key_issue(
+            owner_id,
+            "second-owner-key",
+            [BuiltInRole::Owner],
+            ProductAuthorization::ALL,
+            2,
+            None,
+        )?;
+        catalog.activate_key(second_key.id())?;
+        let key_page = catalog.list_keys(SecurityKeyListRequest::new(None, 1)?)?;
+        let cursor = key_page.next_cursor().ok_or("missing key cursor")?;
+        let remaining = catalog.list_keys(SecurityKeyListRequest::new(Some(cursor), 1)?)?;
+        let keys: Vec<_> = key_page.items().iter().chain(remaining.items()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.windows(2).all(|items| items[0].id() < items[1].id()));
+        let key = keys
+            .iter()
+            .copied()
+            .find(|summary| summary.id() == owner_key.id())
+            .ok_or("missing primary key summary")?;
+        assert_eq!(key.id(), owner_key.id());
+        assert_eq!(key.principal_id(), owner_id);
+        assert_eq!(key.label(), "owner-key");
+        assert_eq!(key.roles(), &[BuiltInRole::Owner]);
+        assert_eq!(key.permission_ceiling(), ProductAuthorization::ALL);
+        assert_eq!(key.scope_ceiling(), &[ProductScope::Instance]);
+        assert_eq!(key.created_at_micros(), 1);
+
+        let key_record = catalog.key(owner_key.id()).ok_or("missing key")?;
+        let debug_pages = format!("{key_page:?}{remaining:?}");
+        assert!(!debug_pages.contains(owner_key.expose_secret()));
+        assert!(!debug_pages.contains(second_key.expose_secret()));
+        let digest_hex =
+            key_record
+                .verifier
+                .digest()
+                .iter()
+                .try_fold(String::new(), |mut output, byte| {
+                    write!(&mut output, "{byte:02x}")?;
+                    Ok::<_, std::fmt::Error>(output)
+                })?;
+        assert!(!debug_pages.contains(&digest_hex));
+        Ok(())
+    }
+
+    #[test]
+    fn security_catalog_pages_survive_reopen_and_corruption_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let key_path = path.with_extension("owner-security-list-key");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&key_path);
+        let mut product = NativeProduct::create(&path)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &key_path, 1)?;
+        let secret = fs::read_to_string(&key_path)?;
+        let owner = product.authenticate_api_key(&secret, 2)?;
+        product.create_security_principal(&owner, "Durable reader", 2)?;
+        let before = product
+            .load_access_control_catalog()?
+            .list_principals(SecurityPrincipalListRequest::new(None, 8)?)?;
+        drop(product);
+
+        let reopened = NativeProduct::open(&path)?;
+        let catalog = reopened.load_access_control_catalog()?;
+        let after = catalog.list_principals(SecurityPrincipalListRequest::new(None, 8)?)?;
+        assert_eq!(after, before);
+        let mut corrupt = catalog.encode()?;
+        corrupt[CATALOG_MAGIC.len()] ^= 1;
+        assert_eq!(
+            AccessControlCatalog::decode(&corrupt),
+            Err(AccessCatalogError::CorruptCatalog)
+        );
+
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(key_path)?;
+        Ok(())
     }
 
     #[test]

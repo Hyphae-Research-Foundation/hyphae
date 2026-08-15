@@ -213,8 +213,7 @@ even when the epoch did not change.
 
 Once the catalog is bootstrapped, every online CLI/TUI, local-daemon, and Native
 HTTP entry point selects managed API-key authentication automatically. Offline
-bootstrap/recovery and pre-bootstrap redacted status are the only CLI
-exceptions. A public
+bootstrap/recovery is the only CLI exception. A public
 transport must never project an operating-system peer, loopback placement, or
 legacy fixed bearer into `ProductAuthorization::ALL` for that directory.
 Unmanaged sessions remain available only to an explicit trusted embedded
@@ -243,6 +242,21 @@ has a row in the machine registry. Notable rules include:
 - transaction commit reauthorizes the union of staged permissions/scopes.
 
 Adding an externally reachable operation without a matrix row fails CI.
+
+### First read-only 1.2 slice
+
+The first read-only promotion closes six security operations:
+`security.status`, `security.principal_list`, `security.role_list`,
+`security.assignment_list`, `security.key_list`, and `security.audit_read`.
+They use typed `ProductOperation` variants, central managed authorization,
+bounded canonical pages, redacted CLI/TUI output, protocol minor-1 gating, and
+native-daemon/HTTP/Rust-client parity. Metadata reads require instance-scoped
+`security.read`; audit reads require instance-scoped `audit.read`.
+
+`backup.verify` remains `planned-1.2` and local-only. It will not enter the
+generic native or HTTP transport until a later contract defines a configured
+backup root and handle-relative, no-follow path resolution. A client-selected
+server filesystem path is not an accepted authority boundary.
 
 ## Bootstrap
 

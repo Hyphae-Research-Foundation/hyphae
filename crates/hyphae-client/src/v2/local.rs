@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hyphae_native_product::{ProductOperation, ProductResponse};
 use hyphae_native_protocol::{
     API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, Hello, ProtocolCapabilities,
-    ProvisionalStream, decode_end, decode_failure, decode_welcome, encode_authenticated_hello,
-    encode_cancel, encode_hello, encode_product_request, encode_window_update,
+    ProvisionalStream, decode_end, decode_failure, decode_product_response_for_minor,
+    decode_welcome, encode_authenticated_hello, encode_cancel, encode_hello,
+    encode_product_request_for_minor, encode_window_update,
 };
 use tokio::sync::Mutex;
 
@@ -71,6 +72,7 @@ impl std::fmt::Debug for LocalTransport {
 struct Connection {
     stream: interprocess::local_socket::tokio::Stream,
     codec: AsyncFrameIo,
+    negotiated_minor: u16,
     maximum_response_bytes: usize,
     next_stream_id: u32,
 }
@@ -194,6 +196,7 @@ impl LocalTransport {
         Ok(Connection {
             stream,
             codec,
+            negotiated_minor: welcome.minor,
             maximum_response_bytes,
             next_stream_id: 1,
         })
@@ -219,15 +222,6 @@ impl LocalTransport {
                 request_id,
             ));
         }
-        let encoded = encode_product_request(&hyphae_native_protocol::WireRequest {
-            operation,
-            logical_time_micros: options.logical_time_micros,
-            deadline_micros: options.deadline_micros,
-            idempotency_token: options.idempotency_token,
-            limits: options.limits,
-            durability: options.durability,
-        })
-        .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let mut state = self.state.lock().await;
         if state.is_none() {
             let handshake_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +230,18 @@ impl LocalTransport {
         let connection = state.as_mut().ok_or_else(|| {
             ClientError::Local("local connection state is unavailable".to_owned())
         })?;
+        let encoded = encode_product_request_for_minor(
+            &hyphae_native_protocol::WireRequest {
+                operation,
+                logical_time_micros: options.logical_time_micros,
+                deadline_micros: options.deadline_micros,
+                idempotency_token: options.idempotency_token,
+                limits: options.limits,
+                durability: options.durability,
+            },
+            connection.negotiated_minor,
+        )
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let stream_id = connection.next_stream_id;
         connection.next_stream_id = connection
             .next_stream_id
@@ -358,7 +364,7 @@ impl LocalTransport {
                                 .map_err(|error| ClientError::Protocol(error.to_string()))?,
                         )
                         .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                    return hyphae_native_protocol::decode_product_response(&bytes)
+                    return decode_product_response_for_minor(&bytes, connection.negotiated_minor)
                         .map_err(|error| ClientError::Protocol(error.to_string()));
                 }
                 FrameKind::Failure => {

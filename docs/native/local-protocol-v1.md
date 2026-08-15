@@ -30,6 +30,11 @@ The server returns `WELCOME` with selected version, session ID, engine
 version, data-format version, limits, capabilities and catalog version.
 Incompatible major versions fail before accepting operations.
 
+Minor negotiation selects the highest version in the intersection of the
+client range and the server range. A 1.0 client therefore remains on minor
+`0` when it connects to a 1.1 server; neither peer may send or accept a payload
+introduced after the selected minor.
+
 ### HELLO authentication extension
 
 The canonical legacy `HELLO` remains byte-for-byte unchanged. Its fixed
@@ -151,6 +156,35 @@ is implemented.
 
 The transaction ID returned by `BEGIN` can carry SQL, structure and search
 operations on the same connection/session.
+
+### Product payload minor registry
+
+Minor `1` adds the managed, redacted security read plane. Its append-only
+product request tags are `42..47`, in this exact order:
+
+1. `SecurityStatus`;
+2. `SecurityPrincipalList`;
+3. `SecurityRoleList`;
+4. `SecurityAssignmentList`;
+5. `SecurityKeyList`; and
+6. `SecurityAuditRead`.
+
+The corresponding response tags are `32..37`. Cursors are typed, bounded,
+exclusive continuations bound to the current authorization epoch. Key pages
+contain public IDs and policy metadata only; API-key secrets and verifier
+digests are not representable in the wire schema. Every request requires a
+managed API-key session and an instance-scoped `security.read` or `audit.read`
+grant as appropriate.
+
+These tags require negotiated minor `1` in both directions. A client that
+negotiated minor `0` rejects them before sending, and a server that negotiated
+minor `0` rejects them before dispatch. Existing minor-0 payload tags and
+golden bytes remain unchanged.
+
+Backup verification is not part of this transport extension. It remains a
+local API until a later contract defines a configured backup root and
+handle-relative, no-follow path resolution; arbitrary client-selected server
+filesystem paths are never accepted by this read plane.
 
 The implemented engine-bearing subset now includes
 [native local structure GET v1](local-structure-get-v1.md) and

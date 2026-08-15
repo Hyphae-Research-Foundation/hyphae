@@ -16,5 +16,7 @@ pub use hyphae_native_product::{
     ProductErrorCategory, ProductErrorCode, ProductLimits, ProductOperation, ProductPreparedHandle,
     ProductResponse, ProductRetry, ProductSearchRequest, ProductSqlResult, ProductTransactionId,
     ProductTransactionState, ProductTransactionStatus, ProductTtl, ProductValue,
-    ProductVectorBranch, ProductVectorExecution,
+    ProductVectorBranch, ProductVectorExecution, SecurityAssignmentListRequest,
+    SecurityAuditReadRequest, SecurityCursor, SecurityCursorId, SecurityKeyListRequest,
+    SecurityPrincipalListRequest, SecurityRoleListRequest,
 };

@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Current native-local protocol major version.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Current native-local protocol minor version.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 /// Maximum combined UTF-8 bytes in handshake names.
 pub const MAX_HANDSHAKE_TEXT_BYTES: usize = 4 * 1024;
 /// Exact UTF-8 bytes in one Native API-key authentication trailer.
@@ -443,11 +443,7 @@ pub fn negotiate(
     if !(hello.minimum_major..=hello.maximum_major).contains(&PROTOCOL_MAJOR) {
         return Err(HandshakeError::IncompatibleVersion);
     }
-    let minimum_minor = hello.minimum_minor;
-    let maximum_minor = PROTOCOL_MINOR;
-    if minimum_minor > maximum_minor {
-        return Err(HandshakeError::IncompatibleVersion);
-    }
+    let minor = negotiate_minor(PROTOCOL_MINOR, hello.minimum_minor, hello.maximum_minor)?;
     if !hello.capabilities.contains(hello.required_capabilities)
         || !policy.capabilities.contains(hello.required_capabilities)
     {
@@ -456,7 +452,7 @@ pub fn negotiate(
     let selected = hello.capabilities.intersection(policy.capabilities);
     Ok(Welcome {
         major: PROTOCOL_MAJOR,
-        minor: maximum_minor,
+        minor,
         capabilities: selected,
         session_id,
         maximum_frame_payload: hello
@@ -587,6 +583,19 @@ fn validate_authenticated_capabilities(hello: &Hello) -> Result<(), HandshakeErr
     }
 }
 
+fn negotiate_minor(
+    server_maximum_minor: u16,
+    client_minimum_minor: u16,
+    client_maximum_minor: u16,
+) -> Result<u16, HandshakeError> {
+    let selected = server_maximum_minor.min(client_maximum_minor);
+    if client_minimum_minor > selected {
+        Err(HandshakeError::IncompatibleVersion)
+    } else {
+        Ok(selected)
+    }
+}
+
 fn put_u16_len(encoded: &mut Vec<u8>, length: usize) -> Result<(), HandshakeError> {
     encoded.extend_from_slice(
         &u16::try_from(length)
@@ -620,4 +629,27 @@ fn read_u64(bytes: &[u8]) -> u64 {
 
 fn read_u128(bytes: &[u8]) -> u128 {
     u128::from_le_bytes(bytes.try_into().unwrap_or([0; 16]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minor_negotiation_preserves_a_legacy_client_ceiling() {
+        assert_eq!(negotiate_minor(1, 0, 0), Ok(0));
+    }
+
+    #[test]
+    fn minor_negotiation_selects_the_highest_common_minor() {
+        assert_eq!(negotiate_minor(2, 1, 3), Ok(2));
+    }
+
+    #[test]
+    fn minor_negotiation_rejects_disjoint_intervals() {
+        assert_eq!(
+            negotiate_minor(0, 1, 1),
+            Err(HandshakeError::IncompatibleVersion)
+        );
+    }
 }

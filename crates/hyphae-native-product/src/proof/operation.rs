@@ -304,6 +304,12 @@ impl ProofOperationClass for ProductOperation {
             | ProductOperation::AdminCheckpoint
             | ProductOperation::Backup(_)
             | ProductOperation::Restore(_)
+            | ProductOperation::SecurityStatus
+            | ProductOperation::SecurityPrincipalList(_)
+            | ProductOperation::SecurityRoleList(_)
+            | ProductOperation::SecurityAssignmentList(_)
+            | ProductOperation::SecurityKeyList(_)
+            | ProductOperation::SecurityAuditRead(_)
             | ProductOperation::Prove { .. } => true,
             ProductOperation::ExecuteSql { statement, .. } => {
                 let first = statement

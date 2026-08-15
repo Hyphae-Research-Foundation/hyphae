@@ -25,8 +25,8 @@ use hyphae_native_protocol::{
     AsyncFrameIo, ControlError, FlowWindow, FrameIoError, FrameKind, HandshakeError, Hello,
     NegotiationPolicy, ProductCodecError, ProtocolCapabilities, StreamCompletion,
     decode_authenticated_hello, decode_cancel, decode_deadline, decode_hello,
-    decode_product_request, decode_window_update, encode_end, encode_failure,
-    encode_product_response, encode_welcome, negotiate,
+    decode_product_request_for_minor, decode_window_update, encode_end, encode_failure,
+    encode_product_response_for_minor, encode_welcome, negotiate,
 };
 use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{ListenerOptions, PeerCreds};
@@ -985,7 +985,8 @@ async fn connection_loop(
                     continue;
                 }
                 let decode_started = Instant::now();
-                let request = match decode_product_request(&frame.payload) {
+                let request = match decode_product_request_for_minor(&frame.payload, welcome.minor)
+                {
                     Ok(request) => request,
                     Err(_) => {
                         pending_controls
@@ -1108,7 +1109,7 @@ async fn connection_loop(
                         Ok(response_codec) => match response {
                             Ok(response) => {
                                 let encoding_started = Instant::now();
-                                match encode_product_response(&response) {
+                                match encode_product_response_for_minor(&response, welcome.minor) {
                                     Ok(encoded) => {
                                         response_client.record_timing(
                                             TimingClass::ResultEncoding,

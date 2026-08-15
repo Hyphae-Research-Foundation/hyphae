@@ -9,31 +9,39 @@ use hyphae_native_product::proof::{
     NativeProofGenerationLimits, ProofCodecLimits, WitnessCodecLimits, decode_native_proof,
 };
 use hyphae_native_product::{
-    AdminStatus, BackupInfo, BackupLimits, BackupRequest, BoundedSearchQuery, CatalogCursor,
+    AccessControlLimits, AccessControlStatus, AdminStatus, ApiKeyId, AuthorizationEpoch,
+    BackupInfo, BackupLimits, BackupRequest, BoundedSearchQuery, BuiltInRole, CatalogCursor,
     CatalogDependencyRequest, CatalogListRequest, CatalogObjectSummary, CatalogPage,
-    CatalogVersion, DoctorRecovery, DoctorReport, DoctorRequest, DoctorStatus, MetricKind,
-    MetricValue, ObjectId, ProductAnnExplanation, ProductAnnRecallRisk, ProductAnnStrategy,
-    ProductCheckpointReceipt, ProductCommitOutcome, ProductCommitReceipt,
-    ProductConvergenceExplanation, ProductConvergenceStrategy, ProductDocValue, ProductDocument,
-    ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCodecError,
-    ProductExplain, ProductExplicitCommitReceipt, ProductExplicitTransactionStatus,
-    ProductHashEntry, ProductHybridExplanation, ProductHybridVectorStrategy,
-    ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
-    ProductMissingPlacement, ProductNamedAggregation, ProductNamedAggregationValue,
-    ProductOperation, ProductPhysicalObservation, ProductPreparedHandle, ProductRead,
-    ProductResponse, ProductRollbackReceipt, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch,
-    ProductSearchIngestReceipt, ProductSearchOperator, ProductSearchRequest, ProductSearchResult,
-    ProductSearchResults, ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection,
-    ProductSortSource, ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult,
-    ProductStreamEntry, ProductStructureKey, ProductStructureMutation,
-    ProductStructureMutationResult, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionStageReceipt, ProductTransactionStageResult,
-    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
-    ProductVectorBranch, ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy,
-    RestoreRequest, SnapshotIdentity, SqlPlanText, TelemetryEvent, TelemetryEventKind,
-    TelemetrySnapshot, decode_product_error, encode_product_error,
+    CatalogVersion, CustomRoleGrant, DoctorRecovery, DoctorReport, DoctorRequest, DoctorStatus,
+    MAX_SECURITY_LIST_ROWS, MetricKind, MetricValue, ObjectId, ProductAnnExplanation,
+    ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization, ProductCheckpointReceipt,
+    ProductCommitOutcome, ProductCommitReceipt, ProductConvergenceExplanation,
+    ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
+    ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
+    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
+    ProductHybridExplanation, ProductHybridVectorStrategy, ProductIntegratedSearchHit,
+    ProductLexicalBranch, ProductLimits, ProductListSide, ProductMissingPlacement,
+    ProductNamedAggregation, ProductNamedAggregationValue, ProductOperation, ProductPermission,
+    ProductPhysicalObservation, ProductPreparedHandle, ProductRead, ProductResponse,
+    ProductRollbackReceipt, ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt,
+    ProductSearchOperator, ProductSearchRequest, ProductSearchResult, ProductSearchResults,
+    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
+    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
+    ProductTransactionVectorMutation, ProductTtl, ProductValue, ProductVectorBranch,
+    ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy, RestoreRequest,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAssignmentSummary,
+    SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor,
+    SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage, SecurityKeySummary,
+    SecurityKeySummaryInput, SecurityPrincipalListRequest, SecurityPrincipalPage,
+    SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary,
+    SnapshotIdentity, SqlPlanText, TelemetryEvent, TelemetryEventKind, TelemetrySnapshot,
+    decode_product_error, encode_product_error,
 };
 use hyphae_native_runtime::CatalogPageStop;
 use thiserror::Error;
@@ -87,6 +95,12 @@ const REQUEST_TRANSACTION_COMMIT: u16 = 37;
 const REQUEST_TRANSACTION_ROLLBACK: u16 = 38;
 const REQUEST_EXPLICIT_TRANSACTION_STATUS: u16 = 40;
 const REQUEST_PROVE: u16 = 41;
+const REQUEST_SECURITY_STATUS: u16 = 42;
+const REQUEST_SECURITY_PRINCIPAL_LIST: u16 = 43;
+const REQUEST_SECURITY_ROLE_LIST: u16 = 44;
+const REQUEST_SECURITY_ASSIGNMENT_LIST: u16 = 45;
+const REQUEST_SECURITY_KEY_LIST: u16 = 46;
+const REQUEST_SECURITY_AUDIT_READ: u16 = 47;
 
 const RESPONSE_CAPABILITIES: u16 = 1;
 const RESPONSE_PREPARED_SQL: u16 = 2;
@@ -119,6 +133,12 @@ const RESPONSE_TRANSACTION_STAGED: u16 = 28;
 const RESPONSE_TRANSACTION_COMMITTED: u16 = 29;
 const RESPONSE_TRANSACTION_ROLLED_BACK: u16 = 30;
 const RESPONSE_PROVEN: u16 = 31;
+const RESPONSE_SECURITY_STATUS: u16 = 32;
+const RESPONSE_SECURITY_PRINCIPAL_PAGE: u16 = 33;
+const RESPONSE_SECURITY_ROLE_PAGE: u16 = 34;
+const RESPONSE_SECURITY_ASSIGNMENT_PAGE: u16 = 35;
+const RESPONSE_SECURITY_KEY_PAGE: u16 = 36;
+const RESPONSE_SECURITY_AUDIT_PAGE: u16 = 37;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -192,6 +212,16 @@ pub fn encode_product_request(request: &WireRequest) -> Result<Vec<u8>, ProductC
     envelope(PRODUCT_REQUEST_MAGIC, kind, &payload)
 }
 
+/// Encodes one request only when every operation is available in the
+/// negotiated protocol minor.
+pub fn encode_product_request_for_minor(
+    request: &WireRequest,
+    negotiated_minor: u16,
+) -> Result<Vec<u8>, ProductCodecError> {
+    ensure_operation_minor(&request.operation, negotiated_minor)?;
+    encode_product_request(request)
+}
+
 /// Decodes one exact request and execution envelope.
 pub fn decode_product_request(encoded: &[u8]) -> Result<WireRequest, ProductCodecError> {
     let (kind, payload) = decode_envelope(encoded, PRODUCT_REQUEST_MAGIC)?;
@@ -247,6 +277,17 @@ pub fn decode_product_request(encoded: &[u8]) -> Result<WireRequest, ProductCode
     {
         return Err(ProductCodecError::InvalidValue);
     }
+    Ok(request)
+}
+
+/// Decodes one request while rejecting operations introduced after the
+/// negotiated protocol minor.
+pub fn decode_product_request_for_minor(
+    encoded: &[u8],
+    negotiated_minor: u16,
+) -> Result<WireRequest, ProductCodecError> {
+    let request = decode_product_request(encoded)?;
+    ensure_operation_minor(&request.operation, negotiated_minor)?;
     Ok(request)
 }
 
@@ -510,6 +551,36 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             }
             (RESPONSE_RESTORE, body)
         }
+        ProductResponse::SecurityStatus(value) => {
+            let mut body = Vec::new();
+            encode_security_status(&mut body, *value)?;
+            (RESPONSE_SECURITY_STATUS, body)
+        }
+        ProductResponse::SecurityPrincipalPage(value) => {
+            let mut body = Vec::new();
+            encode_security_principal_page(&mut body, value)?;
+            (RESPONSE_SECURITY_PRINCIPAL_PAGE, body)
+        }
+        ProductResponse::SecurityRolePage(value) => {
+            let mut body = Vec::new();
+            encode_security_role_page(&mut body, value)?;
+            (RESPONSE_SECURITY_ROLE_PAGE, body)
+        }
+        ProductResponse::SecurityAssignmentPage(value) => {
+            let mut body = Vec::new();
+            encode_security_assignment_page(&mut body, value)?;
+            (RESPONSE_SECURITY_ASSIGNMENT_PAGE, body)
+        }
+        ProductResponse::SecurityKeyPage(value) => {
+            let mut body = Vec::new();
+            encode_security_key_page(&mut body, value)?;
+            (RESPONSE_SECURITY_KEY_PAGE, body)
+        }
+        ProductResponse::SecurityAuditPage(value) => {
+            let mut body = Vec::new();
+            encode_security_audit_page(&mut body, value)?;
+            (RESPONSE_SECURITY_AUDIT_PAGE, body)
+        }
         ProductResponse::Proven { response, artifact } => {
             let mut body = Vec::new();
             put_bytes(&mut body, &encode_product_response(response)?)?;
@@ -521,6 +592,16 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
         _ => return Err(ProductCodecError::Unsupported),
     };
     envelope(PRODUCT_RESPONSE_MAGIC, kind, &body)
+}
+
+/// Encodes one response only when its variant is available in the negotiated
+/// protocol minor.
+pub fn encode_product_response_for_minor(
+    response: &ProductResponse,
+    negotiated_minor: u16,
+) -> Result<Vec<u8>, ProductCodecError> {
+    ensure_response_minor(response, negotiated_minor)?;
+    encode_product_response(response)
 }
 
 /// Decodes one exact transport-independent product response.
@@ -745,6 +826,24 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
                 phases
             },
         }),
+        RESPONSE_SECURITY_STATUS => {
+            ProductResponse::SecurityStatus(decode_security_status(&mut decoder)?)
+        }
+        RESPONSE_SECURITY_PRINCIPAL_PAGE => {
+            ProductResponse::SecurityPrincipalPage(decode_security_principal_page(&mut decoder)?)
+        }
+        RESPONSE_SECURITY_ROLE_PAGE => {
+            ProductResponse::SecurityRolePage(decode_security_role_page(&mut decoder)?)
+        }
+        RESPONSE_SECURITY_ASSIGNMENT_PAGE => {
+            ProductResponse::SecurityAssignmentPage(decode_security_assignment_page(&mut decoder)?)
+        }
+        RESPONSE_SECURITY_KEY_PAGE => {
+            ProductResponse::SecurityKeyPage(decode_security_key_page(&mut decoder)?)
+        }
+        RESPONSE_SECURITY_AUDIT_PAGE => {
+            ProductResponse::SecurityAuditPage(decode_security_audit_page(&mut decoder)?)
+        }
         RESPONSE_SEARCH_INGESTED => {
             ProductResponse::SearchIngested(decode_search_ingest_receipt(&mut decoder)?)
         }
@@ -788,6 +887,63 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
     };
     decoder.finish()?;
     Ok(response)
+}
+
+/// Decodes one response while rejecting variants introduced after the
+/// negotiated protocol minor.
+pub fn decode_product_response_for_minor(
+    encoded: &[u8],
+    negotiated_minor: u16,
+) -> Result<ProductResponse, ProductCodecError> {
+    let response = decode_product_response(encoded)?;
+    ensure_response_minor(&response, negotiated_minor)?;
+    Ok(response)
+}
+
+fn ensure_operation_minor(
+    operation: &ProductOperation,
+    negotiated_minor: u16,
+) -> Result<(), ProductCodecError> {
+    let requires_minor_one = match operation {
+        ProductOperation::SecurityStatus
+        | ProductOperation::SecurityPrincipalList(_)
+        | ProductOperation::SecurityRoleList(_)
+        | ProductOperation::SecurityAssignmentList(_)
+        | ProductOperation::SecurityKeyList(_)
+        | ProductOperation::SecurityAuditRead(_) => true,
+        ProductOperation::Prove { operation, .. } => {
+            return ensure_operation_minor(operation, negotiated_minor);
+        }
+        _ => false,
+    };
+    if requires_minor_one && negotiated_minor == 0 {
+        Err(ProductCodecError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_response_minor(
+    response: &ProductResponse,
+    negotiated_minor: u16,
+) -> Result<(), ProductCodecError> {
+    let requires_minor_one = match response {
+        ProductResponse::SecurityStatus(_)
+        | ProductResponse::SecurityPrincipalPage(_)
+        | ProductResponse::SecurityRolePage(_)
+        | ProductResponse::SecurityAssignmentPage(_)
+        | ProductResponse::SecurityKeyPage(_)
+        | ProductResponse::SecurityAuditPage(_) => true,
+        ProductResponse::Proven { response, .. } => {
+            return ensure_response_minor(response, negotiated_minor);
+        }
+        _ => false,
+    };
+    if requires_minor_one && negotiated_minor == 0 {
+        Err(ProductCodecError::Unsupported)
+    } else {
+        Ok(())
+    }
 }
 
 /// Encodes a canonical `HYPERR01` product error payload.
@@ -997,6 +1153,51 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             body.extend_from_slice(&request.limits.max_manifest_bytes.to_le_bytes());
             body.extend_from_slice(&request.doctor_logical_time_micros.to_le_bytes());
             REQUEST_RESTORE
+        }
+        ProductOperation::SecurityStatus => REQUEST_SECURITY_STATUS,
+        ProductOperation::SecurityPrincipalList(request) => {
+            request
+                .validate()
+                .map_err(|_| ProductCodecError::LimitExceeded)?;
+            encode_security_cursor(&mut body, request.cursor(), SecurityCursorFamily::Principal)?;
+            put_u64(&mut body, request.limit())?;
+            REQUEST_SECURITY_PRINCIPAL_LIST
+        }
+        ProductOperation::SecurityRoleList(request) => {
+            request
+                .validate()
+                .map_err(|_| ProductCodecError::LimitExceeded)?;
+            encode_security_cursor(&mut body, request.cursor(), SecurityCursorFamily::Role)?;
+            put_u64(&mut body, request.limit())?;
+            REQUEST_SECURITY_ROLE_LIST
+        }
+        ProductOperation::SecurityAssignmentList(request) => {
+            request
+                .validate()
+                .map_err(|_| ProductCodecError::LimitExceeded)?;
+            encode_security_cursor(
+                &mut body,
+                request.cursor(),
+                SecurityCursorFamily::Assignment,
+            )?;
+            put_u64(&mut body, request.limit())?;
+            REQUEST_SECURITY_ASSIGNMENT_LIST
+        }
+        ProductOperation::SecurityKeyList(request) => {
+            request
+                .validate()
+                .map_err(|_| ProductCodecError::LimitExceeded)?;
+            encode_security_cursor(&mut body, request.cursor(), SecurityCursorFamily::Key)?;
+            put_u64(&mut body, request.limit())?;
+            REQUEST_SECURITY_KEY_LIST
+        }
+        ProductOperation::SecurityAuditRead(request) => {
+            request
+                .validate()
+                .map_err(|_| ProductCodecError::LimitExceeded)?;
+            encode_optional_security_id(&mut body, request.cursor());
+            put_u64(&mut body, request.limit())?;
+            REQUEST_SECURITY_AUDIT_READ
         }
         ProductOperation::TransactionBegin => REQUEST_TRANSACTION_BEGIN,
         ProductOperation::TransactionStageSql { handle, mutation } => {
@@ -1255,6 +1456,42 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
             request.doctor_logical_time_micros = decoder.i64()?;
             ProductOperation::Restore(request)
         }
+        REQUEST_SECURITY_STATUS => ProductOperation::SecurityStatus,
+        REQUEST_SECURITY_PRINCIPAL_LIST => ProductOperation::SecurityPrincipalList(
+            SecurityPrincipalListRequest::new(
+                decode_security_cursor(&mut decoder, SecurityCursorFamily::Principal)?,
+                decoder.usize()?,
+            )
+            .map_err(|_| ProductCodecError::LimitExceeded)?,
+        ),
+        REQUEST_SECURITY_ROLE_LIST => ProductOperation::SecurityRoleList(
+            SecurityRoleListRequest::new(
+                decode_security_cursor(&mut decoder, SecurityCursorFamily::Role)?,
+                decoder.usize()?,
+            )
+            .map_err(|_| ProductCodecError::LimitExceeded)?,
+        ),
+        REQUEST_SECURITY_ASSIGNMENT_LIST => ProductOperation::SecurityAssignmentList(
+            SecurityAssignmentListRequest::new(
+                decode_security_cursor(&mut decoder, SecurityCursorFamily::Assignment)?,
+                decoder.usize()?,
+            )
+            .map_err(|_| ProductCodecError::LimitExceeded)?,
+        ),
+        REQUEST_SECURITY_KEY_LIST => ProductOperation::SecurityKeyList(
+            SecurityKeyListRequest::new(
+                decode_security_cursor(&mut decoder, SecurityCursorFamily::Key)?,
+                decoder.usize()?,
+            )
+            .map_err(|_| ProductCodecError::LimitExceeded)?,
+        ),
+        REQUEST_SECURITY_AUDIT_READ => ProductOperation::SecurityAuditRead(
+            SecurityAuditReadRequest::new(
+                decode_optional_security_id(&mut decoder)?,
+                decoder.usize()?,
+            )
+            .map_err(|_| ProductCodecError::LimitExceeded)?,
+        ),
         REQUEST_TRANSACTION_BEGIN => ProductOperation::TransactionBegin,
         REQUEST_TRANSACTION_STAGE_SQL => ProductOperation::TransactionStageSql {
             handle: decode_transaction_handle(&mut decoder)?,
@@ -1303,6 +1540,951 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
     };
     decoder.finish()?;
     Ok(operation)
+}
+
+#[derive(Clone, Copy)]
+enum SecurityCursorFamily {
+    Principal,
+    Role,
+    Assignment,
+    Key,
+}
+
+fn encode_security_cursor(
+    encoded: &mut Vec<u8>,
+    cursor: Option<SecurityCursor>,
+    family: SecurityCursorFamily,
+) -> Result<(), ProductCodecError> {
+    let Some(cursor) = cursor else {
+        encoded.extend_from_slice(&[0; 40]);
+        return Ok(());
+    };
+    if cursor.authorization_epoch().get() == 0 {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    encoded.push(1);
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&cursor.authorization_epoch().get().to_le_bytes());
+    let (kind, payload) = encode_security_cursor_id(cursor.after_id(), family)?;
+    encoded.push(kind);
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&payload);
+    Ok(())
+}
+
+fn encode_security_cursor_id(
+    id: SecurityCursorId,
+    family: SecurityCursorFamily,
+) -> Result<(u8, [u8; 16]), ProductCodecError> {
+    match (family, id) {
+        (SecurityCursorFamily::Principal, SecurityCursorId::Principal(id)) => {
+            Ok((1, id.to_be_bytes()))
+        }
+        (SecurityCursorFamily::Role, SecurityCursorId::BuiltInRole(role)) => {
+            let mut encoded = [0; 16];
+            encoded[0] = role.tag();
+            Ok((2, encoded))
+        }
+        (SecurityCursorFamily::Role, SecurityCursorId::CustomRole(id)) => Ok((3, id.to_be_bytes())),
+        (SecurityCursorFamily::Assignment, SecurityCursorId::Assignment(id)) => {
+            Ok((4, id.to_be_bytes()))
+        }
+        (SecurityCursorFamily::Key, SecurityCursorId::Key(id)) => Ok((5, *id.as_bytes())),
+        _ => Err(ProductCodecError::InvalidValue),
+    }
+}
+
+fn decode_security_cursor(
+    decoder: &mut Decoder<'_>,
+    family: SecurityCursorFamily,
+) -> Result<Option<SecurityCursor>, ProductCodecError> {
+    let present = decoder.u8()?;
+    if present > 1 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let epoch = decoder.u64()?;
+    let kind = decoder.u8()?;
+    if decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let payload = decoder.array()?;
+    if present == 0 {
+        if epoch != 0 || kind != 0 || payload != [0; 16] {
+            return Err(ProductCodecError::Malformed);
+        }
+        return Ok(None);
+    }
+    if epoch == 0 {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let after_id = decode_security_cursor_id(kind, payload, family)?;
+    Ok(Some(SecurityCursor::new(
+        AuthorizationEpoch::new(epoch),
+        after_id,
+    )))
+}
+
+fn decode_security_cursor_id(
+    kind: u8,
+    payload: [u8; 16],
+    family: SecurityCursorFamily,
+) -> Result<SecurityCursorId, ProductCodecError> {
+    match (family, kind) {
+        (SecurityCursorFamily::Principal, 1) => {
+            Ok(SecurityCursorId::Principal(decode_security_id(payload)?))
+        }
+        (SecurityCursorFamily::Role, 2) => {
+            if payload[1..] != [0; 15] {
+                return Err(ProductCodecError::Malformed);
+            }
+            Ok(SecurityCursorId::BuiltInRole(
+                BuiltInRole::from_tag(payload[0]).ok_or(ProductCodecError::InvalidValue)?,
+            ))
+        }
+        (SecurityCursorFamily::Role, 3) => {
+            Ok(SecurityCursorId::CustomRole(decode_security_id(payload)?))
+        }
+        (SecurityCursorFamily::Assignment, 4) => {
+            Ok(SecurityCursorId::Assignment(decode_security_id(payload)?))
+        }
+        (SecurityCursorFamily::Key, 5) => Ok(SecurityCursorId::Key(
+            ApiKeyId::from_bytes(payload).ok_or(ProductCodecError::InvalidValue)?,
+        )),
+        _ => Err(ProductCodecError::InvalidValue),
+    }
+}
+
+fn encode_optional_security_id(encoded: &mut Vec<u8>, id: Option<SecurityId>) {
+    encoded.push(u8::from(id.is_some()));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&id.map_or([0; 16], SecurityId::to_be_bytes));
+}
+
+fn decode_optional_security_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SecurityId>, ProductCodecError> {
+    let present = decoder.u8()?;
+    if present > 1 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let payload = decoder.array()?;
+    if present == 0 {
+        return if payload == [0; 16] {
+            Ok(None)
+        } else {
+            Err(ProductCodecError::Malformed)
+        };
+    }
+    decode_security_id(payload).map(Some)
+}
+
+fn decode_security_id(payload: [u8; 16]) -> Result<SecurityId, ProductCodecError> {
+    SecurityId::new(u128::from_be_bytes(payload)).ok_or(ProductCodecError::InvalidValue)
+}
+
+fn encode_security_status(
+    encoded: &mut Vec<u8>,
+    value: AccessControlStatus,
+) -> Result<(), ProductCodecError> {
+    value
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encoded.push(u8::from(value.bootstrapped));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&value.epoch.get().to_le_bytes());
+    for count in [
+        value.principals,
+        value.assignments,
+        value.custom_roles,
+        value.custom_assignments,
+        value.keys,
+        value.pending_keys,
+        value.audit_events,
+    ] {
+        put_u64(encoded, count)?;
+    }
+    Ok(())
+}
+
+fn decode_security_status(
+    decoder: &mut Decoder<'_>,
+) -> Result<AccessControlStatus, ProductCodecError> {
+    let bootstrapped = decoder.boolean()?;
+    if decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let value = AccessControlStatus {
+        bootstrapped,
+        epoch: AuthorizationEpoch::new(decoder.u64()?),
+        principals: decoder.usize()?,
+        assignments: decoder.usize()?,
+        custom_roles: decoder.usize()?,
+        custom_assignments: decoder.usize()?,
+        keys: decoder.usize()?,
+        pending_keys: decoder.usize()?,
+        audit_events: decoder.usize()?,
+    };
+    value
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    Ok(value)
+}
+
+fn encode_security_page_header(
+    encoded: &mut Vec<u8>,
+    authorization_epoch: AuthorizationEpoch,
+    item_count: usize,
+    next_cursor: Option<SecurityCursor>,
+    family: SecurityCursorFamily,
+) -> Result<(), ProductCodecError> {
+    if authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || item_count > MAX_SECURITY_LIST_ROWS
+        || next_cursor.is_some_and(|cursor| cursor.authorization_epoch() != authorization_epoch)
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    encoded.extend_from_slice(&authorization_epoch.get().to_le_bytes());
+    put_u32(encoded, item_count)?;
+    encoded.extend_from_slice(&[0; 4]);
+    encode_security_cursor(encoded, next_cursor, family)
+}
+
+fn decode_security_page_header(
+    decoder: &mut Decoder<'_>,
+    family: SecurityCursorFamily,
+) -> Result<(AuthorizationEpoch, usize, Option<SecurityCursor>), ProductCodecError> {
+    let authorization_epoch = AuthorizationEpoch::new(decoder.u64()?);
+    let item_count = decoder.usize_u32()?;
+    if authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || item_count > MAX_SECURITY_LIST_ROWS
+        || decoder.bytes(4)? != [0; 4]
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let next_cursor = decode_security_cursor(decoder, family)?;
+    if next_cursor.is_some_and(|cursor| cursor.authorization_epoch() != authorization_epoch) {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok((authorization_epoch, item_count, next_cursor))
+}
+
+fn encode_security_principal_page(
+    encoded: &mut Vec<u8>,
+    page: &SecurityPrincipalPage,
+) -> Result<(), ProductCodecError> {
+    page.validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encode_security_page_header(
+        encoded,
+        page.authorization_epoch(),
+        page.items().len(),
+        page.next_cursor(),
+        SecurityCursorFamily::Principal,
+    )?;
+    for item in page.items() {
+        encoded.extend_from_slice(&item.id().to_be_bytes());
+        encoded.push(u8::from(item.enabled()));
+        encoded.extend_from_slice(&[0; 7]);
+        put_security_text(encoded, item.display_name())?;
+    }
+    Ok(())
+}
+
+fn decode_security_principal_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityPrincipalPage, ProductCodecError> {
+    let (authorization_epoch, item_count, next_cursor) =
+        decode_security_page_header(decoder, SecurityCursorFamily::Principal)?;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let id = decode_security_id(decoder.array()?)?;
+        let enabled = decoder.boolean()?;
+        if decoder.bytes(7)? != [0; 7] {
+            return Err(ProductCodecError::Malformed);
+        }
+        items.push(
+            SecurityPrincipalSummary::new(id, decode_security_text(decoder)?, enabled)
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+        );
+    }
+    SecurityPrincipalPage::try_from_wire(authorization_epoch, items, next_cursor)
+        .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_security_role_page(
+    encoded: &mut Vec<u8>,
+    page: &SecurityRolePage,
+) -> Result<(), ProductCodecError> {
+    page.validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encode_security_page_header(
+        encoded,
+        page.authorization_epoch(),
+        page.items().len(),
+        page.next_cursor(),
+        SecurityCursorFamily::Role,
+    )?;
+    for item in page.items() {
+        if let Some(role) = item.built_in_role() {
+            encoded.push(0);
+            encoded.push(role.tag());
+            encoded.extend_from_slice(&[0; 6]);
+        } else {
+            encoded.push(1);
+            encoded.extend_from_slice(&[0; 7]);
+            encoded.extend_from_slice(
+                &item
+                    .custom_role_id()
+                    .ok_or(ProductCodecError::InvalidValue)?
+                    .to_be_bytes(),
+            );
+            put_security_text(encoded, item.display_name())?;
+            encode_custom_role_grants(encoded, item.grants())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_security_role_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityRolePage, ProductCodecError> {
+    let (authorization_epoch, item_count, next_cursor) =
+        decode_security_page_header(decoder, SecurityCursorFamily::Role)?;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        items.push(match decoder.u8()? {
+            0 => {
+                let role =
+                    BuiltInRole::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
+                if decoder.bytes(6)? != [0; 6] {
+                    return Err(ProductCodecError::Malformed);
+                }
+                SecurityRoleSummary::built_in(role)
+            }
+            1 => {
+                if decoder.bytes(7)? != [0; 7] {
+                    return Err(ProductCodecError::Malformed);
+                }
+                let id = decode_security_id(decoder.array()?)?;
+                let display_name = decode_security_text(decoder)?;
+                let grants = decode_custom_role_grants(decoder)?;
+                SecurityRoleSummary::custom(id, display_name, grants)
+                    .map_err(|_| ProductCodecError::InvalidValue)?
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
+        });
+    }
+    SecurityRolePage::try_from_wire(authorization_epoch, items, next_cursor)
+        .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_custom_role_grants(
+    encoded: &mut Vec<u8>,
+    grants: &[CustomRoleGrant],
+) -> Result<(), ProductCodecError> {
+    if grants.is_empty() || grants.len() > AccessControlLimits::V1.grants_per_role {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, grants.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for grant in grants {
+        encoded.push(grant.permission().tag());
+        encoded.extend_from_slice(&[0; 7]);
+        encode_product_scope(encoded, grant.scope());
+    }
+    Ok(())
+}
+
+fn decode_custom_role_grants(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<CustomRoleGrant>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count == 0 || count > AccessControlLimits::V1.grants_per_role || decoder.bytes(4)? != [0; 4]
+    {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut grants = Vec::with_capacity(count);
+    for _ in 0..count {
+        let permission =
+            ProductPermission::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
+        if decoder.bytes(7)? != [0; 7] {
+            return Err(ProductCodecError::Malformed);
+        }
+        grants.push(
+            CustomRoleGrant::new(permission, decode_product_scope(decoder)?)
+                .ok_or(ProductCodecError::InvalidValue)?,
+        );
+    }
+    Ok(grants)
+}
+
+fn encode_security_assignment_page(
+    encoded: &mut Vec<u8>,
+    page: &SecurityAssignmentPage,
+) -> Result<(), ProductCodecError> {
+    page.validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encode_security_page_header(
+        encoded,
+        page.authorization_epoch(),
+        page.items().len(),
+        page.next_cursor(),
+        SecurityCursorFamily::Assignment,
+    )?;
+    for item in page.items() {
+        encoded.extend_from_slice(&item.id().to_be_bytes());
+        encoded.extend_from_slice(&item.principal_id().to_be_bytes());
+        match (item.built_in_role(), item.custom_role_id(), item.scope()) {
+            (Some(role), None, Some(scope)) => {
+                encoded.push(0);
+                encoded.push(role.tag());
+                encoded.extend_from_slice(&[0; 6]);
+                encode_product_scope(encoded, scope);
+            }
+            (None, Some(role_id), None) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&[0; 7]);
+                encoded.extend_from_slice(&role_id.to_be_bytes());
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
+        }
+    }
+    Ok(())
+}
+
+fn decode_security_assignment_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityAssignmentPage, ProductCodecError> {
+    let (authorization_epoch, item_count, next_cursor) =
+        decode_security_page_header(decoder, SecurityCursorFamily::Assignment)?;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let id = decode_security_id(decoder.array()?)?;
+        let principal_id = decode_security_id(decoder.array()?)?;
+        let (built_in_role, custom_role_id, scope) = match decoder.u8()? {
+            0 => {
+                let role =
+                    BuiltInRole::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
+                if decoder.bytes(6)? != [0; 6] {
+                    return Err(ProductCodecError::Malformed);
+                }
+                (Some(role), None, Some(decode_product_scope(decoder)?))
+            }
+            1 => {
+                if decoder.bytes(7)? != [0; 7] {
+                    return Err(ProductCodecError::Malformed);
+                }
+                (None, Some(decode_security_id(decoder.array()?)?), None)
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
+        };
+        items.push(
+            SecurityAssignmentSummary::new(id, principal_id, built_in_role, custom_role_id, scope)
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+        );
+    }
+    SecurityAssignmentPage::try_from_wire(authorization_epoch, items, next_cursor)
+        .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_security_key_page(
+    encoded: &mut Vec<u8>,
+    page: &SecurityKeyPage,
+) -> Result<(), ProductCodecError> {
+    page.validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encode_security_page_header(
+        encoded,
+        page.authorization_epoch(),
+        page.items().len(),
+        page.next_cursor(),
+        SecurityCursorFamily::Key,
+    )?;
+    for item in page.items() {
+        encode_security_key_summary(encoded, item)?;
+    }
+    Ok(())
+}
+
+fn decode_security_key_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityKeyPage, ProductCodecError> {
+    let (authorization_epoch, item_count, next_cursor) =
+        decode_security_page_header(decoder, SecurityCursorFamily::Key)?;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        items.push(decode_security_key_summary(decoder)?);
+    }
+    SecurityKeyPage::try_from_wire(authorization_epoch, items, next_cursor)
+        .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_security_key_summary(
+    encoded: &mut Vec<u8>,
+    item: &SecurityKeySummary,
+) -> Result<(), ProductCodecError> {
+    encoded.extend_from_slice(item.id().as_bytes());
+    encoded.extend_from_slice(&item.principal_id().to_be_bytes());
+    encoded.push(u8::from(item.active()) | (u8::from(item.revoked()) << 1));
+    encoded.extend_from_slice(&[0; 7]);
+    put_security_text(encoded, item.label())?;
+    encode_built_in_roles(encoded, item.roles())?;
+    encode_security_ids(encoded, item.custom_roles())?;
+    encoded.extend_from_slice(&item.permission_ceiling().bits().to_le_bytes());
+    encode_product_scopes(encoded, item.scope_ceiling())?;
+    encoded.extend_from_slice(&item.created_at_micros().to_le_bytes());
+    encode_fixed_optional_i64(encoded, item.expires_at_micros());
+    encoded.extend_from_slice(&item.published_epoch().get().to_le_bytes());
+    encode_optional_api_key_id(encoded, item.predecessor_id());
+    encode_optional_api_key_id(encoded, item.successor_id());
+    encode_fixed_optional_i64(encoded, item.overlap_until_micros());
+    encode_optional_u64(encoded, item.rotation_overlap_micros());
+    Ok(())
+}
+
+fn decode_security_key_summary(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityKeySummary, ProductCodecError> {
+    let id = decode_api_key_id(decoder.array()?)?;
+    let principal_id = decode_security_id(decoder.array()?)?;
+    let flags = decoder.u8()?;
+    if flags & !3 != 0 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let label = decode_security_text(decoder)?;
+    let roles = decode_built_in_roles(decoder)?;
+    let custom_roles = decode_security_ids(decoder)?;
+    let permission_ceiling = ProductAuthorization::from_known_bits(decoder.u64()?)
+        .ok_or(ProductCodecError::InvalidValue)?;
+    let scope_ceiling = decode_product_scopes(decoder)?;
+    let created_at_micros = decoder.i64()?;
+    let expires_at_micros = decode_fixed_optional_i64(decoder)?;
+    let published_epoch = AuthorizationEpoch::new(decoder.u64()?);
+    let predecessor_id = decode_optional_api_key_id(decoder)?;
+    let successor_id = decode_optional_api_key_id(decoder)?;
+    let overlap_until_micros = decode_fixed_optional_i64(decoder)?;
+    let rotation_overlap_micros = decode_optional_u64(decoder)?;
+    SecurityKeySummary::try_from_wire(SecurityKeySummaryInput {
+        id,
+        principal_id,
+        label,
+        active: flags & 1 != 0,
+        roles,
+        custom_roles,
+        permission_ceiling,
+        scope_ceiling,
+        created_at_micros,
+        expires_at_micros,
+        revoked: flags & 2 != 0,
+        published_epoch,
+        predecessor_id,
+        successor_id,
+        overlap_until_micros,
+        rotation_overlap_micros,
+    })
+    .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_built_in_roles(
+    encoded: &mut Vec<u8>,
+    roles: &[BuiltInRole],
+) -> Result<(), ProductCodecError> {
+    if roles.len() > 7 {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, roles.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    encoded.extend(roles.iter().map(|role| role.tag()));
+    Ok(())
+}
+
+fn decode_built_in_roles(decoder: &mut Decoder<'_>) -> Result<Vec<BuiltInRole>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count > 7 || decoder.bytes(4)? != [0; 4] {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut roles = Vec::with_capacity(count);
+    for _ in 0..count {
+        roles.push(BuiltInRole::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?);
+    }
+    Ok(roles)
+}
+
+fn encode_security_ids(encoded: &mut Vec<u8>, ids: &[SecurityId]) -> Result<(), ProductCodecError> {
+    if ids.len() > AccessControlLimits::V1.assignments_per_principal {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, ids.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for id in ids {
+        encoded.extend_from_slice(&id.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn decode_security_ids(decoder: &mut Decoder<'_>) -> Result<Vec<SecurityId>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count > AccessControlLimits::V1.assignments_per_principal || decoder.bytes(4)? != [0; 4] {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(decode_security_id(decoder.array()?)?);
+    }
+    Ok(ids)
+}
+
+fn encode_product_scopes(
+    encoded: &mut Vec<u8>,
+    scopes: &[ProductScope],
+) -> Result<(), ProductCodecError> {
+    if scopes.is_empty() || scopes.len() > AccessControlLimits::V1.assignments_per_principal {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, scopes.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for scope in scopes {
+        encode_product_scope(encoded, *scope);
+    }
+    Ok(())
+}
+
+fn decode_product_scopes(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<ProductScope>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count == 0
+        || count > AccessControlLimits::V1.assignments_per_principal
+        || decoder.bytes(4)? != [0; 4]
+    {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut scopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        scopes.push(decode_product_scope(decoder)?);
+    }
+    Ok(scopes)
+}
+
+fn encode_product_scope(encoded: &mut Vec<u8>, scope: ProductScope) {
+    let (kind, id) = match scope {
+        ProductScope::Instance => (0, [0; 16]),
+        ProductScope::CatalogSubtree(id) => (1, id.get().to_le_bytes()),
+        ProductScope::CatalogObject(id) => (2, id.get().to_le_bytes()),
+    };
+    encoded.push(kind);
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&id);
+}
+
+fn decode_product_scope(decoder: &mut Decoder<'_>) -> Result<ProductScope, ProductCodecError> {
+    let kind = decoder.u8()?;
+    if decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let payload = decoder.array()?;
+    match kind {
+        0 if payload == [0; 16] => Ok(ProductScope::Instance),
+        0 => Err(ProductCodecError::Malformed),
+        1 => Ok(ProductScope::CatalogSubtree(
+            ObjectId::new(u128::from_le_bytes(payload))
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+        )),
+        2 => Ok(ProductScope::CatalogObject(
+            ObjectId::new(u128::from_le_bytes(payload))
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+        )),
+        _ => Err(ProductCodecError::InvalidValue),
+    }
+}
+
+fn encode_security_audit_page(
+    encoded: &mut Vec<u8>,
+    page: &SecurityAuditPage,
+) -> Result<(), ProductCodecError> {
+    page.validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    if page.events.len() > AccessControlLimits::V1.audit_result_rows {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, page.events.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    encode_optional_security_id(encoded, page.next_cursor);
+    for event in &page.events {
+        encode_security_audit_event(encoded, event)?;
+    }
+    Ok(())
+}
+
+fn decode_security_audit_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityAuditPage, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count > AccessControlLimits::V1.audit_result_rows || decoder.bytes(4)? != [0; 4] {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let next_cursor = decode_optional_security_id(decoder)?;
+    let mut events = Vec::with_capacity(count);
+    for _ in 0..count {
+        events.push(decode_security_audit_event(decoder)?);
+    }
+    SecurityAuditPage::try_from_wire(events, next_cursor)
+        .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_security_audit_event(
+    encoded: &mut Vec<u8>,
+    event: &SecurityAuditEvent,
+) -> Result<(), ProductCodecError> {
+    encoded.extend_from_slice(&event.id().to_be_bytes());
+    encoded.extend_from_slice(&event.commit_csn().to_le_bytes());
+    let has_actor = event.actor_principal_id().is_some() && event.actor_key_id().is_some();
+    if event.actor_principal_id().is_some() != event.actor_key_id().is_some() {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    encoded.push(u8::from(has_actor));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(
+        &event
+            .actor_principal_id()
+            .map_or([0; 16], SecurityId::to_be_bytes),
+    );
+    encoded.extend_from_slice(&event.actor_key_id().map_or([0; 16], |id| *id.as_bytes()));
+    encoded.push(event.action().tag());
+    encoded.push(match event.result() {
+        SecurityAuditResult::Succeeded => 0,
+    });
+    encoded.extend_from_slice(&[0; 6]);
+    encode_security_audit_targets(encoded, event.targets())?;
+    encode_security_audit_metadata(encoded, event.metadata())?;
+    Ok(())
+}
+
+fn decode_security_audit_event(
+    decoder: &mut Decoder<'_>,
+) -> Result<SecurityAuditEvent, ProductCodecError> {
+    let id = decode_security_id(decoder.array()?)?;
+    let commit_csn = decoder.u64()?;
+    let has_actor = decoder.boolean()?;
+    if decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let actor_principal = decoder.array()?;
+    let actor_key = decoder.array()?;
+    let (actor_principal_id, actor_key_id) = if has_actor {
+        (
+            Some(decode_security_id(actor_principal)?),
+            Some(decode_api_key_id(actor_key)?),
+        )
+    } else if actor_principal == [0; 16] && actor_key == [0; 16] {
+        (None, None)
+    } else {
+        return Err(ProductCodecError::Malformed);
+    };
+    let action =
+        SecurityAuditAction::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
+    let result = match decoder.u8()? {
+        0 => SecurityAuditResult::Succeeded,
+        _ => return Err(ProductCodecError::InvalidValue),
+    };
+    if decoder.bytes(6)? != [0; 6] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let targets = decode_security_audit_targets(decoder)?;
+    let metadata = decode_security_audit_metadata(decoder)?;
+    SecurityAuditEvent::try_from_wire(
+        id,
+        commit_csn,
+        actor_principal_id,
+        actor_key_id,
+        action,
+        result,
+        targets,
+        metadata,
+    )
+    .map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn encode_security_audit_targets(
+    encoded: &mut Vec<u8>,
+    targets: &[SecurityAuditTarget],
+) -> Result<(), ProductCodecError> {
+    if targets.is_empty() || targets.len() > AccessControlLimits::V1.assignments_per_principal {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, targets.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for target in targets {
+        let (kind, id) = match target {
+            SecurityAuditTarget::Principal(id) => (0, id.to_be_bytes()),
+            SecurityAuditTarget::Role(id) => (1, id.to_be_bytes()),
+            SecurityAuditTarget::Assignment(id) => (2, id.to_be_bytes()),
+            SecurityAuditTarget::Key(id) => (3, *id.as_bytes()),
+        };
+        encoded.push(kind);
+        encoded.extend_from_slice(&[0; 7]);
+        encoded.extend_from_slice(&id);
+    }
+    Ok(())
+}
+
+fn decode_security_audit_targets(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<SecurityAuditTarget>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count == 0
+        || count > AccessControlLimits::V1.assignments_per_principal
+        || decoder.bytes(4)? != [0; 4]
+    {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut targets = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = decoder.u8()?;
+        if decoder.bytes(7)? != [0; 7] {
+            return Err(ProductCodecError::Malformed);
+        }
+        let id = decoder.array()?;
+        targets.push(match kind {
+            0 => SecurityAuditTarget::Principal(decode_security_id(id)?),
+            1 => SecurityAuditTarget::Role(decode_security_id(id)?),
+            2 => SecurityAuditTarget::Assignment(decode_security_id(id)?),
+            3 => SecurityAuditTarget::Key(decode_api_key_id(id)?),
+            _ => return Err(ProductCodecError::InvalidValue),
+        });
+    }
+    Ok(targets)
+}
+
+fn encode_security_audit_metadata(
+    encoded: &mut Vec<u8>,
+    metadata: &[SecurityAuditMetadata],
+) -> Result<(), ProductCodecError> {
+    if metadata.len() > AccessControlLimits::V1.assignments_per_principal {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_u32(encoded, metadata.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for value in metadata {
+        let (kind, instant) = match value {
+            SecurityAuditMetadata::ExpiresAtMicros(instant) => (0, *instant),
+            SecurityAuditMetadata::RotationOverlapUntilMicros(instant) => (1, *instant),
+        };
+        encoded.push(kind);
+        encoded.extend_from_slice(&[0; 7]);
+        encoded.extend_from_slice(&instant.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn decode_security_audit_metadata(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<SecurityAuditMetadata>, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if count > AccessControlLimits::V1.assignments_per_principal || decoder.bytes(4)? != [0; 4] {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut metadata = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = decoder.u8()?;
+        if decoder.bytes(7)? != [0; 7] {
+            return Err(ProductCodecError::Malformed);
+        }
+        let instant = decoder.i64()?;
+        metadata.push(match kind {
+            0 => SecurityAuditMetadata::ExpiresAtMicros(instant),
+            1 => SecurityAuditMetadata::RotationOverlapUntilMicros(instant),
+            _ => return Err(ProductCodecError::InvalidValue),
+        });
+    }
+    Ok(metadata)
+}
+
+fn put_security_text(encoded: &mut Vec<u8>, value: &str) -> Result<(), ProductCodecError> {
+    if value.is_empty() || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    put_text(encoded, value)
+}
+
+fn decode_security_text(decoder: &mut Decoder<'_>) -> Result<String, ProductCodecError> {
+    let value = decoder.text()?;
+    if value.is_empty() || value.len() > hyphae_native_product::MAX_SECURITY_DISPLAY_NAME_BYTES {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    Ok(value)
+}
+
+fn decode_api_key_id(payload: [u8; 16]) -> Result<ApiKeyId, ProductCodecError> {
+    ApiKeyId::from_bytes(payload).ok_or(ProductCodecError::InvalidValue)
+}
+
+fn encode_optional_api_key_id(encoded: &mut Vec<u8>, id: Option<ApiKeyId>) {
+    encoded.push(u8::from(id.is_some()));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&id.map_or([0; 16], |id| *id.as_bytes()));
+}
+
+fn decode_optional_api_key_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<ApiKeyId>, ProductCodecError> {
+    let present = decoder.u8()?;
+    if present > 1 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let payload = decoder.array()?;
+    if present == 0 {
+        return if payload == [0; 16] {
+            Ok(None)
+        } else {
+            Err(ProductCodecError::Malformed)
+        };
+    }
+    decode_api_key_id(payload).map(Some)
+}
+
+fn encode_fixed_optional_i64(encoded: &mut Vec<u8>, value: Option<i64>) {
+    encoded.push(u8::from(value.is_some()));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&value.unwrap_or(0).to_le_bytes());
+}
+
+fn decode_fixed_optional_i64(decoder: &mut Decoder<'_>) -> Result<Option<i64>, ProductCodecError> {
+    let present = decoder.u8()?;
+    if present > 1 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let value = decoder.i64()?;
+    if present == 0 {
+        return if value == 0 {
+            Ok(None)
+        } else {
+            Err(ProductCodecError::Malformed)
+        };
+    }
+    Ok(Some(value))
+}
+
+fn encode_optional_u64(encoded: &mut Vec<u8>, value: Option<u64>) {
+    encoded.push(u8::from(value.is_some()));
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&value.unwrap_or(0).to_le_bytes());
+}
+
+fn decode_optional_u64(decoder: &mut Decoder<'_>) -> Result<Option<u64>, ProductCodecError> {
+    let present = decoder.u8()?;
+    if present > 1 || decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let value = decoder.u64()?;
+    if present == 0 {
+        return if value == 0 {
+            Ok(None)
+        } else {
+            Err(ProductCodecError::Malformed)
+        };
+    }
+    Ok(Some(value))
 }
 
 fn encode_proof_generation_limits(

@@ -21,6 +21,19 @@ from tools.check_native_access_control import (
 CONTRACT = ROOT / "contracts/native-access-control-v1.json"
 SOURCE = ROOT / "crates/hyphae-native-product/src/operation.rs"
 
+READ_ONLY_SLICE = {
+    "backup.verify": "backup.verify",
+}
+
+CURRENT_SECURITY_READ_SLICE = {
+    "security.assignment_list": "security.read",
+    "security.audit_read": "audit.read",
+    "security.key_list": "security.read",
+    "security.principal_list": "security.read",
+    "security.role_list": "security.read",
+    "security.status": "security.read",
+}
+
 
 def payload() -> dict:
     return json.loads(CONTRACT.read_text(encoding="utf-8"))
@@ -40,8 +53,58 @@ class NativeAccessControlContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "contract-complete-implementation-pending")
         self.assertEqual(result["permissions"], 18)
         self.assertEqual(result["built_in_roles"], 7)
-        self.assertEqual(result["current_product_variants"], 41)
-        self.assertEqual(result["planned_operations"], 11)
+        self.assertEqual(result["current_product_variants"], 47)
+        self.assertEqual(result["planned_operations"], 7)
+
+    def test_backup_verify_remains_planned_and_instance_scoped(self) -> None:
+        contract = payload()
+        for operation_id, permission in READ_ONLY_SLICE.items():
+            with self.subTest(operation=operation_id):
+                row = operation(contract, operation_id)
+                self.assertEqual(row["status"], "planned-1.2")
+                self.assertIsNone(row["source_variant"])
+                self.assertEqual(row["classification"], "fixed")
+                self.assertEqual(row["required_all"], [permission])
+                self.assertEqual(row["scope_resolution"], "instance")
+                self.assertFalse(row["inherits_underlying"])
+
+    def test_backup_verify_cannot_claim_current_without_a_safe_transport_boundary(self) -> None:
+        for operation_id in READ_ONLY_SLICE:
+            with self.subTest(operation=operation_id):
+                contract = payload()
+                row = operation(contract, operation_id)
+                row["status"] = "current"
+                row["source_variant"] = "Capabilities"
+                with self.assertRaisesRegex(
+                    AccessControlValidationError,
+                    f"planned read-only operation {operation_id}",
+                ):
+                    validate(contract, SOURCE)
+
+    def test_security_read_slice_is_current_and_instance_scoped(self) -> None:
+        contract = payload()
+        for operation_id, permission in CURRENT_SECURITY_READ_SLICE.items():
+            with self.subTest(operation=operation_id):
+                row = operation(contract, operation_id)
+                self.assertEqual(row["status"], "current")
+                self.assertIsInstance(row["source_variant"], str)
+                self.assertEqual(row["classification"], "fixed")
+                self.assertEqual(row["required_all"], [permission])
+                self.assertEqual(row["scope_resolution"], "instance")
+                self.assertFalse(row["inherits_underlying"])
+
+    def test_security_read_slice_cannot_regress_to_planned(self) -> None:
+        for operation_id in CURRENT_SECURITY_READ_SLICE:
+            with self.subTest(operation=operation_id):
+                contract = payload()
+                row = operation(contract, operation_id)
+                row["status"] = "planned-1.2"
+                row["source_variant"] = None
+                with self.assertRaisesRegex(
+                    AccessControlValidationError,
+                    f"current security read operation {operation_id}",
+                ):
+                    validate(contract, SOURCE)
 
     def test_every_current_product_variant_has_a_matrix_rule(self) -> None:
         contract = payload()

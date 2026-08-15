@@ -637,9 +637,19 @@
       "allowed_roles": ["admin", "auditor", "operator", "owner"]
     },
     {
+      "id": "security.status",
+      "status": "current",
+      "source_variant": "SecurityStatus",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
       "id": "security.principal_list",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "status": "current",
+      "source_variant": "SecurityPrincipalList",
       "classification": "fixed",
       "required_all": ["security.read"],
       "scope_resolution": "instance",
@@ -658,8 +668,8 @@
     },
     {
       "id": "security.role_list",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "status": "current",
+      "source_variant": "SecurityRoleList",
       "classification": "fixed",
       "required_all": ["security.read"],
       "scope_resolution": "instance",
@@ -677,6 +687,16 @@
       "allowed_roles": ["admin", "owner"]
     },
     {
+      "id": "security.assignment_list",
+      "status": "current",
+      "source_variant": "SecurityAssignmentList",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
       "id": "security.assignment_write",
       "status": "planned-1.2",
       "source_variant": null,
@@ -688,8 +708,8 @@
     },
     {
       "id": "security.key_list",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "status": "current",
+      "source_variant": "SecurityKeyList",
       "classification": "fixed",
       "required_all": ["security.read"],
       "scope_resolution": "instance",
@@ -718,8 +738,8 @@
     },
     {
       "id": "security.audit_read",
-      "status": "planned-1.2",
-      "source_variant": null,
+      "status": "current",
+      "source_variant": "SecurityAuditRead",
       "classification": "fixed",
       "required_all": ["audit.read"],
       "scope_resolution": "instance",
@@ -807,6 +827,7 @@
     "audit_event_bytes": 4096,
     "retained_audit_events": 100000,
     "audit_result_rows": 1000,
+    "security_result_rows": 1000,
     "maximum_rotation_overlap_seconds": 604800,
     "authentication_verifiers_per_request": 1,
     "authorization_cache_entries": 4096
