@@ -247,6 +247,11 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.11.15
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
       - name: Check generated SDK models
         run: |
           PYTHONPATH=. python -m unittest tools.test_generate_sdk_models -v
@@ -260,7 +265,12 @@ jobs:
         env:
           PYTHONPATH: sdks/python/src
         run: |
-          PYTHONPATH=. python -m unittest tools.test_check_python_package -v
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_python_package \
+            tools.test_check_python_distributions \
+            tools.test_normalize_python_sdist \
+            tools.test_python_distribution_receipt \
+            -v
           PYTHONPATH=. python tools/check_python_package.py
           python -m compileall -q sdks/python/src sdks/python/conformance sdks/python/tests
           python -m unittest discover -s sdks/python/tests -v

@@ -1,0 +1,532 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/schema/python-distribution-receipt-v2",
+  "description": "Structural validation only. Cross-field equality and publication semantics require tools/python_distribution_receipt.py as the mandatory semantic validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "project",
+    "version",
+    "source",
+    "run",
+    "registry",
+    "distributions",
+    "reproducibility",
+    "testpypi_authority",
+    "publication_authority",
+    "build_receipt_sha256",
+    "registry_verification"
+  ],
+  "properties": {
+    "schema": {"const": "hyphae-python-distribution-receipt-v2"},
+    "status": {"enum": ["built", "published"]},
+    "project": {"const": "hyphae-sdk"},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "source": {"$ref": "#/$defs/source"},
+    "run": {"$ref": "#/$defs/run"},
+    "registry": {"enum": ["testpypi", "pypi"]},
+    "distributions": {"$ref": "#/$defs/distributions"},
+    "reproducibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["builds", "matched"],
+      "properties": {"builds": {"const": 2}, "matched": {"const": true}}
+    },
+    "testpypi_authority": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/testpypi_authority"}]
+    },
+    "publication_authority": {"$ref": "#/$defs/publication_authority"},
+    "build_receipt_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+    },
+    "registry_verification": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/registry_verification"}]
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "commit", "tree"],
+      "properties": {
+        "tag": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "workflow_ref", "workflow_sha", "id", "attempt"],
+      "properties": {
+        "repository": {"const": "celiumsai/hyphae"},
+        "workflow_ref": {
+          "const": "celiumsai/hyphae/.github/workflows/python-publish.yml@refs/heads/main"
+        },
+        "workflow_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "id": {"type": "integer", "minimum": 1},
+        "attempt": {"type": "integer", "minimum": 1}
+      }
+    },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256", "bytes"],
+      "properties": {
+        "filename": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "wheel_distribution": {
+      "allOf": [
+        {"$ref": "#/$defs/distribution"},
+        {
+          "properties": {
+            "filename": {
+              "pattern": "^hyphae_sdk-[0-9]+\\.[0-9]+\\.[0-9]+-py3-none-any\\.whl$"
+            }
+          }
+        }
+      ]
+    },
+    "sdist_distribution": {
+      "allOf": [
+        {"$ref": "#/$defs/distribution"},
+        {
+          "properties": {
+            "filename": {
+              "pattern": "^hyphae_sdk-[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz$"
+            }
+          }
+        }
+      ]
+    },
+    "distributions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wheel", "sdist"],
+      "properties": {
+        "wheel": {"$ref": "#/$defs/wheel_distribution"},
+        "sdist": {"$ref": "#/$defs/sdist_distribution"}
+      }
+    },
+    "distribution_list": {
+      "type": "array",
+      "prefixItems": [
+        {"$ref": "#/$defs/wheel_distribution"},
+        {"$ref": "#/$defs/sdist_distribution"}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "workflow_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "digest"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "builder_toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python", "uv"],
+      "properties": {
+        "python": {"const": "3.11.15"},
+        "uv": {"type": "string", "pattern": "^uv 0\\.12\\.3(?: .*)?$"}
+      }
+    },
+    "builder_runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "image_os", "image_version"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "arch": {"type": "string", "minLength": 1},
+        "image_os": {"type": "string", "minLength": 1},
+        "image_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "independent_build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["builder", "artifact", "receipt_sha256", "toolchain", "runner", "distributions"],
+      "properties": {
+        "builder": {"enum": ["a", "b"]},
+        "artifact": {"$ref": "#/$defs/workflow_artifact"},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "toolchain": {"$ref": "#/$defs/builder_toolchain"},
+        "runner": {"$ref": "#/$defs/builder_runner"},
+        "distributions": {"$ref": "#/$defs/distribution_list"}
+      }
+    },
+    "authority_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "attempt", "event", "status", "conclusion", "head_branch", "head_sha", "path", "repository"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "attempt": {"type": "integer", "minimum": 1},
+        "event": {"enum": ["push", "workflow_dispatch"]},
+        "status": {"const": "completed"},
+        "conclusion": {"const": "success"},
+        "head_branch": {"type": "string", "minLength": 1},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "path": {"enum": [".github/workflows/release.yml", ".github/workflows/native-g8-closure.yml"]},
+        "repository": {"const": "celiumsai/hyphae"}
+      }
+    },
+    "release_run": {
+      "allOf": [
+        {"$ref": "#/$defs/authority_run"},
+        {
+          "properties": {
+            "event": {"const": "push"},
+            "path": {"const": ".github/workflows/release.yml"}
+          }
+        }
+      ]
+    },
+    "g8_run": {
+      "allOf": [
+        {"$ref": "#/$defs/authority_run"},
+        {
+          "properties": {
+            "event": {"const": "workflow_dispatch"},
+            "head_branch": {"const": "main"},
+            "path": {"const": ".github/workflows/native-g8-closure.yml"}
+          }
+        }
+      ]
+    },
+    "file_digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "release_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run", "artifact", "release_evidence", "sboms", "g8_closure"],
+      "properties": {
+        "run": {"$ref": "#/$defs/release_run"},
+        "artifact": {"$ref": "#/$defs/workflow_artifact"},
+        "release_evidence": {"$ref": "#/$defs/file_digest"},
+        "sboms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["spdx", "cyclonedx"],
+          "properties": {
+            "spdx": {"$ref": "#/$defs/file_digest"},
+            "cyclonedx": {"$ref": "#/$defs/file_digest"}
+          }
+        },
+        "g8_closure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run", "artifact", "aggregate"],
+          "properties": {
+            "run": {"$ref": "#/$defs/g8_run"},
+            "artifact": {"$ref": "#/$defs/workflow_artifact"},
+            "aggregate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["filename", "sha256", "claims", "closure_declared"],
+              "properties": {
+                "filename": {"const": "native-g8-aggregate.json"},
+                "sha256": {"$ref": "#/$defs/sha256"},
+                "claims": {"const": ["G8"]},
+                "closure_declared": {"const": true}
+              }
+            }
+          }
+        }
+      }
+    },
+    "publication_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "source", "independent_builds", "release_authority"],
+      "properties": {
+        "schema": {"const": "hyphae-python-publication-authority-v1"},
+        "source": {"$ref": "#/$defs/source"},
+        "independent_builds": {
+          "type": "array",
+          "prefixItems": [
+            {"allOf": [{"$ref": "#/$defs/independent_build"}, {"properties": {"builder": {"const": "a"}}}]},
+            {"allOf": [{"$ref": "#/$defs/independent_build"}, {"properties": {"builder": {"const": "b"}}}]}
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "release_authority": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/release_authority"}]
+        }
+      }
+    },
+    "testpypi_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_sha256", "run", "run_metadata", "source", "distributions"],
+      "properties": {
+        "receipt_sha256": {"$ref": "#/$defs/sha256"},
+        "run": {"$ref": "#/$defs/run"},
+        "run_metadata": {"$ref": "#/$defs/run_metadata"},
+        "source": {"$ref": "#/$defs/source"},
+        "distributions": {"$ref": "#/$defs/distributions"}
+      }
+    },
+    "run_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "attempt", "event", "status", "conclusion", "head_branch", "head_sha", "path", "repository"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "attempt": {"type": "integer", "minimum": 1},
+        "event": {"const": "workflow_dispatch"},
+        "status": {"const": "completed"},
+        "conclusion": {"const": "success"},
+        "head_branch": {"const": "main"},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "path": {"const": ".github/workflows/python-publish.yml"},
+        "repository": {"const": "celiumsai/hyphae"}
+      }
+    },
+    "publisher": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "repository", "workflow", "environment"],
+      "properties": {
+        "kind": {"const": "GitHub"},
+        "repository": {"const": "celiumsai/hyphae"},
+        "workflow": {"const": "python-publish.yml"},
+        "environment": {"enum": ["testpypi", "pypi"]}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrity_api_version", "cryptographic_verifier", "publisher", "predicate_type", "subject"],
+      "properties": {
+        "integrity_api_version": {"const": 1},
+        "cryptographic_verifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "mode"],
+          "properties": {
+            "name": {"const": "pypi-attestations"},
+            "version": {"const": "0.0.30"},
+            "mode": {"const": "pep740-local-artifact-and-provenance"}
+          }
+        },
+        "publisher": {"$ref": "#/$defs/publisher"},
+        "predicate_type": {"const": "https://docs.pypi.org/attestations/publish/v1"},
+        "subject": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["filename", "sha256"],
+          "properties": {
+            "filename": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
+    "installation_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "python_boundary",
+        "kind",
+        "version",
+        "distribution_filename",
+        "distribution_sha256",
+        "implementation",
+        "interpreter_version",
+        "status"
+      ],
+      "properties": {
+        "schema": {"const": "hyphae-python-installation-evidence-v1"},
+        "python_boundary": {"enum": ["3.11", "3.14"]},
+        "kind": {"enum": ["wheel", "sdist"]},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "distribution_filename": {"type": "string", "minLength": 1},
+        "distribution_sha256": {"$ref": "#/$defs/sha256"},
+        "implementation": {"const": "CPython"},
+        "interpreter_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "status": {"const": "passed"}
+      }
+    },
+    "installation_evidence_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_sha256", "observed"],
+      "properties": {
+        "evidence_sha256": {"$ref": "#/$defs/sha256"},
+        "observed": {"$ref": "#/$defs/installation_observation"}
+      }
+    },
+    "installation_evidence": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/installation_evidence_entry"},
+            {"properties": {"observed": {"properties": {"python_boundary": {"const": "3.11"}, "kind": {"const": "wheel"}}}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/installation_evidence_entry"},
+            {"properties": {"observed": {"properties": {"python_boundary": {"const": "3.11"}, "kind": {"const": "sdist"}}}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/installation_evidence_entry"},
+            {"properties": {"observed": {"properties": {"python_boundary": {"const": "3.14"}, "kind": {"const": "wheel"}}}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/installation_evidence_entry"},
+            {"properties": {"observed": {"properties": {"python_boundary": {"const": "3.14"}, "kind": {"const": "sdist"}}}}}
+          ]
+        }
+      ],
+      "items": false,
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "registry_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "python_versions", "installation_evidence", "publication_artifact", "provenance"],
+      "properties": {
+        "repository": {"enum": ["testpypi", "pypi"]},
+        "python_versions": {"const": ["3.11", "3.14"]},
+        "installation_evidence": {"$ref": "#/$defs/installation_evidence"},
+        "publication_artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "sha256"],
+          "properties": {
+            "id": {"type": "integer", "minimum": 1},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wheel", "sdist"],
+          "properties": {
+            "wheel": {"$ref": "#/$defs/provenance"},
+            "sdist": {"$ref": "#/$defs/provenance"}
+          }
+        }
+      }
+    },
+    "testpypi_registry_verification": {
+      "allOf": [
+        {"$ref": "#/$defs/registry_verification"},
+        {
+          "properties": {
+            "repository": {"const": "testpypi"},
+            "provenance": {
+              "properties": {
+                "wheel": {"properties": {"publisher": {"properties": {"environment": {"const": "testpypi"}}}}},
+                "sdist": {"properties": {"publisher": {"properties": {"environment": {"const": "testpypi"}}}}}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pypi_registry_verification": {
+      "allOf": [
+        {"$ref": "#/$defs/registry_verification"},
+        {
+          "properties": {
+            "repository": {"const": "pypi"},
+            "provenance": {
+              "properties": {
+                "wheel": {"properties": {"publisher": {"properties": {"environment": {"const": "pypi"}}}}},
+                "sdist": {"properties": {"publisher": {"properties": {"environment": {"const": "pypi"}}}}}
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"registry": {"const": "testpypi"}}},
+      "then": {
+        "properties": {
+          "testpypi_authority": {"type": "null"},
+          "publication_authority": {
+            "properties": {"release_authority": {"type": "null"}}
+          },
+          "registry_verification": {
+            "oneOf": [
+              {"type": "null"},
+              {"$ref": "#/$defs/testpypi_registry_verification"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"registry": {"const": "pypi"}}},
+      "then": {
+        "properties": {
+          "testpypi_authority": {"$ref": "#/$defs/testpypi_authority"},
+          "publication_authority": {
+            "properties": {
+              "release_authority": {"$ref": "#/$defs/release_authority"}
+            }
+          },
+          "registry_verification": {
+            "oneOf": [
+              {"type": "null"},
+              {"$ref": "#/$defs/pypi_registry_verification"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "built"}}},
+      "then": {
+        "properties": {
+          "build_receipt_sha256": {"type": "null"},
+          "registry_verification": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "published"}}},
+      "then": {
+        "properties": {
+          "build_receipt_sha256": {"$ref": "#/$defs/sha256"},
+          "registry_verification": {"$ref": "#/$defs/registry_verification"}
+        }
+      }
+    }
+  ]
+}
