@@ -243,6 +243,87 @@ fn cancellation_deadline_and_authorization_fail_before_mutation() -> Result<(), 
 }
 
 #[test]
+fn internal_structure_namespace_is_inaccessible_and_near_misses_remain_public()
+-> Result<(), Box<dyn Error>> {
+    let path = temporary("internal-structure-namespace");
+    let key_path = path.with_extension("owner-key");
+    let _ = fs::remove_dir_all(&path);
+    let _ = fs::remove_file(&key_path);
+    let mut product = NativeProduct::create(&path)?;
+    product.bootstrap_access_control_to_file("Owner", "owner", &key_path, 1)?;
+    let mut session = direct_session("trusted-test", ProductAuthorization::ALL)?;
+    let reserved = b"\0hyphae.product.access-control.v1\0catalog".to_vec();
+    for (request_id, operation) in [
+        (
+            1,
+            ProductOperation::StructureGet {
+                key: reserved.clone(),
+            },
+        ),
+        (
+            2,
+            ProductOperation::StructureSet {
+                key: reserved.clone(),
+                value: b"overwrite".to_vec(),
+                expires_at_micros: None,
+            },
+        ),
+        (
+            3,
+            ProductOperation::StructureTtl {
+                key: reserved.clone(),
+            },
+        ),
+    ] {
+        let request = memory_context(&session, request_id, 2);
+        let error = product
+            .dispatch(&mut session, &request, operation)
+            .expect_err("reserved structure key was accepted");
+        assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+    }
+    let snapshot = product.snapshot_bounded(2)?;
+    assert_eq!(snapshot.structure_get(&reserved), None);
+
+    let near_miss = b"\0hyphae/public".to_vec();
+    let request = memory_context(&session, 4, 2);
+    product.dispatch(
+        &mut session,
+        &request,
+        ProductOperation::StructureSet {
+            key: near_miss.clone(),
+            value: b"visible".to_vec(),
+            expires_at_micros: None,
+        },
+    )?;
+    assert_eq!(
+        product.snapshot_bounded(2)?.structure_get(&near_miss),
+        Some(b"visible".as_slice())
+    );
+
+    assert_eq!(
+        product
+            .migration_store_public_entries(&[
+                (b"would-have-committed".to_vec(), b"value".to_vec()),
+                (reserved, b"overwrite".to_vec()),
+            ])
+            .map(|_| ()),
+        Err(hyphae_native_product::ProductError::from_code(
+            ProductErrorCode::InvalidRequest
+        ))
+    );
+    assert_eq!(
+        product
+            .snapshot_bounded(2)?
+            .structure_get(b"would-have-committed"),
+        None
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    fs::remove_file(key_path)?;
+    Ok(())
+}
+
+#[test]
 fn authorization_distinguishes_sql_observation_maintenance_backup_and_restore()
 -> Result<(), Box<dyn Error>> {
     let path = temporary("rbac-boundaries");

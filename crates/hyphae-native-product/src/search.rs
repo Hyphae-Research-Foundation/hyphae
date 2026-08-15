@@ -502,7 +502,7 @@ impl NativeProduct {
         let digest = ingest_digest(batch)?;
         let marker_key = idempotency_key(collection, batch.idempotency_id);
         let current = self.snapshot_bounded(logical_time_micros)?;
-        if let Some(encoded) = current.structure_get(&marker_key) {
+        if let Some(encoded) = current.structure_get_internal(&marker_key) {
             let marker = decode_idempotency(encoded)?;
             if marker.digest != digest {
                 return Err(idempotency_conflict());
@@ -765,7 +765,8 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<Option<ProductSearchIngestReceipt>, ProductError> {
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let Some(encoded) = snapshot.structure_get(&idempotency_key(collection, idempotency_id))
+        let Some(encoded) =
+            snapshot.structure_get_internal(&idempotency_key(collection, idempotency_id))
         else {
             return Ok(None);
         };
@@ -1030,7 +1031,7 @@ impl NativeProduct {
         collection: crate::ObjectId,
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
         let encoded = product_snapshot
-            .structure_get(&binding_key(collection))
+            .structure_get_internal(&binding_key(collection))
             .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
         decode_binding(encoded)
     }
@@ -1047,7 +1048,7 @@ impl NativeProduct {
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
         let encoded = snapshot
-            .structure_get(&binding_key(collection))
+            .structure_get_internal(&binding_key(collection))
             .ok_or_else(|| {
                 ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
             })?;
@@ -1478,7 +1479,7 @@ fn load_documents(
     collection: crate::ObjectId,
 ) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
     let manifest = snapshot
-        .structure_get(&manifest_key(collection))
+        .structure_get_internal(&manifest_key(collection))
         .ok_or_else(corruption)?;
     let identities = decode_manifest(manifest)?;
     if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
@@ -1488,7 +1489,7 @@ fn load_documents(
         .into_iter()
         .map(|object_id| {
             let encoded = snapshot
-                .structure_get(&document_key(collection, object_id))
+                .structure_get_internal(&document_key(collection, object_id))
                 .ok_or_else(corruption)?;
             Ok(hyphae_native_runtime::DocValueCandidate {
                 document_id: object_id.get().to_be_bytes().to_vec(),

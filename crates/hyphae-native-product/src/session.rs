@@ -65,7 +65,7 @@ impl ProductPrincipal {
 }
 
 /// Product permission checked before operation execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum ProductPermission {
     /// Read bounded durable security events.

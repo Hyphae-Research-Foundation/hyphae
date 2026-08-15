@@ -1088,6 +1088,9 @@ fn admit_operation(
     {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
+    if operation_uses_internal_structure_namespace(operation) {
+        return Err(context.error(ProductErrorCode::InvalidRequest));
+    }
     let (count, bytes, work, memory) = operation.request_cost();
     context.limits.admit_request(count, bytes, work, memory)?;
     operation.validate_limits(context.limits)?;
@@ -1096,6 +1099,25 @@ fn admit_operation(
         context.limits.admit_response(count, bytes, bytes)?;
     }
     Ok(())
+}
+
+fn operation_uses_internal_structure_namespace(operation: &ProductOperation) -> bool {
+    match operation {
+        ProductOperation::StructureGet { key }
+        | ProductOperation::StructureSet { key, .. }
+        | ProductOperation::StructureTtl { key } => crate::is_internal_structure_key(key),
+        ProductOperation::StructureMutate { mutations } => mutations
+            .iter()
+            .any(|mutation| crate::is_internal_structure_key(&mutation.structure_key().key)),
+        ProductOperation::StructureRead(request) => request.uses_internal_structure_namespace(),
+        ProductOperation::TransactionStageStructure { mutation, .. } => {
+            crate::is_internal_structure_key(&mutation.structure_key().key)
+        }
+        ProductOperation::Prove { operation, .. } => {
+            operation_uses_internal_structure_namespace(operation)
+        }
+        _ => false,
+    }
 }
 
 fn validate_context(
@@ -1756,6 +1778,17 @@ impl ProductStructureMutation {
 }
 
 impl ProductStructureReadRequest {
+    fn uses_internal_structure_namespace(&self) -> bool {
+        match self {
+            Self::SetAlgebra { keys, .. } => {
+                keys.iter().any(|key| crate::is_internal_structure_key(key))
+            }
+            _ => self
+                .structure_key()
+                .is_some_and(|key| crate::is_internal_structure_key(&key.key)),
+        }
+    }
+
     fn structure_key(&self) -> Option<&ProductStructureKey> {
         match self {
             Self::SetAlgebra { .. } => None,

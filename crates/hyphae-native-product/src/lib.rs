@@ -116,6 +116,7 @@ pub const MAX_PRODUCT_SQL_PARAMETERS: usize = 1_024;
 pub const MAX_PRODUCT_SQL_ROWS: usize = 1_024;
 
 const MIGRATION_STORAGE_PREFIX: &[u8] = b"\0hyphae.migration.v1\0";
+const INTERNAL_STRUCTURE_KEY_PREFIX: &[u8] = b"\0hyphae.";
 const MIGRATION_SEARCH_BATCH_SIZE: usize = 512;
 
 /// One source lexical index prepared for offline migration.
@@ -237,12 +238,22 @@ impl ProductSnapshot {
 
     /// Returns one scalar structure value at the snapshot logical time.
     pub fn structure_get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.inner.get(key)
+        (!is_internal_structure_key(key))
+            .then(|| self.inner.get(key))
+            .flatten()
     }
 
     /// Returns one scalar structure TTL state.
     pub fn structure_ttl(&self, key: &[u8]) -> ProductTtl {
-        self.inner.ttl(key).into()
+        if is_internal_structure_key(key) {
+            ProductTtl::Missing
+        } else {
+            self.inner.ttl(key).into()
+        }
+    }
+
+    pub(crate) fn structure_get_internal(&self, key: &[u8]) -> Option<&[u8]> {
+        self.inner.get(key)
     }
 
     /// Executes one catalog-bound prepared SQL read.
@@ -392,7 +403,11 @@ impl NativeProduct {
         &mut self,
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<ProductCommitReceipt, ProductError> {
-        if entries.is_empty() {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|(key, _)| is_internal_structure_key(key))
+        {
             return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
         }
         let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
@@ -419,7 +434,7 @@ impl NativeProduct {
             storage_key.extend_from_slice(&(key.len() as u64).to_be_bytes());
             storage_key.extend_from_slice(key);
             snapshot
-                .structure_get(&storage_key)
+                .structure_get_internal(&storage_key)
                 .is_some_and(|actual| actual == value)
         }))
     }
@@ -433,6 +448,12 @@ impl NativeProduct {
         &self,
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<bool, ProductError> {
+        if entries
+            .iter()
+            .any(|(key, _)| is_internal_structure_key(key))
+        {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
         let snapshot = self.snapshot_bounded(0)?;
         Ok(entries.iter().all(|(key, value)| {
             snapshot
@@ -828,6 +849,10 @@ impl NativeProduct {
             value: ProductSqlResult::from(value),
         })
     }
+}
+
+pub(crate) fn is_internal_structure_key(key: &[u8]) -> bool {
+    key.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
 }
 
 const fn migration_hnsw_seed(index: ObjectId) -> u64 {

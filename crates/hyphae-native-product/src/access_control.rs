@@ -572,6 +572,34 @@ impl ProductPermission {
         }
     }
 
+    pub(crate) const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::AuditRead),
+            1 => Some(Self::BackupCreate),
+            2 => Some(Self::BackupVerify),
+            3 => Some(Self::CatalogRead),
+            4 => Some(Self::CatalogWrite),
+            5 => Some(Self::CredentialSelfManage),
+            6 => Some(Self::DataRead),
+            7 => Some(Self::DataWrite),
+            8 => Some(Self::Discover),
+            9 => Some(Self::Maintain),
+            10 => Some(Self::Observe),
+            11 => Some(Self::OwnershipManage),
+            12 => Some(Self::ProofGenerate),
+            13 => Some(Self::ProofVerify),
+            14 => Some(Self::Restore),
+            15 => Some(Self::SearchExecute),
+            16 => Some(Self::SecurityManage),
+            17 => Some(Self::SecurityRead),
+            _ => None,
+        }
+    }
+
     /// Returns whether this permission may be granted at `scope`.
     pub const fn supports_scope(self, scope: ProductScope) -> bool {
         match scope {
