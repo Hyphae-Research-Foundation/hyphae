@@ -5914,7 +5914,8 @@ fn apply_windows_restricted_acl(file: &mut File) -> std::io::Result<()> {
 /// current process account plus LocalSystem authority.
 pub fn validate_windows_restricted_file(file: &File) -> std::io::Result<()> {
     use windows_permissions::{
-        constants::{SeObjectType, SecurityInformation},
+        LocalBox, Sid,
+        constants::{AccessRights, AceType, SeObjectType, SecurityInformation},
         utilities, wrappers,
     };
 
@@ -5923,78 +5924,74 @@ pub fn validate_windows_restricted_file(file: &File) -> std::io::Result<()> {
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner | SecurityInformation::Dacl,
     )?;
-    let actual = wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+    let sddl = wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
         &actual,
         SecurityInformation::Owner | SecurityInformation::Dacl,
     )?;
     let current_user = utilities::current_process_sid()?.to_string();
-    if windows_restricted_sddl_matches(&actual.to_string_lossy(), &current_user) {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "credential file ACL is not restricted to the current account and LocalSystem",
-        ))
+    let current_user_sid = utilities::current_process_sid()?;
+    let system_sid: LocalBox<Sid> = "S-1-5-18".parse()?;
+    if actual.owner() != Some(current_user_sid.as_ref())
+        || !windows_sddl_has_protected_dacl(&sddl.to_string_lossy())
+    {
+        return Err(windows_restricted_acl_error());
     }
+    let dacl = actual.dacl().ok_or_else(windows_restricted_acl_error)?;
+    let expected_aces = if current_user == "S-1-5-18" { 1 } else { 2 };
+    if dacl.len() != expected_aces {
+        return Err(windows_restricted_acl_error());
+    }
+    let mut current_user_seen = false;
+    let mut system_seen = false;
+    for index in 0..dacl.len() {
+        let ace = dacl
+            .get_ace(index)
+            .ok_or_else(windows_restricted_acl_error)?;
+        if ace.ace_type() != AceType::ACCESS_ALLOWED_ACE_TYPE
+            || !ace.flags().is_empty()
+            || ace.mask() != AccessRights::FileAllAccess
+        {
+            return Err(windows_restricted_acl_error());
+        }
+        let sid = ace.sid().ok_or_else(windows_restricted_acl_error)?;
+        if sid == current_user_sid.as_ref() {
+            if current_user_seen {
+                return Err(windows_restricted_acl_error());
+            }
+            current_user_seen = true;
+        } else if sid == system_sid.as_ref() {
+            if system_seen {
+                return Err(windows_restricted_acl_error());
+            }
+            system_seen = true;
+        } else {
+            return Err(windows_restricted_acl_error());
+        }
+    }
+    if !current_user_seen || (current_user != "S-1-5-18" && !system_seen) {
+        return Err(windows_restricted_acl_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn windows_restricted_sddl_matches(actual: &str, current_user: &str) -> bool {
-    let current_user_alias = windows_sddl_alias(current_user);
-    let Some(owner_end) = actual.find("D:") else {
+fn windows_sddl_has_protected_dacl(actual: &str) -> bool {
+    let Some(dacl_start) = actual.find("D:") else {
         return false;
     };
-    let Some(owner) = actual.get(2..owner_end) else {
-        return false;
-    };
-    if owner != current_user && current_user_alias != Some(owner) {
-        return false;
-    }
-    let dacl = &actual[owner_end + 2..];
+    let dacl = &actual[dacl_start + 2..];
     let Some(aces_start) = dacl.find('(') else {
         return false;
     };
-    if !dacl[..aces_start].contains('P') {
-        return false;
-    }
-    let mut remaining = &dacl[aces_start..];
-    let mut trustees = BTreeSet::new();
-    while !remaining.is_empty() {
-        let Some(end) = remaining.find(')') else {
-            return false;
-        };
-        let ace = &remaining[1..end];
-        let fields: Vec<_> = ace.split(';').collect();
-        if fields.len() != 6 || fields[0] != "A" || !fields[1].is_empty() || fields[2] != "FA" {
-            return false;
-        }
-        let trustee = if matches!(fields[5], "SY" | "S-1-5-18") {
-            "S-1-5-18"
-        } else if fields[5] == current_user || current_user_alias == Some(fields[5]) {
-            current_user
-        } else {
-            return false;
-        };
-        if !trustees.insert(trustee) {
-            return false;
-        }
-        remaining = &remaining[end + 1..];
-    }
-    if current_user == "S-1-5-18" {
-        trustees == BTreeSet::from(["S-1-5-18"])
-    } else {
-        trustees == BTreeSet::from([current_user, "S-1-5-18"])
-    }
+    dacl[..aces_start].contains('P')
 }
 
 #[cfg(windows)]
-fn windows_sddl_alias(sid: &str) -> Option<&'static str> {
-    match sid {
-        "S-1-5-18" => Some("SY"),
-        "S-1-5-19" => Some("LS"),
-        "S-1-5-20" => Some("NS"),
-        _ => None,
-    }
+fn windows_restricted_acl_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "credential file ACL is not restricted to the current account and LocalSystem",
+    )
 }
 
 fn remove_empty_output(path: &Path) {
@@ -6806,7 +6803,7 @@ mod tests {
         let current_user = utilities::current_process_sid()?.to_string();
         let sddl = sddl.to_string_lossy();
         assert!(sddl.contains("D:P"));
-        assert!(windows_restricted_sddl_matches(&sddl, &current_user));
+        assert!(windows_sddl_has_protected_dacl(&sddl));
         if current_user != "S-1-5-18" {
             assert!(sddl.contains("(A;;FA;;;SY)") || sddl.contains("(A;;FA;;;S-1-5-18)"));
         }
@@ -6867,39 +6864,16 @@ mod tests {
     }
 
     #[test]
-    fn windows_dacl_parser_accepts_only_current_user_and_system() {
+    fn windows_dacl_parser_requires_protected_dacl() {
         #[cfg(windows)]
         {
-            let user = "S-1-5-21-1-2-3-1001";
-            assert!(windows_restricted_sddl_matches(
-                "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
-                user,
+            assert!(windows_sddl_has_protected_dacl("O:SYD:P(A;;FA;;;SY)"));
+            assert!(windows_sddl_has_protected_dacl(
+                "O:LSD:PAI(A;;FA;;;LS)(A;;FA;;;SY)"
             ));
-            assert!(windows_restricted_sddl_matches(
-                "O:SYD:P(A;;FA;;;SY)",
-                "S-1-5-18",
+            assert!(!windows_sddl_has_protected_dacl(
+                "O:NSD:AI(A;;FA;;;NS)(A;;FA;;;SY)"
             ));
-            assert!(windows_restricted_sddl_matches(
-                "O:LSD:P(A;;FA;;;LS)(A;;FA;;;SY)",
-                "S-1-5-19",
-            ));
-            assert!(windows_restricted_sddl_matches(
-                "O:NSD:P(A;;FA;;;SY)(A;;FA;;;NS)",
-                "S-1-5-20",
-            ));
-            assert!(windows_restricted_sddl_matches(
-                "O:S-1-5-21-1-2-3-1001D:PAI(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-21-1-2-3-1001)",
-                user,
-            ));
-            for invalid in [
-                "O:S-1-5-21-1-2-3-1001D:(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
-                "O:S-1-5-21-1-2-3-1002D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
-                "O:S-1-5-21-1-2-3-1001D:P(A;;FR;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
-                "O:S-1-5-21-1-2-3-1001D:P(A;ID;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)",
-                "O:S-1-5-21-1-2-3-1001D:P(A;;FA;;;S-1-5-21-1-2-3-1001)(A;;FA;;;SY)(A;;FR;;;WD)",
-            ] {
-                assert!(!windows_restricted_sddl_matches(invalid, user));
-            }
         }
     }
 
