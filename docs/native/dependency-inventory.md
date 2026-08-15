@@ -56,7 +56,8 @@ dependency, performance and replacement-cost review.
 | `widestring` | safe UTF-16 security-descriptor construction for the Windows named-pipe ACL | allowed Windows encoding primitive |
 | `recvmsg` | target-conditioned Windows named-pipe message primitive used by `interprocess` | allowed operating-system IPC wrapper |
 | `doctest-file` | transitive documentation macro used by `interprocess` | allowed build primitive |
-| `bytes`, `futures-core`, `mio`, `log`, `socket2`, `signal-hook-registry`, `errno`, `pin-project-lite` | transitive asynchronous, diagnostic and operating-system support for Tokio and IPC | allowed runtime primitives |
+| `bytes`, `futures-core`, `mio`, `socket2`, `signal-hook-registry`, `errno`, `pin-project-lite` | transitive asynchronous and operating-system support for Tokio and IPC | allowed runtime primitives |
+| `log` | Mio diagnostic facade activated by Cargo workspace feature unification through the TUI closure | allowed diagnostic primitive; not an isolated daemon dependency |
 | `windows-sys`, `windows-link`, `wasi` | target-conditioned operating-system bindings for IPC and async I/O | allowed platform bindings |
 | `r-efi`, `wasip2`, `wit-bindgen` | target-conditioned backends in the `getrandom` entropy closure | allowed platform bindings |
 | `thiserror` | typed errors | allowed primitive |
@@ -86,10 +87,17 @@ The exact locked normal/build metadata closure is rooted at
 `hyphae-native-daemon`, the local native product entry point. This root includes
 the protocol, product facade, runtime, and every native engine package: 14
 Hyphae-owned packages and 57 external package identities (56 package names) as
-of 2026-08-12. The two identities for `syn` are 2.0.119 on the Tokio macro
+of 2026-08-14. The two identities for `syn` are 2.0.119 on the Tokio macro
 path and 3.0.2 on the serde/thiserror derive paths. Target-conditioned
 dependencies remain in scope even when they are not compiled on the audit
 host.
+
+Cargo resolves features across the workspace before the gate walks outward
+from the daemon node. Consequently, this conservative metadata closure also
+contains `log` 0.4.33 because the TUI's `crossterm` dependency activates Mio's
+optional diagnostic feature. An isolated `cargo tree -p hyphae-native-daemon`
+does not contain `log`; the allowlist records the wider feature-unified graph
+honestly instead of presenting it as an isolated daemon dependency.
 
 `hyphae-native-daemon` uses `interprocess` 2.4.3 as the reviewed safe OS IPC
 wrapper. The Rust standard library has no Windows named-pipe server API;

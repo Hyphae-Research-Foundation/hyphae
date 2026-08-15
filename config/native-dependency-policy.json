@@ -214,8 +214,8 @@
       "version": "0.4.33",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
-      "category": "diagnostic facade primitive",
-      "rationale": "Target-conditioned diagnostic facade selected transitively by Mio; it supplies no storage, query, or logging backend semantics."
+      "category": "workspace feature-unified diagnostic primitive",
+      "rationale": "Cargo's workspace resolver activates Mio's optional diagnostic facade through the TUI closure while the policy audits the daemon-rooted metadata graph; it supplies no storage, query, or logging backend semantics."
     },
     {
       "name": "memchr",
