@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$id": "https://hyphae.dev/schema/python-windows-async-receipt-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "source_commit", "source_tree", "platform", "python_version", "distribution", "transport", "cases", "transcript_sha256"],
+  "properties": {
+    "schema": {"const": "hyphae-python-windows-async-receipt-v1"},
+    "status": {"const": "passed"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "platform": {"const": "windows"},
+    "python_version": {"type": "string", "pattern": "^3\\.11\\.[0-9]+$"},
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {"type": "string", "pattern": "^hyphae_sdk-[0-9]+\\.[0-9]+\\.[0-9]+-py3-none-any\\.whl$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "transport": {"const": "named-pipe"},
+    "cases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["welcome_task_cancel_reconnect", "welcome_deadline_reconnect", "welcome_aclose_terminal", "response_task_cancel_reconnect", "response_deadline_reconnect", "response_aclose_terminal"],
+      "properties": {
+        "welcome_task_cancel_reconnect": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "cancelled_task"}, "recovery": {"const": "reconnected"}}}]},
+        "welcome_deadline_reconnect": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "deadline_exceeded"}, "recovery": {"const": "reconnected"}}}]},
+        "welcome_aclose_terminal": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "cancelled"}, "recovery": {"const": "terminal"}}}]},
+        "response_task_cancel_reconnect": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "cancelled_task"}, "recovery": {"const": "reconnected"}}}]},
+        "response_deadline_reconnect": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "deadline_exceeded"}, "recovery": {"const": "reconnected"}}}]},
+        "response_aclose_terminal": {"allOf": [{"$ref": "#/$defs/case"}, {"properties": {"error": {"const": "cancelled"}, "recovery": {"const": "terminal"}}}]}
+      }
+    },
+    "transcript_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["elapsed_millis", "error", "recovery"],
+      "properties": {
+        "elapsed_millis": {"type": "integer", "minimum": 0, "exclusiveMaximum": 1000},
+        "error": {"enum": ["cancelled_task", "cancelled", "deadline_exceeded"]},
+        "recovery": {"enum": ["reconnected", "terminal"]}
+      }
+    }
+  }
+}

@@ -180,4 +180,8 @@ session state remains governed by its configured TTL. CPython does not expose a
 portable way to interrupt DNS before a socket exists; after DNS returns, the
 client fails closed before continuing an already cancelled or expired request.
 Windows named-pipe cancellation uses `CancelSynchronousIo`; release evidence
-still requires the Windows cancellation/reconnect lane.
+comes from the hosted `windows-2025` gate over a real Win32 named-pipe peer.
+That gate stalls WELCOME and response reads, requires task cancellation,
+deadline expiry, and `aclose()` to interrupt within one second, and proves
+clean reconnect after cancellation and deadline. Its retained receipt binds
+the exact source commit/tree, installed wheel digest, and transcript digest.

@@ -50,6 +50,20 @@ walks every response for secret-bearing fields, and reads back the durable
 principal, role, and assignment effects before accepting the transcript. The
 daemon must remain alive until the harness performs its controlled shutdown.
 
+Async Windows named-pipe lifecycle is retained as a separate hosted receipt
+because the managed transcript above is intentionally byte-identical across
+its three OS lanes. `Python Windows async named pipe` installs the same exact
+wheel in an isolated environment on `windows-2025` and exercises a real Win32
+byte stream. A controlled `CreateNamedPipeW` peer stalls both WELCOME and
+product-response reads. At each stall, task cancellation, an absolute
+deadline, and `aclose()` must interrupt synchronous I/O in less than one
+second. Cancellation and deadline cases must reconnect on the same client
+without stale bytes; close cases must remain terminal. The retained transcript
+and receipt are checked against
+`schema/python-windows-async-receipt.schema.json`, the exact source commit/tree,
+and the SHA-256 of the installed wheel. Release readiness requires this hosted
+job in addition to the three-platform managed aggregate.
+
 No receipt contains an endpoint, filesystem path, credential, bearer header,
 verifier, or raw response. The Windows lane proves local named-pipe and
 loopback HTTP behavior; it does not claim owner-only Windows ACL enforcement
