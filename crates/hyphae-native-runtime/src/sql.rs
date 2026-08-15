@@ -217,6 +217,16 @@ impl PreparedStatement {
         self.plan.maximum_result_rows()
     }
 
+    /// Returns every catalog object used by this bound read plan.
+    ///
+    /// The set contains the referenced relations and physical secondary
+    /// indexes in canonical [`ObjectId`] order. Duplicate identities are
+    /// collapsed, including when one object participates in more than one
+    /// branch of a join plan.
+    pub fn referenced_object_ids(&self) -> BTreeSet<ObjectId> {
+        self.plan.referenced_object_ids()
+    }
+
     pub(crate) fn parallel_scan_limit(&self) -> Option<usize> {
         match &self.plan {
             PreparedPlan::PrimaryKeyScan { limit, .. }
@@ -391,6 +401,45 @@ enum JoinSide {
 }
 
 impl PreparedPlan {
+    fn referenced_object_ids(&self) -> BTreeSet<ObjectId> {
+        let mut referenced = BTreeSet::new();
+        match self {
+            Self::PrimaryKeyLookup { table, .. }
+            | Self::PrimaryKeyScan { table, .. }
+            | Self::PrimaryKeyPrefixScan { table, .. }
+            | Self::PrimaryKeyPrefixRangeScan { table, .. }
+            | Self::PrimaryKeyRangeScan { table, .. } => {
+                referenced.insert(*table);
+            }
+            Self::SecondaryIndexLookup { table, index, .. }
+            | Self::SecondaryIndexRangeScan { table, index, .. } => {
+                referenced.extend([*table, *index]);
+            }
+            Self::SecondaryIndexIntersection { table, indexes, .. } => {
+                referenced.insert(*table);
+                referenced.extend(indexes.iter().map(|lookup| lookup.index));
+            }
+            Self::IndexedInnerJoin {
+                left_table,
+                right_table,
+                left_access,
+                right_access,
+                ..
+            } => {
+                referenced.extend([*left_table, *right_table]);
+                if let JoinLeftAccess::UniqueSecondaryIndex { index, .. }
+                | JoinLeftAccess::BoundedSecondaryIndex { index, .. } = left_access
+                {
+                    referenced.insert(*index);
+                }
+                if let JoinRightAccess::UniqueSecondaryIndex { index, .. } = right_access {
+                    referenced.insert(*index);
+                }
+            }
+        }
+        referenced
+    }
+
     fn parameter_count(&self) -> usize {
         match self {
             Self::PrimaryKeyLookup {

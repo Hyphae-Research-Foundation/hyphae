@@ -3,6 +3,7 @@
 //! Transport-independent product operations and embedded dispatcher.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +20,7 @@ pub use hyphae_native_runtime::CommitBoundary;
 
 use crate::proof::{NativeOperationProofArtifact, NativeProofGenerationLimits};
 
+use crate::session::ProductAuthorizationRequirement;
 use crate::{
     AdminStatus, AuthorizationEpoch, BackupInfo, BackupPhase, BackupProductError, BackupRequest,
     CatalogDependencyRequest, CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage,
@@ -805,6 +807,10 @@ fn dispatch_inner(
                 &product.database,
                 session,
                 handle,
+                &ProductAuthorizationRequirement::instance(authorization([
+                    ProductPermission::CatalogRead,
+                    ProductPermission::DataWrite,
+                ])),
                 |batch| {
                     validate_transaction_sql(&mutation)?;
                     let result =
@@ -815,10 +821,15 @@ fn dispatch_inner(
         }
         ProductOperation::TransactionStageStructure { handle, mutation } => {
             context.checkpoint()?;
+            let authorization = ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::DataWrite]),
+                mutation.structure_key().keyspace,
+            );
             ProductResponse::TransactionStaged(stage_transaction(
                 &product.database,
                 session,
                 handle,
+                &authorization,
                 |batch| {
                     let result = apply_structure_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Structure(result))
@@ -827,10 +838,15 @@ fn dispatch_inner(
         }
         ProductOperation::TransactionStageSearch { handle, mutation } => {
             context.checkpoint()?;
+            let authorization = ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
+                mutation.index(),
+            );
             ProductResponse::TransactionStaged(stage_transaction(
                 &product.database,
                 session,
                 handle,
+                &authorization,
                 |batch| {
                     apply_search_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Search)
@@ -839,10 +855,15 @@ fn dispatch_inner(
         }
         ProductOperation::TransactionStageVector { handle, mutation } => {
             context.checkpoint()?;
+            let authorization = ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
+                mutation.index(),
+            );
             ProductResponse::TransactionStaged(stage_transaction(
                 &product.database,
                 session,
                 handle,
+                &authorization,
                 |batch| {
                     let changed = apply_vector_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Vector(changed))
@@ -1094,9 +1115,38 @@ fn admit_operation(
     operation: &ProductOperation,
 ) -> Result<(), ProductError> {
     validate_context(session, context)?;
-    let effective_authorization = validate_durable_authority(product, session)?;
+    let current_authority = validate_durable_authority(product, session)?;
+    let coarse_permissions = operation.required_permissions().map_err(|error| {
+        if current_authority
+            .as_deref()
+            .is_some_and(|authority| mask_sql_classification_error(operation, authority))
+        {
+            ProductError::from_code(ProductErrorCode::AuthorizationDenied)
+        } else {
+            error
+        }
+    })?;
+    let has_coarse_permissions = current_authority.as_ref().map_or_else(
+        || session.authorization().allows_all(coarse_permissions),
+        |authority| authority.authorization().allows_all(coarse_permissions),
+    );
+    if !has_coarse_permissions {
+        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    }
+    let requirement = operation_authorization_requirement(
+        product,
+        session,
+        operation,
+        current_authority.as_deref(),
+    )?;
     context.checkpoint()?;
-    if !effective_authorization.allows_all(operation.required_permissions()?) {
+    let authorized = match current_authority.as_ref() {
+        Some(authority) => authority_satisfies_requirement(product, authority, &requirement)?,
+        None => session
+            .authorization()
+            .allows_all(requirement.permissions()),
+    };
+    if !authorized {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
     if operation_uses_internal_structure_namespace(operation) {
@@ -1112,30 +1162,226 @@ fn admit_operation(
     Ok(())
 }
 
+fn mask_sql_classification_error(
+    operation: &ProductOperation,
+    authority: &crate::AuthenticatedAuthority,
+) -> bool {
+    let (is_sql, additional) = match operation {
+        ProductOperation::ExecuteSql { .. } => (true, ProductAuthorization::NONE),
+        ProductOperation::Prove { operation, .. }
+            if matches!(operation.as_ref(), ProductOperation::ExecuteSql { .. }) =>
+        {
+            (
+                true,
+                ProductAuthorization::from_permissions([ProductPermission::ProofGenerate]),
+            )
+        }
+        _ => (false, ProductAuthorization::NONE),
+    };
+    is_sql
+        && ![
+            ProductAuthorization::from_permissions([
+                ProductPermission::CatalogRead,
+                ProductPermission::DataRead,
+            ]),
+            ProductAuthorization::from_permissions([
+                ProductPermission::CatalogRead,
+                ProductPermission::DataWrite,
+            ]),
+            ProductAuthorization::from_permissions([ProductPermission::CatalogWrite]),
+        ]
+        .into_iter()
+        .any(|permissions| authority.allows_instance_authorization(permissions.union(additional)))
+}
+
 fn validate_durable_authority(
     product: &NativeProduct,
     session: &ProductSession,
-) -> Result<ProductAuthorization, ProductError> {
+) -> Result<Option<Arc<crate::AuthenticatedAuthority>>, ProductError> {
     let Some(bound) = session.authenticated_authority()? else {
-        return Ok(session.authorization());
+        return Ok(None);
     };
     let current = product.revalidate_authenticated_authority(Arc::clone(&bound))?;
     if !Arc::ptr_eq(&bound, &current) {
         session.refresh_authenticated_authority(Arc::clone(&current))?;
     }
-    if !current
-        .scope_ceiling()
-        .contains(&crate::ProductScope::Instance)
-    {
-        return Ok(ProductAuthorization::NONE);
+    Ok(Some(current))
+}
+
+fn operation_authorization_requirement(
+    product: &NativeProduct,
+    session: &ProductSession,
+    operation: &ProductOperation,
+    authority: Option<&crate::AuthenticatedAuthority>,
+) -> Result<ProductAuthorizationRequirement, ProductError> {
+    let permissions = operation.required_permissions()?;
+    let requirement = match operation {
+        ProductOperation::CatalogObject { id } | ProductOperation::CatalogDescribe { id } => {
+            ProductAuthorizationRequirement::object(permissions, *id)
+        }
+        ProductOperation::CatalogDependencies(request) => {
+            ProductAuthorizationRequirement::object(permissions, request.object)
+        }
+        ProductOperation::CatalogCreate { object } => object.parent().map_or_else(
+            || ProductAuthorizationRequirement::instance(permissions),
+            |parent| ProductAuthorizationRequirement::object(permissions, parent),
+        ),
+        ProductOperation::CatalogObjectNamed { name }
+        | ProductOperation::CatalogResolve { name } => {
+            let snapshot = product.catalog_snapshot()?;
+            product.catalog_resolve(&snapshot, name)?.map_or_else(
+                || ProductAuthorizationRequirement::instance(permissions),
+                |object| ProductAuthorizationRequirement::object(permissions, object.id()),
+            )
+        }
+        ProductOperation::PrepareSql { statement } => {
+            let prepared = product.prepare_sql(statement).map_err(|error| {
+                if authority
+                    .is_some_and(|current| !current.allows_instance_authorization(permissions))
+                {
+                    ProductError::from_code(ProductErrorCode::AuthorizationDenied)
+                } else {
+                    error
+                }
+            })?;
+            requirement_for_objects(permissions, prepared.referenced_object_ids())
+        }
+        ProductOperation::DeallocatePrepared { handle }
+        | ProductOperation::ExecutePrepared { handle, .. } => {
+            session.prepared(*handle).map_or_else(
+                || ProductAuthorizationRequirement::instance(permissions),
+                |prepared| requirement_for_objects(permissions, prepared.referenced_object_ids()),
+            )
+        }
+        ProductOperation::StructureMutate { mutations } => requirement_for_objects(
+            permissions,
+            mutations
+                .iter()
+                .map(|mutation| mutation.structure_key().keyspace),
+        ),
+        ProductOperation::StructureRead(request) => request.keyspace().map_or_else(
+            || ProductAuthorizationRequirement::instance(permissions),
+            |keyspace| ProductAuthorizationRequirement::object(permissions, keyspace),
+        ),
+        ProductOperation::Search { index, .. } => {
+            ProductAuthorizationRequirement::object(permissions, *index)
+        }
+        ProductOperation::SearchCollection { collection, .. }
+        | ProductOperation::SearchIngest { collection, .. }
+        | ProductOperation::SearchDocumentUpdate { collection, .. }
+        | ProductOperation::SearchDocumentDelete { collection, .. } => {
+            ProductAuthorizationRequirement::object(permissions, *collection)
+        }
+        ProductOperation::TransactionStageStructure { mutation, .. } => {
+            ProductAuthorizationRequirement::object(permissions, mutation.structure_key().keyspace)
+        }
+        ProductOperation::TransactionStageSearch { mutation, .. } => {
+            ProductAuthorizationRequirement::object(permissions, mutation.index())
+        }
+        ProductOperation::TransactionStageVector { mutation, .. } => {
+            ProductAuthorizationRequirement::object(permissions, mutation.index())
+        }
+        ProductOperation::TransactionCommit { handle } => {
+            session.active_transaction(*handle).map_or_else(
+                || ProductAuthorizationRequirement::unscoped(permissions),
+                |transaction| transaction.authorization.clone(),
+            )
+        }
+        ProductOperation::Prove { operation, .. } => {
+            let mut inner =
+                operation_authorization_requirement(product, session, operation, authority)?;
+            inner.add_permission_to_bound_targets(ProductPermission::ProofGenerate);
+            inner
+        }
+        ProductOperation::TransactionBegin
+        | ProductOperation::TransactionRollback { .. }
+        | ProductOperation::ExplicitTransactionStatus { .. }
+        | ProductOperation::TransactionStatus { .. }
+        | ProductOperation::TransactionStatusByIdempotency { .. } => {
+            ProductAuthorizationRequirement::unscoped(permissions)
+        }
+        // CatalogList remains instance-only until its physical traversal and
+        // continuation are scope-opaque. Other unbound surfaces also fail
+        // closed at the instance boundary.
+        _ => ProductAuthorizationRequirement::instance(permissions),
+    };
+    Ok(requirement)
+}
+
+fn requirement_for_objects(
+    permissions: ProductAuthorization,
+    objects: impl IntoIterator<Item = ObjectId>,
+) -> ProductAuthorizationRequirement {
+    let mut objects = objects.into_iter();
+    let Some(first) = objects.next() else {
+        return ProductAuthorizationRequirement::instance(permissions);
+    };
+    let mut requirement = ProductAuthorizationRequirement::object(permissions, first);
+    for object in objects {
+        requirement.union(&ProductAuthorizationRequirement::object(
+            permissions,
+            object,
+        ));
     }
-    Ok(current
-        .scoped_authorization()
-        .iter()
-        .filter(|scoped| scoped.scope == crate::ProductScope::Instance)
-        .fold(ProductAuthorization::NONE, |authorization, scoped| {
-            authorization.union(scoped.authorization)
-        }))
+    requirement
+}
+
+fn authority_satisfies_requirement(
+    product: &NativeProduct,
+    authority: &crate::AuthenticatedAuthority,
+    requirement: &ProductAuthorizationRequirement,
+) -> Result<bool, ProductError> {
+    let snapshot = product.catalog_snapshot()?;
+    authority_satisfies_requirement_at_snapshot(product, authority, requirement, &snapshot)
+}
+
+fn authority_satisfies_requirement_at_snapshot(
+    product: &NativeProduct,
+    authority: &crate::AuthenticatedAuthority,
+    requirement: &ProductAuthorizationRequirement,
+    snapshot: &crate::ProductCatalogSnapshot,
+) -> Result<bool, ProductError> {
+    if !authority.authorization().allows_all(requirement.unscoped) {
+        return Ok(false);
+    }
+    if !authority.allows_instance_authorization(requirement.instance) {
+        return Ok(false);
+    }
+    if requirement.objects.is_empty() {
+        return Ok(true);
+    }
+    let objects = requirement.objects.keys().copied().collect::<BTreeSet<_>>();
+    let ancestry = catalog_ancestry_at(product, snapshot, &objects)?;
+    Ok(requirement.objects.iter().all(|(object, permissions)| {
+        authority.allows_object_authorization(*permissions, *object, |candidate, ancestor| {
+            ancestry
+                .get(&candidate)
+                .is_some_and(|ancestors| ancestors.contains(&ancestor))
+        })
+    }))
+}
+
+fn catalog_ancestry_at(
+    product: &NativeProduct,
+    snapshot: &crate::ProductCatalogSnapshot,
+    objects: &BTreeSet<ObjectId>,
+) -> Result<BTreeMap<ObjectId, BTreeSet<ObjectId>>, ProductError> {
+    let mut ancestry = BTreeMap::new();
+    for target in objects {
+        let mut ancestors = BTreeSet::new();
+        let mut current = *target;
+        while let Some(object) = product.catalog_describe(snapshot, current)? {
+            let Some(parent) = object.parent() else {
+                break;
+            };
+            if !ancestors.insert(parent) {
+                return Err(ProductError::from_code(ProductErrorCode::Corruption));
+            }
+            current = parent;
+        }
+        ancestry.insert(*target, ancestors);
+    }
+    Ok(ancestry)
 }
 
 fn operation_uses_internal_structure_namespace(operation: &ProductOperation) -> bool {
@@ -1849,6 +2095,13 @@ impl ProductStructureReadRequest {
         }
     }
 
+    fn keyspace(&self) -> Option<ObjectId> {
+        match self {
+            Self::SetAlgebra { keyspace, .. } => Some(*keyspace),
+            _ => self.structure_key().map(|key| key.keyspace),
+        }
+    }
+
     fn family(&self) -> StructureKind {
         match self {
             Self::StringGet { .. } => StructureKind::String,
@@ -1868,6 +2121,24 @@ impl ProductStructureReadRequest {
             | Self::SortedSetRange { .. }
             | Self::SortedSetCardinality { .. } => StructureKind::SortedSet,
             Self::StreamRange { .. } => StructureKind::Stream,
+        }
+    }
+}
+
+impl ProductTransactionSearchMutation {
+    fn index(&self) -> ObjectId {
+        match self {
+            Self::Index { index, .. }
+            | Self::Replace { index, .. }
+            | Self::Delete { index, .. } => *index,
+        }
+    }
+}
+
+impl ProductTransactionVectorMutation {
+    fn index(&self) -> ObjectId {
+        match self {
+            Self::Upsert { index, .. } | Self::Delete { index, .. } => *index,
         }
     }
 }
@@ -1965,6 +2236,7 @@ fn stage_transaction(
     database: &NativeDatabase,
     session: &mut ProductSession,
     handle: ProductTransactionHandle,
+    authorization: &ProductAuthorizationRequirement,
     stage: impl FnOnce(&mut NativeWriteBatch) -> Result<ProductTransactionStageResult, ProductError>,
 ) -> Result<ProductTransactionStageReceipt, ProductError> {
     let current = session
@@ -1983,10 +2255,13 @@ fn stage_transaction(
     let source = session
         .take_active_transaction(handle)
         .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    let mut retained_authorization = source.authorization;
+    retained_authorization.union(authorization);
     let candidate = crate::session::ActiveProductTransaction {
         batch: candidate_batch.finish(source.batch)?,
         staged_operations: operation_ordinal,
         durability,
+        authorization: retained_authorization,
     };
     session.replace_active_transaction(handle, candidate);
     Ok(ProductTransactionStageReceipt {

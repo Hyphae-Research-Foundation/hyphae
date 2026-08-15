@@ -11,7 +11,7 @@ use hyphae_native_runtime::NativeWriteBatch;
 use hyphae_native_types::TransactionId;
 
 use crate::{
-    AuthenticatedAuthority, AuthorizationEpoch, ProductCommitReceipt, ProductDurability,
+    AuthenticatedAuthority, AuthorizationEpoch, ObjectId, ProductCommitReceipt, ProductDurability,
     ProductError, ProductErrorCode, ProductExplicitTransactionStatus, ProductPreparedStatement,
     ProductTransactionHandle,
 };
@@ -30,6 +30,72 @@ pub(crate) struct ActiveProductTransaction {
     pub(crate) batch: NativeWriteBatch,
     pub(crate) staged_operations: usize,
     pub(crate) durability: ProductDurability,
+    pub(crate) authorization: ProductAuthorizationRequirement,
+}
+
+/// Canonical permission and stable-object union retained across deferred work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProductAuthorizationRequirement {
+    pub(crate) unscoped: ProductAuthorization,
+    pub(crate) instance: ProductAuthorization,
+    pub(crate) objects: BTreeMap<ObjectId, ProductAuthorization>,
+}
+
+impl ProductAuthorizationRequirement {
+    pub(crate) const fn unscoped(permissions: ProductAuthorization) -> Self {
+        Self {
+            unscoped: permissions,
+            instance: ProductAuthorization::NONE,
+            objects: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) const fn instance(permissions: ProductAuthorization) -> Self {
+        Self {
+            unscoped: ProductAuthorization::NONE,
+            instance: permissions,
+            objects: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn object(permissions: ProductAuthorization, object: ObjectId) -> Self {
+        Self {
+            unscoped: ProductAuthorization::NONE,
+            instance: ProductAuthorization::NONE,
+            objects: BTreeMap::from([(object, permissions)]),
+        }
+    }
+
+    pub(crate) fn union(&mut self, other: &Self) {
+        self.unscoped = self.unscoped.union(other.unscoped);
+        self.instance = self.instance.union(other.instance);
+        for (object, permissions) in &other.objects {
+            self.objects
+                .entry(*object)
+                .and_modify(|current| *current = current.union(*permissions))
+                .or_insert(*permissions);
+        }
+    }
+
+    pub(crate) fn permissions(&self) -> ProductAuthorization {
+        self.objects.values().copied().fold(
+            self.unscoped.union(self.instance),
+            ProductAuthorization::union,
+        )
+    }
+
+    pub(crate) fn add_permission_to_bound_targets(&mut self, permission: ProductPermission) {
+        let additional = ProductAuthorization::from_permissions([permission]);
+        if self.instance != ProductAuthorization::NONE {
+            self.instance = self.instance.union(additional);
+        }
+        if self.objects.is_empty() && self.instance == ProductAuthorization::NONE {
+            self.unscoped = self.unscoped.union(additional);
+        }
+        for permissions in self.objects.values_mut() {
+            *permissions = permissions.union(additional);
+        }
+    }
 }
 
 /// Stable identity for one process-local product session.
@@ -520,6 +586,9 @@ impl ProductSession {
                 batch,
                 staged_operations: 0,
                 durability,
+                authorization: ProductAuthorizationRequirement::unscoped(
+                    ProductAuthorization::NONE,
+                ),
             },
         );
         self.record_explicit_status(handle, status);

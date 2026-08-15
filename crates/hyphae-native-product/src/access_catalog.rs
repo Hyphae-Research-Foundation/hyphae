@@ -319,6 +319,86 @@ impl AuthenticatedAuthority {
     pub fn scoped_authorization(&self) -> &[ScopedAuthorization] {
         &self.scoped_authorization
     }
+
+    /// Returns whether both the current principal grant and credential ceiling
+    /// authorize one instance-scoped permission.
+    #[must_use]
+    pub fn allows_instance(&self, permission: ProductPermission) -> bool {
+        self.scope_ceiling.contains(&ProductScope::Instance)
+            && self.scoped_authorization.iter().any(|scoped| {
+                scoped.scope == ProductScope::Instance && scoped.authorization.allows(permission)
+            })
+    }
+
+    /// Returns whether every permission in `required` is authorized at the
+    /// complete product instance.
+    #[must_use]
+    pub fn allows_instance_authorization(&self, required: ProductAuthorization) -> bool {
+        every_required_permission(required, |permission| self.allows_instance(permission))
+    }
+
+    /// Returns whether both the current principal grant and credential ceiling
+    /// authorize `permission` for one stable catalog object.
+    ///
+    /// The caller supplies ancestry from the immutable catalog snapshot that
+    /// bound the operation. Grants and credential ceilings remain separate so
+    /// subtree intersections are evaluated exactly rather than approximated or
+    /// widened during authentication.
+    #[must_use]
+    pub fn allows_object(
+        &self,
+        permission: ProductPermission,
+        target: ObjectId,
+        is_descendant: impl Fn(ObjectId, ObjectId) -> bool,
+    ) -> bool {
+        if !permission.supports_scope(ProductScope::CatalogObject(target)) {
+            return false;
+        }
+        let ceiling_allows = self
+            .scope_ceiling
+            .iter()
+            .copied()
+            .any(|scope| scope.covers_object(target, &is_descendant));
+        ceiling_allows
+            && self.scoped_authorization.iter().any(|scoped| {
+                scoped.authorization.allows(permission)
+                    && scoped.scope.covers_object(target, &is_descendant)
+            })
+    }
+
+    /// Returns whether every permission in `required` is authorized for one
+    /// stable catalog object in the caller-supplied immutable ancestry.
+    #[must_use]
+    pub fn allows_object_authorization(
+        &self,
+        required: ProductAuthorization,
+        target: ObjectId,
+        is_descendant: impl Fn(ObjectId, ObjectId) -> bool,
+    ) -> bool {
+        every_required_permission(required, |permission| {
+            self.allows_object(permission, target, &is_descendant)
+        })
+    }
+}
+
+fn every_required_permission(
+    required: ProductAuthorization,
+    mut predicate: impl FnMut(ProductPermission) -> bool,
+) -> bool {
+    let mut remaining = required.bits();
+    while remaining != 0 {
+        let Ok(tag) = u8::try_from(remaining.trailing_zeros()) else {
+            return false;
+        };
+        let Some(permission) = ProductPermission::from_tag(tag) else {
+            return false;
+        };
+        if !predicate(permission) {
+            return false;
+        }
+        remaining &= remaining - 1;
+    }
+    true
 }
 
 /// One effective permission set at one stable scope.
@@ -3436,10 +3516,7 @@ fn authority_allows_instance(
     authority: &AuthenticatedAuthority,
     permission: ProductPermission,
 ) -> bool {
-    authority.scope_ceiling.contains(&ProductScope::Instance)
-        && authority.scoped_authorization.iter().any(|scoped| {
-            scoped.scope == ProductScope::Instance && scoped.authorization.allows(permission)
-        })
+    authority.allows_instance(permission)
 }
 
 fn trusted_wall_time_micros() -> Result<i64, ProductError> {
@@ -4219,6 +4296,165 @@ mod tests {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn scoped_authority(
+        permission: ProductPermission,
+        grant_scope: ProductScope,
+        ceiling_scope: ProductScope,
+    ) -> Result<AuthenticatedAuthority, Box<dyn std::error::Error>> {
+        Ok(AuthenticatedAuthority {
+            principal_id: SecurityId::new(1).ok_or("invalid principal")?,
+            key_id: ApiKeyId::from_bytes([1; 16]).ok_or("invalid key")?,
+            principal: ProductPrincipal::new("scope-test").ok_or("invalid product principal")?,
+            authorization: ProductAuthorization::from_permissions([permission]),
+            authorization_epoch: AuthorizationEpoch::INITIAL,
+            directory_lineage: [1; 24],
+            valid_until_micros: None,
+            effective_roles: Box::new([]),
+            effective_custom_roles: Box::new([]),
+            scope_ceiling: vec![ceiling_scope].into_boxed_slice(),
+            scoped_authorization: vec![ScopedAuthorization {
+                scope: grant_scope,
+                authorization: ProductAuthorization::from_permissions([permission]),
+            }]
+            .into_boxed_slice(),
+        })
+    }
+
+    #[test]
+    fn authority_scope_intersection_table_requires_grant_and_key_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = ObjectId::new(10)?;
+        let child = ObjectId::new(11)?;
+        let grandchild = ObjectId::new(12)?;
+        let foreign = ObjectId::new(13)?;
+        let is_descendant = |candidate, ancestor| {
+            matches!(
+                (candidate, ancestor),
+                (value, parent) if (value == child && parent == root)
+                    || (value == grandchild && (parent == child || parent == root))
+            )
+        };
+        let cases = [
+            (ProductScope::Instance, ProductScope::Instance, root, true),
+            (
+                ProductScope::Instance,
+                ProductScope::CatalogSubtree(root),
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::Instance,
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::CatalogObject(child),
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogObject(child),
+                ProductScope::CatalogSubtree(root),
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::CatalogSubtree(child),
+                grandchild,
+                true,
+            ),
+            (
+                ProductScope::CatalogObject(child),
+                ProductScope::CatalogObject(child),
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::CatalogObject(child),
+                root,
+                false,
+            ),
+            (
+                ProductScope::CatalogObject(child),
+                ProductScope::CatalogSubtree(root),
+                grandchild,
+                false,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::CatalogSubtree(child),
+                child,
+                true,
+            ),
+            (
+                ProductScope::CatalogSubtree(root),
+                ProductScope::CatalogSubtree(child),
+                foreign,
+                false,
+            ),
+            (
+                ProductScope::CatalogObject(child),
+                ProductScope::CatalogObject(foreign),
+                child,
+                false,
+            ),
+        ];
+
+        for (grant, ceiling, target, expected) in cases {
+            let authority = scoped_authority(ProductPermission::DataRead, grant, ceiling)?;
+            assert_eq!(
+                authority.allows_object(ProductPermission::DataRead, target, is_descendant),
+                expected,
+                "grant={grant:?}, ceiling={ceiling:?}, target={target:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn authority_scope_intersection_never_widens_instance_or_permission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let object = ObjectId::new(21)?;
+        for grant in [
+            ProductScope::Instance,
+            ProductScope::CatalogSubtree(object),
+            ProductScope::CatalogObject(object),
+        ] {
+            for ceiling in [
+                ProductScope::Instance,
+                ProductScope::CatalogSubtree(object),
+                ProductScope::CatalogObject(object),
+            ] {
+                let authority = scoped_authority(ProductPermission::DataRead, grant, ceiling)?;
+                assert_eq!(
+                    authority.allows_instance(ProductPermission::DataRead),
+                    grant == ProductScope::Instance && ceiling == ProductScope::Instance
+                );
+                assert!(!authority.allows_instance(ProductPermission::DataWrite));
+                assert!(!authority.allows_object(
+                    ProductPermission::DataWrite,
+                    object,
+                    |_candidate, _ancestor| false,
+                ));
+            }
+        }
+        let instance_only = scoped_authority(
+            ProductPermission::SecurityManage,
+            ProductScope::Instance,
+            ProductScope::CatalogObject(object),
+        )?;
+        assert!(!instance_only.allows_object(
+            ProductPermission::SecurityManage,
+            object,
+            |_candidate, _ancestor| false,
+        ));
+        Ok(())
     }
 
     #[test]

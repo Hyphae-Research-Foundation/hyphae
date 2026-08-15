@@ -109,6 +109,10 @@ impl ProductPreparedStatement {
     pub const fn maximum_result_rows(&self) -> usize {
         self.maximum_result_rows
     }
+
+    pub(crate) fn referenced_object_ids(&self) -> std::collections::BTreeSet<ObjectId> {
+        self.inner.referenced_object_ids()
+    }
 }
 
 /// Maximum UTF-8 statement bytes admitted by the current embedded product slice.

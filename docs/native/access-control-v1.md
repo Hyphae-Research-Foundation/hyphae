@@ -100,12 +100,22 @@ SQL authorization happens after parse and bind. All relations, indexes,
 keyspaces, search collections, links, views, and functions referenced by the
 bound plan must be admitted. DDL requires `catalog.write`; DML requires
 `data.write`; read-only SQL requires `data.read`. A string prefix or keyword
-heuristic is not authorization.
+heuristic is not authorization. For a credential without instance-wide SQL
+authority, bind failures for an out-of-scope existing object, a missing object,
+and malformed SQL expose the same authorization denial; binder diagnostics
+must not become a catalog-existence oracle.
 
 Raw structure operations bind to the canonical default keyspace object before
 scope evaluation. Search operations bind the requested stable collection or
 index. A transaction accumulates the union of every referenced scope and
 reauthorizes the complete union before commit.
+
+Catalog listing currently requires instance-wide `catalog.read`. Object- and
+subtree-scoped pages fail closed before traversal because the public cursor and
+physical-work metadata are not yet scope-opaque. A requested parent must never
+be treated as implicit authority for its children. A future scoped listing
+must use a scope-aware traversal and continuation that cannot reveal invisible
+object identities, counts, ordering, or stop conditions.
 
 ## API-key format
 

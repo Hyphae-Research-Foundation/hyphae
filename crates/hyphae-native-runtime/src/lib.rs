@@ -49820,6 +49820,130 @@ mod tests {
     }
 
     #[test]
+    fn prepared_statement_referenced_object_ids_include_every_access_index_canonically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing events table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(tenant_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?
+        else {
+            return Err("missing tenant index".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(active_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_active ON events (active)", &[])?
+        else {
+            return Err("missing active index".into());
+        };
+        seed.commit()?;
+
+        let point = database.prepare_sql_latest("SELECT id FROM events WHERE id = ?")?;
+        assert_eq!(point.referenced_object_ids(), BTreeSet::from([table]));
+
+        let indexed = database
+            .prepare_sql_latest("SELECT id FROM events WHERE tenant = ? ORDER BY id LIMIT 10")?;
+        assert_eq!(
+            indexed.referenced_object_ids(),
+            BTreeSet::from([table, tenant_index])
+        );
+
+        let intersection = database.prepare_sql_latest(
+            "SELECT id FROM events
+             WHERE tenant = ? AND active = ?
+             ORDER BY id LIMIT 10",
+        )?;
+        assert_eq!(
+            intersection.referenced_object_ids(),
+            BTreeSet::from([table, tenant_index, active_index])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_referenced_object_ids_include_both_join_sides_and_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(accounts),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE accounts (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                plan_code TEXT
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing accounts table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(plans),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE plans (
+                id BIGINT PRIMARY KEY,
+                code TEXT NOT NULL,
+                label TEXT NOT NULL
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing plans table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(plans_code),
+            ..
+        } = seed.execute_sql("CREATE UNIQUE INDEX plans_code ON plans (code)", &[])?
+        else {
+            return Err("missing plans code index".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(accounts_email),
+            ..
+        } = seed.execute_sql(
+            "CREATE UNIQUE INDEX accounts_email ON accounts (email)",
+            &[],
+        )?
+        else {
+            return Err("missing accounts email index".into());
+        };
+        seed.commit()?;
+
+        let prepared = database.prepare_sql_latest(
+            "SELECT accounts.id, plans.label
+             FROM accounts
+             INNER JOIN plans ON accounts.plan_code = plans.code
+             WHERE email = ?",
+        )?;
+        assert_eq!(
+            prepared.referenced_object_ids(),
+            BTreeSet::from([accounts, plans, plans_code, accounts_email])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn typed_sql_rows_bind_to_catalog_and_survive_recovery()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
