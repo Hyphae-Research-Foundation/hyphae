@@ -66,20 +66,15 @@ jobs:
         run: python3 tools/check_crate_packages.py
       - name: Dry-run crates.io packages
         if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'crates-io'
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r package; do
-            cargo publish --locked --dry-run -p "$package"
-          done < <(python3 -c 'import json; print(*(package for layer in json.load(open("config/crates-io-release.json", encoding="utf-8"))["layers"] for package in layer), sep="\n")')
+        run: python3 tools/verify_crate_packages.py
       - name: Audit npm package inventory
         if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
         run: python3 tools/check_npm_packages.py
       - name: Dry-run npm packages
         if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
         run: |
-          npm --prefix sdks/typescript publish --dry-run
-          npm --prefix integrations/javascript publish --dry-run
+          npm publish ./sdks/typescript --dry-run
+          npm publish ./integrations/javascript --dry-run
 
   live:
     name: Gate and publish ${{ inputs.ecosystem }}
@@ -287,7 +282,7 @@ jobs:
             --authority-receipt "$AUTHORITY_RECEIPT" \
             --evidence-root "$EVIDENCE_ROOT" --evidence-receipt "$EVIDENCE_RECEIPT" \
             --publication-state "$PUBLICATION_STATE" -- \
-            npm --prefix sdks/typescript publish --provenance --access public
+            npm publish ./sdks/typescript --provenance --access public
           PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
             --ecosystem npm --root "$SOURCE_ROOT" --live-recheck \
             --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
@@ -299,7 +294,7 @@ jobs:
             --authority-receipt "$AUTHORITY_RECEIPT" \
             --evidence-root "$EVIDENCE_ROOT" --evidence-receipt "$EVIDENCE_RECEIPT" \
             --publication-state "$PUBLICATION_STATE" -- \
-            npm --prefix integrations/javascript publish --provenance --access public
+            npm publish ./integrations/javascript --provenance --access public
       - name: Retain npm reconciliation receipt
         if: always() && inputs.ecosystem == 'npm'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

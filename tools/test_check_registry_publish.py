@@ -212,12 +212,8 @@ class RegistryPublishGateTests(unittest.TestCase):
             encoding="utf-8"
         )
         cargo = 'cargo publish --locked -p "$package"'
-        npm_typescript = (
-            "npm --prefix sdks/typescript publish --provenance --access public"
-        )
-        npm_integrations = (
-            "npm --prefix integrations/javascript publish --provenance --access public"
-        )
+        npm_typescript = "npm publish ./sdks/typescript --provenance --access public"
+        npm_integrations = "npm publish ./integrations/javascript --provenance --access public"
         for ecosystem, invocation, expected in (
             (
                 "crates-io",
@@ -229,9 +225,8 @@ class RegistryPublishGateTests(unittest.TestCase):
                 npm_typescript,
                 [
                     "npm",
-                    "--prefix",
-                    "sdks/typescript",
                     "publish",
+                    "./sdks/typescript",
                     "--provenance",
                     "--access",
                     "public",
@@ -242,9 +237,8 @@ class RegistryPublishGateTests(unittest.TestCase):
                 npm_integrations,
                 [
                     "npm",
-                    "--prefix",
-                    "integrations/javascript",
                     "publish",
+                    "./integrations/javascript",
                     "--provenance",
                     "--access",
                     "public",
@@ -277,6 +271,54 @@ class RegistryPublishGateTests(unittest.TestCase):
                 self.assertFalse(any("command shape differs" in item for item in failures))
 
         self.assertEqual(guarded_publish_command(["--", "--", "cargo"]), ["--", "cargo"])
+
+    def test_legacy_npm_prefix_publish_shape_is_rejected(self) -> None:
+        failures = validate_publish_command(
+            "npm",
+            [
+                "npm",
+                "--prefix",
+                "sdks/typescript",
+                "publish",
+                "--provenance",
+                "--access",
+                "public",
+            ],
+        )
+        self.assertIn("npm: publish command prefix differs", failures)
+        self.assertIn("npm: publish command shape differs", failures)
+
+    def test_npm_package_intent_packs_the_validated_root_relative_path(self) -> None:
+        from tools.check_registry_publish import _package_intent
+
+        completed = subprocess.CompletedProcess(
+            [], 0, json.dumps([{"filename": "celiums-hyphae-1.2.0.tgz"}]), ""
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "tools.check_registry_publish.subprocess.run", return_value=completed
+        ) as run, patch("pathlib.Path.is_file", return_value=True), patch(
+            "pathlib.Path.is_symlink", return_value=False
+        ), patch("pathlib.Path.read_bytes", return_value=b"package"), patch(
+            "tools.check_registry_publish._archive_content_sha256",
+            return_value="a" * 64,
+        ):
+            root = Path(directory)
+            self.materialize(root, "1.2.0")
+            intent, _artifact = _package_intent(
+                "npm",
+                [
+                    "npm",
+                    "publish",
+                    "./sdks/typescript",
+                    "--provenance",
+                    "--access",
+                    "public",
+                ],
+                root,
+                {"commit": COMMIT, "tree": TREE},
+            )
+            intent["temporary"].cleanup()
+        self.assertEqual(run.call_args.args[0][:3], ["npm", "pack", "./sdks/typescript"])
 
     def test_workflow_mutations_fail_closed(self) -> None:
         original = (ROOT / ".github/workflows/registry-publish.yml").read_text(

@@ -54,6 +54,8 @@ jobs:
       - name: Validate locked Rust dependency graphs
         run: |
           cargo metadata --locked --format-version 1 > /dev/null
+          cargo metadata --manifest-path conformance/g6/runners/rust/Cargo.toml --locked --format-version 1 > /dev/null
+          cargo metadata --manifest-path conformance/g7/runners/rust/Cargo.toml --locked --format-version 1 > /dev/null
           cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
       - name: Audit locked JavaScript dependency graphs
         shell: bash

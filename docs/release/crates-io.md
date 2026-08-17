@@ -50,16 +50,20 @@ the tag being published. The trusted checker and policy are loaded from the
    cargo fmt --all --check
    cargo check --workspace --all-targets --all-features --locked
    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-   cargo test --workspace --all-features --locked
-   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-   python3 tools/check_crate_packages.py
+    cargo test --workspace --all-features --locked
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+    python3 tools/check_crate_packages.py
+    python3 tools/verify_crate_packages.py
    ```
 
    The package audit rejects an incomplete publication set, a mismatched
    version, a non-exact internal dependency, an invalid dependency layer, or a
-   compile-time asset absent from the generated crate. Release readiness runs
-   the historical SemVer comparison only for packages present in the v0.2.1
-   baseline; newly introduced Native packages have no fabricated baseline.
+   compile-time asset absent from the generated crate. Package verification
+   extracts every exact `.crate`, patches all release dependencies to those
+   extracts, proves Cargo resolved no older registry copy, and checks the full
+   packaged workspace. Release readiness runs the historical SemVer comparison
+   only for packages present in the v0.2.1 baseline; newly introduced Native
+   packages have no fabricated baseline.
 
 7. Store a least-privilege crates.io token only in the protected environment.
    Never place the token in a command line, repository file, workflow log, or
@@ -98,8 +102,9 @@ also identifies the edge as a local path; registry wildcard requirements
 remain denied.
 
 Use the `Registry publish` workflow. Pull requests and manual dry runs remain
-unprivileged and execute package audits plus `cargo publish --locked --dry-run`
-or `npm publish --dry-run`. A live dispatch must select `dry_run=false` from
+unprivileged and execute package audits plus exact crate tarball verification
+with local packaged dependency patches or `npm publish ./path --dry-run`. A
+live dispatch must select `dry_run=false` from
 `main`. Before any publish command, the workflow checks out trusted main control
 code separately from the source tag, compares every target-side policy/checker
 file byte-for-byte with trusted main, resolves live GitHub authority, downloads

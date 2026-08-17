@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 * text=auto eol=lf
+THIRD_PARTY_LICENSES.txt whitespace=-blank-at-eof
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf

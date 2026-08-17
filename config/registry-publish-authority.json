@@ -170,6 +170,7 @@
     "tools/check_relicensing_preflight.py",
     "tools/check_license_policy.py",
     "tools/generate_third_party_licenses.py",
-    "tools/produce_native_g8_receipt.py"
+    "tools/produce_native_g8_receipt.py",
+    "tools/verify_crate_packages.py"
   ]
 }

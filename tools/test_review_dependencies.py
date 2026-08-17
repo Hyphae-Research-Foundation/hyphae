@@ -337,6 +337,14 @@ class DependencyReviewTests(unittest.TestCase):
 
         read_object.side_effect = content
         validate_dependency_license_boundaries(HEAD)
+        packages["node_modules/@anthropic-ai/claude-code-1"]["license"] = (
+            "SEE LICENSE IN README.md"
+        )
+        with self.assertRaisesRegex(ValueError, "Claude Code"):
+            validate_dependency_license_boundaries(HEAD)
+        packages["node_modules/@anthropic-ai/claude-code-1"]["license"] = (
+            "SEE LICENSE IN LICENSE.md"
+        )
         packages["node_modules/@img/sharp-libvips-linux-x64"]["license"] = "MIT"
         with self.assertRaisesRegex(ValueError, "LGPL"):
             validate_dependency_license_boundaries(HEAD)

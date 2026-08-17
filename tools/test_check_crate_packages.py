@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools.check_crate_packages import validate_release_graph
+from tools.verify_crate_packages import (
+    validate_local_resolution,
+    verification_manifest,
+)
 
 
 def package(
@@ -101,6 +107,37 @@ class ReleaseGraphTests(unittest.TestCase):
             failures,
             ["semver baseline packages must belong to the release closure"],
         )
+
+    def test_verification_manifest_patches_every_extracted_package(self) -> None:
+        manifest = verification_manifest(("base", "product"), "1.2.0")
+        self.assertIn('"base" = { path = "packages/base-1.2.0" }', manifest)
+        self.assertIn('"product" = { path = "packages/product-1.2.0" }', manifest)
+
+    def test_local_resolution_rejects_registry_or_workspace_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = (root / "base-1.2.0").resolve()
+            product = (root / "product-1.2.0").resolve()
+            metadata = {
+                "packages": [
+                    {
+                        "name": "base",
+                        "source": None,
+                        "manifest_path": str(base / "Cargo.toml"),
+                    },
+                    {
+                        "name": "product",
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                        "manifest_path": str(product / "Cargo.toml"),
+                    },
+                ]
+            }
+            failures = validate_local_resolution(
+                metadata,
+                ("base", "product"),
+                {"base": base, "product": product},
+            )
+        self.assertEqual(failures, ["product: verification resolved a registry package"])
 
 if __name__ == "__main__":
     unittest.main()

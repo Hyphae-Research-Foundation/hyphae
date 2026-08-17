@@ -115,6 +115,7 @@ EXPECTED_CONTROL_FILES = (
     "tools/check_license_policy.py",
     "tools/generate_third_party_licenses.py",
     "tools/produce_native_g8_receipt.py",
+    "tools/verify_crate_packages.py",
 )
 
 
@@ -510,8 +511,8 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         "previous_layer=-1",
         "layer=\"${package%%:*}\"",
         "--wait-layer \"$previous_layer\"",
-        "npm --prefix sdks/typescript publish --provenance --access public",
-        "npm --prefix integrations/javascript publish --provenance --access public",
+        "npm publish ./sdks/typescript --provenance --access public",
+        "npm publish ./integrations/javascript --provenance --access public",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         "registry-publication-${{ inputs.ecosystem }}-${{ steps.authority.outputs.source_commit }}",
         "Restore a prior reconciliation receipt on workflow rerun",
@@ -520,9 +521,9 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
     required_dry = (
         "if: github.event_name == 'pull_request' || inputs.dry_run",
         "--dry-run",
-        "cargo publish --locked --dry-run",
-        "npm --prefix sdks/typescript publish --dry-run",
-        "npm --prefix integrations/javascript publish --dry-run",
+        "python3 tools/verify_crate_packages.py",
+        "npm publish ./sdks/typescript --dry-run",
+        "npm publish ./integrations/javascript --dry-run",
     )
     failures = [
         f"{path}: required live publication control is missing: {fragment}"
@@ -534,7 +535,7 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         for fragment in required_dry
         if fragment not in dry_run
     )
-    if "cargo publish --locked -p" in dry_run or "--provenance --access public" in dry_run:
+    if "cargo publish" in dry_run or "--provenance --access public" in dry_run:
         failures.append(f"{path}: unprivileged dry-run job contains a live publish command")
     if workflow.count("environment: registry-production") != 1:
         failures.append(f"{path}: exactly one live job must use the protected environment")
@@ -1146,12 +1147,19 @@ def _package_intent(
         )
         artifact = destination / "target" / "package" / f"{name}-{version}.crate"
     else:
-        project = command[2]
+        project = command[2].removeprefix("./")
         package = _load_json(root / project / "package.json", f"{project}/package.json")
         name = package["name"]
         version = package["version"]
         completed = subprocess.run(
-            ["npm", "--prefix", project, "pack", "--json", "--pack-destination", str(destination)],
+            [
+                "npm",
+                "pack",
+                f"./{project}",
+                "--json",
+                "--pack-destination",
+                str(destination),
+            ],
             cwd=root,
             check=True,
             stdout=subprocess.PIPE,
@@ -1893,13 +1901,11 @@ def validate_publish_command(
     expected_prefix = (
         ["cargo", "publish", "--locked", "-p"]
         if ecosystem == "crates-io"
-        else ["npm", "--prefix"]
+        else ["npm", "publish"]
     )
     if command[: len(expected_prefix)] != expected_prefix:
         failures.append(f"{ecosystem}: publish command prefix differs")
-    if ecosystem == "npm" and command[-4:] != [
-        "publish", "--provenance", "--access", "public"
-    ]:
+    if ecosystem == "npm" and command[3:] != ["--provenance", "--access", "public"]:
         failures.append("npm: publish command must require provenance and public access")
     if ecosystem == "crates-io" and len(command) == 5:
         try:
@@ -1913,8 +1919,8 @@ def validate_publish_command(
             failures.append("crates-io: package is outside the exact release closure")
     elif ecosystem == "crates-io":
         failures.append("crates-io: publish command shape differs")
-    if ecosystem == "npm" and len(command) == 7:
-        if command[2] not in {path for path, _name in EXPECTED_NPM_PACKAGES}:
+    if ecosystem == "npm" and len(command) == 6:
+        if command[2] not in {f"./{path}" for path, _name in EXPECTED_NPM_PACKAGES}:
             failures.append("npm: package path is outside the exact release inventory")
     elif ecosystem == "npm":
         failures.append("npm: publish command shape differs")

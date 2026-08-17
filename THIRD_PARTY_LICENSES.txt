@@ -4349,3 +4349,4 @@ Declared license: MIT/Apache-2.0
 - unicode-casefold 0.2.0 (registry+https://github.com/rust-lang/crates.io-index) [declared SPDX expression; upstream package archive contains no standalone license file]
 - winapi-i686-pc-windows-gnu 0.4.0 (registry+https://github.com/rust-lang/crates.io-index) [declared SPDX expression; upstream package archive contains no standalone license file]
 - winapi-x86_64-pc-windows-gnu 0.4.0 (registry+https://github.com/rust-lang/crates.io-index) [declared SPDX expression; upstream package archive contains no standalone license file]
+

@@ -256,15 +256,13 @@ def validate_dependency_license_boundaries(head: str) -> None:
             claude = [
                 value
                 for key, value in packages.items()
-                if key.startswith("@anthropic-ai/claude-code@")
+                if key.startswith("@anthropic-ai/claude-code")
             ]
-            if len(claude) != 9 or any(
-                value["license"] not in {
-                    "SEE LICENSE IN README.md",
-                    "SEE LICENSE IN LICENSE.md",
-                }
-                for value in claude
-            ):
+            licenses = [value["license"] for value in claude]
+            expected = ["SEE LICENSE IN LICENSE.md"] * 8 + [
+                "SEE LICENSE IN README.md"
+            ]
+            if len(claude) != 9 or sorted(licenses) != sorted(expected):
                 raise ValueError("Claude Code proprietary license boundary differs")
         if any(
             key.startswith("@img/sharp-libvips-")
