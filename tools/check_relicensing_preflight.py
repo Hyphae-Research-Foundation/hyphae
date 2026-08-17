@@ -28,6 +28,12 @@ MAX_CONTRACT_BYTES = 1024 * 1024
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}$")
+LEGAL_BASE_COMMIT = "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18"
+LEGAL_BASE_TREE = "51b283d27d0c0f5d194680de1d3e273b57f2ff95"
+DEPENDENCY_EVIDENCE_EVOLUTION = (
+    "Current exact dependency evidence evolved from legal base fcf2f918; the "
+    "base-derived filename is retained as the classification contract path."
+)
 DEPENDENCY_RECEIPT_PATH = (
     "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json"
 )
@@ -1153,7 +1159,42 @@ def _validate_digest(value: Any, location: str, failures: list[str]) -> None:
         failures.append(f"{location}: invalid SHA-256")
 
 
-def validate_preflight_evidence(root: Path = ROOT) -> list[str]:
+def _current_cargo_inputs(root: Path) -> list[dict[str, str]]:
+    encoded_paths = _git_read(
+        root,
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    paths = sorted(
+        path
+        for path in encoded_paths.decode("utf-8").split("\0")
+        if path
+        and (
+            path == "deny.toml"
+            or path.endswith("Cargo.toml")
+            or path.endswith("Cargo.lock")
+        )
+    )
+    inputs: list[dict[str, str]] = []
+    for path in paths:
+        candidate = root / path
+        if _path_uses_symlink(root, candidate) or not candidate.is_file():
+            raise ValueError(f"{path}: current Cargo input must be a regular file")
+        inputs.append(
+            {
+                "path": path,
+                "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            }
+        )
+    return inputs
+
+
+def validate_preflight_evidence(
+    root: Path = ROOT, *, require_transition_content: bool = True
+) -> list[str]:
     failures: list[str] = []
     try:
         dependency = _load_json_evidence(root, DEPENDENCY_RECEIPT_PATH)
@@ -1178,25 +1219,95 @@ def validate_preflight_evidence(root: Path = ROOT) -> list[str]:
     attestation_commit, attestation_tree = _source_binding(
         attestation, REPRESENTATIVE_ATTESTATION_PATH, root, failures
     )
-    if len({dependency_commit, audit_commit, attestation_commit}) != 1:
-        failures.append("preflight evidence: source commits differ")
-    if len({dependency_tree, audit_tree, attestation_tree}) != 1:
-        failures.append("preflight evidence: source trees differ")
+    if (audit_commit, audit_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: repository audit differs from exact legal base")
+    if (attestation_commit, attestation_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: owner attestation differs from exact legal base")
 
     if dependency.get("schema") != "hyphae-relicensing-dependency-receipt-v1":
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.schema: unsupported identifier")
     if dependency.get("target_release") != "1.2.0":
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.target_release: must be 1.2.0")
+    scope = dependency.get("scope")
+    if not isinstance(scope, dict) or scope.get("evidence_evolution") != (
+        DEPENDENCY_EVIDENCE_EVOLUTION
+    ):
+        failures.append(
+            f"{DEPENDENCY_RECEIPT_PATH}.scope: evidence evolution statement differs"
+        )
     source = dependency.get("source")
-    if not isinstance(source, dict) or source.get("mode") not in {
+    source_mode = source.get("mode") if isinstance(source, dict) else None
+    if not isinstance(source, dict) or source_mode not in {
         "clean-commit",
         "integration-tree",
     }:
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: unsupported source mode")
-    elif source.get("mode") == "clean-commit" and source.get("worktree_clean") is not True:
+    elif source_mode == "clean-commit" and source.get("worktree_clean") is not True:
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: clean source claim differs")
-    elif source.get("mode") == "integration-tree" and source.get("worktree_clean") is not False:
+    elif source_mode == "integration-tree" and source.get("worktree_clean") is not False:
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: integration-tree claim differs")
+    if isinstance(source, dict) and (
+        source.get("legal_base_commit"), source.get("legal_base_tree")
+    ) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append(
+            f"{DEPENDENCY_RECEIPT_PATH}.source: legal base identity differs"
+        )
+    if dependency_commit is not None:
+        try:
+            head = _git_read(root, "rev-parse", "HEAD^{commit}").decode("ascii").strip()
+            _git_read(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                LEGAL_BASE_COMMIT,
+                dependency_commit,
+            )
+            _git_read(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                dependency_commit,
+                head,
+            )
+        except (subprocess.SubprocessError, UnicodeError, ValueError):
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.source.commit: must descend from the legal base and anchor current HEAD"
+            )
+        else:
+            try:
+                current_tree = _git_read(root, "rev-parse", "HEAD^{tree}").decode(
+                    "ascii"
+                ).strip()
+            except (subprocess.SubprocessError, UnicodeError, ValueError):
+                current_tree = None
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.tree: current HEAD tree unavailable"
+                )
+            if source_mode == "clean-commit" and dependency_commit != head:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.commit: clean receipt must bind current HEAD"
+                )
+            if source_mode == "clean-commit" and dependency_tree != current_tree:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.tree: clean receipt must bind current HEAD tree"
+                )
+            if source_mode == "clean-commit":
+                try:
+                    status = _git_read(
+                        root,
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    )
+                except (subprocess.SubprocessError, ValueError):
+                    failures.append(
+                        f"{DEPENDENCY_RECEIPT_PATH}.source: cannot verify clean source claim"
+                    )
+                else:
+                    if status:
+                        failures.append(
+                            f"{DEPENDENCY_RECEIPT_PATH}.source: clean source claim is false for current content"
+                        )
     inventory = dependency.get("inventory")
     if not isinstance(inventory, dict):
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.inventory: must be an object")
@@ -1338,30 +1449,26 @@ def validate_preflight_evidence(root: Path = ROOT) -> list[str]:
             seen_paths.add(path)
             _validate_digest(digest, f"{location}.sha256", failures)
             try:
-                if isinstance(source, dict) and source.get("mode") == "integration-tree":
-                    candidate = root / path
-                    if _path_uses_symlink(root, candidate) or not candidate.is_file():
-                        raise ValueError("integration input is not a regular file")
-                    encoded = candidate.read_bytes()
-                else:
-                    encoded = _git_read(root, "show", f"{dependency_commit}:{path}")
+                candidate = root / path
+                if _path_uses_symlink(root, candidate) or not candidate.is_file():
+                    raise ValueError("current input is not a regular file")
+                encoded = candidate.read_bytes()
             except (OSError, subprocess.SubprocessError, ValueError):
-                failures.append(f"{location}.path: unavailable from source mode")
+                failures.append(f"{location}.path: unavailable from current content")
                 continue
             if isinstance(digest, str) and hashlib.sha256(encoded).hexdigest() != digest:
                 failures.append(f"{location}.sha256: source bytes differ")
-        required_inputs = {
-            "Cargo.lock",
-            "Cargo.toml",
-            "conformance/g6/runners/rust/Cargo.lock",
-            "conformance/g7/runners/rust/Cargo.lock",
-            "deny.toml",
-            "fuzz/Cargo.lock",
-        }
-        if not required_inputs.issubset(seen_paths):
+        try:
+            current_inputs = _current_cargo_inputs(root)
+        except (OSError, UnicodeError, subprocess.SubprocessError, ValueError) as error:
             failures.append(
-                f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: required Cargo inputs missing"
+                f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: cannot inventory current Cargo inputs: {error}"
             )
+        else:
+            if inputs != current_inputs:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: current Cargo input set or digest differs"
+                )
 
     if audit.get("schema") != "hyphae-relicensing-repository-audit-v1":
         failures.append(f"{REPOSITORY_AUDIT_PATH}.schema: unsupported identifier")
@@ -1610,6 +1717,17 @@ def validate_preflight_evidence(root: Path = ROOT) -> list[str]:
                 failures.append(f"{location}.insertions: count differs")
             if review.get("deletions") != deletions:
                 failures.append(f"{location}.deletions: count differs")
+    if require_transition_content:
+        try:
+            from tools.check_relicensing_transition import (
+                validate_current_transition_content,
+            )
+
+            failures.extend(validate_current_transition_content(root))
+        except (ImportError, OSError, ValueError) as error:
+            failures.append(
+                f"{TRANSITION_RECEIPT_PATH}: cannot validate current transition content: {error}"
+            )
     return failures
 
 

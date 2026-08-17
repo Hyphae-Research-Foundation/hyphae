@@ -5,6 +5,10 @@ inventories `Cargo.lock` and the repository `package-lock.json` files. Their
 copyrights and licenses remain with their respective authors. The project
 Apache-2.0 grant does not relicense those components.
 
+The current reviewed Rust, JavaScript, and Python inventory is aggregated by
+exact digest in
+`docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json`.
+
 ## DCO 1.1
 
 `DCO` is the canonical Developer Certificate of Origin 1.1, copyright The Linux

@@ -70,7 +70,7 @@ def _validate_readonly() -> int:
 
 
 def _refresh() -> int:
-    result = _run_checks(CHECKS)
+    result = _run_checks(CHECKS[:2])
     if result != 0:
         return result
     completed = subprocess.run(
@@ -81,9 +81,7 @@ def _refresh() -> int:
     if completed.returncode != 0:
         return completed.returncode
     state = repository_state()
-    result = subprocess.run(
-        [sys.executable, TRANSITION_CHECK], cwd=ROOT, check=False
-    ).returncode
+    result = _run_checks((CHECKS[2], TRANSITION_CHECK))
     if state != repository_state():
         print("error: repository changed after final transition refresh", file=sys.stderr)
         return 1

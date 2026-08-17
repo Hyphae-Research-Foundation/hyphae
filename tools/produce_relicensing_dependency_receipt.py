@@ -16,6 +16,16 @@ from pathlib import Path
 from typing import Any
 
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.check_relicensing_preflight import (
+    DEPENDENCY_EVIDENCE_EVOLUTION,
+    LEGAL_BASE_COMMIT,
+    LEGAL_BASE_TREE,
+)
+
+
 def run(root: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         arguments,
@@ -163,7 +173,9 @@ def produce(
     root: Path, generated_at: str, *, allow_integration_tree: bool = False
 ) -> dict[str, Any]:
     root = root.resolve()
-    dirty = bool(git_bytes(root, "status", "--porcelain=v1"))
+    dirty = bool(
+        git_bytes(root, "status", "--porcelain=v1", "--untracked-files=all")
+    )
     if dirty and not allow_integration_tree:
         raise ValueError("source worktree must be clean")
     commit = git_bytes(root, "rev-parse", "HEAD").decode("ascii").strip()
@@ -208,12 +220,15 @@ def produce(
             "mode": "integration-tree" if dirty else "clean-commit",
             "worktree_clean": not dirty,
             "source_inputs_sha256": canonical_sha256(inputs),
+            "legal_base_commit": LEGAL_BASE_COMMIT,
+            "legal_base_tree": LEGAL_BASE_TREE,
         },
         "scope": {
             "cargo_metadata": "workspace locked graph including all target-conditioned packages",
             "cargo_tree": "workspace all features including development dependencies",
             "current_first_party_license": "Apache-2.0",
             "transitioned_from_release_1_1_0_license": "AGPL-3.0-only",
+            "evidence_evolution": DEPENDENCY_EVIDENCE_EVOLUTION,
         },
         "source_inputs": inputs,
         "inventory": {

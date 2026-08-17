@@ -59,8 +59,9 @@ class RelicensingCheckOrchestratorTests(unittest.TestCase):
         ):
             self.assertEqual(main(["--refresh"]), 0)
         self.assertEqual(
-            calls[-2][-2:], ("tools/check_relicensing_transition.py", "--refresh")
+            calls[-3][-2:], ("tools/check_relicensing_transition.py", "--refresh")
         )
+        self.assertEqual(calls[-2][-1], "tools/check_relicensing_preflight.py")
         self.assertEqual(calls[-1][-1], "tools/check_relicensing_transition.py")
 
 

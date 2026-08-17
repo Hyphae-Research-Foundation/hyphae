@@ -18,6 +18,9 @@ if __package__ in {None, ""}:
 
 from tools.check_relicensing_preflight import (
     CONTRACT_PATH,
+    GIT_OBJECT_ID,
+    LEGAL_BASE_COMMIT,
+    LEGAL_BASE_TREE,
     ROOT,
     TRANSITION_RECEIPT_PATH,
     classify_path,
@@ -105,21 +108,31 @@ def validate_source_anchor(root: Path, source: object) -> list[str]:
         failures.append("transition receipt source mode differs")
     base_commit = source.get("base_commit")
     base_tree = source.get("base_tree")
-    try:
-        actual_base_tree = _git(root, "rev-parse", f"{base_commit}^{{tree}}")
-        head = _git(root, "rev-parse", "HEAD")
-        subprocess.run(
-            ["git", "-C", str(root), "merge-base", "--is-ancestor", str(base_commit), head],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
-    except subprocess.SubprocessError as error:
-        failures.append(f"transition receipt base is not an ancestor of HEAD: {error}")
+    if (base_commit, base_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("transition receipt source differs from exact legal base")
+    if (
+        not isinstance(base_commit, str)
+        or GIT_OBJECT_ID.fullmatch(base_commit) is None
+        or not isinstance(base_tree, str)
+        or GIT_OBJECT_ID.fullmatch(base_tree) is None
+    ):
+        failures.append("transition receipt base identity is invalid")
     else:
-        if actual_base_tree != base_tree:
-            failures.append("transition receipt base tree differs")
+        try:
+            actual_base_tree = _git(root, "rev-parse", f"{base_commit}^{{tree}}")
+            head = _git(root, "rev-parse", "HEAD")
+            subprocess.run(
+                ["git", "-C", str(root), "merge-base", "--is-ancestor", base_commit, head],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+        except subprocess.SubprocessError as error:
+            failures.append(f"transition receipt base is not an ancestor of HEAD: {error}")
+        else:
+            if actual_base_tree != base_tree:
+                failures.append("transition receipt base tree differs")
     event = source.get("base_event")
     if not isinstance(event, dict) or event != {
         "kind": "interactive-owner-attestation",
@@ -130,6 +143,52 @@ def validate_source_anchor(root: Path, source: object) -> list[str]:
     }:
         failures.append("transition receipt base owner-attestation event differs")
     return failures
+
+
+def _validate_transition_content(
+    root: Path, receipt: dict[str, Any], paths: list[str]
+) -> list[str]:
+    failures: list[str] = []
+    if receipt.get("schema") != "hyphae-relicensing-transition-receipt-v1":
+        failures.append("transition receipt schema differs")
+    if receipt.get("target_release") != "1.2.0" or receipt.get("status") != (
+        "effective-in-current-integration-tree"
+    ):
+        failures.append("transition receipt effective status differs")
+    failures.extend(validate_source_anchor(root, receipt.get("source")))
+    transitioned = receipt.get("transitioned_tree")
+    if not isinstance(transitioned, dict):
+        failures.append("transition receipt transitioned_tree must be an object")
+        return failures
+    excluded = transitioned.get("excluded_paths")
+    if excluded != [TRANSITION_RECEIPT_PATH]:
+        failures.append("transition receipt excluded path set differs")
+    else:
+        try:
+            actual_digest, actual_count = transitioned_content_digest(
+                root, paths, set(excluded)
+            )
+        except (OSError, ValueError) as error:
+            failures.append(str(error))
+        else:
+            if transitioned.get("content_sha256") != actual_digest:
+                failures.append("transition receipt content digest differs")
+            if transitioned.get("path_count") != actual_count:
+                failures.append("transition receipt path count differs")
+    if transitioned.get("digest_domain") != DIGEST_DOMAIN[:-1].decode("ascii"):
+        failures.append("transition receipt digest domain differs")
+    return failures
+
+
+def validate_current_transition_content(root: Path = ROOT) -> list[str]:
+    try:
+        receipt = _load_receipt(root)
+        paths = repository_paths(root)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        return [str(error)]
+    except subprocess.SubprocessError as error:
+        return [f"Git transition inventory failed: {error}"]
+    return _validate_transition_content(root, receipt, paths)
 
 
 def validate_transition(root: Path = ROOT) -> list[str]:
@@ -146,7 +205,7 @@ def validate_transition(root: Path = ROOT) -> list[str]:
 
     failures.extend(contract_result.failures)
     failures.extend(validate_historical_release_evidence(root))
-    failures.extend(validate_preflight_evidence(root))
+    failures.extend(validate_preflight_evidence(root, require_transition_content=False))
     failures.extend(validate_repository(root))
     if contract_result.blockers:
         failures.append(f"preflight blockers remain: {contract_result.blockers}")
@@ -199,36 +258,10 @@ def validate_transition(root: Path = ROOT) -> list[str]:
         ):
             failures.append(f"{relative}: generated dependency bundle authority differs")
 
-    if receipt.get("schema") != "hyphae-relicensing-transition-receipt-v1":
-        failures.append("transition receipt schema differs")
-    if receipt.get("target_release") != "1.2.0" or receipt.get("status") != (
-        "effective-in-current-integration-tree"
-    ):
-        failures.append("transition receipt effective status differs")
-    source = receipt.get("source")
-    failures.extend(validate_source_anchor(root, source))
+    failures.extend(_validate_transition_content(root, receipt, paths))
 
     transitioned = receipt.get("transitioned_tree")
-    if not isinstance(transitioned, dict):
-        failures.append("transition receipt transitioned_tree must be an object")
-    else:
-        excluded = transitioned.get("excluded_paths")
-        if excluded != [TRANSITION_RECEIPT_PATH]:
-            failures.append("transition receipt excluded path set differs")
-        else:
-            try:
-                actual_digest, actual_count = transitioned_content_digest(
-                    root, paths, set(excluded)
-                )
-            except (OSError, ValueError) as error:
-                failures.append(str(error))
-            else:
-                if transitioned.get("content_sha256") != actual_digest:
-                    failures.append("transition receipt content digest differs")
-                if transitioned.get("path_count") != actual_count:
-                    failures.append("transition receipt path count differs")
-        if transitioned.get("digest_domain") != DIGEST_DOMAIN[:-1].decode("ascii"):
-            failures.append("transition receipt digest domain differs")
+    if isinstance(transitioned, dict):
         expected_counts = dict(sorted(category_counts.items()))
         if transitioned.get("category_counts") != expected_counts:
             failures.append("transition receipt category counts differ")

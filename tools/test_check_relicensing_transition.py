@@ -7,7 +7,6 @@ import copy
 import json
 import tempfile
 import unittest
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,45 +94,29 @@ class RelicensingTransitionTests(unittest.TestCase):
         )
 
     def test_source_anchor_accepts_dirty_and_committed_descendant_content(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.name", "Test Owner"],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "config", "user.email", "owner@example.test"],
-                check=True,
-            )
-            (root / "content").write_text("base\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "content"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "base"], check=True)
-            base = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-            ).strip()
-            tree = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"], text=True
-            ).strip()
-            source = {
-                "worktree_state": "content-bound-integration-tree",
-                "base_commit": base,
-                "base_tree": tree,
-                "base_event": {
-                    "kind": "interactive-owner-attestation",
-                    "evidence": "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json",
-                },
-            }
-            (root / "content").write_text("dirty integration\n", encoding="utf-8")
-            self.assertEqual(validate_source_anchor(root, source), [])
-            dirty_digest = transitioned_content_digest(root, ["content"], set())
-            subprocess.run(["git", "-C", str(root), "add", "content"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "transition"], check=True)
-            self.assertEqual(validate_source_anchor(root, source), [])
-            self.assertEqual(
-                transitioned_content_digest(root, ["content"], set()),
-                dirty_digest,
-            )
+        source = copy.deepcopy(_load_receipt(ROOT)["source"])
+        self.assertEqual(validate_source_anchor(ROOT, source), [])
+
+    def test_source_anchor_rejects_unrelated_commit_or_tree(self) -> None:
+        original = _load_receipt(ROOT)["source"]
+        cases = (
+            (
+                "commit",
+                "e88f2ea2c3455a393e3ac0cd69e25486cc26888e",
+                "c131ab057c8ab05ed2e2389954f0e8145a71dbdb",
+            ),
+            (
+                "tree",
+                original["base_commit"],
+                "163633dec3a79931507d184926b10e6cc17722ea",
+            ),
+        )
+        for name, commit, tree in cases:
+            with self.subTest(name=name):
+                source = copy.deepcopy(original)
+                source["base_commit"] = commit
+                source["base_tree"] = tree
+                self.assertNotEqual(validate_source_anchor(ROOT, source), [])
 
     def test_committed_tree_authority_rejects_dirty_source(self) -> None:
         with patch(

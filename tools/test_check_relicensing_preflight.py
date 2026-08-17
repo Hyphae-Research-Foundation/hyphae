@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -12,8 +13,12 @@ from unittest.mock import patch
 
 from tools.check_relicensing_preflight import (
     CONTRACT_PATH,
+    DEPENDABOT_REVIEW_PATH,
+    DEPENDENCY_RECEIPT_PATH,
     EXPECTED_GENERATED_COPIES,
     MAX_CONTRACT_BYTES,
+    REPRESENTATIVE_ATTESTATION_PATH,
+    REPOSITORY_AUDIT_PATH,
     ROOT,
     _git_read,
     _git_read_unbounded,
@@ -52,6 +57,32 @@ class RelicensingPreflightTests(unittest.TestCase):
                 evidence_path = root / path
                 evidence_path.parent.mkdir(parents=True, exist_ok=True)
                 evidence_path.write_text("evidence\n", encoding="utf-8")
+
+    def validate_evidence_documents(
+        self, mutations: dict[str, dict[str, object]]
+    ) -> list[str]:
+        paths = (
+            DEPENDENCY_RECEIPT_PATH,
+            REPOSITORY_AUDIT_PATH,
+            REPRESENTATIVE_ATTESTATION_PATH,
+            DEPENDABOT_REVIEW_PATH,
+        )
+        documents = {
+            path: json.loads((ROOT / path).read_text(encoding="utf-8"))
+            for path in paths
+        }
+        documents.update(mutations)
+        with patch(
+            "tools.check_relicensing_preflight._load_json_evidence",
+            side_effect=lambda _root, relative: copy.deepcopy(documents[relative]),
+        ), patch(
+            "tools.check_dependency_license_aggregate.validate_aggregate",
+            return_value=[],
+        ), patch(
+            "tools.check_relicensing_transition.validate_current_transition_content",
+            return_value=[],
+        ):
+            return validate_preflight_evidence(ROOT)
 
     def test_current_repository_contract_passes_as_effective(self) -> None:
         result = validate_contract(self.contract, repository_paths(ROOT), ROOT)
@@ -314,6 +345,109 @@ class RelicensingPreflightTests(unittest.TestCase):
             ):
                 failures = validate_preflight_evidence(root)
             self.assertTrue(any("digest differs" in error for error in failures))
+
+    def test_legal_evidence_must_remain_bound_to_the_exact_base(self) -> None:
+        cases = (
+            (REPOSITORY_AUDIT_PATH, "audit differs from exact legal base"),
+            (
+                REPRESENTATIVE_ATTESTATION_PATH,
+                "attestation differs from exact legal base",
+            ),
+        )
+        for path, expected in cases:
+            with self.subTest(path=path):
+                document = json.loads((ROOT / path).read_text(encoding="utf-8"))
+                document["source"]["commit"] = (
+                    "8572af2c2e9ccb95f4ebc8002d3a524efbba67f0"
+                )
+                document["source"]["tree"] = (
+                    "163633dec3a79931507d184926b10e6cc17722ea"
+                )
+                failures = self.validate_evidence_documents({path: document})
+                self.assertTrue(any(expected in error for error in failures))
+
+    def test_dependency_receipt_rejects_unrelated_commit_and_tree(self) -> None:
+        original = json.loads(
+            (ROOT / DEPENDENCY_RECEIPT_PATH).read_text(encoding="utf-8")
+        )
+        cases = (
+            (
+                "commit",
+                "e88f2ea2c3455a393e3ac0cd69e25486cc26888e",
+                "c131ab057c8ab05ed2e2389954f0e8145a71dbdb",
+                "must descend from the legal base",
+            ),
+            (
+                "tree",
+                original["source"]["commit"],
+                "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
+                "does not match source commit",
+            ),
+        )
+        for name, commit, tree, expected in cases:
+            with self.subTest(name=name):
+                receipt = copy.deepcopy(original)
+                receipt["source"]["commit"] = commit
+                receipt["source"]["tree"] = tree
+                failures = self.validate_evidence_documents(
+                    {DEPENDENCY_RECEIPT_PATH: receipt}
+                )
+                self.assertTrue(any(expected in error for error in failures), failures)
+
+    def test_dependency_receipt_rejects_stale_current_cargo_inputs(self) -> None:
+        receipt = json.loads(
+            (ROOT / DEPENDENCY_RECEIPT_PATH).read_text(encoding="utf-8")
+        )
+        receipt["source_inputs"][0]["sha256"] = "0" * 64
+        receipt["source"]["source_inputs_sha256"] = hashlib.sha256(
+            json.dumps(
+                receipt["source_inputs"],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        failures = self.validate_evidence_documents({DEPENDENCY_RECEIPT_PATH: receipt})
+        self.assertTrue(
+            any(
+                "current Cargo input set or digest differs" in error
+                for error in failures
+            )
+        )
+
+    def test_dependency_receipt_rejects_false_clean_claim(self) -> None:
+        receipt = json.loads(
+            (ROOT / DEPENDENCY_RECEIPT_PATH).read_text(encoding="utf-8")
+        )
+        receipt["source"]["mode"] = "clean-commit"
+        receipt["source"]["worktree_clean"] = True
+
+        def git_read(root: Path, *arguments: str) -> bytes:
+            if arguments == (
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ):
+                return b" M Cargo.toml\n"
+            return _git_read(root, *arguments)
+
+        with patch(
+            "tools.check_relicensing_preflight._git_read", side_effect=git_read
+        ):
+            failures = self.validate_evidence_documents(
+                {DEPENDENCY_RECEIPT_PATH: receipt}
+            )
+        self.assertTrue(
+            any("clean source claim is false" in error for error in failures)
+        )
+
+    def test_preflight_rejects_stale_transition_content(self) -> None:
+        with patch(
+            "tools.check_relicensing_transition.validate_current_transition_content",
+            return_value=["transition receipt content digest differs"],
+        ):
+            failures = validate_preflight_evidence(ROOT)
+        self.assertIn("transition receipt content digest differs", failures)
 
     def test_each_decisive_attestation_boolean_fails_closed_when_false(self) -> None:
         source = ROOT / "docs/gates/evidence"

@@ -241,6 +241,8 @@ def build_aggregate(root: Path = ROOT) -> tuple[dict[str, Any], list[str]]:
                 "commit": source.get("commit"),
                 "tree": source.get("tree"),
                 "mode": source.get("mode"),
+                "legal_base_commit": source.get("legal_base_commit"),
+                "legal_base_tree": source.get("legal_base_tree"),
             },
         },
         "inventories": {
