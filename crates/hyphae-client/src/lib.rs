@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bounded asynchronous Rust client for the public Hyphae HTTP API.
 //!

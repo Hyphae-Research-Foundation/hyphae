@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Mutation tests for the publishable Python SDK contract."""
 
 from __future__ import annotations
@@ -55,6 +55,13 @@ class PythonPackageContractTests(unittest.TestCase):
             validate(),
             {"name": "hyphae-sdk", "status": "passed", "version": "1.1.0"},
         )
+
+    def test_python_publish_rejects_apache_1_1_0(self) -> None:
+        with self.fixture() as directory:
+            root = Path(directory)
+            self.remove_from_workflow(root, 'test "$version" = "1.2.0"')
+            with self.assertRaisesRegex(PythonPackageValidationError, "workflow|1.2.0"):
+                validate(root)
 
     def test_distribution_name_cannot_collide_with_unrelated_project(self) -> None:
         with self.fixture() as directory:

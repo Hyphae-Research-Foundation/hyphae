@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Focused logical catalog V2 persistence and bounded product API coverage.
 
@@ -40,6 +40,7 @@ fn header(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn product_catalog_pages_bind_cursor_to_snapshot_and_apply_limits()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("bounded");
@@ -52,12 +53,26 @@ fn product_catalog_pages_bind_cursor_to_snapshot_and_apply_limits()
     product.create_catalog_object_v2(schema.clone(), ProductDurability::Strict)?;
 
     let snapshot = product.catalog_snapshot()?;
+    let internal_keyspace = product
+        .catalog_resolve(
+            &snapshot,
+            &QualifiedName::new(
+                CatalogName::unquoted("hyphae_internal")?,
+                CatalogName::unquoted("system")?,
+                CatalogName::unquoted("default_scalar")?,
+            ),
+        )?
+        .ok_or("default scalar keyspace is missing")?
+        .id();
     let first = product.catalog_list(
         &snapshot,
         CatalogListRequest {
             parent: None,
             kind: None,
-            cursor: None,
+            cursor: Some(hyphae_native_product::CatalogCursor::new(
+                snapshot.identity(),
+                internal_keyspace,
+            )),
             item_limit: 1,
             visit_limit: 2,
             byte_limit: 4_096,
@@ -68,7 +83,7 @@ fn product_catalog_pages_bind_cursor_to_snapshot_and_apply_limits()
     let next = product.catalog_list(
         &snapshot,
         CatalogListRequest {
-            parent: None,
+            parent: Some(ObjectId::new(10)?),
             kind: None,
             cursor: Some(cursor),
             item_limit: 2,
@@ -135,7 +150,7 @@ fn product_catalog_pages_bind_cursor_to_snapshot_and_apply_limits()
         .ok_or("zero catalog limit unexpectedly accepted")?;
     assert_eq!(limit.code(), ProductErrorCode::LimitExceeded);
     assert_eq!(limit.category(), ProductErrorCategory::Limit);
-    assert_eq!(product.capabilities().catalog_tree_format_version, 6);
+    assert_eq!(product.capabilities().catalog_tree_format_version, 7);
 
     drop(product);
     fs::remove_dir_all(path)?;

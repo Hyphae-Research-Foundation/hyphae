@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,9 +21,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::stream;
 use hyphae_native_product::{
-    ApiKeyCredential, MAX_API_KEY_CREDENTIAL_BYTES, NativeProductClient, NativeProductHandle,
-    ProductAuthorization, ProductCancellationToken, ProductErrorCode, ProductOperation,
-    ProductPreparedHandle, ProductPrincipal, ProductResponse, TimingClass,
+    ApiKeyCredential, ApiKeyRequestAuthentication, ApiKeyRequestSessionAuthentication,
+    MAX_API_KEY_CREDENTIAL_BYTES, NativeProductClient, NativeProductHandle,
+    PendingTerminalCredential, ProductAuthorization, ProductCancellationToken, ProductErrorCode,
+    ProductOperation, ProductPreparedHandle, ProductPrincipal, ProductResponse, ProductSessionId,
+    TimingClass,
 };
 use tokio::{
     net::TcpListener,
@@ -36,10 +38,13 @@ use super::{
 };
 
 const SESSION_ID_HEADER: &str = hyphae_contracts::v2::SESSION_ID_HEADER_V2;
+const PROTOCOL_MINOR_HEADER: &str = hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2;
+const PROTOCOL_MINOR_VALUE: &str = hyphae_contracts::v2::PROTOCOL_MINOR_VALUE_V2;
 const STREAM_COMPLETION_HEADER: &str = "x-hyphae-stream-completion";
 const MAX_HTTP_SESSIONS: usize = 256;
 const MAX_HTTP_PREPARED_PER_SESSION: usize = 128;
-const MAX_HTTP_REQUESTS: usize = 256;
+pub(super) const MAX_HTTP_REQUESTS: usize = 256;
+pub(super) const MAX_HTTP_BODY_READERS: usize = 256;
 const MAX_HTTP_STREAMS: usize = 64;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -58,9 +63,11 @@ pub(super) struct NativeHttpV2State {
     limits: super::NativeHttpV2Limits,
     sessions: Mutex<BTreeMap<u128, SessionEntry>>,
     prepared_handles: Arc<Mutex<BTreeSet<u64>>>,
-    active_requests: Arc<Mutex<BTreeMap<u128, ProductCancellationToken>>>,
+    active_requests: Arc<Mutex<BTreeMap<(ProductSessionId, u128), ProductCancellationToken>>>,
     session_slots: Arc<Semaphore>,
     request_slots: Arc<Semaphore>,
+    auth_slots: Arc<Semaphore>,
+    pub(super) body_slots: Arc<Semaphore>,
     stream_slots: Arc<Semaphore>,
 }
 
@@ -68,23 +75,21 @@ enum NativeHttpV2SessionMode {
     Unmanaged {
         bearer_token: Option<crate::BearerToken>,
     },
-    Managed,
+    Managed {
+        legacy_bearer_token: Option<crate::BearerToken>,
+    },
 }
 
 #[derive(Clone)]
 pub(super) struct RequestAuthentication {
     principal: AuthenticatedPrincipal,
     initial_client: Option<Arc<NativeProductClient>>,
+    pending_terminal: Option<PendingTerminalCredential>,
+    _request_slot: Option<Arc<OwnedSemaphorePermit>>,
 }
 
-impl RequestAuthentication {
-    pub(super) fn unmanaged(principal: AuthenticatedPrincipal) -> Self {
-        Self {
-            principal,
-            initial_client: None,
-        }
-    }
-}
+#[derive(Clone)]
+struct RequestBodyAdmission(Arc<OwnedSemaphorePermit>);
 
 struct SessionEntry {
     session: Arc<HttpProductSession>,
@@ -142,7 +147,25 @@ impl NativeHttpV2Server {
         config: NativeHttpV2Config,
     ) -> Result<Self, NativeHttpV2Error> {
         if handle.access_control_bootstrapped() {
-            return Self::new_managed(handle, config);
+            let legacy_state = handle.legacy_bearer_state();
+            config.validate_managed_legacy(legacy_state)?;
+            if let Some(candidate) = config.legacy_bearer_token.as_ref()
+                && !handle
+                    .legacy_bearer_digest_matches(candidate.digest())
+                    .map_err(Box::new)?
+            {
+                return Err(super::NativeHttpV2ConfigError::LegacyBearerMismatch.into());
+            }
+            let bind = config.bind;
+            let limits = config.limits;
+            return Ok(Self::configured(
+                handle,
+                bind,
+                limits,
+                NativeHttpV2SessionMode::Managed {
+                    legacy_bearer_token: config.legacy_bearer_token,
+                },
+            ));
         }
         config.validate()?;
         let session_mode = NativeHttpV2SessionMode::Unmanaged {
@@ -178,13 +201,24 @@ impl NativeHttpV2Server {
         config: NativeHttpV2Config,
     ) -> Result<Self, NativeHttpV2Error> {
         config.validate_managed()?;
+        if config.legacy_bearer_token.is_some() {
+            return Err(
+                super::NativeHttpV2ConfigError::LegacyStateConfigurationMismatch {
+                    state: handle.legacy_bearer_state(),
+                    configured: true,
+                }
+                .into(),
+            );
+        }
         let bind = config.bind;
         let limits = config.limits;
         Ok(Self::configured(
             handle,
             bind,
             limits,
-            NativeHttpV2SessionMode::Managed,
+            NativeHttpV2SessionMode::Managed {
+                legacy_bearer_token: None,
+            },
         ))
     }
 
@@ -205,6 +239,8 @@ impl NativeHttpV2Server {
                 active_requests: Arc::new(Mutex::new(BTreeMap::new())),
                 session_slots: Arc::new(Semaphore::new(MAX_HTTP_SESSIONS)),
                 request_slots: Arc::new(Semaphore::new(MAX_HTTP_REQUESTS)),
+                auth_slots: Arc::new(Semaphore::new(MAX_HTTP_REQUESTS)),
+                body_slots: Arc::new(Semaphore::new(MAX_HTTP_BODY_READERS)),
                 stream_slots: Arc::new(Semaphore::new(MAX_HTTP_STREAMS)),
             }),
         }
@@ -243,12 +279,63 @@ impl NativeHttpV2Server {
 
     #[cfg(test)]
     pub(super) fn test_cancellation(&self, request_id: u128) -> Option<ProductCancellationToken> {
+        let active = self.state.active_requests.lock().ok()?;
+        let mut matches = active
+            .iter()
+            .filter(|((_, candidate), _)| *candidate == request_id)
+            .map(|(_, token)| token.clone());
+        let token = matches.next()?;
+        matches.next().is_none().then_some(token)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_register_cancellation(
+        &self,
+        session_id: ProductSessionId,
+        request_id: u128,
+    ) -> Result<CancellationGuard, NativeApiError> {
+        let metadata = RequestMetadata {
+            request_id,
+            binary_errors: false,
+        };
+        CancellationGuard::new(
+            ProductCancellationToken::new(),
+            Arc::clone(&self.state.active_requests),
+            (session_id, request_id),
+            &metadata,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_product_session_id(&self, session_id: u128) -> Option<ProductSessionId> {
         self.state
-            .active_requests
+            .sessions
             .lock()
             .ok()?
-            .get(&request_id)
-            .cloned()
+            .get(&session_id)
+            .map(|entry| entry.session.client.session_id())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_authentication_permits(&self) -> usize {
+        self.state.auth_slots.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_request_permits(&self) -> usize {
+        self.state.request_slots.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_unmanaged_authentication(
+        principal: AuthenticatedPrincipal,
+    ) -> RequestAuthentication {
+        RequestAuthentication {
+            principal,
+            initial_client: None,
+            pending_terminal: None,
+            _request_slot: None,
+        }
     }
 
     /// Builds an in-process router for SDK parity and embedding tests.
@@ -306,8 +393,10 @@ pub(super) enum OperationFamily {
     Restore,
     ProofVerify,
     Transaction,
+    Security,
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn build_router(state: Arc<NativeHttpV2State>) -> Router {
     Router::new()
         .route("/v2/capabilities", get(capabilities))
@@ -326,14 +415,71 @@ fn build_router(state: Arc<NativeHttpV2State>) -> Router {
         .route("/v2/restore", post(execute_restore))
         .route("/v2/proofs/verify", post(execute_proof_verify))
         .route("/v2/transactions/status", post(execute_transaction))
+        .route("/v2/security/keys", post(execute_security))
         .route("/v2/read-stream", post(read_stream))
         .route("/v1", get(v1_unmappable).post(v1_unmappable))
         .route("/v1/{*path}", get(v1_unmappable).post(v1_unmappable))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(Arc::clone(&state))
-        .layer(middleware::from_fn_with_state(state, authenticate))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            authenticate,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            admit_request_body,
+        ))
+        .layer(middleware::from_fn(require_supported_protocol_minor))
         .layer(middleware::from_fn(assign_request_id))
+}
+
+async fn admit_request_body(
+    State(state): State<Arc<NativeHttpV2State>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.method() == axum::http::Method::POST {
+        if let Err(error) = validate_request_headers(request.headers(), &metadata, &state) {
+            return error.into_response();
+        }
+        let Ok(permit) = Arc::clone(&state.body_slots).try_acquire_owned() else {
+            return NativeApiError::code(ProductErrorCode::Unavailable, &metadata).into_response();
+        };
+        request
+            .extensions_mut()
+            .insert(RequestBodyAdmission(Arc::new(permit)));
+    }
+    next.run(request).await
+}
+
+fn validate_request_headers(
+    headers: &HeaderMap,
+    metadata: &RequestMetadata,
+    state: &NativeHttpV2State,
+) -> Result<(), NativeApiError> {
+    parse_deadline_header(headers, metadata)?;
+    parse_session_header(headers, metadata)?;
+    require_product_content_type(headers, metadata)?;
+    let mut lengths = headers.get_all(header::CONTENT_LENGTH).iter();
+    if let Some(value) = lengths.next() {
+        if lengths.next().is_some() {
+            return Err(NativeApiError::code(
+                ProductErrorCode::InvalidRequest,
+                metadata,
+            ));
+        }
+        let length = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| NativeApiError::code(ProductErrorCode::InvalidRequest, metadata))?;
+        if length > state.limits.request_body_bytes {
+            return Err(NativeApiError::payload_too_large(metadata));
+        }
+    }
+    Ok(())
 }
 
 async fn assign_request_id(mut request: Request, next: Next) -> Response {
@@ -362,12 +508,43 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
     response
 }
 
+async fn require_supported_protocol_minor(request: Request, next: Next) -> Response {
+    if request.uri().path() != "/v2" && !request.uri().path().starts_with("/v2/") {
+        return next.run(request).await;
+    }
+    let metadata = request.extensions().get::<RequestMetadata>().cloned();
+    let supported = request
+        .headers()
+        .get_all(PROTOCOL_MINOR_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    if supported.len() != 1 || supported[0].as_bytes() != PROTOCOL_MINOR_VALUE.as_bytes() {
+        let metadata = metadata.unwrap_or(RequestMetadata {
+            request_id: Uuid::now_v7().as_u128(),
+            binary_errors: accepts_binary_errors(request.headers()),
+        });
+        return NativeApiError::code(ProductErrorCode::InvalidRequest, &metadata).into_response();
+    }
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        PROTOCOL_MINOR_HEADER,
+        HeaderValue::from_static(PROTOCOL_MINOR_VALUE),
+    );
+    response
+}
+
 async fn authenticate(
     State(state): State<Arc<NativeHttpV2State>>,
     Extension(metadata): Extension<RequestMetadata>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    let request_slot = match Arc::clone(&state.request_slots).try_acquire_owned() {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => {
+            return NativeApiError::code(ProductErrorCode::Unavailable, &metadata).into_response();
+        }
+    };
     let authentication = match &state.session_mode {
         NativeHttpV2SessionMode::Unmanaged { bearer_token } => {
             let principal = match bearer_token {
@@ -379,19 +556,47 @@ async fn authenticate(
                 }),
             };
             principal
-                .map(|principal| {
-                    RequestAuthentication::unmanaged(AuthenticatedPrincipal(principal))
-                })
                 .ok_or_else(|| NativeApiError::unauthorized(&metadata))
+                .and_then(|principal| {
+                    let principal = AuthenticatedPrincipal(principal);
+                    let initial_client = if request.headers().contains_key(SESSION_ID_HEADER) {
+                        None
+                    } else {
+                        Some(Arc::new(open_unmanaged_product_client(
+                            &state, &principal, &metadata,
+                        )?))
+                    };
+                    Ok(RequestAuthentication {
+                        principal,
+                        initial_client,
+                        pending_terminal: None,
+                        _request_slot: Some(Arc::clone(&request_slot)),
+                    })
+                })
         }
-        NativeHttpV2SessionMode::Managed => {
-            authenticate_managed_request(&state, request.headers(), &metadata).await
+        NativeHttpV2SessionMode::Managed {
+            legacy_bearer_token,
+        } => {
+            authenticate_managed_request(
+                &state,
+                request.headers(),
+                &metadata,
+                legacy_bearer_token.as_ref(),
+                Arc::clone(&request_slot),
+            )
+            .await
         }
     };
     let authentication = match authentication {
         Ok(authentication) => authentication,
         Err(error) => return error.into_response(),
     };
+    if authentication.pending_terminal.is_some()
+        && (request.method() != axum::http::Method::POST
+            || request.uri().path() != "/v2/security/keys")
+    {
+        return NativeApiError::unauthorized(&metadata).into_response();
+    }
     request.extensions_mut().insert(authentication);
     next.run(request).await
 }
@@ -400,35 +605,121 @@ async fn authenticate_managed_request(
     state: &NativeHttpV2State,
     headers: &HeaderMap,
     metadata: &RequestMetadata,
+    legacy_bearer_token: Option<&crate::BearerToken>,
+    request_slot: Arc<OwnedSemaphorePermit>,
 ) -> Result<RequestAuthentication, NativeApiError> {
-    let candidate =
-        managed_bearer_candidate(headers).ok_or_else(|| NativeApiError::unauthorized(metadata))?;
-    let principal = AuthenticatedPrincipal(managed_credential_fingerprint(candidate.as_bytes()));
-    let initial_client = if headers.contains_key(SESSION_ID_HEADER) {
-        None
-    } else {
-        let credential =
-            ApiKeyCredential::new(candidate).map_err(|_| NativeApiError::unauthorized(metadata))?;
+    let raw_candidate = bearer_candidate(headers)
+        .and_then(|candidate| std::str::from_utf8(candidate).ok())
+        .ok_or_else(|| NativeApiError::unauthorized(metadata))?;
+    if raw_candidate.starts_with("hyp1_") {
+        let candidate = managed_bearer_candidate(headers)
+            .ok_or_else(|| NativeApiError::unauthorized(metadata))?;
+        return authenticate_canonical_request(state, headers, metadata, candidate, request_slot)
+            .await;
+    }
+    let expected = legacy_bearer_token.ok_or_else(|| NativeApiError::unauthorized(metadata))?;
+    if !expected.verifies(raw_candidate.as_bytes()) {
+        return Err(NativeApiError::unauthorized(metadata));
+    }
+    if !headers.contains_key(SESSION_ID_HEADER) {
         let handle = state.handle.clone();
-        let client = tokio::task::spawn_blocking(move || {
+        let digest = expected.digest();
+        let durable_match = tokio::task::spawn_blocking(move || {
             handle
-                .open_authenticated_session(credential)
+                .legacy_bearer_digest_matches(digest)
                 .map_err(Box::new)
         })
         .await
         .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?
-        .map_err(|error| {
-            if error.code() == ProductErrorCode::AuthorizationDenied {
-                NativeApiError::unauthorized(metadata)
-            } else {
-                NativeApiError::product(*error, metadata)
+        .map_err(|error| NativeApiError::product(*error, metadata))?;
+        if !durable_match {
+            return Err(NativeApiError::unauthorized(metadata));
+        }
+    }
+    let principal = AuthenticatedPrincipal(legacy_credential_fingerprint(raw_candidate.as_bytes()));
+    if headers.contains_key(SESSION_ID_HEADER) {
+        return Ok(RequestAuthentication {
+            principal,
+            initial_client: None,
+            pending_terminal: None,
+            _request_slot: Some(request_slot),
+        });
+    }
+    let handle = state.handle.clone();
+    let credential = hyphae_native_product::LegacyBearerCredential::new(raw_candidate.as_bytes())
+        .map_err(|_| NativeApiError::unauthorized(metadata))?;
+    let client = tokio::task::spawn_blocking(move || {
+        handle
+            .open_legacy_owner_session(credential)
+            .map_err(Box::new)
+    })
+    .await
+    .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?
+    .map_err(|_| NativeApiError::unauthorized(metadata))?;
+    Ok(RequestAuthentication {
+        principal,
+        initial_client: Some(Arc::new(client)),
+        pending_terminal: None,
+        _request_slot: Some(request_slot),
+    })
+}
+
+async fn authenticate_canonical_request(
+    state: &NativeHttpV2State,
+    headers: &HeaderMap,
+    metadata: &RequestMetadata,
+    candidate: &str,
+    request_slot: Arc<OwnedSemaphorePermit>,
+) -> Result<RequestAuthentication, NativeApiError> {
+    let principal = AuthenticatedPrincipal(managed_credential_fingerprint(candidate.as_bytes()));
+    let (initial_client, pending_terminal) = if headers.contains_key(SESSION_ID_HEADER) {
+        let auth_slot = Arc::clone(&state.auth_slots)
+            .try_acquire_owned()
+            .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?;
+        let credential =
+            ApiKeyCredential::new(candidate).map_err(|_| NativeApiError::unauthorized(metadata))?;
+        let handle = state.handle.clone();
+        let authentication = tokio::task::spawn_blocking(move || {
+            let _auth_slot = auth_slot;
+            handle
+                .authenticate_api_key_request(credential)
+                .map_err(Box::new)
+        })
+        .await
+        .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?
+        .map_err(|error| NativeApiError::product(*error, metadata))?;
+        match authentication {
+            ApiKeyRequestAuthentication::Authenticated(_) => (None, None),
+            ApiKeyRequestAuthentication::PendingTerminal(pending) => (None, Some(pending)),
+        }
+    } else {
+        let auth_slot = Arc::clone(&state.auth_slots)
+            .try_acquire_owned()
+            .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?;
+        let credential =
+            ApiKeyCredential::new(candidate).map_err(|_| NativeApiError::unauthorized(metadata))?;
+        let handle = state.handle.clone();
+        let authentication = tokio::task::spawn_blocking(move || {
+            let _auth_slot = auth_slot;
+            handle
+                .open_api_key_request_session(credential)
+                .map_err(Box::new)
+        })
+        .await
+        .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?
+        .map_err(|error| NativeApiError::product(*error, metadata))?;
+        match authentication {
+            ApiKeyRequestSessionAuthentication::Authenticated(client) => {
+                (Some(Arc::new(client)), None)
             }
-        })?;
-        Some(Arc::new(client))
+            ApiKeyRequestSessionAuthentication::PendingTerminal(pending) => (None, Some(pending)),
+        }
     };
     Ok(RequestAuthentication {
         principal,
         initial_client,
+        pending_terminal,
+        _request_slot: Some(request_slot),
     })
 }
 
@@ -492,6 +783,7 @@ family_handler!(execute_backup, Backup);
 family_handler!(execute_restore, Restore);
 family_handler!(execute_proof_verify, ProofVerify);
 family_handler!(execute_transaction, Transaction);
+family_handler!(execute_security, Security);
 
 async fn read_stream(
     State(state): State<Arc<NativeHttpV2State>>,
@@ -510,41 +802,97 @@ async fn read_stream(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_request(
     state: Arc<NativeHttpV2State>,
     metadata: RequestMetadata,
-    request: Request,
+    mut request: Request,
     family: OperationFamily,
     stream_response: bool,
     authentication: RequestAuthentication,
 ) -> Result<Response, NativeApiError> {
+    let pending_terminal = authentication.pending_terminal.is_some();
+    let rejection = |code| {
+        if pending_terminal {
+            NativeApiError::unauthorized(&metadata)
+        } else {
+            NativeApiError::code(code, &metadata)
+        }
+    };
     let deadline_header = parse_deadline_header(request.headers(), &metadata)?;
     let session_id = parse_session_header(request.headers(), &metadata)?;
     require_product_content_type(request.headers(), &metadata)?;
+    let request_admission = request
+        .extensions_mut()
+        .remove::<RequestBodyAdmission>()
+        .ok_or_else(|| NativeApiError::code(ProductErrorCode::Internal, &metadata))?;
+    let _request_admission = request_admission.0;
     let body = tokio::time::timeout(
         state.limits.request_body_timeout,
         body::to_bytes(request.into_body(), state.limits.request_body_bytes),
     )
     .await
-    .map_err(|_| NativeApiError::code(ProductErrorCode::DeadlineExceeded, &metadata))?
-    .map_err(|_| NativeApiError::payload_too_large(&metadata))?;
+    .map_err(|_| rejection(ProductErrorCode::DeadlineExceeded))?
+    .map_err(|_| {
+        if pending_terminal {
+            NativeApiError::unauthorized(&metadata)
+        } else {
+            NativeApiError::payload_too_large(&metadata)
+        }
+    })?;
     let decode_started = Instant::now();
     let mut wire = hyphae_native_protocol::decode_product_request(&body)
-        .map_err(|_| NativeApiError::code(ProductErrorCode::InvalidRequest, &metadata))?;
+        .map_err(|_| rejection(ProductErrorCode::InvalidRequest))?;
     let decode_time = decode_started.elapsed();
     if deadline_header.is_some() && deadline_header != wire.deadline_micros {
-        return Err(NativeApiError::code(
-            ProductErrorCode::InvalidRequest,
-            &metadata,
-        ));
+        return Err(rejection(ProductErrorCode::InvalidRequest));
     }
     if !family_accepts(family, &wire.operation)
         || (stream_response && !is_read_operation(&wire.operation))
     {
-        return Err(NativeApiError::code(
-            ProductErrorCode::InvalidRequest,
-            &metadata,
-        ));
+        return Err(rejection(ProductErrorCode::InvalidRequest));
+    }
+    if matches!(family, OperationFamily::Security) {
+        if !matches!(state.session_mode, NativeHttpV2SessionMode::Managed { .. }) {
+            return Err(rejection(ProductErrorCode::AuthorizationDenied));
+        }
+        if wire.durability != hyphae_native_product::ProductDurabilityPolicy::STRICT {
+            return Err(rejection(ProductErrorCode::InvalidRequest));
+        }
+    }
+    let mut authentication = authentication;
+    if let Some(pending) = authentication.pending_terminal.take() {
+        let Some(idempotency_token) = wire.idempotency_token else {
+            return Err(NativeApiError::unauthorized(&metadata));
+        };
+        let operation = wire.operation.clone();
+        let handle = state.handle.clone();
+        let existing_session = session_id.is_some();
+        let authenticated = tokio::task::spawn_blocking(move || {
+            if existing_session {
+                handle
+                    .authenticate_exact_terminal_replay(pending, idempotency_token, operation)
+                    .map(|()| None)
+                    .map_err(Box::new)
+            } else {
+                handle
+                    .open_exact_terminal_replay_session(pending, idempotency_token, operation)
+                    .map(Some)
+                    .map_err(Box::new)
+            }
+        })
+        .await
+        .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, &metadata))?
+        .map_err(|error| {
+            if error.code() == ProductErrorCode::AuthorizationDenied {
+                NativeApiError::unauthorized(&metadata)
+            } else {
+                NativeApiError::product(*error, &metadata)
+            }
+        })?;
+        if let Some(client) = authenticated {
+            authentication.initial_client = Some(Arc::new(client));
+        }
     }
     wire.limits.max_request_bytes = wire
         .limits
@@ -577,10 +925,14 @@ async fn execute_operation(
     requested_session: Option<u128>,
 ) -> Result<Response, NativeApiError> {
     let transport_started = Instant::now();
-    let _request_slot = Arc::clone(&state.request_slots)
-        .try_acquire_owned()
-        .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, &metadata))?;
     let mut operation = wire.operation;
+    let one_time_secret = matches!(
+        operation,
+        ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+            | ProductOperation::SecurityApiKeyIssueStart { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+            | ProductOperation::SecurityApiKeyRotateStart { .. }
+    );
     let mut new_session = None;
     let session = if operation_requires_existing_session(&operation) {
         let session_id = requested_session
@@ -614,6 +966,21 @@ async fn execute_operation(
     } else {
         None
     };
+
+    let client = if let Some(session) = &session {
+        Arc::clone(&session.client)
+    } else {
+        product_client_for_request(&state, &authentication, &metadata)?
+    };
+    let token = ProductCancellationToken::new();
+    // Reserve correlation identity before service admission. A duplicate
+    // cannot enter the queue or replace this cancellation token.
+    let cancellation = CancellationGuard::new(
+        token.clone(),
+        Arc::clone(&state.active_requests),
+        (client.session_id(), metadata.request_id),
+        &metadata,
+    )?;
 
     let prepared_slot = if matches!(operation, ProductOperation::PrepareSql { .. }) {
         let session = session
@@ -649,13 +1016,7 @@ async fn execute_operation(
         _ => None,
     };
 
-    let client = if let Some(session) = &session {
-        Arc::clone(&session.client)
-    } else {
-        product_client_for_request(&state, &authentication, &metadata)?
-    };
     client.record_timing(TimingClass::RequestDecoding, decode_time);
-    let token = ProductCancellationToken::new();
     let mut context = client.request_context(metadata.request_id, wire.logical_time_micros);
     context.idempotency_token = wire.idempotency_token;
     context.deadline_micros = wire.deadline_micros;
@@ -668,12 +1029,6 @@ async fn execute_operation(
     let pending = client
         .try_submit(context, operation)
         .map_err(|error| NativeApiError::product(error, &metadata))?;
-    let cancellation = CancellationGuard::new(
-        token.clone(),
-        Arc::clone(&state.active_requests),
-        metadata.request_id,
-        &metadata,
-    )?;
     let task = tokio::task::spawn_blocking(move || pending.wait().map_err(Box::new));
     let mut response = wait_for_product(task, &token, wire.deadline_micros, &metadata).await?;
 
@@ -750,6 +1105,11 @@ async fn execute_operation(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
         .header(header::CONTENT_LENGTH, encoded.len());
+    if one_time_secret {
+        builder = builder
+            .header(header::CACHE_CONTROL, "no-store, private, max-age=0")
+            .header(header::PRAGMA, "no-cache");
+    }
     if let Some(session_id) = response_session {
         builder = builder.header(SESSION_ID_HEADER, format!("{session_id:032x}"));
     }
@@ -933,10 +1293,10 @@ fn completion_record(
     Ok(Bytes::from(completion))
 }
 
-struct CancellationGuard {
-    token: ProductCancellationToken,
-    active_requests: Arc<Mutex<BTreeMap<u128, ProductCancellationToken>>>,
-    request_id: u128,
+pub(super) struct CancellationGuard {
+    pub(super) token: ProductCancellationToken,
+    active_requests: Arc<Mutex<BTreeMap<(ProductSessionId, u128), ProductCancellationToken>>>,
+    key: (ProductSessionId, u128),
     armed: bool,
 }
 
@@ -966,24 +1326,25 @@ impl ResponseBodyState {
 impl CancellationGuard {
     fn new(
         token: ProductCancellationToken,
-        active_requests: Arc<Mutex<BTreeMap<u128, ProductCancellationToken>>>,
-        request_id: u128,
+        active_requests: Arc<Mutex<BTreeMap<(ProductSessionId, u128), ProductCancellationToken>>>,
+        key: (ProductSessionId, u128),
         metadata: &RequestMetadata,
     ) -> Result<Self, NativeApiError> {
         let mut active = active_requests
             .lock()
             .map_err(|_| NativeApiError::code(ProductErrorCode::Unavailable, metadata))?;
-        if active.insert(request_id, token.clone()).is_some() {
+        if active.contains_key(&key) {
             return Err(NativeApiError::code(
                 ProductErrorCode::InvalidRequest,
                 metadata,
             ));
         }
+        active.insert(key, token.clone());
         drop(active);
         Ok(Self {
             token,
             active_requests,
-            request_id,
+            key,
             armed: true,
         })
     }
@@ -995,7 +1356,7 @@ impl CancellationGuard {
 
     fn remove_active(&self) {
         if let Ok(mut active) = self.active_requests.lock() {
-            active.remove(&self.request_id);
+            active.remove(&self.key);
         }
     }
 }
@@ -1038,12 +1399,13 @@ async fn method_not_allowed(
 
 pub(super) fn family_accepts(family: OperationFamily, operation: &ProductOperation) -> bool {
     match family {
-        OperationFamily::Any => true,
+        OperationFamily::Any => !operation.is_key_lifecycle(),
         OperationFamily::Catalog => matches!(
             operation,
             ProductOperation::CatalogObject { .. }
                 | ProductOperation::CatalogObjectNamed { .. }
                 | ProductOperation::CatalogList(_)
+                | ProductOperation::CatalogVisibleList(_)
                 | ProductOperation::CatalogDependencies(_)
                 | ProductOperation::CatalogDescribe { .. }
                 | ProductOperation::CatalogResolve { .. }
@@ -1091,6 +1453,24 @@ pub(super) fn family_accepts(family: OperationFamily, operation: &ProductOperati
         OperationFamily::Transaction => {
             matches!(operation, ProductOperation::TransactionStatus { .. })
         }
+        OperationFamily::Security => matches!(
+            operation,
+            ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+                | ProductOperation::SecurityApiKeyIssueStart { .. }
+                | ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+                | ProductOperation::SecurityApiKeyIssueActivate { .. }
+                | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+                | ProductOperation::SecurityApiKeyRotateStart { .. }
+                | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+                | ProductOperation::SecurityApiKeyRotateActivate { .. }
+                | ProductOperation::SecurityApiKeyIssueSelfAbort { .. }
+                | ProductOperation::SecurityApiKeyIssueAbort { .. }
+                | ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+                | ProductOperation::SecurityApiKeyRotateAbort { .. }
+                | ProductOperation::SecurityApiKeyRevokeSelf { .. }
+                | ProductOperation::SecurityApiKeyRevoke { .. }
+                | ProductOperation::SecurityLegacyBearerRevoke
+        ),
     }
 }
 
@@ -1211,7 +1591,7 @@ fn product_client_for_request(
         NativeHttpV2SessionMode::Unmanaged { .. } => {
             open_unmanaged_product_client(state, &authentication.principal, metadata).map(Arc::new)
         }
-        NativeHttpV2SessionMode::Managed => {
+        NativeHttpV2SessionMode::Managed { .. } => {
             Err(NativeApiError::code(ProductErrorCode::Internal, metadata))
         }
     }
@@ -1289,7 +1669,7 @@ pub(super) fn lookup_session(
             NativeHttpV2SessionMode::Unmanaged { .. } => {
                 NativeApiError::code(ProductErrorCode::SqlInvalidValue, metadata)
             }
-            NativeHttpV2SessionMode::Managed => NativeApiError::unauthorized(metadata),
+            NativeHttpV2SessionMode::Managed { .. } => NativeApiError::unauthorized(metadata),
         });
     };
     if &entry.session.principal != principal {
@@ -1297,7 +1677,7 @@ pub(super) fn lookup_session(
             NativeHttpV2SessionMode::Unmanaged { .. } => {
                 NativeApiError::code(ProductErrorCode::AuthorizationDenied, metadata)
             }
-            NativeHttpV2SessionMode::Managed => NativeApiError::unauthorized(metadata),
+            NativeHttpV2SessionMode::Managed { .. } => NativeApiError::unauthorized(metadata),
         });
     }
     entry.expires_at = Instant::now() + HTTP_SESSION_IDLE_TIMEOUT;
@@ -1530,6 +1910,13 @@ fn is_canonical_api_key(candidate: &[u8]) -> bool {
 fn managed_credential_fingerprint(candidate: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hyphae-native-http-v2-managed-credential-v1\0");
+    hasher.update(candidate);
+    *hasher.finalize().as_bytes()
+}
+
+fn legacy_credential_fingerprint(candidate: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-native-http-v2-legacy-credential-v1\0");
     hasher.update(candidate);
     *hasher.finalize().as_bytes()
 }

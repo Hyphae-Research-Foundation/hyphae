@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Structured document format v1
 
 Status: normative for the Hyphae `0.1.0` engine facade.

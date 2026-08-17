@@ -218,6 +218,14 @@
       "rationale": "Operating-system bindings used by CPU detection, entropy, Tokio, Mio, interprocess, socket, signal, and error primitives."
     },
     {
+      "name": "linux-raw-sys",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "Linux platform binding primitive",
+      "rationale": "Target-conditioned Linux constants used transitively by rustix for reviewed filesystem and terminal operations."
+    },
+    {
       "name": "log",
       "version": "0.4.33",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -296,6 +304,22 @@
       "license": "MIT OR Apache-2.0",
       "category": "build primitive",
       "rationale": "Compiler-version detection used by crc32c at build time."
+    },
+    {
+      "name": "rustix",
+      "version": "1.1.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "operating-system filesystem primitive",
+      "rationale": "Safe target-conditioned filesystem and terminal adapters used by fs4, same-file, and the CLI closure."
+    },
+    {
+      "name": "same-file",
+      "version": "1.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Unlicense/MIT",
+      "category": "filesystem identity primitive",
+      "rationale": "Cross-platform same-file identity checks used by the native runtime and CLI without supplying storage semantics."
     },
     {
       "name": "semver",
@@ -496,6 +520,14 @@
       "license": "MIT/Apache-2.0",
       "category": "Windows target binding primitive",
       "rationale": "Target-conditioned i686 GNU import libraries selected transitively by winapi; they supply no product semantics."
+    },
+    {
+      "name": "winapi-util",
+      "version": "0.1.11",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Unlicense OR MIT",
+      "category": "Windows filesystem identity primitive",
+      "rationale": "Target-conditioned Windows handle helpers used transitively by same-file for file identity checks."
     },
     {
       "name": "winapi-x86_64-pc-windows-gnu",

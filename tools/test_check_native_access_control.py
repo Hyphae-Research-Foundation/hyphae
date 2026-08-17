@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the Native access-control v1 design contract checker."""
 
 from __future__ import annotations
@@ -57,13 +57,13 @@ def role(contract: dict, role_id: str) -> dict:
 
 
 class NativeAccessControlContractTests(unittest.TestCase):
-    def test_checked_in_contract_is_complete_and_honestly_pending(self) -> None:
+    def test_checked_in_contract_is_complete_and_current(self) -> None:
         result = validate(payload(), SOURCE)
-        self.assertEqual(result["status"], "contract-complete-implementation-pending")
+        self.assertEqual(result["status"], "passed")
         self.assertEqual(result["permissions"], 18)
         self.assertEqual(result["built_in_roles"], 7)
-        self.assertEqual(result["current_product_variants"], 53)
-        self.assertEqual(result["planned_operations"], 4)
+        self.assertEqual(result["current_product_variants"], 69)
+        self.assertEqual(result["planned_operations"], 2)
 
     def test_backup_verify_remains_planned_and_instance_scoped(self) -> None:
         contract = payload()
@@ -225,6 +225,60 @@ class NativeAccessControlContractTests(unittest.TestCase):
         with self.assertRaisesRegex(AccessControlValidationError, "ExecuteSql must distinguish"):
             validate(contract, SOURCE)
 
+    def test_sql_scope_policy_requires_binding_reuse_and_split_explain_authority(self) -> None:
+        for field, value in (
+            ("sql_authorization", "parsed-bound-object-set"),
+            ("sql_binding_reuse", "rebind-before-execution"),
+            ("sql_dml_dependencies", "target-only"),
+            ("sql_explain_authorization", "instance"),
+        ):
+            with self.subTest(field=field):
+                contract = payload()
+                contract["scope_policy"][field] = value
+                with self.assertRaisesRegex(
+                    AccessControlValidationError, "binder-owned SQL authorization"
+                ):
+                    validate(contract, SOURCE)
+
+    def test_sql_explain_and_staging_scope_resolvers_are_fail_closed(self) -> None:
+        for operation_id, scope, message in (
+            (
+                "admin.explain_sql",
+                "instance",
+                "AdminExplainSql must split instance observe",
+            ),
+            (
+                "transaction.stage_sql",
+                "transaction_union",
+                "TransactionStageSql must retain",
+            ),
+        ):
+            with self.subTest(operation=operation_id):
+                contract = payload()
+                operation(contract, operation_id)["scope_resolution"] = scope
+                with self.assertRaisesRegex(AccessControlValidationError, message):
+                    validate(contract, SOURCE)
+
+    def test_default_scalar_scope_requires_the_durable_binding_resolver(self) -> None:
+        for operation_id in ("structure.get", "structure.set", "structure.ttl"):
+            with self.subTest(operation=operation_id):
+                contract = payload()
+                operation(contract, operation_id)["scope_resolution"] = "instance"
+                with self.assertRaisesRegex(
+                    AccessControlValidationError, "durable default scalar keyspace"
+                ):
+                    validate(contract, SOURCE)
+
+    def test_default_scalar_binding_policy_cannot_be_weakened(self) -> None:
+        for field in ("default_scalar_authorization", "default_scalar_binding"):
+            with self.subTest(field=field):
+                contract = payload()
+                contract["scope_policy"][field] = "instance"
+                with self.assertRaisesRegex(
+                    AccessControlValidationError, "durable default scalar binding"
+                ):
+                    validate(contract, SOURCE)
+
     def test_key_grammar_rejects_ambiguous_or_weaker_formats(self) -> None:
         for field, value in (
             ("secret_bits", 128),
@@ -253,6 +307,24 @@ class NativeAccessControlContractTests(unittest.TestCase):
                 contract = payload()
                 contract["authorization_policy"][field] = value
                 with self.assertRaisesRegex(AccessControlValidationError, "authorization policy"):
+                    validate(contract, SOURCE)
+
+    def test_legacy_verifier_must_be_durable_keyed_and_downgrade_safe(self) -> None:
+        for field, value in (
+            ("catalog_format", "HYACAT04"),
+            ("bearer_verifier_persisted", False),
+            ("bearer_verifier", "bare-digest"),
+            ("bearer_verifier_key", "process-local"),
+            ("offline_bare_digest_authentication", True),
+            ("enabled_state_requires_verifier", False),
+            ("older_format_enabled_state", "accept"),
+        ):
+            with self.subTest(field=field):
+                contract = copy.deepcopy(payload())
+                contract["migration_policy"][field] = value
+                with self.assertRaisesRegex(
+                    AccessControlValidationError, "legacy bearer migration"
+                ):
                     validate(contract, SOURCE)
 
     def test_recovery_cannot_bypass_integrity_or_keep_owner_keys(self) -> None:

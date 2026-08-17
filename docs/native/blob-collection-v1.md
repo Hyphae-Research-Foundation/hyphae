@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native immutable-blob collection v1
 
 Status: normative contract; single-retained-root implementation, deterministic

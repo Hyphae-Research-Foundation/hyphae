@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +9,7 @@ use hyphae_native_protocol::{
     decode_welcome, encode_authenticated_hello, encode_cancel, encode_hello,
     encode_product_request_for_minor, encode_window_update,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
@@ -29,6 +29,7 @@ pub struct LocalTransport {
     api_key: Option<LocalApiKey>,
     state: Mutex<Option<Connection>>,
     next_request_id: AtomicU64,
+    pending_slots: Semaphore,
 }
 
 struct LocalApiKey {
@@ -91,6 +92,7 @@ impl LocalTransport {
             api_key: None,
             state: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
+            pending_slots: Semaphore::new(64),
         })
     }
 
@@ -112,7 +114,22 @@ impl LocalTransport {
         Ok(self)
     }
 
-    async fn connect(&self, handshake_id: u64) -> Result<Connection, ClientError> {
+    /// Sets the finite number of active plus queued local operations.
+    pub fn maximum_pending(mut self, maximum: usize) -> Result<Self, ClientError> {
+        if maximum == 0 || maximum > 4096 {
+            return Err(ClientError::Local(
+                "local pending request bound is invalid".to_owned(),
+            ));
+        }
+        self.pending_slots = Semaphore::new(maximum);
+        Ok(self)
+    }
+
+    async fn connect(
+        &self,
+        handshake_id: u64,
+        terminal_request: Option<(u32, u64, &[u8])>,
+    ) -> Result<Connection, ClientError> {
         use interprocess::local_socket::tokio::prelude::*;
 
         #[cfg(unix)]
@@ -155,6 +172,18 @@ impl LocalTransport {
             .await;
         hello_payload.fill(0);
         sent.map_err(|error| ClientError::Local(error.to_string()))?;
+        if let Some((stream_id, request_id, encoded)) = terminal_request {
+            codec
+                .send(
+                    &mut &stream,
+                    FrameKind::Execute,
+                    stream_id,
+                    request_id,
+                    encoded,
+                )
+                .await
+                .map_err(|error| ClientError::Local(error.to_string()))?;
+        }
         let welcome = codec
             .receive(&mut &stream)
             .await
@@ -222,10 +251,84 @@ impl LocalTransport {
                 request_id,
             ));
         }
-        let mut state = self.state.lock().await;
+        let pending_slot = tokio::select! {
+            result = self.pending_slots.acquire() => result.map_err(|_| {
+                ClientError::Local("local pending request queue is closed".to_owned())
+            })?,
+            () = options.cancellation.cancelled() => {
+                return Err(product_error(
+                    hyphae_native_product::ProductErrorCode::Cancelled,
+                    request_id,
+                ));
+            }
+            () = wait_deadline(options.deadline_micros) => {
+                return Err(product_error(
+                    hyphae_native_product::ProductErrorCode::DeadlineExceeded,
+                    request_id,
+                ));
+            }
+        };
+        let one_time_start = matches!(
+            operation,
+            ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+                | ProductOperation::SecurityApiKeyIssueStart { .. }
+                | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+                | ProductOperation::SecurityApiKeyRotateStart { .. }
+        );
+        let mut state = tokio::select! {
+            state = self.state.lock() => state,
+            () = options.cancellation.cancelled() => {
+                return Err(product_error(
+                    hyphae_native_product::ProductErrorCode::Cancelled,
+                    request_id,
+                ));
+            }
+            () = wait_deadline(options.deadline_micros) => {
+                return Err(product_error(
+                    hyphae_native_product::ProductErrorCode::DeadlineExceeded,
+                    request_id,
+                ));
+            }
+        };
+        drop(pending_slot);
+        if one_time_start {
+            *state = None;
+        }
+        let terminal_replay = state.is_none()
+            && matches!(
+                operation,
+                ProductOperation::SecurityApiKeyRevokeSelf { .. }
+                    | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+            );
+        let terminal_encoded = if terminal_replay {
+            Some(
+                encode_product_request_for_minor(
+                    &hyphae_native_protocol::WireRequest {
+                        operation: operation.clone(),
+                        logical_time_micros: options.logical_time_micros,
+                        deadline_micros: options.deadline_micros,
+                        idempotency_token: options.idempotency_token,
+                        limits: options.limits,
+                        durability: options.durability,
+                    },
+                    hyphae_native_protocol::PROTOCOL_MINOR,
+                )
+                .map_err(|error| ClientError::Protocol(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         if state.is_none() {
             let handshake_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            *state = Some(self.connect(handshake_id.max(1)).await?);
+            *state = Some(
+                self.connect(
+                    handshake_id.max(1),
+                    terminal_encoded
+                        .as_deref()
+                        .map(|encoded| (1, request_id, encoded)),
+                )
+                .await?,
+            );
         }
         let connection = state.as_mut().ok_or_else(|| {
             ClientError::Local("local connection state is unavailable".to_owned())
@@ -249,17 +352,19 @@ impl LocalTransport {
             .filter(|value| *value != 0)
             .unwrap_or(1);
         let kind = operation_frame_kind(&encoded)?;
-        connection
-            .codec
-            .send(
-                &mut &connection.stream,
-                kind,
-                stream_id,
-                request_id,
-                &encoded,
-            )
-            .await
-            .map_err(|error| ClientError::Local(error.to_string()))?;
+        if !terminal_replay {
+            connection
+                .codec
+                .send(
+                    &mut &connection.stream,
+                    kind,
+                    stream_id,
+                    request_id,
+                    &encoded,
+                )
+                .await
+                .map_err(|error| ClientError::Local(error.to_string()))?;
+        }
 
         let maximum = options
             .limits
@@ -364,10 +469,18 @@ impl LocalTransport {
                                 .map_err(|error| ClientError::Protocol(error.to_string()))?,
                         )
                         .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                    return decode_product_response_for_minor(&bytes, connection.negotiated_minor)
-                        .map_err(|error| ClientError::Protocol(error.to_string()));
+                    let decoded =
+                        decode_product_response_for_minor(&bytes, connection.negotiated_minor)
+                            .map_err(|error| ClientError::Protocol(error.to_string()));
+                    if one_time_start {
+                        *state = None;
+                    }
+                    return decoded;
                 }
                 FrameKind::Failure => {
+                    if one_time_start {
+                        *state = None;
+                    }
                     return Err(Box::new(
                         decode_failure(&frame.payload)
                             .map_err(|error| ClientError::Protocol(error.to_string()))?,

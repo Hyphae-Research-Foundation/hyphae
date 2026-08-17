@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "$id": "https://hyphae.dev/schema/native-g6-transcript-v1",
   "type": "object",
   "additionalProperties": false,

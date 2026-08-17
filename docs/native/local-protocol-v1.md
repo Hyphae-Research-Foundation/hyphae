@@ -1,4 +1,24 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
+
+Protocol minor 3 adds request tag `54` (`CatalogVisibleList`) and response tag
+`42` (`CatalogVisiblePage`). Minor 0-2 retain the exact historical
+`CatalogList` tag `15` and `CatalogPage` tag `13` layout; minor 2 rejects the
+new variants before dispatch. The new cursor field is length-framed opaque
+bytes only. Python exposes `bytes`, TypeScript exposes `Uint8Array`, and Rust
+exposes `CatalogVisibleCursor` without snapshot or position accessors.
+
+Minor 3 also reserves request tags `55` through `68` for the separated
+`SecurityApiKey{Issue,Rotate}{Self,}{Start,Activate,Abort}` and
+`SecurityApiKeyRevoke{Self,}` variants. Response tag `43` is the one-time
+`SecurityApiKeyStarted` delivery; tag `44` is the redacted activation receipt.
+Every lifecycle request is path-free, strict, managed-authority, and requires a
+nonzero idempotency token. A repeated Start never re-encodes its secret and
+fails with `secret_delivery_consumed`; a token reused with another payload
+fails with `idempotency_conflict`. Start commits an inactive verifier, Activate
+requires the exact confirmation digest derived from the delivered secret, and
+disconnecting before Activate leaves the key inactive and unauthenticatable.
+These variants are never accepted inside `Prove` and are absent from MCP.
 
 Status: implemented normative contract; G6 cross-surface and cross-platform
 receipts are closed for the bounded product profile
@@ -63,6 +83,15 @@ rejects a legacy payload, an unrequired capability, unknown authentication
 kinds, non-canonical lengths, invalid UTF-8, truncation and trailing bytes.
 Credential syntax and verifier failures are intentionally left to the sole
 product authority so they remain indistinguishable as authorization denial.
+
+A managed daemon sends `WELCOME` immediately for current authority. When
+normal authentication fails, it retains only opaque pending terminal state and
+waits for one bounded request frame before replying. It sends `WELCOME` only if
+that frame is an exact durable self-revoke or zero-overlap self-rotation
+activation replay, then executes that already supplied frame. Unknown keys,
+nonterminal operations, malformed frames, and any token, target, digest, or
+marker mismatch receive the same handshake `authorization_denied`; no terminal
+session or revoked-key oracle is exposed.
 
 The raw credential is ephemeral transport material. It is never part of the
 public `Hello` value, client identity, diagnostics or `Debug` output. Decoded

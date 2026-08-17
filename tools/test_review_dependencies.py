@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import json
@@ -7,7 +7,10 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 from tools.review_dependencies import (
+    ROOT,
     CARGO_MANIFESTS,
+    NPM_PROJECTS,
+    PYTHON_BUILD_EVIDENCE,
     REGISTERED_DEPENDENCY_FILES,
     cargo_dependencies,
     changed_dependency_files,
@@ -19,6 +22,7 @@ from tools.review_dependencies import (
     resolve_commit,
     review,
     validate_manifest_lock_pairs,
+    validate_dependency_license_boundaries,
     validate_registered_dependency_files,
 )
 
@@ -43,11 +47,30 @@ class DependencyReviewTests(unittest.TestCase):
                     "version": "2.0.0",
                     "resolved": "https://example.invalid/demo.tgz",
                     "integrity": "sha512-example",
+                    "license": "MIT",
                 },
             }
         }
         parsed = npm_dependencies(json.dumps(lock))
         self.assertIn("@scope/demo@2.0.0|node_modules/@scope/demo", parsed)
+
+    def test_npm_dependency_requires_integrity_and_license_evidence(self) -> None:
+        base = {
+            "packages": {
+                "node_modules/demo": {
+                    "version": "1.0.0",
+                    "resolved": "https://example.invalid/demo.tgz",
+                    "integrity": "sha512-example",
+                    "license": "MIT",
+                }
+            }
+        }
+        for field in ("integrity", "license"):
+            with self.subTest(field=field):
+                value = json.loads(json.dumps(base))
+                del value["packages"]["node_modules/demo"][field]
+                with self.assertRaisesRegex(ValueError, field):
+                    npm_dependencies(json.dumps(value))
 
     def test_python_dependencies_include_runtime_optional_and_build(self) -> None:
         parsed = python_dependencies(
@@ -56,6 +79,7 @@ class DependencyReviewTests(unittest.TestCase):
             '[build-system]\nrequires = ["three"]\n'
         )
         self.assertEqual(len(parsed), 3)
+        self.assertIn(PYTHON_BUILD_EVIDENCE, REGISTERED_DEPENDENCY_FILES)
 
     def test_diff_reports_added_removed_and_metadata_changes(self) -> None:
         result = dependency_diff(
@@ -135,6 +159,10 @@ class DependencyReviewTests(unittest.TestCase):
             "conformance/g7/runners/rust/Cargo.lock",
         ):
             self.assertIn(lock, REGISTERED_DEPENDENCY_FILES)
+        self.assertEqual(
+            NPM_PROJECTS["conformance/mcp/hosts/package.json"],
+            "conformance/mcp/hosts/package-lock.json",
+        )
 
     @patch("tools.review_dependencies.validate_cargo_lock")
     def test_g7_runner_manifest_checks_its_isolated_lock(self, check_lock) -> None:
@@ -219,6 +247,7 @@ class DependencyReviewTests(unittest.TestCase):
             resolve_commit("HEAD", "head")
 
     @patch("tools.review_dependencies.read_revision")
+    @patch("tools.review_dependencies.validate_dependency_license_boundaries")
     @patch("tools.review_dependencies.validate_manifest_lock_pairs")
     @patch("tools.review_dependencies.changed_dependency_files", return_value=set())
     @patch("tools.review_dependencies.merge_base", return_value=MERGE_BASE)
@@ -229,6 +258,7 @@ class DependencyReviewTests(unittest.TestCase):
         find_merge_base,
         changed,
         validate_pairs,
+        validate_boundaries,
         read_object,
     ) -> None:
         resolve.side_effect = lambda revision, _label: revision
@@ -254,6 +284,7 @@ class DependencyReviewTests(unittest.TestCase):
         find_merge_base.assert_called_once_with(BASE, HEAD)
         changed.assert_called_once_with(MERGE_BASE, HEAD)
         validate_pairs.assert_called_once_with(set(), HEAD)
+        validate_boundaries.assert_called_once_with(HEAD)
         expected_reads = []
         for path in (
             "Cargo.lock",
@@ -263,10 +294,52 @@ class DependencyReviewTests(unittest.TestCase):
             "sdks/typescript/package-lock.json",
             "integrations/javascript/package-lock.json",
             "integrations/host-smoke/package-lock.json",
+            "conformance/mcp/hosts/package-lock.json",
             "sdks/python/pyproject.toml",
         ):
             expected_reads.extend((call(MERGE_BASE, path), call(HEAD, path)))
         self.assertEqual(read_object.call_args_list, expected_reads)
+
+    @patch("tools.review_dependencies.read_revision")
+    def test_proprietary_claude_and_lgpl_libvips_are_explicit_tooling_boundaries(
+        self, read_object
+    ) -> None:
+        packages = {
+            "": {"name": "fixture", "version": "1.0.0", "license": "Apache-2.0"},
+            **{
+                f"node_modules/@anthropic-ai/claude-code-{index}": {
+                    "name": "@anthropic-ai/claude-code",
+                    "version": f"2.1.233-{index}",
+                    "resolved": f"https://example.invalid/claude-{index}.tgz",
+                    "integrity": "sha512-example",
+                    "license": (
+                        "SEE LICENSE IN README.md"
+                        if index == 0
+                        else "SEE LICENSE IN LICENSE.md"
+                    ),
+                }
+                for index in range(9)
+            },
+            "node_modules/@img/sharp-libvips-linux-x64": {
+                "version": "1.3.2",
+                "resolved": "https://example.invalid/libvips.tgz",
+                "integrity": "sha512-example",
+                "license": "LGPL-3.0-or-later",
+            },
+        }
+
+        def content(_revision: str, path: str) -> str:
+            if path == "sdks/python/pyproject.toml":
+                return '[build-system]\nrequires = ["setuptools==80.9.0"]\n[project]\ndependencies = []\n'
+            if path == PYTHON_BUILD_EVIDENCE:
+                return (ROOT / PYTHON_BUILD_EVIDENCE).read_text(encoding="utf-8")
+            return json.dumps({"packages": packages if "mcp/hosts" in path else {}})
+
+        read_object.side_effect = content
+        validate_dependency_license_boundaries(HEAD)
+        packages["node_modules/@img/sharp-libvips-linux-x64"]["license"] = "MIT"
+        with self.assertRaisesRegex(ValueError, "LGPL"):
+            validate_dependency_license_boundaries(HEAD)
 
 
 if __name__ == "__main__":

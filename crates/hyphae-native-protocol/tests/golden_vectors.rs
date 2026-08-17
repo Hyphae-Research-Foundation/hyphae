@@ -1,10 +1,12 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Shared protocol golden vectors and strict completion controls.
 
 use hyphae_native_product::{
-    AccessControlMutationReceipt, AccessControlStatus, ApiKeyId, AuthorizationEpoch, BackupRequest,
-    BuiltInRole, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRequest, ObjectId,
+    AccessControlMutationReceipt, AccessControlStatus, ApiKeyConfirmationDigest, ApiKeyId,
+    ApiKeySecretDelivery, ApiKeyStartReceipt, AuthorizationEpoch, BackupRequest, BuiltInRole,
+    CatalogListRequest, CatalogVisibleCursor, CatalogVisibleListFilter, CatalogVisibleListRequest,
+    CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRequest, ObjectId,
     ProductAuthorization, ProductCommitReceipt, ProductDocValue, ProductDocument,
     ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCode,
     ProductExplicitTransactionStatus, ProductLimits, ProductOperation, ProductPermission,
@@ -58,7 +60,7 @@ fn shared_frame_and_handshake_vectors_are_stable() -> Result<(), Box<dyn std::er
     assert_eq!(decode_welcome(&encoded)?, welcome);
     assert_eq!(
         blake3::hash(&encoded).to_hex().as_str(),
-        "1aad5efb68acd602463954756eb2d56cc8c07bba1e48970e4d74f31b0918c310"
+        "3ba7485426d52f643523edc48a239dc78e1b2e5f7502070059171f8777178b21"
     );
     Ok(())
 }
@@ -386,7 +388,7 @@ fn security_read_plane_rejects_truncation_trailing_unknown_and_invalid_cursors()
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&54_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&69_u16.to_le_bytes());
     assert!(matches!(
         decode_product_request(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -503,7 +505,7 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&42_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&45_u16.to_le_bytes());
     assert!(matches!(
         decode_product_response(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -673,6 +675,26 @@ fn security_write_plane_responses_use_minor_two_append_only_tags_and_redacted_go
 }
 
 #[test]
+fn api_key_start_wire_size_matches_product_preflight_bound()
+-> Result<(), Box<dyn std::error::Error>> {
+    let credential = format!("hyp1_{}_{}", "1".repeat(32), "a".repeat(64));
+    let key_id = "11111111111111111111111111111111".parse()?;
+    let response = ProductResponse::SecurityApiKeyStarted(ApiKeyStartReceipt {
+        key_id,
+        principal_id: SecurityId::new(1).ok_or("nonzero principal")?,
+        predecessor_key_id: Some(key_id),
+        authorization_epoch: AuthorizationEpoch::new(7),
+        commit: security_commit_receipt()?,
+        secret: ApiKeySecretDelivery::from_bytes(credential.as_bytes())?,
+    });
+    assert_eq!(
+        encode_product_response(&response)?.len(),
+        ApiKeyStartReceipt::wire_size_bound()
+    );
+    Ok(())
+}
+
+#[test]
 fn security_write_plane_requires_minor_two_and_nonzero_context_idempotency()
 -> Result<(), Box<dyn std::error::Error>> {
     let operation = ProductOperation::SecurityPrincipalCreate {
@@ -766,7 +788,7 @@ fn security_write_plane_rejects_noncanonical_bodies() -> Result<(), Box<dyn std:
         Err(ProductCodecError::Malformed)
     ));
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&54_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&69_u16.to_le_bytes());
     assert!(matches!(
         decode_product_request(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -803,7 +825,7 @@ fn security_write_plane_responses_reject_truncation_trailing_unknown_and_zero_fi
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&42_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&45_u16.to_le_bytes());
     assert!(matches!(
         decode_product_response(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -859,7 +881,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 }
 
 #[test]
-fn protocol_minor_negotiation_preserves_1_0_and_1_1_and_selects_1_2()
+fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -870,6 +892,21 @@ fn protocol_minor_negotiation_preserves_1_0_and_1_1_and_selects_1_2()
         ..Hello::default()
     };
     let current = Hello::default();
+    let minor_two = Hello {
+        maximum_minor: 2,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_two,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        2
+    );
     assert_eq!(
         negotiate(
             &legacy,
@@ -901,12 +938,12 @@ fn protocol_minor_negotiation_preserves_1_0_and_1_1_and_selects_1_2()
             1
         )?
         .minor,
-        2
+        3
     );
 
     let incompatible = Hello {
-        minimum_minor: 3,
-        maximum_minor: 3,
+        minimum_minor: 4,
+        maximum_minor: 4,
         ..Hello::default()
     };
     assert_eq!(
@@ -919,6 +956,112 @@ fn protocol_minor_negotiation_preserves_1_0_and_1_1_and_selects_1_2()
         )
         .err(),
         Some(HandshakeError::IncompatibleVersion)
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_visible_list_uses_minor_three_append_only_tags_and_opaque_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cursor = CatalogVisibleCursor::new(vec![7; 184])?;
+    let request = WireRequest {
+        operation: ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+            filter: CatalogVisibleListFilter {
+                parent: Some(ObjectId::new(11)?),
+                kind: None,
+            },
+            cursor: Some(cursor.clone()),
+            item_limit: 2,
+            visit_limit: 3,
+            byte_limit: 4096,
+        }),
+        logical_time_micros: 0,
+        deadline_micros: None,
+        idempotency_token: None,
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::STRICT,
+    };
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 2),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 3)?;
+    assert_eq!(u16::from_le_bytes(encoded[12..14].try_into()?), 54);
+    let decoded = decode_product_request_for_minor(&encoded, 3)?;
+    let ProductOperation::CatalogVisibleList(decoded) = decoded.operation else {
+        return Err("wrong visible catalog request variant".into());
+    };
+    assert_eq!(decoded.cursor, Some(cursor));
+
+    let response = ProductResponse::CatalogVisiblePage(CatalogVisiblePage {
+        items: Vec::new(),
+        cursor: decoded.cursor,
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 2),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&response, 3)?;
+    assert_eq!(u16::from_le_bytes(encoded[12..14].try_into()?), 42);
+    assert_eq!(decode_product_response_for_minor(&encoded, 3)?, response);
+    Ok(())
+}
+
+#[test]
+fn api_key_lifecycle_uses_minor_three_append_only_tags_without_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let key_id = ApiKeyId::from_bytes([7; 16]).ok_or("zero key id")?;
+    let request = WireRequest {
+        operation: ProductOperation::SecurityApiKeyIssueSelfActivate {
+            key_id,
+            confirmation_digest: ApiKeyConfirmationDigest::from_bytes([9; 32]),
+        },
+        logical_time_micros: 0,
+        deadline_micros: None,
+        idempotency_token: Some(1),
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::STRICT,
+    };
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 2),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 3)?;
+    assert_eq!(u16::from_le_bytes(encoded[12..14].try_into()?), 57);
+    assert!(!encoded.windows(4).any(|window| window == b"path"));
+    let decoded = decode_product_request_for_minor(&encoded, 3)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SecurityApiKeyIssueSelfActivate { key_id: decoded, .. } if decoded == key_id
+    ));
+    Ok(())
+}
+
+#[test]
+fn catalog_list_minor_zero_through_two_is_byte_identical() -> Result<(), Box<dyn std::error::Error>>
+{
+    let request = WireRequest {
+        operation: ProductOperation::CatalogList(CatalogListRequest {
+            parent: Some(ObjectId::new(11)?),
+            kind: None,
+            cursor: None,
+            item_limit: 2,
+            visit_limit: 3,
+            byte_limit: 4_096,
+        }),
+        logical_time_micros: 0,
+        deadline_micros: None,
+        idempotency_token: None,
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::STRICT,
+    };
+    let minor_zero = encode_product_request_for_minor(&request, 0)?;
+    assert_eq!(minor_zero, encode_product_request_for_minor(&request, 1)?);
+    assert_eq!(minor_zero, encode_product_request_for_minor(&request, 2)?);
+    assert_eq!(u16::from_le_bytes(minor_zero[12..14].try_into()?), 15);
+    assert_eq!(
+        blake3::hash(&minor_zero).to_hex().as_str(),
+        "d2fb175427b7c9b6b28f2444b6494d72f736efffb90c56c35d79e3f30ca5561b"
     );
     Ok(())
 }

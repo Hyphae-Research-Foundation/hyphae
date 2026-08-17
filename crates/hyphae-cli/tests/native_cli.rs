@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Black-box conformance for the native-authority single binary.
 
@@ -16,14 +16,14 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use hyphae_client::v2::{ClientError, HttpTransport, HyphaeClient, RequestOptions};
+#[cfg(unix)]
+use hyphae_native_product::ProductResponse;
 use hyphae_native_product::proof::{
     AdmittedProofLimits, CanonicalBytes, CompletionStatus, NativeProof, NativeProofAnchor,
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
     bundle_native_witness, encode_native_proof,
 };
-use hyphae_native_product::{BuiltInRole, NativeProduct};
-#[cfg(unix)]
-use hyphae_native_product::{ProductErrorCode, ProductResponse};
+use hyphae_native_product::{BuiltInRole, NativeProduct, ProductErrorCode};
 use hyphae_storage::{SnapshotReadLimits, load_snapshot};
 use uuid::Uuid;
 
@@ -173,6 +173,650 @@ impl SecurityWriteFixture {
         )?;
         Ok(fs::read_to_string(destination)?)
     }
+}
+
+#[test]
+fn cli_api_key_issue_writes_restricted_file_before_activation() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let principal = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "CLI key target",
+        "--idempotency-token",
+        "901",
+    ])?;
+    let principal_id = principal["result_id"].as_str().ok_or("missing principal")?;
+    fixture.owner(&[
+        "assignment",
+        "create-built-in",
+        "--principal-id",
+        principal_id,
+        "--role",
+        "reader",
+        "--scope",
+        "instance",
+        "--idempotency-token",
+        "902",
+    ])?;
+    let destination = fixture.temporary.0.join("cli-issued.key");
+    let receipt = fixture.owner(&[
+        "key",
+        "issue",
+        "--principal-id",
+        principal_id,
+        "--label",
+        "cli-issued",
+        "--role",
+        "reader",
+        "--permission",
+        "catalog.read",
+        "--permission",
+        "credential.self_manage",
+        "--permission",
+        "data.read",
+        "--permission",
+        "discover",
+        "--permission",
+        "proof.generate",
+        "--permission",
+        "proof.verify",
+        "--permission",
+        "search.execute",
+        "--scope",
+        "instance",
+        "--key-out",
+        &path(&destination),
+        "--idempotency-token",
+        "903",
+    ])?;
+    assert_eq!(receipt["operation"], "security.key_issue");
+    let secret = fs::read_to_string(&destination)?;
+    assert!(secret.starts_with("hyp1_"));
+    assert!(!receipt.to_string().contains(&secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&destination)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_key_issue_reserves_output_before_start_and_cleans_failed_start() -> Result<(), Box<dyn Error>>
+{
+    let fixture = SecurityWriteFixture::create()?;
+    let before = NativeProduct::open(&fixture.data)?.access_control_status()?;
+    let existing = fixture.temporary.0.join("existing-key-out");
+    fs::write(&existing, b"existing-canary")?;
+    let denied = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "key",
+            "issue",
+            "--principal-id",
+            "00000000000000000000000000000001",
+            "--label",
+            "existing-output",
+            "--role",
+            "reader",
+            "--permission",
+            "data.read",
+            "--scope",
+            "instance",
+            "--key-out",
+            &path(&existing),
+            "--idempotency-token",
+            "904",
+        ],
+    )?;
+    assert!(!denied.status.success());
+    assert_eq!(fs::read(&existing)?, b"existing-canary");
+    assert_eq!(
+        NativeProduct::open(&fixture.data)?.access_control_status()?,
+        before
+    );
+
+    let reserved = fixture.temporary.0.join("failed-start.key");
+    let failed = security_output(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "key",
+            "issue",
+            "--principal-id",
+            "00000000000000000000000000000001",
+            "--label",
+            "failed-start",
+            "--role",
+            "reader",
+            "--permission",
+            "data.read",
+            "--scope",
+            "instance",
+            "--key-out",
+            &path(&reserved),
+            "--idempotency-token",
+            "905",
+        ],
+    )?;
+    assert!(!failed.status.success());
+    assert!(!reserved.exists());
+    assert_eq!(
+        NativeProduct::open(&fixture.data)?.access_control_status()?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_self_revoke_exact_replay_accepts_the_revoked_request_identity() -> Result<(), Box<dyn Error>>
+{
+    let fixture = SecurityWriteFixture::create()?;
+    let key_id = NativeProduct::open(&fixture.data)?
+        .authenticate_api_key(&fixture.owner_secret, 0)?
+        .key_id()
+        .to_string();
+    let first = run_security(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "key",
+            "revoke",
+            "--key-id",
+            &key_id,
+            "--self-manage",
+            "--idempotency-token",
+            "906",
+        ],
+    )?;
+    let replay = run_security(
+        &fixture.data,
+        &fixture.owner_key,
+        &[
+            "key",
+            "revoke",
+            "--key-id",
+            &key_id,
+            "--self-manage",
+            "--idempotency-token",
+            "906",
+        ],
+    )?;
+    assert_eq!(replay, first);
+    Ok(())
+}
+
+#[test]
+fn explicit_upgrade_migrates_a_pre_binding_native_directory() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("old-native");
+    drop(hyphae_native_runtime::NativeDatabase::create(&data)?);
+    let before = output(&["capabilities", "--data-dir", &path(&data)])?;
+    assert!(!before.status.success());
+
+    let upgraded = run(&["upgrade", "--data-dir", &path(&data)])?;
+    assert_eq!(upgraded["status"], "upgraded");
+    assert_eq!(upgraded["default_scalar_keyspace_created"], true);
+    let capabilities = run(&["capabilities", "--data-dir", &path(&data)])?;
+    assert_eq!(capabilities["product_api_version"], 1);
+
+    Ok(())
+}
+
+fn owner_output(data: &Path, operation: &[&str]) -> Result<Output, Box<dyn Error>> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["security", "--data-dir"])
+        .arg(data)
+        .arg("owner")
+        .args(operation)
+        .output()?)
+}
+
+fn run_owner(data: &Path, operation: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = owner_output(data, operation)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr)).into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+#[test]
+fn offline_owner_recovery_is_pending_until_exact_resume() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let replacement = fixture.temporary.0.join("replacement.key");
+    let started = run_owner(
+        &fixture.data,
+        &[
+            "recover",
+            "--label",
+            "recovered-owner",
+            "--key-out",
+            &path(&replacement),
+        ],
+    )?;
+    let replacement_secret = fs::read_to_string(&replacement)?;
+    assert!(!started.to_string().contains(&replacement_secret));
+    assert_eq!(started["status"], "pending");
+
+    let inspected = run_owner(&fixture.data, &["inspect"])?;
+    assert_eq!(
+        inspected["pending"]["pending_key_id"],
+        started["pending_key_id"]
+    );
+    assert!(!inspected.to_string().contains(&replacement_secret));
+
+    let product = NativeProduct::open(&fixture.data)?;
+    assert!(
+        product
+            .authenticate_api_key(fixture.owner_secret.trim(), 0)
+            .is_ok()
+    );
+    let error = product
+        .authenticate_api_key(&replacement_secret, 0)
+        .err()
+        .ok_or("pending replacement authenticated")?;
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    drop(product);
+
+    let pending_key = started["pending_key_id"]
+        .as_str()
+        .ok_or("missing pending key")?;
+    let pending_epoch = started["authorization_epoch"]
+        .as_u64()
+        .ok_or("missing pending epoch")?
+        .to_string();
+    let resumed = run_owner(
+        &fixture.data,
+        &[
+            "resume",
+            "--pending-key-id",
+            pending_key,
+            "--key-file",
+            &path(&replacement),
+            "--expected-authorization-epoch",
+            &pending_epoch,
+        ],
+    )?;
+    assert_eq!(resumed["status"], "activated");
+    let replay = run_owner(
+        &fixture.data,
+        &[
+            "resume",
+            "--pending-key-id",
+            pending_key,
+            "--key-file",
+            &path(&replacement),
+            "--expected-authorization-epoch",
+            &pending_epoch,
+        ],
+    )?;
+    assert_eq!(replay, resumed);
+
+    let product = NativeProduct::open(&fixture.data)?;
+    assert!(product.authenticate_api_key(&replacement_secret, 0).is_ok());
+    let error = product
+        .authenticate_api_key(fixture.owner_secret.trim(), 0)
+        .err()
+        .ok_or("old owner remained valid")?;
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn offline_owner_recovery_rejects_bad_outputs_and_exact_abort_is_replayable()
+-> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let inside = fixture.data.join("inside.key");
+    assert!(
+        !owner_output(
+            &fixture.data,
+            &["recover", "--label", "inside", "--key-out", &path(&inside),],
+        )?
+        .status
+        .success()
+    );
+    assert!(!inside.exists());
+
+    let existing = fixture.temporary.0.join("existing.key");
+    fs::write(&existing, b"canary-existing")?;
+    assert!(
+        !owner_output(
+            &fixture.data,
+            &[
+                "recover",
+                "--label",
+                "existing",
+                "--key-out",
+                &path(&existing),
+            ],
+        )?
+        .status
+        .success()
+    );
+    assert_eq!(fs::read(&existing)?, b"canary-existing");
+
+    let replacement = fixture.temporary.0.join("pending.key");
+    let started = run_owner(
+        &fixture.data,
+        &[
+            "recover",
+            "--label",
+            "pending",
+            "--key-out",
+            &path(&replacement),
+        ],
+    )?;
+    let second = fixture.temporary.0.join("second.key");
+    let denied = owner_output(
+        &fixture.data,
+        &["recover", "--label", "second", "--key-out", &path(&second)],
+    )?;
+    assert!(!denied.status.success());
+    assert!(!second.exists());
+
+    let pending_key = started["pending_key_id"]
+        .as_str()
+        .ok_or("missing pending key")?;
+    let pending_epoch = started["authorization_epoch"]
+        .as_u64()
+        .ok_or("missing pending epoch")?
+        .to_string();
+    for bytes in [Vec::new(), b"hyp1_partial".to_vec(), vec![b'x'; 102]] {
+        let wrong = fixture
+            .temporary
+            .0
+            .join(format!("wrong-{}.key", bytes.len()));
+        fs::write(&wrong, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wrong, fs::Permissions::from_mode(0o600))?;
+        }
+        assert!(
+            !owner_output(
+                &fixture.data,
+                &[
+                    "resume",
+                    "--pending-key-id",
+                    pending_key,
+                    "--key-file",
+                    &path(&wrong),
+                    "--expected-authorization-epoch",
+                    &pending_epoch,
+                ],
+            )?
+            .status
+            .success()
+        );
+    }
+    let aborted = run_owner(
+        &fixture.data,
+        &[
+            "abort-pending",
+            "--pending-key-id",
+            pending_key,
+            "--expected-authorization-epoch",
+            &pending_epoch,
+        ],
+    )?;
+    let replay = run_owner(
+        &fixture.data,
+        &[
+            "abort-pending",
+            "--pending-key-id",
+            pending_key,
+            "--expected-authorization-epoch",
+            &pending_epoch,
+        ],
+    )?;
+    assert_eq!(aborted, replay);
+    let product = NativeProduct::open(&fixture.data)?;
+    assert!(
+        product
+            .authenticate_api_key(fixture.owner_secret.trim(), 0)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn offline_owner_recovery_reserves_key_output_before_phase_one() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let missing_parent = fixture.temporary.0.join("missing").join("owner.key");
+    let before = NativeProduct::open(&fixture.data)?.access_control_status()?;
+    let output = owner_output(
+        &fixture.data,
+        &[
+            "recover",
+            "--label",
+            "must-not-start",
+            "--key-out",
+            &path(&missing_parent),
+        ],
+    )?;
+    assert!(!output.status.success());
+    let product = NativeProduct::open(&fixture.data)?;
+    assert_eq!(product.access_control_status()?, before);
+    drop(product);
+
+    let conflict = fixture.temporary.0.join("reserved-conflict.key");
+    let mut reservation = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&conflict)?;
+    std::io::Write::write_all(&mut reservation, b"canary")?;
+    drop(reservation);
+    let output = owner_output(
+        &fixture.data,
+        &[
+            "recover",
+            "--label",
+            "must-not-race",
+            "--key-out",
+            &path(&conflict),
+        ],
+    )?;
+    assert!(!output.status.success());
+    assert_eq!(fs::read(conflict)?, b"canary");
+    assert_eq!(
+        NativeProduct::open(&fixture.data)?.access_control_status()?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn offline_owner_recovery_rejects_lock_contention() -> Result<(), Box<dyn Error>> {
+    let fixture = SecurityWriteFixture::create()?;
+    let product = NativeProduct::open(&fixture.data)?;
+    let output = owner_output(&fixture.data, &["inspect"])?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("data_directory_locked"));
+    drop(product);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_owner_recovery_rejects_symlink_directory_authority() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = SecurityWriteFixture::create()?;
+    let link = fixture.temporary.0.join("data-link");
+    symlink(&fixture.data, &link)?;
+    let output = owner_output(&link, &["inspect"])?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authorization_denied"));
+    Ok(())
+}
+
+#[test]
+fn offline_owner_recovery_recovers_after_phase_one_process_boundary() -> Result<(), Box<dyn Error>>
+{
+    let fixture = SecurityWriteFixture::create()?;
+    let replacement = fixture.temporary.0.join("phase-one.key");
+    let mut product = NativeProduct::open_offline_owner(&fixture.data)?;
+    let started = product.start_owner_recovery_offline("phase-one", 1)?;
+    write_restricted_test_key(&replacement, started.secret.expose_secret_bytes())?;
+    let pending_key = started.key_id.to_string();
+    let pending_epoch = started.authorization_epoch.get().to_string();
+    drop(product);
+
+    let inspected = run_owner(&fixture.data, &["inspect"])?;
+    assert_eq!(inspected["pending"]["pending_key_id"], pending_key);
+    let resumed = run_owner(
+        &fixture.data,
+        &[
+            "resume",
+            "--pending-key-id",
+            &pending_key,
+            "--key-file",
+            &path(&replacement),
+            "--expected-authorization-epoch",
+            &pending_epoch,
+        ],
+    )?;
+    assert_eq!(resumed["status"], "activated");
+    Ok(())
+}
+
+fn write_restricted_test_key(path: &Path, secret: &[u8]) -> Result<(), Box<dyn Error>> {
+    fs::write(path, secret)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_bearer_migration_and_terminal_revoke_are_file_only_and_redacted()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let legacy_path = temporary.0.join("legacy.bearer");
+    let owner_path = temporary.0.join("migrated-owner.key");
+    let canary = "legacy-cli-canary-0123456789abcdef";
+    run(&["init", "--data-dir", &path(&data)])?;
+    write_restricted_test_key(&legacy_path, canary.as_bytes())?;
+
+    let migrated = output(&[
+        "security",
+        "--data-dir",
+        &path(&data),
+        "legacy-bearer",
+        "migrate",
+        "--name",
+        "Migrated owner",
+        "--label",
+        "canonical-owner",
+        "--legacy-bearer-file",
+        &path(&legacy_path),
+        "--key-out",
+        &path(&owner_path),
+    ])?;
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let migration: serde_json::Value = serde_json::from_slice(&migrated.stdout)?;
+    assert_eq!(migration["status"], "dual_window");
+    assert!(!String::from_utf8_lossy(&migrated.stdout).contains(canary));
+    assert!(!String::from_utf8_lossy(&migrated.stderr).contains(canary));
+    let canonical = fs::read_to_string(&owner_path)?;
+    assert!(canonical.starts_with("hyp1_"));
+    assert!(!migration.to_string().contains(&canonical));
+    let product = NativeProduct::open(&data)?;
+    assert_eq!(
+        product.legacy_bearer_migration_inspection()?.state,
+        hyphae_native_product::LegacyBearerState::DualWindow
+    );
+    drop(product);
+
+    let revoked = security_output(
+        &data,
+        &owner_path,
+        &["legacy-bearer", "revoke", "--idempotency-token", "9901"],
+    )?;
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let revocation: serde_json::Value = serde_json::from_slice(&revoked.stdout)?;
+    assert_eq!(revocation["status"], "revoked");
+    assert!(!String::from_utf8_lossy(&revoked.stdout).contains(canary));
+    let product = NativeProduct::open(&data)?;
+    assert_eq!(
+        product.legacy_bearer_migration_inspection()?.state,
+        hyphae_native_product::LegacyBearerState::Revoked
+    );
+    drop(product);
+    assert_directory_files_exclude(&data, canary.as_bytes())?;
+    Ok(())
+}
+
+#[test]
+fn legacy_migration_reserves_key_output_before_phase_one() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let legacy_path = temporary.0.join("legacy.bearer");
+    let missing_output = temporary.0.join("missing").join("owner.key");
+    let canary = "legacy-reservation-canary-0123456789abcdef";
+    run(&["init", "--data-dir", &path(&data)])?;
+    write_restricted_test_key(&legacy_path, canary.as_bytes())?;
+
+    let failed = output(&[
+        "security",
+        "--data-dir",
+        &path(&data),
+        "legacy-bearer",
+        "migrate",
+        "--name",
+        "Migrated owner",
+        "--label",
+        "canonical-owner",
+        "--legacy-bearer-file",
+        &path(&legacy_path),
+        "--key-out",
+        &path(&missing_output),
+    ])?;
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains(canary));
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains(canary));
+    let product = NativeProduct::open(&data)?;
+    assert_eq!(
+        product.legacy_bearer_migration_inspection()?.state,
+        hyphae_native_product::LegacyBearerState::NeverEnabled
+    );
+    drop(product);
+    assert_directory_files_exclude(&data, canary.as_bytes())?;
+    Ok(())
+}
+
+fn assert_directory_files_exclude(directory: &Path, canary: &[u8]) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            assert_directory_files_exclude(&entry.path(), canary)?;
+        } else if file_type.is_file() {
+            let bytes = fs::read(entry.path())?;
+            assert!(
+                !bytes.windows(canary.len()).any(|window| window == canary),
+                "legacy bearer canary was persisted"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn assert_security_mutation_receipt(receipt: &serde_json::Value, operation: &str) {
@@ -541,8 +1185,42 @@ fn search_collection_helper_is_one_atomic_catalog_commit() -> Result<(), Box<dyn
     assert!(!failed.status.success());
     let catalog = run(&["catalog", "--data-dir", &data_text, "list"])?;
     let items = catalog["items"].as_array().ok_or("catalog items absent")?;
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["name"], "main.public.occupied");
+    let occupied = items
+        .iter()
+        .filter(|item| item["name"] == "main.public.occupied")
+        .count();
+    assert_eq!(occupied, 1);
+    Ok(())
+}
+
+#[test]
+fn catalog_list_round_trips_the_complete_opaque_cursor_between_processes()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+
+    let first = run(&["catalog", "--data-dir", &data_text, "list", "--limit", "1"])?;
+    let cursor = first["cursor"]
+        .as_str()
+        .ok_or("catalog first page omitted its opaque cursor")?;
+    assert!(cursor.starts_with("hycatv1:"));
+    let first_id = first["items"][0]["id"]
+        .as_str()
+        .ok_or("catalog first page omitted its ID")?;
+
+    let second = run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "list",
+        "--limit",
+        "1",
+        "--cursor",
+        cursor,
+    ])?;
+    assert_ne!(second["items"][0]["id"].as_str(), Some(first_id));
     Ok(())
 }
 
@@ -2207,10 +2885,58 @@ fn native_mcp_requires_a_restricted_api_key_source() -> Result<(), Box<dyn Error
 }
 
 #[cfg(unix)]
+#[test]
+fn native_mcp_exits_when_stdout_breaks_while_stdin_remains_open() -> Result<(), Box<dyn Error>> {
+    use std::io::Write as _;
+
+    let fixture = SecurityWriteFixture::create()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", "http://127.0.0.1:1"])
+        .arg("--native-api-key-file")
+        .arg(&fixture.owner_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = child.stdin.take().ok_or("missing MCP stdin")?;
+    drop(child.stdout.take().ok_or("missing MCP stdout")?);
+    serde_json::to_writer(
+        &mut input,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"}
+            }
+        }),
+    )?;
+    input.write_all(b"\n")?;
+    input.flush()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            assert!(!status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            return Err("MCP process hung with broken stdout and open stdin".into());
+        }
+        thread::yield_now();
+    }
+    drop(input);
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
 -> Result<(), Box<dyn Error>> {
-    use std::io::Write as _;
+    use std::io::{BufRead as _, BufReader as IoBufReader, Read as _, Write as _};
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 
     let fixture = SecurityWriteFixture::create()?;
@@ -2274,15 +3000,15 @@ async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
     let _server_guard = ChildGuard(&mut server);
 
     let messages = [
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"},"_meta":{"client":"host-shaped"}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"hymcpt1:2"}}),
-        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"progressToken":"host-list-1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"hymcpt2:100","_meta":{"progressToken":2}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{},"_meta":{"progressToken":"host-call-1"}}}),
         serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"hyphae_native_security_status","arguments":{}}}),
         serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"hyphae_native_security_principals","arguments":{"limit":1}}}),
         serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"hyphae_native_security_status","arguments":{"role":"owner","api_key":auditor_secret.trim()}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"cursor":"hymcpt1:1"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"cursor":"hymcpt2:1"}}),
     ];
     let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
         .args(["mcp", "--base-url", &format!("http://{address_text}")])
@@ -2293,19 +3019,146 @@ async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
         .stderr(Stdio::piped())
         .spawn()?;
     let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let mut output = IoBufReader::new(output);
+    let mut observed = Vec::new();
     for message in messages {
         serde_json::to_writer(&mut input, &message)?;
         input.write_all(b"\n")?;
+        input.flush()?;
+        if message.get("id").is_some() {
+            let mut line = String::new();
+            if output.read_line(&mut line)? == 0 {
+                return Err("MCP stdout closed before its response barrier".into());
+            }
+            observed.push(line);
+        }
     }
     drop(input);
-    let output = mcp.wait_with_output()?;
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
+    assert!(mcp.wait()?.success());
+    let stdout = observed.concat();
+    let mut stderr = String::new();
+    mcp.stderr
+        .take()
+        .ok_or("missing MCP stderr")?
+        .read_to_string(&mut stderr)?;
     assert!(!stdout.contains(auditor_secret.trim()));
     assert!(!stderr.contains(auditor_secret.trim()));
     assert_mcp_read_only_session(&stdout)?;
     let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result<(), Box<dyn Error>>
+{
+    use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::sync::mpsc;
+
+    let fixture = SecurityWriteFixture::create()?;
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let (accepted_sender, accepted_receiver) = mpsc::channel();
+    let server = thread::spawn(move || -> Result<(), std::io::Error> {
+        let (mut connection, _) = listener.accept()?;
+        let reader_connection = connection.try_clone()?;
+        let mut reader = IoBufReader::new(reader_connection);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        accepted_sender
+            .send(())
+            .map_err(|_| std::io::Error::other("test receiver dropped"))?;
+        let mut release = String::new();
+        reader.read_line(&mut release)?;
+        connection.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")?;
+        Ok(())
+    });
+
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address}")])
+        .arg("--native-api-key-file")
+        .arg(&fixture.owner_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let (line_sender, line_receiver) = mpsc::channel();
+    let output_reader = thread::spawn(move || {
+        for line in IoBufReader::new(output).lines() {
+            if line_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{}}}),
+    ];
+    for message in messages {
+        serde_json::to_writer(&mut input, &message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+    }
+    assert!(
+        serde_json::from_str::<serde_json::Value>(
+            &line_receiver.recv_timeout(Duration::from_secs(1))??
+        )?["result"]
+            .is_object()
+    );
+    accepted_receiver.recv_timeout(Duration::from_secs(1))?;
+    for message in [
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"test"}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}),
+    ] {
+        serde_json::to_writer(&mut input, &message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+    }
+    let mut responses = Vec::new();
+    while responses.len() < 2 {
+        responses.push(serde_json::from_str::<serde_json::Value>(
+            &line_receiver.recv_timeout(Duration::from_secs(1))??,
+        )?);
+    }
+    assert!(
+        responses
+            .iter()
+            .any(|response| { response["id"] == 3 && response["error"]["code"] == -32001 })
+    );
+    assert!(responses.iter().any(|response| {
+        response["id"] == 2
+            && response["result"]["structuredContent"]["error"]["code"] == "cancelled"
+    }));
+    input.write_all(b"\r\n")?;
+    input.flush()?;
+    serde_json::to_writer(
+        &mut input,
+        &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"ping","params":{}}),
+    )?;
+    input.write_all(b"\n")?;
+    input.flush()?;
+    let recovered = serde_json::from_str::<serde_json::Value>(
+        &line_receiver.recv_timeout(Duration::from_secs(1))??,
+    )?;
+    assert_eq!(recovered["id"], 4);
+    assert_eq!(recovered["result"], serde_json::json!({}));
+    drop(input);
+    assert!(mcp.wait()?.success());
+    output_reader
+        .join()
+        .map_err(|_| "MCP stdout reader panicked")?;
+    server.join().map_err(|_| "HTTP test server panicked")??;
     Ok(())
 }
 
@@ -2488,18 +3341,24 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(responses.len(), 8);
     let schema_version = &responses[0]["result"]["_meta"]["hyphaeToolSchemaVersion"];
     let schema_digest = &responses[0]["result"]["_meta"]["hyphaeToolSchemaDigest"];
-    assert_eq!(schema_version, "hyphae-native-mcp-tools-v1");
+    assert_eq!(schema_version, "hyphae-native-mcp-tools-v2");
     assert_eq!(schema_digest.as_str().map(str::len), Some(64));
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
-    assert_eq!(responses[1]["result"]["nextCursor"], "hymcpt1:2");
-    assert_eq!(
-        responses[2]["result"]["tools"].as_array().map(Vec::len),
-        Some(1)
-    );
-    assert!(responses[2]["result"]["nextCursor"].is_null());
+    assert!(responses[1]["result"].get("nextCursor").is_none());
+    assert_eq!(responses[2]["error"]["code"], -32602);
+    for tool in responses[1]["result"]["tools"]
+        .as_array()
+        .ok_or("missing host-shaped MCP tools")?
+    {
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert_eq!(
+            tool["outputSchema"]["oneOf"].as_array().map(Vec::len),
+            Some(2)
+        );
+    }
     assert_eq!(responses[3]["result"]["isError"], false);
     assert_eq!(
         responses[3]["result"]["structuredContent"]["product_api_version"],
@@ -2515,7 +3374,7 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
         responses[5]["result"]["structuredContent"]["schema"],
         "hyphae-native-security-principals-v1"
     );
-    assert_eq!(responses[6]["result"]["isError"], true);
+    assert_eq!(responses[6]["result"]["isError"], false);
     assert_eq!(
         responses[6]["result"]["structuredContent"]["error"]["code"],
         "invalid_request"
@@ -2539,7 +3398,7 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
         ],
     );
     assert_eq!(responses[7]["error"]["code"], -32602);
-    for response in &responses[1..7] {
+    for response in std::iter::once(&responses[1]).chain(responses[3..7].iter()) {
         assert_eq!(
             response["result"]["_meta"]["hyphaeToolSchemaVersion"],
             *schema_version
@@ -2562,12 +3421,6 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
         .as_array()
         .into_iter()
         .flatten()
-        .chain(
-            responses[2]["result"]["tools"]
-                .as_array()
-                .into_iter()
-                .flatten(),
-        )
     {
         assert_eq!(
             tool["outputSchema"]["oneOf"].as_array().map(Vec::len),

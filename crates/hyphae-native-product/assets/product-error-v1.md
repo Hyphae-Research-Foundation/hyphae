@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native product error model v1
 
 | Code | Category | Retry default |
@@ -32,3 +33,6 @@
 | `unknown_commit` | `unavailable` | `unknown-commit` |
 | `backup_invalid` | `corruption` | `after-recovery` |
 | `idempotency_conflict` | `conflict` | `never` |
+| `secret_delivery_consumed` | `conflict` | `never` |
+| `confirmation_digest_mismatch` | `authorization` | `never` |
+| `upgrade_required` | `conflict` | `after-recovery` |

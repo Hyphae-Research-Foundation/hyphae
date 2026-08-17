@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fetch and validate the hosted checks bound to a release commit."""
 
 from __future__ import annotations
@@ -42,6 +42,8 @@ REQUIRED_CHECKS = (
     ("Public client conformance", ".github/workflows/ci.yml"),
     ("Quality", ".github/workflows/ci.yml"),
     ("Release readiness", ".github/workflows/ci.yml"),
+    ("Security hard-kill aggregate", ".github/workflows/ci.yml"),
+    ("MCP real hosts", ".github/workflows/ci.yml"),
     ("Review dependency changes", ".github/workflows/dependency-review.yml"),
     ("Test (Linux MSRV)", ".github/workflows/ci.yml"),
     ("Test (Linux stable)", ".github/workflows/ci.yml"),
@@ -677,7 +679,7 @@ def validate_report(document: object, *, expected_commit: str) -> None:
         raise ValueError("required-check report pull request is invalid")
     checks = root["checks"]
     if not isinstance(checks, list) or len(checks) != len(REQUIRED_CHECK_NAMES):
-        raise ValueError("required-check report must contain exactly 18 checks")
+        raise ValueError("required-check report must contain exactly 20 checks")
     seen_ids: set[int] = set()
     seen_workflow_runs: dict[int, tuple[str, int]] = {}
     workflow_run_by_path: dict[str, int] = {}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Mutation tests for the shared Claude Code and Codex plugin bundle."""
 
 from __future__ import annotations
@@ -29,6 +29,11 @@ class AgentPluginContractTests(unittest.TestCase):
             ROOT / "contracts/native-mcp-v2.json",
             root / "contracts/native-mcp-v2.json",
         )
+        shutil.copytree(
+            ROOT / "conformance/mcp",
+            root / "conformance/mcp",
+            ignore=shutil.ignore_patterns("node_modules"),
+        )
         return directory
 
     def test_checked_in_plugins_share_one_server(self) -> None:
@@ -52,6 +57,18 @@ class AgentPluginContractTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentPluginValidationError, "canonical hyphae stdio"):
                 validate(root)
 
+    def test_mcp_environment_allowlist_is_exact_and_never_contains_secrets(self) -> None:
+        mutations = (["HYPHAE_NATIVE_API_KEY_FILE", "HOME"], ["hyp1_" + "a" * 32 + "_" + "b" * 64])
+        for env_vars in mutations:
+            with self.subTest(env_vars=env_vars), self.fixture() as directory:
+                root = Path(directory)
+                path = root / "plugins/hyphae/.mcp.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                value["mcpServers"]["hyphae"]["env_vars"] = env_vars
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaises(AgentPluginValidationError):
+                    validate(root)
+
     def test_marketplace_version_cannot_drift(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
@@ -60,6 +77,27 @@ class AgentPluginContractTests(unittest.TestCase):
             value["plugins"][0]["version"] = "9.9.9"
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(AgentPluginValidationError, "Claude Code marketplace"):
+                validate(root)
+
+    def test_plugin_version_is_the_bounded_slice_version(self) -> None:
+        self.assertEqual(
+            json.loads(
+                (ROOT / "plugins/hyphae/.codex-plugin/plugin.json").read_text(encoding="utf-8")
+            )["version"],
+            "1.2.0",
+        )
+
+    def test_plugin_version_cannot_remain_on_the_legacy_bundle(self) -> None:
+        with self.fixture() as directory:
+            root = Path(directory)
+            for relative in (
+                "plugins/hyphae/.codex-plugin/plugin.json",
+                "plugins/hyphae/.claude-plugin/plugin.json",
+                ".claude-plugin/marketplace.json",
+            ):
+                path = root / relative
+                path.write_text(path.read_text(encoding="utf-8").replace("1.2.0", "0.2.0"), encoding="utf-8")
+            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 1.2"):
                 validate(root)
 
     def test_credential_material_is_rejected_everywhere(self) -> None:
@@ -99,7 +137,7 @@ class AgentPluginContractTests(unittest.TestCase):
                 validate(root)
 
     def test_tool_page_size_is_exact(self) -> None:
-        for page_size in (1, 3, 2.0, "2"):
+        for page_size in (1, 3, 100.0, "100"):
             with self.subTest(page_size=page_size), self.fixture() as directory:
                 root = Path(directory)
                 path = root / "contracts/native-mcp-v2.json"
@@ -118,6 +156,51 @@ class AgentPluginContractTests(unittest.TestCase):
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(AgentPluginValidationError, "annotations"):
                 validate(root)
+
+    def test_resource_and_cancellation_limits_are_exact(self) -> None:
+        mutations = (
+            ("resource_limits", "active_tool_calls", 2, "resource limits"),
+            ("resource_limits", "pending_responses", 0, "resource limits"),
+            ("resource_limits", "input_bytes", 4194305, "resource limits"),
+            ("cancellation", "idempotent", False, "cancellation"),
+        )
+        for section, field, replacement, error in mutations:
+            with self.subTest(field=field), self.fixture() as directory:
+                root = Path(directory)
+                path = root / "contracts/native-mcp-v2.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                value[section][field] = replacement
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(AgentPluginValidationError, error):
+                    validate(root)
+
+    def test_shared_host_corpus_cannot_add_a_tool(self) -> None:
+        with self.fixture() as directory:
+            root = Path(directory)
+            path = root / "conformance/mcp/corpus.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["tools"].append("hyphae_native_write")
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(AgentPluginValidationError, "conformance corpus"):
+                validate(root)
+
+    def test_shared_host_corpus_exact_cases_are_frozen_and_unique(self) -> None:
+        mutations = (
+            lambda cases: cases[0].__setitem__("id", cases[1]["id"]),
+            lambda cases: cases[0].__setitem__("tool", "hyphae_native_security_status"),
+            lambda cases: cases[2].__setitem__("arguments", {"limit": 2}),
+            lambda cases: cases[3].__setitem__("expect", "success"),
+            lambda cases: cases[1].__setitem__("assert", {"pointer": "/schema", "equals": "other"}),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), self.fixture() as directory:
+                root = Path(directory)
+                path = root / "conformance/mcp/corpus.json"
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutate(value["cases"])
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(AgentPluginValidationError, "conformance corpus"):
+                    validate(root)
 
     def test_success_schema_cannot_expose_credential_material(self) -> None:
         with self.fixture() as directory:
@@ -139,6 +222,16 @@ class AgentPluginContractTests(unittest.TestCase):
             output = value["tools"][0]["outputSchema"]
             if "oneOf" in output:
                 output["oneOf"].pop()
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(AgentPluginValidationError, "output schema"):
+                validate(root)
+
+    def test_output_schema_root_object_is_mandatory(self) -> None:
+        with self.fixture() as directory:
+            root = Path(directory)
+            path = root / "contracts/native-mcp-v2.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["tools"][0]["outputSchema"].pop("type")
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(AgentPluginValidationError, "output schema"):
                 validate(root)

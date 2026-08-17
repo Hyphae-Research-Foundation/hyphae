@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native whole-list TTL v1
 
 Status: implemented; direct-Linux evidence recorded in

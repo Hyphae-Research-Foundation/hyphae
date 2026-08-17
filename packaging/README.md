@@ -1,7 +1,7 @@
 # Packaging
 
 `package.py` produces a deterministic archive containing one native `hyphae`
-binary plus the AGPLv3 code license, CC BY-SA documentation license, licensing
+binary plus the Apache-2.0 software license, CC BY-SA documentation license, licensing
 scope policy, readme, and third-party notices. It never bundles a database,
 cache, model, provider credential, or runtime installer.
 
@@ -24,7 +24,7 @@ and retains Syft JSON as the pre-conversion inventory. Before producing either
 published format, [`conclude_release_sbom_licenses.py`](conclude_release_sbom_licenses.py)
 resolves every supported discovered first-party Hyphae artifact against its
 exact tracked package-manifest authority and the applicable local lock/source
-evidence. It then records `AGPL-3.0-only` as both the declared and concluded
+evidence. It then records `Apache-2.0` as both the declared and concluded
 first-party license. Because pinned Syft does not catalog the source
 `pyproject.toml`, the same step adds the `hyphae-sdk` component explicitly with
 `foundBy = hyphae-manifest-cataloger` and that manifest as its primary evidence;
@@ -35,7 +35,7 @@ npm package fails closed. Third-party artifacts and their observed licenses
 are never rewritten.
 
 SPDX and CycloneDX are converted from that same normalized Syft document. The
-G8 release verifier requires `AGPL-3.0-only` in every emitted first-party
+G8 release verifier requires `Apache-2.0` in every emitted first-party
 license field and exact multiset equality with the lock-derived Rust/npm
 inventory plus the explicit Python manifest component. It independently
 requires the same first-party `(name, version, purl)` multiset in both output
@@ -66,11 +66,14 @@ that commit to remain reachable from `main`, and re-fetches both immediately
 before publication. A tag may be pushed only after the complete gate is green
 and publication is explicitly authorized.
 
-A publication also records exactly 18 required checks. Seventeen checks bind
+A publication also records exactly 20 required checks. Nineteen checks bind
 the reviewed PR-head commit and its head branch; the exact-SHA G8 closure binds
 the tagged merge commit on `main`. Each check is bound to its expected
 canonical workflow path and successful workflow-run metadata; a same-named job
-from another workflow is rejected. The 17 PR checks must be `pull_request`
+from another workflow is rejected. This set explicitly includes the
+`Security hard-kill aggregate` and `MCP real hosts` jobs. Registry publication
+also downloads and independently validates both exact-SHA artifact sets before
+each package boundary. The 19 PR checks must be `pull_request`
 runs, while G8 closure is the sole `workflow_dispatch` run. Every workflow path
 must resolve to one run, and the tagged merge commit must belong to exactly one
 merged in-repository PR targeting `main`; the complete PR
@@ -92,3 +95,9 @@ python packaging/test_package.py
 
 Consumer verification is documented in
 [`../docs/release/verification.md`](../docs/release/verification.md).
+
+crates.io and npm use the separate `Registry publish` workflow. Dry-runs are
+allowed against the current manifests, but live publication is fail-closed
+unless the source is a clean checkout of the annotated `v1.2.0` tag and every
+package manifest and registry policy declares exact version `1.2.0` with
+Apache-2.0 authority.

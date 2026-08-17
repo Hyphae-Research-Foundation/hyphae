@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Canonical public contract documents embedded for validation and generation.
 
@@ -8,7 +8,7 @@ pub mod v1;
 pub mod v2;
 
 /// Canonical SPDX marker embedded in every generated JSON Schema document.
-pub const JSON_SCHEMA_LICENSE_COMMENT: &str = "SPDX-License-Identifier: AGPL-3.0-only";
+pub const JSON_SCHEMA_LICENSE_COMMENT: &str = "SPDX-License-Identifier: Apache-2.0";
 
 /// Generates a canonical JSON Schema document for a public Rust wire model.
 ///

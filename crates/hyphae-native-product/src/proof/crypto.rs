@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 // Minimal safe, unkeyed BLAKE3 and CRC32C primitives keep the proof format independent of
 // transitive dependency visibility. Golden tests cover the standard empty and `abc` vectors.

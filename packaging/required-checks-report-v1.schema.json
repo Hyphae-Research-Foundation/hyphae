@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "$id": "https://hyphae.dev/schemas/required-checks-report-v1.json",
   "title": "HyphaeRequiredChecksReportV1",
   "description": "Canonical successful GitHub Actions pull-request check runs bound to one merged Hyphae release candidate.",
@@ -122,6 +122,8 @@
             "Public client conformance",
             "Quality",
             "Release readiness",
+            "Security hard-kill aggregate",
+            "MCP real hosts",
             "Review dependency changes",
             "Test (Linux MSRV)",
             "Test (Linux stable)",
@@ -261,6 +263,8 @@
                   "Public client conformance",
                   "Quality",
                   "Release readiness",
+                  "Security hard-kill aggregate",
+                  "MCP real hosts",
                   "Test (Linux MSRV)",
                   "Test (Linux stable)",
                   "Test (Windows stable)",
@@ -382,8 +386,8 @@
     },
     "checks": {
       "type": "array",
-      "minItems": 18,
-      "maxItems": 18,
+      "minItems": 20,
+      "maxItems": 20,
       "uniqueItems": true,
       "prefixItems": [
         {
@@ -549,6 +553,34 @@
               "properties": {
                 "name": {
                   "const": "Release readiness"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "Security hard-kill aggregate"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "MCP real hosts"
                 }
               }
             }

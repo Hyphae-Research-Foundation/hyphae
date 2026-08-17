@@ -23,6 +23,10 @@ paginated redacted principal list. The API key's durable roles remain the sole
 authority; prompt text cannot select a role or widen its permissions. Legacy
 bearers and MCP writes are not accepted.
 
+The server admits one active tool call and one pending response, limits complete
+input and output messages to 4 MiB, and handles idempotent cancellation while
+Native HTTP is in flight. It rejects saturation rather than growing a queue.
+
 ## Codex
 
 Validate the bundle with the repository checker, then add the repository
@@ -47,3 +51,8 @@ For marketplace installation, add this repository and install
 
 Claude Code reads `.claude-plugin/plugin.json`, the shared `.mcp.json`, and
 the namespaced `use-hyphae` skill.
+
+The shared host corpus and receipt runner live under `conformance/mcp`. A host
+receipt is valid only when the installed host exposes deterministic
+machine-readable MCP evidence; unsupported or missing host evidence fails
+closed and is never replaced by a direct server simulation.

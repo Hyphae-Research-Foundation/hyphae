@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native segmented substrate v1
 
 Status: shared relational, hash, set, stream, sorted-set score/rank, list,

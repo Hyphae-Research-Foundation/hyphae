@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Product structure-family and explicit all-engine transaction integration tests.
 
@@ -14,12 +14,12 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_product::{
     NativeProduct, ObjectId, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
-    ProductExplicitTransactionStatus, ProductListSide, ProductOperation, ProductPrincipal,
-    ProductRequestContext, ProductResponse, ProductSession, ProductSessionId, ProductStructureKey,
-    ProductStructureMutation, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
-    ProductTransactionStageResult, ProductTransactionStatus, ProductTransactionVectorMutation,
-    ProductValue, ProductVector, StructureKind,
+    ProductExplicitTransactionStatus, ProductLimits, ProductListSide, ProductOperation,
+    ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession, ProductSessionId,
+    ProductStructureKey, ProductStructureMutation, ProductStructureReadRequest,
+    ProductStructureReadResult, ProductTransactionId, ProductTransactionSearchMutation,
+    ProductTransactionSqlMutation, ProductTransactionStageResult, ProductTransactionStatus,
+    ProductTransactionVectorMutation, ProductValue, ProductVector, StructureKind,
 };
 use hyphae_native_types::{EngineKind, LogicalType};
 
@@ -31,6 +31,147 @@ fn temporary(name: &str) -> PathBuf {
         std::process::id(),
         NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
     ))
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn list_pop_stage_response_limit_does_not_retain_a_hidden_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("list-pop-response-limit");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(4, "lists", StructureKind::List)?,
+    ))?;
+    seed.create_list(b"queue".to_vec())?;
+    seed.rpush(b"queue".to_vec(), vec![b'x'; 512])?;
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+    let begin_context = context(&session, 1);
+    let begin = product.dispatch(
+        &mut session,
+        &begin_context,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+    let expected_response_bytes = 16 + 8 + 8 + 1 + 1 + 1 + 1 + 4 + 512;
+    let mut limited = context(&session, 2);
+    limited.limits = ProductLimits {
+        max_response_bytes: expected_response_bytes - 1,
+        ..ProductLimits::default()
+    };
+    let Err(error) = product.dispatch(
+        &mut session,
+        &limited,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::ListPop {
+                key: key(4, b"queue")?,
+                side: ProductListSide::Left,
+            },
+        },
+    ) else {
+        return Err("oversized ListPop stage response was retained".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+
+    let status_context = context(&session, 3);
+    let status = product.dispatch(
+        &mut session,
+        &status_context,
+        ProductOperation::ExplicitTransactionStatus { handle },
+    )?;
+    assert!(matches!(
+        status,
+        ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+            staged_operations: 0,
+            ..
+        })
+    ));
+    let commit_context = context(&session, 4);
+    let Err(commit_error) = product.dispatch(
+        &mut session,
+        &commit_context,
+        ProductOperation::TransactionCommit { handle },
+    ) else {
+        return Err("hidden ListPop mutation committed after response rejection".into());
+    };
+    assert_eq!(commit_error.code(), ProductErrorCode::InvalidRequest);
+    let rollback_context = context(&session, 5);
+    product.dispatch(
+        &mut session,
+        &rollback_context,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    let read_context = context(&session, 6);
+    let read = product.dispatch(
+        &mut session,
+        &read_context,
+        ProductOperation::StructureRead(ProductStructureReadRequest::ListRange {
+            key: key(4, b"queue")?,
+            start: 0,
+            stop: -1,
+        }),
+    )?;
+    assert!(matches!(
+        read,
+        ProductResponse::StructureRead(read)
+            if read.value == ProductStructureReadResult::Values(vec![vec![b'x'; 512]])
+    ));
+
+    let exact_begin_context = context(&session, 7);
+    let exact_begin = product.dispatch(
+        &mut session,
+        &exact_begin_context,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = exact_begin
+    else {
+        return Err("exact-bound transaction did not begin".into());
+    };
+    let mut exact = context(&session, 8);
+    exact.limits.max_response_bytes = expected_response_bytes;
+    let staged = product.dispatch(
+        &mut session,
+        &exact,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::ListPop {
+                key: key(4, b"queue")?,
+                side: ProductListSide::Left,
+            },
+        },
+    )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Value(Some(vec![b'x'; 512]))
+                )
+    ));
+    let final_rollback_context = context(&session, 9);
+    product.dispatch(
+        &mut session,
+        &final_rollback_context,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
 }
 
 fn session() -> Result<ProductSession, Box<dyn std::error::Error>> {
@@ -114,7 +255,7 @@ fn every_structure_family_is_catalogued_atomic_and_snapshot_equal()
     seed.commit()?;
     drop(runtime);
 
-    let mut product = NativeProduct::open(&path)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
     let mut session = session()?;
     let request = context(&session, 1);
     let response = product.dispatch(
@@ -237,7 +378,7 @@ fn explicit_transaction_stages_all_engines_and_rolls_back_without_partial_state(
     seed.commit()?;
     drop(runtime);
 
-    let mut product = NativeProduct::open(&path)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
     let mut session = session()?;
     let request = context(&session, 10);
     let begin = product.dispatch(&mut session, &request, ProductOperation::TransactionBegin)?;
@@ -365,7 +506,13 @@ fn unknown_explicit_commit_resolves_after_reopen() -> Result<(), Box<dyn std::er
     seed.commit()?;
     drop(runtime);
 
-    let mut product = NativeProduct::open(&path)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let binding_csn = product
+        .snapshot_bounded(0)?
+        .identity()
+        .visible_csn
+        .ok_or("default scalar binding commit is missing")?
+        .get();
     let mut product_session = session()?;
     let request = context(&product_session, 30);
     let begin = product.dispatch(
@@ -423,7 +570,7 @@ fn unknown_explicit_commit_resolves_after_reopen() -> Result<(), Box<dyn std::er
     assert!(matches!(
         status,
         ProductResponse::TransactionStatus(ProductTransactionStatus::Committed(receipt))
-            if receipt.commit_csn == 2
+            if receipt.commit_csn == binding_csn + 1
     ));
     assert_eq!(
         reopened.snapshot_bounded(10)?.structure_get(b"unknown"),

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native clean-room and dependency inventory
 
 Status: normative G0 policy; the exact native-closure gate, machine-readable

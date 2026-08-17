@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fail-closed structural checker for the Claude Code and Codex plugins."""
 
 from __future__ import annotations
@@ -25,6 +25,42 @@ EXPECTED_ANNOTATIONS = {
     "openWorldHint": False,
 }
 EXPECTED_EXECUTION = {"taskSupport": "forbidden"}
+EXPECTED_MCP_CASES = [
+    {
+        "id": "capabilities-read",
+        "tool": "hyphae_native_capabilities",
+        "arguments": {},
+        "expect": "success",
+        "assert": {"pointer": "/product_api_version", "type": "integer"},
+    },
+    {
+        "id": "security-status-read",
+        "tool": "hyphae_native_security_status",
+        "arguments": {},
+        "expect": "success",
+        "assert": {
+            "pointer": "/schema",
+            "equals": "hyphae-native-access-control-status-v1",
+        },
+    },
+    {
+        "id": "principal-page-read",
+        "tool": "hyphae_native_security_principals",
+        "arguments": {"limit": 1},
+        "expect": "success",
+        "assert": {
+            "pointer": "/schema",
+            "equals": "hyphae-native-security-principals-v1",
+        },
+    },
+    {
+        "id": "prompt-authority-rejected",
+        "tool": "hyphae_native_security_status",
+        "arguments": {"role": "owner"},
+        "expect": "invalid_request",
+        "assert": {"pointer": "/error/code", "equals": "invalid_request"},
+    },
+]
 EMPTY_INPUT_SCHEMA = {
     "type": "object",
     "properties": {},
@@ -53,7 +89,7 @@ ERROR_OUTPUT_SCHEMA = {
     "additionalProperties": False,
     "required": ["schema", "error"],
     "properties": {
-        "schema": {"const": "hyphae-native-mcp-tool-error-v1"},
+        "schema": {"const": "hyphae-native-mcp-tool-error-v2"},
         "error": {
             "type": "object",
             "additionalProperties": False,
@@ -273,6 +309,7 @@ def validate_mcp(value: dict[str, Any]) -> None:
         "type": "stdio",
         "command": "hyphae",
         "args": CANONICAL_MCP_ARGS,
+        "env_vars": ["HYPHAE_NATIVE_API_KEY_FILE"],
     }
     if server != expected:
         fail("Claude Code and Codex must use the canonical hyphae stdio server")
@@ -284,7 +321,7 @@ def validate_codex(value: dict[str, Any]) -> str:
     version = value.get("version")
     if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
         fail("Codex plugin version must be strict semver")
-    if value.get("license") != "AGPL-3.0-only":
+    if value.get("license") != "Apache-2.0":
         fail("Codex plugin license must match the repository")
     interface = value.get("interface")
     if not isinstance(interface, dict) or interface.get("developerName") != "Celiums Solutions LLC":
@@ -309,7 +346,7 @@ def validate_codex(value: dict[str, Any]) -> str:
 def validate_claude(value: dict[str, Any], version: str) -> None:
     if value.get("name") != "hyphae" or value.get("version") != version:
         fail("Claude Code plugin identity must match the Codex bundle")
-    if value.get("license") != "AGPL-3.0-only":
+    if value.get("license") != "Apache-2.0":
         fail("Claude Code plugin license must match the repository")
     description = str(value.get("description", ""))
     if "Auditor" not in description or "Instance" not in description:
@@ -328,6 +365,7 @@ def validate_marketplaces(root: Path, version: str) -> None:
         or plugins[0].get("name") != "hyphae"
         or plugins[0].get("source") != "./plugins/hyphae"
         or plugins[0].get("version") != version
+        or plugins[0].get("license") != "Apache-2.0"
     ):
         fail("Claude Code marketplace is not bound to the checked-in plugin")
     description = str(plugins[0].get("description", ""))
@@ -388,17 +426,31 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
         "mcp_protocol",
         "tool_schema_version",
         "tool_page_size",
+        "resource_limits",
+        "cancellation",
         "tools",
     }:
         fail("Native MCP contract envelope is invalid")
     if (
-        contract.get("schema") != "hyphae-native-mcp-contract-v1"
-        or contract.get("mcp_protocol") != "2025-11-25"
-        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v1"
+        contract.get("schema") != "hyphae-native-mcp-contract-v2"
+        or contract.get("mcp_protocol") != "2025-06-18"
+        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v2"
     ):
         fail("Native MCP contract versions are invalid")
-    if type(contract.get("tool_page_size")) is not int or contract.get("tool_page_size") != 2:
-        fail("Native MCP tool page size must be exactly two")
+    if type(contract.get("tool_page_size")) is not int or contract.get("tool_page_size") != 100:
+        fail("Native MCP tool page size must be exactly one hundred")
+    if contract.get("resource_limits") != {
+        "input_bytes": 4 * 1024 * 1024,
+        "output_bytes": 4 * 1024 * 1024,
+        "active_tool_calls": 1,
+        "pending_responses": 1,
+    }:
+        fail("Native MCP resource limits must be exact and bounded")
+    if contract.get("cancellation") != {
+        "method": "notifications/cancelled",
+        "idempotent": True,
+    }:
+        fail("Native MCP cancellation contract is invalid")
 
     tools = contract.get("tools")
     if not isinstance(tools, list) or len(tools) != len(EXPECTED_TOOL_NAMES):
@@ -433,7 +485,10 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
         )
         if tool.get("inputSchema") != expected_input:
             fail(f"Native MCP {expected_name} input schema is invalid")
-        expected_output = {"oneOf": [schemas[expected_name], ERROR_OUTPUT_SCHEMA]}
+        expected_output = {
+            "type": "object",
+            "oneOf": [schemas[expected_name], ERROR_OUTPUT_SCHEMA],
+        }
         if tool.get("outputSchema") != expected_output:
             fail(f"Native MCP {expected_name} output schema is invalid or unredacted")
     return EXPECTED_TOOL_NAMES
@@ -450,6 +505,8 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         root / ".claude-plugin/marketplace.json",
         root / ".agents/plugins/marketplace.json",
         root / "contracts/native-mcp-v2.json",
+        root / "conformance/mcp/corpus.json",
+        root / "conformance/mcp/receipt.schema.json",
     ]
     for path in files:
         if not path.is_file():
@@ -458,11 +515,26 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
             fail(f"credential material is forbidden in {path.relative_to(root)}")
     validate_mcp(load_object(plugin / ".mcp.json", root))
     version = validate_codex(load_object(plugin / ".codex-plugin/plugin.json", root))
+    if version != "1.2.0":
+        fail("agent plugin version must match the bounded 1.2 MCP slice")
     validate_claude(load_object(plugin / ".claude-plugin/plugin.json", root), version)
     validate_marketplaces(root, version)
     expected_tools = set(
         validate_contract(load_object(root / "contracts/native-mcp-v2.json", root))
     )
+    corpus = load_object(root / "conformance/mcp/corpus.json", root)
+    if (
+        set(corpus) != {"schema", "mcp_config", "tool_schema_version", "tools", "cases"}
+        or
+        corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
+        or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
+        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v2"
+        or corpus.get("tools") != list(EXPECTED_TOOL_NAMES)
+        or corpus.get("cases") != EXPECTED_MCP_CASES
+    ):
+        fail("shared MCP host conformance corpus is invalid")
+    if len({case["id"] for case in corpus["cases"]}) != 4:
+        fail("shared MCP host conformance case IDs must be unique")
     validate_skill(plugin, expected_tools)
     validate_plugin_readme(plugin)
     return {

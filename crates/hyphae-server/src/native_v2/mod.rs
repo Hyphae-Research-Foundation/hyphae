@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Native HTTP v2 edge adapter over the one-owner product service.
 
@@ -28,19 +28,31 @@ use server::RequestMetadata;
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
-    use std::{error::Error, fs, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        error::Error,
+        fs,
+        net::Ipv4Addr,
+        path::PathBuf,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
 
     use axum::{
         body::{self, Body, Bytes},
-        http::{Request, StatusCode, header},
+        http::{HeaderMap, Request, StatusCode, header},
     };
     use hyphae_native_product::{
-        ApiKeyId, AuthenticatedAuthority, BuiltInRole, NativeProduct, NativeProductService,
-        NativeProductServiceConfig, ProductDurabilityPolicy, ProductLimits, ProductOperation,
-        ProductScope,
+        ApiKeyId, BuiltInRole, NativeProduct, NativeProductService, NativeProductServiceConfig,
+        ProductAuthorization, ProductDurabilityPolicy, ProductLimits, ProductOperation,
+        ProductResponse, ProductScope,
     };
     use hyphae_native_protocol::{WireRequest, decode_product_response, encode_product_request};
     use serde_json::Value;
+    use tokio::sync::watch;
     use tower::ServiceExt as _;
 
     use super::{
@@ -55,7 +67,6 @@ mod tests {
         service: NativeProductService,
         credential: String,
         owner_credential: String,
-        owner_authority: AuthenticatedAuthority,
         credential_key_id: ApiKeyId,
         _directory: TestDirectory,
     }
@@ -80,6 +91,7 @@ mod tests {
             "/v2/restore",
             "/v2/proofs/verify",
             "/v2/transactions/status",
+            "/v2/security/keys",
             "/v2/read-stream",
         ] {
             assert!(contract.contains(&format!("  {route}:")), "missing {route}");
@@ -89,6 +101,25 @@ mod tests {
         );
         assert!(!contract.contains("\"501\""));
         assert!(contract.contains("x-hyphae-authentication-modes:"));
+        assert!(contract.contains("x-hyphae-protocol-minor:"));
+        assert_eq!(
+            contract
+                .matches(
+                    "X-Hyphae-Protocol-Minor: { $ref: \"#/components/headers/ProtocolMinor\" }"
+                )
+                .count(),
+            6
+        );
+        assert_eq!(
+            contract
+                .matches("parameters: [{ $ref: \"#/components/parameters/ProtocolMinor\" }]")
+                .count(),
+            18
+        );
+        assert!(contract.contains("description: Exact Native product protocol minor"));
+        assert!(contract.contains("Generic /v2/execute rejects these variants"));
+        assert!(contract.contains("legacy-migration-1.2:"));
+        assert!(contract.contains("Canonical hyp1 is always parsed without fallback"));
         assert!(contract.contains("After bootstrap, new automatically requires one canonical"));
         assert!(contract.contains("adapter is loopback-only; remote exposure requires a TLS"));
         assert!(
@@ -96,17 +127,19 @@ mod tests {
                 .contains("bearerFormat: hyp1_<32-lowercase-hex-key-id>_<64-lowercase-hex-secret>")
         );
         assert!(contract.contains("authority loss is HTTP 403"));
+        assert!(contract.contains("Revoked canonical candidates retain only opaque pending state"));
+        assert!(contract.contains("bounded to 256 active tasks"));
         assert_eq!(
             contract
                 .matches("\"401\": { $ref: \"#/components/responses/AuthenticationRequired\" }")
                 .count(),
-            17
+            18
         );
         assert_eq!(
             contract
                 .matches("\"403\": { $ref: \"#/components/responses/AuthorizationDenied\" }")
                 .count(),
-            17
+            18
         );
     }
 
@@ -173,13 +206,11 @@ mod tests {
             let owner = product.authenticate_api_key(&owner_secret, 2)?;
             (owner_secret.clone(), owner.key_id())
         };
-        let owner_authority = product.authenticate_api_key(&owner_secret, 5)?;
         let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
         Ok(ManagedServiceFixture {
             service,
             credential,
             owner_credential: owner_secret,
-            owner_authority,
             credential_key_id,
             _directory: directory,
         })
@@ -196,6 +227,67 @@ mod tests {
         })?)
     }
 
+    fn mutation_request(
+        operation: ProductOperation,
+        idempotency_token: u128,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        Ok(encode_product_request(&WireRequest {
+            operation,
+            logical_time_micros: 1,
+            deadline_micros: None,
+            idempotency_token: Some(idempotency_token),
+            limits: ProductLimits::default(),
+            durability: ProductDurabilityPolicy::STRICT,
+        })?)
+    }
+
+    #[tokio::test]
+    async fn api_key_start_is_cache_safe_and_never_compressed() -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("key-start-headers", false)?;
+        let owner = fixture.owner_credential.clone();
+        let actor = fixture
+            .service
+            .handle()
+            .open_authenticated_session(hyphae_native_product::ApiKeyCredential::new(&owner)?)?;
+        let principal_id: hyphae_native_product::SecurityId =
+            actor.request_context(1, 1).principal.identity().parse()?;
+        drop(actor);
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let response = app
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(
+                    ProductOperation::SecurityApiKeyIssueSelfStart {
+                        principal_id,
+                        label: "http-pending".to_owned(),
+                        roles: vec![BuiltInRole::Owner],
+                        custom_roles: Vec::new(),
+                        permission_ceiling: ProductAuthorization::ALL,
+                        scope_ceiling: vec![ProductScope::Instance],
+                        expires_at_micros: None,
+                    },
+                    77,
+                )?,
+                Some("77"),
+                Some(&owner),
+                None,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, private, max-age=0"
+        );
+        assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+        assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+        let _ = response_bytes(response).await?;
+        Ok(())
+    }
+
     fn http_request(
         path: &str,
         body: Vec<u8>,
@@ -206,7 +298,8 @@ mod tests {
         let mut builder = Request::builder()
             .method("POST")
             .uri(path)
-            .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE);
+            .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
+            .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3");
         if let Some(request_id) = request_id {
             builder = builder.header(REQUEST_ID_HEADER, request_id);
         }
@@ -238,6 +331,272 @@ mod tests {
 
     async fn response_bytes(response: axum::response::Response) -> Result<Bytes, Box<dyn Error>> {
         Ok(body::to_bytes(response.into_body(), 32 * 1024 * 1024).await?)
+    }
+
+    async fn response_snapshot(
+        response: axum::response::Response,
+    ) -> Result<(StatusCode, HeaderMap, Bytes), Box<dyn Error>> {
+        let (parts, body) = response.into_parts();
+        let bytes = body::to_bytes(body, 32 * 1024 * 1024).await?;
+        Ok((parts.status, parts.headers, bytes))
+    }
+
+    struct RetainedSlowBody {
+        retained: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        released: futures_util::future::BoxFuture<'static, ()>,
+        entered: bool,
+    }
+
+    impl RetainedSlowBody {
+        fn new(
+            retained: Arc<AtomicUsize>,
+            maximum: Arc<AtomicUsize>,
+            mut release: watch::Receiver<bool>,
+        ) -> Self {
+            Self {
+                retained,
+                maximum,
+                released: Box::pin(async move {
+                    if !*release.borrow() {
+                        let _changed = release.changed().await;
+                    }
+                }),
+                entered: false,
+            }
+        }
+    }
+
+    impl Drop for RetainedSlowBody {
+        fn drop(&mut self) {
+            if self.entered {
+                self.retained.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl futures_util::Stream for RetainedSlowBody {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.entered {
+                let current = self.retained.fetch_add(1, Ordering::SeqCst) + 1;
+                self.maximum.fetch_max(current, Ordering::SeqCst);
+                self.entered = true;
+            }
+            match std::future::Future::poll(self.released.as_mut(), context) {
+                std::task::Poll::Ready(()) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_bodies_are_bounded_before_authentication_and_buffering()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("bounded-body-readers", false)?;
+        let server = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config {
+                limits: NativeHttpV2Limits {
+                    request_body_timeout: Duration::from_secs(30),
+                    ..NativeHttpV2Limits::default()
+                },
+                ..NativeHttpV2Config::default()
+            },
+        )?;
+        let app = server.test_router();
+        let retained = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (release, released) = watch::channel(false);
+        let mut tasks = Vec::new();
+        for request_id in 1..=super::server::MAX_HTTP_BODY_READERS + 32 {
+            let stream = RetainedSlowBody::new(
+                Arc::clone(&retained),
+                Arc::clone(&maximum),
+                released.clone(),
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v2/execute")
+                .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
+                .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                .header(REQUEST_ID_HEADER, request_id.to_string())
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", fixture.credential),
+                )
+                .body(Body::from_stream(stream))?;
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move { app.oneshot(request).await }));
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.state.body_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            server.state.body_slots.available_permits(),
+            0,
+            "all bounded body-reader slots should be retained"
+        );
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            retained.load(Ordering::SeqCst),
+            "no body reader may bypass the retained admission set"
+        );
+        assert!(maximum.load(Ordering::SeqCst) <= super::server::MAX_HTTP_BODY_READERS);
+        release.send(true)?;
+        let mut unavailable = 0;
+        for task in tasks {
+            if task.await??.status() == StatusCode::SERVICE_UNAVAILABLE {
+                unavailable += 1;
+            }
+        }
+        assert_eq!(unavailable, 32);
+        drop(fixture.service);
+        Ok(())
+    }
+
+    #[test]
+    fn get_capability_authentication_is_bounded_before_blocking_work() -> Result<(), Box<dyn Error>>
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?;
+        runtime.block_on(async {
+            let fixture = managed_service("bounded-get-auth", false)?;
+            let server = NativeHttpV2Server::new_managed(
+                fixture.service.handle(),
+                NativeHttpV2Config::default(),
+            )?;
+            let app = server.test_router();
+            let started = Arc::new(Barrier::new(2));
+            let worker_started = Arc::clone(&started);
+            let (release, released) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                worker_started.wait();
+                released.recv()
+            });
+            started.wait();
+
+            let mut tasks = Vec::new();
+            for request_id in 1..=super::server::MAX_HTTP_REQUESTS + 32 {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri("/v2/capabilities")
+                    .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                    .header(REQUEST_ID_HEADER, request_id.to_string())
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", fixture.credential),
+                    )
+                    .body(Body::empty())?;
+                let app = app.clone();
+                tasks.push(tokio::spawn(async move { app.oneshot(request).await }));
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while server.test_request_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+                while tasks.iter().filter(|task| task.is_finished()).count() < 32 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(server.test_request_permits(), 0);
+            assert!(server.test_authentication_permits() <= super::server::MAX_HTTP_REQUESTS);
+            release.send(())?;
+            blocker.await??;
+            let mut unavailable = 0;
+            for task in tasks {
+                if task.await??.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    unavailable += 1;
+                }
+            }
+            assert_eq!(unavailable, 32);
+            Ok::<(), Box<dyn Error>>(())
+        })
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unauthorized_headers_never_consume_body_admission()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("header-before-body-admission", false)?;
+        let server = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?;
+        let app = server.test_router();
+        let baseline = server.state.body_slots.available_permits();
+
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/execute")
+                    .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
+                    .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                    .header(header::CONTENT_LENGTH, (16 * 1024 * 1024 + 1).to_string())
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", fixture.credential),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(server.state.body_slots.available_permits(), baseline);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/execute")
+                    .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
+                    .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                    .header(header::AUTHORIZATION, "Bearer not-a-key")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(server.state.body_slots.available_permits(), baseline);
+
+        let retained = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (_release, released) = watch::channel(false);
+        let mut tasks = Vec::new();
+        for request_id in 1..=super::server::MAX_HTTP_BODY_READERS + 32 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v2/execute")
+                .header(header::CONTENT_TYPE, PRODUCT_MEDIA_TYPE)
+                .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                .header(REQUEST_ID_HEADER, request_id.to_string())
+                .header(header::AUTHORIZATION, "Bearer not-a-key")
+                .body(Body::from_stream(RetainedSlowBody::new(
+                    Arc::clone(&retained),
+                    Arc::clone(&maximum),
+                    released.clone(),
+                )))?;
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move { app.oneshot(request).await }));
+        }
+        for task in tasks {
+            assert_eq!(task.await??.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 0);
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+        assert_eq!(server.state.body_slots.available_permits(), baseline);
+        drop(fixture.service);
+        Ok(())
     }
 
     #[test]
@@ -363,6 +722,265 @@ mod tests {
             decode_product_response(&response_bytes(response).await?)?,
             hyphae_native_product::ProductResponse::Capabilities(_)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migrated_legacy_bearer_is_http_only_cannot_fallback_from_hyp1_and_revokes_live_session()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("legacy-migration-window");
+        fs::create_dir_all(&directory.0)?;
+        let data = directory.0.join("data");
+        let key_path = directory.0.join("canonical.key");
+        let legacy = "legacy-bearer-canary-0123456789abcdef";
+        let mut product = NativeProduct::create(&data)?;
+        drop(product);
+        product = NativeProduct::open_offline_owner(&data)?;
+        let started = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy.as_bytes(),
+            1,
+        )?;
+        let canonical = started.secret.expose_secret().to_owned();
+        let pending_service =
+            NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        NativeHttpV2Server::new(
+            pending_service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(legacy)?),
+                ..NativeHttpV2Config::default()
+            },
+        )?;
+        product = pending_service.shutdown()?;
+        fs::write(&key_path, &canonical)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        }
+        product.activate_legacy_bearer_migration_offline(
+            started.key_id,
+            &canonical,
+            started.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy.as_bytes(),
+            2,
+        )?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        let app = NativeHttpV2Server::new(
+            service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(legacy)?),
+                ..NativeHttpV2Config::default()
+            },
+        )?
+        .test_router();
+
+        let accepted = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/execute",
+                request(ProductOperation::TransactionBegin)?,
+                Some("801"),
+                Some(legacy),
+                None,
+            )?)
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let retained = accepted.headers()[hyphae_contracts::v2::SESSION_ID_HEADER_V2]
+            .to_str()?
+            .to_owned();
+        let ProductResponse::ExplicitTransactionStatus(
+            hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+        ) = decode_product_response(&response_bytes(accepted).await?)?
+        else {
+            return Err("legacy session did not begin a transaction".into());
+        };
+
+        let canonical_looking_legacy = concat!(
+            "hyp1_11111111111111111111111111111111_",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let denied = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some("802"),
+                Some(canonical_looking_legacy),
+                None,
+            )?)
+            .await?;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let owner = service.handle().open_authenticated_session(
+            hyphae_native_product::ApiKeyCredential::new(&canonical)?,
+        )?;
+        let mut context = owner.request_context(803, 3);
+        context.idempotency_token = Some(803);
+        owner.dispatch(context, ProductOperation::SecurityLegacyBearerRevoke)?;
+
+        let retained_denied = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionRollback { handle })?,
+                "804",
+                Some(legacy),
+                Some(&retained),
+            )?)
+            .await?;
+        assert_eq!(retained_denied.status(), StatusCode::FORBIDDEN);
+        let fresh_denied = app
+            .oneshot(http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some("805"),
+                Some(legacy),
+                None,
+            )?)
+            .await?;
+        assert_eq!(fresh_denied.status(), StatusCode::UNAUTHORIZED);
+        drop(owner);
+        drop(service);
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_legacy_bearer_configuration_must_match_exactly() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("legacy-exact-config");
+        fs::create_dir_all(&directory.0)?;
+        let data = directory.0.join("data");
+        let legacy_a = "legacy-bearer-a-0123456789abcdef012345";
+        let legacy_b = "legacy-bearer-b-0123456789abcdef012345";
+        drop(NativeProduct::create(&data)?);
+        let mut product = NativeProduct::open_offline_owner(&data)?;
+        let started = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy_a.as_bytes(),
+            1,
+        )?;
+        let canonical = started.secret.expose_secret().to_owned();
+        product.activate_legacy_bearer_migration_offline(
+            started.key_id,
+            &canonical,
+            started.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy_a.as_bytes(),
+            2,
+        )?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        NativeHttpV2Server::new(
+            service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(legacy_a)?),
+                ..NativeHttpV2Config::default()
+            },
+        )?;
+        let wrong = NativeHttpV2Server::new(
+            service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(legacy_b)?),
+                ..NativeHttpV2Config::default()
+            },
+        );
+        assert!(matches!(
+            wrong,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::LegacyBearerMismatch
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn compatibility_version_1_3_rejects_enabled_legacy_state_but_preserves_revoked_startup()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("legacy-version-gate");
+        fs::create_dir_all(&directory.0)?;
+        let data = directory.0.join("data");
+        let legacy = "legacy-version-canary-0123456789abcdef";
+        let mut product = NativeProduct::create(&data)?;
+        drop(product);
+        product = NativeProduct::open_offline_owner(&data)?;
+        let started = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy.as_bytes(),
+            1,
+        )?;
+        let canonical = started.secret.expose_secret().to_owned();
+        product.activate_legacy_bearer_migration_offline(
+            started.key_id,
+            &canonical,
+            started.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy.as_bytes(),
+            2,
+        )?;
+        let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+        let version_1_3 =
+            hyphae_native_product::LegacyBearerCompatibilityVersion { major: 1, minor: 3 };
+        let configured = NativeHttpV2Server::new(
+            service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(legacy)?),
+                legacy_compatibility_version: version_1_3,
+                ..NativeHttpV2Config::default()
+            },
+        );
+        assert!(matches!(
+            configured,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::LegacyCompatibilityExpired { .. }
+            ))
+        ));
+        let owner = service.handle().open_authenticated_session(
+            hyphae_native_product::ApiKeyCredential::new(&canonical)?,
+        )?;
+        let mut context = owner.request_context(901, 3);
+        context.idempotency_token = Some(901);
+        owner.dispatch(context, ProductOperation::SecurityLegacyBearerRevoke)?;
+        NativeHttpV2Server::new(
+            service.handle(),
+            NativeHttpV2Config {
+                legacy_compatibility_version: version_1_3,
+                ..NativeHttpV2Config::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn normal_bootstrap_never_enables_legacy_and_state_requires_exact_configuration()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("legacy-state-config-matrix", false)?;
+        assert_eq!(
+            fixture.service.handle().legacy_bearer_state(),
+            hyphae_native_product::LegacyBearerState::NeverEnabled
+        );
+        let configured = NativeHttpV2Server::new(
+            fixture.service.handle(),
+            NativeHttpV2Config {
+                legacy_bearer_token: Some(BearerToken::new(
+                    "normal-bootstrap-cannot-enable-legacy",
+                )?),
+                ..NativeHttpV2Config::default()
+            },
+        );
+        assert!(matches!(
+            configured,
+            Err(super::NativeHttpV2Error::Configuration(
+                NativeHttpV2ConfigError::LegacyStateConfigurationMismatch { .. }
+            ))
+        ));
+        NativeHttpV2Server::new(fixture.service.handle(), NativeHttpV2Config::default())?;
         Ok(())
     }
 
@@ -557,6 +1175,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_http_request_replays_self_revoke_after_ack_loss() -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("self-revoke-reconnect", true)?;
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let operation = ProductOperation::SecurityApiKeyRevokeSelf {
+            key_id: fixture.credential_key_id,
+        };
+        let first = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(operation.clone(), 0x7b01)?,
+                Some("301"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(first.status(), StatusCode::OK);
+        drop(first);
+
+        let replay = app
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(operation, 0x7b01)?,
+                Some("302"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(replay).await?)?,
+            ProductResponse::SecurityMutated(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_is_uniformly_rejected_without_exact_lifecycle_replay()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("revoked-no-oracle", false)?;
+        let handle = fixture.service.handle();
+        let actor = handle.open_authenticated_session(
+            hyphae_native_product::ApiKeyCredential::new(&fixture.credential)?,
+        )?;
+        actor.dispatch(
+            actor.request_context(1, 1).with_idempotency_token(1),
+            ProductOperation::SecurityApiKeyRevokeSelf {
+                key_id: fixture.credential_key_id,
+            },
+        )?;
+        let app =
+            NativeHttpV2Server::new_managed(handle, NativeHttpV2Config::default())?.test_router();
+        let unknown = concat!(
+            "hyp1_11111111111111111111111111111111_",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let credentials = [
+            ("revoked", fixture.credential.as_str()),
+            ("unknown", unknown),
+            ("malformed", "hyp1_short"),
+        ];
+        let mut expected = None;
+        for path in [
+            "/v2/capabilities",
+            "/v2/execute",
+            "/v2/sql",
+            "/v2/security/keys",
+        ] {
+            for (case, credential) in credentials {
+                let request = if path == "/v2/capabilities" {
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
+                        .header(REQUEST_ID_HEADER, "401")
+                        .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())?
+                } else {
+                    http_request(
+                        path,
+                        request(ProductOperation::Capabilities)?,
+                        Some("401"),
+                        Some(credential),
+                        None,
+                    )?
+                };
+                let actual = response_snapshot(app.clone().oneshot(request).await?).await?;
+                assert_eq!(actual.0, StatusCode::UNAUTHORIZED, "{case} on {path}");
+                assert_eq!(
+                    actual.1[header::WWW_AUTHENTICATE],
+                    "Bearer realm=\"hyphae-native-v2\"",
+                    "{case} on {path}"
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&actual, expected, "{case} differs on {path}");
+                } else {
+                    expected = Some(actual);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_http_request_replays_zero_overlap_self_rotation_after_ack_loss()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("self-rotate-reconnect", false)?;
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let started = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(
+                    ProductOperation::SecurityApiKeyRotateSelfStart {
+                        predecessor_key_id: fixture.credential_key_id,
+                        label: "zero-overlap".to_owned(),
+                        overlap_seconds: 0,
+                        expires_at_micros: None,
+                    },
+                    0x7b02,
+                )?,
+                Some("303"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(started.status(), StatusCode::OK);
+        let ProductResponse::SecurityApiKeyStarted(started) =
+            decode_product_response(&response_bytes(started).await?)?
+        else {
+            return Err("rotation start returned the wrong response".into());
+        };
+        let successor = started.secret.take().ok_or("missing successor secret")?;
+        let operation = ProductOperation::SecurityApiKeyRotateSelfActivate {
+            successor_key_id: started.key_id,
+            confirmation_digest: successor.confirmation_digest(),
+        };
+        let first = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(operation.clone(), 0x7b03)?,
+                Some("304"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(first.status(), StatusCode::OK);
+        drop(first);
+
+        let replay = app
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(operation, 0x7b03)?,
+                Some("305"),
+                Some(&fixture.credential),
+                None,
+            )?)
+            .await?;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(replay).await?)?,
+            ProductResponse::SecurityApiKeyActivated(ref receipt)
+                if receipt.key_id == started.key_id
+                    && receipt.predecessor_key_id == Some(fixture.credential_key_id)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn managed_permission_denial_is_typed_forbidden_without_challenge()
     -> Result<(), Box<dyn Error>> {
         let fixture = managed_service("managed-permission", true)?;
@@ -588,7 +1384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_session_reports_post_open_revocation_as_typed_forbidden()
+    async fn retained_managed_session_cannot_turn_pending_terminal_into_forbidden()
     -> Result<(), Box<dyn Error>> {
         let fixture = managed_service("managed-session-revocation", true)?;
         let handle = fixture.service.handle();
@@ -635,10 +1431,14 @@ mod tests {
             return Err("managed prepare returned the wrong response".into());
         };
 
-        handle.revoke_api_key(
-            fixture.owner_authority.clone(),
-            fixture.credential_key_id,
-            6,
+        let owner = handle.open_authenticated_session(
+            hyphae_native_product::ApiKeyCredential::new(&fixture.owner_credential)?,
+        )?;
+        owner.dispatch(
+            owner.request_context(999, 6).with_idempotency_token(999),
+            ProductOperation::SecurityApiKeyRevoke {
+                key_id: fixture.credential_key_id,
+            },
         )?;
         let revoked = app
             .oneshot(http_request_with_session(
@@ -653,8 +1453,8 @@ mod tests {
             )?)
             .await?;
 
-        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-        assert!(!revoked.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        assert!(revoked.headers().contains_key(header::WWW_AUTHENTICATE));
         let denied: Value = serde_json::from_slice(&response_bytes(revoked).await?)?;
         assert_eq!(denied["code"], "authorization_denied");
         assert_eq!(denied["request_id"], "212");
@@ -1033,6 +1833,337 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn two_clients_with_the_same_request_id_cancel_independently() -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("cancellation-namespace")?;
+        let server = NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?;
+        let first_session =
+            hyphae_native_product::ProductSessionId::new(1).ok_or("invalid first session")?;
+        let second_session =
+            hyphae_native_product::ProductSessionId::new(2).ok_or("invalid second session")?;
+        let first = server
+            .test_register_cancellation(first_session, 91)
+            .map_err(|_| "first cancellation registration failed")?;
+        let second = server
+            .test_register_cancellation(second_session, 91)
+            .map_err(|_| "second cancellation registration failed")?;
+        assert!(server.test_cancellation(91).is_none());
+        let first_token = first.token.clone();
+        let second_token = second.token.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            first_barrier.wait();
+            drop(first);
+        });
+        barrier.wait();
+        worker.join().map_err(|_| "first client panicked")?;
+        assert!(first_token.is_cancelled());
+        assert!(!second_token.is_cancelled());
+        let remaining = server
+            .test_cancellation(91)
+            .ok_or("second client cancellation was removed by first client")?;
+        assert!(!remaining.is_cancelled());
+        drop(second);
+        assert!(server.test_cancellation(91).is_none());
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_request_is_rejected_before_mutation_admission()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("duplicate-request-admission")?;
+        let server = NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?;
+        let app = server.test_router();
+        let created = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::ExecuteSql {
+                    statement: "CREATE TABLE duplicate_guard (id BIGINT PRIMARY KEY, value BIGINT)"
+                        .to_owned(),
+                    parameters: Vec::new(),
+                })?,
+                "489",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let _ = response_bytes(created).await?;
+        let begun = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionBegin)?,
+                "490",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(begun.status(), StatusCode::OK);
+        let external_session = begun.headers()[hyphae_contracts::v2::SESSION_ID_HEADER_V2]
+            .to_str()?
+            .to_owned();
+        let external_session_id = u128::from_str_radix(&external_session, 16)?;
+        let ProductResponse::ExplicitTransactionStatus(
+            hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+        ) = decode_product_response(&response_bytes(begun).await?)?
+        else {
+            return Err("transaction begin returned the wrong response".into());
+        };
+        let product_session = server
+            .test_product_session_id(external_session_id)
+            .ok_or("HTTP session did not retain a product session")?;
+        let original = server
+            .test_register_cancellation(product_session, 491)
+            .map_err(|_| "failed to reserve original request identity")?;
+        let original_token = original.token.clone();
+
+        let duplicate = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::TransactionStageSql {
+                    handle,
+                    mutation: hyphae_native_product::ProductTransactionSqlMutation {
+                        statement: "UPDATE duplicate_guard SET value = 1 WHERE id = 1".to_owned(),
+                        parameters: Vec::new(),
+                    },
+                })?,
+                "491",
+                None,
+                Some(&external_session),
+            )?)
+            .await?;
+        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+        assert!(!original_token.is_cancelled());
+        drop(original);
+
+        let status = app
+            .oneshot(http_request_with_session(
+                "/v2/execute",
+                request(ProductOperation::ExplicitTransactionStatus { handle })?,
+                "492",
+                None,
+                Some(&external_session),
+            )?)
+            .await?;
+        let ProductResponse::ExplicitTransactionStatus(
+            hyphae_native_product::ProductExplicitTransactionStatus::Active {
+                staged_operations,
+                ..
+            },
+        ) = decode_product_response(&response_bytes(status).await?)?
+        else {
+            return Err("transaction status returned the wrong response".into());
+        };
+        assert_eq!(staged_operations, 0);
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn protocol_minor_is_negotiated_and_emitted_on_every_response()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("http-minor")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+
+        let success = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some("493"),
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(success.status(), StatusCode::OK);
+        assert_eq!(
+            success.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+            "3"
+        );
+
+        let mut unsupported = http_request(
+            "/v2/execute",
+            request(ProductOperation::Capabilities)?,
+            Some("494"),
+            None,
+            Some(ERROR_MEDIA_TYPE),
+        )?;
+        unsupported
+            .headers_mut()
+            .insert(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "2".parse()?);
+        let unsupported = app.clone().oneshot(unsupported).await?;
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            unsupported.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+            "3"
+        );
+
+        for (request_id, minor) in [("496", None), ("497", Some("garbage"))] {
+            let mut request = http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some(request_id),
+                None,
+                Some(ERROR_MEDIA_TYPE),
+            )?;
+            request
+                .headers_mut()
+                .remove(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2);
+            if let Some(minor) = minor {
+                request.headers_mut().insert(
+                    hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                    minor.parse()?,
+                );
+            }
+            let rejected = app.clone().oneshot(request).await?;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+                "3"
+            );
+        }
+
+        let managed_fixture = managed_service("http-minor-managed", false)?;
+        let managed = NativeHttpV2Server::new_managed(
+            managed_fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        for (request_id, minor) in [("501", None), ("502", Some("2")), ("503", Some("bad"))] {
+            let mut request = http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some(request_id),
+                None,
+                Some(ERROR_MEDIA_TYPE),
+            )?;
+            request
+                .headers_mut()
+                .remove(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2);
+            if let Some(minor) = minor {
+                request.headers_mut().insert(
+                    hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                    minor.parse()?,
+                );
+            }
+            let rejected = managed.clone().oneshot(request).await?;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            assert!(!rejected.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
+
+        let error = app
+            .oneshot(http_request(
+                "/missing",
+                request(ProductOperation::Capabilities)?,
+                Some("495"),
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+            "3"
+        );
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_lifecycle_requires_dedicated_managed_strict_route()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = managed_service("key-route-family", false)?;
+        let owner = fixture.owner_credential.clone();
+        let actor = fixture
+            .service
+            .handle()
+            .open_authenticated_session(hyphae_native_product::ApiKeyCredential::new(&owner)?)?;
+        let principal_id: hyphae_native_product::SecurityId =
+            actor.request_context(1, 1).principal.identity().parse()?;
+        drop(actor);
+        let app = NativeHttpV2Server::new_managed(
+            fixture.service.handle(),
+            NativeHttpV2Config::default(),
+        )?
+        .test_router();
+        let operation = ProductOperation::SecurityApiKeyIssueSelfStart {
+            principal_id,
+            label: "route-family".to_owned(),
+            roles: vec![BuiltInRole::Owner],
+            custom_roles: Vec::new(),
+            permission_ceiling: ProductAuthorization::ALL,
+            scope_ceiling: vec![ProductScope::Instance],
+            expires_at_micros: None,
+        };
+
+        let generic = app
+            .clone()
+            .oneshot(http_request(
+                "/v2/execute",
+                mutation_request(operation.clone(), 0x7c01)?,
+                Some("498"),
+                Some(&owner),
+                Some(ERROR_MEDIA_TYPE),
+            )?)
+            .await?;
+        assert_eq!(generic.status(), StatusCode::BAD_REQUEST);
+
+        let mut non_strict =
+            hyphae_native_protocol::encode_product_request(&hyphae_native_protocol::WireRequest {
+                operation,
+                logical_time_micros: 1,
+                deadline_micros: None,
+                idempotency_token: Some(0x7c02),
+                limits: ProductLimits::default(),
+                durability: ProductDurabilityPolicy::STRICT,
+            })?;
+        non_strict[88] = 2;
+        let non_strict = app
+            .oneshot(http_request(
+                "/v2/security/keys",
+                non_strict,
+                Some("499"),
+                Some(&owner),
+                Some(ERROR_MEDIA_TYPE),
+            )?)
+            .await?;
+        assert_eq!(non_strict.status(), StatusCode::BAD_REQUEST);
+
+        let (_unmanaged_directory, unmanaged_service) = service("key-route-unmanaged")?;
+        let unmanaged =
+            NativeHttpV2Server::new(unmanaged_service.handle(), NativeHttpV2Config::default())?
+                .test_router();
+        let unmanaged = unmanaged
+            .oneshot(http_request(
+                "/v2/security/keys",
+                mutation_request(
+                    ProductOperation::SecurityApiKeyIssueSelfStart {
+                        principal_id,
+                        label: "unmanaged".to_owned(),
+                        roles: vec![BuiltInRole::Owner],
+                        custom_roles: Vec::new(),
+                        permission_ceiling: ProductAuthorization::ALL,
+                        scope_ceiling: vec![ProductScope::Instance],
+                        expires_at_micros: None,
+                    },
+                    0x7c03,
+                )?,
+                Some("500"),
+                None,
+                Some(ERROR_MEDIA_TYPE),
+            )?)
+            .await?;
+        assert_eq!(unmanaged.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn prepared_handles_are_opaque_and_principal_bound() -> Result<(), Box<dyn Error>> {
@@ -1167,7 +2298,8 @@ mod tests {
             request_id: 106,
             binary_errors: false,
         };
-        let authentication = super::server::RequestAuthentication::unmanaged(first);
+        let authentication =
+            super::server::NativeHttpV2Server::test_unmanaged_authentication(first);
         let (session_id, session) =
             super::server::create_session(&server.state, authentication, &metadata)
                 .map_err(|error| error.error.message().to_owned())?;
@@ -1370,6 +2502,83 @@ mod tests {
             super::server::OperationFamily::Search,
             &search,
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_family_rejects_every_api_key_lifecycle_variant() -> Result<(), Box<dyn Error>> {
+        let principal_id = hyphae_native_product::SecurityId::new(1).ok_or("principal")?;
+        let key_id = ApiKeyId::from_bytes([1; 16]).ok_or("key")?;
+        let confirmation_digest =
+            hyphae_native_product::ApiKeyConfirmationDigest::from_bytes([2; 32]);
+        let operations = [
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: "self issue".to_owned(),
+                roles: vec![BuiltInRole::Reader],
+                custom_roles: Vec::new(),
+                permission_ceiling: BuiltInRole::Reader.authorization(),
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyIssueStart {
+                principal_id,
+                label: "admin issue".to_owned(),
+                roles: vec![BuiltInRole::Reader],
+                custom_roles: Vec::new(),
+                permission_ceiling: BuiltInRole::Reader.authorization(),
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyIssueSelfActivate {
+                key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyIssueActivate {
+                key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyRotateSelfStart {
+                predecessor_key_id: key_id,
+                label: "self rotate".to_owned(),
+                overlap_seconds: 0,
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyRotateStart {
+                predecessor_key_id: key_id,
+                label: "admin rotate".to_owned(),
+                overlap_seconds: 0,
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyRotateSelfActivate {
+                successor_key_id: key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyRotateActivate {
+                successor_key_id: key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyIssueSelfAbort { key_id },
+            ProductOperation::SecurityApiKeyIssueAbort { key_id },
+            ProductOperation::SecurityApiKeyRotateSelfAbort {
+                successor_key_id: key_id,
+            },
+            ProductOperation::SecurityApiKeyRotateAbort {
+                successor_key_id: key_id,
+            },
+            ProductOperation::SecurityApiKeyRevokeSelf { key_id },
+            ProductOperation::SecurityApiKeyRevoke { key_id },
+        ];
+        for operation in operations {
+            assert!(!super::server::family_accepts(
+                super::server::OperationFamily::Any,
+                &operation,
+            ));
+            assert!(super::server::family_accepts(
+                super::server::OperationFamily::Security,
+                &operation,
+            ));
+        }
         Ok(())
     }
 

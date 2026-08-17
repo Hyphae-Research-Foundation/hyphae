@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_catalog::{
     CatalogName, CatalogObject, CatalogObjectKind, DependencyDirection, DependencyEdge,
@@ -9,29 +9,31 @@ use hyphae_native_product::proof::{
     NativeProofGenerationLimits, ProofCodecLimits, WitnessCodecLimits, decode_native_proof,
 };
 use hyphae_native_product::{
-    AccessControlLimits, AccessControlMutationReceipt, AccessControlStatus, AdminStatus, ApiKeyId,
-    AuthorizationEpoch, BackupInfo, BackupLimits, BackupRequest, BoundedSearchQuery, BuiltInRole,
-    CatalogCursor, CatalogDependencyRequest, CatalogListRequest, CatalogObjectSummary, CatalogPage,
-    CatalogVersion, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRecovery, DoctorReport,
-    DoctorRequest, DoctorStatus, MAX_SECURITY_LIST_ROWS, MetricKind, MetricValue, ObjectId,
-    ProductAnnExplanation, ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization,
-    ProductCheckpointReceipt, ProductCommitOutcome, ProductCommitReceipt,
-    ProductConvergenceExplanation, ProductConvergenceStrategy, ProductDocValue, ProductDocument,
-    ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCodecError,
-    ProductExplain, ProductExplicitCommitReceipt, ProductExplicitTransactionStatus,
-    ProductHashEntry, ProductHybridExplanation, ProductHybridVectorStrategy,
-    ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
-    ProductMissingPlacement, ProductNamedAggregation, ProductNamedAggregationValue,
-    ProductOperation, ProductPermission, ProductPhysicalObservation, ProductPreparedHandle,
-    ProductRead, ProductResponse, ProductRollbackReceipt, ProductScope,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
-    ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
-    ProductSearchRequest, ProductSearchResult, ProductSearchResults, ProductSearchSort,
-    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSortedSetEntry,
-    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
-    ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
-    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    AccessControlLimits, AccessControlMutationReceipt, AccessControlStatus, AdminStatus,
+    ApiKeyActivationReceipt, ApiKeyConfirmationDigest, ApiKeyId, ApiKeySecretDelivery,
+    ApiKeyStartReceipt, AuthorizationEpoch, BackupInfo, BackupLimits, BackupRequest,
+    BoundedSearchQuery, BuiltInRole, CatalogCursor, CatalogDependencyRequest, CatalogListRequest,
+    CatalogObjectSummary, CatalogPage, CatalogVersion, CatalogVisibleCursor,
+    CatalogVisibleListFilter, CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant,
+    CustomRoleMutationReceipt, DoctorRecovery, DoctorReport, DoctorRequest, DoctorStatus,
+    MAX_SECURITY_LIST_ROWS, MetricKind, MetricValue, ObjectId, ProductAnnExplanation,
+    ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization, ProductCheckpointReceipt,
+    ProductCommitOutcome, ProductCommitReceipt, ProductConvergenceExplanation,
+    ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
+    ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
+    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
+    ProductHybridExplanation, ProductHybridVectorStrategy, ProductIntegratedSearchHit,
+    ProductLexicalBranch, ProductLimits, ProductListSide, ProductMissingPlacement,
+    ProductNamedAggregation, ProductNamedAggregationValue, ProductOperation, ProductPermission,
+    ProductPhysicalObservation, ProductPreparedHandle, ProductRead, ProductResponse,
+    ProductRollbackReceipt, ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt,
+    ProductSearchOperator, ProductSearchRequest, ProductSearchResult, ProductSearchResults,
+    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
+    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProductVectorBranch,
     ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy, RestoreRequest,
@@ -109,6 +111,22 @@ const REQUEST_SECURITY_CUSTOM_ROLE_CREATE: u16 = 50;
 const REQUEST_SECURITY_BUILT_IN_ASSIGNMENT_CREATE: u16 = 51;
 const REQUEST_SECURITY_CUSTOM_ASSIGNMENT_CREATE: u16 = 52;
 const REQUEST_SECURITY_ASSIGNMENT_REVOKE: u16 = 53;
+const REQUEST_CATALOG_VISIBLE_LIST: u16 = 54;
+const REQUEST_SECURITY_API_KEY_ISSUE_SELF_START: u16 = 55;
+const REQUEST_SECURITY_API_KEY_ISSUE_START: u16 = 56;
+const REQUEST_SECURITY_API_KEY_ISSUE_SELF_ACTIVATE: u16 = 57;
+const REQUEST_SECURITY_API_KEY_ISSUE_ACTIVATE: u16 = 58;
+const REQUEST_SECURITY_API_KEY_ROTATE_SELF_START: u16 = 59;
+const REQUEST_SECURITY_API_KEY_ROTATE_START: u16 = 60;
+const REQUEST_SECURITY_API_KEY_ROTATE_SELF_ACTIVATE: u16 = 61;
+const REQUEST_SECURITY_API_KEY_ROTATE_ACTIVATE: u16 = 62;
+const REQUEST_SECURITY_API_KEY_ISSUE_SELF_ABORT: u16 = 63;
+const REQUEST_SECURITY_API_KEY_ISSUE_ABORT: u16 = 64;
+const REQUEST_SECURITY_API_KEY_ROTATE_SELF_ABORT: u16 = 65;
+const REQUEST_SECURITY_API_KEY_ROTATE_ABORT: u16 = 66;
+const REQUEST_SECURITY_API_KEY_REVOKE_SELF: u16 = 67;
+const REQUEST_SECURITY_API_KEY_REVOKE: u16 = 68;
+const REQUEST_SECURITY_LEGACY_BEARER_REVOKE: u16 = 70;
 
 const RESPONSE_CAPABILITIES: u16 = 1;
 const RESPONSE_PREPARED_SQL: u16 = 2;
@@ -151,6 +169,9 @@ const RESPONSE_SECURITY_PRINCIPAL_MUTATED: u16 = 38;
 const RESPONSE_SECURITY_CUSTOM_ROLE_MUTATED: u16 = 39;
 const RESPONSE_SECURITY_ASSIGNMENT_MUTATED: u16 = 40;
 const RESPONSE_SECURITY_MUTATED: u16 = 41;
+const RESPONSE_CATALOG_VISIBLE_PAGE: u16 = 42;
+const RESPONSE_SECURITY_API_KEY_STARTED: u16 = 43;
+const RESPONSE_SECURITY_API_KEY_ACTIVATED: u16 = 44;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -197,6 +218,11 @@ pub fn encode_product_request(request: &WireRequest) -> Result<Vec<u8>, ProductC
     if request.idempotency_token == Some(0)
         || (operation_requires_idempotency(&request.operation)
             && request.idempotency_token.is_none())
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    if operation_is_key_lifecycle(&request.operation)
+        && request.durability != ProductDurabilityPolicy::STRICT
     {
         return Err(ProductCodecError::InvalidValue);
     }
@@ -295,6 +321,11 @@ pub fn decode_product_request(encoded: &[u8]) -> Result<WireRequest, ProductCode
     if operation_requires_idempotency(&request.operation) && request.idempotency_token.is_none() {
         return Err(ProductCodecError::InvalidValue);
     }
+    if operation_is_key_lifecycle(&request.operation)
+        && request.durability != ProductDurabilityPolicy::STRICT
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
     Ok(request)
 }
 
@@ -357,6 +388,11 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             let mut body = Vec::new();
             encode_catalog_page(&mut body, value)?;
             (RESPONSE_CATALOG_PAGE, body)
+        }
+        ProductResponse::CatalogVisiblePage(value) => {
+            let mut body = Vec::new();
+            encode_catalog_visible_page(&mut body, value)?;
+            (RESPONSE_CATALOG_VISIBLE_PAGE, body)
         }
         ProductResponse::CatalogDependencyPage(value) => {
             let mut body = Vec::new();
@@ -635,6 +671,26 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             encode_receipt(&mut body, value.commit)?;
             (RESPONSE_SECURITY_MUTATED, body)
         }
+        ProductResponse::SecurityApiKeyStarted(value) => {
+            let mut body = Vec::new();
+            body.extend_from_slice(value.key_id.as_bytes());
+            body.extend_from_slice(&value.principal_id.to_be_bytes());
+            encode_optional_api_key_id(&mut body, value.predecessor_key_id);
+            encode_authorization_epoch(&mut body, value.authorization_epoch)?;
+            encode_receipt(&mut body, value.commit)?;
+            let secret = value.secret.take().ok_or(ProductCodecError::Unsupported)?;
+            put_bytes(&mut body, secret.expose_secret_bytes())?;
+            (RESPONSE_SECURITY_API_KEY_STARTED, body)
+        }
+        ProductResponse::SecurityApiKeyActivated(value) => {
+            let mut body = Vec::new();
+            body.extend_from_slice(value.key_id.as_bytes());
+            encode_optional_api_key_id(&mut body, value.predecessor_key_id);
+            encode_fixed_optional_i64(&mut body, value.overlap_until_micros);
+            encode_authorization_epoch(&mut body, value.authorization_epoch)?;
+            encode_receipt(&mut body, value.commit)?;
+            (RESPONSE_SECURITY_API_KEY_ACTIVATED, body)
+        }
         ProductResponse::Proven { response, artifact } => {
             let mut body = Vec::new();
             put_bytes(&mut body, &encode_product_response(response)?)?;
@@ -693,6 +749,9 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
                 .map_err(|_| ProductCodecError::InvalidValue)?,
         }),
         RESPONSE_CATALOG_PAGE => ProductResponse::CatalogPage(decode_catalog_page(&mut decoder)?),
+        RESPONSE_CATALOG_VISIBLE_PAGE => {
+            ProductResponse::CatalogVisiblePage(decode_catalog_visible_page(&mut decoder)?)
+        }
         RESPONSE_CATALOG_DEPENDENCY_PAGE => {
             ProductResponse::CatalogDependencyPage(decode_dependency_page(&mut decoder)?)
         }
@@ -931,6 +990,35 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
                 commit: decode_receipt(&mut decoder)?,
             })
         }
+        RESPONSE_SECURITY_API_KEY_STARTED => {
+            let key_id = decode_api_key_id(decoder.array()?)?;
+            let principal_id = decode_security_id(decoder.array()?)?;
+            let predecessor_key_id = decode_optional_api_key_id(&mut decoder)?;
+            let authorization_epoch = decode_authorization_epoch(&mut decoder)?;
+            let commit = decode_receipt(&mut decoder)?;
+            let secret = ApiKeySecretDelivery::from_bytes(&decoder.owned_bytes()?)
+                .map_err(|_| ProductCodecError::InvalidValue)?;
+            if secret.id() != key_id {
+                return Err(ProductCodecError::InvalidValue);
+            }
+            ProductResponse::SecurityApiKeyStarted(ApiKeyStartReceipt {
+                key_id,
+                principal_id,
+                predecessor_key_id,
+                authorization_epoch,
+                commit,
+                secret,
+            })
+        }
+        RESPONSE_SECURITY_API_KEY_ACTIVATED => {
+            ProductResponse::SecurityApiKeyActivated(ApiKeyActivationReceipt {
+                key_id: decode_api_key_id(decoder.array()?)?,
+                predecessor_key_id: decode_optional_api_key_id(&mut decoder)?,
+                overlap_until_micros: decode_fixed_optional_i64(&mut decoder)?,
+                authorization_epoch: decode_authorization_epoch(&mut decoder)?,
+                commit: decode_receipt(&mut decoder)?,
+            })
+        }
         RESPONSE_SEARCH_INGESTED => {
             ProductResponse::SearchIngested(decode_search_ingest_receipt(&mut decoder)?)
         }
@@ -1004,6 +1092,22 @@ fn ensure_operation_minor(
         | ProductOperation::SecurityBuiltInAssignmentCreate { .. }
         | ProductOperation::SecurityCustomAssignmentCreate { .. }
         | ProductOperation::SecurityAssignmentRevoke { .. } => 2,
+        ProductOperation::CatalogVisibleList(_)
+        | ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+        | ProductOperation::SecurityApiKeyIssueStart { .. }
+        | ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+        | ProductOperation::SecurityApiKeyIssueActivate { .. }
+        | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+        | ProductOperation::SecurityApiKeyRotateStart { .. }
+        | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+        | ProductOperation::SecurityApiKeyRotateActivate { .. }
+        | ProductOperation::SecurityApiKeyIssueSelfAbort { .. }
+        | ProductOperation::SecurityApiKeyIssueAbort { .. }
+        | ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+        | ProductOperation::SecurityApiKeyRotateAbort { .. }
+        | ProductOperation::SecurityApiKeyRevokeSelf { .. }
+        | ProductOperation::SecurityApiKeyRevoke { .. }
+        | ProductOperation::SecurityLegacyBearerRevoke => 3,
         ProductOperation::Prove { operation, .. } => {
             return ensure_operation_minor(operation, negotiated_minor);
         }
@@ -1031,6 +1135,9 @@ fn ensure_response_minor(
         | ProductResponse::SecurityCustomRoleMutated(_)
         | ProductResponse::SecurityAssignmentMutated(_)
         | ProductResponse::SecurityMutated(_) => 2,
+        ProductResponse::CatalogVisiblePage(_)
+        | ProductResponse::SecurityApiKeyStarted(_)
+        | ProductResponse::SecurityApiKeyActivated(_) => 3,
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
         }
@@ -1052,6 +1159,42 @@ fn operation_requires_idempotency(operation: &ProductOperation) -> bool {
             | ProductOperation::SecurityBuiltInAssignmentCreate { .. }
             | ProductOperation::SecurityCustomAssignmentCreate { .. }
             | ProductOperation::SecurityAssignmentRevoke { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+            | ProductOperation::SecurityApiKeyIssueStart { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+            | ProductOperation::SecurityApiKeyRotateStart { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyIssueAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateAbort { .. }
+            | ProductOperation::SecurityApiKeyRevokeSelf { .. }
+            | ProductOperation::SecurityApiKeyRevoke { .. }
+            | ProductOperation::SecurityLegacyBearerRevoke
+    )
+}
+
+fn operation_is_key_lifecycle(operation: &ProductOperation) -> bool {
+    matches!(
+        operation,
+        ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+            | ProductOperation::SecurityApiKeyIssueStart { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+            | ProductOperation::SecurityApiKeyRotateStart { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyIssueAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateAbort { .. }
+            | ProductOperation::SecurityApiKeyRevokeSelf { .. }
+            | ProductOperation::SecurityApiKeyRevoke { .. }
+            | ProductOperation::SecurityLegacyBearerRevoke
     )
 }
 
@@ -1090,6 +1233,25 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             put_u64(&mut body, request.visit_limit)?;
             put_u64(&mut body, request.byte_limit)?;
             REQUEST_CATALOG_LIST
+        }
+        ProductOperation::CatalogVisibleList(request) => {
+            body.push(u8::from(request.filter.parent.is_some()));
+            body.push(request.filter.kind.map_or(0, |kind| kind as u8));
+            body.extend_from_slice(&[0; 6]);
+            if let Some(parent) = request.filter.parent {
+                body.extend_from_slice(&parent.get().to_le_bytes());
+            }
+            put_bytes(
+                &mut body,
+                request
+                    .cursor
+                    .as_ref()
+                    .map_or(&[], CatalogVisibleCursor::as_bytes),
+            )?;
+            put_u64(&mut body, request.item_limit)?;
+            put_u64(&mut body, request.visit_limit)?;
+            put_u64(&mut body, request.byte_limit)?;
+            REQUEST_CATALOG_VISIBLE_LIST
         }
         ProductOperation::CatalogDependencies(request) => {
             body.extend_from_slice(&request.object.get().to_le_bytes());
@@ -1352,6 +1514,135 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             body.extend_from_slice(&assignment_id.to_be_bytes());
             REQUEST_SECURITY_ASSIGNMENT_REVOKE
         }
+        ProductOperation::SecurityApiKeyIssueSelfStart {
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            expires_at_micros,
+        }
+        | ProductOperation::SecurityApiKeyIssueStart {
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            expires_at_micros,
+        } => {
+            body.extend_from_slice(&principal_id.to_be_bytes());
+            put_security_text(&mut body, label)?;
+            encode_built_in_roles(&mut body, roles)?;
+            encode_security_ids(&mut body, custom_roles)?;
+            body.extend_from_slice(&permission_ceiling.bits().to_le_bytes());
+            encode_product_scopes(&mut body, scope_ceiling)?;
+            encode_fixed_optional_i64(&mut body, *expires_at_micros);
+            if matches!(
+                operation,
+                ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+            ) {
+                REQUEST_SECURITY_API_KEY_ISSUE_SELF_START
+            } else {
+                REQUEST_SECURITY_API_KEY_ISSUE_START
+            }
+        }
+        ProductOperation::SecurityApiKeyIssueSelfActivate {
+            key_id,
+            confirmation_digest,
+        }
+        | ProductOperation::SecurityApiKeyIssueActivate {
+            key_id,
+            confirmation_digest,
+        } => {
+            body.extend_from_slice(key_id.as_bytes());
+            body.extend_from_slice(confirmation_digest.as_bytes());
+            if matches!(
+                operation,
+                ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+            ) {
+                REQUEST_SECURITY_API_KEY_ISSUE_SELF_ACTIVATE
+            } else {
+                REQUEST_SECURITY_API_KEY_ISSUE_ACTIVATE
+            }
+        }
+        ProductOperation::SecurityApiKeyRotateSelfStart {
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+        }
+        | ProductOperation::SecurityApiKeyRotateStart {
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+        } => {
+            body.extend_from_slice(predecessor_key_id.as_bytes());
+            put_security_text(&mut body, label)?;
+            body.extend_from_slice(&overlap_seconds.to_le_bytes());
+            encode_fixed_optional_i64(&mut body, *expires_at_micros);
+            if matches!(
+                operation,
+                ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+            ) {
+                REQUEST_SECURITY_API_KEY_ROTATE_SELF_START
+            } else {
+                REQUEST_SECURITY_API_KEY_ROTATE_START
+            }
+        }
+        ProductOperation::SecurityApiKeyRotateSelfActivate {
+            successor_key_id,
+            confirmation_digest,
+        }
+        | ProductOperation::SecurityApiKeyRotateActivate {
+            successor_key_id,
+            confirmation_digest,
+        } => {
+            body.extend_from_slice(successor_key_id.as_bytes());
+            body.extend_from_slice(confirmation_digest.as_bytes());
+            if matches!(
+                operation,
+                ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+            ) {
+                REQUEST_SECURITY_API_KEY_ROTATE_SELF_ACTIVATE
+            } else {
+                REQUEST_SECURITY_API_KEY_ROTATE_ACTIVATE
+            }
+        }
+        ProductOperation::SecurityApiKeyIssueSelfAbort { key_id }
+        | ProductOperation::SecurityApiKeyIssueAbort { key_id }
+        | ProductOperation::SecurityApiKeyRevokeSelf { key_id }
+        | ProductOperation::SecurityApiKeyRevoke { key_id } => {
+            body.extend_from_slice(key_id.as_bytes());
+            match operation {
+                ProductOperation::SecurityApiKeyIssueSelfAbort { .. } => {
+                    REQUEST_SECURITY_API_KEY_ISSUE_SELF_ABORT
+                }
+                ProductOperation::SecurityApiKeyIssueAbort { .. } => {
+                    REQUEST_SECURITY_API_KEY_ISSUE_ABORT
+                }
+                ProductOperation::SecurityApiKeyRevokeSelf { .. } => {
+                    REQUEST_SECURITY_API_KEY_REVOKE_SELF
+                }
+                ProductOperation::SecurityApiKeyRevoke { .. } => REQUEST_SECURITY_API_KEY_REVOKE,
+                _ => return Err(ProductCodecError::InvalidValue),
+            }
+        }
+        ProductOperation::SecurityApiKeyRotateSelfAbort { successor_key_id }
+        | ProductOperation::SecurityApiKeyRotateAbort { successor_key_id } => {
+            body.extend_from_slice(successor_key_id.as_bytes());
+            if matches!(
+                operation,
+                ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+            ) {
+                REQUEST_SECURITY_API_KEY_ROTATE_SELF_ABORT
+            } else {
+                REQUEST_SECURITY_API_KEY_ROTATE_ABORT
+            }
+        }
+        ProductOperation::SecurityLegacyBearerRevoke => REQUEST_SECURITY_LEGACY_BEARER_REVOKE,
         ProductOperation::TransactionBegin => REQUEST_TRANSACTION_BEGIN,
         ProductOperation::TransactionStageSql { handle, mutation } => {
             body.extend_from_slice(&handle.get().to_le_bytes());
@@ -1387,7 +1678,9 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             REQUEST_EXPLICIT_TRANSACTION_STATUS
         }
         ProductOperation::Prove { operation, limits } => {
-            if matches!(operation.as_ref(), ProductOperation::Prove { .. }) {
+            if matches!(operation.as_ref(), ProductOperation::Prove { .. })
+                || operation.is_key_lifecycle()
+            {
                 return Err(ProductCodecError::InvalidValue);
             }
             let (operation_kind, operation_body) = encode_operation(operation)?;
@@ -1434,6 +1727,40 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
                     Some(decode_catalog_kind(kind)?)
                 },
                 cursor: decode_cursor(&mut decoder)?,
+                item_limit: decoder.usize()?,
+                visit_limit: decoder.usize()?,
+                byte_limit: decoder.usize()?,
+            })
+        }
+        REQUEST_CATALOG_VISIBLE_LIST => {
+            let has_parent = decoder.u8()?;
+            let kind = decoder.u8()?;
+            if has_parent > 1 || decoder.bytes(6)? != [0; 6] {
+                return Err(ProductCodecError::Malformed);
+            }
+            let parent = if has_parent == 1 {
+                Some(ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?)
+            } else {
+                None
+            };
+            let cursor = decoder.owned_bytes()?;
+            ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+                filter: CatalogVisibleListFilter {
+                    parent,
+                    kind: if kind == 0 {
+                        None
+                    } else {
+                        Some(decode_catalog_kind(kind)?)
+                    },
+                },
+                cursor: if cursor.is_empty() {
+                    None
+                } else {
+                    Some(
+                        CatalogVisibleCursor::new(cursor)
+                            .map_err(|_| ProductCodecError::InvalidValue)?,
+                    )
+                },
                 item_limit: decoder.usize()?,
                 visit_limit: decoder.usize()?,
                 byte_limit: decoder.usize()?,
@@ -1685,6 +2012,119 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
         REQUEST_SECURITY_ASSIGNMENT_REVOKE => ProductOperation::SecurityAssignmentRevoke {
             assignment_id: decode_security_id(decoder.array()?)?,
         },
+        REQUEST_SECURITY_API_KEY_ISSUE_SELF_START | REQUEST_SECURITY_API_KEY_ISSUE_START => {
+            let principal_id = decode_security_id(decoder.array()?)?;
+            let label = decode_security_text(&mut decoder)?;
+            let roles = decode_built_in_roles(&mut decoder)?;
+            let custom_roles = decode_security_ids(&mut decoder)?;
+            let permission_ceiling = ProductAuthorization::from_known_bits(decoder.u64()?)
+                .ok_or(ProductCodecError::InvalidValue)?;
+            let scope_ceiling = decode_product_scopes(&mut decoder)?;
+            let expires_at_micros = decode_fixed_optional_i64(&mut decoder)?;
+            if kind == REQUEST_SECURITY_API_KEY_ISSUE_SELF_START {
+                ProductOperation::SecurityApiKeyIssueSelfStart {
+                    principal_id,
+                    label,
+                    roles,
+                    custom_roles,
+                    permission_ceiling,
+                    scope_ceiling,
+                    expires_at_micros,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyIssueStart {
+                    principal_id,
+                    label,
+                    roles,
+                    custom_roles,
+                    permission_ceiling,
+                    scope_ceiling,
+                    expires_at_micros,
+                }
+            }
+        }
+        REQUEST_SECURITY_API_KEY_ISSUE_SELF_ACTIVATE | REQUEST_SECURITY_API_KEY_ISSUE_ACTIVATE => {
+            let key_id = decode_api_key_id(decoder.array()?)?;
+            let confirmation_digest = ApiKeyConfirmationDigest::from_bytes(decoder.array()?);
+            if kind == REQUEST_SECURITY_API_KEY_ISSUE_SELF_ACTIVATE {
+                ProductOperation::SecurityApiKeyIssueSelfActivate {
+                    key_id,
+                    confirmation_digest,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyIssueActivate {
+                    key_id,
+                    confirmation_digest,
+                }
+            }
+        }
+        REQUEST_SECURITY_API_KEY_ROTATE_SELF_START | REQUEST_SECURITY_API_KEY_ROTATE_START => {
+            let predecessor_key_id = decode_api_key_id(decoder.array()?)?;
+            let label = decode_security_text(&mut decoder)?;
+            let overlap_seconds = decoder.u64()?;
+            let expires_at_micros = decode_fixed_optional_i64(&mut decoder)?;
+            if kind == REQUEST_SECURITY_API_KEY_ROTATE_SELF_START {
+                ProductOperation::SecurityApiKeyRotateSelfStart {
+                    predecessor_key_id,
+                    label,
+                    overlap_seconds,
+                    expires_at_micros,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyRotateStart {
+                    predecessor_key_id,
+                    label,
+                    overlap_seconds,
+                    expires_at_micros,
+                }
+            }
+        }
+        REQUEST_SECURITY_API_KEY_ROTATE_SELF_ACTIVATE
+        | REQUEST_SECURITY_API_KEY_ROTATE_ACTIVATE => {
+            let successor_key_id = decode_api_key_id(decoder.array()?)?;
+            let confirmation_digest = ApiKeyConfirmationDigest::from_bytes(decoder.array()?);
+            if kind == REQUEST_SECURITY_API_KEY_ROTATE_SELF_ACTIVATE {
+                ProductOperation::SecurityApiKeyRotateSelfActivate {
+                    successor_key_id,
+                    confirmation_digest,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyRotateActivate {
+                    successor_key_id,
+                    confirmation_digest,
+                }
+            }
+        }
+        REQUEST_SECURITY_API_KEY_ISSUE_SELF_ABORT
+        | REQUEST_SECURITY_API_KEY_ISSUE_ABORT
+        | REQUEST_SECURITY_API_KEY_REVOKE_SELF
+        | REQUEST_SECURITY_API_KEY_REVOKE => {
+            let key_id = decode_api_key_id(decoder.array()?)?;
+            match kind {
+                REQUEST_SECURITY_API_KEY_ISSUE_SELF_ABORT => {
+                    ProductOperation::SecurityApiKeyIssueSelfAbort { key_id }
+                }
+                REQUEST_SECURITY_API_KEY_ISSUE_ABORT => {
+                    ProductOperation::SecurityApiKeyIssueAbort { key_id }
+                }
+                REQUEST_SECURITY_API_KEY_REVOKE_SELF => {
+                    ProductOperation::SecurityApiKeyRevokeSelf { key_id }
+                }
+                REQUEST_SECURITY_API_KEY_REVOKE => {
+                    ProductOperation::SecurityApiKeyRevoke { key_id }
+                }
+                _ => return Err(ProductCodecError::InvalidValue),
+            }
+        }
+        REQUEST_SECURITY_API_KEY_ROTATE_SELF_ABORT | REQUEST_SECURITY_API_KEY_ROTATE_ABORT => {
+            let successor_key_id = decode_api_key_id(decoder.array()?)?;
+            if kind == REQUEST_SECURITY_API_KEY_ROTATE_SELF_ABORT {
+                ProductOperation::SecurityApiKeyRotateSelfAbort { successor_key_id }
+            } else {
+                ProductOperation::SecurityApiKeyRotateAbort { successor_key_id }
+            }
+        }
+        REQUEST_SECURITY_LEGACY_BEARER_REVOKE => ProductOperation::SecurityLegacyBearerRevoke,
         REQUEST_TRANSACTION_BEGIN => ProductOperation::TransactionBegin,
         REQUEST_TRANSACTION_STAGE_SQL => ProductOperation::TransactionStageSql {
             handle: decode_transaction_handle(&mut decoder)?,
@@ -1721,7 +2161,7 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
             }
             let operation_body = decoder.owned_bytes()?;
             let operation = decode_operation(operation_kind, &operation_body)?;
-            if matches!(operation, ProductOperation::Prove { .. }) {
+            if matches!(operation, ProductOperation::Prove { .. }) || operation.is_key_lifecycle() {
                 return Err(ProductCodecError::InvalidValue);
             }
             ProductOperation::Prove {
@@ -2561,6 +3001,7 @@ fn encode_security_audit_targets(
             SecurityAuditTarget::Role(id) => (1, id.to_be_bytes()),
             SecurityAuditTarget::Assignment(id) => (2, id.to_be_bytes()),
             SecurityAuditTarget::Key(id) => (3, *id.as_bytes()),
+            SecurityAuditTarget::LegacyBearer => (4, [0; 16]),
         };
         encoded.push(kind);
         encoded.extend_from_slice(&[0; 7]);
@@ -2591,6 +3032,7 @@ fn decode_security_audit_targets(
             1 => SecurityAuditTarget::Role(decode_security_id(id)?),
             2 => SecurityAuditTarget::Assignment(decode_security_id(id)?),
             3 => SecurityAuditTarget::Key(decode_api_key_id(id)?),
+            4 if id == [0; 16] => SecurityAuditTarget::LegacyBearer,
             _ => return Err(ProductCodecError::InvalidValue),
         });
     }
@@ -5170,6 +5612,67 @@ fn decode_catalog_page(
         stop,
         visited,
         returned_bytes,
+    })
+}
+
+fn encode_catalog_visible_page(
+    encoded: &mut Vec<u8>,
+    page: &CatalogVisiblePage,
+) -> Result<(), ProductCodecError> {
+    put_bytes(
+        encoded,
+        page.cursor
+            .as_ref()
+            .map_or(&[], CatalogVisibleCursor::as_bytes),
+    )?;
+    put_u32(encoded, page.items.len())?;
+    for item in &page.items {
+        encoded.extend_from_slice(&item.id.get().to_le_bytes());
+        encoded.push(item.kind as u8);
+        encoded.push(u8::from(item.parent.is_some()));
+        encoded.extend_from_slice(&[0; 6]);
+        if let Some(parent) = item.parent {
+            encoded.extend_from_slice(&parent.get().to_le_bytes());
+        }
+        encode_qualified_name(encoded, &item.name)?;
+    }
+    Ok(())
+}
+
+fn decode_catalog_visible_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<CatalogVisiblePage, ProductCodecError> {
+    let cursor = decoder.owned_bytes()?;
+    let count = decoder.usize_u32()?;
+    if count > 4096 {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        let kind = decode_catalog_kind(decoder.u8()?)?;
+        let has_parent = decoder.u8()?;
+        if has_parent > 1 || decoder.bytes(6)? != [0; 6] {
+            return Err(ProductCodecError::Malformed);
+        }
+        items.push(CatalogObjectSummary {
+            id,
+            kind,
+            parent: if has_parent == 1 {
+                Some(ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?)
+            } else {
+                None
+            },
+            name: decode_qualified_name(decoder)?,
+        });
+    }
+    Ok(CatalogVisiblePage {
+        items,
+        cursor: if cursor.is_empty() {
+            None
+        } else {
+            Some(CatalogVisibleCursor::new(cursor).map_err(|_| ProductCodecError::InvalidValue)?)
+        },
     })
 }
 

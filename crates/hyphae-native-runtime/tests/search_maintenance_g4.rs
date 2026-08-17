@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! G4 maintenance and fail-closed corruption matrices for lexical and ANN search.
 

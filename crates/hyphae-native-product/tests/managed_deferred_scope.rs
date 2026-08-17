@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Managed scope contracts for work retained beyond one request.
 
@@ -19,8 +19,8 @@ use hyphae_native_product::{
     ProductPreparedHandle, ProductPrincipal, ProductRequestContext, ProductResponse, ProductScope,
     ProductSession, ProductSessionId, ProductStructureKey, ProductStructureMutation,
     ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionSearchMutation, ProductTransactionVectorMutation, ProductValue,
-    ProductVector, StructureKind,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionVectorMutation, ProductValue, ProductVector, StructureKind,
 };
 use hyphae_native_runtime::{HnswConfig, NativeDatabase, SqlResult, VectorMetric};
 use hyphae_native_types::{DurabilityClass, EngineKind, ObjectId};
@@ -102,7 +102,7 @@ impl ManagedDeferredFixture {
         seed.commit()?;
         drop(runtime);
 
-        let mut product = NativeProduct::open(&directory)?;
+        let mut product = NativeProduct::open_with_preview_default_scalar_migration(&directory)?;
         product.bootstrap_access_control_to_file("Owner", "owner", &owner_key_path, 1)?;
         let owner_secret = fs::read_to_string(&owner_key_path)?;
         Ok(Self {
@@ -618,5 +618,70 @@ fn managed_transaction_preserves_heterogeneous_permissions_per_object() -> Resul
         return Err("heterogeneous transaction did not commit".into());
     };
     assert_eq!(receipt.staged_operations, 2);
+    Ok(())
+}
+
+#[test]
+fn managed_transaction_sql_stage_retains_bound_target_through_commit_and_revocation()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedDeferredFixture::create("sql-stage-union")?;
+    let scopes = [ProductScope::CatalogObject(fixture.target_table)];
+
+    let mut admitted = fixture.managed_session("sql-stage-admitted", &scopes, 7)?;
+    let handle = begin_transaction(&mut fixture.product, &mut admitted.session, 1)?;
+    let request = context(&admitted.session, 2);
+    let response = fixture.product.dispatch(
+        &mut admitted.session,
+        &request,
+        ProductOperation::TransactionStageSql {
+            handle,
+            mutation: ProductTransactionSqlMutation {
+                statement: "UPDATE target_rows SET body = ? WHERE id = ?".to_owned(),
+                parameters: vec![
+                    ProductValue::Text("staged".to_owned()),
+                    ProductValue::Signed(1),
+                ],
+            },
+        },
+    )?;
+    assert!(matches!(response, ProductResponse::TransactionStaged(_)));
+    let request = context(&admitted.session, 3);
+    let response = fixture.product.dispatch(
+        &mut admitted.session,
+        &request,
+        ProductOperation::TransactionCommit { handle },
+    )?;
+    assert!(matches!(response, ProductResponse::TransactionCommitted(_)));
+
+    let mut revoked = fixture.managed_session("sql-stage-revoked", &scopes, 8)?;
+    let handle = begin_transaction(&mut fixture.product, &mut revoked.session, 10)?;
+    let request = context(&revoked.session, 11);
+    fixture.product.dispatch(
+        &mut revoked.session,
+        &request,
+        ProductOperation::TransactionStageSql {
+            handle,
+            mutation: ProductTransactionSqlMutation {
+                statement: "UPDATE target_rows SET body = ? WHERE id = ?".to_owned(),
+                parameters: vec![
+                    ProductValue::Text("revoked".to_owned()),
+                    ProductValue::Signed(1),
+                ],
+            },
+        },
+    )?;
+    let owner = fixture
+        .product
+        .authenticate_api_key(&fixture.owner_secret, 0)?;
+    fixture.product.revoke_api_key(&owner, revoked.key_id, 30)?;
+    let request = context(&revoked.session, 12);
+    let Err(error) = fixture.product.dispatch(
+        &mut revoked.session,
+        &request,
+        ProductOperation::TransactionCommit { handle },
+    ) else {
+        return Err("revoked SQL transaction committed".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
     Ok(())
 }

@@ -1,5 +1,5 @@
 {
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-relicensing-classification-v1",
   "target_release": "1.2.0",
   "licenses": {
@@ -82,6 +82,29 @@
           "paths": [
             ".github/assets/hyphae-lockup-reversed.svg",
             ".github/assets/hyphae-lockup.svg"
+          ]
+        }
+      },
+      {
+        "id": "third-party-material",
+        "priority": 11,
+        "category": "third-party-material",
+        "match": {
+          "kind": "exact",
+          "paths": [
+            "DCO",
+            "THIRD_PARTY_LICENSES.txt"
+          ]
+        }
+      },
+      {
+        "id": "software-notice-documents",
+        "priority": 19,
+        "category": "software",
+        "match": {
+          "kind": "basename",
+          "paths": [
+            "THIRD_PARTY_NOTICES.md"
           ]
         }
       },
@@ -333,49 +356,63 @@
     },
     "third_party": {
       "notice": "THIRD_PARTY_NOTICES.md",
-      "exact_paths": [],
+      "exact_paths": [
+        "DCO",
+        "THIRD_PARTY_LICENSES.txt"
+      ],
       "statement": "Third-party works retain their original terms; dependency, provenance, and historical-license records describe facts and are never rewritten as first-party grants."
     }
   },
   "effective_transition": {
-    "state": "preflight-only-not-effective",
-    "current_software_license": "AGPL-3.0-only",
+    "state": "effective-in-current-integration-tree",
+    "current_software_license": "Apache-2.0",
     "current_documentation_license": "CC-BY-SA-4.0",
-    "required_event": "one-atomic-relicensing-commit-after-all-preflight-evidence-is-accepted",
+    "effective_at_utc": "2026-08-16T13:15:26Z",
+    "transition_receipt": "docs/gates/evidence/relicensing-1.2.0-transition.json",
     "requires_all_preflight_evidence": true
   },
   "preflight": {
-    "overall_status": "blocked",
-    "completion_claim": false,
+    "overall_status": "accepted",
+    "completion_claim": true,
     "evidence_categories": [
       {
         "id": "counsel-approval",
         "required": true,
-        "status": "open-unclaimed",
-        "evidence": []
+        "status": "accepted-owner-attestation",
+        "evidence": [
+          "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+        ]
       },
       {
         "id": "copyright-relicensing-authority",
         "required": true,
-        "status": "open-unclaimed",
-        "evidence": []
+        "status": "accepted-owner-attestation",
+        "evidence": [
+          "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json",
+          "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+        ]
       },
       {
         "id": "prior-commitments",
         "required": true,
-        "status": "open-unclaimed",
-        "evidence": []
+        "status": "accepted-owner-attestation",
+        "evidence": [
+          "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json",
+          "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+        ]
       },
       {
         "id": "dependency-license-exact-sha",
         "required": true,
-        "status": "open-unclaimed",
-        "evidence": []
+        "status": "accepted-evidence",
+        "evidence": [
+          "docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json"
+        ]
       },
       {
         "id": "specification-classification",
         "required": true,
-        "status": "accepted-decision",
+        "status": "accepted-evidence",
         "evidence": [
           "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
           "config/relicensing-1.2.0-classification.json"
@@ -384,9 +421,38 @@
       {
         "id": "contribution-governance",
         "required": true,
-        "status": "open-unclaimed",
-        "evidence": []
+        "status": "accepted-evidence",
+        "evidence": [
+          "CONTRIBUTING.md",
+          "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json"
+        ]
       }
+    ]
+  },
+  "verification": {
+    "agpl_history_allowlist": [
+      "CHANGELOG.md",
+      "LICENSE-POLICY.md",
+      "README.md",
+      "config/relicensing-1.2.0-classification.json",
+      "docs/adr/0025-agplv3-code-and-cc-by-sa-documentation.md",
+      "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
+      "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
+      "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json",
+      "docs/roadmap.md",
+      "docs/roadmaps/1.2.0-relicensing.md",
+      "tools/check_license_policy.py",
+      "tools/check_relicensing_preflight.py",
+      "tools/produce_relicensing_dependency_receipt.py",
+      "tools/test_check_license_policy.py",
+      "tools/test_check_native_v2_authority_conformance.py"
+    ],
+    "distribution_copy_suffixes": [
+      "/LICENSE-POLICY.md"
+    ],
+    "historical_agpl_literal_allowlist": [
+      "AGPL-3.0-only",
+      "GNU Affero"
     ]
   }
 }

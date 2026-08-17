@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.check_relicensing_preflight import (
     CONTRACT_PATH,
     EXPECTED_GENERATED_COPIES,
     MAX_CONTRACT_BYTES,
     ROOT,
+    _git_read,
+    _git_read_unbounded,
     classify_path,
     load_contract,
     repository_paths,
     validate_contract,
     validate_historical_release_evidence,
+    validate_preflight_evidence,
 )
 
 
@@ -48,22 +53,16 @@ class RelicensingPreflightTests(unittest.TestCase):
                 evidence_path.parent.mkdir(parents=True, exist_ok=True)
                 evidence_path.write_text("evidence\n", encoding="utf-8")
 
-    def test_current_repository_contract_passes_with_truthful_blockers(self) -> None:
+    def test_current_repository_contract_passes_as_effective(self) -> None:
         result = validate_contract(self.contract, repository_paths(ROOT), ROOT)
         self.assertEqual(result.failures, [])
-        self.assertEqual(
-            result.blockers,
-            [
-                "counsel-approval",
-                "copyright-relicensing-authority",
-                "prior-commitments",
-                "dependency-license-exact-sha",
-                "contribution-governance",
-            ],
-        )
+        self.assertEqual(result.blockers, [])
 
     def test_historical_tags_match_the_frozen_apache_evidence(self) -> None:
         self.assertEqual(validate_historical_release_evidence(ROOT), [])
+
+    def test_source_bound_preflight_evidence_is_accepted(self) -> None:
+        self.assertEqual(validate_preflight_evidence(ROOT), [])
 
     def test_unknown_top_level_and_nested_keys_fail_closed(self) -> None:
         top_level = copy.deepcopy(self.contract)
@@ -167,7 +166,10 @@ class RelicensingPreflightTests(unittest.TestCase):
     def test_normative_roots_machine_contracts_and_readmes_are_exact(self) -> None:
         rules = self.contract["classification"]["rules"]
         expected = {
+            "DCO": "third-party-material",
             "NOTICE": "software",
+            "THIRD_PARTY_NOTICES.md": "software",
+            "crates/hyphae-core/THIRD_PARTY_NOTICES.md": "software",
             "contracts/openapi/hyphae-v2.yaml": "normative-specification",
             "crates/hyphae-contracts/assets/openapi/hyphae-v2.yaml": (
                 "normative-specification"
@@ -194,6 +196,16 @@ class RelicensingPreflightTests(unittest.TestCase):
                 category, ties = classify_path(path, rules)
                 self.assertEqual(ties, [])
                 self.assertEqual(category, expected_category)
+
+    def test_canonical_dco_is_exact_third_party_material(self) -> None:
+        rules = self.contract["classification"]["rules"]
+        category, ties = classify_path("DCO", rules)
+        self.assertEqual(ties, [])
+        self.assertEqual(category, "third-party-material")
+        self.assertEqual(
+            self.contract["boundaries"]["third_party"]["exact_paths"],
+            ["DCO", "THIRD_PARTY_LICENSES.txt"],
+        )
 
     def test_generated_contract_copies_inherit_apache_and_exact_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -249,24 +261,98 @@ class RelicensingPreflightTests(unittest.TestCase):
                 result.failures,
             )
 
-    def test_only_specification_decision_may_be_closed(self) -> None:
+    def test_accepted_legal_evidence_cannot_be_reopened_silently(self) -> None:
         false_claim = copy.deepcopy(self.contract)
         false_claim["preflight"]["evidence_categories"][0]["status"] = (
-            "accepted-decision"
+            "prepared-unverified"
         )
-        false_claim["preflight"]["evidence_categories"][0]["evidence"] = [
-            "docs/fake-counsel-receipt.md"
-        ]
         self.assertTrue(
             any("truthful frozen statuses" in error for error in self.validate(false_claim))
         )
 
         complete = copy.deepcopy(self.contract)
-        complete["preflight"]["overall_status"] = "complete"
-        complete["preflight"]["completion_claim"] = True
+        complete["preflight"]["overall_status"] = "blocked"
+        complete["preflight"]["completion_claim"] = False
         self.assertTrue(
-            any("truthfully remain blocked" in error for error in self.validate(complete))
+            any("accepted completion state" in error for error in self.validate(complete))
         )
+
+    def test_dependency_receipt_fails_closed_on_digest_drift(self) -> None:
+        receipt_path = ROOT / (
+            "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json"
+        )
+        original = receipt_path.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "docs" / "gates" / "evidence"
+            evidence.mkdir(parents=True)
+            for name in (
+                "relicensing-1.2.0-dependencies-fcf2f918.json",
+                "relicensing-1.2.0-dependency-license-aggregate.json",
+                "relicensing-1.2.0-repository-audit-fcf2f918.json",
+                "relicensing-1.2.0-representative-attestation.json",
+                "relicensing-1.2.0-dependabot-review.json",
+            ):
+                (evidence / name).write_bytes(
+                    (ROOT / "docs" / "gates" / "evidence" / name).read_bytes()
+                )
+            dependency = evidence / receipt_path.name
+            document = json.loads(original)
+            document["inventory"]["canonical_sha256"] = "0" * 64
+            dependency.write_text(
+                json.dumps(document),
+                encoding="utf-8",
+            )
+            with patch(
+                "tools.check_relicensing_preflight._git_read",
+                side_effect=lambda _root, *arguments: _git_read(ROOT, *arguments),
+            ), patch(
+                "tools.check_relicensing_preflight._git_read_unbounded",
+                side_effect=lambda _root, *arguments: _git_read_unbounded(
+                    ROOT, *arguments
+                ),
+            ):
+                failures = validate_preflight_evidence(root)
+            self.assertTrue(any("digest differs" in error for error in failures))
+
+    def test_each_decisive_attestation_boolean_fails_closed_when_false(self) -> None:
+        source = ROOT / "docs/gates/evidence"
+        mutations = (
+            ("statements_prepared_for_attestation", "transition_authorization", "confirmed"),
+            ("statements_prepared_for_attestation", "copyright_authority", "confirmed"),
+            ("statements_prepared_for_attestation", "counsel_approval", "qualified_open_source_counsel"),
+            ("statements_prepared_for_attestation", "counsel_approval", "written_approval_received"),
+            ("statements_prepared_for_attestation", "counsel_approval", "confidential_record_not_embedded"),
+            ("statements_prepared_for_attestation", "prior_commitments", "absence_confirmed"),
+            ("identity_dispositions", "ec2_user_commits", "authority_confirmed"),
+            ("identity_dispositions", "dependabot_commits", "authority_confirmed"),
+        )
+        for section, item, field in mutations:
+            with self.subTest(field=f"{section}.{item}.{field}"), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "docs/gates/evidence"
+                target.mkdir(parents=True)
+                for path in (
+                    "relicensing-1.2.0-dependencies-fcf2f918.json",
+                    "relicensing-1.2.0-dependency-license-aggregate.json",
+                    "relicensing-1.2.0-repository-audit-fcf2f918.json",
+                    "relicensing-1.2.0-representative-attestation.json",
+                    "relicensing-1.2.0-dependabot-review.json",
+                ):
+                    (target / path).write_bytes((source / path).read_bytes())
+                attestation_path = target / "relicensing-1.2.0-representative-attestation.json"
+                attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+                attestation[section][item][field] = False
+                attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+                with patch(
+                    "tools.check_relicensing_preflight._git_read",
+                    side_effect=lambda _root, *arguments: _git_read(ROOT, *arguments),
+                ), patch(
+                    "tools.check_relicensing_preflight._git_read_unbounded",
+                    side_effect=lambda _root, *arguments: _git_read_unbounded(ROOT, *arguments),
+                ):
+                    failures = validate_preflight_evidence(root)
+                self.assertTrue(any("must be explicitly true" in error for error in failures))
 
 
 if __name__ == "__main__":

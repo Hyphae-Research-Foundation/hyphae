@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native whole-list lifecycle v1
 
 Status: implemented and retained by the closed G3 structure gate.

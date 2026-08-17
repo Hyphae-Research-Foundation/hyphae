@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     collections::BTreeMap,
@@ -35,7 +35,7 @@ use super::{
         NativeProofContent, NativeProofError, NativeProofGenerationLimits, NativeProofKind,
         NativeVerificationLimits, ProofObjectBinding, VectorMetric, limit,
     },
-    witness::bundle_native_witness,
+    witness::bundle_native_witness_with_checkpoint,
 };
 
 const REQUEST_MAGIC: &[u8; 8] = b"HYOPRQ02";
@@ -106,64 +106,7 @@ pub fn generate_native_operation_proof(
     let response = product
         .dispatch(session, context, operation.clone())
         .map_err(|_| NativeProofError::Invalid("proven operation execution failed"))?;
-    let captured = capture_execution(product, context, operation, response)?;
-    let checkpoint = checkpoint_authority(product, captured.snapshot)?;
-    let visible_csn = captured.snapshot.visible_csn.map_or(0, crate::Csn::get);
-    if checkpoint.0 != visible_csn {
-        return Err(NativeProofError::Invalid(
-            "proof checkpoint moved beyond the result snapshot",
-        ));
-    }
-    let anchor = NativeProofAnchor {
-        directory_lineage: captured.snapshot.directory_lineage,
-        history_epoch: product.database.directory_identity().history_epoch(),
-        visible_csn,
-        catalog_version: captured.snapshot.catalog_version.get(),
-        root_digest: captured.snapshot.root_digest,
-        checkpoint_sequence: checkpoint.0,
-        checkpoint_digest: checkpoint.1,
-    };
-    let witness = bundle_native_witness(product.data_directory(), anchor, &limits.witness)?;
-    let request = CanonicalBytes::new(encode_semantic_operation(&captured.operation)?);
-    let (result, evidence) = encode_claim(&captured.response, captured.snapshot)?;
-    enforce_generation_limits(
-        &captured.response,
-        result.len(),
-        evidence.len(),
-        limits.admitted,
-    )?;
-    let objects = collect_object_bindings(product, &captured.operation, &captured.response)?;
-    let ann = ann_metadata(
-        product,
-        &captured.operation,
-        &captured.response,
-        captured.snapshot,
-    )?;
-    let hybrid = hybrid_metadata(&captured.operation, &captured.response)?;
-    let proof_content = NativeProofContent {
-        kind: captured.kind,
-        anchor,
-        semantics_version: SEMANTICS_VERSION,
-        ordering_version: ORDERING_VERSION,
-        objects,
-        request,
-        result: CanonicalBytes::new(result),
-        evidence: CanonicalBytes::new(evidence),
-        limits: limits.admitted,
-        completion: CompletionStatus::Complete,
-        witness: witness.reference()?,
-        ann,
-        hybrid,
-    };
-    let proof = super::codec::finalize_proof(proof_content, &limits.proof)?;
-    let proof_bytes = encode_native_proof(&proof, &limits.proof)?;
-    let artifact = NativeOperationProofArtifact {
-        trusted_anchor: ExternalTrustedAnchor::new(anchor.digest()),
-        proof,
-        proof_bytes,
-        witness_bytes: witness.bytes,
-    };
-    Ok((captured.response, artifact))
+    generate_native_operation_proof_from_response(product, context, operation, response, limits)
 }
 
 fn checkpoint_authority(
@@ -208,12 +151,111 @@ pub(crate) fn dispatch_proven_operation(
     if matches!(operation, ProductOperation::Prove { .. }) {
         return Err(NativeProofError::Invalid("nested proof generation"));
     }
-    let (response, artifact) =
-        generate_native_operation_proof(product, session, context, operation, limits)?;
+    let response = match operation {
+        ProductOperation::ExecuteSql {
+            statement: _,
+            parameters,
+        } => {
+            let bound = session
+                .take_sql_binding(crate::session::ProductSessionSqlBindingKey::Execute(
+                    context.request_id,
+                ))
+                .map_err(|_| NativeProofError::Invalid("SQL proof binding unavailable"))?
+                .ok_or(NativeProofError::Invalid("SQL proof binding unavailable"))?;
+            let read = product
+                .execute_bound_sql_with_checkpoint(&bound, parameters, || {
+                    context.checkpoint().is_ok()
+                })
+                .map_err(|_| NativeProofError::Invalid("proven operation execution failed"))?;
+            ProductResponse::Sql {
+                result: read.value,
+                snapshot: Some(read.snapshot),
+                commit: None,
+            }
+        }
+        _ => product
+            .dispatch(session, context, operation.clone())
+            .map_err(|_| NativeProofError::Invalid("proven operation execution failed"))?,
+    };
+    let (response, artifact) = generate_native_operation_proof_from_response(
+        product, context, operation, response, limits,
+    )?;
     Ok(ProductResponse::Proven {
         response: Box::new(response),
         artifact: Box::new(artifact),
     })
+}
+
+fn generate_native_operation_proof_from_response(
+    product: &mut NativeProduct,
+    context: &ProductRequestContext,
+    operation: &ProductOperation,
+    response: ProductResponse,
+    limits: NativeProofGenerationLimits,
+) -> Result<(ProductResponse, NativeOperationProofArtifact), NativeProofError> {
+    let captured = capture_execution(product, context, operation, response)?;
+    let checkpoint = checkpoint_authority(product, captured.snapshot)?;
+    let visible_csn = captured.snapshot.visible_csn.map_or(0, crate::Csn::get);
+    if checkpoint.0 != visible_csn {
+        return Err(NativeProofError::Invalid(
+            "proof checkpoint moved beyond the result snapshot",
+        ));
+    }
+    let anchor = NativeProofAnchor {
+        directory_lineage: captured.snapshot.directory_lineage,
+        history_epoch: product.database.directory_identity().history_epoch(),
+        visible_csn,
+        catalog_version: captured.snapshot.catalog_version.get(),
+        root_digest: captured.snapshot.root_digest,
+        checkpoint_sequence: checkpoint.0,
+        checkpoint_digest: checkpoint.1,
+    };
+    let witness = bundle_native_witness_with_checkpoint(
+        product.data_directory(),
+        anchor,
+        &limits.witness,
+        || context.checkpoint().is_ok(),
+    )?;
+    let request = CanonicalBytes::new(encode_semantic_operation(&captured.operation)?);
+    let (result, evidence) = encode_claim(&captured.response, captured.snapshot)?;
+    enforce_generation_limits(
+        &captured.response,
+        result.len(),
+        evidence.len(),
+        limits.admitted,
+    )?;
+    let objects = collect_object_bindings(product, &captured.operation, &captured.response)?;
+    let ann = ann_metadata(
+        product,
+        &captured.operation,
+        &captured.response,
+        captured.snapshot,
+    )?;
+    let hybrid = hybrid_metadata(&captured.operation, &captured.response)?;
+    let proof_content = NativeProofContent {
+        kind: captured.kind,
+        anchor,
+        semantics_version: SEMANTICS_VERSION,
+        ordering_version: ORDERING_VERSION,
+        objects,
+        request,
+        result: CanonicalBytes::new(result),
+        evidence: CanonicalBytes::new(evidence),
+        limits: limits.admitted,
+        completion: CompletionStatus::Complete,
+        witness: witness.reference()?,
+        ann,
+        hybrid,
+    };
+    let proof = super::codec::finalize_proof(proof_content, &limits.proof)?;
+    let proof_bytes = encode_native_proof(&proof, &limits.proof)?;
+    let artifact = NativeOperationProofArtifact {
+        trusted_anchor: ExternalTrustedAnchor::new(anchor.digest()),
+        proof,
+        proof_bytes,
+        witness_bytes: witness.bytes,
+    };
+    Ok((captured.response, artifact))
 }
 
 /// Reopens the retained native authority and reexecutes a recognized operation proof.
@@ -310,6 +352,21 @@ impl ProofOperationClass for ProductOperation {
             | ProductOperation::SecurityAssignmentList(_)
             | ProductOperation::SecurityKeyList(_)
             | ProductOperation::SecurityAuditRead(_)
+            | ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+            | ProductOperation::SecurityApiKeyIssueStart { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+            | ProductOperation::SecurityApiKeyRotateStart { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfActivate { .. }
+            | ProductOperation::SecurityApiKeyRotateActivate { .. }
+            | ProductOperation::SecurityApiKeyIssueSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyIssueAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateSelfAbort { .. }
+            | ProductOperation::SecurityApiKeyRotateAbort { .. }
+            | ProductOperation::SecurityApiKeyRevokeSelf { .. }
+            | ProductOperation::SecurityApiKeyRevoke { .. }
+            | ProductOperation::SecurityLegacyBearerRevoke
             | ProductOperation::Prove { .. } => true,
             ProductOperation::ExecuteSql { statement, .. } => {
                 let first = statement

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 name: CI
 
 on:
@@ -26,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - name: Verify the pull-request integration tree
         if: github.event_name == 'pull_request'
         shell: bash
@@ -41,6 +43,13 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
+      - name: Enforce DCO sign-offs on the pull-request commit range
+        if: github.event_name == 'pull_request'
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_dco_signoffs -v
+          python tools/check_dco_signoffs.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
       - name: Verify Native access-control contract
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_access_control -v
@@ -53,9 +62,16 @@ jobs:
             tools.test_run_python_managed_v2_conformance \
             -v
           PYTHONPATH=. python tools/check_native_v2_authority_conformance.py
+      - name: Verify exhaustive security crash inventory
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_security_crash_matrix -v
+          PYTHONPATH=. python tools/check_security_crash_matrix.py
       - name: Verify Claude Code and Codex plugins
         run: |
-          PYTHONPATH=. python -m unittest tools.test_check_agent_plugins -v
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_agent_plugins \
+            tools.test_mcp_host_conformance \
+            -v
           PYTHONPATH=. python tools/check_agent_plugins.py
       - name: Verify open G7 and G8 authority
         run: |
@@ -157,6 +173,9 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Run exhaustive injected security crash matrix
+        if: matrix.run-native-conformance
+        run: cargo test --locked -p hyphae-native-product --test security_crash_matrix
       - name: Run native conformance profile
         if: matrix.run-native-conformance
         shell: bash
@@ -173,6 +192,74 @@ jobs:
         with:
           name: native-conformance-${{ matrix.native-platform }}
           path: native-conformance-${{ matrix.native-platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  security-hard-kill:
+    name: Security hard-kill shard ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run exact process hard-kill shard
+        run: |
+          cargo run --quiet --locked -p hyphae-native-product \
+            --example security_crash_matrix -- \
+            "${{ github.event.pull_request.head.sha || github.sha }}" \
+            "github-actions-ubuntu" \
+            "${{ matrix.shard }}" 4 \
+            > "security-process-crash-matrix-${{ matrix.shard }}.json"
+          PYTHONPATH=. python tools/check_security_crash_matrix.py
+      - name: Upload process hard-kill shard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-process-crash-matrix-${{ matrix.shard }}
+          path: security-process-crash-matrix-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  security-hard-kill-receipt:
+    name: Security hard-kill aggregate
+    needs: security-hard-kill
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Download process hard-kill shards
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: security-process-crash-matrix-*
+          path: security-process-crash-matrix
+          merge-multiple: true
+      - name: Validate exact aggregate
+        run: |
+          PYTHONPATH=. python tools/check_security_crash_matrix.py \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-0.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-1.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-2.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-3.json \
+            --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Upload security hard-kill aggregate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-hard-kill-${{ github.event.pull_request.head.sha || github.sha }}
+          path: security-process-crash-matrix/*.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true
@@ -261,6 +348,13 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm test
+      - name: Inspect clean npm package tarballs
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_npm_packages \
+            tools.test_check_registry_publish \
+            -v
+          python tools/check_npm_packages.py
       - name: Test Python SDK
         env:
           PYTHONPATH: sdks/python/src
@@ -280,6 +374,106 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_run_conformance -v
           python tools/run_conformance.py
+
+  mcp-real-hosts:
+    name: MCP real hosts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.16.0
+          package-manager-cache: false
+      - name: Install exact MCP hosts without lifecycle scripts
+        working-directory: conformance/mcp/hosts
+        run: npm ci --ignore-scripts
+      - name: Build CLI and MCP authority fixture
+        run: cargo build --locked -p hyphae-cli -p hyphae-v2-fixture
+      - name: Prepare MCP Auditor authority and start loopback HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          data_dir="$RUNNER_TEMP/hyphae-mcp-data"
+          owner_key="$RUNNER_TEMP/hyphae-mcp-owner.key"
+          auditor_key="$RUNNER_TEMP/hyphae-mcp-auditor.key"
+          target/debug/hyphae init --data-dir "$data_dir"
+          target/debug/hyphae security --data-dir "$data_dir" bootstrap \
+            --name "MCP Conformance Owner" \
+            --label "mcp-conformance-owner" \
+            --key-out "$owner_key"
+          target/debug/hyphae-v2-fixture \
+            --data-dir "$data_dir" \
+            --owner-key-file "$owner_key" \
+            --auditor-key-out "$auditor_key" \
+            --metadata-out "$RUNNER_TEMP/hyphae-mcp-fixture.json"
+          RUNNER_TRACKING_ID= target/debug/hyphae serve \
+            --data-dir "$data_dir" \
+            --endpoint "$RUNNER_TEMP/hyphae-mcp.sock" \
+            --http-bind 127.0.0.1:8787 \
+            --native-api-key-auth \
+            > "$RUNNER_TEMP/hyphae-mcp-daemon.stdout" \
+            2> "$RUNNER_TEMP/hyphae-mcp-daemon.stderr" &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 300); do
+            if grep -q 'hyphae native HTTP v2 listening on 127.0.0.1:8787' \
+              "$RUNNER_TEMP/hyphae-mcp-daemon.stderr"; then
+              break
+            fi
+            kill -0 "$daemon_pid"
+            sleep 0.1
+          done
+          kill -0 "$daemon_pid"
+          grep -q 'hyphae native HTTP v2 listening on 127.0.0.1:8787' \
+            "$RUNNER_TEMP/hyphae-mcp-daemon.stderr"
+          printf 'HYPHAE_NATIVE_API_KEY_FILE=%s\n' "$auditor_key" >> "$GITHUB_ENV"
+          printf 'PATH=%s/target/debug:%s/conformance/mcp/hosts/node_modules/.bin:%s\n' \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE" "$PATH" >> "$GITHUB_ENV"
+          printf '%s\n' "$daemon_pid" > "$RUNNER_TEMP/hyphae-mcp-daemon.pid"
+          disown "$daemon_pid"
+          trap - EXIT
+      - name: Run direct MCP and real hosted conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'kill "$(cat "$RUNNER_TEMP/hyphae-mcp-daemon.pid")" 2>/dev/null || true' EXIT
+          cargo test --locked -p hyphae-cli native_mcp
+          PYTHONPATH=. python -m unittest tools.test_mcp_host_conformance -v
+          evidence="$RUNNER_TEMP/mcp-evidence"
+          mkdir -p "$evidence"
+          python tools/run_mcp_host_conformance.py \
+            --host claude-code \
+            --output "$evidence/claude-code.receipt.json" \
+            --transcript "$evidence/claude-code.transcript.json" \
+            --allow-integration-tree
+          python tools/run_mcp_host_conformance.py \
+            --host codex \
+            --output "$evidence/codex.receipt.json" \
+            --transcript "$evidence/codex.transcript.json" \
+            --allow-integration-tree
+          python tools/check_mcp_host_receipts.py \
+            --evidence "$evidence" \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --allow-integration-tree
+      - name: Upload MCP host receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-real-hosts-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/mcp-evidence
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
   python-managed-v2-wheel:
     name: Python managed v2 wheel
@@ -500,16 +694,20 @@ jobs:
   release-readiness:
     name: Release readiness
     if: always()
-    needs: [python-managed-v2-aggregate, python-windows-async]
+    needs: [python-managed-v2-aggregate, python-windows-async, security-hard-kill-receipt, mcp-real-hosts]
     runs-on: ubuntu-24.04
     steps:
       - name: Require hosted Python managed conformance
         env:
           PYTHON_MANAGED_RESULT: ${{ needs.python-managed-v2-aggregate.result }}
           PYTHON_WINDOWS_ASYNC_RESULT: ${{ needs.python-windows-async.result }}
+          SECURITY_HARD_KILL_RESULT: ${{ needs.security-hard-kill-receipt.result }}
+          MCP_REAL_HOSTS_RESULT: ${{ needs.mcp-real-hosts.result }}
         run: |
           test "$PYTHON_MANAGED_RESULT" = success
           test "$PYTHON_WINDOWS_ASYNC_RESULT" = success
+          test "$SECURITY_HARD_KILL_RESULT" = success
+          test "$MCP_REAL_HOSTS_RESULT" = success
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -561,7 +759,16 @@ jobs:
       - name: Build the standalone binary
         run: cargo build -p hyphae-cli --locked
       - name: Audit publishable crate contents
-        run: python tools/check_crate_packages.py
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_crate_packages \
+            tools.test_check_registry_publish \
+            -v
+          python tools/check_crate_packages.py
+      - name: Verify effective license transition
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_relicensing_checks -v
+          python tools/relicensing_checks.py --readonly
       - name: Validate documentation and executable embedded example
         run: |
           python tools/check_documentation.py --binary target/debug/hyphae
@@ -572,6 +779,8 @@ jobs:
           python tools/generate_compatibility_fixture.py --binary target/debug/hyphae --check compatibility/v1/data-directory.json
           cargo test -p hyphae-engine --example generate_disk_format_2_fixture --locked
           cargo test -p hyphae-engine --example generate_retrieval_goldens --locked
+      - name: Verify workflow syntax
+        uses: raven-actions/actionlint@01fce4f43a270a612932cb1c64d40505a029f821 # v2.0.1
       - name: Test deterministic packaging and checksums
         run: |
           python -m compileall -q packaging tools

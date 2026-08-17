@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native B+tree format v1
 
 Status: normative experimental format; copy-on-write insertion, replacement,

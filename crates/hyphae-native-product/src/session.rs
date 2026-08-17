@@ -1,19 +1,19 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Product principals, authorization, sessions, and prepared handles.
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use hyphae_native_runtime::NativeWriteBatch;
 use hyphae_native_types::TransactionId;
 
 use crate::{
-    AuthenticatedAuthority, AuthorizationEpoch, ObjectId, ProductCommitReceipt, ProductDurability,
-    ProductError, ProductErrorCode, ProductExplicitTransactionStatus, ProductPreparedStatement,
-    ProductTransactionHandle,
+    AuthenticatedAuthority, AuthorizationEpoch, BoundSqlStatement, ObjectId, ProductCommitReceipt,
+    ProductDurability, ProductError, ProductErrorCode, ProductExplicitTransactionStatus,
+    ProductPreparedStatement, ProductTransactionHandle,
 };
 
 /// Maximum UTF-8 bytes in one product principal identity.
@@ -326,16 +326,28 @@ pub struct ProductSession {
     transaction_order: VecDeque<ProductTransactionId>,
     maximum_transactions: usize,
     active_transactions: BTreeMap<ProductTransactionHandle, ActiveProductTransaction>,
+    sql_bindings: Mutex<BTreeMap<ProductSessionSqlBindingKey, BoundSqlStatement>>,
     explicit_statuses: BTreeMap<ProductTransactionHandle, ProductExplicitTransactionStatus>,
     explicit_status_order: VecDeque<ProductTransactionHandle>,
     next_transaction_handle: u64,
     maximum_active_transactions: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProductSessionSqlBindingKey {
+    Execute(u128),
+    Explain(u128),
+    Stage {
+        request_id: u128,
+        handle: ProductTransactionHandle,
+    },
+}
+
 #[derive(Debug)]
 enum ProductSessionAuthority {
     Unmanaged,
     Managed(RwLock<Arc<AuthenticatedAuthority>>),
+    LegacyOwner,
 }
 
 impl ProductSession {
@@ -381,6 +393,27 @@ impl ProductSession {
             DEFAULT_PRODUCT_TRANSACTION_STATUSES,
             DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
         )
+    }
+
+    /// Creates the synthetic 1.2 legacy-owner session without fabricated IDs.
+    ///
+    /// This constructor is reserved to the Native HTTP compatibility adapter.
+    /// Every operation revalidates the durable terminal state in the product.
+    pub fn new_legacy_owner(id: ProductSessionId) -> Self {
+        let principal = ProductPrincipal::new("legacy-owner").unwrap_or(Self::legacy_principal());
+        let mut session = Self::with_limits(
+            id,
+            principal,
+            ProductAuthorization::ALL
+                .without(crate::ProductPermission::OwnershipManage)
+                .without(crate::ProductPermission::SecurityManage),
+            AuthorizationEpoch::UNMANAGED,
+            DEFAULT_PRODUCT_PREPARED_HANDLES,
+            DEFAULT_PRODUCT_TRANSACTION_STATUSES,
+            DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
+        );
+        session.authority = ProductSessionAuthority::LegacyOwner;
+        session
     }
 
     pub(crate) fn with_limits(
@@ -453,6 +486,7 @@ impl ProductSession {
             transaction_order: VecDeque::new(),
             maximum_transactions,
             active_transactions: BTreeMap::new(),
+            sql_bindings: Mutex::new(BTreeMap::new()),
             explicit_statuses: BTreeMap::new(),
             explicit_status_order: VecDeque::new(),
             next_transaction_handle: 1,
@@ -484,7 +518,7 @@ impl ProductSession {
         &self,
     ) -> Result<Option<Arc<AuthenticatedAuthority>>, ProductError> {
         match &self.authority {
-            ProductSessionAuthority::Unmanaged => Ok(None),
+            ProductSessionAuthority::Unmanaged | ProductSessionAuthority::LegacyOwner => Ok(None),
             ProductSessionAuthority::Managed(authority) => authority
                 .read()
                 .map(|authority| Some(Arc::clone(&authority)))
@@ -497,7 +531,7 @@ impl ProductSession {
         authority: Arc<AuthenticatedAuthority>,
     ) -> Result<(), ProductError> {
         match &self.authority {
-            ProductSessionAuthority::Unmanaged => {
+            ProductSessionAuthority::Unmanaged | ProductSessionAuthority::LegacyOwner => {
                 Err(ProductError::from_code(ProductErrorCode::Internal))
             }
             ProductSessionAuthority::Managed(cached) => {
@@ -512,6 +546,16 @@ impl ProductSession {
 
     pub(crate) fn is_managed(&self) -> bool {
         matches!(self.authority, ProductSessionAuthority::Managed(_))
+    }
+
+    pub(crate) fn is_legacy_owner(&self) -> bool {
+        matches!(self.authority, ProductSessionAuthority::LegacyOwner)
+    }
+
+    fn legacy_principal() -> ProductPrincipal {
+        ProductPrincipal {
+            identity: Box::<str>::from("legacy-owner"),
+        }
     }
 
     pub(crate) fn retain_prepared(
@@ -536,6 +580,29 @@ impl ProductSession {
 
     pub(crate) fn deallocate(&mut self, handle: ProductPreparedHandle) -> bool {
         self.prepared.remove(&handle).is_some()
+    }
+
+    pub(crate) fn retain_sql_binding(
+        &self,
+        key: ProductSessionSqlBindingKey,
+        binding: BoundSqlStatement,
+    ) -> Result<(), ProductError> {
+        self.sql_bindings
+            .lock()
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))?
+            .insert(key, binding);
+        Ok(())
+    }
+
+    pub(crate) fn take_sql_binding(
+        &self,
+        key: ProductSessionSqlBindingKey,
+    ) -> Result<Option<BoundSqlStatement>, ProductError> {
+        Ok(self
+            .sql_bindings
+            .lock()
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))?
+            .remove(&key))
     }
 
     pub(crate) fn record_transaction(

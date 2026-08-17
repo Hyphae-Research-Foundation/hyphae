@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Logical snapshot formats v1 and v2
 
 Status: normative for disk formats `1` and `2`.

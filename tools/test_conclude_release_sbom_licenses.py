@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ members = ["crates/hyphae-core"]
 
 [workspace.package]
 version = "1.0.1"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 """,
         )
         write(
@@ -223,7 +223,7 @@ version = "1.0.1"
             """[project]
 name = "hyphae-sdk"
 version = "1.0.1"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 dependencies = []
 """,
         )
@@ -254,6 +254,54 @@ dependencies = []
             conclude_file(path, self.root)
 
         self.assertEqual(path.read_bytes(), before)
+
+    def test_private_conformance_tooling_is_not_shipped_first_party_identity(self) -> None:
+        write(
+            self.root / "conformance/mcp/hosts/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "private": True,
+                    "license": SOFTWARE_LICENSE,
+                }
+            ),
+        )
+        write(
+            self.root / "conformance/mcp/hosts/package-lock.json",
+            json.dumps(
+                {
+                    "packages": {
+                        "": {
+                            "name": "hyphae-mcp-conformance-hosts",
+                            "version": "1.0.0",
+                            "license": SOFTWARE_LICENSE,
+                        }
+                    }
+                }
+            ),
+        )
+        document = syft_document(rust_artifact(), linked_npm_artifact())
+        self.assertEqual(conclude_document(document, self.root), 2)
+        self.assertNotIn(
+            "hyphae-mcp-conformance-hosts",
+            {artifact["name"] for artifact in document["artifacts"]},
+        )
+
+    def test_private_website_is_not_shipped_first_party_identity(self) -> None:
+        write(
+            self.root / "website/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-premium-site",
+                    "version": "0.1.0",
+                    "private": True,
+                    "license": "UNLICENSED",
+                }
+            ),
+        )
+        document = syft_document(rust_artifact(), linked_npm_artifact())
+        self.assertEqual(conclude_document(document, self.root), 2)
 
 
 if __name__ == "__main__":

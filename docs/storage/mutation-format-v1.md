@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # KV mutation format v1
 
 Status: normative for Hyphae `0.1.0` KV operation payloads in disk format `1`.

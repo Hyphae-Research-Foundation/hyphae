@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Hosted Windows named-pipe lifecycle evidence for the installed v2 wheel."""
 
 from __future__ import annotations

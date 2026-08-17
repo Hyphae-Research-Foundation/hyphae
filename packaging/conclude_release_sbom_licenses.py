@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Conclude first-party release SBOM licenses from tracked package manifests."""
 
@@ -24,9 +24,16 @@ ROOT = Path(
         Path(__file__).resolve().parents[1],
     )
 ).resolve()
-SOFTWARE_LICENSE = "AGPL-3.0-only"
+SOFTWARE_LICENSE = "Apache-2.0"
 SYFT_VERSION = "1.46.0"
 IGNORED_DIRECTORIES = frozenset({"build", "dist", "node_modules", "target"})
+EXCLUDED_PRIVATE_PACKAGE_MANIFESTS = frozenset(
+    {
+        "conformance/mcp/hosts/package.json",
+        "integrations/host-smoke/package.json",
+        "website/package.json",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,8 @@ def discover_package_authorities(root: Path) -> dict[tuple[str, str, str], Packa
 
     for manifest in sorted(root.rglob("package.json")):
         if IGNORED_DIRECTORIES.intersection(manifest.parts):
+            continue
+        if manifest.relative_to(root).as_posix() in EXCLUDED_PRIVATE_PACKAGE_MANIFESTS:
             continue
         document = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(document, dict):
@@ -473,6 +482,10 @@ def expected_npm_identities(
     identities: list[ArtifactIdentity] = []
     for path in sorted(root.rglob("package-lock.json")):
         if IGNORED_DIRECTORIES.intersection(path.parts):
+            continue
+        if path.with_name("package.json").relative_to(root).as_posix() in (
+            EXCLUDED_PRIVATE_PACKAGE_MANIFESTS
+        ):
             continue
         packages = npm_lock_packages(path)
         for key, package in packages.items():

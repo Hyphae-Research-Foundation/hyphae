@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 import json
 import tempfile
@@ -72,7 +72,7 @@ def signed_release() -> dict:
         "archive_count": 4,
         "signature_verifications": 12,
         "attestation_verifications": 12,
-        "software_license": "AGPL-3.0-only",
+        "software_license": "Apache-2.0",
         "license_authority": "tracked-package-manifests-and-local-locks-v1",
         "first_party_artifact_count": 79,
         "first_party_identity_count": 33,

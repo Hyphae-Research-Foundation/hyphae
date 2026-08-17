@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native structure execution v1
 
 Status: experimental P6 foundation; no P6 or G7 closure claim

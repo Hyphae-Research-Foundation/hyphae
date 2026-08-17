@@ -57,12 +57,11 @@ Hyphae `1.2.0` has two coupled execution programs. The
 [operator and agent experience plan](roadmaps/1.2.0-operator-and-agent-experience.md)
 adds durable access control, the operator console, shared agent plugins, and a
 published Python client. The accepted-target
-[relicensing plan](roadmaps/1.2.0-relicensing.md) moves new software artifacts
-back to `Apache-2.0` after a fail-closed legal, dependency, ownership, and
-governance preflight. [ADR-0029](adr/0029-apache-2.0-software-and-normative-specifications.md)
-closes only the choice of `Apache-2.0` for implementable normative
-specifications; the target is not effective before the atomic relicensing
-commit.
+[relicensing plan](roadmaps/1.2.0-relicensing.md) moved the current integration
+tree and new software artifacts back to `Apache-2.0` after a fail-closed legal,
+dependency, ownership, and governance preflight.
+[ADR-0029](adr/0029-apache-2.0-software-and-normative-specifications.md) is the
+effective classification authority.
 
 The programs must close on the same exact release candidate. Published
 `v1.1.0` artifacts remain `AGPL-3.0-only`; the roadmap does not retroactively

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the real-daemon Python managed conformance harness."""
 
 from __future__ import annotations
@@ -53,8 +53,15 @@ class PythonManagedV2RunnerTests(unittest.TestCase):
         valid = {
             "schema": "hyphae-python-managed-v2-transcript-v1",
             "status": "passed",
-            "protocol": {"major": 1, "minor": 2},
+            "protocol": {"major": 1, "minor": 3},
             "operations": {
+                "lifecycle": [
+                    "security_api_key_issue_abort",
+                    "security_api_key_issue_activate",
+                    "security_api_key_issue_start",
+                    "security_api_key_revoke",
+                    "security_legacy_bearer_revoke",
+                ],
                 "reads": [
                     "security_assignment_list",
                     "security_audit_read",
@@ -80,6 +87,7 @@ class PythonManagedV2RunnerTests(unittest.TestCase):
                 "redaction": True,
                 "replay": True,
                 "stale_cursor": True,
+                "terminal_replay": True,
             },
         }
         self.assertEqual(validate_transcript(valid), valid)

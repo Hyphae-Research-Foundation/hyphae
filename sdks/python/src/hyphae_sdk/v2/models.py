@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Runtime models shared by Hyphae v2 local and HTTP transports."""
 
 from __future__ import annotations
@@ -80,6 +80,33 @@ def product_error(code: str, request_id: int) -> ProductError:
 
 class ClientError(Exception):
     """Configuration, transport, bound, cancellation, or protocol failure."""
+
+
+class SensitiveBytes:
+    """Mutable one-time secret bytes with explicit and contextual cleanup."""
+
+    def __init__(self, value: bytes) -> None:
+        self._value = bytearray(value)
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return "SensitiveBytes([REDACTED])"
+
+    def expose(self) -> bytearray:
+        if self._closed:
+            raise ClientError("sensitive bytes are closed")
+        return self._value
+
+    def close(self) -> None:
+        self._value[:] = b"\0" * len(self._value)
+        self._closed = True
+
+    def __enter__(self) -> SensitiveBytes:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
 
 
 class CancellationToken:
@@ -175,4 +202,5 @@ __all__ = [
     "ProductErrorFields",
     "RequestOptions",
     "Response",
+    "SensitiveBytes",
 ]

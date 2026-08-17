@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native directory format v1
 
 Status: implemented by the Native runtime. Canonical

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native durable snapshot pins v1
 
 Status: implemented and retained by the closed G1 substrate gate. The frozen

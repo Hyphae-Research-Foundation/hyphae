@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Expanded bounded TPC-H correctness corpus for admitted native SQL shapes.
 

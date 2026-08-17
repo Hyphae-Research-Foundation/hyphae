@@ -2,7 +2,7 @@
   "name": "@celiums/hyphae",
   "version": "1.1.0",
   "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -11,7 +11,8 @@
     "dist",
     "LICENSE",
     "LICENSE-DOCUMENTATION",
-    "LICENSE-POLICY.md"
+    "LICENSE-POLICY.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "exports": {
     ".": {
@@ -26,6 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "rm -rf dist && npm run build",
     "test": "npm run build && node --test test/*.test.mjs",
     "conformance": "npm run build && node conformance/run.mjs"
   },

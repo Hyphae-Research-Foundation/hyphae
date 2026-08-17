@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native WAL format v1
 
 Status: normative target contract; block/record framing, append, integrity

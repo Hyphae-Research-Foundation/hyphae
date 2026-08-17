@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native set algebra v1
 
 Status: contract implemented and evidenced on direct Linux; hosted CI remains

@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-product"
+autoexamples = false
 description = "Transport-independent product contracts and embedded facade for Hyphae Native"
 version.workspace = true
 edition.workspace = true
@@ -32,6 +34,12 @@ hyphae-native-manifest.workspace = true
 hyphae-native-pages.workspace = true
 hyphae-native-records.workspace = true
 hyphae-native-wal.workspace = true
+hyphae-native-protocol = { path = "../hyphae-native-protocol" }
+serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "security_crash_matrix"
+test = false

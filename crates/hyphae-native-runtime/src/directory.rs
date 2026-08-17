@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Native data-directory identity and single-writer ownership.
 
@@ -12,6 +12,7 @@ use std::{
 
 use blake3::Hasher;
 use hyphae_native_types::{DirectoryUuid, HistoryEpoch, LineageIdentity};
+use same_file::Handle as FileIdentityHandle;
 use thiserror::Error;
 
 const FORMAT_FILE: &str = "FORMAT";
@@ -124,6 +125,9 @@ pub enum NativeDirectoryError {
         #[source]
         source: io::Error,
     },
+    /// The current OS account does not own one stable, protected directory.
+    #[error("native data directory owner authority is invalid")]
+    OfflineOwnerAuthorityDenied,
     /// A deterministic migration-promotion interruption was requested.
     #[error("native migration promotion interrupted at {0:?}; reopen the data directory")]
     InjectedPromotionCrash(PromotionBoundary),
@@ -134,6 +138,12 @@ pub(crate) struct NativeDirectoryGuard {
     identity: NativeDirectoryIdentity,
     pending: bool,
     _lock: File,
+    offline_owner: Option<OfflineOwnerAuthority>,
+}
+
+#[derive(Debug)]
+struct OfflineOwnerAuthority {
+    identity: FileIdentityHandle,
 }
 
 impl NativeDirectoryGuard {
@@ -146,6 +156,8 @@ impl NativeDirectoryGuard {
     }
 
     fn initialize_with_marker(path: &Path, pending: bool) -> Result<Self, NativeDirectoryError> {
+        #[cfg(windows)]
+        restrict_windows_data_directory(path)?;
         let lock = acquire_lock(path, true)?;
         let identity =
             NativeDirectoryIdentity::new(generate_directory_id(path)?, HistoryEpoch::FIRST);
@@ -154,19 +166,34 @@ impl NativeDirectoryGuard {
             identity,
             pending,
             _lock: lock,
+            offline_owner: None,
         })
     }
 
     pub(crate) fn open(path: &Path) -> Result<Self, NativeDirectoryError> {
-        Self::open_with_pending(path, false)
+        Self::open_with_pending(path, false, false)
     }
 
     pub(crate) fn open_pending(path: &Path) -> Result<Self, NativeDirectoryError> {
-        Self::open_with_pending(path, true)
+        Self::open_with_pending(path, true, false)
     }
 
-    fn open_with_pending(path: &Path, allow_pending: bool) -> Result<Self, NativeDirectoryError> {
+    pub(crate) fn open_offline_owner(path: &Path) -> Result<Self, NativeDirectoryError> {
+        Self::open_with_pending(path, false, true)
+    }
+
+    fn open_with_pending(
+        path: &Path,
+        allow_pending: bool,
+        require_offline_owner: bool,
+    ) -> Result<Self, NativeDirectoryError> {
+        let offline_owner = require_offline_owner
+            .then(|| OfflineOwnerAuthority::validate(path))
+            .transpose()?;
         let lock = acquire_lock(path, false)?;
+        if let Some(authority) = &offline_owner {
+            authority.revalidate(path)?;
+        }
         let identity = read_and_validate_marker(path, allow_pending)?;
         reject_mixed_format_families(path)?;
         Ok(Self {
@@ -176,6 +203,7 @@ impl NativeDirectoryGuard {
                 .try_exists()
                 .map_err(|source| io_error(&path.join(FORMAT_FILE), source))?,
             _lock: lock,
+            offline_owner,
         })
     }
 
@@ -221,6 +249,240 @@ impl NativeDirectoryGuard {
     pub(crate) const fn identity(&self) -> &NativeDirectoryIdentity {
         &self.identity
     }
+
+    pub(crate) fn revalidate_offline_owner(&self, path: &Path) -> Result<(), NativeDirectoryError> {
+        self.offline_owner
+            .as_ref()
+            .ok_or_else(owner_authority_error)?
+            .revalidate(path)
+    }
+}
+
+impl OfflineOwnerAuthority {
+    fn validate(path: &Path) -> Result<Self, NativeDirectoryError> {
+        validate_offline_owner_path(path).map_err(|_| owner_authority_error())
+    }
+
+    fn revalidate(&self, path: &Path) -> Result<(), NativeDirectoryError> {
+        let current = Self::validate(path)?;
+        if self.identity != current.identity {
+            return Err(owner_authority_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn validate_offline_owner_path(path: &Path) -> io::Result<OfflineOwnerAuthority> {
+    use std::os::unix::fs::MetadataExt;
+
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink()
+        || !before.file_type().is_dir()
+        || before.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data directory owner authority is invalid",
+        ));
+    }
+    let identity = FileIdentityHandle::from_path(path)?;
+    let opened = identity.as_file().metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    let expected_identity = (before.dev(), before.ino());
+    if !opened.file_type().is_dir()
+        || !current.file_type().is_dir()
+        || current.file_type().is_symlink()
+        || opened.uid() != before.uid()
+        || current.uid() != before.uid()
+        || (opened.dev(), opened.ino()) != expected_identity
+        || (current.dev(), current.ino()) != expected_identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data directory identity changed",
+        ));
+    }
+    Ok(OfflineOwnerAuthority { identity })
+}
+
+#[cfg(windows)]
+fn validate_offline_owner_path(path: &Path) -> io::Result<OfflineOwnerAuthority> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if is_windows_named_stream(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "named streams cannot carry directory authority",
+        ));
+    }
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_dir() || before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data directory is not a regular directory",
+        ));
+    }
+    let identity = FileIdentityHandle::from_path(path)?;
+    validate_windows_data_directory(identity.as_file())?;
+    let current = fs::symlink_metadata(path)?;
+    if !current.file_type().is_dir()
+        || current.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || identity != FileIdentityHandle::from_path(path)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data directory identity changed",
+        ));
+    }
+    Ok(OfflineOwnerAuthority { identity })
+}
+
+#[cfg(windows)]
+fn is_windows_named_stream(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    path.components().any(|component| match component {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => false,
+            _ => prefix.as_os_str().to_string_lossy().contains(':'),
+        },
+        Component::Normal(value) => value.to_string_lossy().contains(':'),
+        Component::RootDir | Component::CurDir | Component::ParentDir => false,
+    })
+}
+
+#[cfg(windows)]
+fn validate_windows_data_directory(file: &File) -> io::Result<()> {
+    use windows_permissions::{
+        LocalBox, Sid,
+        constants::{AccessRights, AceFlags, AceType, SeObjectType, SecurityInformation},
+        utilities, wrappers,
+    };
+
+    let actual = wrappers::GetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )?;
+    let sddl = wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(
+        &actual,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )?;
+    let current_sid = utilities::current_process_sid()?;
+    let current = current_sid.to_string();
+    let system_sid: LocalBox<Sid> = "S-1-5-18".parse()?;
+    if actual.owner() != Some(current_sid.as_ref())
+        || !windows_sddl_has_protected_dacl(&sddl.to_string_lossy())
+    {
+        return Err(windows_directory_acl_error());
+    }
+    let dacl = actual.dacl().ok_or_else(windows_directory_acl_error)?;
+    let expected = if current == "S-1-5-18" { 1 } else { 2 };
+    if dacl.len() != expected {
+        return Err(windows_directory_acl_error());
+    }
+    let mut current_seen = false;
+    let mut system_seen = false;
+    for index in 0..dacl.len() {
+        let ace = dacl
+            .get_ace(index)
+            .ok_or_else(windows_directory_acl_error)?;
+        let allowed_flags = AceFlags::ObjectInherit | AceFlags::ContainerInherit;
+        if ace.ace_type() != AceType::ACCESS_ALLOWED_ACE_TYPE
+            || !(ace.flags().is_empty() || ace.flags() == allowed_flags)
+            || ace.mask() != AccessRights::FileAllAccess
+        {
+            return Err(windows_directory_acl_error());
+        }
+        let sid = ace.sid().ok_or_else(windows_directory_acl_error)?;
+        if sid == current_sid.as_ref() && !current_seen {
+            current_seen = true;
+        } else if sid == system_sid.as_ref() && !system_seen {
+            system_seen = true;
+        } else {
+            return Err(windows_directory_acl_error());
+        }
+    }
+    if !current_seen || (current != "S-1-5-18" && !system_seen) {
+        return Err(windows_directory_acl_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        utilities, wrappers,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if is_windows_named_stream(path) {
+        return Err(owner_authority_error());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(owner_authority_error());
+    }
+    let current_sid = utilities::current_process_sid().map_err(|source| io_error(path, source))?;
+    let current = current_sid.to_string();
+    let system = "S-1-5-18";
+    let sddl = if current == system {
+        format!("D:P(A;OICI;FA;;;{system})")
+    } else {
+        format!("D:P(A;OICI;FA;;;{current})(A;OICI;FA;;;{system})")
+    };
+    let descriptor: LocalBox<SecurityDescriptor> =
+        sddl.parse().map_err(|source| io_error(path, source))?;
+    wrappers::SetNamedSecurityInfo(
+        path.as_os_str(),
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        None,
+        None,
+        descriptor.dacl(),
+        None,
+    )
+    .map_err(|source| io_error(path, source))?;
+    wrappers::SetNamedSecurityInfo(
+        path.as_os_str(),
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner,
+        Some(current_sid.as_ref()),
+        None,
+        None,
+        None,
+    )
+    .map_err(|source| io_error(path, source))?;
+    let identity = FileIdentityHandle::from_path(path).map_err(|source| io_error(path, source))?;
+    validate_windows_data_directory(identity.as_file()).map_err(|source| io_error(path, source))
+}
+
+#[cfg(windows)]
+fn windows_sddl_has_protected_dacl(actual: &str) -> bool {
+    actual
+        .find("D:")
+        .and_then(|start| actual[start + 2..].find('(').map(|aces| (start, aces)))
+        .is_some_and(|(start, aces)| actual[start + 2..start + 2 + aces].contains('P'))
+}
+
+#[cfg(windows)]
+fn windows_directory_acl_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "data directory ACL is not restricted to the current account and LocalSystem",
+    )
+}
+
+fn owner_authority_error() -> NativeDirectoryError {
+    NativeDirectoryError::OfflineOwnerAuthorityDenied
 }
 
 fn interrupt_promotion(
@@ -518,5 +780,80 @@ mod tests {
             parse_marker(path, &oversized),
             Err(NativeDirectoryError::MalformedFormat(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_owner_authority_rejects_a_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-offline-owner-path-{}-{}",
+            std::process::id(),
+            super::NEXT_DIRECTORY_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let directory = root.join("data");
+        let link = root.join("link");
+        fs::create_dir_all(&directory)?;
+        symlink(&directory, &link)?;
+        assert!(matches!(
+            super::validate_offline_owner_path(&link),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_owner_authority_requires_effective_uid_and_stable_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, os::unix::fs::MetadataExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-offline-owner-identity-{}-{}",
+            std::process::id(),
+            super::NEXT_DIRECTORY_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&root)?;
+        let authority = super::OfflineOwnerAuthority::validate(&root)?;
+        assert_eq!(
+            fs::symlink_metadata(&root)?.uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        authority.revalidate(&root)?;
+        let moved = root.with_extension("moved");
+        fs::rename(&root, &moved)?;
+        fs::create_dir(&root)?;
+        assert!(matches!(
+            authority.revalidate(&root),
+            Err(NativeDirectoryError::OfflineOwnerAuthorityDenied)
+        ));
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(moved)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_owner_authority_rejects_a_named_stream_path() {
+        assert!(super::is_windows_named_stream(Path::new(r"C:\\data:owner")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normal_directory_creation_installs_offline_owner_dacl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-windows-directory-dacl-{}-{}",
+            std::process::id(),
+            super::NEXT_DIRECTORY_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ignored = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path)?;
+        super::restrict_windows_data_directory(&path)?;
+        super::validate_offline_owner_path(&path)?;
+        std::fs::remove_dir_all(path)?;
+        Ok(())
     }
 }

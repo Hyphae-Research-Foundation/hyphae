@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Create the restricted Auditor credential used by live Python conformance.
 
@@ -14,6 +14,12 @@ use std::{
 
 use hyphae_native_product::{BuiltInRole, NativeProduct, ProductScope};
 use serde_json::json;
+#[cfg(windows)]
+use windows_permissions::{
+    LocalBox, SecurityDescriptor,
+    constants::{SeObjectType, SecurityInformation},
+    utilities, wrappers,
+};
 
 #[derive(Debug)]
 struct Arguments {
@@ -21,6 +27,7 @@ struct Arguments {
     owner_key_file: PathBuf,
     auditor_key_out: PathBuf,
     metadata_out: PathBuf,
+    legacy_bearer_file: Option<PathBuf>,
 }
 
 impl Arguments {
@@ -30,6 +37,7 @@ impl Arguments {
         let mut owner_key_file = None;
         let mut auditor_key_out = None;
         let mut metadata_out = None;
+        let mut legacy_bearer_file = None;
         while let Some(flag) = values.next() {
             let value = values
                 .next()
@@ -45,6 +53,9 @@ impl Arguments {
                 Some("--metadata-out") if metadata_out.is_none() => {
                     metadata_out = Some(value.into());
                 }
+                Some("--legacy-bearer-file") if legacy_bearer_file.is_none() => {
+                    legacy_bearer_file = Some(value.into());
+                }
                 _ => return Err(io::Error::other("fixture arguments are invalid").into()),
             }
         }
@@ -53,6 +64,7 @@ impl Arguments {
             owner_key_file: required(owner_key_file, "--owner-key-file")?,
             auditor_key_out: required(auditor_key_out, "--auditor-key-out")?,
             metadata_out: required(metadata_out, "--metadata-out")?,
+            legacy_bearer_file,
         })
     }
 }
@@ -79,6 +91,17 @@ fn write_metadata(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn 
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse()?;
+    if let Some(path) = arguments.legacy_bearer_file.as_deref() {
+        let mut legacy_bearer = b"python-managed-legacy-bearer-0123456789abcdef".to_vec();
+        let result = prepare_legacy_bearer(
+            &arguments.data_dir,
+            &arguments.owner_key_file,
+            path,
+            &mut legacy_bearer,
+        );
+        legacy_bearer.fill(0);
+        result?;
+    }
     let mut owner_credential = fs::read(&arguments.owner_key_file)?;
     let result = create_auditor_fixture(&arguments, &owner_credential);
     owner_credential.fill(0);
@@ -128,4 +151,90 @@ fn create_auditor_fixture(
             "key_id": issued.key_id.to_string(),
         }),
     )
+}
+
+fn prepare_legacy_bearer(
+    data_dir: &Path,
+    owner_key_file: &Path,
+    legacy_bearer_file: &Path,
+    legacy_bearer: &mut [u8],
+) -> Result<(), Box<dyn Error>> {
+    let mut legacy_output = restricted_output(legacy_bearer_file)?;
+    legacy_output.write_all(legacy_bearer)?;
+    legacy_output.sync_all()?;
+    drop(legacy_output);
+    drop(NativeProduct::open(data_dir)?);
+    let mut product = NativeProduct::open_offline_owner(data_dir)?;
+    let started = product.start_legacy_bearer_migration_offline(
+        "Python managed conformance owner",
+        "python-managed-conformance-owner",
+        legacy_bearer,
+        logical_time_micros()?,
+    )?;
+    let canonical = started.secret.expose_secret();
+    let mut output = restricted_output(owner_key_file)?;
+    output.write_all(canonical.as_bytes())?;
+    output.sync_all()?;
+    drop(output);
+    product.activate_legacy_bearer_migration_offline(
+        started.key_id,
+        canonical,
+        started.authorization_epoch,
+        "Python managed conformance owner",
+        "python-managed-conformance-owner",
+        legacy_bearer,
+        logical_time_micros()?,
+    )?;
+    Ok(())
+}
+
+fn restricted_output(path: &Path) -> Result<fs::File, Box<dyn Error>> {
+    let mut output_options = OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        output_options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
+
+        output_options
+            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .share_mode(0);
+    }
+    let output = output_options.open(path)?;
+    #[cfg(windows)]
+    if let Err(error) = restrict_windows_file(path, &output) {
+        drop(output);
+        let _ignored = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn restrict_windows_file(path: &Path, file: &fs::File) -> Result<(), Box<dyn Error>> {
+    let current_user_sid = utilities::current_process_sid()?;
+    let current_user = current_user_sid.to_string();
+    let system = "S-1-5-18";
+    let sddl = if current_user == system {
+        format!("D:P(A;;FA;;;{system})")
+    } else {
+        format!("D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
+    };
+    let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+    wrappers::SetNamedSecurityInfo(
+        path.as_os_str(),
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        None,
+        None,
+        descriptor.dacl()?,
+        None,
+    )?;
+    hyphae_native_product::validate_windows_restricted_file(file)?;
+    Ok(())
 }

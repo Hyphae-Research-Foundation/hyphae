@@ -1,6 +1,6 @@
 {
   "name": "hyphae",
-  "version": "0.2.0",
+  "version": "1.2.0",
   "description": "Inspect a local Hyphae data engine through bounded Native v2 MCP tools.",
   "author": {
     "name": "Celiums Solutions LLC",
@@ -8,7 +8,7 @@
   },
   "homepage": "https://hyphae.dev",
   "repository": "https://github.com/celiumsai/hyphae",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "keywords": ["database", "sql", "search", "rag", "mcp"],
   "skills": "./skills/",
   "interface": {

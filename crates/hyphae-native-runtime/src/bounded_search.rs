@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bounded compound lexical matching over the current native source-text model.
 
@@ -180,6 +180,9 @@ pub enum BoundedSearchError {
         /// Configured maximum.
         maximum: usize,
     },
+    /// A caller-owned cooperative checkpoint interrupted execution.
+    #[error("native bounded search was interrupted")]
+    ExecutionInterrupted,
 }
 
 #[derive(Clone, Debug)]
@@ -213,11 +216,22 @@ pub(crate) fn search_documents(
     limit: usize,
     limits: BoundedSearchLimits,
 ) -> Result<BoundedSearchResults, BoundedSearchError> {
+    search_documents_with_checkpoint(documents, query, limit, limits, &mut || true)
+}
+
+pub(crate) fn search_documents_with_checkpoint(
+    documents: &BTreeMap<Vec<u8>, String>,
+    query: &BoundedSearchQuery,
+    limit: usize,
+    limits: BoundedSearchLimits,
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<BoundedSearchResults, BoundedSearchError> {
     validate_limits(limit, limits)?;
     let compiled = compile(query, limits)?;
     let mut work = Work::default();
     let mut hits = Vec::new();
     for (document_id, source) in documents {
+        execution_checkpoint(checkpoint)?;
         add_bounded(&mut work.documents, 1, limits.max_documents).map_err(|()| {
             BoundedSearchError::DocumentBudgetExceeded {
                 maximum: limits.max_documents,
@@ -232,7 +246,7 @@ pub(crate) fn search_documents(
             maximum: limits.max_source_bytes,
         })?;
         let tokens = analyze(source);
-        if let Some(score) = evaluate(&compiled, &tokens, &mut work, limits)? {
+        if let Some(score) = evaluate(&compiled, &tokens, &mut work, limits, checkpoint)? {
             if hits.len() == limits.max_matches {
                 return Err(BoundedSearchError::MatchBudgetExceeded {
                     maximum: limits.max_matches,
@@ -383,15 +397,18 @@ fn account_query_bytes(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate(
     query: &CompiledQuery,
     tokens: &[String],
     work: &mut Work,
     limits: BoundedSearchLimits,
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<Option<u32>, BoundedSearchError> {
     match query {
         CompiledQuery::Term(term) => {
             for token in tokens {
+                execution_checkpoint(checkpoint)?;
                 visit_token(work, limits)?;
                 compare_token(work, limits)?;
                 if token == term {
@@ -402,6 +419,7 @@ fn evaluate(
         }
         CompiledQuery::Prefix(prefix) => {
             for token in tokens {
+                execution_checkpoint(checkpoint)?;
                 visit_token(work, limits)?;
                 compare_token(work, limits)?;
                 if token.starts_with(prefix) {
@@ -415,8 +433,10 @@ fn evaluate(
                 return Ok(None);
             }
             for window in tokens.windows(phrase.len()) {
+                execution_checkpoint(checkpoint)?;
                 let mut matched = true;
                 for (actual, expected) in window.iter().zip(phrase) {
+                    execution_checkpoint(checkpoint)?;
                     visit_token(work, limits)?;
                     compare_token(work, limits)?;
                     if actual != expected {
@@ -432,6 +452,7 @@ fn evaluate(
         }
         CompiledQuery::Fuzzy { term, max_distance } => {
             for token in tokens {
+                execution_checkpoint(checkpoint)?;
                 visit_token(work, limits)?;
                 let candidate: Vec<char> = token.chars().collect();
                 let steps = term
@@ -451,7 +472,7 @@ fn evaluate(
                         maximum: limits.max_fuzzy_steps,
                     },
                 )?;
-                if levenshtein(term, &candidate) <= *max_distance {
+                if levenshtein(term, &candidate, checkpoint)? <= *max_distance {
                     return Ok(Some(1));
                 }
             }
@@ -464,19 +485,19 @@ fn evaluate(
         } => {
             let mut score = 0_u32;
             for clause in must {
-                let Some(clause_score) = evaluate(clause, tokens, work, limits)? else {
+                let Some(clause_score) = evaluate(clause, tokens, work, limits, checkpoint)? else {
                     return Ok(None);
                 };
                 score = score.saturating_add(clause_score);
             }
             for clause in must_not {
-                if evaluate(clause, tokens, work, limits)?.is_some() {
+                if evaluate(clause, tokens, work, limits, checkpoint)?.is_some() {
                     return Ok(None);
                 }
             }
             let mut should_matches = 0_u32;
             for clause in should {
-                if let Some(clause_score) = evaluate(clause, tokens, work, limits)? {
+                if let Some(clause_score) = evaluate(clause, tokens, work, limits, checkpoint)? {
                     should_matches = should_matches.saturating_add(clause_score);
                 }
             }
@@ -515,19 +536,33 @@ fn add_bounded(value: &mut usize, amount: usize, maximum: usize) -> Result<(), (
     }
 }
 
-fn levenshtein(left: &[char], right: &[char]) -> usize {
+fn levenshtein(
+    left: &[char],
+    right: &[char],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<usize, BoundedSearchError> {
     let mut previous: Vec<usize> = (0..=right.len()).collect();
     let mut current = vec![0; right.len() + 1];
     for (left_index, left_character) in left.iter().enumerate() {
+        execution_checkpoint(checkpoint)?;
         current[0] = left_index + 1;
         for (right_index, right_character) in right.iter().enumerate() {
+            execution_checkpoint(checkpoint)?;
             current[right_index + 1] = (previous[right_index + 1] + 1)
                 .min(current[right_index] + 1)
                 .min(previous[right_index] + usize::from(left_character != right_character));
         }
         std::mem::swap(&mut previous, &mut current);
     }
-    previous[right.len()]
+    Ok(previous[right.len()])
+}
+
+fn execution_checkpoint(checkpoint: &mut dyn FnMut() -> bool) -> Result<(), BoundedSearchError> {
+    if checkpoint() {
+        Ok(())
+    } else {
+        Err(BoundedSearchError::ExecutionInterrupted)
+    }
 }
 
 #[cfg(test)]
@@ -668,5 +703,25 @@ mod tests {
             ),
             Err(BoundedSearchError::NoPositiveClause)
         );
+    }
+
+    #[test]
+    fn search_observes_deterministic_mid_execution_cancellation() {
+        let mut checkpoints = 0_usize;
+        let result = search_documents_with_checkpoint(
+            &documents(),
+            &BoundedSearchQuery::Fuzzy {
+                term: "searching".to_owned(),
+                max_distance: 2,
+            },
+            10,
+            BoundedSearchLimits::default(),
+            &mut || {
+                checkpoints = checkpoints.saturating_add(1);
+                checkpoints < 6
+            },
+        );
+        assert_eq!(result, Err(BoundedSearchError::ExecutionInterrupted));
+        assert_eq!(checkpoints, 6);
     }
 }

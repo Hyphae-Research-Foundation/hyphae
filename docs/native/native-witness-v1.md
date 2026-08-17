@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native directory witness v2
 
 Status: implemented G6 retained native authority

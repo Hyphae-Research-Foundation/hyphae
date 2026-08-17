@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local UDS transport v1
 
 Status: implemented for Unix; transport-only and first engine-bearing

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Tests for hosted Python managed Native v2 conformance receipts."""
 
 from __future__ import annotations
@@ -38,6 +38,13 @@ WRITES = [
     "security_principal_create",
     "security_principal_set_enabled",
 ]
+LIFECYCLE = [
+    "security_api_key_issue_abort",
+    "security_api_key_issue_activate",
+    "security_api_key_issue_start",
+    "security_api_key_revoke",
+    "security_legacy_bearer_revoke",
+]
 
 
 def receipt(platform: str) -> dict[str, object]:
@@ -69,9 +76,9 @@ def receipt(platform: str) -> dict[str, object]:
             ),
             "sha256": "f" * 64,
         },
-        "protocol": {"major": 1, "minor": 2},
+        "protocol": {"major": 1, "minor": 3},
         "transports": transports,
-        "operations": {"reads": READS, "writes": WRITES},
+        "operations": {"lifecycle": LIFECYCLE, "reads": READS, "writes": WRITES},
         "cases": {
             "conflict": True,
             "next_operation_revocation": True,
@@ -80,6 +87,7 @@ def receipt(platform: str) -> dict[str, object]:
             "redaction": True,
             "replay": True,
             "stale_cursor": True,
+            "terminal_replay": True,
         },
         "transcript_sha256": TRANSCRIPT,
     }

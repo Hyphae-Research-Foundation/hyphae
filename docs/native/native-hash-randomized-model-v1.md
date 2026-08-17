@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native hash randomized-model gate v1
 
 Status: implemented and retained by the closed G3 structure gate.

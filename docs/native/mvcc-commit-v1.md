@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native MVCC and commit semantics v1
 
 Status: normative target contract; immutable snapshots, CSN reservation,

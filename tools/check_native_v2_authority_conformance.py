@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fail-closed checker for managed Native v2 authority conformance."""
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ WRITE_OPERATIONS = {
     "security.custom_role_create": "SecurityCustomRoleCreate",
     "security.principal_create": "SecurityPrincipalCreate",
     "security.principal_set_enabled": "SecurityPrincipalSetEnabled",
+    "security.legacy_bearer_revoke": "SecurityLegacyBearerRevoke",
 }
 ALL_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
 BUILT_IN_ROLES = {
@@ -100,6 +101,7 @@ PROTOCOL_REJECTIONS = [
 REQUIRED_LIMITS = {
     "audit_result_rows",
     "authentication_verifiers_per_request",
+    "concurrent_transport_authentication_tasks_per_adapter",
     "security_idempotency_records_per_shard",
     "security_idempotency_shards",
     "security_result_rows",
@@ -164,6 +166,13 @@ def canonical_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def authority_contract_digest(contract: dict[str, Any]) -> str:
+    semantic_contract = {
+        key: value for key, value in contract.items() if key != "$comment"
+    }
+    return canonical_digest(semantic_contract)
+
+
 def sorted_unique_strings(value: Any, context: str) -> list[str]:
     if (
         not isinstance(value, list)
@@ -187,16 +196,18 @@ def load_contract(path: Path) -> dict[str, Any]:
         fail(f"cannot load authority contract: {error}")
     if not isinstance(contract, dict) or contract.get("schema") != CONTRACT_SCHEMA:
         fail("authority contract schema differs")
+    if contract.get("$comment") != "SPDX-License-Identifier: Apache-2.0":
+        fail("authority contract SPDX marker differs")
     return contract
 
 
 def validate_operations(corpus: dict[str, Any], contract: dict[str, Any]) -> None:
     rows = corpus.get("operations")
-    if not isinstance(rows, list) or len(rows) != 12:
-        fail("authority corpus must contain the exact twelve operations")
+    if not isinstance(rows, list) or len(rows) != len(ALL_OPERATIONS):
+        fail("authority corpus must contain the exact managed operations")
     ids = [row.get("id") for row in rows if isinstance(row, dict)]
     if ids != sorted(ALL_OPERATIONS) or len(ids) != len(rows):
-        fail("authority corpus must contain the exact twelve operations")
+        fail("authority corpus must contain the exact managed operations")
     contract_rows = {
         row.get("id"): row
         for row in contract.get("operations", [])
@@ -225,7 +236,7 @@ def validate_operations(corpus: dict[str, Any], contract: dict[str, Any]) -> Non
             "denied_roles": sorted(BUILT_IN_ROLES - set(contract_row["allowed_roles"])),
             "id": operation_id,
             "kind": kind,
-            "minimum_minor": 1 if kind == "read" else 2,
+            "minimum_minor": 1 if kind == "read" else (3 if operation_id == "security.legacy_bearer_revoke" else 2),
             "permission": contract_row["required_all"][0],
             "scope": "instance",
             "source_variant": source_variant,
@@ -265,8 +276,8 @@ def validate_protocol(corpus: dict[str, Any]) -> None:
         {"current_major", "current_minor", "rejections_before_dispatch"},
         "protocol policy",
     )
-    if protocol["current_major"] != 1 or protocol["current_minor"] != 2:
-        fail("protocol authority must describe Native 1.2")
+    if protocol["current_major"] != 1 or protocol["current_minor"] != 3:
+        fail("protocol authority must describe Native 1.3")
     if protocol["rejections_before_dispatch"] != PROTOCOL_REJECTIONS:
         fail("minor 0/1 operations must fail before dispatch")
 
@@ -297,23 +308,36 @@ def validate_native_sources(root: Path, corpus: dict[str, Any]) -> None:
         fail(f"cannot load Native authority source: {error}")
     if (
         "pub const PROTOCOL_MAJOR: u16 = 1;" not in handshake
-        or "pub const PROTOCOL_MINOR: u16 = 2;" not in handshake
+        or "pub const PROTOCOL_MINOR: u16 = 3;" not in handshake
     ):
         fail("Native protocol version differs from the corpus")
     minor_body = function_slice(product, "ensure_operation_minor", "ensure_response_minor")
     read_body, separator, remaining = minor_body.partition("=> 1,")
-    write_body, separator_two, _remaining = remaining.partition("=> 2,")
+    write_body, separator_two, remaining_writes = remaining.partition("=> 2,")
     if not separator or not separator_two:
         fail("Native protocol minor admission is not canonical")
     variant_pattern = r"ProductOperation::(Security[A-Za-z0-9]+)"
     if set(re.findall(variant_pattern, read_body)) != set(READ_OPERATIONS.values()):
         fail("Native protocol read minor admission differs")
     if set(re.findall(variant_pattern, write_body)) != set(WRITE_OPERATIONS.values()):
-        fail("Native protocol write minor admission differs")
+        expected_minor_two = set(WRITE_OPERATIONS.values()) - {"SecurityLegacyBearerRevoke"}
+        if set(re.findall(variant_pattern, write_body)) != expected_minor_two:
+            fail("Native protocol write minor admission differs")
+    if "SecurityLegacyBearerRevoke" not in remaining_writes:
+        fail("Native protocol terminal legacy revocation minor admission differs")
     idempotency_body = function_slice(
-        product, "operation_requires_idempotency", "encode_failure"
+        product, "operation_requires_idempotency", "operation_is_key_lifecycle"
     )
-    if set(re.findall(variant_pattern, idempotency_body)) != set(WRITE_OPERATIONS.values()):
+    lifecycle_variants = {
+        "SecurityApiKeyIssueSelfStart", "SecurityApiKeyIssueStart",
+        "SecurityApiKeyIssueSelfActivate", "SecurityApiKeyIssueActivate",
+        "SecurityApiKeyRotateSelfStart", "SecurityApiKeyRotateStart",
+        "SecurityApiKeyRotateSelfActivate", "SecurityApiKeyRotateActivate",
+        "SecurityApiKeyIssueSelfAbort", "SecurityApiKeyIssueAbort",
+        "SecurityApiKeyRotateSelfAbort", "SecurityApiKeyRotateAbort",
+        "SecurityApiKeyRevokeSelf", "SecurityApiKeyRevoke",
+    }
+    if set(re.findall(variant_pattern, idempotency_body)) != set(WRITE_OPERATIONS.values()) | lifecycle_variants:
         fail("Native security write idempotency admission differs")
     authorization_definition = re.compile(
         r"ProductErrorCode::AuthorizationDenied,\s*"
@@ -333,9 +357,10 @@ def validate_pagination(corpus: dict[str, Any], limits: dict[str, Any]) -> None:
     pagination = corpus.get("pagination")
     if not isinstance(pagination, dict):
         fail("pagination policy is missing")
-    exact_keys(pagination, {"audit", "metadata"}, "pagination policy")
+    exact_keys(pagination, {"audit", "catalog_visible", "metadata"}, "pagination policy")
     metadata = pagination["metadata"]
     audit = pagination["audit"]
+    catalog_visible = pagination["catalog_visible"]
     expected_metadata = {
         "cursor": "authorization_epoch+after_id",
         "deterministic": True,
@@ -354,6 +379,13 @@ def validate_pagination(corpus: dict[str, Any], limits: dict[str, Any]) -> None:
         fail("metadata pagination differs from the canonical policy")
     if audit != expected_audit:
         fail("audit pagination differs from the canonical policy")
+    if catalog_visible != {
+        "cursor": "opaque_authenticated_bytes",
+        "minimum_minor": 3,
+        "cross_authority_error": "catalog_conflict",
+        "stale_cursor_error": "catalog_conflict",
+    }:
+        fail("catalog visible pagination differs from the canonical policy")
 
 
 def validate_limits_and_redaction(corpus: dict[str, Any], contract: dict[str, Any]) -> None:
@@ -398,7 +430,7 @@ def validate_role_matrix_and_revocation(corpus: dict[str, Any]) -> None:
         fail("revocation must deny the next operation on the same connection")
 
 
-def validate_digests(corpus: dict[str, Any], contract_path: Path) -> None:
+def validate_digests(corpus: dict[str, Any], contract: dict[str, Any]) -> None:
     digests = corpus.get("digests")
     if not isinstance(digests, dict):
         fail("digests are missing")
@@ -415,9 +447,7 @@ def validate_digests(corpus: dict[str, Any], contract_path: Path) -> None:
     )
     for name, value in digests.items():
         validate_digest(value, name)
-    if digests["authority_contract_sha256"] != hashlib.sha256(
-        contract_path.read_bytes()
-    ).hexdigest():
+    if digests["authority_contract_sha256"] != authority_contract_digest(contract):
         fail("authority contract digest differs")
     if digests["operation_matrix_sha256"] != canonical_digest(corpus["operations"]):
         fail("operation matrix digest differs")
@@ -523,7 +553,7 @@ def validate(
     validate_operations(corpus, contract)
     validate_authentication(corpus)
     validate_protocol(corpus)
-    validate_digests(corpus, contract_path)
+    validate_digests(corpus, contract)
     validate_native_sources(root, corpus)
     validate_limits_and_redaction(corpus, contract)
     validate_pagination(corpus, corpus["limits"])

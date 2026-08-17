@@ -1,8 +1,12 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Native identity, role, scope, and API-key primitives.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use hyphae_native_types::ObjectId;
 use subtle::ConstantTimeEq;
@@ -223,7 +227,7 @@ impl FromStr for ApiKeyId {
 /// One-time API-key material returned only to an explicit secret sink.
 pub struct IssuedApiKey {
     id: ApiKeyId,
-    serialized: Box<str>,
+    serialized: [u8; API_KEY_BYTES],
 }
 
 impl IssuedApiKey {
@@ -234,7 +238,21 @@ impl IssuedApiKey {
 
     /// Exposes the complete secret for one-time restricted-file output.
     pub fn expose_secret(&self) -> &str {
+        std::str::from_utf8(&self.serialized).unwrap_or_default()
+    }
+
+    /// Exposes the complete canonical bytes for one-time restricted output.
+    pub const fn expose_secret_bytes(&self) -> &[u8; API_KEY_BYTES] {
         &self.serialized
+    }
+
+    /// Returns the confirmation digest required to activate this exact secret.
+    pub fn confirmation_digest(&self) -> ApiKeyConfirmationDigest {
+        let (id, mut secret) = parse_api_key(self.expose_secret())
+            .unwrap_or((*self.id.as_bytes(), [0; API_KEY_SECRET_BYTES]));
+        let digest = ApiKeyConfirmationDigest(key_digest(&id, &secret));
+        secret.fill(0);
+        digest
     }
 }
 
@@ -247,6 +265,98 @@ impl fmt::Debug for IssuedApiKey {
             .finish()
     }
 }
+
+impl Drop for IssuedApiKey {
+    fn drop(&mut self) {
+        self.serialized.fill(0);
+    }
+}
+
+/// Non-secret digest proving that a caller durably received one exact API key.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ApiKeyConfirmationDigest([u8; 32]);
+
+impl ApiKeyConfirmationDigest {
+    /// Reconstructs a confirmation digest from canonical wire bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns canonical wire bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKeyConfirmationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiKeyConfirmationDigest([REDACTED])")
+    }
+}
+
+/// Shared handle to one non-cloneable secret delivery.
+///
+/// Cloning this handle never clones secret bytes. Taking the secret through
+/// any handle consumes it for every handle.
+#[derive(Clone)]
+pub struct ApiKeySecretDelivery {
+    id: ApiKeyId,
+    secret: Arc<Mutex<Option<IssuedApiKey>>>,
+}
+
+impl ApiKeySecretDelivery {
+    pub(crate) fn new(secret: IssuedApiKey) -> Self {
+        Self {
+            id: secret.id(),
+            secret: Arc::new(Mutex::new(Some(secret))),
+        }
+    }
+
+    /// Reconstructs one one-time delivery from canonical protocol bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessControlError::InvalidApiKey`] for noncanonical bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AccessControlError> {
+        let serialized =
+            std::str::from_utf8(bytes).map_err(|_| AccessControlError::InvalidApiKey)?;
+        let (_, secret) = ApiKeyVerifier::import(serialized)?;
+        Ok(Self::new(secret))
+    }
+
+    /// Returns the public identity without exposing the secret.
+    pub const fn id(&self) -> ApiKeyId {
+        self.id
+    }
+
+    /// Consumes and returns the secret exactly once across all cloned handles.
+    pub fn take(&self) -> Option<IssuedApiKey> {
+        self.secret.lock().ok()?.take()
+    }
+
+    /// Returns whether the one-time secret has already been consumed.
+    pub fn is_consumed(&self) -> bool {
+        self.secret.lock().map_or(true, |secret| secret.is_none())
+    }
+}
+
+impl fmt::Debug for ApiKeySecretDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiKeySecretDelivery")
+            .field("id", &self.id)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl PartialEq for ApiKeySecretDelivery {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for ApiKeySecretDelivery {}
 
 /// Durable verifier for one API key. It never retains the raw secret.
 #[derive(Clone, Eq, PartialEq)]
@@ -283,11 +393,14 @@ impl ApiKeyVerifier {
     /// Returns [`AccessControlError::InvalidApiKey`] when the input is not the
     /// exact canonical v1 representation.
     pub fn import(serialized: &str) -> Result<(Self, IssuedApiKey), AccessControlError> {
-        let (id, secret) = parse_api_key(serialized)?;
+        let (id, mut secret) = parse_api_key(serialized)?;
         let verifier = Self::verifier(id, secret);
+        secret.fill(0);
+        let mut encoded = [0; API_KEY_BYTES];
+        encoded.copy_from_slice(serialized.as_bytes());
         let issued = IssuedApiKey {
             id: ApiKeyId(id),
-            serialized: serialized.into(),
+            serialized: encoded,
         };
         Ok((verifier, issued))
     }
@@ -299,16 +412,22 @@ impl ApiKeyVerifier {
 
     /// Verifies one canonical candidate in constant time after strict parsing.
     pub fn verifies(&self, candidate: &str) -> bool {
-        let Ok((candidate_id, candidate_secret)) = parse_api_key(candidate) else {
+        let Ok((candidate_id, mut candidate_secret)) = parse_api_key(candidate) else {
             return false;
         };
         let candidate_digest = key_digest(&candidate_id, &candidate_secret);
+        candidate_secret.fill(0);
         bool::from(self.id.0.ct_eq(&candidate_id) & self.digest.ct_eq(&candidate_digest))
     }
 
     /// Returns the durable domain-separated verifier bytes.
     pub const fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    /// Returns the non-secret digest required to activate the key.
+    pub const fn confirmation_digest(&self) -> ApiKeyConfirmationDigest {
+        ApiKeyConfirmationDigest(self.digest)
     }
 
     pub(crate) const fn from_digest(id: ApiKeyId, digest: [u8; 32]) -> Self {
@@ -321,28 +440,50 @@ impl ApiKeyVerifier {
 
     fn from_parts(
         id: [u8; API_KEY_ID_BYTES],
-        secret: [u8; API_KEY_SECRET_BYTES],
+        mut secret: [u8; API_KEY_SECRET_BYTES],
     ) -> (Self, IssuedApiKey) {
-        let mut serialized = String::with_capacity(API_KEY_BYTES);
-        serialized.push_str("hyp1_");
-        push_lower_hex(&mut serialized, &id);
-        serialized.push('_');
-        push_lower_hex(&mut serialized, &secret);
+        let verifier = Self::verifier(id, secret);
+        let mut serialized = [0; API_KEY_BYTES];
+        serialized[..API_KEY_PREFIX.len()].copy_from_slice(API_KEY_PREFIX);
+        encode_lower_hex(
+            &id,
+            &mut serialized[API_KEY_PREFIX.len()..API_KEY_SEPARATOR_INDEX],
+        );
+        serialized[API_KEY_SEPARATOR_INDEX] = b'_';
+        encode_lower_hex(&secret, &mut serialized[API_KEY_SEPARATOR_INDEX + 1..]);
+        secret.fill(0);
         (
-            Self::verifier(id, secret),
+            verifier,
             IssuedApiKey {
                 id: ApiKeyId(id),
-                serialized: serialized.into_boxed_str(),
+                serialized,
             },
         )
     }
 
-    fn verifier(id: [u8; API_KEY_ID_BYTES], secret: [u8; API_KEY_SECRET_BYTES]) -> Self {
-        Self {
+    fn verifier(id: [u8; API_KEY_ID_BYTES], mut secret: [u8; API_KEY_SECRET_BYTES]) -> Self {
+        let verifier = Self {
             id: ApiKeyId(id),
             digest: key_digest(&id, &secret),
-        }
+        };
+        secret.fill(0);
+        verifier
     }
+}
+
+/// Derives the activation confirmation digest from one canonical API key.
+///
+/// # Errors
+///
+/// Returns [`AccessControlError::InvalidApiKey`] when `serialized` is not the
+/// exact canonical v1 representation.
+pub fn api_key_confirmation_digest(
+    serialized: &str,
+) -> Result<ApiKeyConfirmationDigest, AccessControlError> {
+    let (id, mut secret) = parse_api_key(serialized)?;
+    let digest = ApiKeyConfirmationDigest(key_digest(&id, &secret));
+    secret.fill(0);
+    Ok(digest)
 }
 
 impl fmt::Debug for ApiKeyVerifier {
@@ -738,11 +879,11 @@ const fn decode_lower_nibble(value: u8) -> u8 {
     }
 }
 
-fn push_lower_hex(output: &mut String, bytes: &[u8]) {
+fn encode_lower_hex(bytes: &[u8], output: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    for (index, byte) in bytes.iter().enumerate() {
+        output[index * 2] = HEX[usize::from(byte >> 4)];
+        output[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
     }
 }
 

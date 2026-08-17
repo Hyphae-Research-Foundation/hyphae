@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Managed Native API-key authentication over the exact local transport.
 
@@ -92,7 +92,16 @@ async fn authenticated_local_client_preserves_typed_authorization_and_connection
         ProductResponse::StructureValue(Some(b"value".to_vec()))
     );
 
-    handle.revoke_api_key(owner, issued.key_id, 5)?;
+    let owner_client = handle
+        .open_authenticated_session(hyphae_native_product::ApiKeyCredential::new(&owner_secret)?)?;
+    owner_client.dispatch(
+        owner_client
+            .request_context(99, 5)
+            .with_idempotency_token(99),
+        ProductOperation::SecurityApiKeyRevoke {
+            key_id: issued.key_id,
+        },
+    )?;
     let revoked = client
         .execute(
             ProductOperation::StructureGet {
