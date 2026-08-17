@@ -9146,13 +9146,19 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
         format!("D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
     };
     let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+    let dacl = descriptor.dacl().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restricted credential descriptor has no DACL",
+        )
+    })?;
     wrappers::SetNamedSecurityInfo(
         path.as_os_str(),
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
         None,
-        descriptor.dacl(),
+        Some(dacl),
         None,
     )?;
     wrappers::SetNamedSecurityInfo(

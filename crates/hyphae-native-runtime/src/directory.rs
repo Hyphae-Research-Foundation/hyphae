@@ -441,13 +441,22 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
     };
     let descriptor: LocalBox<SecurityDescriptor> =
         sddl.parse().map_err(|source| io_error(path, source))?;
+    let dacl = descriptor.dacl().ok_or_else(|| {
+        io_error(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "restricted data directory descriptor has no DACL",
+            ),
+        )
+    })?;
     wrappers::SetNamedSecurityInfo(
         path.as_os_str(),
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
         None,
-        descriptor.dacl(),
+        Some(dacl),
         None,
     )
     .map_err(|source| io_error(path, source))?;
