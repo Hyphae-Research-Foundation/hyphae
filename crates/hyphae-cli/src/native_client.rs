@@ -393,11 +393,31 @@ pub(crate) fn read_api_key_file(path: &Path) -> Result<ApiKeyBuffer, CliFailure>
 }
 
 pub(crate) fn read_legacy_bearer_file(path: &Path) -> Result<LegacyBearerBuffer, CliFailure> {
+    #[cfg(windows)]
+    if is_windows_named_stream(path) {
+        return Err(authorization_denied());
+    }
     let metadata = fs::symlink_metadata(path).map_err(|_| authorization_denied())?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(authorization_denied());
     }
+    #[cfg(not(windows))]
     let mut file = File::open(path).map_err(|_| authorization_denied())?;
+    #[cfg(windows)]
+    let mut file = (|| -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL},
+        };
+
+        OpenOptions::new()
+            .access_mode(GENERIC_READ | READ_CONTROL)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })()
+    .map_err(|_| authorization_denied())?;
     validate_open_api_key_file(path, &metadata, &file).map_err(|_| authorization_denied())?;
     let mut bytes = Vec::with_capacity(128);
     Read::by_ref(&mut file)
@@ -461,9 +481,12 @@ pub(crate) fn reserve_restricted_api_key_file(
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
         options
-            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(0);
     }
     let file = options.open(path)?;

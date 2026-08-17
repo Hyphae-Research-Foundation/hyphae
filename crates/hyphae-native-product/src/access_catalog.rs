@@ -9087,12 +9087,15 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
 
-        // An exclusive handle prevents another process from acquiring the
-        // inherited ACL before the protected DACL is installed and verified.
+        // An exclusive handle plus WRITE_DAC/WRITE_OWNER makes ACL replacement
+        // and owner assignment refer to this exact newly created file.
         options
-            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(0);
     }
     #[allow(unused_mut)]
@@ -9100,7 +9103,7 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
         .open(path)
         .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
     #[cfg(windows)]
-    if apply_windows_restricted_acl(path).is_err()
+    if apply_windows_restricted_acl(&file).is_err()
         || validate_windows_restricted_file(&file).is_err()
     {
         drop(file);
@@ -9130,7 +9133,7 @@ fn is_windows_named_stream(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
+fn apply_windows_restricted_acl(file: &File) -> std::io::Result<()> {
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{SeObjectType, SecurityInformation},
@@ -9152,8 +9155,9 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
             "restricted credential descriptor has no DACL",
         )
     })?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    let mut security_handle = file.try_clone()?;
+    wrappers::SetSecurityInfo(
+        &mut security_handle,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
@@ -9161,8 +9165,8 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
         Some(dacl),
         None,
     )?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    wrappers::SetSecurityInfo(
+        &mut security_handle,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner,
         Some(current_user_sid.as_ref()),
@@ -9177,9 +9181,17 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an I/O error when the DACL cannot be installed or validated.
+/// Returns an I/O error when the DACL cannot be installed or validated. The
+/// handle must refer to `path` and grant Windows DACL-write, owner-write, and
+/// security-descriptor-read access in addition to the caller's data access.
 pub fn restrict_windows_credential_file(path: &Path, file: &File) -> std::io::Result<()> {
-    apply_windows_restricted_acl(path)?;
+    if is_windows_named_stream(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "named streams cannot contain credentials",
+        ));
+    }
+    apply_windows_restricted_acl(file)?;
     validate_windows_restricted_file(file)
 }
 
@@ -9189,7 +9201,7 @@ pub fn restrict_windows_credential_file(path: &Path, file: &File) -> std::io::Re
 /// # Errors
 ///
 /// Returns an I/O or permission error when the owner or DACL differs from the
-/// current process account plus LocalSystem authority.
+/// current process account plus `LocalSystem` authority.
 pub fn validate_windows_restricted_file(file: &File) -> std::io::Result<()> {
     use windows_permissions::{
         LocalBox, Sid,
@@ -10401,6 +10413,47 @@ mod tests {
         assert!(!sddl.contains(";;;AU)"));
         drop(file);
         remove_test_files(&[&path]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_strips_an_inherited_parent_trustee()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            LocalBox, SecurityDescriptor,
+            constants::{SeObjectType, SecurityInformation},
+            utilities, wrappers,
+        };
+
+        let root = temporary_directory().with_extension("restricted-parent");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let current_sid = utilities::current_process_sid()?;
+        let current = current_sid.to_string();
+        let system = "S-1-5-18";
+        let sddl = if current == system {
+            format!("D:P(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        } else {
+            format!("D:P(A;OICI;FA;;;{current})(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        };
+        let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+        let dacl = descriptor.dacl().ok_or("test descriptor has no DACL")?;
+        wrappers::SetNamedSecurityInfo(
+            root.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )?;
+
+        let path = root.join("owner.key");
+        let file = create_restricted_output(&path)?;
+        validate_windows_restricted_file(&file)?;
+        drop(file);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

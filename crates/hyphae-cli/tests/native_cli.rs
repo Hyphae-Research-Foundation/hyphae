@@ -687,6 +687,28 @@ fn offline_owner_recovery_recovers_after_phase_one_process_boundary() -> Result<
 }
 
 fn write_restricted_test_key(path: &Path, secret: &[u8]) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .share_mode(0)
+            .open(path)?;
+        // Match the product's Windows restricted-output contract rather than
+        // inheriting the test runner's temporary-directory ACL.
+        hyphae_native_product::restrict_windows_credential_file(path, &file)?;
+        std::io::Write::write_all(&mut file, secret)?;
+        file.sync_all()?;
+        hyphae_native_product::validate_windows_restricted_file(&file)?;
+    }
+    #[cfg(not(windows))]
     fs::write(path, secret)?;
     #[cfg(unix)]
     {

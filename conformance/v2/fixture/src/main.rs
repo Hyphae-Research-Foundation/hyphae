@@ -193,10 +193,13 @@ fn restricted_output(path: &Path) -> Result<fs::File, Box<dyn Error>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
 
         output_options
-            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(0);
     }
     let output = output_options.open(path)?;

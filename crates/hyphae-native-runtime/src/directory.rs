@@ -309,7 +309,9 @@ fn validate_offline_owner_path(path: &Path) -> io::Result<OfflineOwnerAuthority>
 #[cfg(windows)]
 fn validate_offline_owner_path(path: &Path) -> io::Result<OfflineOwnerAuthority> {
     use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL,
+    };
 
     if is_windows_named_stream(path) {
         return Err(io::Error::new(
@@ -325,19 +327,46 @@ fn validate_offline_owner_path(path: &Path) -> io::Result<OfflineOwnerAuthority>
             "data directory is not a regular directory",
         ));
     }
-    let identity = FileIdentityHandle::from_path(path)?;
+    let directory_access = READ_CONTROL | FILE_READ_ATTRIBUTES;
+    let identity = FileIdentityHandle::from_file(open_windows_directory(path, directory_access)?)?;
     validate_windows_data_directory(identity.as_file())?;
+    let opened = identity.as_file().metadata()?;
     let current = fs::symlink_metadata(path)?;
-    if !current.file_type().is_dir()
+    if !opened.file_type().is_dir()
+        || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !current.file_type().is_dir()
         || current.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || identity != FileIdentityHandle::from_path(path)?
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "data directory identity changed",
         ));
     }
+    let current_identity =
+        FileIdentityHandle::from_file(open_windows_directory(path, directory_access)?)?;
+    if identity != current_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "data directory identity changed",
+        ));
+    }
     Ok(OfflineOwnerAuthority { identity })
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path, access_mode: u32) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .access_mode(access_mode)
+        // Deny rename/delete while authority is captured or held, but permit
+        // the runtime's normal file opens beneath the directory.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 #[cfg(windows)]
@@ -420,7 +449,9 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
         constants::{SeObjectType, SecurityInformation},
         utilities, wrappers,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    };
 
     if is_windows_named_stream(path) {
         return Err(owner_authority_error());
@@ -428,6 +459,17 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
     let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
     if !metadata.file_type().is_dir()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(owner_authority_error());
+    }
+    let directory_access = READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES;
+    let mut directory =
+        open_windows_directory(path, directory_access).map_err(|source| io_error(path, source))?;
+    let opened_metadata = directory
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    if !opened_metadata.file_type().is_dir()
+        || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         return Err(owner_authority_error());
     }
@@ -450,8 +492,8 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
             ),
         )
     })?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    wrappers::SetSecurityInfo(
+        &mut directory,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
@@ -460,8 +502,8 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
         None,
     )
     .map_err(|source| io_error(path, source))?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    wrappers::SetSecurityInfo(
+        &mut directory,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner,
         Some(current_sid.as_ref()),
@@ -470,8 +512,18 @@ fn restrict_windows_data_directory(path: &Path) -> Result<(), NativeDirectoryErr
         None,
     )
     .map_err(|source| io_error(path, source))?;
-    let identity = FileIdentityHandle::from_path(path).map_err(|source| io_error(path, source))?;
-    validate_windows_data_directory(identity.as_file()).map_err(|source| io_error(path, source))
+    validate_windows_data_directory(&directory).map_err(|source| io_error(path, source))?;
+    let identity =
+        FileIdentityHandle::from_file(directory).map_err(|source| io_error(path, source))?;
+    let current_identity = FileIdentityHandle::from_file(
+        open_windows_directory(path, READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .map_err(|source| io_error(path, source))?,
+    )
+    .map_err(|source| io_error(path, source))?;
+    if identity != current_identity {
+        return Err(owner_authority_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -748,6 +800,9 @@ mod tests {
     use hyphae_native_types::{DirectoryUuid, HistoryEpoch};
     use std::path::Path;
 
+    #[cfg(windows)]
+    const OFFLINE_OWNER_PROCESS_PROBE_PATH: &str = "HYPHAE_OFFLINE_OWNER_PROCESS_PROBE_PATH";
+
     #[test]
     fn canonical_marker_has_golden_bytes() -> Result<(), hyphae_native_types::NativeTypeError> {
         let identity = NativeDirectoryIdentity::new(
@@ -864,5 +919,115 @@ mod tests {
         super::validate_offline_owner_path(&path)?;
         std::fs::remove_dir_all(path)?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_owner_authority_survives_inherited_acl_and_process_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, process::Command};
+
+        let root = std::env::temp_dir().join(format!(
+            "hyphae-windows-owner-process-{}-{}",
+            std::process::id(),
+            super::NEXT_DIRECTORY_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        install_inheritable_world_acl(&root)?;
+        let data = root.join("data");
+        fs::create_dir(&data)?;
+        assert!(directory_has_world_ace(&data)?);
+
+        drop(super::NativeDirectoryGuard::initialize(&data)?);
+        let guard = super::NativeDirectoryGuard::open_offline_owner(&data)?;
+        guard.revalidate_offline_owner(&data)?;
+        drop(guard);
+
+        let output = Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("directory::tests::offline_owner_process_probe")
+            .arg("--nocapture")
+            .env(OFFLINE_OWNER_PROCESS_PROBE_PATH, &data)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "offline-owner child probe failed: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_owner_process_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = std::env::var_os(OFFLINE_OWNER_PROCESS_PROBE_PATH) else {
+            return Ok(());
+        };
+        let path = Path::new(&path);
+        let guard = super::NativeDirectoryGuard::open_offline_owner(path)?;
+        guard.revalidate_offline_owner(path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn install_inheritable_world_acl(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            LocalBox, SecurityDescriptor,
+            constants::{SeObjectType, SecurityInformation},
+            utilities, wrappers,
+        };
+
+        let current_sid = utilities::current_process_sid()?;
+        let current = current_sid.to_string();
+        let system = "S-1-5-18";
+        let sddl = if current == system {
+            format!("D:P(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        } else {
+            format!("D:P(A;OICI;FA;;;{current})(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        };
+        let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+        let dacl = descriptor.dacl().ok_or("test descriptor has no DACL")?;
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn directory_has_world_ace(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            LocalBox, Sid,
+            constants::{SeObjectType, SecurityInformation},
+            wrappers,
+        };
+
+        let directory = same_file::Handle::from_file(super::open_windows_directory(
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
+        )?)?;
+        let descriptor = wrappers::GetSecurityInfo(
+            directory.as_file(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl,
+        )?;
+        let dacl = descriptor.dacl().ok_or("test directory has no DACL")?;
+        let world: LocalBox<Sid> = "S-1-1-0".parse()?;
+        Ok((0..dacl.len()).any(|index| {
+            dacl.get_ace(index)
+                .and_then(|ace| ace.sid())
+                .is_some_and(|sid| sid == world.as_ref())
+        }))
     }
 }
