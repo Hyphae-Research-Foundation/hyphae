@@ -232,7 +232,7 @@ fn restrict_windows_file(path: &Path, file: &fs::File) -> Result<(), Box<dyn Err
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
         None,
-        descriptor.dacl()?,
+        descriptor.dacl(),
         None,
     )?;
     hyphae_native_product::validate_windows_restricted_file(file)?;

@@ -561,8 +561,6 @@ async fn managed_missing_malformed_and_wrong_credentials_are_uniform() -> Result
         encode_authenticated_hello(&authenticated_hello, &wrong)?,
         encode_authenticated_hello(&wrong_namespace_hello, &wrong)?,
     ];
-    let unknown = request(ProductOperation::Capabilities);
-    let unknown = encode_product_request(&unknown)?;
     let mut errors = Vec::new();
     for payload in payloads {
         let path = test.socket.to_string_lossy();
@@ -570,9 +568,6 @@ async fn managed_missing_malformed_and_wrong_credentials_are_uniform() -> Result
         let mut codec = AsyncFrameIo::new(16 * 1024 * 1024)?;
         codec
             .send(&mut &stream, FrameKind::Hello, 0, 1, &payload)
-            .await?;
-        codec
-            .send(&mut &stream, FrameKind::Execute, 1, 2, &unknown)
             .await?;
         let response = codec
             .receive(&mut &stream)

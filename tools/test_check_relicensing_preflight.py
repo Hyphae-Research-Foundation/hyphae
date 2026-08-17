@@ -357,14 +357,63 @@ class RelicensingPreflightTests(unittest.TestCase):
         for path, expected in cases:
             with self.subTest(path=path):
                 document = json.loads((ROOT / path).read_text(encoding="utf-8"))
-                document["source"]["commit"] = (
-                    "8572af2c2e9ccb95f4ebc8002d3a524efbba67f0"
-                )
-                document["source"]["tree"] = (
-                    "163633dec3a79931507d184926b10e6cc17722ea"
-                )
+                current = json.loads(
+                    (ROOT / DEPENDENCY_RECEIPT_PATH).read_text(encoding="utf-8")
+                )["source"]
+                document["source"]["commit"] = current["commit"]
+                document["source"]["tree"] = current["tree"]
                 failures = self.validate_evidence_documents({path: document})
                 self.assertTrue(any(expected in error for error in failures))
+
+    def test_dependabot_review_uses_only_its_legal_base_history(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def git_read(root: Path, *arguments: str) -> bytes:
+            calls.append(arguments)
+            return _git_read(root, *arguments)
+
+        with patch(
+            "tools.check_relicensing_preflight._git_read", side_effect=git_read
+        ):
+            self.assertEqual(self.validate_evidence_documents({}), [])
+        log_calls = [arguments for arguments in calls if arguments[:1] == ("log",)]
+        self.assertEqual(len(log_calls), 1)
+        self.assertEqual(
+            log_calls[0][1],
+            json.loads((ROOT / DEPENDABOT_REVIEW_PATH).read_text(encoding="utf-8"))[
+                "source"
+            ]["commit"],
+        )
+        self.assertNotIn("--all", log_calls[0])
+
+    def test_dependabot_review_method_and_digest_fail_closed(self) -> None:
+        original = json.loads(
+            (ROOT / DEPENDABOT_REVIEW_PATH).read_text(encoding="utf-8")
+        )
+        cases = (
+            ("scope", "All Dependabot commits in every local ref", "review method differs"),
+            ("ordered_commit_ids_sha256", "not-a-digest", "invalid SHA-256"),
+        )
+        for field, value, expected in cases:
+            with self.subTest(field=field):
+                review = copy.deepcopy(original)
+                review["method"][field] = value
+                failures = self.validate_evidence_documents(
+                    {DEPENDABOT_REVIEW_PATH: review}
+                )
+                self.assertTrue(any(expected in error for error in failures), failures)
+
+        review = copy.deepcopy(original)
+        current = json.loads(
+            (ROOT / DEPENDENCY_RECEIPT_PATH).read_text(encoding="utf-8")
+        )["source"]
+        review["source"]["commit"] = current["commit"]
+        review["source"]["tree"] = current["tree"]
+        failures = self.validate_evidence_documents({DEPENDABOT_REVIEW_PATH: review})
+        self.assertTrue(
+            any("Dependabot review differs from exact legal base" in error for error in failures),
+            failures,
+        )
 
     def test_dependency_receipt_rejects_unrelated_commit_and_tree(self) -> None:
         original = json.loads(

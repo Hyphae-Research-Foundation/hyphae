@@ -49,6 +49,11 @@ REPRESENTATIVE_ATTESTATION_PATH = (
 DEPENDABOT_REVIEW_PATH = (
     "docs/gates/evidence/relicensing-1.2.0-dependabot-review.json"
 )
+DEPENDABOT_REVIEW_METHOD = {
+    "scope": f"Every commit reachable from legal base source.commit {LEGAL_BASE_COMMIT} whose author is dependabot[bot].",
+    "review": "Each parent-to-commit patch, changed path set, numstat, author, committer, subject, and tree was inspected individually.",
+    "classification_rule": "A commit is mechanical only when its complete patch changes dependency versions, lock resolution, checksums, or immutable full-SHA action references and contains no authored product logic, prose, or license grant.",
+}
 TRANSITION_RECEIPT_PATH = "docs/gates/evidence/relicensing-1.2.0-transition.json"
 HISTORICAL_APACHE_LICENSE_SHA256 = (
     "cdf5cb75ba05132c2933df3d948450e0503ede64552ee3a4d3fb9f52dab096c0"
@@ -1219,10 +1224,15 @@ def validate_preflight_evidence(
     attestation_commit, attestation_tree = _source_binding(
         attestation, REPRESENTATIVE_ATTESTATION_PATH, root, failures
     )
+    dependabot_commit, dependabot_tree = _source_binding(
+        dependabot, DEPENDABOT_REVIEW_PATH, root, failures
+    )
     if (audit_commit, audit_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
         failures.append("preflight evidence: repository audit differs from exact legal base")
     if (attestation_commit, attestation_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
         failures.append("preflight evidence: owner attestation differs from exact legal base")
+    if (dependabot_commit, dependabot_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: Dependabot review differs from exact legal base")
 
     if dependency.get("schema") != "hyphae-relicensing-dependency-receipt-v1":
         failures.append(f"{DEPENDENCY_RECEIPT_PATH}.schema: unsupported identifier")
@@ -1642,19 +1652,21 @@ def validate_preflight_evidence(
 
     if dependabot.get("schema") != "hyphae-relicensing-dependabot-review-v1":
         failures.append(f"{DEPENDABOT_REVIEW_PATH}.schema: unsupported identifier")
-    if dependabot.get("reviewed_commit_count") != 12 or dependabot.get("result") != (
-        "accepted-mechanical-first-party-review"
-    ):
-        failures.append(f"{DEPENDABOT_REVIEW_PATH}: accepted review result differs")
     reviews = dependabot.get("reviews")
-    if not isinstance(reviews, list) or len(reviews) != 12:
-        failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: must contain twelve reviews")
+    if not isinstance(reviews, list) or not reviews:
+        failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: must be a nonempty array")
     else:
+        if dependabot.get("reviewed_commit_count") != len(reviews) or dependabot.get(
+            "result"
+        ) != "accepted-mechanical-first-party-review":
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}: accepted review result differs")
         try:
+            if dependabot_commit is None:
+                raise ValueError("Dependabot source commit is invalid")
             observed = _git_read(
                 root,
                 "log",
-                "--all",
+                dependabot_commit,
                 "--author=dependabot\\|dependabot\\[bot\\]",
                 "--format=%H",
             ).decode("ascii").splitlines()
@@ -1666,9 +1678,19 @@ def validate_preflight_evidence(
             failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: commit inventory differs")
         method = dependabot.get("method")
         ordered = "".join(f"{commit}\n" for commit in sorted(observed)).encode("ascii")
-        if not isinstance(method, dict) or method.get(
-            "ordered_commit_ids_sha256"
-        ) != hashlib.sha256(ordered).hexdigest():
+        expected_method_keys = {*DEPENDABOT_REVIEW_METHOD, "ordered_commit_ids_sha256"}
+        if not isinstance(method, dict) or set(method) != expected_method_keys:
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: missing or unknown fields")
+            method = {}
+        elif any(method.get(key) != value for key, value in DEPENDABOT_REVIEW_METHOD.items()):
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: review method differs")
+        method_digest = method.get("ordered_commit_ids_sha256")
+        _validate_digest(
+            method_digest,
+            f"{DEPENDABOT_REVIEW_PATH}.method.ordered_commit_ids_sha256",
+            failures,
+        )
+        if method_digest != hashlib.sha256(ordered).hexdigest():
             failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: commit digest differs")
         for index, review in enumerate(reviews):
             location = f"{DEPENDABOT_REVIEW_PATH}.reviews[{index}]"

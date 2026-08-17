@@ -2844,7 +2844,10 @@ fn security_write_plane_parsers_are_canonical_and_bounded() -> Result<(), Box<dy
 #[test]
 fn native_mcp_requires_a_restricted_api_key_source() -> Result<(), Box<dyn Error>> {
     let fixture = SecurityWriteFixture::create()?;
-    let missing = output(&["mcp", "--base-url", "http://127.0.0.1:1"])?;
+    let missing = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+        .args(["mcp", "--base-url", "http://127.0.0.1:1"])
+        .output()?;
     assert_eq!(missing.status.code(), Some(8));
 
     let accepted_file = output(&[

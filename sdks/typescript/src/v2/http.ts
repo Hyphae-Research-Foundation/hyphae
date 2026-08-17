@@ -87,7 +87,7 @@ export class HttpTransport implements Transport {
     const controller = new AbortController();
     const cancel = (): void => controller.abort(options.signal?.reason);
     options.signal?.addEventListener("abort", cancel, { once: true });
-    const timeout = deadlineTimeout(options.deadlineMicros, controller);
+    const timeout = deadlineTimeout(options.deadlineMicros, controller, requestId);
     const headers = new Headers({
       accept: `${PRODUCT_MEDIA_TYPE}, ${ERROR_MEDIA_TYPE}`,
       "content-type": PRODUCT_MEDIA_TYPE,
@@ -171,11 +171,12 @@ export class HttpTransport implements Transport {
 function deadlineTimeout(
   deadlineMicros: bigint | undefined,
   controller: AbortController,
+  requestId: bigint,
 ): ReturnType<typeof setTimeout> | undefined {
   if (deadlineMicros === undefined) return undefined;
   const remainingMicros = deadlineMicros - BigInt(Date.now()) * 1000n;
   const delay = remainingMicros <= 0n ? 0 : Number((remainingMicros + 999n) / 1000n);
-  return setTimeout(() => controller.abort(new ClientError("Hyphae v2 request deadline elapsed")), delay);
+  return setTimeout(() => controller.abort(productError("deadline_exceeded", requestId)), delay);
 }
 
 async function readBounded(response: globalThis.Response, maximum: number, signal?: AbortSignal): Promise<Uint8Array> {

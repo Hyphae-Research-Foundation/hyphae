@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.produce_relicensing_dependency_receipt import produce, source_inputs
+from tools.produce_relicensing_dependency_receipt import (
+    canonical_sha256,
+    produce,
+    source_inputs,
+)
 
 
 class RelicensingDependencyReceiptTests(unittest.TestCase):
@@ -139,14 +144,54 @@ class RelicensingDependencyReceiptTests(unittest.TestCase):
                 / "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(
-            receipt["source"]["commit"],
-            "8572af2c2e9ccb95f4ebc8002d3a524efbba67f0",
+        source = receipt["source"]
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{commit}"], cwd=root, text=True
+        ).strip()
+        source_tree = subprocess.check_output(
+            ["git", "rev-parse", f"{source['commit']}^{{tree}}"],
+            cwd=root,
+            text=True,
+        ).strip()
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source["commit"], head],
+            cwd=root,
+            check=True,
         )
-        self.assertEqual(receipt["source"]["mode"], "integration-tree")
-        self.assertFalse(receipt["source"]["worktree_clean"])
+        subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                source["legal_base_commit"],
+                source["commit"],
+            ],
+            cwd=root,
+            check=True,
+        )
+        self.assertEqual(source["tree"], source_tree)
+        self.assertEqual(
+            (source["legal_base_commit"], source["legal_base_tree"]),
+            (
+                "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
+                "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
+            ),
+        )
+        self.assertIn(source["mode"], {"clean-commit", "integration-tree"})
+        if source["mode"] == "clean-commit":
+            self.assertTrue(source["worktree_clean"])
+            self.assertEqual(source["commit"], head)
+        else:
+            self.assertFalse(source["worktree_clean"])
+        self.assertEqual(
+            source["source_inputs_sha256"],
+            canonical_sha256(receipt["source_inputs"]),
+        )
         self.assertIn("evolved from legal base", receipt["scope"]["evidence_evolution"])
-        self.assertEqual(receipt["inventory"]["package_count"], 299)
+        self.assertEqual(
+            receipt["inventory"]["package_count"],
+            len(receipt["inventory"]["packages"]),
+        )
         self.assertIn(
             "same-file",
             {package["name"] for package in receipt["inventory"]["packages"]},

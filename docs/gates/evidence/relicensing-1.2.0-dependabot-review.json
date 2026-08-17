@@ -9,7 +9,7 @@
     "tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95"
   },
   "method": {
-    "scope": "Every commit reachable from source.commit whose author is dependabot[bot].",
+    "scope": "Every commit reachable from legal base source.commit fcf2f918e1539cfb7d67fd52abf0c7d57169ec18 whose author is dependabot[bot].",
     "review": "Each parent-to-commit patch, changed path set, numstat, author, committer, subject, and tree was inspected individually.",
     "classification_rule": "A commit is mechanical only when its complete patch changes dependency versions, lock resolution, checksums, or immutable full-SHA action references and contains no authored product logic, prose, or license grant.",
     "ordered_commit_ids_sha256": "5db8ee5b9bd9a8db8f0723e05707f312fa3ec7331162f1d5ba9aa0b9790f5718"
