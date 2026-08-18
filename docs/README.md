@@ -151,7 +151,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ### Durable formats
 
-- [Data directory and architecture](architecture/overview.md#data-directory)
+- [Data directory and architecture](architecture/overview.md#native-data-directory)
 - [Log format v1](storage/log-format-v1.md)
 - [Mutation format v1](storage/mutation-format-v1.md)
 - [Durable vector record format v1](storage/vector-record-format-v1.md)
