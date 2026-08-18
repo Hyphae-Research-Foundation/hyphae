@@ -32,7 +32,10 @@ it does not represent this component as a Syft discovery. An unsupported
 first-party package type, conflicting
 license, unknown identity, non-local first-party source, or unresolved linked
 npm package fails closed. Third-party artifacts and their observed licenses
-are never rewritten.
+are never rewritten. Private development-only npm projects are omitted only
+when their artifact identity matches an explicit manifest path, package name,
+`"private": true`, and local lock inventory; a matching name at another path or
+a non-private manifest fails closed.
 
 SPDX and CycloneDX are converted from that same normalized Syft document. The
 G8 release verifier requires `Apache-2.0` in every emitted first-party

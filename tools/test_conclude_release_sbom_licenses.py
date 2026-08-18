@@ -61,6 +61,19 @@ def linked_npm_artifact() -> dict:
     }
 
 
+def private_mcp_host_artifact() -> dict:
+    return {
+        "id": "private-mcp-host-id",
+        "name": "hyphae-mcp-conformance-hosts",
+        "version": "1.0.0",
+        "type": "npm",
+        "foundBy": "javascript-lock-cataloger",
+        "locations": [{"path": "/conformance/mcp/hosts/package-lock.json"}],
+        "licenses": [],
+        "purl": "pkg:npm/hyphae-mcp-conformance-hosts@1.0.0",
+    }
+
+
 def syft_document(*artifacts: dict) -> dict:
     return {
         "descriptor": {"name": "syft", "version": SYFT_VERSION},
@@ -271,6 +284,8 @@ dependencies = []
             self.root / "conformance/mcp/hosts/package-lock.json",
             json.dumps(
                 {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
                     "packages": {
                         "": {
                             "name": "hyphae-mcp-conformance-hosts",
@@ -281,12 +296,133 @@ dependencies = []
                 }
             ),
         )
-        document = syft_document(rust_artifact(), linked_npm_artifact())
-        self.assertEqual(conclude_document(document, self.root), 2)
-        self.assertNotIn(
-            "hyphae-mcp-conformance-hosts",
-            {artifact["name"] for artifact in document["artifacts"]},
+        document = syft_document(
+            rust_artifact(), private_mcp_host_artifact(), linked_npm_artifact()
         )
+        document["artifactRelationships"] = [
+            {"parent": "rust-id", "child": "private-mcp-host-id"},
+            {"parent": "rust-id", "child": "npm-link-id"},
+        ]
+        self.assertEqual(conclude_document(document, self.root), 2)
+        self.assertEqual(
+            [artifact["name"] for artifact in document["artifacts"]],
+            ["hyphae-core", "@celiums/hyphae"],
+        )
+        self.assertEqual(
+            document["artifactRelationships"],
+            [{"parent": "rust-id", "child": "npm-link-id"}],
+        )
+
+    def test_mcp_tool_name_is_not_excluded_without_private_true(self) -> None:
+        write(
+            self.root / "conformance/mcp/hosts/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "private": False,
+                    "license": SOFTWARE_LICENSE,
+                }
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "private=true"):
+            conclude_document(
+                syft_document(rust_artifact(), linked_npm_artifact()), self.root
+            )
+
+    def test_mcp_tool_name_is_not_excluded_at_another_path(self) -> None:
+        write(
+            self.root / "tools/mcp-hosts/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "private": True,
+                    "license": SOFTWARE_LICENSE,
+                }
+            ),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "must use conformance/mcp/hosts/package.json"
+        ):
+            conclude_document(
+                syft_document(rust_artifact(), linked_npm_artifact()), self.root
+            )
+
+    def test_mcp_tool_artifact_is_not_excluded_at_another_path(self) -> None:
+        write(
+            self.root / "conformance/mcp/hosts/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "private": True,
+                    "license": SOFTWARE_LICENSE,
+                }
+            ),
+        )
+        write(
+            self.root / "conformance/mcp/hosts/package-lock.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "packages": {
+                        "": {
+                            "name": "hyphae-mcp-conformance-hosts",
+                            "version": "1.0.0",
+                        }
+                    },
+                }
+            ),
+        )
+        write(
+            self.root / "tools/package-lock.json",
+            json.dumps({"packages": {}}),
+        )
+        artifact = private_mcp_host_artifact()
+        artifact["locations"] = [{"path": "/tools/package-lock.json"}]
+        with self.assertRaisesRegex(RuntimeError, "evidence does not match"):
+            conclude_document(
+                syft_document(rust_artifact(), artifact, linked_npm_artifact()),
+                self.root,
+            )
+
+    def test_private_mcp_artifact_requires_exact_inventory(self) -> None:
+        write(
+            self.root / "conformance/mcp/hosts/package.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "private": True,
+                    "license": SOFTWARE_LICENSE,
+                }
+            ),
+        )
+        write(
+            self.root / "conformance/mcp/hosts/package-lock.json",
+            json.dumps(
+                {
+                    "name": "hyphae-mcp-conformance-hosts",
+                    "version": "1.0.0",
+                    "packages": {
+                        "": {
+                            "name": "hyphae-mcp-conformance-hosts",
+                            "version": "1.0.0",
+                            "license": SOFTWARE_LICENSE,
+                        }
+                    },
+                }
+            ),
+        )
+        artifact = private_mcp_host_artifact()
+        artifact["purl"] = "pkg:npm/hyphae-mcp-conformance-hosts@9.9.9"
+        with self.assertRaisesRegex(RuntimeError, "inventory does not match"):
+            conclude_document(
+                syft_document(rust_artifact(), artifact, linked_npm_artifact()),
+                self.root,
+            )
 
     def test_private_website_is_not_shipped_first_party_identity(self) -> None:
         write(
@@ -297,6 +433,21 @@ dependencies = []
                     "version": "0.1.0",
                     "private": True,
                     "license": "UNLICENSED",
+                }
+            ),
+        )
+        write(
+            self.root / "website/package-lock.json",
+            json.dumps(
+                {
+                    "name": "hyphae-premium-site",
+                    "version": "0.1.0",
+                    "packages": {
+                        "": {
+                            "name": "hyphae-premium-site",
+                            "version": "0.1.0",
+                        }
+                    },
                 }
             ),
         )

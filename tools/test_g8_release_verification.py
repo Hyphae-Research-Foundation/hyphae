@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "packaging"))
 
 from g8_release_verification import (  # noqa: E402
     expected_archives,
+    expected_hyphae_identities,
     verify,
     verify_cyclonedx_hyphae_licenses,
     verify_spdx_hyphae_licenses,
@@ -67,6 +68,17 @@ def cyclonedx(license_identifier: str = "Apache-2.0") -> dict:
 
 
 class G8ReleaseVerificationTests(unittest.TestCase):
+    def test_repository_release_authority_remains_79_artifacts_33_identities(
+        self,
+    ) -> None:
+        identities = expected_hyphae_identities()
+        self.assertEqual(sum(identities.values()), 79)
+        self.assertEqual(len(identities), 33)
+        self.assertNotIn(
+            "hyphae-mcp-conformance-hosts",
+            {name for name, _, _ in identities},
+        )
+
     def test_expected_archives_rejects_noncanonical_tag(self) -> None:
         with self.assertRaises(ValueError):
             expected_archives("1.0")
