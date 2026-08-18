@@ -3,6 +3,53 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [1.2.0] - Unreleased
+
+Hyphae 1.2.0 completes the coupled operator/agent-experience and relicensing
+programs: durable native access control, the operator console, agent plugins,
+a published Python client, and the Apache-2.0 software transition. It does
+not change the Native format.
+
+### Added
+
+- Added durable principals, custom roles, scoped grants, API keys, rotation,
+  revocation, owner bootstrap/recovery, legacy-bearer migration, and bounded
+  security audit committed through the native WAL and CSN sequence.
+- Added the `hyphae console` Ratatui operator console with bounded SQL,
+  keyspace, search, catalog, telemetry, maintenance, backup, and redacted
+  security views.
+- Added the versioned read-only Native v2 MCP stdio server with Claude Code
+  and Codex plugin manifests around one adapter.
+- Added the typed `hyphae` Python client with embedded/local and remote
+  transports and sync/async APIs.
+- New native data directories are now created owner-only (`0o700`) on Unix
+  inside the `mkdir` call itself, covering the raw WAL, pages, blobs,
+  security catalog, and the default local endpoint.
+
+### Changed
+
+- License the software tree and normative specifications under `Apache-2.0`;
+  narrative documentation remains `CC-BY-SA-4.0`. Published `v1.1.0`
+  artifacts retain their `AGPL-3.0-only` terms.
+- Deprecated the pre-daemon `LocalDataSession`, `UdsFrameListener`, and
+  `UdsFrameConnection` runtime APIs; local clients use `hyphae-native-daemon`
+  with `hyphae-native-protocol`.
+- Impossible internal residues in the local session, aggregate convergence,
+  and product vector-search paths now return bounded typed failures instead
+  of panicking; the remaining format-2 invariant panics are documented at
+  each site.
+- Refreshed the architecture overview, workspace-boundary ADR, gate-status
+  documents, and crate READMEs to describe the shipped Native generation and
+  label the format-2 product as compatibility-only.
+
+### Non-claims
+
+- No universal latency claim; transport, execution, queueing, and durability
+  remain separately reported.
+- Filesystem hardening covers newly created data directories; existing
+  directories retain their modes, and a custom Unix endpoint outside the
+  data directory requires an owner-only parent directory.
+
 ## [1.1.0] - 2026-08-14
 
 Hyphae 1.1.0 completes the Native local-engine readiness program through G7
