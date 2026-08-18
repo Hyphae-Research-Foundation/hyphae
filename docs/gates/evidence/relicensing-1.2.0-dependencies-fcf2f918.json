@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-08-18T19:22:24.427573+00:00",
+  "generated_at_utc": "2026-08-18T20:22:09.391654+00:00",
   "inventory": {
     "canonical_sha256": "6b776a3d6fa654ba240328a8e40ef2567915ed496903c156e3954c44fdb6bb61",
     "external_package_count": 272,
@@ -2151,13 +2151,13 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "f48af7276e96a7e017d8cc2142ba36d05969c983",
+    "commit": "953ae01c1086db249c7337751e0f039240988e2d",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/celiumsai/hyphae.git",
-    "source_inputs_sha256": "c2d077ee601f8bdeac24dc7329afdc011d55697f47055d0d7c89ab1264200324",
-    "tree": "f159b9ba3085a5a3b0385673ff8e414ad76a83ae",
+    "source_inputs_sha256": "f8d53830a259272fe64c9cd6aee4877101493d427d182c26b1c2356ca4a8001e",
+    "tree": "55087b4a778a0e0a8e134113d7a96a26301e2adb",
     "worktree_clean": false
   },
   "source_inputs": [
@@ -2171,7 +2171,7 @@
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
-      "sha256": "50db3ab94364816efc4d5ff3be9f75aa58433105b6207a8f1332aeb325d8c9c1"
+      "sha256": "724496ba5866780118902fca3f5cf1e606c6a269c27e22c1787fc649ac858b0d"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.toml",
@@ -2179,7 +2179,7 @@
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.lock",
-      "sha256": "27ac5f5de958467b928979b132240cfeffeedac704cd86fb482ce5e57dab0615"
+      "sha256": "838cc3b5243e31c8db7f9ddc4f0f1b43a8b7d7084cda52423f40cef6796a6b15"
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.toml",
@@ -2295,11 +2295,11 @@
     },
     {
       "path": "fuzz/Cargo.lock",
-      "sha256": "7d4a49b220f1f4d9a3f6101aa524580077de5fb8ab2fa08b1a613148182069b3"
+      "sha256": "f7018935ea719ab3bdd86e6831fc60a51aa30460d49a13cc6f71fa492c721843"
     },
     {
       "path": "fuzz/Cargo.toml",
-      "sha256": "f9dd265dacedd1a3b0c7c2faf2e7b6c3914e6ff143da78b14da778b06ba929a1"
+      "sha256": "8b9197c4cb6f9c0946becb3f24c5bd5c6922eee9b1d653136f3375ef5d5f4ed5"
     },
     {
       "path": "integrations/pliegors/Cargo.toml",
