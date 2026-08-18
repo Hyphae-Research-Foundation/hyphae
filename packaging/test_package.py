@@ -365,7 +365,7 @@ class PackageTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(version, "1.1.0")
+        self.assertEqual(version, "1.2.0")
         self.assertEqual(python["project"]["version"], version)
         self.assertEqual(typescript["version"], version)
         self.assertEqual(typescript_lock["version"], version)
