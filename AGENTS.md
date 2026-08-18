@@ -40,3 +40,27 @@
 - Add failure-path tests for durable behavior.
 - Do not claim a roadmap phase complete without its exit evidence.
 - Never add an automation attribution trailer to a commit.
+
+## Cursor Cloud specific instructions
+
+- This is a single Rust workspace (Cargo, no other services/databases). The
+ pinned toolchain in `rust-toolchain.toml` (1.96.0, with `clippy`/`rustfmt`/
+ `rust-docs`) is preinstalled; `rustup` auto-selects it inside `/workspace`.
+- The startup update script runs `cargo fetch --locked` to prime the crate
+ cache. It does not build; the first `cargo build`/`test` still compiles the
+ full graph and can take a few minutes.
+- `hyphae-cli` is the only executable (`default-members`). Build the dev binary
+ with `cargo build --locked -p hyphae-cli` → `target/debug/hyphae`.
+- Lint/test/doc commands live in `README.md` (Development) and
+ `docs/development.md` (Required local checks); use those, e.g.
+ `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+ `cargo test --workspace --all-features --locked`.
+- The product is offline-first: no listener starts unless `hyphae serve` is
+ run. To exercise the engines, `hyphae init --data-dir <new-dir>` then use the
+ `sql`/`structure`/`search`/`doctor` subcommands (see
+ `docs/quickstart-native.md`). The data dir must not already exist; reuse
+ `--data-dir` to reopen it. Do not commit created data dirs.
+- Some checks in `docs/development.md`/`CONTRIBUTING.md` are Python tools under
+ `tools/` (e.g. `check_documentation.py`) and network-dependent security tools
+ (`cargo deny`, `cargo audit`); these are optional for local dev and not part
+ of the startup script.
