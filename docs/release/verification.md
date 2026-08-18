@@ -83,7 +83,7 @@ workflow, and GitHub Actions run. Its artifact inventory must contain every
 archive, provenance predicate, SPDX SBOM, CycloneDX SBOM, and the
 required-checks report exactly once. The checks
 report must identify `celiumsai/hyphae`, the tagged merge commit, and exactly
-the 18 canonical checks in fixed order. Every record must have a unique
+the 20 canonical checks in fixed order. Every record must have a unique
 check-run ID, the matching workflow-run ID, canonical workflow path and
 GitHub job URL, GitHub Actions app ID/slug, the authoritative `head_sha` and head branch,
 run attempt and
@@ -94,7 +94,7 @@ commit, and merge time; querying all PRs for that in-repository head branch must
 return that same PR and no other, and its complete issue-event history must
 contain no base-ref change or successful automatic base change. The producer
 verifies each referenced workflow run's exact ID, path, commit, branch, event,
-repository, attempt, state, and conclusion. Seventeen checks require
+repository, attempt, state, and conclusion. Nineteen checks require
 `event=pull_request` on the reviewed PR head; the exact-SHA G8 closure requires
 `event=workflow_dispatch` on the tagged merge commit and `main`. It fetches the Jobs API record for
 every selected check and requires the job's exact ID, workflow-run ID, name,
@@ -109,6 +109,12 @@ release workflow verifies the recorded merge commit's two parents and tree and
 requires it to remain reachable from `main`. The selected record carries its
 start and completion timestamps; the producer rejects an ambiguous latest
 completion or a relevant run that remains incomplete.
+
+The canonical set includes `Security hard-kill aggregate` and `MCP real hosts`.
+The separate registry publication authority re-resolves those successful jobs
+on the exact source SHA, downloads their named artifacts from that same CI run,
+and runs the security crash and real-host receipt validators over the downloaded
+bytes. Omission, expiry, digest drift, or validation failure blocks publication.
 
 From a checkout of the exact source commit, fetch the tag and validate its live
 object/target binding together with all inventoried payload hashes:
@@ -152,6 +158,35 @@ Require protected workflow ownership, independent review, last-push approval,
 protected release tags, and immutable releases when prevention against that
 authority is part of the threat model.
 
+## Registry publication authority
+
+Live crates.io and npm publication has a separate final authority boundary. It
+cannot be initiated by a tag event and cannot trust a checker first loaded from
+the tag. `Registry publish` must be manually dispatched from protected `main`
+with `dry_run=false`; its `registry-production` environment supplies the
+external immutable approval boundary. Pull requests may run only the dry-run
+path.
+
+The workflow checks out `github.workflow_sha` as the trusted control plane and
+`v1.2.0` as source in separate directories. Before executing source package
+tools, the trusted checker requires the tag to be annotated, its peeled commit
+to equal the exact fetched `origin/main` tip, and all pinned control files to be
+byte-identical between trusted main and the tag tree. It then uses the GitHub
+Checks, Actions, Jobs, and Artifacts APIs to bind each expected workflow/job
+name to one successful current exact-SHA authority, rejects other apps or paths,
+and downloads only the named unexpired Release and G8 artifacts from those run
+IDs.
+
+The final gate semantically revalidates the accepted relicensing transition for
+the exact Git tree, the complete registry package inventory, signed Release
+checksums/SBOMs/provenance, required-check report, signed-release receipt, and
+closed G8 aggregate. It records all file and service digests and re-fetches the
+tag, `origin/main`, checks, jobs, workflow runs, artifacts, and evidence
+immediately before each ecosystem's live upload. Any mutation fails closed.
+The current policy requires an annotated tag and the Sigstore-signed Release;
+`config/registry-publish-authority.json` also carries the explicit switch for a
+cryptographically signed tag if repository policy adopts that requirement.
+
 ## 4. Verify build provenance and SBOM attestations
 
 The native package job emits a SLSA provenance v1 attestation whose subject is
@@ -190,8 +225,8 @@ including first-party Hyphae components and third-party dependencies. Retain
 them with the installed binary. For every first-party Hyphae identity, require:
 
 - SPDX `licenseDeclared` and `licenseConcluded` both equal
-  `AGPL-3.0-only`;
-- the CycloneDX license expression or identifier equals `AGPL-3.0-only`;
+  `Apache-2.0`;
+- the CycloneDX license expression or identifier equals `Apache-2.0`;
 - the complete multiset of `(name, version, purl)` identities, including
   duplicate observations, is identical between SPDX and CycloneDX.
 
@@ -209,7 +244,8 @@ complete lock-derived plus Python-manifest inventory, and any cross-format
 first-party identity drift.
 
 Extract the archive into an empty directory and confirm that it contains one
-executable plus `LICENSE`, `README.md`, and `THIRD_PARTY_NOTICES.md`:
+executable plus `LICENSE`, `LICENSE-DOCUMENTATION`, `LICENSE-POLICY.md`,
+`NOTICE`, `README.md`, and `THIRD_PARTY_NOTICES.md`:
 
 ```bash
 tar -xzf hyphae-VERSION-TARGET.tar.gz

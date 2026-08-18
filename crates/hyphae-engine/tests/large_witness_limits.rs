@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Regression coverage for large, bounded offline result and retrieval witnesses.
 
 use std::{

@@ -1,7 +1,7 @@
 # Configuration reference
 
 Hyphae has no required configuration file. The single binary receives
-explicit command options and four optional environment variables. A fresh
+explicit command options and five optional environment variables. A fresh
 data directory is initialized on first open.
 
 ## Environment variables
@@ -10,12 +10,16 @@ data directory is initialized on first open.
 |---|---|---|
 | `HYPHAE_DATA_DIR` | Local data commands, `serve` | Data directory when `--data-dir` is absent |
 | `HYPHAE_BASE_URL` | `remote`, `mcp` | Root HTTP(S) origin when `--base-url` is absent |
-| `HYPHAE_BEARER_TOKEN_FILE` | `serve`, `remote`, `mcp` | Restricted token file when the option is absent |
-| `HYPHAE_BEARER_TOKEN` | `serve`, `remote`, `mcp` | Token value used only when no token file was selected |
+| `HYPHAE_BEARER_TOKEN_FILE` | format-2 `serve`, `remote` | Restricted token file when the option is absent |
+| `HYPHAE_BEARER_TOKEN` | format-2 `serve`, `remote` | Token value used only when no token file was selected |
+| `HYPHAE_NATIVE_API_KEY_FILE` | Native local commands, `mcp` | Restricted durable `hyp1_...` credential file |
 
 An explicit command option wins over its corresponding environment variable.
 If a token file is selected, its contents win over `HYPHAE_BEARER_TOKEN`.
 There is intentionally no command-line option containing the token value.
+Native MCP additionally rejects a credential-value environment variable. It
+accepts only `HYPHAE_NATIVE_API_KEY_FILE`/`--native-api-key-file`, or the first
+stdin line with `--native-api-key-stdin`.
 
 ## Data directory ownership
 

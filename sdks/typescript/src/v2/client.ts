@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 import { HttpTransport, type HttpTransportOptions } from "./http.js";
-import { LocalTransport, type LocalConnector } from "./local.js";
+import { LocalTransport, type LocalConnector, type LocalTransportOptions } from "./local.js";
 import type { RequestOptions, Response, Transport } from "./models.js";
 import { nodeLocalConnector } from "./node-local.js";
 
@@ -19,6 +19,14 @@ export class HyphaeClient {
 
   static local(endpoint: string, connector: LocalConnector = nodeLocalConnector, clientIdentity = "hyphae-typescript-sdk-v2"): HyphaeClient {
     return new HyphaeClient(new LocalTransport(endpoint, connector, clientIdentity));
+  }
+
+  static localWithOptions(endpoint: string, options: LocalTransportOptions = {}, connector: LocalConnector = nodeLocalConnector): HyphaeClient {
+    return new HyphaeClient(new LocalTransport(endpoint, connector, options));
+  }
+
+  static localAuthenticated(endpoint: string, apiKey: string, connector: LocalConnector = nodeLocalConnector, clientIdentity = "hyphae-typescript-sdk-v2"): HyphaeClient {
+    return HyphaeClient.localWithOptions(endpoint, { clientIdentity, apiKey }, connector);
   }
 
   execute(operation: string, args: Readonly<Record<string, unknown>> = {}, options: RequestOptions = {}): Promise<Response> {
@@ -43,6 +51,11 @@ export class HyphaeClient {
 
   catalogList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
     return this.execute("catalog_list", request, options);
+  }
+
+  /** Lists current visible catalog objects; cursor values are opaque Uint8Array tokens. */
+  catalogVisibleList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("catalog_visible_list", request, options);
   }
 
   sql(statement: string, parameters: readonly unknown[] = [], options: RequestOptions = {}): Promise<Response> {
@@ -182,4 +195,83 @@ export class HyphaeClient {
     return this.execute("transaction_status_by_idempotency", { idempotency_token: idempotencyToken }, options);
   }
 
+  securityPrincipalCreate(displayName: string, options: RequestOptions): Promise<Response> {
+    return this.execute("security_principal_create", { display_name: displayName }, options);
+  }
+
+  securityPrincipalSetEnabled(principalId: bigint, enabled: boolean, options: RequestOptions): Promise<Response> {
+    return this.execute("security_principal_set_enabled", { principal_id: principalId, enabled }, options);
+  }
+
+  securityCustomRoleCreate(displayName: string, grants: ReadonlyArray<Readonly<Record<string, unknown>>>, options: RequestOptions): Promise<Response> {
+    return this.execute("security_custom_role_create", { display_name: displayName, grants }, options);
+  }
+
+  securityBuiltInAssignmentCreate(principalId: bigint, role: string, scope: Readonly<Record<string, unknown>>, options: RequestOptions): Promise<Response> {
+    return this.execute("security_built_in_assignment_create", { principal_id: principalId, role, scope }, options);
+  }
+
+  securityCustomAssignmentCreate(principalId: bigint, roleId: bigint, options: RequestOptions): Promise<Response> {
+    return this.execute("security_custom_assignment_create", { principal_id: principalId, role_id: roleId }, options);
+  }
+
+  securityAssignmentRevoke(assignmentId: bigint, options: RequestOptions): Promise<Response> {
+    return this.execute("security_assignment_revoke", { assignment_id: assignmentId }, options);
+  }
+
+  securityApiKeyIssueStart(args: Readonly<Record<string, unknown>>, selfManage = false, options: RequestOptions): Promise<Response> {
+    return this.execute(selfManage ? "security_api_key_issue_self_start" : "security_api_key_issue_start", args, options);
+  }
+
+  securityApiKeyRotateStart(args: Readonly<Record<string, unknown>>, selfManage = false, options: RequestOptions): Promise<Response> {
+    return this.execute(selfManage ? "security_api_key_rotate_self_start" : "security_api_key_rotate_start", args, options);
+  }
+
+  securityApiKeyActivate(keyId: Uint8Array, confirmationDigest: Uint8Array, rotation = false, selfManage = false, options: RequestOptions): Promise<Response> {
+    const operation = `security_api_key_${rotation ? "rotate" : "issue"}_${selfManage ? "self_" : ""}activate`;
+    return this.execute(operation, { [rotation ? "successor_key_id" : "key_id"]: keyId, confirmation_digest: confirmationDigest }, options);
+  }
+
+  securityApiKeyAbort(keyId: Uint8Array, rotation = false, selfManage = false, options: RequestOptions): Promise<Response> {
+    const operation = `security_api_key_${rotation ? "rotate" : "issue"}_${selfManage ? "self_" : ""}abort`;
+    return this.execute(operation, { [rotation ? "successor_key_id" : "key_id"]: keyId }, options);
+  }
+
+  securityApiKeyRevoke(keyId: Uint8Array, selfManage = false, options: RequestOptions): Promise<Response> {
+    return this.execute(selfManage ? "security_api_key_revoke_self" : "security_api_key_revoke", { key_id: keyId }, options);
+  }
+
+  securityLegacyBearerRevoke(options: RequestOptions): Promise<Response> {
+    return this.execute("security_legacy_bearer_revoke", {}, options);
+  }
+
+  securityStatus(options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_status", {}, options);
+  }
+
+  securityPrincipalList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_principal_list", request, options);
+  }
+
+  securityRoleList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_role_list", request, options);
+  }
+
+  securityAssignmentList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_assignment_list", request, options);
+  }
+
+  securityKeyList(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_key_list", request, options);
+  }
+
+  securityAuditRead(request: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("security_audit_read", request, options);
+  }
+
+}
+
+/** Overwrites sensitive bytes in place. */
+export function clearSensitiveBytes(value: Uint8Array): void {
+  value.fill(0);
 }

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-ann"
 description = "Deterministic Hyphae-owned HNSW kernel with an exact vector oracle"

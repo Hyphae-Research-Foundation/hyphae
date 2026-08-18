@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Microsecond-first performance contract
 
 Status: target contract; one bounded structure-point observation meets its

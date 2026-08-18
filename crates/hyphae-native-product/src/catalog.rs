@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bounded transport-independent logical catalog contracts.
 
@@ -7,7 +7,8 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_runtime::{
     CatalogDependencyRequest as RuntimeDependencyRequest, CatalogListRequest as RuntimeListRequest,
-    CatalogPageStop, NativeCatalogSnapshot, NativeRuntimeError,
+    CatalogPageStop, CatalogVisibleListRequest as RuntimeVisibleListRequest,
+    CatalogVisibleScope as RuntimeVisibleScope, NativeCatalogSnapshot, NativeRuntimeError,
 };
 use hyphae_native_types::ObjectId;
 
@@ -19,6 +20,8 @@ pub const MAX_PRODUCT_CATALOG_ITEMS: usize = hyphae_native_runtime::MAX_CATALOG_
 pub const MAX_PRODUCT_CATALOG_VISITS: usize = hyphae_native_runtime::MAX_CATALOG_READ_VISITS;
 /// Maximum canonical output bytes returned by one product catalog request.
 pub const MAX_PRODUCT_CATALOG_BYTES: usize = hyphae_native_runtime::MAX_CATALOG_READ_BYTES;
+/// Maximum canonical opaque cursor bytes accepted from public callers.
+pub const MAX_CATALOG_VISIBLE_CURSOR_BYTES: usize = 256;
 
 /// Opaque catalog pagination cursor bound to one immutable root identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +63,70 @@ pub struct CatalogListRequest {
     pub visit_limit: usize,
     /// Maximum canonical summary bytes returned.
     pub byte_limit: usize,
+}
+
+/// Opaque authenticated continuation for scope-visible catalog listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVisibleCursor(Vec<u8>);
+
+impl CatalogVisibleCursor {
+    /// Constructs a bounded opaque cursor without parsing private fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `catalog_conflict` for empty input or input above the complete
+    /// product request bound. Canonical cursor length and authentication are
+    /// intentionally checked only at dispatch so every malformed token has the
+    /// same public `catalog_conflict` result.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, ProductError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_PRODUCT_CATALOG_BYTES {
+            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the complete opaque bytes for transport or later continuation.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Scope-visible list filter bound into every opaque continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogVisibleListFilter {
+    /// Optional visible parent filter.
+    pub parent: Option<ObjectId>,
+    /// Optional stable object-kind filter.
+    pub kind: Option<CatalogObjectKind>,
+}
+
+/// Bounded scope-visible list request introduced in protocol minor 3.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVisibleListRequest {
+    /// Filter cryptographically bound to the continuation.
+    pub filter: CatalogVisibleListFilter,
+    /// Opaque continuation returned by the preceding page.
+    pub cursor: Option<CatalogVisibleCursor>,
+    /// Maximum visible summaries to return.
+    pub item_limit: usize,
+    /// Maximum visible candidates to consider.
+    pub visit_limit: usize,
+    /// Maximum canonical summary bytes to return.
+    pub byte_limit: usize,
+}
+
+/// Scope-visible page with no physical snapshot or traversal accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVisiblePage {
+    /// Visible summaries in stable `ObjectId` order.
+    pub items: Vec<CatalogObjectSummary>,
+    /// Opaque continuation, absent when authorized scopes are exhausted.
+    pub cursor: Option<CatalogVisibleCursor>,
 }
 
 /// Bounded catalog dependency-list request.
@@ -232,6 +299,93 @@ impl NativeProduct {
         })
     }
 
+    /// Explicitly upgrades the logical catalog to the scope-index format.
+    ///
+    /// This is a strict mutating maintenance operation. Catalog reads never
+    /// invoke it implicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, corruption, or durability error if migration fails.
+    pub fn upgrade_catalog_scope_index(
+        &mut self,
+    ) -> Result<Option<crate::ProductCommitReceipt>, ProductError> {
+        if let Some(receipt) = self
+            .database
+            .ensure_catalog_scope_index(hyphae_native_types::DurabilityClass::Strict)?
+        {
+            self.observe_commit(&receipt);
+            return Ok(Some(receipt.into()));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn catalog_visible_list(
+        &self,
+        snapshot: &ProductCatalogSnapshot,
+        scopes: &[crate::ProductScope],
+        authority_key: [u8; 32],
+        authorization_epoch: crate::AuthorizationEpoch,
+        request: &CatalogVisibleListRequest,
+    ) -> Result<CatalogVisiblePage, ProductError> {
+        let runtime_scopes = canonical_visible_scopes(scopes);
+        if runtime_scopes.is_empty() {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let filter_digest = visible_filter_digest(request.filter, &runtime_scopes);
+        let start_after = request.cursor.as_ref().map_or(Ok(None), |cursor| {
+            decode_visible_cursor(
+                cursor,
+                authority_key,
+                authorization_epoch,
+                snapshot.identity,
+                filter_digest,
+            )
+            .map(Some)
+        })?;
+        let page = self
+            .database
+            .catalog_visible_list(
+                &snapshot.inner,
+                &RuntimeVisibleListRequest {
+                    scopes: runtime_scopes,
+                    parent: request.filter.parent,
+                    kind: request.filter.kind,
+                    start_after,
+                    item_limit: request.item_limit,
+                    visit_limit: request.visit_limit,
+                    byte_limit: request.byte_limit,
+                },
+            )
+            .map_err(map_catalog_error)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|item| CatalogObjectSummary {
+                id: item.id,
+                kind: item.kind,
+                name: item.name,
+                parent: item.parent,
+            })
+            .collect();
+        let cursor = (!page.exhausted)
+            .then_some(page.continuation)
+            .flatten()
+            .map(|after| {
+                encode_visible_cursor(
+                    authority_key,
+                    authorization_epoch,
+                    snapshot.identity,
+                    filter_digest,
+                    after,
+                )
+            })
+            .transpose()?;
+        Ok(CatalogVisiblePage { items, cursor })
+    }
+
     /// Describes one complete logical V2 definition at an immutable snapshot.
     ///
     /// # Errors
@@ -304,6 +458,122 @@ impl NativeProduct {
             returned_bytes: page.returned_bytes,
         })
     }
+}
+
+fn canonical_visible_scopes(scopes: &[crate::ProductScope]) -> Vec<RuntimeVisibleScope> {
+    let scopes = scopes
+        .iter()
+        .copied()
+        .map(|scope| match scope {
+            crate::ProductScope::Instance => RuntimeVisibleScope::Instance,
+            crate::ProductScope::CatalogObject(object) => RuntimeVisibleScope::Object(object),
+            crate::ProductScope::CatalogSubtree(object) => RuntimeVisibleScope::Subtree(object),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if scopes.contains(&RuntimeVisibleScope::Instance) {
+        return vec![RuntimeVisibleScope::Instance];
+    }
+    scopes.iter().copied().collect()
+}
+
+fn visible_filter_digest(
+    filter: CatalogVisibleListFilter,
+    scopes: &[RuntimeVisibleScope],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-catalog-visible-filter-v1\0");
+    match filter.parent {
+        Some(parent) => {
+            hasher.update(&[1]);
+            hasher.update(&parent.get().to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[filter.kind.map_or(0, |kind| kind as u8)]);
+    for scope in scopes {
+        match scope {
+            RuntimeVisibleScope::Instance => {
+                hasher.update(&[0]);
+            }
+            RuntimeVisibleScope::Object(object) => {
+                hasher.update(&[1]);
+                hasher.update(&object.get().to_le_bytes());
+            }
+            RuntimeVisibleScope::Subtree(object) => {
+                hasher.update(&[2]);
+                hasher.update(&object.get().to_le_bytes());
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+const VISIBLE_CURSOR_MAGIC: &[u8; 8] = b"HYCVIS01";
+const VISIBLE_CURSOR_CONTENT_BYTES: usize = 144;
+const VISIBLE_CURSOR_BYTES: usize = VISIBLE_CURSOR_CONTENT_BYTES + 32;
+
+fn encode_visible_cursor(
+    key: [u8; 32],
+    epoch: crate::AuthorizationEpoch,
+    snapshot: SnapshotIdentity,
+    filter_digest: [u8; 32],
+    after: ObjectId,
+) -> Result<CatalogVisibleCursor, ProductError> {
+    let mut bytes = Vec::with_capacity(VISIBLE_CURSOR_BYTES);
+    bytes.extend_from_slice(VISIBLE_CURSOR_MAGIC);
+    bytes.extend_from_slice(&epoch.get().to_le_bytes());
+    bytes.extend_from_slice(&snapshot.directory_lineage);
+    bytes.extend_from_slice(
+        &snapshot
+            .visible_csn
+            .map_or(0, hyphae_native_types::Csn::get)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&snapshot.catalog_version.get().to_le_bytes());
+    bytes.extend_from_slice(&snapshot.root_digest);
+    bytes.extend_from_slice(&filter_digest);
+    bytes.extend_from_slice(&after.get().to_le_bytes());
+    bytes.extend_from_slice(&[1; 8]);
+    let mac = blake3::keyed_hash(&key, &bytes);
+    bytes.extend_from_slice(mac.as_bytes());
+    CatalogVisibleCursor::new(bytes)
+}
+
+fn decode_visible_cursor(
+    cursor: &CatalogVisibleCursor,
+    key: [u8; 32],
+    epoch: crate::AuthorizationEpoch,
+    snapshot: SnapshotIdentity,
+    filter_digest: [u8; 32],
+) -> Result<ObjectId, ProductError> {
+    let bytes = cursor.as_bytes();
+    let conflict = || ProductError::from_code(ProductErrorCode::CatalogConflict);
+    if bytes.len() != VISIBLE_CURSOR_BYTES {
+        return Err(conflict());
+    }
+    if &bytes[..8] != VISIBLE_CURSOR_MAGIC
+        || bytes[136..144] != [1; 8]
+        || blake3::keyed_hash(&key, &bytes[..VISIBLE_CURSOR_CONTENT_BYTES]).as_bytes()
+            != &bytes[VISIBLE_CURSOR_CONTENT_BYTES..]
+        || u64::from_le_bytes(bytes[8..16].try_into().map_err(|_| conflict())?) != epoch.get()
+        || bytes[16..40] != snapshot.directory_lineage
+        || u64::from_le_bytes(bytes[40..48].try_into().map_err(|_| conflict())?)
+            != snapshot
+                .visible_csn
+                .map_or(0, hyphae_native_types::Csn::get)
+        || u64::from_le_bytes(bytes[48..56].try_into().map_err(|_| conflict())?)
+            != snapshot.catalog_version.get()
+        || bytes[56..88] != snapshot.root_digest
+        || bytes[88..120] != filter_digest
+    {
+        return Err(conflict());
+    }
+    ObjectId::new(u128::from_le_bytes(
+        bytes[120..136].try_into().map_err(|_| conflict())?,
+    ))
+    .map_err(|_| conflict())
 }
 
 fn validate_cursor(

@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
 name: Security
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
+  merge_group:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
@@ -42,7 +47,18 @@ jobs:
       - name: Verify project licensing
         run: |
           python -m unittest tools/test_check_license_policy.py -v
+          PYTHONPATH=. python -m unittest tools.test_generate_third_party_licenses -v
+          python tools/generate_third_party_licenses.py --check
           python tools/check_license_policy.py
+      - name: Verify 1.2.0 relicensing classification preflight
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_relicensing_preflight \
+            tools.test_produce_relicensing_dependency_receipt \
+            tools.test_check_dependency_license_aggregate \
+            -v
+          python tools/check_dependency_license_aggregate.py
+          python tools/check_relicensing_preflight.py
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:

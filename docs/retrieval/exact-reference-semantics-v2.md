@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Durable exact retrieval reference semantics v2
 
 Status: normative for Hyphae `0.2` durable retrieval.

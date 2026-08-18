@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 export * from "./client.js";
 export * from "./generated.js";
@@ -17,10 +17,13 @@ export {
   decodeProductError,
   decodeProductResponse,
   decodeWelcome,
+  encodeAuthenticatedHello,
   encodeCancel,
   encodeFrame,
   encodeHello,
   encodeProductRequest,
+  operationRequiredMinor,
+  responseRequiredMinor,
   encodeWindowUpdate,
 } from "./protocol.js";
 export type { Frame } from "./protocol.js";

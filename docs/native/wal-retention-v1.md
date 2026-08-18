@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native WAL retention and bounded replay v1
 
 Status: normative contract; current-root anchors, identity-preserving prefix

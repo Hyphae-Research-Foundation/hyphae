@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     cmp::Ordering,
@@ -185,6 +185,9 @@ pub enum SqlError {
     /// A bounded scan exhausted its explicit engine work ceiling.
     #[error("HYSQL019 native SQL bounded scan candidate budget exceeded")]
     ScanCandidateBudgetExceeded,
+    /// A caller-owned cooperative checkpoint interrupted execution.
+    #[error("native SQL execution was interrupted")]
+    ExecutionInterrupted,
     /// Native storage or engine execution failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
@@ -217,6 +220,16 @@ impl PreparedStatement {
         self.plan.maximum_result_rows()
     }
 
+    /// Returns every catalog object used by this bound read plan.
+    ///
+    /// The set contains the referenced relations and physical secondary
+    /// indexes in canonical [`ObjectId`] order. Duplicate identities are
+    /// collapsed, including when one object participates in more than one
+    /// branch of a join plan.
+    pub fn referenced_object_ids(&self) -> BTreeSet<ObjectId> {
+        self.plan.referenced_object_ids()
+    }
+
     pub(crate) fn parallel_scan_limit(&self) -> Option<usize> {
         match &self.plan {
             PreparedPlan::PrimaryKeyScan { limit, .. }
@@ -230,6 +243,62 @@ impl PreparedStatement {
             _ => None,
         }
     }
+}
+
+/// One parser- and catalog-bound native SQL statement.
+///
+/// Scoped authorization and execution consume this same binding. The retained
+/// object set includes physical indexes and foreign-key relations used by the
+/// executor, not only relation names written in the SQL text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundSqlStatement {
+    catalog_version: CatalogVersion,
+    class: SqlStatementClass,
+    referenced_object_ids: BTreeSet<ObjectId>,
+    statement: BoundSqlStatementKind,
+}
+
+impl BoundSqlStatement {
+    /// Returns the catalog version used by the binder.
+    pub const fn catalog_version(&self) -> CatalogVersion {
+        self.catalog_version
+    }
+
+    /// Returns the parser-owned authorization class.
+    pub const fn class(&self) -> SqlStatementClass {
+        self.class
+    }
+
+    /// Returns every existing catalog object the bound execution may touch.
+    pub fn referenced_object_ids(&self) -> &BTreeSet<ObjectId> {
+        &self.referenced_object_ids
+    }
+
+    /// Returns the prepared plan retained by a read binding.
+    pub fn prepared_statement(&self) -> Option<&PreparedStatement> {
+        match &self.statement {
+            BoundSqlStatementKind::Read(prepared) => Some(prepared),
+            BoundSqlStatementKind::ReadTransaction(_) | BoundSqlStatementKind::Write(_) => None,
+        }
+    }
+
+    /// Returns whether catalog write authorization must remain instance-wide.
+    ///
+    /// `CREATE TABLE` has no durable schema parent in the current catalog, so
+    /// it cannot inherit object authority from its generated relation ID.
+    pub fn requires_instance_catalog_write(&self) -> bool {
+        matches!(
+            &self.statement,
+            BoundSqlStatementKind::Write(Statement::CreateTable { .. })
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoundSqlStatementKind {
+    Read(PreparedStatement),
+    ReadTransaction(Statement),
+    Write(Statement),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,6 +460,45 @@ enum JoinSide {
 }
 
 impl PreparedPlan {
+    fn referenced_object_ids(&self) -> BTreeSet<ObjectId> {
+        let mut referenced = BTreeSet::new();
+        match self {
+            Self::PrimaryKeyLookup { table, .. }
+            | Self::PrimaryKeyScan { table, .. }
+            | Self::PrimaryKeyPrefixScan { table, .. }
+            | Self::PrimaryKeyPrefixRangeScan { table, .. }
+            | Self::PrimaryKeyRangeScan { table, .. } => {
+                referenced.insert(*table);
+            }
+            Self::SecondaryIndexLookup { table, index, .. }
+            | Self::SecondaryIndexRangeScan { table, index, .. } => {
+                referenced.extend([*table, *index]);
+            }
+            Self::SecondaryIndexIntersection { table, indexes, .. } => {
+                referenced.insert(*table);
+                referenced.extend(indexes.iter().map(|lookup| lookup.index));
+            }
+            Self::IndexedInnerJoin {
+                left_table,
+                right_table,
+                left_access,
+                right_access,
+                ..
+            } => {
+                referenced.extend([*left_table, *right_table]);
+                if let JoinLeftAccess::UniqueSecondaryIndex { index, .. }
+                | JoinLeftAccess::BoundedSecondaryIndex { index, .. } = left_access
+                {
+                    referenced.insert(*index);
+                }
+                if let JoinRightAccess::UniqueSecondaryIndex { index, .. } = right_access {
+                    referenced.insert(*index);
+                }
+            }
+        }
+        referenced
+    }
+
     fn parameter_count(&self) -> usize {
         match self {
             Self::PrimaryKeyLookup {
@@ -627,6 +735,45 @@ enum Statement {
     ExplainSelectJoin(ParsedInnerJoin),
     WithSelect(ParsedCteSelect),
     SelectWindow(ParsedWindowSelect),
+}
+
+/// Authorization-relevant class produced by the canonical SQL parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlStatementClass {
+    /// A statement that reads an existing catalog snapshot without publishing data.
+    Read,
+    /// A statement that mutates data under existing catalog definitions.
+    DataMutation,
+    /// A statement that creates, changes, renames, or drops catalog definitions.
+    CatalogMutation,
+}
+
+/// Classifies one complete SQL statement through the same parser used for execution.
+///
+/// # Errors
+///
+/// Returns the canonical SQL parse error for malformed or unsupported input.
+pub fn classify_sql_statement(statement: &str) -> Result<SqlStatementClass, SqlError> {
+    Ok(statement_class(&parse(statement)?))
+}
+
+fn statement_class(statement: &Statement) -> SqlStatementClass {
+    match statement {
+        Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_)
+        | Statement::WithSelect(_)
+        | Statement::SelectWindow(_) => SqlStatementClass::Read,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+            SqlStatementClass::DataMutation
+        }
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::AlterTableRename { .. }
+        | Statement::DropTable { .. }
+        | Statement::DropIndex { .. } => SqlStatementClass::CatalogMutation,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -944,7 +1091,21 @@ pub(crate) fn prepare_catalog(
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
     statement: &str,
 ) -> Result<PreparedStatement, SqlError> {
-    let plan = match parse(statement)? {
+    prepare_parsed_catalog(
+        catalog_version,
+        catalog,
+        ordered_secondary_indexes,
+        parse(statement)?,
+    )
+}
+
+fn prepare_parsed_catalog(
+    catalog_version: CatalogVersion,
+    catalog: &crate::model::CatalogState,
+    ordered_secondary_indexes: &BTreeSet<ObjectId>,
+    statement: Statement,
+) -> Result<PreparedStatement, SqlError> {
+    let plan = match statement {
         Statement::Select {
             name,
             projection,
@@ -973,6 +1134,100 @@ pub(crate) fn prepare_catalog(
         catalog_version,
         plan,
     })
+}
+
+pub(crate) fn bind_catalog(
+    catalog_version: CatalogVersion,
+    catalog: &crate::model::CatalogState,
+    ordered_secondary_indexes: &BTreeSet<ObjectId>,
+    statement: &str,
+    parameters: &[SqlValue],
+) -> Result<BoundSqlStatement, SqlError> {
+    let statement = parse(statement)?;
+    let class = statement_class(&statement);
+    let (statement, referenced_object_ids) = match class {
+        SqlStatementClass::Read => match statement {
+            Statement::WithSelect(cte) => {
+                let referenced = bind_cte_read_objects(
+                    catalog_version,
+                    catalog,
+                    ordered_secondary_indexes,
+                    &cte,
+                )?;
+                (
+                    BoundSqlStatementKind::ReadTransaction(Statement::WithSelect(cte)),
+                    referenced,
+                )
+            }
+            Statement::SelectWindow(window) => {
+                let (table, definition) = relation_named(catalog, &window.name)?;
+                let _ = column_index(&definition.columns, &window.value_column)?;
+                let _ = column_index(&definition.columns, &window.order_column)?;
+                if let Some(column) = &window.partition_column {
+                    let _ = column_index(&definition.columns, column)?;
+                }
+                (
+                    BoundSqlStatementKind::ReadTransaction(Statement::SelectWindow(window)),
+                    BTreeSet::from([table]),
+                )
+            }
+            statement => {
+                let prepared = prepare_parsed_catalog(
+                    catalog_version,
+                    catalog,
+                    ordered_secondary_indexes,
+                    statement,
+                )?;
+                let referenced = prepared.referenced_object_ids();
+                (BoundSqlStatementKind::Read(prepared), referenced)
+            }
+        },
+        SqlStatementClass::DataMutation => {
+            let referenced = bind_data_mutation(catalog, &statement, parameters)?;
+            (BoundSqlStatementKind::Write(statement), referenced)
+        }
+        SqlStatementClass::CatalogMutation => {
+            let referenced = bind_catalog_mutation(catalog, &statement, parameters)?;
+            (BoundSqlStatementKind::Write(statement), referenced)
+        }
+    };
+    Ok(BoundSqlStatement {
+        catalog_version,
+        class,
+        referenced_object_ids,
+        statement,
+    })
+}
+
+fn bind_cte_read_objects(
+    catalog_version: CatalogVersion,
+    catalog: &crate::model::CatalogState,
+    ordered_secondary_indexes: &BTreeSet<ObjectId>,
+    cte: &ParsedCteSelect,
+) -> Result<BTreeSet<ObjectId>, SqlError> {
+    let inner = cte.inner.as_ref().clone();
+    let prepared =
+        prepare_parsed_catalog(catalog_version, catalog, ordered_secondary_indexes, inner)?;
+    let Statement::Select {
+        projection, filter, ..
+    } = cte.outer.as_ref()
+    else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if filter.is_some() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    let schema = prepared.result_schema()?;
+    if let Projection::Columns(columns) = projection {
+        for column in columns {
+            if !schema.iter().any(|(candidate, _)| {
+                normalize_identifier(candidate) == normalize_identifier(column)
+            }) {
+                return Err(SqlError::UnknownColumn);
+            }
+        }
+    }
+    Ok(prepared.referenced_object_ids())
 }
 
 // Keep the exhaustive access-to-plan mapping together so new operators cannot
@@ -1123,6 +1378,7 @@ pub(crate) fn execute_prepared_latest(
     prepared: &PreparedStatement,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(SqlResult, SqlLatestExecutionProfile), SqlError> {
     ensure_catalog_version(snapshot.catalog_version, prepared)?;
     let mut profile = SqlLatestExecutionProfile::default();
@@ -1132,6 +1388,7 @@ pub(crate) fn execute_prepared_latest(
         &prepared.plan,
         parameters,
         permit,
+        checkpoint,
         &mut profile,
     )?;
     Ok((result, profile))
@@ -1189,23 +1446,43 @@ pub(crate) fn execute_transaction(
             primary_key,
             foreign_keys,
             parameters,
+            &mut || true,
         ),
         Statement::CreateIndex {
             name,
             table,
             columns,
             unique,
-        } => execute_create_index(transaction, &name, &table, &columns, unique, parameters),
+        } => execute_create_index(
+            transaction,
+            &name,
+            &table,
+            &columns,
+            unique,
+            parameters,
+            &mut || true,
+        ),
         Statement::AlterTableRename { name, new_name } => {
             execute_alter_table_rename(transaction, &name, &new_name, parameters)
         }
-        Statement::DropTable { name } => execute_drop_table(transaction, &name, parameters),
-        Statement::DropIndex { name } => execute_drop_index(transaction, &name, parameters),
+        Statement::DropTable { name } => {
+            execute_drop_table(transaction, &name, parameters, &mut || true)
+        }
+        Statement::DropIndex { name } => {
+            execute_drop_index(transaction, &name, parameters, &mut || true)
+        }
         Statement::Insert {
             name,
             values,
             parameter_count,
-        } => execute_insert(transaction, &name, &values, parameter_count, parameters),
+        } => execute_insert(
+            transaction,
+            &name,
+            &values,
+            parameter_count,
+            parameters,
+            &mut || true,
+        ),
         Statement::Update {
             name,
             assignments,
@@ -1218,12 +1495,20 @@ pub(crate) fn execute_transaction(
             &predicates,
             parameter_count,
             parameters,
+            &mut || true,
         ),
         Statement::Delete {
             name,
             predicates,
             parameter_count,
-        } => execute_delete(transaction, &name, &predicates, parameter_count, parameters),
+        } => execute_delete(
+            transaction,
+            &name,
+            &predicates,
+            parameter_count,
+            parameters,
+            &mut || true,
+        ),
         Statement::Select {
             name,
             projection,
@@ -1242,6 +1527,7 @@ pub(crate) fn execute_transaction(
                 limit,
             },
             parameters,
+            &mut || true,
         ),
         Statement::ExplainSelect {
             name,
@@ -1274,8 +1560,127 @@ pub(crate) fn execute_transaction(
         Statement::ExplainSelectJoin(join) => {
             execute_indexed_join_explain(transaction, &join, parameters)
         }
-        Statement::WithSelect(cte) => execute_cte_select(transaction, &cte, parameters),
-        Statement::SelectWindow(window) => execute_window_select(transaction, &window, parameters),
+        Statement::WithSelect(cte) => {
+            execute_cte_select(transaction, &cte, parameters, &mut || true)
+        }
+        Statement::SelectWindow(window) => {
+            execute_window_select(transaction, &window, parameters, &mut || true)
+        }
+    }
+}
+
+pub(crate) fn execute_bound_transaction_with_checkpoint(
+    transaction: &mut NativeWriteBatch,
+    bound: &BoundSqlStatement,
+    parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<SqlResult, SqlError> {
+    ensure_bound_catalog_version(transaction.catalog_version(), bound)?;
+    match &bound.statement {
+        BoundSqlStatementKind::ReadTransaction(Statement::WithSelect(cte)) => {
+            execute_cte_select(transaction, cte, parameters, checkpoint)
+        }
+        BoundSqlStatementKind::ReadTransaction(Statement::SelectWindow(window)) => {
+            execute_window_select(transaction, window, parameters, checkpoint)
+        }
+        BoundSqlStatementKind::Read(_) | BoundSqlStatementKind::ReadTransaction(_) => {
+            Err(SqlError::InvalidSyntax)
+        }
+        BoundSqlStatementKind::Write(statement) => {
+            execute_parsed_bound_transaction(transaction, statement, parameters, checkpoint)
+        }
+    }
+}
+
+fn execute_parsed_bound_transaction(
+    transaction: &mut NativeWriteBatch,
+    statement: &Statement,
+    parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<SqlResult, SqlError> {
+    execution_checkpoint(checkpoint)?;
+    match statement {
+        Statement::CreateTable {
+            name,
+            columns,
+            primary_key,
+            foreign_keys,
+        } => execute_create(
+            transaction,
+            name,
+            columns,
+            primary_key.clone(),
+            foreign_keys.clone(),
+            parameters,
+            checkpoint,
+        ),
+        Statement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => execute_create_index(
+            transaction,
+            name,
+            table,
+            columns,
+            *unique,
+            parameters,
+            checkpoint,
+        ),
+        Statement::AlterTableRename { name, new_name } => {
+            execute_alter_table_rename(transaction, name, new_name, parameters)
+        }
+        Statement::DropTable { name } => {
+            execute_drop_table(transaction, name, parameters, checkpoint)
+        }
+        Statement::DropIndex { name } => {
+            execute_drop_index(transaction, name, parameters, checkpoint)
+        }
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => execute_insert(
+            transaction,
+            name,
+            values,
+            *parameter_count,
+            parameters,
+            checkpoint,
+        ),
+        Statement::Update {
+            name,
+            assignments,
+            predicates,
+            parameter_count,
+        } => execute_update(
+            transaction,
+            name,
+            assignments,
+            predicates,
+            *parameter_count,
+            parameters,
+            checkpoint,
+        ),
+        Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } => execute_delete(
+            transaction,
+            name,
+            predicates,
+            *parameter_count,
+            parameters,
+            checkpoint,
+        ),
+        Statement::Select { .. }
+        | Statement::ExplainSelect { .. }
+        | Statement::SelectJoin(_)
+        | Statement::ExplainSelectJoin(_)
+        | Statement::WithSelect(_)
+        | Statement::SelectWindow(_) => Err(SqlError::InvalidSyntax),
     }
 }
 
@@ -1283,6 +1688,7 @@ fn execute_window_select(
     transaction: &mut NativeWriteBatch,
     window: &ParsedWindowSelect,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
@@ -1338,6 +1744,7 @@ fn execute_window_select(
             limit,
         },
         &[],
+        checkpoint,
     )?
     else {
         return Err(SqlError::InvalidSyntax);
@@ -1346,6 +1753,7 @@ fn execute_window_select(
     let mut previous_partition = None;
     let mut ordinal = 0_u64;
     for row in rows {
+        execution_checkpoint(checkpoint)?;
         let value = row.first().cloned().ok_or(SqlError::InvalidStoredRow)?;
         let partition = window
             .partition_column
@@ -1372,6 +1780,7 @@ fn execute_cte_select(
     transaction: &mut NativeWriteBatch,
     cte: &ParsedCteSelect,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let inner_parameter_count = statement_parameter_count(&cte.inner)?;
     let outer_parameter_count = statement_parameter_count(&cte.outer)?;
@@ -1379,7 +1788,7 @@ fn execute_cte_select(
         return Err(SqlError::ParameterMismatch);
     }
     let (inner_parameters, outer_parameters) = parameters.split_at(inner_parameter_count);
-    let inner = execute_parsed_transaction(transaction, &cte.inner, inner_parameters)?;
+    let inner = execute_parsed_transaction(transaction, &cte.inner, inner_parameters, checkpoint)?;
     let SqlResult::Rows { columns, rows } = inner else {
         return Err(SqlError::InvalidSyntax);
     };
@@ -1423,6 +1832,7 @@ fn execute_cte_select(
         .into_iter()
         .take(limit)
         .map(|row| {
+            execution_checkpoint(checkpoint)?;
             projection
                 .iter()
                 .map(|index| row.get(*index).cloned().ok_or(SqlError::InvalidStoredRow))
@@ -1448,6 +1858,7 @@ fn execute_parsed_transaction(
     transaction: &mut NativeWriteBatch,
     statement: &Statement,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     match statement {
         Statement::Select {
@@ -1468,6 +1879,7 @@ fn execute_parsed_transaction(
                 limit: *limit,
             },
             parameters,
+            checkpoint,
         ),
         _ => Err(SqlError::InvalidSyntax),
     }
@@ -1595,7 +2007,14 @@ impl TransactionDml {
                 name,
                 values,
                 parameter_count,
-            } => execute_insert(transaction, name, values, *parameter_count, parameters),
+            } => execute_insert(
+                transaction,
+                name,
+                values,
+                *parameter_count,
+                parameters,
+                &mut || true,
+            ),
             Statement::Update {
                 name,
                 assignments,
@@ -1608,12 +2027,20 @@ impl TransactionDml {
                 predicates,
                 *parameter_count,
                 parameters,
+                &mut || true,
             ),
             Statement::Delete {
                 name,
                 predicates,
                 parameter_count,
-            } => execute_delete(transaction, name, predicates, *parameter_count, parameters),
+            } => execute_delete(
+                transaction,
+                name,
+                predicates,
+                *parameter_count,
+                parameters,
+                &mut || true,
+            ),
             _ => Err(SqlError::InvalidSyntax),
         }
     }
@@ -1738,8 +2165,10 @@ fn execute_bound_latest(
     plan: &PreparedPlan,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
+    execution_checkpoint(checkpoint)?;
     match plan {
         PreparedPlan::PrimaryKeyLookup {
             table,
@@ -1782,31 +2211,31 @@ fn execute_bound_latest(
                 rows,
             })
         }
-        PreparedPlan::SecondaryIndexLookup { .. } => {
-            execute_secondary_index_latest(database, snapshot, plan, parameters, profile)
-        }
+        PreparedPlan::SecondaryIndexLookup { .. } => execute_secondary_index_latest(
+            database, snapshot, plan, parameters, checkpoint, profile,
+        ),
         PreparedPlan::SecondaryIndexIntersection { .. } => {
             execute_secondary_index_intersection_latest(
-                database, snapshot, plan, parameters, profile,
+                database, snapshot, plan, parameters, checkpoint, profile,
             )
         }
-        PreparedPlan::SecondaryIndexRangeScan { .. } => {
-            execute_secondary_index_range_latest(database, snapshot, plan, parameters, profile)
-        }
-        PreparedPlan::PrimaryKeyScan { .. } => {
-            execute_latest_scan(database, snapshot, plan, parameters, permit, profile)
-        }
-        PreparedPlan::PrimaryKeyPrefixScan { .. } => {
-            execute_latest_prefix_scan(database, snapshot, plan, parameters, permit, profile)
-        }
-        PreparedPlan::PrimaryKeyPrefixRangeScan { .. } => {
-            execute_latest_prefix_range_scan(database, snapshot, plan, parameters, permit, profile)
-        }
-        PreparedPlan::PrimaryKeyRangeScan { .. } => {
-            execute_latest_range_scan(database, snapshot, plan, parameters, permit, profile)
-        }
+        PreparedPlan::SecondaryIndexRangeScan { .. } => execute_secondary_index_range_latest(
+            database, snapshot, plan, parameters, checkpoint, profile,
+        ),
+        PreparedPlan::PrimaryKeyScan { .. } => execute_latest_scan(
+            database, snapshot, plan, parameters, permit, checkpoint, profile,
+        ),
+        PreparedPlan::PrimaryKeyPrefixScan { .. } => execute_latest_prefix_scan(
+            database, snapshot, plan, parameters, permit, checkpoint, profile,
+        ),
+        PreparedPlan::PrimaryKeyPrefixRangeScan { .. } => execute_latest_prefix_range_scan(
+            database, snapshot, plan, parameters, permit, checkpoint, profile,
+        ),
+        PreparedPlan::PrimaryKeyRangeScan { .. } => execute_latest_range_scan(
+            database, snapshot, plan, parameters, permit, checkpoint, profile,
+        ),
         PreparedPlan::IndexedInnerJoin { .. } => {
-            execute_indexed_join_latest(database, snapshot, plan, parameters, profile)
+            execute_indexed_join_latest(database, snapshot, plan, parameters, checkpoint, profile)
         }
     }
 }
@@ -1881,6 +2310,7 @@ fn execute_secondary_index_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::SecondaryIndexLookup {
@@ -1916,6 +2346,7 @@ fn execute_secondary_index_latest(
             *index,
             &index_key,
             |matched_table, primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if matched_table != *table {
@@ -2007,6 +2438,7 @@ fn execute_secondary_index_intersection_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::SecondaryIndexIntersection {
@@ -2033,6 +2465,7 @@ fn execute_secondary_index_intersection_latest(
     let bound_keys = order_latest_intersection_keys(database, snapshot, bound_keys)?;
     let mut candidates = None;
     for (position, (index, key)) in bound_keys.into_iter().enumerate() {
+        execution_checkpoint(checkpoint)?;
         let primary_keys = database
             .select_secondary_index_at(snapshot, index, &key)?
             .into_iter()
@@ -2049,7 +2482,9 @@ fn execute_secondary_index_intersection_latest(
             profile.intersection_start_rows = primary_keys.len();
         }
         candidates = Some(match candidates {
-            Some(current) => intersect_ordered_primary_keys(current, &primary_keys),
+            Some(current) => {
+                intersect_ordered_primary_keys_with_checkpoint(current, &primary_keys, checkpoint)?
+            }
             None => primary_keys,
         });
         if candidates.as_ref().is_some_and(Vec::is_empty) {
@@ -2061,6 +2496,7 @@ fn execute_secondary_index_intersection_latest(
     profile.candidate_rows = candidates.len();
     let mut rows = Vec::with_capacity(limit.unwrap_or(candidates.len()).min(candidates.len()));
     for primary_key in candidates {
+        execution_checkpoint(checkpoint)?;
         let stored = database
             .select_relational_at(snapshot, *table, &primary_key)?
             .ok_or(SqlError::InvalidStoredRow)?;
@@ -2131,11 +2567,21 @@ fn bind_secondary_intersection_keys(
     Ok(Some(bound))
 }
 
-fn intersect_ordered_primary_keys(mut left: Vec<Vec<u8>>, right: &[Vec<u8>]) -> Vec<Vec<u8>> {
+fn intersect_ordered_primary_keys(left: Vec<Vec<u8>>, right: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut checkpoint = || true;
+    intersect_ordered_primary_keys_with_checkpoint(left, right, &mut checkpoint).unwrap_or_default()
+}
+
+fn intersect_ordered_primary_keys_with_checkpoint(
+    mut left: Vec<Vec<u8>>,
+    right: &[Vec<u8>],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<Vec<Vec<u8>>, SqlError> {
     let mut left_index = 0;
     let mut right_index = 0;
     let mut output = Vec::with_capacity(left.len().min(right.len()));
     while left_index < left.len() && right_index < right.len() {
+        execution_checkpoint(checkpoint)?;
         match left[left_index].cmp(&right[right_index]) {
             Ordering::Less => left_index += 1,
             Ordering::Greater => right_index += 1,
@@ -2146,7 +2592,7 @@ fn intersect_ordered_primary_keys(mut left: Vec<Vec<u8>>, right: &[Vec<u8>]) -> 
             }
         }
     }
-    output
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2251,6 +2697,7 @@ fn execute_secondary_index_range_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::SecondaryIndexRangeScan {
@@ -2290,6 +2737,7 @@ fn execute_secondary_index_range_latest(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |matched_table, index_key, primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if matched_table != *table {
@@ -2380,6 +2828,7 @@ fn execute_indexed_join_latest(
     snapshot: &Snapshot,
     plan: &PreparedPlan,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::IndexedInnerJoin {
@@ -2413,6 +2862,7 @@ fn execute_indexed_join_latest(
             range.as_ref(),
             *limit,
             parameters,
+            checkpoint,
             profile,
         );
     }
@@ -2424,6 +2874,7 @@ fn execute_indexed_join_latest(
             plan,
             left_access,
             parameters,
+            checkpoint,
             profile,
         );
     }
@@ -2591,6 +3042,7 @@ fn execute_bounded_join_snapshot(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_bounded_join_latest(
     database: &NativeDatabase,
     snapshot: &Snapshot,
@@ -2598,6 +3050,7 @@ fn execute_bounded_join_latest(
     range: Option<&PrimaryKeyRange>,
     limit: usize,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::IndexedInnerJoin {
@@ -2636,6 +3089,7 @@ fn execute_bounded_join_latest(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_join_candidate(&mut candidates)?;
                 profile.candidate_rows = candidates;
                 if let Some(row) = materialize_join_row(&context, primary_key, stored, |value| {
@@ -2813,6 +3267,7 @@ fn execute_bounded_secondary_join_latest(
     plan: &PreparedPlan,
     access: &JoinLeftAccess,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let JoinLeftAccess::BoundedSecondaryIndex {
@@ -2863,6 +3318,7 @@ fn execute_bounded_secondary_join_latest(
             *index,
             &index_key,
             |matched_table, primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_join_candidate(&mut candidates)?;
                 profile.candidate_rows = candidates;
                 if matched_table != *left_table {
@@ -3032,6 +3488,14 @@ fn consume_scan_candidates(candidates: &mut usize, amount: usize) -> Result<(), 
     }
     *candidates = next;
     Ok(())
+}
+
+fn execution_checkpoint(checkpoint: &mut dyn FnMut() -> bool) -> Result<(), SqlError> {
+    if checkpoint() {
+        Ok(())
+    } else {
+        Err(SqlError::ExecutionInterrupted)
+    }
 }
 
 type JoinInputRow = Option<(Vec<u8>, Vec<u8>)>;
@@ -3491,6 +3955,7 @@ fn execute_latest_scan(
     plan: &PreparedPlan,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyScan {
@@ -3529,6 +3994,7 @@ fn execute_latest_scan(
             &Bound::Unbounded,
             *limit,
             permit,
+            checkpoint,
             profile,
         )?;
         return Ok(SqlResult::Rows {
@@ -3545,6 +4011,7 @@ fn execute_latest_scan(
             Bound::Unbounded,
             Bound::Unbounded,
             |primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
@@ -3635,6 +4102,7 @@ fn execute_latest_prefix_scan(
     plan: &PreparedPlan,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyPrefixScan {
@@ -3673,6 +4141,7 @@ fn execute_latest_prefix_scan(
             &upper,
             *limit,
             permit,
+            checkpoint,
             profile,
         )?;
         return Ok(rows_result(output_columns, rows));
@@ -3686,6 +4155,7 @@ fn execute_latest_prefix_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
@@ -3769,6 +4239,7 @@ fn execute_latest_prefix_range_scan(
     plan: &PreparedPlan,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyPrefixRangeScan {
@@ -3806,6 +4277,7 @@ fn execute_latest_prefix_range_scan(
             &upper,
             *limit,
             permit,
+            checkpoint,
             profile,
         )?;
         return Ok(rows_result(output_columns, rows));
@@ -3819,6 +4291,7 @@ fn execute_latest_prefix_range_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
@@ -3907,6 +4380,7 @@ fn execute_latest_range_scan(
     plan: &PreparedPlan,
     parameters: &[SqlValue],
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<SqlResult, SqlError> {
     let PreparedPlan::PrimaryKeyRangeScan {
@@ -3959,6 +4433,7 @@ fn execute_latest_range_scan(
             &upper,
             *limit,
             permit,
+            checkpoint,
             profile,
         )?;
         return Ok(SqlResult::Rows {
@@ -3975,6 +4450,7 @@ fn execute_latest_range_scan(
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
             |primary_key, stored| {
+                execution_checkpoint(checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 profile.candidate_rows = candidates;
                 if let Some(row) = materialize_filtered_row(
@@ -4011,6 +4487,7 @@ fn execute_create_index(
     column_names: &[String],
     unique: bool,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
@@ -4045,7 +4522,7 @@ fn execute_create_index(
     };
     definition.validate().map_err(NativeRuntimeError::from)?;
     transaction
-        .create_secondary_index_definition(&definition)
+        .create_secondary_index_definition_with_checkpoint(&definition, checkpoint)
         .map_err(map_runtime_error)?;
     Ok(SqlResult::Command {
         rows_affected: 0,
@@ -4291,6 +4768,7 @@ fn execute_create(
     primary_key_names: Vec<String>,
     parsed_foreign_keys: Vec<ParsedForeignKey>,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
@@ -4302,6 +4780,7 @@ fn execute_create(
         .map_err(NativeRuntimeError::from)?;
     let mut columns = Vec::with_capacity(parsed_columns.len());
     for (index, parsed) in parsed_columns.iter().enumerate() {
+        execution_checkpoint(checkpoint)?;
         let raw_id = u32::try_from(index)
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -4315,6 +4794,7 @@ fn execute_create(
     }
     let mut primary_key = Vec::with_capacity(primary_key_names.len());
     for name in primary_key_names {
+        execution_checkpoint(checkpoint)?;
         let index = column_index(&columns, &name)?;
         let column = &mut columns[index];
         if primary_key.contains(&column.id) {
@@ -4328,6 +4808,7 @@ fn execute_create(
     }
     let mut checks = Vec::new();
     for parsed in parsed_columns {
+        execution_checkpoint(checkpoint)?;
         let Some(check) = &parsed.check else {
             continue;
         };
@@ -4352,6 +4833,7 @@ fn execute_create(
     }
     let mut constraint_names = BTreeSet::new();
     for foreign_key in &parsed_foreign_keys {
+        execution_checkpoint(checkpoint)?;
         if let Some(name) = &foreign_key.name
             && !constraint_names.insert(normalize_identifier(name))
         {
@@ -4360,6 +4842,7 @@ fn execute_create(
     }
     let mut foreign_keys = Vec::new();
     for foreign_key in parsed_foreign_keys {
+        execution_checkpoint(checkpoint)?;
         let child_columns = foreign_key
             .columns
             .iter()
@@ -4419,6 +4902,7 @@ fn execute_create(
             return Err(SqlError::InvalidCatalogObject);
         }
         for (child, parent_column) in child_columns.iter().zip(&parent_columns) {
+            execution_checkpoint(checkpoint)?;
             let child_type = &columns
                 .iter()
                 .find(|column| column.id == *child)
@@ -4462,6 +4946,7 @@ fn execute_create(
         }
     }
     definition.validate().map_err(NativeRuntimeError::from)?;
+    execution_checkpoint(checkpoint)?;
     transaction.create_relation_definition(definition)?;
     Ok(SqlResult::Command {
         rows_affected: 0,
@@ -4523,6 +5008,7 @@ fn execute_drop_table(
     transaction: &mut NativeWriteBatch,
     name: &str,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
@@ -4535,6 +5021,7 @@ fn execute_drop_table(
     let Some(CatalogObject::Relation(_)) = transaction.state.catalog.object(id) else {
         return Err(SqlError::InvalidCatalogObject);
     };
+    execution_checkpoint(checkpoint)?;
     transaction
         .state
         .relational
@@ -4565,6 +5052,7 @@ fn execute_drop_index(
     transaction: &mut NativeWriteBatch,
     name: &str,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     if !parameters.is_empty() {
         return Err(SqlError::ParameterMismatch);
@@ -4577,6 +5065,7 @@ fn execute_drop_index(
     let Some(CatalogObject::SecondaryIndex(_)) = transaction.state.catalog.object(id) else {
         return Err(SqlError::InvalidCatalogObject);
     };
+    execution_checkpoint(checkpoint)?;
     transaction
         .state
         .relational
@@ -4609,24 +5098,25 @@ fn execute_insert(
     supplied_values: &[ColumnOperand],
     parameter_count: usize,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
     let resolved =
         resolve_mutation_operands(&definition, supplied_values, parameter_count, parameters)?;
     let values = bind_insert_values(&definition, supplied_values, &resolved)?;
-    validate_foreign_keys(transaction, &definition, &values)?;
+    validate_foreign_keys(transaction, &definition, &values, checkpoint)?;
     if is_legacy_binary_relation(&definition) {
         let primary_key = legacy_binary_value(values[0], false)?;
         let row = legacy_binary_value(values[1], false)?;
         transaction
-            .insert(table, primary_key, row)
+            .insert_with_checkpoint(table, primary_key, row, checkpoint)
             .map_err(map_runtime_error)?;
     } else {
         let primary_key = encode_primary_key(&definition, &values)?;
         let tuple = encode_tuple(&definition, &values)?;
         transaction
-            .insert(table, primary_key, tuple)
+            .insert_with_checkpoint(table, primary_key, tuple, checkpoint)
             .map_err(map_runtime_error)?;
     }
     Ok(SqlResult::Command {
@@ -4646,10 +5136,11 @@ fn validate_updated_foreign_keys(
     transaction: &NativeWriteBatch,
     definition: &RelationDefinition,
     stored: &[u8],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(), SqlError> {
     let values = decode_stored_values(definition, stored)?;
     let references = values.iter().map(Some).collect::<Vec<_>>();
-    validate_foreign_keys(transaction, definition, &references)
+    validate_foreign_keys(transaction, definition, &references, checkpoint)
 }
 
 fn execute_update(
@@ -4659,6 +5150,7 @@ fn execute_update(
     predicates: &[ColumnOperand],
     parameter_count: usize,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
@@ -4686,10 +5178,10 @@ fn execute_update(
         return Ok(command_result(0));
     }
     if !is_legacy_binary_relation(&definition) {
-        validate_updated_foreign_keys(transaction, &definition, &update)?;
+        validate_updated_foreign_keys(transaction, &definition, &update, checkpoint)?;
     }
     transaction
-        .update(table, primary_key, update)
+        .update_with_checkpoint(table, primary_key, update, checkpoint)
         .map_err(map_runtime_error)?;
     Ok(command_result(1))
 }
@@ -4698,12 +5190,15 @@ fn validate_parent_not_referenced(
     transaction: &NativeWriteBatch,
     parent: ObjectId,
     parent_key: &[u8],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(), SqlError> {
     for object in transaction.state.catalog.objects.values() {
+        execution_checkpoint(checkpoint)?;
         let CatalogObject::Relation(child) = object else {
             continue;
         };
         for foreign_key in &child.foreign_keys {
+            execution_checkpoint(checkpoint)?;
             if foreign_key.referenced_relation != parent {
                 continue;
             }
@@ -4711,6 +5206,7 @@ fn validate_parent_not_referenced(
                 continue;
             };
             for (child_key, stored) in rows {
+                execution_checkpoint(checkpoint)?;
                 let values = decode_complete_row(child, false, child_key, stored)?;
                 let mut key = Vec::new();
                 let mut contains_null = false;
@@ -4719,6 +5215,7 @@ fn validate_parent_not_referenced(
                     .iter()
                     .zip(&foreign_key.referenced_columns)
                 {
+                    execution_checkpoint(checkpoint)?;
                     let child_index = child
                         .columns
                         .iter()
@@ -4761,6 +5258,7 @@ fn execute_delete(
     predicates: &[ColumnOperand],
     parameter_count: usize,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let predicate_columns = bind_primary_key_columns(definition, predicates)?;
@@ -4770,9 +5268,9 @@ fn execute_delete(
     if transaction.select(table, &primary_key).is_none() {
         return Ok(command_result(0));
     }
-    validate_parent_not_referenced(transaction, table, &primary_key)?;
+    validate_parent_not_referenced(transaction, table, &primary_key, checkpoint)?;
     transaction
-        .delete(table, primary_key)
+        .delete_with_checkpoint(table, primary_key, checkpoint)
         .map_err(map_runtime_error)?;
     Ok(command_result(1))
 }
@@ -4788,6 +5286,7 @@ fn execute_select(
     transaction: &NativeWriteBatch,
     query: SelectQuery<'_>,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let ordered_secondary_indexes = transaction_ordered_secondary_indexes(transaction);
     let bound = bind_select(
@@ -4806,7 +5305,7 @@ fn execute_select(
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
-    let context = TransactionSelectContext {
+    let mut context = TransactionSelectContext {
         transaction,
         table,
         definition,
@@ -4814,6 +5313,7 @@ fn execute_select(
         filter: filter.as_ref(),
         residual,
         parameters,
+        checkpoint,
     };
     let rows = match access {
         SelectAccess::PrimaryKey { key, legacy_binary } => {
@@ -4858,7 +5358,9 @@ fn execute_select(
     })
 }
 
-fn transaction_ordered_secondary_indexes(transaction: &NativeWriteBatch) -> BTreeSet<ObjectId> {
+pub(crate) fn transaction_ordered_secondary_indexes(
+    transaction: &NativeWriteBatch,
+) -> BTreeSet<ObjectId> {
     transaction
         .state
         .relational
@@ -4878,11 +5380,12 @@ struct TransactionSelectContext<'context> {
     filter: Option<&'context BoundFilterExpression>,
     residual: bool,
     parameters: &'context [SqlValue],
+    checkpoint: &'context mut dyn FnMut() -> bool,
 }
 
 impl TransactionSelectContext<'_> {
     fn primary_key_rows(
-        &self,
+        &mut self,
         key: &KeyBinding,
         legacy_binary: bool,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -4910,7 +5413,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn secondary_index_rows(
-        &self,
+        &mut self,
         index: ObjectId,
         key: &KeyBinding,
         limit: Option<usize>,
@@ -4936,6 +5439,7 @@ impl TransactionSelectContext<'_> {
         let mut rows = Vec::with_capacity(primary_keys.len());
         let mut candidates = 0;
         for primary_key in primary_keys {
+            execution_checkpoint(self.checkpoint)?;
             consume_scan_candidates(&mut candidates, 1)?;
             let stored = self
                 .transaction
@@ -4960,7 +5464,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn secondary_index_intersection_rows(
-        &self,
+        &mut self,
         indexes: &[(ObjectId, KeyBinding)],
         limit: Option<usize>,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -4970,6 +5474,7 @@ impl TransactionSelectContext<'_> {
         let mut candidates = None;
         let mut index_stream_rows = 0;
         for (index, binding) in indexes {
+            execution_checkpoint(self.checkpoint)?;
             let definition = secondary_index_by_id(&self.transaction.state.catalog, *index)?;
             let Some(index_key) = bind_secondary_index_key_binding(
                 self.definition,
@@ -4999,6 +5504,7 @@ impl TransactionSelectContext<'_> {
         let candidates = candidates.unwrap_or_default();
         let mut rows = Vec::with_capacity(limit.unwrap_or(candidates.len()).min(candidates.len()));
         for primary_key in candidates {
+            execution_checkpoint(self.checkpoint)?;
             let stored = self
                 .transaction
                 .select(self.table, &primary_key)
@@ -5022,7 +5528,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn secondary_index_range_rows(
-        &self,
+        &mut self,
         index: ObjectId,
         range: &SecondaryIndexRange,
         limit: usize,
@@ -5054,6 +5560,7 @@ impl TransactionSelectContext<'_> {
         let mut candidates = 0;
         for (index_key, primary_keys) in index_state.entries.range((lower, upper)) {
             for primary_key in primary_keys {
+                execution_checkpoint(self.checkpoint)?;
                 consume_scan_candidates(&mut candidates, 1)?;
                 let stored = self
                     .transaction
@@ -5083,7 +5590,11 @@ impl TransactionSelectContext<'_> {
         Ok(rows)
     }
 
-    fn scan_rows(&self, limit: usize, legacy_binary: bool) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    fn scan_rows(
+        &mut self,
+        limit: usize,
+        legacy_binary: bool,
+    ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -5098,7 +5609,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn prefix_rows(
-        &self,
+        &mut self,
         prefix: &KeyBinding,
         limit: usize,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -5124,7 +5635,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn prefix_range_rows(
-        &self,
+        &mut self,
         range: &PrimaryKeyPrefixRange,
         limit: usize,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -5147,7 +5658,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn range_rows(
-        &self,
+        &mut self,
         range: &PrimaryKeyRange,
         execution: ScanExecution,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -5170,7 +5681,7 @@ impl TransactionSelectContext<'_> {
     }
 
     fn collect_rows<'row>(
-        &self,
+        &mut self,
         stored_rows: impl IntoIterator<Item = (&'row Vec<u8>, &'row Vec<u8>)>,
         limit: usize,
         legacy_binary: bool,
@@ -5178,6 +5689,7 @@ impl TransactionSelectContext<'_> {
         let mut rows = Vec::with_capacity(limit.min(256));
         let mut candidates = 0;
         for (primary_key, stored) in stored_rows {
+            execution_checkpoint(self.checkpoint)?;
             consume_scan_candidates(&mut candidates, 1)?;
             if let Some(row) = materialize_filtered_row(
                 self.definition,
@@ -6394,8 +6906,10 @@ fn validate_foreign_keys(
     transaction: &NativeWriteBatch,
     definition: &RelationDefinition,
     values: &[Option<&SqlValue>],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(), SqlError> {
     for foreign_key in &definition.foreign_keys {
+        execution_checkpoint(checkpoint)?;
         let mut key = Vec::new();
         let mut contains_null = false;
         let Some(CatalogObject::Relation(parent)) = transaction
@@ -6410,6 +6924,7 @@ fn validate_foreign_keys(
             .iter()
             .zip(&foreign_key.referenced_columns)
         {
+            execution_checkpoint(checkpoint)?;
             let child_index = definition
                 .columns
                 .iter()
@@ -6461,6 +6976,356 @@ fn validate_foreign_keys(
         }
     }
     Ok(())
+}
+
+fn bind_data_mutation(
+    catalog: &crate::model::CatalogState,
+    statement: &Statement,
+    parameters: &[SqlValue],
+) -> Result<BTreeSet<ObjectId>, SqlError> {
+    let (table, definition) = match statement {
+        Statement::Insert {
+            name,
+            values,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(catalog, name)?;
+            let resolved =
+                resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
+            let _ = bind_insert_values(definition, values, &resolved)?;
+            (table, definition)
+        }
+        Statement::Update {
+            name,
+            assignments,
+            predicates,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(catalog, name)?;
+            let assignment_columns = bind_update_columns(definition, assignments)?;
+            let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+            let assignment_values =
+                resolve_mutation_operands(definition, assignments, *parameter_count, parameters)?;
+            let predicate_values =
+                resolve_mutation_operands(definition, predicates, *parameter_count, parameters)?;
+            let _ = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+            if is_legacy_binary_relation(definition) {
+                if assignment_columns.as_slice() != [1] {
+                    return Err(SqlError::InvalidSyntax);
+                }
+                let _ = legacy_binary_value(assignment_values.first(), false)?;
+            } else {
+                let _ =
+                    bind_update_assignments(definition, &assignment_columns, &assignment_values)?;
+            }
+            (table, definition)
+        }
+        Statement::Delete {
+            name,
+            predicates,
+            parameter_count,
+        } => {
+            let (table, definition) = relation_named(catalog, name)?;
+            let predicate_columns = bind_primary_key_columns(definition, predicates)?;
+            let predicate_values =
+                resolve_mutation_operands(definition, predicates, *parameter_count, parameters)?;
+            let _ = bind_primary_key(definition, &predicate_columns, &predicate_values)?;
+            (table, definition)
+        }
+        _ => return Err(SqlError::InvalidSyntax),
+    };
+
+    let mut referenced = BTreeSet::from([table]);
+    referenced.extend(secondary_indexes_for_relation(catalog, table));
+    if !matches!(statement, Statement::Delete { .. }) {
+        for foreign_key in &definition.foreign_keys {
+            referenced.insert(foreign_key.referenced_relation);
+            referenced.extend(foreign_key.referenced_index);
+        }
+    }
+    if matches!(statement, Statement::Delete { .. }) {
+        for object in catalog.objects.values() {
+            let CatalogObject::Relation(child) = object else {
+                continue;
+            };
+            if child
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_relation == table)
+            {
+                referenced.insert(child.header.id);
+            }
+        }
+    }
+    Ok(referenced)
+}
+
+fn bind_catalog_mutation(
+    catalog: &crate::model::CatalogState,
+    statement: &Statement,
+    parameters: &[SqlValue],
+) -> Result<BTreeSet<ObjectId>, SqlError> {
+    if !parameters.is_empty() {
+        return Err(SqlError::ParameterMismatch);
+    }
+    let mut referenced = BTreeSet::new();
+    match statement {
+        Statement::CreateTable {
+            name,
+            columns,
+            primary_key,
+            foreign_keys,
+        } => bind_create_table_dependencies(
+            catalog,
+            name,
+            columns,
+            primary_key,
+            foreign_keys,
+            &mut referenced,
+        )?,
+        Statement::CreateIndex { table, columns, .. } => {
+            let (table_id, definition) = relation_named(catalog, table)?;
+            if is_legacy_binary_relation(definition) {
+                return Err(SqlError::InvalidSyntax);
+            }
+            let mut seen = BTreeSet::new();
+            for name in columns {
+                let id = definition.columns[column_index(&definition.columns, name)?].id;
+                if !seen.insert(id) {
+                    return Err(SqlError::DuplicateColumn);
+                }
+            }
+            referenced.insert(table_id);
+        }
+        Statement::AlterTableRename { name, .. } => {
+            referenced.insert(relation_named(catalog, name)?.0);
+        }
+        Statement::DropTable { name } => {
+            let (table, _) = relation_named(catalog, name)?;
+            referenced.insert(table);
+            referenced.extend(secondary_indexes_for_relation(catalog, table));
+            for object in catalog.objects.values() {
+                if let CatalogObject::Relation(child) = object
+                    && child
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_relation == table)
+                {
+                    referenced.insert(child.header.id);
+                }
+            }
+        }
+        Statement::DropIndex { name } => {
+            let id = catalog
+                .id_named(name, EngineKind::Relational)
+                .map_err(NativeRuntimeError::from)?;
+            let definition = secondary_index_by_id(catalog, id)?;
+            referenced.extend([id, definition.relation]);
+        }
+        _ => return Err(SqlError::InvalidSyntax),
+    }
+    Ok(referenced)
+}
+
+fn bind_create_table_dependencies(
+    catalog: &crate::model::CatalogState,
+    table_name: &str,
+    parsed_columns: &[ParsedColumn],
+    primary_key_names: &[String],
+    foreign_keys: &[ParsedForeignKey],
+    referenced: &mut BTreeSet<ObjectId>,
+) -> Result<(), SqlError> {
+    let mut columns = parsed_columns
+        .iter()
+        .enumerate()
+        .map(|(index, parsed)| {
+            let raw_id = u32::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SqlError::InvalidSyntax)?;
+            Ok(ColumnDefinition {
+                id: ColumnId::new(raw_id).map_err(|_| SqlError::InvalidSyntax)?,
+                name: CatalogName::unquoted(parsed.name.clone())
+                    .map_err(NativeRuntimeError::from)?,
+                logical_type: parsed.logical_type.clone(),
+                nullable: parsed.nullable,
+            })
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    let mut primary_key = BTreeSet::new();
+    for name in primary_key_names {
+        let index = column_index(&columns, name)?;
+        if !primary_key.insert(columns[index].id) {
+            return Err(SqlError::DuplicateColumn);
+        }
+        columns[index].nullable = false;
+    }
+    for foreign_key in foreign_keys {
+        for column in &foreign_key.columns {
+            let _ = column_index(&columns, column)?;
+        }
+        if normalize_identifier(&foreign_key.referenced_table) == normalize_identifier(table_name) {
+            for column in &foreign_key.referenced_columns {
+                let _ = column_index(&columns, column)?;
+            }
+            continue;
+        }
+        let (parent_id, parent) = relation_named(catalog, &foreign_key.referenced_table)?;
+        referenced.insert(parent_id);
+        let parent_columns = foreign_key
+            .referenced_columns
+            .iter()
+            .map(|name| column_index(&parent.columns, name).map(|index| parent.columns[index].id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if parent_columns != parent.primary_key {
+            let index = catalog.objects.values().find_map(|object| match object {
+                CatalogObject::SecondaryIndex(index)
+                    if index.relation == parent_id
+                        && index.unique
+                        && index.columns == parent_columns =>
+                {
+                    Some(index.header.id)
+                }
+                _ => None,
+            });
+            referenced.insert(index.ok_or(SqlError::InvalidCatalogObject)?);
+        }
+    }
+    Ok(())
+}
+
+fn secondary_indexes_for_relation(
+    catalog: &crate::model::CatalogState,
+    relation: ObjectId,
+) -> impl Iterator<Item = ObjectId> + '_ {
+    catalog.objects.iter().filter_map(move |(id, object)| {
+        matches!(object, CatalogObject::SecondaryIndex(index) if index.relation == relation)
+            .then_some(*id)
+    })
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::{BoundSqlStatementKind, bind_catalog, transaction_ordered_secondary_indexes};
+    use crate::NativeDatabase;
+    use hyphae_native_types::{DurabilityClass, ObjectId, ScalarValue};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "hyphae-sql-binding-{}-{sequence}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn dml_binding_includes_target_indexes_and_foreign_key_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let database = NativeDatabase::create(directory.path())?;
+        let mut batch = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        let parent = command_object_id(&batch.execute_sql(
+            "CREATE TABLE parents (id BIGINT PRIMARY KEY, code TEXT NOT NULL)",
+            &[],
+        )?)?;
+        let parent_code = command_object_id(
+            &batch.execute_sql("CREATE UNIQUE INDEX parents_code ON parents (code)", &[])?,
+        )?;
+        let child = command_object_id(&batch.execute_sql(
+            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_code TEXT, CONSTRAINT child_parent FOREIGN KEY (parent_code) REFERENCES parents (code))",
+            &[],
+        )?)?;
+        let child_parent = command_object_id(&batch.execute_sql(
+            "CREATE INDEX children_parent ON children (parent_code)",
+            &[],
+        )?)?;
+        let ordered = transaction_ordered_secondary_indexes(&batch);
+        let bound = bind_catalog(
+            batch.catalog_version(),
+            &batch.state.catalog,
+            &ordered,
+            "INSERT INTO children (id, parent_code) VALUES (?, ?)",
+            &[ScalarValue::Signed(1), ScalarValue::Text("one".to_owned())],
+        )?;
+        assert_eq!(
+            bound.referenced_object_ids(),
+            &BTreeSet::from([parent, parent_code, child, child_parent])
+        );
+        assert!(matches!(bound.statement, BoundSqlStatementKind::Write(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_binding_includes_incoming_foreign_key_children()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let database = NativeDatabase::create(directory.path())?;
+        let mut batch = database.begin_optimistic(0, DurabilityClass::Memory)?;
+        let parent = command_object_id(
+            &batch.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?,
+        )?;
+        let child = command_object_id(&batch.execute_sql(
+            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents (id))",
+            &[],
+        )?)?;
+        let ordered = transaction_ordered_secondary_indexes(&batch);
+        let bound = bind_catalog(
+            batch.catalog_version(),
+            &batch.state.catalog,
+            &ordered,
+            "DELETE FROM parents WHERE id = ?",
+            &[ScalarValue::Signed(1)],
+        )?;
+        assert_eq!(
+            bound.referenced_object_ids(),
+            &BTreeSet::from([parent, child])
+        );
+
+        let child_delete = bind_catalog(
+            batch.catalog_version(),
+            &batch.state.catalog,
+            &ordered,
+            "DELETE FROM children WHERE id = ?",
+            &[ScalarValue::Signed(1)],
+        )?;
+        assert_eq!(
+            child_delete.referenced_object_ids(),
+            &BTreeSet::from([child])
+        );
+        Ok(())
+    }
+
+    fn command_object_id(result: &super::SqlResult) -> Result<ObjectId, &'static str> {
+        match result {
+            super::SqlResult::Command {
+                object_id: Some(id),
+                ..
+            } => Ok(*id),
+            _ => Err("SQL command returned no object identity"),
+        }
+    }
 }
 
 fn bind_insert_values<'value>(
@@ -7423,10 +8288,12 @@ fn execute_latest_vectorized_range(
     upper: &Bound<Vec<u8>>,
     limit: usize,
     permit: Option<&OwnedGovernorPermit>,
+    checkpoint: &mut dyn FnMut() -> bool,
     profile: &mut SqlLatestExecutionProfile,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     let mut rows = Vec::with_capacity(limit.min(SQL_VECTOR_BATCH_ROWS));
     while rows.len() < limit {
+        execution_checkpoint(checkpoint)?;
         let (candidates, planned_workers, worker_batches) = database
             .scan_relational_range_at_governed(
                 snapshot,
@@ -7452,6 +8319,7 @@ fn execute_latest_vectorized_range(
             &candidates,
             filter,
             parameters,
+            checkpoint,
         )?;
         profile.path = if worker_batches > 0 {
             NativeSqlExecutionPath::VectorizedParallel
@@ -7479,6 +8347,7 @@ fn materialize_vector_batch(
     candidates: &[RelationalScanRow],
     filter: Option<&BoundFilterExpression>,
     parameters: &[SqlValue],
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     debug_assert!(candidates.len() <= SQL_VECTOR_BATCH_ROWS);
     let decoded = candidates
@@ -7494,6 +8363,7 @@ fn materialize_vector_batch(
         .collect::<Result<Vec<_>, _>>()?;
     let mut selected = SqlSelectionBitmap::empty(decoded.len());
     for (index, values) in decoded.iter().enumerate() {
+        execution_checkpoint(checkpoint)?;
         let matches = match filter {
             Some(expression) => {
                 evaluate_filter(definition, expression, values, parameters)? == TruthValue::True
@@ -7506,6 +8376,7 @@ fn materialize_vector_batch(
     }
     let mut rows = Vec::with_capacity(decoded.len());
     for (index, values) in decoded.into_iter().enumerate() {
+        execution_checkpoint(checkpoint)?;
         if !selected.contains(index) {
             continue;
         }
@@ -7686,6 +8557,9 @@ pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
         NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
         NativeRuntimeError::CheckConstraintViolation => SqlError::CheckViolation,
         NativeRuntimeError::ForeignKeyConstraintViolation => SqlError::ForeignKeyViolation,
+        NativeRuntimeError::ResourceQueue(crate::GovernorQueueError::Cancelled) => {
+            SqlError::ExecutionInterrupted
+        }
         error => SqlError::Runtime(error),
     }
 }
@@ -7724,6 +8598,17 @@ fn ensure_catalog_version(
     prepared: &PreparedStatement,
 ) -> Result<(), SqlError> {
     if prepared.catalog_version == catalog_version {
+        Ok(())
+    } else {
+        Err(SqlError::CatalogChanged)
+    }
+}
+
+fn ensure_bound_catalog_version(
+    catalog_version: CatalogVersion,
+    bound: &BoundSqlStatement,
+) -> Result<(), SqlError> {
+    if bound.catalog_version == catalog_version {
         Ok(())
     } else {
         Err(SqlError::CatalogChanged)
@@ -8685,9 +9570,59 @@ mod tests {
     use super::{
         ColumnOperand, ComparisonOperator, FilterExpression, MAX_SQL_JOIN_CANDIDATES,
         MAX_SQL_SCAN_CANDIDATES, ParsedJoinEquality, Projection, SQL_VECTOR_BATCH_ROWS,
-        ScalarOperand, SqlError, Statement, TruthValue, binary_prefix_successor,
-        consume_join_candidate, consume_scan_candidates, key_range_is_empty, parse,
+        ScalarOperand, SqlError, SqlStatementClass, Statement, TruthValue, binary_prefix_successor,
+        classify_sql_statement, consume_join_candidate, consume_scan_candidates,
+        key_range_is_empty, parse,
     };
+
+    #[test]
+    fn canonical_parser_classifies_authorization_boundaries() {
+        for statement in [
+            "SELECT value FROM items WHERE id = ?",
+            "WITH current AS (SELECT value FROM items WHERE id = ?) SELECT value FROM current WHERE id = ?",
+            "EXPLAIN SELECT value FROM items WHERE id = ?",
+        ] {
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::Read)
+                ),
+                "{statement}"
+            );
+        }
+        for statement in [
+            "INSERT INTO items (id, value) VALUES (?, ?)",
+            "UPDATE items SET value = ? WHERE id = ?",
+            "DELETE FROM items WHERE id = ?",
+        ] {
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::DataMutation)
+                ),
+                "{statement}"
+            );
+        }
+        for statement in [
+            "CREATE TABLE items (id BIGINT PRIMARY KEY, value TEXT)",
+            "CREATE INDEX items_value ON items (value)",
+            "ALTER TABLE items RENAME TO archived_items",
+            "DROP INDEX items_value",
+            "DROP TABLE items",
+        ] {
+            assert!(
+                matches!(
+                    classify_sql_statement(statement),
+                    Ok(SqlStatementClass::CatalogMutation)
+                ),
+                "{statement}"
+            );
+        }
+        assert!(matches!(
+            classify_sql_statement("SELECT FROM"),
+            Err(SqlError::InvalidSyntax)
+        ));
+    }
 
     #[test]
     fn join_candidate_budget_accepts_the_boundary_and_then_fails_closed() {

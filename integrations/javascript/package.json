@@ -2,7 +2,7 @@
   "name": "@celiums/hyphae-integrations",
   "version": "1.1.0",
   "description": "Optional Astro, Next, and Vite adapters for Hyphae v1",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=20.19"
@@ -11,7 +11,8 @@
     "dist",
     "LICENSE",
     "LICENSE-DOCUMENTATION",
-    "LICENSE-POLICY.md"
+    "LICENSE-POLICY.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "exports": {
     "./astro": {
@@ -34,6 +35,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "rm -rf dist && npm run build",
     "conformance": "node conformance/run.mjs",
     "test": "npm run build && node --test test/*.test.mjs"
   },

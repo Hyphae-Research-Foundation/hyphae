@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     future::Future,
@@ -10,11 +10,16 @@ use std::{
 };
 
 use hyphae_native_product::{
-    BackupRequest, BoundedSearchQuery, CatalogDependencyRequest, CatalogListRequest, DoctorRequest,
-    ObjectId, ProductDurabilityPolicy, ProductError, ProductLimits, ProductOperation,
-    ProductPreparedHandle, ProductResponse, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchRequest,
-    ProductStructureMutation, ProductStructureReadRequest, ProductValue, RestoreRequest,
+    AccessControlMutationReceipt, ApiKeyActivationReceipt, ApiKeyConfirmationDigest, ApiKeyId,
+    ApiKeyStartReceipt, BackupRequest, BoundedSearchQuery, BuiltInRole, CatalogDependencyRequest,
+    CatalogListRequest, CatalogVisibleListRequest, CustomRoleGrant, CustomRoleMutationReceipt,
+    DoctorRequest, ObjectId, ProductDurabilityPolicy, ProductError, ProductLimits,
+    ProductOperation, ProductPreparedHandle, ProductResponse, ProductScope,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
+    ProductSearchRequest, ProductStructureMutation, ProductStructureReadRequest, ProductValue,
+    RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
+    SecurityAuditReadRequest, SecurityId, SecurityKeyListRequest, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityRoleListRequest,
 };
 
 use super::{HttpTransport, LocalTransport};
@@ -167,6 +172,14 @@ impl HyphaeClient {
         Ok(Self::new(LocalTransport::new(endpoint)?))
     }
 
+    /// Creates an API-key-authenticated local client.
+    pub fn local_authenticated(
+        endpoint: impl Into<String>,
+        api_key: impl AsRef<str>,
+    ) -> Result<Self, ClientError> {
+        Ok(Self::new(LocalTransport::new(endpoint)?.api_key(api_key)?))
+    }
+
     /// Creates a local client with an explicit bounded handshake identity.
     pub fn local_with_identity(
         endpoint: impl Into<String>,
@@ -201,6 +214,16 @@ impl HyphaeClient {
         options: RequestOptions,
     ) -> Result<ProductResponse, ClientError> {
         self.execute(ProductOperation::CatalogList(request), options)
+            .await
+    }
+
+    /// Lists a bounded page under current visible scopes with an opaque cursor.
+    pub async fn catalog_visible_list(
+        &self,
+        request: CatalogVisibleListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::CatalogVisibleList(request), options)
             .await
     }
 
@@ -419,6 +442,415 @@ impl HyphaeClient {
         self.execute(ProductOperation::Telemetry, options).await
     }
 
+    /// Reads redacted access-control catalog status.
+    pub async fn security_status(
+        &self,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityStatus, options)
+            .await
+    }
+
+    /// Lists one bounded redacted principal page.
+    pub async fn security_principal_list(
+        &self,
+        request: SecurityPrincipalListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityPrincipalList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted role page.
+    pub async fn security_role_list(
+        &self,
+        request: SecurityRoleListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityRoleList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted assignment page.
+    pub async fn security_assignment_list(
+        &self,
+        request: SecurityAssignmentListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityAssignmentList(request), options)
+            .await
+    }
+
+    /// Lists one bounded redacted API-key metadata page.
+    pub async fn security_key_list(
+        &self,
+        request: SecurityKeyListRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityKeyList(request), options)
+            .await
+    }
+
+    /// Reads one bounded redacted security-audit page.
+    pub async fn security_audit_read(
+        &self,
+        request: SecurityAuditReadRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::SecurityAuditRead(request), options)
+            .await
+    }
+
+    /// Creates one disabled durable principal under a nonzero idempotency token.
+    pub async fn security_principal_create(
+        &self,
+        display_name: impl Into<String>,
+        options: RequestOptions,
+    ) -> Result<SecurityPrincipalMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityPrincipalCreate {
+                    display_name: display_name.into(),
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityPrincipalMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Enables or disables one durable principal under a nonzero idempotency token.
+    pub async fn security_principal_set_enabled(
+        &self,
+        principal_id: SecurityId,
+        enabled: bool,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityPrincipalSetEnabled {
+                    principal_id,
+                    enabled,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Creates one immutable custom role under a nonzero idempotency token.
+    pub async fn security_custom_role_create(
+        &self,
+        display_name: impl Into<String>,
+        grants: Vec<CustomRoleGrant>,
+        options: RequestOptions,
+    ) -> Result<CustomRoleMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityCustomRoleCreate {
+                    display_name: display_name.into(),
+                    grants,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityCustomRoleMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Assigns one built-in role under a nonzero idempotency token.
+    pub async fn security_built_in_assignment_create(
+        &self,
+        principal_id: SecurityId,
+        role: BuiltInRole,
+        scope: ProductScope,
+        options: RequestOptions,
+    ) -> Result<RoleAssignmentMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityBuiltInAssignmentCreate {
+                    principal_id,
+                    role,
+                    scope,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityAssignmentMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Assigns one custom role under a nonzero idempotency token.
+    pub async fn security_custom_assignment_create(
+        &self,
+        principal_id: SecurityId,
+        role_id: SecurityId,
+        options: RequestOptions,
+    ) -> Result<RoleAssignmentMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityCustomAssignmentCreate {
+                    principal_id,
+                    role_id,
+                },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityAssignmentMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Revokes one non-owner assignment under a nonzero idempotency token.
+    pub async fn security_assignment_revoke(
+        &self,
+        assignment_id: SecurityId,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self
+            .execute(
+                ProductOperation::SecurityAssignmentRevoke { assignment_id },
+                options,
+            )
+            .await?
+        {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Starts one self-managed inactive API key and returns its secret once.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn security_api_key_issue_self_start(
+        &self,
+        principal_id: SecurityId,
+        label: impl Into<String>,
+        roles: Vec<BuiltInRole>,
+        custom_roles: Vec<SecurityId>,
+        permission_ceiling: hyphae_native_product::ProductAuthorization,
+        scope_ceiling: Vec<ProductScope>,
+        expires_at_micros: Option<i64>,
+        options: RequestOptions,
+    ) -> Result<ApiKeyStartReceipt, ClientError> {
+        self.security_key_start(
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: label.into(),
+                roles,
+                custom_roles,
+                permission_ceiling,
+                scope_ceiling,
+                expires_at_micros,
+            },
+            options,
+        )
+        .await
+    }
+
+    /// Starts one administratively managed inactive API key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn security_api_key_issue_start(
+        &self,
+        principal_id: SecurityId,
+        label: impl Into<String>,
+        roles: Vec<BuiltInRole>,
+        custom_roles: Vec<SecurityId>,
+        permission_ceiling: hyphae_native_product::ProductAuthorization,
+        scope_ceiling: Vec<ProductScope>,
+        expires_at_micros: Option<i64>,
+        options: RequestOptions,
+    ) -> Result<ApiKeyStartReceipt, ClientError> {
+        self.security_key_start(
+            ProductOperation::SecurityApiKeyIssueStart {
+                principal_id,
+                label: label.into(),
+                roles,
+                custom_roles,
+                permission_ceiling,
+                scope_ceiling,
+                expires_at_micros,
+            },
+            options,
+        )
+        .await
+    }
+
+    /// Starts one self-managed inactive rotation successor.
+    pub async fn security_api_key_rotate_self_start(
+        &self,
+        predecessor_key_id: ApiKeyId,
+        label: impl Into<String>,
+        overlap_seconds: u64,
+        expires_at_micros: Option<i64>,
+        options: RequestOptions,
+    ) -> Result<ApiKeyStartReceipt, ClientError> {
+        self.security_key_start(
+            ProductOperation::SecurityApiKeyRotateSelfStart {
+                predecessor_key_id,
+                label: label.into(),
+                overlap_seconds,
+                expires_at_micros,
+            },
+            options,
+        )
+        .await
+    }
+
+    /// Starts one administratively managed inactive rotation successor.
+    pub async fn security_api_key_rotate_start(
+        &self,
+        predecessor_key_id: ApiKeyId,
+        label: impl Into<String>,
+        overlap_seconds: u64,
+        expires_at_micros: Option<i64>,
+        options: RequestOptions,
+    ) -> Result<ApiKeyStartReceipt, ClientError> {
+        self.security_key_start(
+            ProductOperation::SecurityApiKeyRotateStart {
+                predecessor_key_id,
+                label: label.into(),
+                overlap_seconds,
+                expires_at_micros,
+            },
+            options,
+        )
+        .await
+    }
+
+    async fn security_key_start(
+        &self,
+        operation: ProductOperation,
+        options: RequestOptions,
+    ) -> Result<ApiKeyStartReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self.execute(operation, options).await? {
+            ProductResponse::SecurityApiKeyStarted(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Activates one exact pending issue.
+    pub async fn security_api_key_issue_activate(
+        &self,
+        key_id: ApiKeyId,
+        confirmation_digest: ApiKeyConfirmationDigest,
+        self_manage: bool,
+        options: RequestOptions,
+    ) -> Result<ApiKeyActivationReceipt, ClientError> {
+        self.security_key_activate(
+            if self_manage {
+                ProductOperation::SecurityApiKeyIssueSelfActivate {
+                    key_id,
+                    confirmation_digest,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyIssueActivate {
+                    key_id,
+                    confirmation_digest,
+                }
+            },
+            options,
+        )
+        .await
+    }
+
+    /// Activates one exact pending rotation successor.
+    pub async fn security_api_key_rotate_activate(
+        &self,
+        successor_key_id: ApiKeyId,
+        confirmation_digest: ApiKeyConfirmationDigest,
+        self_manage: bool,
+        options: RequestOptions,
+    ) -> Result<ApiKeyActivationReceipt, ClientError> {
+        self.security_key_activate(
+            if self_manage {
+                ProductOperation::SecurityApiKeyRotateSelfActivate {
+                    successor_key_id,
+                    confirmation_digest,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyRotateActivate {
+                    successor_key_id,
+                    confirmation_digest,
+                }
+            },
+            options,
+        )
+        .await
+    }
+
+    async fn security_key_activate(
+        &self,
+        operation: ProductOperation,
+        options: RequestOptions,
+    ) -> Result<ApiKeyActivationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        match self.execute(operation, options).await? {
+            ProductResponse::SecurityApiKeyActivated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Aborts an exact pending issue or rotation successor.
+    pub async fn security_api_key_abort(
+        &self,
+        key_id: ApiKeyId,
+        rotation: bool,
+        self_manage: bool,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        let operation = match (rotation, self_manage) {
+            (false, true) => ProductOperation::SecurityApiKeyIssueSelfAbort { key_id },
+            (false, false) => ProductOperation::SecurityApiKeyIssueAbort { key_id },
+            (true, true) => ProductOperation::SecurityApiKeyRotateSelfAbort {
+                successor_key_id: key_id,
+            },
+            (true, false) => ProductOperation::SecurityApiKeyRotateAbort {
+                successor_key_id: key_id,
+            },
+        };
+        match self.execute(operation, options).await? {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Revokes one exact active API key.
+    pub async fn security_api_key_revoke(
+        &self,
+        key_id: ApiKeyId,
+        self_manage: bool,
+        options: RequestOptions,
+    ) -> Result<AccessControlMutationReceipt, ClientError> {
+        require_security_mutation_idempotency(&options)?;
+        let operation = if self_manage {
+            ProductOperation::SecurityApiKeyRevokeSelf { key_id }
+        } else {
+            ProductOperation::SecurityApiKeyRevoke { key_id }
+        };
+        match self.execute(operation, options).await? {
+            ProductResponse::SecurityMutated(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Explains one SQL statement.
     pub async fn explain_sql(
         &self,
@@ -524,6 +956,16 @@ impl HyphaeClient {
             options,
         )
         .await
+    }
+}
+
+fn require_security_mutation_idempotency(options: &RequestOptions) -> Result<(), ClientError> {
+    if options.idempotency_token.is_some_and(|token| token != 0) {
+        Ok(())
+    } else {
+        Err(ClientError::Protocol(
+            "security mutations require a nonzero idempotency token".to_owned(),
+        ))
     }
 }
 

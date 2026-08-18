@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native performance evidence v1
 
 Status: implemented P0 evidence contract; no performance closure claimed

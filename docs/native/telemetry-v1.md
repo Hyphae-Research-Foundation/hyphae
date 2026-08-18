@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local telemetry v1
 
 Status: implemented G6 contract

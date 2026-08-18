@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 name: CI
 
 on:
@@ -26,6 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - name: Verify the pull-request integration tree
         if: github.event_name == 'pull_request'
         shell: bash
@@ -41,6 +43,36 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
+      - name: Enforce DCO sign-offs on the pull-request commit range
+        if: github.event_name == 'pull_request'
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_dco_signoffs -v
+          python tools/check_dco_signoffs.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
+      - name: Verify Native access-control contract
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_native_access_control -v
+          PYTHONPATH=. python tools/check_native_access_control.py
+      - name: Verify managed Native v2 authority conformance
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_native_v2_authority_conformance \
+            tools.test_check_python_managed_v2_conformance \
+            tools.test_run_python_managed_v2_conformance \
+            -v
+          PYTHONPATH=. python tools/check_native_v2_authority_conformance.py
+      - name: Verify exhaustive security crash inventory
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_security_crash_matrix -v
+          PYTHONPATH=. python tools/check_security_crash_matrix.py
+      - name: Verify Claude Code and Codex plugins
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_agent_plugins \
+            tools.test_mcp_host_conformance \
+            -v
+          PYTHONPATH=. python tools/check_agent_plugins.py
       - name: Verify open G7 and G8 authority
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g7_g8_readiness -v
@@ -141,6 +173,9 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Run exhaustive injected security crash matrix
+        if: matrix.run-native-conformance
+        run: cargo test --locked -p hyphae-native-product --test security_crash_matrix
       - name: Run native conformance profile
         if: matrix.run-native-conformance
         shell: bash
@@ -157,6 +192,74 @@ jobs:
         with:
           name: native-conformance-${{ matrix.native-platform }}
           path: native-conformance-${{ matrix.native-platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  security-hard-kill:
+    name: Security hard-kill shard ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run exact process hard-kill shard
+        run: |
+          cargo run --quiet --locked -p hyphae-native-product \
+            --example security_crash_matrix -- \
+            "${{ github.event.pull_request.head.sha || github.sha }}" \
+            "github-actions-ubuntu" \
+            "${{ matrix.shard }}" 4 \
+            > "security-process-crash-matrix-${{ matrix.shard }}.json"
+          PYTHONPATH=. python tools/check_security_crash_matrix.py
+      - name: Upload process hard-kill shard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-process-crash-matrix-${{ matrix.shard }}
+          path: security-process-crash-matrix-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  security-hard-kill-receipt:
+    name: Security hard-kill aggregate
+    needs: security-hard-kill
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Download process hard-kill shards
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: security-process-crash-matrix-*
+          path: security-process-crash-matrix
+          merge-multiple: true
+      - name: Validate exact aggregate
+        run: |
+          PYTHONPATH=. python tools/check_security_crash_matrix.py \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-0.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-1.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-2.json \
+            --receipt security-process-crash-matrix/security-process-crash-matrix-3.json \
+            --expected-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Upload security hard-kill aggregate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-hard-kill-${{ github.event.pull_request.head.sha || github.sha }}
+          path: security-process-crash-matrix/*.json
           if-no-files-found: error
           retention-days: 14
           overwrite: true
@@ -231,6 +334,11 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.11.15
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
       - name: Check generated SDK models
         run: |
           PYTHONPATH=. python -m unittest tools.test_generate_sdk_models -v
@@ -240,16 +348,305 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm test
+      - name: Inspect clean npm package tarballs
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_npm_packages \
+            tools.test_check_registry_publish \
+            -v
+          python tools/check_npm_packages.py
       - name: Test Python SDK
         env:
           PYTHONPATH: sdks/python/src
         run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_python_package \
+            tools.test_check_python_distributions \
+            tools.test_normalize_python_sdist \
+            tools.test_python_distribution_receipt \
+            -v
+          PYTHONPATH=. python tools/check_python_package.py
           python -m compileall -q sdks/python/src sdks/python/conformance sdks/python/tests
           python -m unittest discover -s sdks/python/tests -v
       - name: Build public Rust clients and single binary
         run: cargo build -p hyphae-cli -p hyphae-conformance-rust --locked
       - name: Run common live conformance suite
-        run: python tools/run_conformance.py
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_run_conformance -v
+          python tools/run_conformance.py
+
+  mcp-real-hosts:
+    name: MCP real hosts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.16.0
+          package-manager-cache: false
+      - name: Install exact MCP hosts without lifecycle scripts
+        working-directory: conformance/mcp/hosts
+        run: npm ci --ignore-scripts
+      - name: Build CLI and MCP authority fixture
+        run: cargo build --locked -p hyphae-cli -p hyphae-v2-fixture
+      - name: Prepare MCP Auditor authority and start loopback HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          data_dir="$RUNNER_TEMP/hyphae-mcp-data"
+          owner_key="$RUNNER_TEMP/hyphae-mcp-owner.key"
+          auditor_key="$RUNNER_TEMP/hyphae-mcp-auditor.key"
+          target/debug/hyphae init --data-dir "$data_dir"
+          target/debug/hyphae security --data-dir "$data_dir" bootstrap \
+            --name "MCP Conformance Owner" \
+            --label "mcp-conformance-owner" \
+            --key-out "$owner_key"
+          target/debug/hyphae-v2-fixture \
+            --data-dir "$data_dir" \
+            --owner-key-file "$owner_key" \
+            --auditor-key-out "$auditor_key" \
+            --metadata-out "$RUNNER_TEMP/hyphae-mcp-fixture.json"
+          RUNNER_TRACKING_ID= target/debug/hyphae serve \
+            --data-dir "$data_dir" \
+            --endpoint "$RUNNER_TEMP/hyphae-mcp.sock" \
+            --http-bind 127.0.0.1:8787 \
+            --native-api-key-auth \
+            > "$RUNNER_TEMP/hyphae-mcp-daemon.stdout" \
+            2> "$RUNNER_TEMP/hyphae-mcp-daemon.stderr" &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 300); do
+            if grep -q 'hyphae native HTTP v2 listening on 127.0.0.1:8787' \
+              "$RUNNER_TEMP/hyphae-mcp-daemon.stderr"; then
+              break
+            fi
+            kill -0 "$daemon_pid"
+            sleep 0.1
+          done
+          kill -0 "$daemon_pid"
+          grep -q 'hyphae native HTTP v2 listening on 127.0.0.1:8787' \
+            "$RUNNER_TEMP/hyphae-mcp-daemon.stderr"
+          printf 'HYPHAE_NATIVE_API_KEY_FILE=%s\n' "$auditor_key" >> "$GITHUB_ENV"
+          printf 'PATH=%s/target/debug:%s/conformance/mcp/hosts/node_modules/.bin:%s\n' \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE" "$PATH" >> "$GITHUB_ENV"
+          printf '%s\n' "$daemon_pid" > "$RUNNER_TEMP/hyphae-mcp-daemon.pid"
+          disown "$daemon_pid"
+          trap - EXIT
+      - name: Run direct MCP and real hosted conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'kill "$(cat "$RUNNER_TEMP/hyphae-mcp-daemon.pid")" 2>/dev/null || true' EXIT
+          cargo test --locked -p hyphae-cli native_mcp
+          PYTHONPATH=. python -m unittest tools.test_mcp_host_conformance -v
+          evidence="$RUNNER_TEMP/mcp-evidence"
+          mkdir -p "$evidence"
+          python tools/run_mcp_host_conformance.py \
+            --host claude-code \
+            --output "$evidence/claude-code.receipt.json" \
+            --transcript "$evidence/claude-code.transcript.json" \
+            --allow-integration-tree
+          python tools/run_mcp_host_conformance.py \
+            --host codex \
+            --output "$evidence/codex.receipt.json" \
+            --transcript "$evidence/codex.transcript.json" \
+            --allow-integration-tree
+          python tools/check_mcp_host_receipts.py \
+            --evidence "$evidence" \
+            --expected-commit "$(git rev-parse HEAD)" \
+            --allow-integration-tree
+      - name: Upload MCP host receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-real-hosts-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/mcp-evidence
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  python-managed-v2-wheel:
+    name: Python managed v2 wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Build the exact pure-Python wheel once
+        run: uv build sdks/python --wheel --out-dir dist
+      - name: Upload the exact wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/hyphae_sdk-1.1.0-py3-none-any.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+
+  python-managed-v2:
+    name: Python managed v2 (${{ matrix.name }})
+    needs: python-managed-v2-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            platform: linux
+          - name: macOS
+            os: macos-latest
+            platform: macos
+          - name: Windows
+            os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Download the exact shared wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist
+      - name: Build the product and fixture binaries
+        run: cargo build --locked -p hyphae-cli -p hyphae-v2-fixture
+      - name: Run real managed local and HTTP conformance
+        env:
+          PYTHONPATH: .
+        run: >-
+          python tools/run_python_managed_v2_conformance.py
+          --binary target/debug/hyphae
+          --fixture-binary target/debug/hyphae-v2-fixture
+          --wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl
+          --startup-timeout-seconds 30
+          --output python-managed-v2-conformance-${{ matrix.platform }}.json
+      - name: Upload the platform receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-conformance-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-conformance-${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  python-managed-v2-aggregate:
+    name: Python managed v2 aggregate
+    if: always()
+    needs: python-managed-v2
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.11.15
+      - name: Download all platform receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: python-managed-v2-conformance-*-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-receipts
+          merge-multiple: true
+      - name: Validate exact-source hosted receipts
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_check_python_managed_v2_conformance -v
+          python tools/check_python_managed_v2_conformance.py \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-linux.json \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-macos.json \
+            --receipt python-managed-v2-receipts/python-managed-v2-conformance-windows.json \
+            --expected-source-commit "$(git rev-parse HEAD)" \
+            --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --output python-managed-v2-conformance-aggregate.json
+      - name: Upload the aggregate receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-managed-v2-conformance-aggregate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-managed-v2-conformance-aggregate.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  python-windows-async:
+    name: Python Windows async named pipe
+    needs: python-managed-v2-wheel
+    runs-on: windows-2025
+    steps:
+      - name: Check out exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Download the exact shared wheel once
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist
+      - name: Run real installed-wheel async named-pipe lifecycle
+        shell: bash
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m unittest tools.test_check_python_windows_async_gate tools.test_run_python_windows_async_gate -v
+          python tools/run_python_windows_async_gate.py \
+            --wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl \
+            --output python-windows-async-receipt.json \
+            --transcript-output python-windows-async-transcript.json
+          python tools/check_python_windows_async_gate.py \
+            --receipt python-windows-async-receipt.json \
+            --expected-source-commit "$(git rev-parse HEAD)" \
+            --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
+            --expected-wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl \
+            --expected-transcript python-windows-async-transcript.json
+      - name: Upload exact-source Windows async evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-windows-async-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            python-windows-async-receipt.json
+            python-windows-async-transcript.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
   optional-integrations:
     name: Optional framework integrations
@@ -296,12 +693,60 @@ jobs:
 
   release-readiness:
     name: Release readiness
+    if: always()
+    needs: [python-managed-v2-aggregate, python-windows-async, security-hard-kill-receipt, mcp-real-hosts]
     runs-on: ubuntu-24.04
     steps:
+      - name: Require hosted Python managed conformance
+        env:
+          PYTHON_MANAGED_RESULT: ${{ needs.python-managed-v2-aggregate.result }}
+          PYTHON_WINDOWS_ASYNC_RESULT: ${{ needs.python-windows-async.result }}
+          SECURITY_HARD_KILL_RESULT: ${{ needs.security-hard-kill-receipt.result }}
+          MCP_REAL_HOSTS_RESULT: ${{ needs.mcp-real-hosts.result }}
+        run: |
+          test "$PYTHON_MANAGED_RESULT" = success
+          test "$PYTHON_WINDOWS_ASYNC_RESULT" = success
+          test "$SECURITY_HARD_KILL_RESULT" = success
+          test "$MCP_REAL_HOSTS_RESULT" = success
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          fetch-tags: false
+      - name: Fetch and verify immutable relicensing tags
+        shell: bash
+        env:
+          CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          # Relicensing recomputes ancestry-bound legal evidence from this exact SHA.
+          git fetch --unshallow --no-tags origin "$CANDIDATE_COMMIT"
+          test "$(git rev-list --count fcf2f918e1539cfb7d67fd52abf0c7d57169ec18)" = 847
+          git merge-base --is-ancestor \
+            fcf2f918e1539cfb7d67fd52abf0c7d57169ec18 "$CANDIDATE_COMMIT"
+          git fetch --atomic --no-tags origin \
+            "refs/tags/v0.1.0:refs/tags/v0.1.0" \
+            "refs/tags/v0.2.0:refs/tags/v0.2.0" \
+            "refs/tags/v0.2.1:refs/tags/v0.2.1" \
+            "refs/tags/v1.0.0:refs/tags/v1.0.0" \
+            "refs/tags/v1.0.1:refs/tags/v1.0.1" \
+            "refs/tags/v1.1.0:refs/tags/v1.1.0"
+          while read -r tag expected_object expected_commit; do
+            tag_ref="refs/tags/${tag}"
+            test "$(git cat-file -t "$tag_ref")" = tag
+            test "$(git rev-parse "$tag_ref")" = "$expected_object"
+            test "$(git rev-parse "${tag_ref}^{commit}")" = "$expected_commit"
+          done <<'TAGS'
+          v0.1.0 3505ee8fb8a2184c5248109325aa2ad463ba1421 76b0cfdad90cf9e75d949a945c94a3badf0c6b59
+          v0.2.0 72f55eb2f6023c36834a133d65411861dabcb01d 170380453a2ca6322a4c8bc50417318daee1c011
+          v0.2.1 469be57b547661755a31d2fc838136f3c051dff4 08028e8dac077846c638f067ce74fbcf6fb75501
+          v1.0.0 d5e9e142dfa49e688ce4f21880fcbc91d9b5016d 839ea6e2a806ed919610952cb17fd1dd61195d76
+          v1.0.1 4a81737036c8122d23db632947666eaa03dfe61d 84161cf067141b60f4847b965ef77c5b749749c0
+          v1.1.0 80b2f094c17ada6adc3bb879e20c3662bd93f4e4 e88f2ea2c3455a393e3ac0cd69e25486cc26888e
+          TAGS
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
@@ -328,8 +773,6 @@ jobs:
           BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin \
-            "refs/tags/v0.2.1:refs/tags/v0.2.1"
           test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
           while IFS= read -r package; do
             "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
@@ -349,7 +792,16 @@ jobs:
       - name: Build the standalone binary
         run: cargo build -p hyphae-cli --locked
       - name: Audit publishable crate contents
-        run: python tools/check_crate_packages.py
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_crate_packages \
+            tools.test_check_registry_publish \
+            -v
+          python tools/check_crate_packages.py
+      - name: Verify effective license transition
+        run: |
+          PYTHONPATH=. python -m unittest tools.test_relicensing_checks -v
+          python tools/relicensing_checks.py --readonly
       - name: Validate documentation and executable embedded example
         run: |
           python tools/check_documentation.py --binary target/debug/hyphae
@@ -360,6 +812,19 @@ jobs:
           python tools/generate_compatibility_fixture.py --binary target/debug/hyphae --check compatibility/v1/data-directory.json
           cargo test -p hyphae-engine --example generate_disk_format_2_fixture --locked
           cargo test -p hyphae-engine --example generate_retrieval_goldens --locked
+      - name: Verify workflow syntax
+        shell: bash
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_URL: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint-1.7.12.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" "$ACTIONLINT_URL"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck=
       - name: Test deterministic packaging and checksums
         run: |
           python -m compileall -q packaging tools

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native SQL vector execution v1
 
 Status: experimental P5 foundation; no P5 or G7 closure claim

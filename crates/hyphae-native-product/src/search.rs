@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bounded, catalog-bound integrated native search.
 
@@ -502,7 +502,7 @@ impl NativeProduct {
         let digest = ingest_digest(batch)?;
         let marker_key = idempotency_key(collection, batch.idempotency_id);
         let current = self.snapshot_bounded(logical_time_micros)?;
-        if let Some(encoded) = current.structure_get(&marker_key) {
+        if let Some(encoded) = current.structure_get_internal(&marker_key) {
             let marker = decode_idempotency(encoded)?;
             if marker.digest != digest {
                 return Err(idempotency_conflict());
@@ -765,7 +765,8 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<Option<ProductSearchIngestReceipt>, ProductError> {
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let Some(encoded) = snapshot.structure_get(&idempotency_key(collection, idempotency_id))
+        let Some(encoded) =
+            snapshot.structure_get_internal(&idempotency_key(collection, idempotency_id))
         else {
             return Ok(None);
         };
@@ -813,17 +814,30 @@ impl NativeProduct {
         request: &ProductSearchRequest,
         logical_time_micros: i64,
     ) -> Result<ProductSearchResult, ProductError> {
+        self.search_collection_with_checkpoint(collection, request, logical_time_micros, || Ok(()))
+    }
+
+    pub(crate) fn search_collection_with_checkpoint(
+        &self,
+        collection: crate::ObjectId,
+        request: &ProductSearchRequest,
+        logical_time_micros: i64,
+        mut checkpoint: impl FnMut() -> Result<(), ProductError>,
+    ) -> Result<ProductSearchResult, ProductError> {
+        checkpoint()?;
         let binding = self.resolve_search_collection_binding(collection, logical_time_micros)?;
         let definition = self.search_definition(collection)?;
         validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let documents = load_documents(&snapshot, collection)?;
+        let documents = load_documents_with_checkpoint(&snapshot, collection, &mut checkpoint)?;
         let total_documents = documents.len();
-        let eligible = filter_documents(&documents, &request.filter)?;
-        let eligible_ids = eligible
-            .iter()
-            .map(|candidate| decode_object_id(&candidate.document_id))
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let eligible =
+            filter_documents_with_checkpoint(&documents, &request.filter, &mut checkpoint)?;
+        let mut eligible_ids = BTreeSet::new();
+        for candidate in &eligible {
+            checkpoint()?;
+            eligible_ids.insert(decode_object_id(&candidate.document_id)?);
+        }
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             &snapshot,
@@ -831,6 +845,7 @@ impl NativeProduct {
             request.lexical.as_ref(),
             &eligible_ids,
             &mut fused,
+            &mut checkpoint,
         )?;
         let vector_receipts = execute_vector_branches(
             &snapshot,
@@ -839,28 +854,30 @@ impl NativeProduct {
             &request.vectors,
             &eligible_ids,
             &mut fused,
+            &mut checkpoint,
         )?;
 
         if request.lexical.is_none() && request.vectors.is_empty() {
             for candidate in &eligible {
+                checkpoint()?;
                 fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
             }
         }
-        let by_id = documents
-            .into_iter()
-            .map(|candidate| Ok((decode_object_id(&candidate.document_id)?, candidate)))
-            .collect::<Result<BTreeMap<_, _>, ProductError>>()?;
-        let candidates = fused
-            .into_iter()
-            .map(|(object_id, score)| {
-                let source = by_id.get(&object_id).ok_or_else(corruption)?;
-                Ok(hyphae_native_runtime::DocValueCandidate {
-                    document_id: object_id.get().to_be_bytes().to_vec(),
-                    score,
-                    values: source.values.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, ProductError>>()?;
+        let mut by_id = BTreeMap::new();
+        for candidate in documents {
+            checkpoint()?;
+            by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
+        }
+        let mut candidates = Vec::with_capacity(fused.len());
+        for (object_id, score) in fused {
+            checkpoint()?;
+            let source = by_id.get(&object_id).ok_or_else(corruption)?;
+            candidates.push(hyphae_native_runtime::DocValueCandidate {
+                document_id: object_id.get().to_be_bytes().to_vec(),
+                score,
+                values: source.values.clone(),
+            });
+        }
         let retrieval_candidates = candidates.len();
         let doc_request = hyphae_native_runtime::DocValueRequest {
             filter: request.filter.clone(),
@@ -871,6 +888,7 @@ impl NativeProduct {
         };
         let result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
@@ -929,6 +947,7 @@ impl NativeProduct {
             request.lexical.as_ref(),
             &eligible_ids,
             &mut fused,
+            &mut || Ok(()),
         )?;
         let vector_receipts = execute_vector_branches(
             snapshot,
@@ -937,6 +956,7 @@ impl NativeProduct {
             &request.vectors,
             &eligible_ids,
             &mut fused,
+            &mut || Ok(()),
         )?;
         if request.lexical.is_none() && request.vectors.is_empty() {
             for candidate in &eligible {
@@ -1030,7 +1050,7 @@ impl NativeProduct {
         collection: crate::ObjectId,
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
         let encoded = product_snapshot
-            .structure_get(&binding_key(collection))
+            .structure_get_internal(&binding_key(collection))
             .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
         decode_binding(encoded)
     }
@@ -1047,7 +1067,7 @@ impl NativeProduct {
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
         let encoded = snapshot
-            .structure_get(&binding_key(collection))
+            .structure_get_internal(&binding_key(collection))
             .ok_or_else(|| {
                 ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
             })?;
@@ -1064,6 +1084,7 @@ fn execute_lexical_branch(
     lexical: Option<&ProductLexicalBranch>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<usize, ProductError> {
     let Some(lexical) = lexical else {
         return Ok(0);
@@ -1074,6 +1095,7 @@ fn execute_lexical_branch(
         .map_err(map_runtime_error)?;
     let mut admitted = 0;
     for (rank, hit) in hits.into_iter().enumerate() {
+        checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
         if eligible.contains(&object_id) {
             add_rrf(fused, object_id, lexical.weight, rank)?;
@@ -1090,9 +1112,11 @@ fn execute_vector_branches(
     branches: &[ProductVectorBranch],
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<Vec<ProductVectorBranchReceipt>, ProductError> {
     let mut receipts = Vec::with_capacity(branches.len());
     for branch in branches {
+        checkpoint()?;
         let vector_binding = binding
             .vectors
             .iter()
@@ -1106,6 +1130,7 @@ fn execute_vector_branches(
         let (hits, receipt) =
             execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
         for (rank, hit) in hits.into_iter().enumerate() {
+            checkpoint()?;
             add_rrf(fused, hit.object_id, branch.weight, rank)?;
         }
         receipts.push(receipt);
@@ -1477,32 +1502,49 @@ fn load_documents(
     snapshot: &ProductSnapshot,
     collection: crate::ObjectId,
 ) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
+    load_documents_with_checkpoint(snapshot, collection, &mut || Ok(()))
+}
+
+fn load_documents_with_checkpoint(
+    snapshot: &ProductSnapshot,
+    collection: crate::ObjectId,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
     let manifest = snapshot
-        .structure_get(&manifest_key(collection))
+        .structure_get_internal(&manifest_key(collection))
         .ok_or_else(corruption)?;
     let identities = decode_manifest(manifest)?;
     if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
         return Err(corruption());
     }
-    identities
-        .into_iter()
-        .map(|object_id| {
-            let encoded = snapshot
-                .structure_get(&document_key(collection, object_id))
-                .ok_or_else(corruption)?;
-            Ok(hyphae_native_runtime::DocValueCandidate {
-                document_id: object_id.get().to_be_bytes().to_vec(),
-                score: 0.0,
-                values: decode_document(encoded, object_id)?,
-            })
-        })
-        .collect()
+    let mut documents = Vec::with_capacity(identities.len());
+    for object_id in identities {
+        checkpoint()?;
+        let encoded = snapshot
+            .structure_get_internal(&document_key(collection, object_id))
+            .ok_or_else(corruption)?;
+        documents.push(hyphae_native_runtime::DocValueCandidate {
+            document_id: object_id.get().to_be_bytes().to_vec(),
+            score: 0.0,
+            values: decode_document(encoded, object_id)?,
+        });
+    }
+    Ok(documents)
 }
 
 fn filter_documents(
     documents: &[hyphae_native_runtime::DocValueCandidate],
     filter: &ProductSearchFilter,
 ) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
+    filter_documents_with_checkpoint(documents, filter, &mut || Ok(()))
+}
+
+fn filter_documents_with_checkpoint(
+    documents: &[hyphae_native_runtime::DocValueCandidate],
+    filter: &ProductSearchFilter,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
+    checkpoint()?;
     let request = hyphae_native_runtime::DocValueRequest {
         filter: filter.clone(),
         sort: Vec::new(),
@@ -1510,9 +1552,10 @@ fn filter_documents(
         facets: Vec::new(),
         aggregations: Vec::new(),
     };
-    execute_doc_values(documents, &request, &doc_value_limits())
-        .map(|result| result.hits)
-        .map_err(|error| map_doc_value_error(&error))
+    let result = execute_doc_values(documents, &request, &doc_value_limits())
+        .map_err(|error| map_doc_value_error(&error))?;
+    checkpoint()?;
+    Ok(result.hits)
 }
 
 fn doc_value_limits() -> hyphae_native_runtime::DocValueLimits {

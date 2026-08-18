@@ -1,0 +1,1014 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Python package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Existing immutable annotated release tag
+        required: true
+        type: string
+      repository:
+        description: Registry selected for this one publication
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - pypi
+      testpypi_run_id:
+        description: Exact successful TestPyPI workflow run required for PyPI
+        required: false
+        type: string
+      testpypi_receipt_sha256:
+        description: SHA-256 of the exact TestPyPI publication receipt
+        required: false
+        type: string
+      release_authority:
+        description: Strict JSON with exact Release run, attempt, evidence and SBOM SHA-256 values
+        required: false
+        type: string
+      g8_closure_authority:
+        description: Strict JSON with exact G8 closure run, attempt and aggregate SHA-256
+        required: false
+        type: string
+
+concurrency:
+  group: python-package-${{ inputs.repository }}-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  independent-build:
+    name: Independent Python builder ${{ matrix.builder }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        builder: [a, b]
+    steps:
+      - name: Reject an untrusted build dispatch
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          test "${{ github.ref }}" = refs/heads/main
+          [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Check out exact workflow control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Check out immutable source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Install exact build Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11.15'
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Bind and build the exact source independently
+        shell: bash
+        env:
+          BUILDER: ${{ matrix.builder }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source cat-file -t "refs/tags/$SOURCE_TAG")" = tag
+          source_commit="$(git -C source rev-parse "refs/tags/$SOURCE_TAG^{commit}")"
+          source_tree="$(git -C source rev-parse "$source_commit^{tree}")"
+          test "$(git -C source rev-parse HEAD)" = "$source_commit"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          test "$version" = "1.2.0"
+          test "$SOURCE_TAG" = "v$version"
+          source_date_epoch="$(git -C source show -s --format=%ct "$source_commit")"
+          SOURCE_DATE_EPOCH="$source_date_epoch" uv build source/sdks/python --out-dir dist
+          python control/tools/normalize_python_sdist.py \
+            --path "dist/hyphae_sdk-$version.tar.gz" \
+            --source-date-epoch "$source_date_epoch"
+          python control/tools/check_python_distributions.py \
+            --directory dist \
+            --expected-version "$version"
+          mkdir artifact
+          cp dist/*.whl dist/*.tar.gz artifact/
+          BUILDER="$BUILDER" SOURCE_COMMIT="$source_commit" \
+            SOURCE_TREE="$source_tree" SOURCE_TAG="$SOURCE_TAG" VERSION="$version" \
+            python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import subprocess
+          from pathlib import Path
+
+          distributions = []
+          for path in sorted(Path("dist").iterdir()):
+              distributions.append(
+                  {
+                      "filename": path.name,
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                      "bytes": path.stat().st_size,
+                  }
+              )
+          receipt = {
+              "schema": "hyphae-python-independent-build-v1",
+              "builder": os.environ["BUILDER"],
+              "source": {
+                  "tag": os.environ["SOURCE_TAG"],
+                  "commit": os.environ["SOURCE_COMMIT"],
+                  "tree": os.environ["SOURCE_TREE"],
+              },
+              "version": os.environ["VERSION"],
+              "toolchain": {
+                  "python": platform.python_version(),
+                  "uv": subprocess.check_output(["uv", "--version"], text=True).strip(),
+              },
+              "runner": {
+                  "os": os.environ["RUNNER_OS"],
+                  "arch": os.environ["RUNNER_ARCH"],
+                  "image_os": os.environ["ImageOS"],
+                  "image_version": os.environ["ImageVersion"],
+              },
+              "distributions": distributions,
+          }
+          Path("artifact/builder-receipt.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Upload immutable independent build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyphae-python-independent-${{ matrix.builder }}-${{ inputs.source_tag }}
+          path: artifact/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  candidate-validation:
+    name: Validate candidate Python code and distributions
+    needs: independent-build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact workflow control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Check out immutable source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+          fetch-depth: 1
+          path: source
+          persist-credentials: false
+      - name: Install exact validation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11.15'
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Test candidate source and publication control contracts
+        env:
+          PYTHONPATH: control:source/sdks/python/src
+        run: |
+          set -euo pipefail
+          python -m compileall -q source/sdks/python/src source/sdks/python/conformance source/sdks/python/tests
+          python -m unittest discover -s source/sdks/python/tests -v
+          python -m unittest \
+            tools.test_check_python_package \
+            tools.test_check_python_distributions \
+            tools.test_normalize_python_sdist \
+            tools.test_python_distribution_receipt -v
+          python control/tools/check_python_package.py --root source --workflow-root control
+      - name: Download independent builder A by name
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hyphae-python-independent-a-${{ inputs.source_tag }}
+          path: independent-a
+      - name: Download independent builder B by name
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hyphae-python-independent-b-${{ inputs.source_tag }}
+          path: independent-b
+      - name: Inspect and execute candidate distributions
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          version="${SOURCE_TAG#v}"
+          for builder in a b; do
+            mkdir "candidate-$builder"
+            cp "independent-$builder"/*.whl "candidate-$builder/"
+            cp "independent-$builder"/*.tar.gz "candidate-$builder/"
+            python control/tools/check_python_distributions.py \
+              --directory "candidate-$builder" \
+              --expected-version "$version"
+          done
+          for kind in wheel sdist; do
+            uv venv --python 3.11 "verify-$kind"
+          done
+          uv pip install --python verify-wheel/bin/python --no-deps \
+            "independent-a/hyphae_sdk-$version-py3-none-any.whl"
+          uv pip install --python verify-sdist/bin/python --no-deps \
+            "independent-a/hyphae_sdk-$version.tar.gz"
+          for kind in wheel sdist; do
+            "verify-$kind/bin/python" -I -c \
+              "import hyphae_sdk; from hyphae_sdk.v2 import HyphaeClient; assert hyphae_sdk.__version__ == '$version'; assert HyphaeClient.__name__ == 'HyphaeClient'"
+          done
+
+  build:
+    name: Compare independent Python distributions and bind authority
+    needs:
+      - independent-build
+      - candidate-validation
+    runs-on: ubuntu-24.04
+    outputs:
+      source-commit: ${{ steps.source.outputs.commit }}
+      source-tree: ${{ steps.source.outputs.tree }}
+      version: ${{ steps.source.outputs.version }}
+      wheel-sha256: ${{ steps.distribution-bytes.outputs.wheel-sha256 }}
+      sdist-sha256: ${{ steps.distribution-bytes.outputs.sdist-sha256 }}
+      publication-artifact-id: ${{ steps.publication-artifact.outputs.artifact-id }}
+      publication-artifact-digest: ${{ steps.publication-artifact.outputs.artifact-digest }}
+    steps:
+      - name: Validate main control plane and promotion inputs
+        id: authority-inputs
+        shell: bash
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+          TESTPYPI_RUN_ID: ${{ inputs.testpypi_run_id }}
+          TESTPYPI_RECEIPT_SHA256: ${{ inputs.testpypi_receipt_sha256 }}
+          RELEASE_AUTHORITY: ${{ inputs.release_authority }}
+          G8_CLOSURE_AUTHORITY: ${{ inputs.g8_closure_authority }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" != 'refs/heads/main' ]]; then
+            echo 'Python publication control plane must be dispatched from main' >&2
+            exit 1
+          fi
+          test "$WORKFLOW_REF" = 'celiumsai/hyphae/.github/workflows/python-publish.yml@refs/heads/main'
+          case "$REPOSITORY" in
+            testpypi)
+              test -z "$TESTPYPI_RUN_ID"
+              test -z "$TESTPYPI_RECEIPT_SHA256"
+              test -z "$RELEASE_AUTHORITY"
+              test -z "$G8_CLOSURE_AUTHORITY"
+              ;;
+            pypi)
+              [[ "$TESTPYPI_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+              [[ "$TESTPYPI_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              test "$TESTPYPI_RUN_ID" != '${{ github.run_id }}'
+              ;;
+            *) exit 1 ;;
+          esac
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          def reject_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError(f"duplicate authority input field: {key}")
+                  result[key] = value
+              return result
+
+          repository = os.environ["REPOSITORY"]
+          if repository == "testpypi":
+              values = {
+                  "release_run_id": "",
+                  "release_run_attempt": "",
+                  "release_evidence_sha256": "",
+                  "release_spdx_sha256": "",
+                  "release_cyclonedx_sha256": "",
+                  "g8_closure_run_id": "",
+                  "g8_closure_run_attempt": "",
+                  "g8_closure_sha256": "",
+              }
+          else:
+              if len(os.environ["RELEASE_AUTHORITY"]) > 1024 or len(os.environ["G8_CLOSURE_AUTHORITY"]) > 512:
+                  raise SystemExit("Release/G8 authority input is unbounded")
+              release = json.loads(
+                  os.environ["RELEASE_AUTHORITY"], object_pairs_hook=reject_duplicates
+              )
+              g8 = json.loads(
+                  os.environ["G8_CLOSURE_AUTHORITY"], object_pairs_hook=reject_duplicates
+              )
+              if set(release) != {
+                  "run_id", "run_attempt", "release_evidence_sha256",
+                  "spdx_sha256", "cyclonedx_sha256",
+              } or set(g8) != {"run_id", "run_attempt", "aggregate_sha256"}:
+                  raise SystemExit("Release/G8 authority input fields differ")
+              values = {
+                  "release_run_id": str(release["run_id"]),
+                  "release_run_attempt": str(release["run_attempt"]),
+                  "release_evidence_sha256": release["release_evidence_sha256"],
+                  "release_spdx_sha256": release["spdx_sha256"],
+                  "release_cyclonedx_sha256": release["cyclonedx_sha256"],
+                  "g8_closure_run_id": str(g8["run_id"]),
+                  "g8_closure_run_attempt": str(g8["run_attempt"]),
+                  "g8_closure_sha256": g8["aggregate_sha256"],
+              }
+              for key in ("release_run_id", "release_run_attempt", "g8_closure_run_id", "g8_closure_run_attempt"):
+                  if re.fullmatch(r"[1-9][0-9]*", values[key]) is None:
+                      raise SystemExit(f"{key} is malformed")
+              for key in ("release_evidence_sha256", "release_spdx_sha256", "release_cyclonedx_sha256", "g8_closure_sha256"):
+                  if not isinstance(values[key], str) or re.fullmatch(r"[0-9a-f]{64}", values[key]) is None:
+                      raise SystemExit(f"{key} is malformed")
+              run_ids = {
+                  os.environ["TESTPYPI_RUN_ID"],
+                  values["release_run_id"],
+                  values["g8_closure_run_id"],
+                  os.environ["GITHUB_RUN_ID"],
+              }
+              if len(run_ids) != 4:
+                  raise SystemExit("publication authority workflow runs must be distinct")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          PY
+      - name: Check out exact workflow control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Check out immutable source tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Bind version to annotated tag and exact source tree
+        id: source
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git -C source cat-file -t "refs/tags/$SOURCE_TAG")" = tag
+          source_commit="$(git -C source rev-parse "refs/tags/$SOURCE_TAG^{commit}")"
+          source_tree="$(git -C source rev-parse "$source_commit^{tree}")"
+          test "$(git -C source rev-parse HEAD)" = "$source_commit"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          test "$SOURCE_TAG" = "v$version"
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "tree=$source_tree" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install exact control-plane Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11.15'
+      - name: Download independent builder A
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hyphae-python-independent-a-${{ inputs.source_tag }}
+          path: independent-a
+      - name: Download independent builder B
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hyphae-python-independent-b-${{ inputs.source_tag }}
+          path: independent-b
+      - name: Inspect both downloaded distribution pairs without executing them
+        shell: bash
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          for builder in a b; do
+            mkdir "inspected-$builder"
+            cp "independent-$builder"/*.whl "inspected-$builder/"
+            cp "independent-$builder"/*.tar.gz "inspected-$builder/"
+            python control/tools/check_python_distributions.py \
+              --directory "inspected-$builder" \
+              --expected-version "$VERSION"
+          done
+      - name: Observe immutable independent build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+            > independent-artifacts.json
+      - name: Verify independent builder identities and byte equality
+        id: distribution-bytes
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.tree }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=control python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from tools.python_distribution_receipt import load_local_json
+
+          expected_source = {
+              "tag": os.environ["SOURCE_TAG"],
+              "commit": os.environ["SOURCE_COMMIT"],
+              "tree": os.environ["SOURCE_TREE"],
+          }
+          expected_names = {
+              f"hyphae_sdk-{os.environ['VERSION']}-py3-none-any.whl",
+              f"hyphae_sdk-{os.environ['VERSION']}.tar.gz",
+          }
+          for builder in ("a", "b"):
+              directory = Path(f"independent-{builder}")
+              receipt_path = directory / "builder-receipt.json"
+              receipt = load_local_json(
+                  receipt_path, f"independent builder {builder} receipt"
+              )
+              if set(receipt) != {
+                  "schema", "builder", "source", "version", "toolchain", "runner",
+                  "distributions",
+              }:
+                  raise SystemExit(f"independent builder {builder} fields differ")
+              if (
+                  receipt["schema"] != "hyphae-python-independent-build-v1"
+                  or receipt["builder"] != builder
+                  or receipt["source"] != expected_source
+                  or receipt["version"] != os.environ["VERSION"]
+                  or receipt["toolchain"].get("python") != "3.11.15"
+                  or receipt["toolchain"].get("uv", "").split()[:2] != ["uv", "0.12.3"]
+                  or set(receipt["runner"]) != {"os", "arch", "image_os", "image_version"}
+                  or not all(isinstance(value, str) and value for value in receipt["runner"].values())
+              ):
+                  raise SystemExit(f"independent builder {builder} identity is invalid")
+              records = receipt["distributions"]
+              if (
+                  not isinstance(records, list)
+                  or {record.get("filename") for record in records} != expected_names
+              ):
+                  raise SystemExit(f"independent builder {builder} inventory differs")
+              for record in records:
+                  path = directory / record["filename"]
+                  if (
+                      set(record) != {"filename", "sha256", "bytes"}
+                      or not path.is_file()
+                      or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]
+                      or path.stat().st_size != record["bytes"]
+                  ):
+                      raise SystemExit(f"independent builder {builder} bytes differ")
+          PY
+          cmp "independent-a/hyphae_sdk-$VERSION-py3-none-any.whl" \
+            "independent-b/hyphae_sdk-$VERSION-py3-none-any.whl"
+          cmp "independent-a/hyphae_sdk-$VERSION.tar.gz" \
+            "independent-b/hyphae_sdk-$VERSION.tar.gz"
+          echo "wheel-sha256=$(sha256sum "independent-a/hyphae_sdk-$VERSION-py3-none-any.whl" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "sdist-sha256=$(sha256sum "independent-a/hyphae_sdk-$VERSION.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Download exact TestPyPI authority
+        if: inputs.repository == 'pypi'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.testpypi_run_id }}
+          name: hyphae-python-testpypi-${{ steps.source.outputs.commit }}
+          path: testpypi-authority
+      - name: Inspect retained TestPyPI distributions without executing them
+        if: inputs.repository == 'pypi'
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          python control/tools/check_python_distributions.py \
+            --directory testpypi-authority/release/publish-dist \
+            --expected-version "$VERSION"
+      - name: Observe exact successful TestPyPI workflow run
+        if: inputs.repository == 'pypi'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTPYPI_RUN_ID: ${{ inputs.testpypi_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/${{ github.repository }}/actions/runs/$TESTPYPI_RUN_ID" \
+            > testpypi-authority/github-run.json
+      - name: Download exact signed Release authority
+        if: inputs.repository == 'pypi'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority-inputs.outputs.release_run_id }}
+          name: hyphae-release-candidate
+          path: release-authority
+      - name: Download exact G8 closure authority
+        if: inputs.repository == 'pypi'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority-inputs.outputs.g8_closure_run_id }}
+          name: native-g8-aggregate-${{ steps.source.outputs.commit }}
+          path: g8-closure-authority
+      - name: Observe exact Release and G8 workflow authorities
+        if: inputs.repository == 'pypi'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ steps.authority-inputs.outputs.release_run_id }}
+          G8_CLOSURE_RUN_ID: ${{ steps.authority-inputs.outputs.g8_closure_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/${{ github.repository }}/actions/runs/$RELEASE_RUN_ID" \
+            > release-authority/github-run.json
+          gh api "/repos/${{ github.repository }}/actions/runs/$RELEASE_RUN_ID/artifacts?per_page=100" \
+            > release-authority/github-artifacts.json
+          gh api "/repos/${{ github.repository }}/actions/runs/$G8_CLOSURE_RUN_ID" \
+            > g8-closure-authority/github-run.json
+          gh api "/repos/${{ github.repository }}/actions/runs/$G8_CLOSURE_RUN_ID/artifacts?per_page=100" \
+            > g8-closure-authority/github-artifacts.json
+      - name: Verify exact Release, G8 closure, SBOM, and independent-build authority
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.tree }}
+          VERSION: ${{ steps.source.outputs.version }}
+          RELEASE_RUN_ID: ${{ steps.authority-inputs.outputs.release_run_id }}
+          RELEASE_RUN_ATTEMPT: ${{ steps.authority-inputs.outputs.release_run_attempt }}
+          RELEASE_EVIDENCE_SHA256: ${{ steps.authority-inputs.outputs.release_evidence_sha256 }}
+          RELEASE_SPDX_SHA256: ${{ steps.authority-inputs.outputs.release_spdx_sha256 }}
+          RELEASE_CYCLONEDX_SHA256: ${{ steps.authority-inputs.outputs.release_cyclonedx_sha256 }}
+          G8_CLOSURE_RUN_ID: ${{ steps.authority-inputs.outputs.g8_closure_run_id }}
+          G8_CLOSURE_RUN_ATTEMPT: ${{ steps.authority-inputs.outputs.g8_closure_run_attempt }}
+          G8_CLOSURE_SHA256: ${{ steps.authority-inputs.outputs.g8_closure_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ "$REPOSITORY" = pypi ]]; then
+            evidence="release-authority/hyphae-$SOURCE_TAG.release-evidence.json"
+            spdx="release-authority/hyphae-$SOURCE_TAG.spdx.json"
+            cyclonedx="release-authority/hyphae-$SOURCE_TAG.cdx.json"
+            aggregate="g8-closure-authority/native-g8-aggregate.json"
+            test "$(sha256sum "$evidence" | cut -d' ' -f1)" = "$RELEASE_EVIDENCE_SHA256"
+            test "$(sha256sum "$spdx" | cut -d' ' -f1)" = "$RELEASE_SPDX_SHA256"
+            test "$(sha256sum "$cyclonedx" | cut -d' ' -f1)" = "$RELEASE_CYCLONEDX_SHA256"
+            test "$(sha256sum "$aggregate" | cut -d' ' -f1)" = "$G8_CLOSURE_SHA256"
+            tag_object="$(git -C source rev-parse "refs/tags/$SOURCE_TAG")"
+            tag_target="$(git -C source rev-parse "refs/tags/$SOURCE_TAG^{commit}")"
+            HYPHAE_RELEASE_SOURCE_ROOT=source python \
+              control/packaging/release_evidence.py verify \
+              --directory release-authority \
+              --manifest "$evidence" \
+              --commit "$SOURCE_COMMIT" \
+              --tag-object "$tag_object" \
+              --tag-target "$tag_target"
+          fi
+          PYTHONPATH=control python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from tools.python_distribution_receipt import load_local_json
+
+          def load(path):
+              return load_local_json(Path(path), f"local publication authority {path}")
+
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def run_authority(path, *, run_id, attempt, workflow, event, branch, commit):
+              run = load(path)
+              expected = {
+                  "id": int(run_id),
+                  "run_attempt": int(attempt),
+                  "event": event,
+                  "status": "completed",
+                  "conclusion": "success",
+                  "head_branch": branch,
+                  "head_sha": commit,
+                  "path": workflow,
+              }
+              if any(run.get(key) != value for key, value in expected.items()):
+                  raise SystemExit(f"workflow authority differs: {workflow}")
+              if run.get("repository", {}).get("full_name") != "celiumsai/hyphae":
+                  raise SystemExit(f"workflow repository differs: {workflow}")
+              return {
+                  "id": expected["id"],
+                  "attempt": expected["run_attempt"],
+                  "event": expected["event"],
+                  "status": expected["status"],
+                  "conclusion": expected["conclusion"],
+                  "head_branch": expected["head_branch"],
+                  "head_sha": expected["head_sha"],
+                  "path": expected["path"],
+                  "repository": "celiumsai/hyphae",
+              }
+
+          def artifact_authority(path, name):
+              payload = load(path)
+              matches = [item for item in payload.get("artifacts", []) if item.get("name") == name]
+              if len(matches) != 1:
+                  raise SystemExit(f"expected exactly one workflow artifact: {name}")
+              artifact = matches[0]
+              if artifact.get("expired") is not False:
+                  raise SystemExit(f"workflow artifact is expired: {name}")
+              service_digest = artifact.get("digest")
+              if (
+                  not isinstance(artifact.get("id"), int)
+                  or artifact["id"] < 1
+                  or not isinstance(service_digest, str)
+                  or not service_digest.startswith("sha256:")
+                  or len(service_digest) != 71
+              ):
+                  raise SystemExit(f"workflow artifact identity is malformed: {name}")
+              return {"id": artifact["id"], "name": name, "digest": service_digest}
+
+          source = {
+              "tag": os.environ["SOURCE_TAG"],
+              "commit": os.environ["SOURCE_COMMIT"],
+              "tree": os.environ["SOURCE_TREE"],
+          }
+          builders = []
+          for builder in ("a", "b"):
+              receipt_path = Path(f"independent-{builder}/builder-receipt.json")
+              receipt = load(receipt_path)
+              if receipt.get("builder") != builder or receipt.get("source") != source:
+                  raise SystemExit(f"independent builder authority differs: {builder}")
+              builders.append(
+                  {
+                      "builder": builder,
+                      "artifact": artifact_authority(
+                          "independent-artifacts.json",
+                          f"hyphae-python-independent-{builder}-{os.environ['SOURCE_TAG']}",
+                      ),
+                      "receipt_sha256": digest(receipt_path),
+                      "toolchain": receipt["toolchain"],
+                      "runner": receipt["runner"],
+                      "distributions": receipt["distributions"],
+                  }
+              )
+
+          release_authority = None
+          if os.environ["REPOSITORY"] == "pypi":
+              release_run = run_authority(
+                  "release-authority/github-run.json",
+                  run_id=os.environ["RELEASE_RUN_ID"],
+                  attempt=os.environ["RELEASE_RUN_ATTEMPT"],
+                  workflow=".github/workflows/release.yml",
+                  event="push",
+                  branch=os.environ["SOURCE_TAG"],
+                  commit=os.environ["SOURCE_COMMIT"],
+              )
+              g8_run = run_authority(
+                  "g8-closure-authority/github-run.json",
+                  run_id=os.environ["G8_CLOSURE_RUN_ID"],
+                  attempt=os.environ["G8_CLOSURE_RUN_ATTEMPT"],
+                  workflow=".github/workflows/native-g8-closure.yml",
+                  event="workflow_dispatch",
+                  branch="main",
+                  commit=os.environ["SOURCE_COMMIT"],
+              )
+              evidence_path = Path(
+                  f"release-authority/hyphae-{os.environ['SOURCE_TAG']}.release-evidence.json"
+              )
+              spdx_path = Path(f"release-authority/hyphae-{os.environ['SOURCE_TAG']}.spdx.json")
+              cyclonedx_path = Path(f"release-authority/hyphae-{os.environ['SOURCE_TAG']}.cdx.json")
+              aggregate_path = Path("g8-closure-authority/native-g8-aggregate.json")
+              evidence = load(evidence_path)
+              aggregate = load(aggregate_path)
+              if (
+                  evidence.get("release") != {
+                      "tag": os.environ["SOURCE_TAG"],
+                      "version": os.environ["VERSION"],
+                  }
+                  or evidence.get("source", {}).get("commit") != os.environ["SOURCE_COMMIT"]
+                  or evidence.get("source", {}).get("tree") != os.environ["SOURCE_TREE"]
+                  or evidence.get("workflow", {}).get("run_id") != os.environ["RELEASE_RUN_ID"]
+                  or evidence.get("workflow", {}).get("run_attempt") != int(os.environ["RELEASE_RUN_ATTEMPT"])
+              ):
+                  raise SystemExit("release evidence source or workflow binding differs")
+              if (
+                  aggregate.get("schema") != "hyphae-native-g8-aggregate-v1"
+                  or aggregate.get("gate") != "G8"
+                  or aggregate.get("status") != "passed"
+                  or aggregate.get("source_commit") != os.environ["SOURCE_COMMIT"]
+                  or aggregate.get("claims") != ["G8"]
+                  or aggregate.get("closure_declared") is not True
+              ):
+                  raise SystemExit("G8 closure authority is open or source-unbound")
+              release_authority = {
+                  "run": release_run,
+                  "artifact": artifact_authority(
+                      "release-authority/github-artifacts.json", "hyphae-release-candidate"
+                  ),
+                  "release_evidence": {
+                      "filename": evidence_path.name,
+                      "sha256": digest(evidence_path),
+                  },
+                  "sboms": {
+                      "spdx": {"filename": spdx_path.name, "sha256": digest(spdx_path)},
+                      "cyclonedx": {
+                          "filename": cyclonedx_path.name,
+                          "sha256": digest(cyclonedx_path),
+                      },
+                  },
+                  "g8_closure": {
+                      "run": g8_run,
+                      "artifact": artifact_authority(
+                          "g8-closure-authority/github-artifacts.json",
+                          f"native-g8-aggregate-{os.environ['SOURCE_COMMIT']}",
+                      ),
+                      "aggregate": {
+                          "filename": aggregate_path.name,
+                          "sha256": digest(aggregate_path),
+                          "claims": ["G8"],
+                          "closure_declared": True,
+                      },
+                  },
+              }
+
+          authority = {
+              "schema": "hyphae-python-publication-authority-v1",
+              "source": source,
+              "independent_builds": builders,
+              "release_authority": release_authority,
+          }
+          Path("python-publication-authority.json").write_text(
+              json.dumps(authority, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Create exact build receipt
+        shell: bash
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+          TESTPYPI_RUN_ID: ${{ inputs.testpypi_run_id }}
+          TESTPYPI_RECEIPT_SHA256: ${{ inputs.testpypi_receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          authority=()
+          if [[ "$REPOSITORY" = pypi ]]; then
+            authority+=(
+              --testpypi-receipt testpypi-authority/python-publish-receipt.json
+              --testpypi-run-metadata testpypi-authority/github-run.json
+              --testpypi-receipt-sha256 "$TESTPYPI_RECEIPT_SHA256"
+              --testpypi-run-id "$TESTPYPI_RUN_ID"
+            )
+          fi
+          PYTHONPATH=control python control/tools/python_distribution_receipt.py build \
+            --directory independent-a \
+            --reproducible-directory independent-b \
+            --independent-build-receipt independent-a/builder-receipt.json \
+            --independent-build-receipt independent-b/builder-receipt.json \
+            --publication-authority python-publication-authority.json \
+            --version '${{ steps.source.outputs.version }}' \
+            --source-tag '${{ inputs.source_tag }}' \
+            --source-commit '${{ steps.source.outputs.commit }}' \
+            --source-tree '${{ steps.source.outputs.tree }}' \
+            --workflow-repository '${{ github.repository }}' \
+            --workflow-ref '${{ github.workflow_ref }}' \
+            --workflow-sha '${{ github.workflow_sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --workflow-run-attempt '${{ github.run_attempt }}' \
+            --repository "$REPOSITORY" \
+            "${authority[@]}" \
+            --output python-distribution-receipt.json
+      - name: Select exact publication bytes
+        shell: bash
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          mkdir publish-dist
+          if [[ "$REPOSITORY" = pypi ]]; then
+            cp testpypi-authority/release/publish-dist/*.whl publish-dist/
+            cp testpypi-authority/release/publish-dist/*.tar.gz publish-dist/
+          else
+            cp independent-a/*.whl publish-dist/
+            cp independent-a/*.tar.gz publish-dist/
+          fi
+          PYTHONPATH=control python control/tools/python_distribution_receipt.py check-local \
+            --receipt python-distribution-receipt.json \
+            --directory publish-dist \
+            --source-commit '${{ steps.source.outputs.commit }}' \
+            --source-tree '${{ steps.source.outputs.tree }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --workflow-run-attempt '${{ github.run_attempt }}' \
+            --repository "$REPOSITORY"
+      - name: Upload exact distributions
+        id: publication-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyphae-python-build-${{ inputs.repository }}-${{ steps.source.outputs.commit }}
+          path: |
+            publish-dist/*.whl
+            publish-dist/*.tar.gz
+            python-distribution-receipt.json
+            python-publication-authority.json
+            independent-a/builder-receipt.json
+            independent-b/builder-receipt.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish exact bytes to ${{ inputs.repository }} with OIDC
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.repository }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download immutable preflighted publication artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}
+          path: release
+      - name: Publish distributions to TestPyPI
+        if: inputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: release/publish-dist/
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+      - name: Publish distributions to PyPI
+        if: inputs.repository == 'pypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: release/publish-dist/
+          attestations: true
+
+  verify:
+    name: Verify registry bytes and PEP 740 provenance
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out exact workflow control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact build receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}
+          path: release
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+          enable-cache: false
+      - name: Install released wheel and sdist on supported Python boundaries
+        shell: bash
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+          SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY" in
+            testpypi) index='https://test.pypi.org/simple/' ;;
+            pypi) index='https://pypi.org/simple/' ;;
+            *) exit 1 ;;
+          esac
+          mkdir installation-evidence
+          for python_version in 3.11 3.14; do
+            wheel_environment="verify-${python_version}-wheel"
+            sdist_environment="verify-${python_version}-sdist"
+            uv venv --python "$python_version" "$wheel_environment"
+            uv venv --python "$python_version" "$sdist_environment"
+            uv pip install \
+              --python "$wheel_environment/bin/python" \
+              --index-url "$index" \
+              --no-cache \
+              --no-deps \
+              --only-binary hyphae-sdk \
+              "hyphae-sdk==$VERSION"
+            uv pip install \
+              --python "$sdist_environment/bin/python" \
+              --index-url https://pypi.org/simple/ \
+              --no-cache \
+              --no-deps \
+              'setuptools==80.9.0'
+            uv pip install \
+              --python "$sdist_environment/bin/python" \
+              --index-url "$index" \
+              --no-cache \
+              --no-binary hyphae-sdk \
+              --no-build-isolation \
+              --no-deps \
+              "hyphae-sdk==$VERSION"
+            for kind in wheel sdist; do
+              environment="verify-${python_version}-${kind}"
+              case "$kind" in
+                wheel) distribution="release/publish-dist/hyphae_sdk-$VERSION-py3-none-any.whl" ;;
+                sdist) distribution="release/publish-dist/hyphae_sdk-$VERSION.tar.gz" ;;
+                *) exit 1 ;;
+              esac
+              case "$kind" in
+                wheel) expected_sha256="$WHEEL_SHA256" ;;
+                sdist) expected_sha256="$SDIST_SHA256" ;;
+                *) exit 1 ;;
+              esac
+              "$environment/bin/python" -I -c '
+          import hashlib
+          import json
+          import platform
+          import re
+          import sys
+          from pathlib import Path
+
+          import hyphae_sdk
+          from hyphae_sdk.v2 import HyphaeClient
+
+          if len(sys.argv) != 7:
+              raise SystemExit("installation evidence arguments differ")
+          boundary, kind, version, distribution_name, expected_sha256, output_name = sys.argv[1:]
+          if (
+              boundary not in {"3.11", "3.14"}
+              or kind not in {"wheel", "sdist"}
+              or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
+              or tuple(map(int, boundary.split("."))) != sys.version_info[:2]
+              or platform.python_implementation() != "CPython"
+              or hyphae_sdk.__version__ != version
+              or HyphaeClient.__name__ != "HyphaeClient"
+              or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+          ):
+              raise SystemExit("installed distribution identity differs")
+          distribution = Path(distribution_name)
+          expected_filename = (
+              f"hyphae_sdk-{version}-py3-none-any.whl"
+              if kind == "wheel"
+              else f"hyphae_sdk-{version}.tar.gz"
+          )
+          if distribution.name != expected_filename or not distribution.is_file():
+              raise SystemExit("retained distribution identity differs")
+          observed_sha256 = hashlib.sha256(distribution.read_bytes()).hexdigest()
+          if observed_sha256 != expected_sha256:
+              raise SystemExit("retained distribution digest differs")
+          evidence = {
+              "schema": "hyphae-python-installation-evidence-v1",
+              "python_boundary": boundary,
+              "kind": kind,
+              "version": version,
+              "distribution_filename": distribution.name,
+              "distribution_sha256": observed_sha256,
+              "implementation": platform.python_implementation(),
+              "interpreter_version": platform.python_version(),
+              "status": "passed",
+          }
+          Path(output_name).write_bytes(
+              (json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          )
+          ' "$python_version" "$kind" "$VERSION" "$distribution" "$expected_sha256" \
+                "installation-evidence/${python_version}-${kind}.json"
+            done
+          done
+      - name: Verify registry bytes, provenance, and publication receipt
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          PYTHONPATH=. python tools/python_distribution_receipt.py verify \
+            --receipt release/python-distribution-receipt.json \
+            --repository "$REPOSITORY" \
+            --installation-evidence installation-evidence/3.11-wheel.json \
+            --installation-evidence installation-evidence/3.11-sdist.json \
+            --installation-evidence installation-evidence/3.14-wheel.json \
+            --installation-evidence installation-evidence/3.14-sdist.json \
+            --publication-artifact-id '${{ needs.build.outputs.publication-artifact-id }}' \
+            --publication-artifact-sha256 '${{ needs.build.outputs.publication-artifact-digest }}' \
+            --output python-publish-receipt.json
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyphae-python-${{ inputs.repository }}-${{ needs.build.outputs.source-commit }}
+          path: |
+            python-publish-receipt.json
+            installation-evidence/*.json
+            release/publish-dist/*.whl
+            release/publish-dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90

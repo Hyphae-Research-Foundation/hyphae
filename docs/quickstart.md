@@ -208,7 +208,8 @@ rules, curl examples, limits, and proof witness download, see
 
 ## Optional public clients
 
-The Rust, TypeScript, Python, remote CLI, and MCP surfaces call only `/v1`.
+The Rust, TypeScript, Python, and remote compatibility CLI surfaces call
+`/v1`. MCP is a bounded read-only client of managed Native HTTP `/v2`.
 For installation/source examples, lossless TypeScript integer behavior,
 remote request files, MCP host configuration, and the common executable suite,
 see [`clients/v1.md`](clients/v1.md).

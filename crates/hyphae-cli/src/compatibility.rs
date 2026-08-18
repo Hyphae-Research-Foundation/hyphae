@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Explicit shipped format-2 CLI and `/v1` compatibility paths.
 //!
@@ -309,14 +309,6 @@ pub(crate) async fn serve(
         })
         .await?;
     Ok(())
-}
-
-pub(crate) async fn run_mcp(
-    base_url: &str,
-    bearer_token_file: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
-    let token = load_remote_bearer_token(bearer_token_file)?;
-    crate::mcp::run(base_url, token.as_deref()).await
 }
 
 pub(crate) fn put(

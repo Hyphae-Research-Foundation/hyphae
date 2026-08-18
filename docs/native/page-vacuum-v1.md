@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native page-generation vacuum v1
 
 Status: normative experimental contract; current-root implementation, codec

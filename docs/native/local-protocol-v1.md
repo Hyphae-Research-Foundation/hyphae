@@ -1,4 +1,24 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
+
+Protocol minor 3 adds request tag `54` (`CatalogVisibleList`) and response tag
+`42` (`CatalogVisiblePage`). Minor 0-2 retain the exact historical
+`CatalogList` tag `15` and `CatalogPage` tag `13` layout; minor 2 rejects the
+new variants before dispatch. The new cursor field is length-framed opaque
+bytes only. Python exposes `bytes`, TypeScript exposes `Uint8Array`, and Rust
+exposes `CatalogVisibleCursor` without snapshot or position accessors.
+
+Minor 3 also reserves request tags `55` through `68` for the separated
+`SecurityApiKey{Issue,Rotate}{Self,}{Start,Activate,Abort}` and
+`SecurityApiKeyRevoke{Self,}` variants. Response tag `43` is the one-time
+`SecurityApiKeyStarted` delivery; tag `44` is the redacted activation receipt.
+Every lifecycle request is path-free, strict, managed-authority, and requires a
+nonzero idempotency token. A repeated Start never re-encodes its secret and
+fails with `secret_delivery_consumed`; a token reused with another payload
+fails with `idempotency_conflict`. Start commits an inactive verifier, Activate
+requires the exact confirmation digest derived from the delivered secret, and
+disconnecting before Activate leaves the key inactive and unauthenticatable.
+These variants are never accepted inside `Prove` and are absent from MCP.
 
 Status: implemented normative contract; G6 cross-surface and cross-platform
 receipts are closed for the bounded product profile
@@ -29,6 +49,75 @@ The client sends `HELLO` with:
 The server returns `WELCOME` with selected version, session ID, engine
 version, data-format version, limits, capabilities and catalog version.
 Incompatible major versions fail before accepting operations.
+
+Minor negotiation selects the highest version in the intersection of the
+client range and the server range. A 1.0 client therefore remains on minor
+`0` when it connects to a 1.2 server; neither peer may send or accept a payload
+introduced after the selected minor.
+
+### HELLO authentication extension
+
+The canonical legacy `HELLO` remains byte-for-byte unchanged. Its fixed
+58-byte header uses bytes 49 through 51 as zero-valued reserved bytes, and its
+payload ends after the client identity, database and schema UTF-8 fields.
+
+Managed API-key authentication uses a parallel `HELLO` codec with this exact
+extension:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| 49 | 1 | authentication kind: `1` for Native API key |
+| 50 | 2 | authentication trailer length, little-endian |
+
+The authenticated payload order is the fixed header, client identity,
+database, schema, then authentication trailer. The trailer is one canonical
+Native API-key candidate: exactly 102 UTF-8 bytes. The combined identity,
+database and schema bound remains 4 KiB and excludes the fixed-size secret.
+No padding or trailing bytes are admitted.
+
+Authenticated `HELLO` requires capability bit 7, `API_KEY_AUTH`, in both the
+supported and required capability masks. Requiring the bit prevents a peer
+from silently downgrading a managed connection to OS-peer authentication.
+The legacy decoder rejects the extension, while the authenticated decoder
+rejects a legacy payload, an unrequired capability, unknown authentication
+kinds, non-canonical lengths, invalid UTF-8, truncation and trailing bytes.
+Credential syntax and verifier failures are intentionally left to the sole
+product authority so they remain indistinguishable as authorization denial.
+
+A managed daemon sends `WELCOME` immediately for current authority. When
+normal authentication fails, it retains only opaque pending terminal state and
+waits for one bounded request frame before replying. It sends `WELCOME` only if
+that frame is an exact durable self-revoke or zero-overlap self-rotation
+activation replay, then executes that already supplied frame. Unknown keys,
+nonterminal operations, malformed frames, and any token, target, digest, or
+marker mismatch receive the same handshake `authorization_denied`; no terminal
+session or revoked-key oracle is exposed.
+
+The raw credential is ephemeral transport material. It is never part of the
+public `Hello` value, client identity, diagnostics or `Debug` output. Decoded
+credentials are held only in a redacted, erase-on-drop value until transferred
+to the product authority.
+
+The daemon selects this authenticated `HELLO` automatically whenever its sole
+product service reports a bootstrapped access-control catalog. The legacy
+OS-peer `HELLO` remains byte-identical for unbootstrapped directories, but is
+rejected with the uniform authorization failure after bootstrap. The public
+daemon constructors cannot force OS-peer authority for a bootstrapped service.
+
+The closed capability registry is:
+
+| Bit | Name |
+|---:|---|
+| 0 | `STREAM_COMPLETION` |
+| 1 | `FLOW_CONTROL` |
+| 2 | `CANCELLATION` |
+| 3 | `DEADLINES` |
+| 4 | `PREPARED` |
+| 5 | `PEER_IDENTITY` |
+| 6 | `PRODUCT_ERRORS` |
+| 7 | `API_KEY_AUTH` |
+
+Bits 8 through 63 are unknown and fail closed.
 
 ## Frame header
 
@@ -97,6 +186,60 @@ is implemented.
 The transaction ID returned by `BEGIN` can carry SQL, structure and search
 operations on the same connection/session.
 
+### Product payload minor registry
+
+Minor `1` adds the managed, redacted security read plane. Its append-only
+product request tags are `42..47`, in this exact order:
+
+1. `SecurityStatus`;
+2. `SecurityPrincipalList`;
+3. `SecurityRoleList`;
+4. `SecurityAssignmentList`;
+5. `SecurityKeyList`; and
+6. `SecurityAuditRead`.
+
+The corresponding response tags are `32..37`. Cursors are typed, bounded,
+exclusive continuations bound to the current authorization epoch. Key pages
+contain public IDs and policy metadata only; API-key secrets and verifier
+digests are not representable in the wire schema. Every request requires a
+managed API-key session and an instance-scoped `security.read` or `audit.read`
+grant as appropriate.
+
+These tags require negotiated minor `1` in both directions. A client that
+negotiated minor `0` rejects them before sending, and a server that negotiated
+minor `0` rejects them before dispatch. Existing minor-0 payload tags and
+golden bytes remain unchanged.
+
+Minor `2` adds the first secret-free managed security write plane. Its
+append-only request tags are `48..53`, in this exact order:
+
+1. `SecurityPrincipalCreate`;
+2. `SecurityPrincipalSetEnabled`;
+3. `SecurityCustomRoleCreate`;
+4. `SecurityBuiltInAssignmentCreate`;
+5. `SecurityCustomAssignmentCreate`; and
+6. `SecurityAssignmentRevoke`.
+
+The corresponding response tags are `38..41`: principal, custom-role,
+assignment, and generic security mutation receipts. Every write request
+requires negotiated minor `2`, a managed session with instance-scoped
+`security.manage`, strict durability, and a nonzero idempotency token in the
+canonical request context. The token is not duplicated inside the operation
+payload. Exact retries return the retained durable receipt; a token reused for
+a different canonical request returns `idempotency_conflict` without dispatching
+a second mutation. Minor `0` and `1` peers reject these request and response
+tags before dispatch or delivery. Existing minor-0 and minor-1 golden bytes
+remain unchanged.
+
+The write payloads contain public IDs and bounded policy metadata only. They
+cannot carry an API-key secret, verifier, output path, caller-selected actor,
+or Owner assignment. They are not eligible for proof wrapping.
+
+Backup verification is not part of this transport extension. It remains a
+local API until a later contract defines a configured backup root and
+handle-relative, no-follow path resolution; arbitrary client-selected server
+filesystem paths are never accepted by this read plane.
+
 The implemented engine-bearing subset now includes
 [native local structure GET v1](local-structure-get-v1.md) and
 [native local structure SET and TTL v1](local-structure-set-ttl-v1.md). They
@@ -144,9 +287,11 @@ the negotiated minor-version rule.
 ## Authentication boundary
 
 UDS/named-pipe deployments rely on OS peer identity and endpoint ACL by
-default. Loopback TCP requires a configured token or later TLS identity.
-Authentication, authorization and tenant policy are not engine-to-engine
-protocols.
+default. Managed deployments use the authenticated `HELLO` extension and
+revalidate its resulting authority at the product boundary. Any TCP transport
+that carries an API key requires TLS; loopback placement alone does not protect
+the credential. Authentication, authorization and tenant policy are not
+engine-to-engine protocols.
 
 ## Performance
 

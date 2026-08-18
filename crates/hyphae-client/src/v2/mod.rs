@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Equivalent high-level API over HTTP `/v2` and exact `HYPHLCL1` local transport.
 
@@ -11,10 +11,17 @@ pub use http::*;
 pub use local::*;
 
 pub use hyphae_native_product::{
-    BackupLimits, BoundedSearchQuery, CatalogDependencyRequest, CatalogListRequest, DoctorRequest,
-    ProductCapabilities, ProductCommitOutcome, ProductDurabilityPolicy, ProductError,
-    ProductErrorCategory, ProductErrorCode, ProductLimits, ProductOperation, ProductPreparedHandle,
-    ProductResponse, ProductRetry, ProductSearchRequest, ProductSqlResult, ProductTransactionId,
+    AccessControlMutationReceipt, ApiKeyActivationReceipt, ApiKeyConfirmationDigest, ApiKeyId,
+    ApiKeySecretDelivery, ApiKeyStartReceipt, BackupLimits, BoundedSearchQuery, BuiltInRole,
+    CatalogDependencyRequest, CatalogListRequest, CatalogVisibleCursor, CatalogVisibleListFilter,
+    CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt,
+    DoctorRequest, ProductAuthorization, ProductCapabilities, ProductCommitOutcome,
+    ProductDurabilityPolicy, ProductError, ProductErrorCategory, ProductErrorCode, ProductLimits,
+    ProductOperation, ProductPermission, ProductPreparedHandle, ProductResponse, ProductRetry,
+    ProductScope, ProductSearchRequest, ProductSqlResult, ProductTransactionId,
     ProductTransactionState, ProductTransactionStatus, ProductTtl, ProductValue,
-    ProductVectorBranch, ProductVectorExecution,
+    ProductVectorBranch, ProductVectorExecution, RoleAssignmentMutationReceipt,
+    SecurityAssignmentListRequest, SecurityAuditReadRequest, SecurityCursor, SecurityCursorId,
+    SecurityId, SecurityKeyListRequest, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityRoleListRequest,
 };

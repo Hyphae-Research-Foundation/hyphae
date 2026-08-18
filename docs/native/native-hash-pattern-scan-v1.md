@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native hash pattern scan v1
 
 Status: accepted implementation target.

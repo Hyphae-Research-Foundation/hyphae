@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Validate the hosted G0 architecture and versioned specification set."""
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,28 @@ class GateFailure(RuntimeError):
     """The architecture/specification profile is incomplete or inconsistent."""
 
 
+def _leading_heading(text: str) -> str | None:
+    lines = iter(text.splitlines())
+    in_comment = False
+    for line in lines:
+        stripped = line.strip()
+        if in_comment:
+            if "-->" in stripped:
+                if stripped.split("-->", 1)[1].strip():
+                    return None
+                in_comment = False
+            continue
+        if not stripped:
+            continue
+        if stripped.startswith("<!--"):
+            if "-->" in stripped and stripped.split("-->", 1)[1].strip():
+                return None
+            in_comment = "-->" not in stripped
+            continue
+        return line
+    return None
+
+
 def validate_profile(root: Path, profile: dict[str, Any]) -> dict[str, Any]:
     if set(profile) != {"schema", "architecture", "specifications"} or profile.get("schema") != SCHEMA:
         raise GateFailure("unsupported specification profile")
@@ -53,7 +76,12 @@ def validate_profile(root: Path, profile: dict[str, Any]) -> dict[str, Any]:
         if not resolved.is_file():
             raise GateFailure(f"specification is missing: {value}")
         text = resolved.read_text(encoding="utf-8")
-        if not text.startswith("# ") or "v1" not in text.lower() and value != architecture:
+        heading = _leading_heading(text)
+        if (
+            heading is None
+            or not heading.startswith("# ")
+            or (value != architecture and re.search(r"\bv1\b", heading, re.IGNORECASE) is None)
+        ):
             raise GateFailure(f"specification lacks versioned heading: {value}")
         if value == architecture and "Status: accepted target architecture" not in text:
             raise GateFailure("architecture is not explicitly accepted")

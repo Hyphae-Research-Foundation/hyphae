@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 exec > >(tee /var/log/hyphae-g7-bootstrap.log | logger -t hyphae-g7-bootstrap -s 2>/dev/console) 2>&1
 

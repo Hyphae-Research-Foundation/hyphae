@@ -27,6 +27,6 @@ binary key and its exact canonical document bytes, including nonmatches and
 records from every shard. Budget or timeout exhaustion returns an error rather
 than partial success.
 
-Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source and security
+Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
-"""Run every public client against the same versioned live fixture."""
+# SPDX-License-Identifier: Apache-2.0
+"""Run format-2 `/v1` clients against the same versioned live fixture."""
 
 from __future__ import annotations
 
@@ -48,9 +48,6 @@ def client_cases() -> list[ClientCase]:
     cli_binary = Path(
         os.environ.get("HYPHAE_CLI_BIN", target / "debug" / f"hyphae{suffix}")
     )
-    mcp_binary = Path(
-        os.environ.get("HYPHAE_MCP_BIN", target / "debug" / f"hyphae{suffix}")
-    )
     return [
         ClientCase("rust", (str(rust_runner),), {}),
         ClientCase(
@@ -76,14 +73,6 @@ def client_cases() -> list[ClientCase]:
                 str(ROOT / "conformance" / "cli" / "run.py"),
             ),
             {"HYPHAE_CLI_BIN": str(cli_binary)},
-        ),
-        ClientCase(
-            "mcp",
-            (
-                executable("python3" if os.name != "nt" else "python"),
-                str(ROOT / "conformance" / "mcp" / "run.py"),
-            ),
-            {"HYPHAE_MCP_BIN": str(mcp_binary)},
         ),
     ]
 

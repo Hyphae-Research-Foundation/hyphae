@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native root manifest and checkpoint format v1
 
 Status: normative experimental format; immutable manifest publication,

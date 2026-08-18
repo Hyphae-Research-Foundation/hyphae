@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]
 members = [
     "conformance/g8/independent-backup-verifier",
     "conformance/rust",
+    "conformance/v2/fixture",
     "integrations/pliegors",
     "crates/hyphae-cli",
     "crates/hyphae-client",
@@ -36,7 +38,7 @@ version = "1.1.0"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Celiums Solutions LLC"]
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 repository = "https://github.com/celiumsai/hyphae"
 homepage = "https://hyphae.dev"
 readme = "README.md"
@@ -50,6 +52,7 @@ axum = { version = "0.8.9", features = ["json", "tokio"] }
 base64 = "0.23.0"
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+crossterm = "0.29.0"
 crc32c = "0.6.8"
 fs4 = "1.1.0"
 futures-channel = "0.3.31"
@@ -84,7 +87,10 @@ libc = "0.2.186"
 nix = { version = "0.31.3", default-features = false, features = ["sched"] }
 proptest = "1.6.0"
 redb = "4.1.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+rustix = { version = "1.0.8", default-features = false }
+same-file = "1.0.6"
 schemars = { version = "1.2.1", features = ["uuid1"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -94,6 +100,8 @@ thiserror = "2.0.18"
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1.25"
 widestring = "1.2.1"
+windows-permissions = "=0.2.4"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 tower = "0.5.3"

@@ -51,6 +51,28 @@ later programs.
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
 and model integration do not begin until G8 closes on one exact commit.
 
+## 1.2.0 programs
+
+Hyphae `1.2.0` has two coupled execution programs. The
+[operator and agent experience plan](roadmaps/1.2.0-operator-and-agent-experience.md)
+adds durable access control, the operator console, shared agent plugins, and a
+published Python client. The accepted-target
+[relicensing plan](roadmaps/1.2.0-relicensing.md) moved the current integration
+tree and new software artifacts back to `Apache-2.0` after a fail-closed legal,
+dependency, ownership, and governance preflight.
+[ADR-0029](adr/0029-apache-2.0-software-and-normative-specifications.md) is the
+effective classification authority.
+
+The programs must close on the same exact release candidate. Published
+`v1.1.0` artifacts remain `AGPL-3.0-only`; the roadmap does not retroactively
+change their terms. No `v1.2.0` tag or registry publication is allowed while
+either program has an open gate.
+
+Historical tags `v0.1.0` through `v1.0.1` retain their Apache-2.0 root license
+and declarations. Because they contain no separate documentation license, the
+documentation classification for those tags is `not-separately-specified`,
+not an inferred Creative Commons license.
+
 The historical `0.2.0` implementation record remains in
 [`roadmap-0.2.md`](roadmap-0.2.md); its retained evidence limitations do not
 describe the independently recorded `0.2.1` release.

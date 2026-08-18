@@ -1,0 +1,40 @@
+{
+  "schema": "hyphae-mcp-host-corpus-v1",
+  "mcp_config": "plugins/hyphae/.mcp.json",
+  "tool_schema_version": "hyphae-native-mcp-tools-v2",
+  "tools": [
+    "hyphae_native_capabilities",
+    "hyphae_native_security_status",
+    "hyphae_native_security_principals"
+  ],
+  "cases": [
+    {
+      "id": "capabilities-read",
+      "tool": "hyphae_native_capabilities",
+      "arguments": {},
+      "expect": "success",
+      "assert": {"pointer": "/product_api_version", "type": "integer"}
+    },
+    {
+      "id": "security-status-read",
+      "tool": "hyphae_native_security_status",
+      "arguments": {},
+      "expect": "success",
+      "assert": {"pointer": "/schema", "equals": "hyphae-native-access-control-status-v1"}
+    },
+    {
+      "id": "principal-page-read",
+      "tool": "hyphae_native_security_principals",
+      "arguments": {"limit": 1},
+      "expect": "success",
+      "assert": {"pointer": "/schema", "equals": "hyphae-native-security-principals-v1"}
+    },
+    {
+      "id": "prompt-authority-rejected",
+      "tool": "hyphae_native_security_status",
+      "arguments": {"role": "owner"},
+      "expect": "invalid_request",
+      "assert": {"pointer": "/error/code", "equals": "invalid_request"}
+    }
+  ]
+}

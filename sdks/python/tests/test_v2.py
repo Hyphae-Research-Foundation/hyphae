@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 from unittest.mock import patch
 
-from hyphae_sdk.v2 import HyphaeClient, RequestOptions, Response
+from hyphae_sdk.v2 import ClientError, HyphaeClient, ProductError, RequestOptions, Response
 from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
 from hyphae_sdk.v2.local import _windows_pipe_namespace, _write_all
 from hyphae_sdk.v2.protocol import (
@@ -22,6 +22,21 @@ from hyphae_sdk.v2.protocol import (
 
 
 FIXTURE = Path(__file__).parents[3] / "compatibility" / "native-protocol-v1-structure-get.bin"
+
+
+def _response(kind: int, body: bytes) -> bytes:
+    import struct
+
+    return struct.pack("<8sIHH", b"HYPRSP01", 16 + len(body), kind, 0) + body
+
+
+def _qualified_name() -> bytes:
+    import struct
+
+    return b"".join(
+        struct.pack("<I", len(value)) + value
+        for value in (b"main", b"main", b"public", b"public", b"item", b"item")
+    )
 
 
 class FakeTransport:
@@ -43,6 +58,7 @@ class FakeHttpResponse:
         return {
             "Content-Length": str(len(self._body)),
             "Content-Type": PRODUCT_MEDIA_TYPE,
+            "X-Hyphae-Protocol-Minor": "3",
             "X-Hyphae-Request-Id": "17",
         }.get(name)
 
@@ -56,6 +72,11 @@ class FakeHttpConnection:
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del args, kwargs
         self.path = ""
+        self.sock = None
+        self.auto_open = 1
+
+    def connect(self) -> None:
+        pass
 
     def request(self, method: str, path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del method, kwargs
@@ -72,6 +93,35 @@ class FakeHttpConnection:
 
     def close(self) -> None:
         pass
+
+
+class FakeJsonErrorHttpResponse:
+    status = 409
+
+    def __init__(self) -> None:
+        self._body = (
+            b'{"code":"catalog_conflict","category":"conflict",'
+            b'"retry":"after-refresh","message":"catalog changed",'
+            b'"request_id":19,"trace_id":23,"object_id":29,'
+            b'"transaction_state":"none","transaction_id":null,'
+            b'"details":{"reason":"stale"}}'
+        )
+
+    def getheader(self, name: str) -> str | None:
+        return {
+            "Content-Length": str(len(self._body)),
+            "Content-Type": "application/json",
+            "X-Hyphae-Protocol-Minor": "3",
+            "X-Hyphae-Request-Id": "19",
+        }.get(name)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body[:size]
+
+
+class FakeJsonErrorHttpConnection(FakeHttpConnection):
+    def getresponse(self) -> FakeJsonErrorHttpResponse:
+        return FakeJsonErrorHttpResponse()
 
 
 class ShortWriteStream:
@@ -141,6 +191,17 @@ class V2Tests(unittest.TestCase):
             ("transaction_commit", {"handle": 7}),
             ("transaction_status_by_idempotency", {"idempotency_token": 23}),
             ("catalog_create", {"definition": b"HYCOBJ02-canonical"}),
+            (
+                "catalog_visible_list",
+                {
+                    "parent": None,
+                    "kind": None,
+                    "cursor": b"opaque",
+                    "item_limit": 2,
+                    "visit_limit": 8,
+                    "byte_limit": 4096,
+                },
+            ),
         )
         for operation, arguments in cases:
             with self.subTest(operation=operation):
@@ -276,6 +337,90 @@ class V2Tests(unittest.TestCase):
             + b"\x03",
         )
 
+    def test_catalog_visible_page_decodes_canonical_items(self) -> None:
+        import struct
+
+        cursor = bytes((7,)) * 176
+        body = (
+            struct.pack("<I", len(cursor))
+            + cursor
+            + struct.pack("<I", 1)
+            + (5).to_bytes(16, "little")
+            + struct.pack("<BB6x", 3, 1)
+            + (2).to_bytes(16, "little")
+            + _qualified_name()
+        )
+        response = decode_product_response(
+            _response(42, body), 27, negotiated_minor=3
+        )
+        self.assertEqual(response.kind, "catalog_visible_page")
+        self.assertEqual(response.value["cursor"], cursor)
+        self.assertEqual(response.value["items"][0]["id"], 5)
+        self.assertEqual(response.value["items"][0]["object_kind"], 3)
+        self.assertEqual(response.value["items"][0]["parent"], 2)
+
+    def test_catalog_visible_page_rejects_oversized_or_impossible_counts(self) -> None:
+        import struct
+
+        for count in (4_097, 0xFFFFFFFF, 1):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ClientError, "item count"):
+                    decode_product_response(
+                        _response(42, struct.pack("<II", 0, count)),
+                        28,
+                        negotiated_minor=3,
+                    )
+        with self.assertRaisesRegex(ClientError, "protocol maximum"):
+            decode_product_response(
+                _response(42, struct.pack("<I", 16 * 1024 * 1024 + 1)),
+                28,
+                negotiated_minor=3,
+            )
+
+    def test_catalog_visible_page_rejects_zero_ids_and_unknown_kinds(self) -> None:
+        import struct
+
+        def item(object_id: int, kind: int, parent: int | None) -> bytes:
+            return (
+                object_id.to_bytes(16, "little")
+                + struct.pack("<BB6x", kind, parent is not None)
+                + (b"" if parent is None else parent.to_bytes(16, "little"))
+                + _qualified_name()
+            )
+
+        for name, encoded_item in {
+            "zero object": item(0, 1, None),
+            "zero kind": item(1, 0, None),
+            "unknown kind": item(1, 10, None),
+            "zero parent": item(1, 1, 0),
+        }.items():
+            with self.subTest(name=name):
+                body = struct.pack("<II", 0, 1) + encoded_item
+                with self.assertRaises(ClientError):
+                    decode_product_response(
+                        _response(42, body), 29, negotiated_minor=3
+                    )
+
+    def test_catalog_visible_page_rejects_every_truncation_and_trailing_bytes(self) -> None:
+        import struct
+
+        body = struct.pack("<II", 0, 1) + (
+            (1).to_bytes(16, "little")
+            + struct.pack("<BB6x", 1, 0)
+            + _qualified_name()
+        )
+        encoded = _response(42, body)
+        for prefix in range(len(encoded)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(ClientError):
+                    decode_product_response(
+                        encoded[:prefix], 30, negotiated_minor=3
+                    )
+        trailing = bytearray(encoded + b"\0")
+        struct.pack_into("<I", trailing, 8, len(trailing))
+        with self.assertRaisesRegex(ClientError, "trailing"):
+            decode_product_response(bytes(trailing), 30, negotiated_minor=3)
+
     def test_integrated_search_uses_only_logical_collection_identity(self) -> None:
         transport = FakeTransport()
         client = HyphaeClient(transport)
@@ -295,6 +440,65 @@ class V2Tests(unittest.TestCase):
         response = transport.execute("capabilities", {}, RequestOptions(request_id=17))
         self.assertEqual(response.kind, "capabilities")
         self.assertEqual(FakeHttpConnection.last_path, "/v2/execute")
+
+    @patch("http.client.HTTPSConnection", FakeHttpConnection)
+    def test_http_client_rejects_nonexact_selected_minor_before_decoding(self) -> None:
+        original = FakeHttpResponse.getheader
+        for minor in (None, "2", "garbage"):
+            with self.subTest(minor=minor):
+                def selected_minor(response: FakeHttpResponse, name: str) -> str | None:
+                    if name == "X-Hyphae-Protocol-Minor":
+                        return minor
+                    if name == "X-Hyphae-Session-Id":
+                        return "1" * 32
+                    return original(response, name)
+
+                with patch.object(FakeHttpResponse, "getheader", selected_minor):
+                    transport = HttpTransport("https://example.test")
+                    with self.assertRaisesRegex(Exception, "protocol minor"):
+                        transport.execute(
+                            "capabilities", {}, RequestOptions(request_id=17)
+                        )
+                    self.assertIsNone(transport._session_id)
+
+    @patch("http.client.HTTPSConnection", FakeHttpConnection)
+    def test_http_swapped_response_cannot_poison_the_next_session(self) -> None:
+        original = FakeHttpResponse.getheader
+        calls = 0
+
+        def swapped(response: FakeHttpResponse, name: str) -> str | None:
+            nonlocal calls
+            if name == "X-Hyphae-Request-Id":
+                calls += 1
+                return "99" if calls == 1 else "18"
+            if name == "X-Hyphae-Session-Id":
+                return "1" * 32 if calls == 1 else None
+            return original(response, name)
+
+        with patch.object(FakeHttpResponse, "getheader", swapped):
+            transport = HttpTransport("https://example.test")
+            with self.assertRaisesRegex(Exception, "request ID mismatch"):
+                transport.execute("capabilities", {}, RequestOptions(request_id=17))
+            self.assertIsNone(transport._session_id)
+            response = transport.execute(
+                "capabilities", {}, RequestOptions(request_id=18)
+            )
+            self.assertEqual(response.kind, "capabilities")
+            self.assertIsNone(transport._session_id)
+
+    @patch("http.client.HTTPSConnection", FakeJsonErrorHttpConnection)
+    def test_http_client_decodes_valid_json_product_error(self) -> None:
+        transport = HttpTransport("https://example.test")
+
+        with self.assertRaises(ProductError) as caught:
+            transport.execute("capabilities", {}, RequestOptions(request_id=19))
+
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.code, "catalog_conflict")
+        self.assertEqual(caught.exception.fields.request_id, 19)
+        self.assertEqual(caught.exception.fields.trace_id, 23)
+        self.assertEqual(caught.exception.fields.object_id, 29)
+        self.assertEqual(caught.exception.fields.details, {"reason": "stale"})
 
 
 if __name__ == "__main__":

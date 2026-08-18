@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     fmt,
@@ -62,6 +62,10 @@ impl BearerToken {
         }
         let candidate = *blake3::hash(candidate).as_bytes();
         bool::from(self.digest.ct_eq(&candidate))
+    }
+
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        self.digest
     }
 }
 

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native page, row, and blob format v1
 
 Status: normative target contract; page codec, append-only page file, tail

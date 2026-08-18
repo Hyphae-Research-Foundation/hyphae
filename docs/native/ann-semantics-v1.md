@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native ANN semantics v1
 
 Status: normative bounded G6 contract; deterministic HNSW, canonical `f32`

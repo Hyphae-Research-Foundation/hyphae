@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Append-only log format v1
 
 Status: normative for Hyphae `0.1.0` disk format `1`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Fail-closed validation and aggregation of exact-SHA G8 receipts."""
 
@@ -179,7 +179,7 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
                 f"G8 platform coverage differs for {requirement}: "
                 f"expected={sorted(expected_platforms)}, actual={sorted(actual_platforms)}"
             )
-    return {
+    result = {
         "schema": "hyphae-native-g8-aggregate-v1",
         "gate": "G8",
         "status": "passed",
@@ -189,6 +189,60 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
         "claims": ["G8"],
         "closure_declared": True,
     }
+    validate_aggregate(result, expected_commit, repository)
+    return result
+
+
+def validate_aggregate(
+    aggregate: dict[str, Any], expected_commit: str, repository: Path | None = None
+) -> None:
+    """Validate a downloaded closed G8 aggregate without trusting its producer."""
+    if HEX40.fullmatch(expected_commit) is None:
+        raise GateFailure("expected commit is not a canonical SHA-1")
+    profile, rows = authority(repository or Path(__file__).resolve().parents[1])
+    if set(aggregate) != {
+        "schema",
+        "gate",
+        "status",
+        "source_commit",
+        "requirements",
+        "required_platforms",
+        "claims",
+        "closure_declared",
+    } or (
+        aggregate.get("schema") != "hyphae-native-g8-aggregate-v1"
+        or aggregate.get("gate") != "G8"
+        or aggregate.get("status") != "passed"
+        or aggregate.get("source_commit") != expected_commit
+        or aggregate.get("required_platforms") != profile["required_platforms"]
+        or aggregate.get("claims") != ["G8"]
+        or aggregate.get("closure_declared") is not True
+    ):
+        raise GateFailure("G8 aggregate identity is open or source-unbound")
+    requirements = aggregate.get("requirements")
+    if not isinstance(requirements, dict) or set(requirements) != set(rows):
+        raise GateFailure("G8 aggregate requirement coverage or ordering differs")
+    for requirement, row in rows.items():
+        platforms = requirements.get(requirement)
+        if not isinstance(platforms, dict) or set(platforms) != set(row["platforms"]):
+            raise GateFailure(f"G8 aggregate platform coverage differs for {requirement}")
+        for platform, record in platforms.items():
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"receipt_sha256", "audit"}
+                or HEX64.fullmatch(record.get("receipt_sha256", "")) is None
+                or record.get("audit")
+                != {
+                    "schema": "hyphae-native-g8-receipt-audit-v1",
+                    "status": "passed",
+                    "source_commit": expected_commit,
+                    "requirement": requirement,
+                    "platform": platform,
+                }
+            ):
+                raise GateFailure(
+                    f"G8 aggregate receipt identity differs for {requirement}/{platform}"
+                )
 
 
 def main() -> int:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Conclude first-party release SBOM licenses from tracked package manifests."""
 
@@ -24,9 +24,38 @@ ROOT = Path(
         Path(__file__).resolve().parents[1],
     )
 ).resolve()
-SOFTWARE_LICENSE = "AGPL-3.0-only"
+SOFTWARE_LICENSE = "Apache-2.0"
 SYFT_VERSION = "1.46.0"
 IGNORED_DIRECTORIES = frozenset({"build", "dist", "node_modules", "target"})
+
+
+@dataclass(frozen=True)
+class PrivateNpmTool:
+    name: str
+    manifest: str
+    lock: str
+
+
+PRIVATE_NPM_TOOLS = (
+    PrivateNpmTool(
+        name="hyphae-mcp-conformance-hosts",
+        manifest="conformance/mcp/hosts/package.json",
+        lock="conformance/mcp/hosts/package-lock.json",
+    ),
+    PrivateNpmTool(
+        name="framework-host-smoke",
+        manifest="integrations/host-smoke/package.json",
+        lock="integrations/host-smoke/package-lock.json",
+    ),
+    PrivateNpmTool(
+        name="hyphae-premium-site",
+        manifest="website/package.json",
+        lock="website/package-lock.json",
+    ),
+)
+PRIVATE_NPM_TOOLS_BY_MANIFEST = {tool.manifest: tool for tool in PRIVATE_NPM_TOOLS}
+PRIVATE_NPM_TOOLS_BY_NAME = {tool.name: tool for tool in PRIVATE_NPM_TOOLS}
+PRIVATE_NPM_TOOLS_BY_LOCK = {tool.lock: tool for tool in PRIVATE_NPM_TOOLS}
 
 
 @dataclass(frozen=True)
@@ -45,6 +74,27 @@ class ArtifactIdentity:
     version: str
     purl: str
     location: str
+
+
+def private_npm_tool_for_manifest(
+    manifest: Path, document: dict[str, Any], root: Path
+) -> PrivateNpmTool | None:
+    relative = manifest.resolve().relative_to(root.resolve()).as_posix()
+    tool = PRIVATE_NPM_TOOLS_BY_MANIFEST.get(relative)
+    name = document.get("name")
+    if tool is None:
+        expected = PRIVATE_NPM_TOOLS_BY_NAME.get(name)
+        if expected is not None:
+            raise RuntimeError(
+                f"{manifest}: private npm tool {name} must use {expected.manifest}"
+            )
+        return None
+    if name != tool.name or document.get("private") is not True:
+        raise RuntimeError(
+            f"{manifest}: excluded private npm tool must be {tool.name} "
+            "with private=true"
+        )
+    return tool
 
 
 def is_hyphae_component(name: object) -> bool:
@@ -154,6 +204,16 @@ def discover_package_authorities(root: Path) -> dict[tuple[str, str, str], Packa
         document = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(document, dict):
             raise RuntimeError(f"{manifest}: package manifest must be an object")
+        private_tool = private_npm_tool_for_manifest(manifest, document, root)
+        if private_tool is not None:
+            version = require_string(
+                document.get("version"), f"{manifest}: package version"
+            )
+            lock = root / private_tool.lock
+            if not lock.is_file():
+                raise RuntimeError(f"{manifest}: private npm tool lock is missing")
+            validate_private_npm_tool_lock(lock, private_tool, version)
+            continue
         add(
             "npm",
             document.get("name"),
@@ -205,6 +265,38 @@ def artifact_location(artifact: dict[str, Any], root: Path) -> tuple[str, Path]:
     return raw_path, resolved
 
 
+def private_npm_tool_for_artifact(
+    artifact: dict[str, Any], location: Path, root: Path
+) -> PrivateNpmTool | None:
+    name = artifact.get("name")
+    tool = PRIVATE_NPM_TOOLS_BY_NAME.get(name)
+    if tool is None:
+        return None
+    expected_location = (root / tool.lock).resolve()
+    if (
+        artifact.get("type") != "npm"
+        or artifact.get("foundBy") != "javascript-lock-cataloger"
+        or location.resolve() != expected_location
+    ):
+        raise RuntimeError(f"{name}: private npm tool artifact evidence does not match")
+    manifest = (root / tool.manifest).resolve()
+    if not manifest.is_file():
+        raise RuntimeError(f"{name}: private npm tool manifest is missing")
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise RuntimeError(f"{manifest}: package manifest must be an object")
+    if private_npm_tool_for_manifest(manifest, document, root) != tool:
+        raise RuntimeError(f"{name}: private npm tool manifest does not match")
+    version = require_string(document.get("version"), f"{manifest}: package version")
+    validate_private_npm_tool_lock(location, tool, version)
+    if (
+        artifact.get("version") != version
+        or artifact.get("purl") != package_purl("npm", tool.name, version)
+    ):
+        raise RuntimeError(f"{name}: private npm tool inventory does not match")
+    return tool
+
+
 def authority_for_exact_artifact(
     artifact: dict[str, Any],
     authorities: dict[tuple[str, str, str], PackageAuthority],
@@ -247,6 +339,24 @@ def npm_lock_packages(location: Path) -> dict[str, Any]:
     packages = document.get("packages") if isinstance(document, dict) else None
     if not isinstance(packages, dict):
         raise RuntimeError(f"{location}: package-lock packages must be an object")
+    return packages
+
+
+def validate_private_npm_tool_lock(
+    location: Path, tool: PrivateNpmTool, version: str
+) -> dict[str, Any]:
+    document = json.loads(location.read_text(encoding="utf-8"))
+    packages = document.get("packages") if isinstance(document, dict) else None
+    root_package = packages.get("") if isinstance(packages, dict) else None
+    if (
+        not isinstance(packages, dict)
+        or not isinstance(root_package, dict)
+        or document.get("name") != tool.name
+        or document.get("version") != version
+        or root_package.get("name") != tool.name
+        or root_package.get("version") != version
+    ):
+        raise RuntimeError(f"{location}: private npm tool lock identity does not match")
     return packages
 
 
@@ -474,6 +584,22 @@ def expected_npm_identities(
     for path in sorted(root.rglob("package-lock.json")):
         if IGNORED_DIRECTORIES.intersection(path.parts):
             continue
+        manifest = path.with_name("package.json")
+        relative_lock = path.resolve().relative_to(root.resolve()).as_posix()
+        tool = PRIVATE_NPM_TOOLS_BY_LOCK.get(relative_lock)
+        if tool is not None:
+            if not manifest.is_file():
+                raise RuntimeError(f"{path}: private npm tool manifest is missing")
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                raise RuntimeError(f"{manifest}: package manifest must be an object")
+            if private_npm_tool_for_manifest(manifest, document, root) != tool:
+                raise RuntimeError(f"{path}: private npm tool inventory does not match")
+            version = require_string(
+                document.get("version"), f"{manifest}: package version"
+            )
+            validate_private_npm_tool_lock(path, tool, version)
+            continue
         packages = npm_lock_packages(path)
         for key, package in packages.items():
             if key != "" and "node_modules/" not in key:
@@ -647,11 +773,26 @@ def conclude_document(document: object, root: Path) -> int:
     supplement_python_artifacts(document, authorities, root)
     expected = expected_artifact_identities(root, authorities)
     observed: Counter[ArtifactIdentity] = Counter()
+    retained_artifacts: list[dict[str, Any]] = []
+    excluded_artifact_ids: set[str] = set()
     concluded = 0
     for artifact in document["artifacts"]:
         if not isinstance(artifact, dict):
             raise RuntimeError("Syft artifact must be an object")
+        if artifact.get("name") in PRIVATE_NPM_TOOLS_BY_NAME:
+            _, location = artifact_location(artifact, root)
+            if private_npm_tool_for_artifact(artifact, location, root) is not None:
+                artifact_id = require_string(
+                    artifact.get("id"), f"{artifact.get('name')}: artifact ID"
+                )
+                if artifact_id in excluded_artifact_ids:
+                    raise RuntimeError(
+                        f"{artifact.get('name')}: duplicate private artifact ID"
+                    )
+                excluded_artifact_ids.add(artifact_id)
+                continue
         if not is_hyphae_component(artifact.get("name")):
+            retained_artifacts.append(artifact)
             continue
         raw_location, location = artifact_location(artifact, root)
         metadata = artifact.get("metadata")
@@ -688,6 +829,7 @@ def conclude_document(document: object, root: Path) -> int:
                 location=raw_location,
             )
         ] += 1
+        retained_artifacts.append(artifact)
         concluded += 1
     if observed != expected:
         missing = sorted((expected - observed).elements(), key=repr)
@@ -696,6 +838,24 @@ def conclude_document(document: object, root: Path) -> int:
             "Syft first-party artifact inventory differs from lock authority: "
             f"missing={missing!r}, unexpected={unexpected!r}"
         )
+    if excluded_artifact_ids:
+        if any(
+            artifact.get("id") in excluded_artifact_ids
+            for artifact in retained_artifacts
+        ):
+            raise RuntimeError("private npm tool artifact ID is not unique")
+        relationships = document.get("artifactRelationships")
+        if not isinstance(relationships, list) or not all(
+            isinstance(relationship, dict) for relationship in relationships
+        ):
+            raise RuntimeError("Syft artifact relationships must be a list")
+        document["artifactRelationships"] = [
+            relationship
+            for relationship in relationships
+            if relationship.get("parent") not in excluded_artifact_ids
+            and relationship.get("child") not in excluded_artifact_ids
+        ]
+        document["artifacts"] = retained_artifacts
     return concluded
 
 
