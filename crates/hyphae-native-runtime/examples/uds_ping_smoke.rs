@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Exercises the deprecated pre-daemon local session/transport on purpose.
+#![allow(deprecated)]
+
 //! Direct-Linux Unix-domain transport latency observation.
 
 #[cfg(not(unix))]

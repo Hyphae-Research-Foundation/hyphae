@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Exercises the deprecated pre-daemon local session/transport on purpose.
+#![allow(deprecated)]
+
 //! Native local prepared SQL codec and session integration tests.
 
 use std::{error::Error, num::NonZeroU64};

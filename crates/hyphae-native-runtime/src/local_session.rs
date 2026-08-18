@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// The module implements the deprecated pre-dispatcher session; internal
+// references to the deprecated type are expected until removal.
+#![allow(deprecated)]
+
 use std::{collections::BTreeMap, num::NonZeroU64};
 
 use hyphae_native_types::DurabilityClass;
@@ -69,6 +73,12 @@ struct ActiveLocalTransaction {
 
 /// Serial local session exposing scalar, lexical, prepared SQL, and explicit
 /// all-engine transaction operations.
+#[deprecated(
+    since = "1.2.0",
+    note = "predates the product dispatcher and bypasses durable RBAC; \
+            serve local clients through `hyphae-native-daemon` and \
+            `hyphae-native-protocol` instead"
+)]
 pub struct LocalDataSession<'database, Clock: NativeSchedulerClock + ?Sized> {
     database: &'database mut NativeDatabase,
     clock: &'database Clock,

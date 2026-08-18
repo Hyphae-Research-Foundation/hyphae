@@ -52,7 +52,6 @@ mod set_lifecycle_equivalence;
 mod set_ttl_equivalence;
 mod snapshot_pins;
 mod sql;
-#[allow(dead_code)]
 mod structure_v3;
 mod wal_codec;
 
@@ -154,6 +153,7 @@ pub use local_search::{
     encode_local_transaction_index_document, encode_local_transaction_replace_document,
 };
 #[cfg(unix)]
+#[allow(deprecated)]
 pub use local_session::{LocalDataSession, LocalSessionError};
 pub use local_sql::{
     LOCAL_SQL_EXECUTE_HEADER_SIZE, LOCAL_SQL_PREPARE_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE,
@@ -183,6 +183,7 @@ pub use local_transaction::{
 };
 pub mod migration;
 #[cfg(unix)]
+#[allow(deprecated)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use migration::{
     MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
