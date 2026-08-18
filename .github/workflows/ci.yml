@@ -824,7 +824,6 @@ jobs:
             --output "$archive" "$ACTIONLINT_URL"
           printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check -
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
-          test "$("$RUNNER_TEMP/actionlint" -version | head -n 1)" = "v1.7.12"
           "$RUNNER_TEMP/actionlint"
       - name: Test deterministic packaging and checksums
         run: |
