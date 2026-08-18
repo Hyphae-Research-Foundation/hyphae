@@ -5,15 +5,14 @@
 [![crates.io](https://img.shields.io/crates/v/hyphae-engine?logo=rust)](https://crates.io/crates/hyphae-engine)
 [![docs.rs](https://img.shields.io/docsrs/hyphae-engine)](https://docs.rs/hyphae-engine)
 
-The recommended embeddable facade for [Hyphae](https://hyphae.dev), an
-autonomous, durable, and verifiable Rust data engine.
-
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The format-2 compatibility facade for [Hyphae](https://hyphae.dev), an
+autonomous, durable, and verifiable Rust data engine. New applications should
+embed the Native product facade in `hyphae-native-product`; this crate serves
+existing format-2 data directories and the published `/v1` surface.
 
 ```toml
 [dependencies]
-hyphae-engine = "0.2.1"
+hyphae-engine = "1.2.0"
 ```
 
 Open one data directory, store structured records, run deterministic queries,

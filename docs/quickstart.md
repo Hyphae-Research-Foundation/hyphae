@@ -2,7 +2,7 @@
 
 This guide is retained for the published format-2 `0.2.1` compatibility
 product. For Native 1.0 commands, use the
-[Native 1.0 quickstart](quickstart-native.md).
+[Native quickstart](quickstart-native.md).
 
 This quickstart exercises Hyphae as one executable and one owned data
 directory. It does not start or contact a database, cache, cloud service,

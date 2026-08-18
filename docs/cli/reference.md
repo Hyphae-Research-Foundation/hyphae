@@ -721,7 +721,7 @@ hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-file <RESTRICTED_PATH>
 hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-stdin
 ```
 
-Runs MCP revision `2025-11-25` as newline-delimited JSON-RPC 2.0 over stdio.
+Runs MCP revision `2025-06-18` as newline-delimited JSON-RPC 2.0 over stdio.
 It opens no listener or data directory. The adapter enforces a 4 MiB message
 bound and exposes only three Native v2 read tools: capabilities, redacted
 security status, and bounded redacted principal pages. `tools/list` returns at

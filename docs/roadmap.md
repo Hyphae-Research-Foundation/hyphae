@@ -16,13 +16,14 @@ preserves the published Rust legacy surface; and carries dependency/host-smoke
 maintenance without changing API `/v1`, disk format `2`, or either proof
 format.
 
-## Next program: native local data ecosystem
+## Native local data ecosystem (shipped)
 
-The Native product program ships as `1.0.0`. G0 through G7 have retained
-source-bound closure for their versioned, bounded profiles. G8 supplies
-exact-release safety evidence. G7 uses an environment-bound operational-scale
-authority and makes no canonical bare-metal latency or interference claim. See
-the [native gate status](gates/native-gate-status.md). Hyphae will build its own
+The Native product program shipped through `1.0.0` and the published `1.1.0`
+release. G0 through G8 have retained source-bound closure for their
+versioned, bounded profiles; G8 closed on the exact `1.1.0` release commit.
+G7 uses an environment-bound operational-scale authority and makes no
+canonical bare-metal latency or interference claim. See the
+[native gate status](gates/native-gate-status.md). Hyphae owns its
 relational SQL engine, native keyspace/data-structure engine, and native
 lexical/vector search engine in one process. They share a Hyphae-owned catalog, memory
 manager, page/blob store, WAL, MVCC/commit sequence, scheduler, backup, and
@@ -39,17 +40,18 @@ The governing documents are:
 - [ordered phase-1 gate](gates/native-local-phase-1.md); and
 - [current native gate status](gates/native-gate-status.md).
 
-The accepted [G6 execution roadmap](roadmaps/native-g6-roadmap.md) makes the
-next gate a competitive local product rather than a thin wrapper. It fixes the
+The accepted [G6 execution roadmap](roadmaps/native-g6-roadmap.md) made that
+gate a competitive local product rather than a thin wrapper. It fixed the
 embedded/local-first strategy, native HTTP `/v2`, Rust/Python/TypeScript SDKs,
 optional provider adapters, integrated filtered/hybrid search, incremental ANN
-lifecycle, and native offline proofs. Closing G8 will establish readiness for
+lifecycle, and native offline proofs. The closed G8 established readiness for
 that bounded local contract, not universal superiority over a distributed
 vector platform; matched comparative evidence and distributed capabilities are
 later programs.
 
 Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
-and model integration do not begin until G8 closes on one exact commit.
+and model integration remain separate later programs with their own accepted
+contracts and gates.
 
 ## 1.2.0 programs
 
