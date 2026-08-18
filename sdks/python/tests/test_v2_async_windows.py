@@ -44,6 +44,7 @@ _ERROR_PIPE_CONNECTED = 535
 _ERROR_OPERATION_ABORTED = 995
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _TRANSCRIPT_ENV = "HYPHAE_WINDOWS_ASYNC_TRANSCRIPT"
+_FAILURE_ENV = "HYPHAE_WINDOWS_ASYNC_FAILURE"
 _EXPECTED_WHEEL_ENV = "HYPHAE_WINDOWS_ASYNC_WHEEL"
 _EXPECTED_VERSION_ENV = "HYPHAE_WINDOWS_ASYNC_VERSION"
 _COORDINATION_TIMEOUT_SECONDS = 5.0
@@ -428,6 +429,45 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
             peer.close()
 
 
+def _describe_failure(error: BaseException, depth: int = 0) -> dict[str, object]:
+    # Static exception types, _GateFailure literals from this module, and
+    # numeric OS error codes only; never runtime material such as endpoint
+    # names, frames, or handles.
+    described: dict[str, object] = {"type": type(error).__name__}
+    if isinstance(error, _GateFailure):
+        described["message"] = str(error)
+    if isinstance(error, OSError):
+        described["errno"] = error.errno
+        described["winerror"] = getattr(error, "winerror", None)
+    cause = error.__cause__ or error.__context__
+    if cause is not None and cause is not error and depth < 5:
+        described["cause"] = _describe_failure(cause, depth + 1)
+    return described
+
+
+def _record_failure(case: str, error: BaseException) -> None:
+    failure_path = os.environ.get(_FAILURE_ENV)
+    if not failure_path:
+        return
+    try:
+        Path(failure_path).write_text(
+            json.dumps(
+                {
+                    "schema": "hyphae-python-windows-async-failure-v1",
+                    "status": "failed",
+                    "failed_case": case,
+                    "failure": _describe_failure(error),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 async def run_windows_async_cases() -> dict[str, dict[str, object]]:
     observations: dict[str, dict[str, object]] = {}
     request_id = 1000
@@ -437,9 +477,12 @@ async def run_windows_async_cases() -> dict[str, dict[str, object]]:
             ("deadline", "deadline_reconnect"),
             ("aclose", "aclose_terminal"),
         ):
-            observations[f"{stall}_{suffix}"] = await _exercise(
-                stall, action, request_id
-            )
+            case = f"{stall}_{suffix}"
+            try:
+                observations[case] = await _exercise(stall, action, request_id)
+            except BaseException as error:
+                _record_failure(case, error)
+                raise
             request_id += 1000
     return observations
 

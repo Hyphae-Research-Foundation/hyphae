@@ -624,6 +624,7 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: .
+          HYPHAE_WINDOWS_ASYNC_FAILURE: python-windows-async-failure.json
         run: |
           python -m unittest tools.test_check_python_windows_async_gate tools.test_run_python_windows_async_gate -v
           python tools/run_python_windows_async_gate.py \
@@ -636,6 +637,15 @@ jobs:
             --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
             --expected-wheel dist/hyphae_sdk-1.2.0-py3-none-any.whl \
             --expected-transcript python-windows-async-transcript.json
+      - name: Upload the sanitized failure diagnostic
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-windows-async-failure-${{ github.event.pull_request.head.sha || github.sha }}
+          path: python-windows-async-failure.json
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
       - name: Upload exact-source Windows async evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
