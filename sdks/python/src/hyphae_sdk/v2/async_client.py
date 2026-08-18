@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Owned-executor asynchronous lifecycle for the synchronous Native v2 core."""
 
 from __future__ import annotations
@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import Any, TypeAlias, TypeVar
 
@@ -28,12 +28,14 @@ _T = TypeVar("_T")
 class AsyncHyphaeClient:
     """Async Native v2 client with one owned, serial worker and explicit aborts."""
 
-    def __init__(self, transport: AbortableTransport) -> None:
+    def __init__(self, transport: AbortableTransport, *, max_pending: int = 64) -> None:
         required_methods = ("execute", "abort", "close")
         if not all(
             callable(getattr(transport, method, None)) for method in required_methods
         ):
             raise ClientError("async transport must support execute, abort, and close")
+        if isinstance(max_pending, bool) or not isinstance(max_pending, int) or not 0 < max_pending <= 4096:
+            raise ClientError("max_pending must be between 1 and 4096")
         self._transport = transport
         self._abort_invalidates_session = bool(
             getattr(transport, "abort_invalidates_session", True)
@@ -43,7 +45,11 @@ class AsyncHyphaeClient:
             max_workers=1,
             thread_name_prefix="hyphae-v2-async",
         )
-        self._pending: dict[asyncio.Task[_WorkerOutcome], CancellationToken] = {}
+        self._pending: dict[
+            asyncio.Task[_WorkerOutcome],
+            tuple[CancellationToken, Future[Response]],
+        ] = {}
+        self._max_pending = max_pending
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -54,13 +60,15 @@ class AsyncHyphaeClient:
         *,
         client_identity: str = "hyphae-python-sdk-v2",
         api_key: str | None = None,
+        max_pending: int = 64,
     ) -> AsyncHyphaeClient:
         return cls(
             LocalTransport(
                 endpoint,
                 client_identity=client_identity,
                 api_key=api_key,
-            )
+            ),
+            max_pending=max_pending,
         )
 
     @classmethod
@@ -70,16 +78,19 @@ class AsyncHyphaeClient:
         api_key: str,
         *,
         client_identity: str = "hyphae-python-sdk-v2",
+        max_pending: int = 64,
     ) -> AsyncHyphaeClient:
         return cls.local(
             endpoint,
             client_identity=client_identity,
             api_key=api_key,
+            max_pending=max_pending,
         )
 
     @classmethod
     def http(cls, base_url: str, **kwargs: Any) -> AsyncHyphaeClient:
-        return cls(HttpTransport(base_url, **kwargs))
+        max_pending = kwargs.pop("max_pending", 64)
+        return cls(HttpTransport(base_url, **kwargs), max_pending=max_pending)
 
     async def execute(
         self,
@@ -90,19 +101,20 @@ class AsyncHyphaeClient:
     ) -> Response:
         if self._closed:
             raise ClientError("async Hyphae client is closed")
+        if len(self._pending) >= self._max_pending:
+            raise ClientError("async Hyphae pending request queue is full")
         request_options = options or RequestOptions()
         loop = asyncio.get_running_loop()
-        executor_future = loop.run_in_executor(
-            self._executor,
-            partial(
-                self._client.execute,
-                operation,
-                arguments,
-                options=request_options,
-            ),
+        execute = partial(
+            self._client.execute,
+            operation,
+            arguments,
+            options=request_options,
         )
+        source_future = self._executor.submit(execute)
+        executor_future = asyncio.wrap_future(source_future, loop=loop)
         worker = asyncio.create_task(self._settle_worker(executor_future))
-        self._pending[worker] = request_options.cancellation
+        self._pending[worker] = (request_options.cancellation, source_future)
         try:
             response, error = await asyncio.shield(worker)
             if error is not None:
@@ -112,10 +124,11 @@ class AsyncHyphaeClient:
         except asyncio.CancelledError as cancellation:
             request_options.cancellation.cancel()
             abort_error: BaseException | None = None
-            try:
-                self._transport.abort(request_options.cancellation)
-            except BaseException as error:
-                abort_error = error
+            if not source_future.cancel():
+                try:
+                    self._transport.abort(request_options.cancellation)
+                except BaseException as error:
+                    abort_error = error
             _, worker_error = await self._wait_after_cancellation(worker)
             if worker_error is not None:
                 cancellation.add_note(
@@ -167,8 +180,9 @@ class AsyncHyphaeClient:
 
     async def _close_owned_resources(self) -> None:
         cleanup_error: BaseException | None = None
-        for cancellation in tuple(self._pending.values()):
+        for cancellation, source in tuple(self._pending.values()):
             cancellation.cancel()
+            source.cancel()
         try:
             self._transport.abort(None)
         except BaseException as error:
@@ -216,6 +230,99 @@ class AsyncHyphaeClient:
         options: RequestOptions | None = None,
     ) -> AsyncTransaction:
         return await AsyncTransaction.begin(self, options=options)
+
+    async def security_api_key_issue_start(
+        self,
+        arguments: dict[str, object],
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return await self._execute_expected(
+            "security_api_key_issue_self_start" if self_manage else "security_api_key_issue_start",
+            "security_api_key_started",
+            arguments,
+            options=options,
+        )
+
+    async def security_api_key_rotate_start(
+        self,
+        arguments: dict[str, object],
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return await self._execute_expected(
+            "security_api_key_rotate_self_start" if self_manage else "security_api_key_rotate_start",
+            "security_api_key_started",
+            arguments,
+            options=options,
+        )
+
+    async def security_api_key_activate(
+        self,
+        key_id: bytes,
+        confirmation_digest: bytes,
+        *,
+        rotation: bool = False,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        operation = "security_api_key_rotate" if rotation else "security_api_key_issue"
+        operation += "_self_activate" if self_manage else "_activate"
+        return await self._execute_expected(
+            operation,
+            "security_api_key_activated",
+            {
+                "successor_key_id" if rotation else "key_id": key_id,
+                "confirmation_digest": confirmation_digest,
+            },
+            options=options,
+        )
+
+    async def security_api_key_abort(
+        self,
+        key_id: bytes,
+        *,
+        rotation: bool = False,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        operation = "security_api_key_rotate" if rotation else "security_api_key_issue"
+        operation += "_self_abort" if self_manage else "_abort"
+        return await self._execute_expected(
+            operation,
+            "security_mutated",
+            {"successor_key_id" if rotation else "key_id": key_id},
+            options=options,
+        )
+
+    async def security_api_key_revoke(
+        self,
+        key_id: bytes,
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return await self._execute_expected(
+            "security_api_key_revoke_self" if self_manage else "security_api_key_revoke",
+            "security_mutated",
+            {"key_id": key_id},
+            options=options,
+        )
+
+    async def security_legacy_bearer_revoke(
+        self,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        """Permanently revoke legacy-bearer compatibility as Owner."""
+
+        return await self._execute_expected(
+            "security_legacy_bearer_revoke",
+            "security_mutated",
+            options=options,
+        )
 
     def security_principal_pages(
         self,

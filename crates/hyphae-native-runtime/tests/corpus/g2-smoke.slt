@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Hyphae Native G2 bounded SQLLogicTest corpus v1
 
 statement ok

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 export interface ProductLimits {
   readonly maxCount: number;
@@ -39,6 +39,9 @@ export class ProductError extends Error {
   readonly status: number | undefined;
 
   constructor(fields: ProductErrorFields, status?: number) {
+    if (status !== undefined && (!Number.isInteger(status) || status < 400 || status > 599)) {
+      throw new ClientError("HTTP product error status is invalid");
+    }
     super(fields.message);
     this.name = "ProductError";
     this.fields = fields;
@@ -57,6 +60,42 @@ export class ClientError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ClientError";
+  }
+}
+
+/** One-time secret bytes that never stringify or serialize in clear text. */
+export class SensitiveBytes {
+  #value: Uint8Array | undefined;
+
+  constructor(value: Uint8Array) {
+    this.#value = value.slice();
+  }
+
+  toString(): string {
+    return "SensitiveBytes([REDACTED])";
+  }
+
+  toJSON(): never {
+    throw new ClientError("sensitive bytes are not serializable");
+  }
+
+  [Symbol.for("nodejs.util.inspect.custom")](): string {
+    return this.toString();
+  }
+
+  /** Returns one copy and immediately zeroizes and closes the wrapper. */
+  consume(): Uint8Array {
+    const value = this.#value;
+    if (value === undefined) throw new ClientError("sensitive bytes are closed");
+    const exposed = value.slice();
+    value.fill(0);
+    this.#value = undefined;
+    return exposed;
+  }
+
+  close(): void {
+    this.#value?.fill(0);
+    this.#value = undefined;
   }
 }
 

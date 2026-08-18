@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Canonical durable access-control catalog state.
 
@@ -19,13 +19,17 @@ use hyphae_native_types::{ObjectId, TransactionId};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    AccessControlLimits, ApiKeyId, ApiKeyVerifier, AuthorizationEpoch, BuiltInRole, IssuedApiKey,
-    NativeProduct, ProductAuthorization, ProductCommitReceipt, ProductDurability, ProductError,
-    ProductErrorCode, ProductPermission, ProductPrincipal, ProductScope, SecurityId,
+    AccessControlLimits, ApiKeyConfirmationDigest, ApiKeyId, ApiKeySecretDelivery, ApiKeyVerifier,
+    AuthorizationEpoch, BuiltInRole, IssuedApiKey, NativeProduct, ProductAuthorization,
+    ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode, ProductPermission,
+    ProductPrincipal, ProductScope, SecurityId,
 };
 
 const CATALOG_V1_MAGIC: &[u8; 8] = b"HYACAT01";
-const CATALOG_MAGIC: &[u8; 8] = b"HYACAT02";
+const CATALOG_V2_MAGIC: &[u8; 8] = b"HYACAT02";
+const CATALOG_V3_MAGIC: &[u8; 8] = b"HYACAT03";
+const CATALOG_V4_MAGIC: &[u8; 8] = b"HYACAT04";
+const CATALOG_MAGIC: &[u8; 8] = b"HYACAT05";
 const CATALOG_DIGEST_BYTES: usize = 32;
 const MAX_ACCESS_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum redacted records returned by one security metadata list.
@@ -45,7 +49,9 @@ const BUILT_IN_ROLES: [BuiltInRole; 7] = [
 const ACCESS_CONTROL_STORAGE_KEY: &[u8] = b"\0hyphae.product.access-control.v1\0catalog";
 const AUDIT_EVENT_MAGIC: &[u8; 8] = b"HYAEVT01";
 const AUDIT_EVENT_STORAGE_PREFIX: &[u8] = b"\0hyphae.product.access-control.v1\0audit\0";
-const SECURITY_MUTATION_MARKER_MAGIC: &[u8; 8] = b"HYASID01";
+const SECURITY_MUTATION_MARKER_V1_MAGIC: &[u8; 8] = b"HYASID01";
+const SECURITY_MUTATION_MARKER_V2_MAGIC: &[u8; 8] = b"HYASID02";
+const SECURITY_MUTATION_MARKER_MAGIC: &[u8; 8] = b"HYASID03";
 const SECURITY_MUTATION_INDEX_MAGIC: &[u8; 8] = b"HYASIX01";
 const SECURITY_MUTATION_MARKER_PREFIX: &[u8] =
     b"\0hyphae.product.access-control.v1\0idempotency\0marker\0";
@@ -53,9 +59,21 @@ const SECURITY_MUTATION_INDEX_PREFIX: &[u8] =
     b"\0hyphae.product.access-control.v1\0idempotency\0index\0";
 const SECURITY_MUTATION_IDEMPOTENCY_SHARDS: u8 = 64;
 const SECURITY_MUTATION_MARKERS_PER_SHARD: usize = 64;
-const SECURITY_MUTATION_MARKER_BYTES: usize = 145;
+const SECURITY_MUTATION_MARKER_V1_BYTES: usize = 145;
+const SECURITY_MUTATION_MARKER_V2_BYTES: usize = 146;
+const SECURITY_MUTATION_MARKER_BYTES: usize = 171;
 const SECURITY_MUTATION_REQUEST_DOMAIN: &[u8] = b"hyphae-security-mutation-request-v1\0";
 const SECURITY_MUTATION_KEY_DOMAIN: &[u8] = b"hyphae-security-mutation-key-v1\0";
+const OFFLINE_OWNER_RECOVERY_MARKER_MAGIC: &[u8; 8] = b"HYAORC01";
+const OFFLINE_OWNER_RECOVERY_MARKER_PREFIX: &[u8] =
+    b"\0hyphae.product.access-control.v1\0offline-owner-recovery\0";
+const OFFLINE_OWNER_RECOVERY_MARKER_BYTES: usize = 105;
+const LEGACY_BEARER_MIGRATION_MARKER_MAGIC: &[u8; 8] = b"HYLBRM01";
+const LEGACY_BEARER_MIGRATION_MARKER_KEY: &[u8] =
+    b"\0hyphae.product.access-control.v1\0legacy-bearer-migration\0activated";
+const LEGACY_BEARER_MIGRATION_MARKER_BYTES: usize = 136;
+const LEGACY_BEARER_MIGRATION_REQUEST_DOMAIN: &[u8] =
+    b"hyphae-legacy-bearer-migration-request-v1\0";
 
 /// Durable principal metadata. Display names are never authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,11 +301,13 @@ pub struct AuthenticatedAuthority {
     authorization: ProductAuthorization,
     authorization_epoch: AuthorizationEpoch,
     directory_lineage: [u8; 24],
+    terminal_replay_only: bool,
     valid_until_micros: Option<i64>,
     effective_roles: Box<[BuiltInRole]>,
     effective_custom_roles: Box<[SecurityId]>,
     scope_ceiling: Box<[ProductScope]>,
     scoped_authorization: Box<[ScopedAuthorization]>,
+    catalog_cursor_key: [u8; 32],
 }
 
 impl AuthenticatedAuthority {
@@ -344,6 +364,10 @@ impl AuthenticatedAuthority {
     /// Returns effective scoped authorizations.
     pub fn scoped_authorization(&self) -> &[ScopedAuthorization] {
         &self.scoped_authorization
+    }
+
+    pub(crate) const fn catalog_cursor_key(&self) -> [u8; 32] {
+        self.catalog_cursor_key
     }
 
     /// Returns whether both the current principal grant and credential ceiling
@@ -446,6 +470,169 @@ pub struct AccessControlCatalog {
     custom_assignments: BTreeMap<SecurityId, CustomRoleAssignment>,
     keys: BTreeMap<ApiKeyId, ApiKeyRecord>,
     audit_index: Vec<SecurityAuditIndexEntry>,
+    pending_owner_recovery: Option<PendingOwnerRecovery>,
+    legacy_bearer_state: LegacyBearerState,
+    legacy_bearer_migration: Option<LegacyBearerMigration>,
+    legacy_bearer_verifier: Option<[u8; 32]>,
+}
+
+/// Durable terminal-aware state of Native HTTP legacy-bearer compatibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyBearerState {
+    /// No migration has ever enabled the compatibility credential.
+    NeverEnabled,
+    /// A canonical Owner key exists but its restricted file is not yet confirmed.
+    MigrationPending,
+    /// Canonical Owner and explicitly configured legacy bearer are both accepted.
+    DualWindow,
+    /// Legacy authentication is permanently disabled for this directory.
+    Revoked,
+}
+
+impl LegacyBearerState {
+    /// Returns the stable lowercase contract identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverEnabled => "never_enabled",
+            Self::MigrationPending => "migration_pending",
+            Self::DualWindow => "dual_window",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Returns whether 1.2 Native HTTP may use an explicitly configured bearer.
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::MigrationPending | Self::DualWindow)
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::NeverEnabled => 0,
+            Self::MigrationPending => 1,
+            Self::DualWindow => 2,
+            Self::Revoked => 3,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::NeverEnabled),
+            1 => Some(Self::MigrationPending),
+            2 => Some(Self::DualWindow),
+            3 => Some(Self::Revoked),
+            _ => None,
+        }
+    }
+}
+
+/// Product compatibility version used to make the one-minor window testable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyBearerCompatibilityVersion {
+    /// Product major version.
+    pub major: u16,
+    /// Product minor version.
+    pub minor: u16,
+}
+
+impl LegacyBearerCompatibilityVersion {
+    /// The sole release line allowed to authenticate a migrated bearer.
+    pub const V1_2: Self = Self { major: 1, minor: 2 };
+
+    /// Returns whether this version is exactly the bounded compatibility line.
+    pub const fn permits_authentication(self) -> bool {
+        self.major == Self::V1_2.major && self.minor == Self::V1_2.minor
+    }
+}
+
+/// Compatibility version used by this implementation.
+pub const LEGACY_BEARER_COMPATIBILITY_VERSION: LegacyBearerCompatibilityVersion =
+    LegacyBearerCompatibilityVersion::V1_2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LegacyBearerVerifier([u8; 32]);
+
+impl LegacyBearerVerifier {
+    pub(crate) fn verifies(self, candidate: &[u8], product_key: [u8; 32]) -> bool {
+        let Ok(candidate) = legacy_bearer_verifier(candidate, product_key) else {
+            return false;
+        };
+        bool::from(self.0.ct_eq(&candidate))
+    }
+
+    fn verifies_digest(self, candidate: [u8; 32], product_key: [u8; 32]) -> bool {
+        let candidate = legacy_bearer_verifier_from_digest(candidate, product_key);
+        bool::from(self.0.ct_eq(&candidate))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LegacyBearerMigration {
+    operation_id: SecurityId,
+    key_id: ApiKeyId,
+    authorization_epoch: AuthorizationEpoch,
+    created_at_micros: i64,
+    request_digest: [u8; 32],
+}
+
+/// Redacted durable legacy-bearer migration state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyBearerMigrationInspection {
+    /// Terminal-aware directory state.
+    pub state: LegacyBearerState,
+    /// Current managed authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Stable offline migration identity, when migration metadata is retained.
+    pub operation_id: Option<SecurityId>,
+    /// Public canonical Owner key identity, when migration metadata is retained.
+    pub key_id: Option<ApiKeyId>,
+    /// Phase-one authorization generation, when migration metadata is retained.
+    pub migration_authorization_epoch: Option<AuthorizationEpoch>,
+    /// Durable phase-one creation instant, when migration metadata is retained.
+    pub created_at_micros: Option<i64>,
+}
+
+/// Durable provenance for one and only one pending offline owner recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingOwnerRecovery {
+    operation_id: SecurityId,
+    key_id: ApiKeyId,
+    authorization_epoch: AuthorizationEpoch,
+    created_at_micros: i64,
+    provenance: OwnerRecoveryProvenance,
+}
+
+/// Authority source recorded for pending owner recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerRecoveryProvenance {
+    /// Exclusive offline data-directory ownership validated by the OS.
+    OfflineOperatingSystemOwner,
+}
+
+impl PendingOwnerRecovery {
+    /// Returns the stable offline operation identity.
+    pub const fn operation_id(self) -> SecurityId {
+        self.operation_id
+    }
+
+    /// Returns the public replacement key identity.
+    pub const fn key_id(self) -> ApiKeyId {
+        self.key_id
+    }
+
+    /// Returns the generation committed by recovery phase one.
+    pub const fn authorization_epoch(self) -> AuthorizationEpoch {
+        self.authorization_epoch
+    }
+
+    /// Returns the durable phase-one creation instant.
+    pub const fn created_at_micros(self) -> i64 {
+        self.created_at_micros
+    }
+
+    /// Returns the authority source that created this pending operation.
+    pub const fn provenance(self) -> OwnerRecoveryProvenance {
+        self.provenance
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,6 +674,8 @@ pub enum SecurityAuditAction {
     SetPrincipalEnabled,
     /// Direct role-assignment revocation.
     RevokeAssignment,
+    /// Explicit terminal legacy-bearer revocation.
+    RevokeLegacyBearer,
 }
 
 impl SecurityAuditAction {
@@ -508,6 +697,7 @@ impl SecurityAuditAction {
             Self::AbortKeyIssue => 12,
             Self::SetPrincipalEnabled => 13,
             Self::RevokeAssignment => 14,
+            Self::RevokeLegacyBearer => 15,
         }
     }
 
@@ -529,6 +719,7 @@ impl SecurityAuditAction {
             12 => Some(Self::AbortKeyIssue),
             13 => Some(Self::SetPrincipalEnabled),
             14 => Some(Self::RevokeAssignment),
+            15 => Some(Self::RevokeLegacyBearer),
             _ => None,
         }
     }
@@ -542,6 +733,14 @@ enum SecurityMutationOperation {
     AssignBuiltInRole,
     AssignCustomRole,
     RevokeAssignment,
+    IssueKeyStart,
+    IssueKeyActivate,
+    RotateKeyStart,
+    RotateKeyActivate,
+    AbortKeyIssue,
+    AbortKeyRotation,
+    RevokeKey,
+    RevokeLegacyBearer,
 }
 
 impl SecurityMutationOperation {
@@ -553,6 +752,14 @@ impl SecurityMutationOperation {
             Self::AssignBuiltInRole => 3,
             Self::AssignCustomRole => 4,
             Self::RevokeAssignment => 5,
+            Self::IssueKeyStart => 6,
+            Self::IssueKeyActivate => 7,
+            Self::RotateKeyStart => 8,
+            Self::RotateKeyActivate => 9,
+            Self::AbortKeyIssue => 10,
+            Self::AbortKeyRotation => 11,
+            Self::RevokeKey => 12,
+            Self::RevokeLegacyBearer => 13,
         }
     }
 
@@ -564,7 +771,38 @@ impl SecurityMutationOperation {
             3 => Some(Self::AssignBuiltInRole),
             4 => Some(Self::AssignCustomRole),
             5 => Some(Self::RevokeAssignment),
+            6 => Some(Self::IssueKeyStart),
+            7 => Some(Self::IssueKeyActivate),
+            8 => Some(Self::RotateKeyStart),
+            9 => Some(Self::RotateKeyActivate),
+            10 => Some(Self::AbortKeyIssue),
+            11 => Some(Self::AbortKeyRotation),
+            12 => Some(Self::RevokeKey),
+            13 => Some(Self::RevokeLegacyBearer),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecurityMutationResultId {
+    None,
+    Security(SecurityId),
+    ApiKey(ApiKeyId),
+}
+
+impl SecurityMutationResultId {
+    const fn security_id(self) -> Option<SecurityId> {
+        match self {
+            Self::Security(id) => Some(id),
+            Self::None | Self::ApiKey(_) => None,
+        }
+    }
+
+    const fn api_key_id(self) -> Option<ApiKeyId> {
+        match self {
+            Self::ApiKey(id) => Some(id),
+            Self::None | Self::Security(_) => None,
         }
     }
 }
@@ -575,7 +813,9 @@ struct SecurityMutationMarker {
     request_digest: [u8; 32],
     actor_principal_id: SecurityId,
     actor_key_id: ApiKeyId,
-    result_id: SecurityId,
+    result_id: SecurityMutationResultId,
+    predecessor_key_id: Option<ApiKeyId>,
+    overlap_until_micros: Option<i64>,
     authorization_epoch: AuthorizationEpoch,
     transaction_id: u128,
 }
@@ -591,7 +831,9 @@ struct SecurityMutationDraft {
     request_digest: [u8; 32],
     actor_principal_id: SecurityId,
     actor_key_id: ApiKeyId,
-    result_id: SecurityId,
+    result_id: SecurityMutationResultId,
+    predecessor_key_id: Option<ApiKeyId>,
+    overlap_until_micros: Option<i64>,
     authorization_epoch: AuthorizationEpoch,
     fingerprint: [u8; 32],
 }
@@ -602,7 +844,7 @@ impl SecurityMutationDraft {
         request_digest: [u8; 32],
         actor: &AuthenticatedAuthority,
         idempotency_token: u128,
-        result_id: SecurityId,
+        result_id: SecurityMutationResultId,
         authorization_epoch: AuthorizationEpoch,
     ) -> Result<Self, ProductError> {
         if idempotency_token == 0 {
@@ -614,17 +856,64 @@ impl SecurityMutationDraft {
             actor_principal_id: actor.principal_id,
             actor_key_id: actor.key_id,
             result_id,
+            predecessor_key_id: None,
+            overlap_until_micros: None,
             authorization_epoch,
             fingerprint: security_mutation_fingerprint(actor, idempotency_token),
         })
+    }
+
+    fn with_activation(
+        mut self,
+        predecessor_key_id: Option<ApiKeyId>,
+        overlap_until_micros: Option<i64>,
+    ) -> Self {
+        self.predecessor_key_id = predecessor_key_id;
+        self.overlap_until_micros = overlap_until_micros;
+        self
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SecurityMutationReplay {
-    result_id: SecurityId,
+    result_id: SecurityMutationResultId,
+    predecessor_key_id: Option<ApiKeyId>,
+    overlap_until_micros: Option<i64>,
     authorization_epoch: AuthorizationEpoch,
     commit: ProductCommitReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfflineOwnerRecoveryOutcome {
+    Activated,
+    Aborted,
+}
+
+impl OfflineOwnerRecoveryOutcome {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Activated => 1,
+            Self::Aborted => 2,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Activated),
+            2 => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OfflineOwnerRecoveryMarker {
+    outcome: OfflineOwnerRecoveryOutcome,
+    operation_id: SecurityId,
+    key_id: ApiKeyId,
+    expected_authorization_epoch: AuthorizationEpoch,
+    result_authorization_epoch: AuthorizationEpoch,
+    transaction_id: u128,
 }
 
 /// Redacted public target in one security audit event.
@@ -638,6 +927,8 @@ pub enum SecurityAuditTarget {
     Assignment(SecurityId),
     /// Public API-key identity.
     Key(ApiKeyId),
+    /// The directory-scoped synthetic compatibility authority.
+    LegacyBearer,
 }
 
 /// Typed redacted metadata retained by a security audit event.
@@ -773,10 +1064,60 @@ struct SecurityAuditAppend {
 
 type OwnerRecoveryStart = (
     SecurityId,
+    SecurityId,
     IssuedApiKey,
     AuthorizationEpoch,
     Box<[ApiKeyId]>,
 );
+
+/// Definite result of legacy-bearer migration phase one.
+#[derive(Debug)]
+pub struct LegacyBearerMigrationStartReceipt {
+    /// Stable canonical Owner principal.
+    pub principal_id: SecurityId,
+    /// Stable migration operation identity.
+    pub operation_id: SecurityId,
+    /// Public identity of the inactive canonical Owner key.
+    pub key_id: ApiKeyId,
+    /// Authorization generation after publishing pending migration state.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict phase-one commit.
+    pub commit: ProductCommitReceipt,
+    /// One-time secret for a restricted output file.
+    pub secret: IssuedApiKey,
+}
+
+/// Definite result of activating the legacy dual window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyBearerMigrationActivationReceipt {
+    /// Stable migration operation identity.
+    pub operation_id: SecurityId,
+    /// Activated canonical Owner key identity.
+    pub key_id: ApiKeyId,
+    /// Authorization generation after activation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict activation commit.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite result of terminal legacy-bearer revocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyBearerRevocationReceipt {
+    /// Durable authorization generation after revocation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict terminal commit.
+    pub commit: ProductCommitReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LegacyBearerMigrationMarker {
+    operation_id: SecurityId,
+    key_id: ApiKeyId,
+    expected_authorization_epoch: AuthorizationEpoch,
+    result_authorization_epoch: AuthorizationEpoch,
+    request_digest: [u8; 32],
+    transaction_id: u128,
+}
 
 impl SecurityAuditDraft {
     fn offline(
@@ -1780,6 +2121,58 @@ pub struct AccessControlBootstrapReceipt {
     pub commit: ProductCommitReceipt,
 }
 
+/// Redacted offline owner-recovery state. Verifier and secret are absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerRecoveryInspection {
+    /// Current managed authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Exact pending recovery provenance, when present.
+    pub pending: Option<PendingOwnerRecovery>,
+}
+
+/// Definite result of recovery phase one.
+#[derive(Debug)]
+pub struct OwnerRecoveryStartReceipt {
+    /// Stable owner principal retained by the operation.
+    pub principal_id: SecurityId,
+    /// Stable operation identity used for redacted provenance.
+    pub operation_id: SecurityId,
+    /// Public identity of the inactive replacement.
+    pub key_id: ApiKeyId,
+    /// Authorization generation after phase one.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict commit that published pending provenance and verifier.
+    pub commit: ProductCommitReceipt,
+    /// One-time secret delivery for the restricted output sink.
+    pub secret: IssuedApiKey,
+}
+
+/// Definite result of owner recovery activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerRecoveryActivationReceipt {
+    /// Stable recovery operation identity.
+    pub operation_id: SecurityId,
+    /// Activated public key identity.
+    pub key_id: ApiKeyId,
+    /// Authorization generation after old owner keys were retired.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict activation commit.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite result of exact pending-recovery abort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerRecoveryAbortReceipt {
+    /// Aborted stable recovery operation identity.
+    pub operation_id: SecurityId,
+    /// Removed inactive public key identity.
+    pub key_id: ApiKeyId,
+    /// Authorization generation after abort.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict abort commit.
+    pub commit: ProductCommitReceipt,
+}
+
 /// Definite result of one durable access-control mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AccessControlMutationReceipt {
@@ -1847,6 +2240,59 @@ pub struct ApiKeyRotationReceipt {
     /// Published authorization generation.
     pub authorization_epoch: AuthorizationEpoch,
     /// Strict commit that activated the successor and set the deadline.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Definite first-phase result with one process-wide one-time secret delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiKeyStartReceipt {
+    /// Public identity of the inactive pending key.
+    pub key_id: ApiKeyId,
+    /// Owning principal identity.
+    pub principal_id: SecurityId,
+    /// Public predecessor identity for a rotation.
+    pub predecessor_key_id: Option<ApiKeyId>,
+    /// Authorization generation after the pending verifier committed.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict commit that published the inactive verifier.
+    pub commit: ProductCommitReceipt,
+    /// Secret delivery consumable exactly once across cloned responses.
+    pub secret: ApiKeySecretDelivery,
+}
+
+impl ApiKeyStartReceipt {
+    /// Exact canonical Native response bytes required to deliver this receipt.
+    pub const fn wire_size_bound() -> usize {
+        282
+    }
+}
+
+/// Definite result of activating an issue or rotation successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiKeyActivationReceipt {
+    /// Public identity of the activated key.
+    pub key_id: ApiKeyId,
+    /// Public predecessor identity for a rotation.
+    pub predecessor_key_id: Option<ApiKeyId>,
+    /// Exclusive predecessor overlap deadline for a rotation.
+    pub overlap_until_micros: Option<i64>,
+    /// Published authorization generation.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Strict commit that activated the key.
+    pub commit: ProductCommitReceipt,
+}
+
+/// Redacted durable marker observation exposed only to crash-matrix harnesses.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityMutationTestObservation {
+    /// Stable security result identity, when the mutation created one.
+    pub result_security_id: Option<SecurityId>,
+    /// Stable key result identity, when the mutation targeted or created one.
+    pub result_key_id: Option<ApiKeyId>,
+    /// Authorization generation retained by the idempotency marker.
+    pub authorization_epoch: AuthorizationEpoch,
+    /// Exact commit retained by the idempotency marker.
     pub commit: ProductCommitReceipt,
 }
 
@@ -1922,6 +2368,10 @@ impl AccessControlCatalog {
             custom_assignments: BTreeMap::new(),
             keys: BTreeMap::new(),
             audit_index: Vec::new(),
+            pending_owner_recovery: None,
+            legacy_bearer_state: LegacyBearerState::NeverEnabled,
+            legacy_bearer_migration: None,
+            legacy_bearer_verifier: None,
         }
     }
 
@@ -1993,6 +2443,144 @@ impl AccessControlCatalog {
             },
         );
         Ok((principal_id, issued))
+    }
+
+    fn begin_legacy_bearer_migration(
+        &mut self,
+        display_name: &str,
+        key_label: &str,
+        created_at_micros: i64,
+        request_digest: [u8; 32],
+        legacy_bearer_verifier: [u8; 32],
+    ) -> Result<
+        (
+            SecurityId,
+            SecurityId,
+            IssuedApiKey,
+            AuthorizationEpoch,
+            Option<ApiKeyId>,
+        ),
+        AccessCatalogError,
+    > {
+        validate_display_name(display_name)?;
+        validate_display_name(key_label)?;
+        if self.legacy_bearer_state == LegacyBearerState::MigrationPending {
+            let migration = self
+                .legacy_bearer_migration
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            if migration.request_digest != request_digest {
+                return Err(AccessCatalogError::Conflict);
+            }
+            if self.legacy_bearer_verifier != Some(legacy_bearer_verifier) {
+                return Err(AccessCatalogError::Conflict);
+            }
+            let previous = self
+                .keys
+                .get(&migration.key_id)
+                .filter(|key| !key.active && !key.revoked)
+                .cloned()
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            let (verifier, issued) =
+                ApiKeyVerifier::issue().map_err(|_| AccessCatalogError::Entropy)?;
+            if self.keys.contains_key(&verifier.id()) {
+                return Err(AccessCatalogError::Conflict);
+            }
+            let epoch = self.next_epoch()?;
+            let operation_id = SecurityId::generate().map_err(|_| AccessCatalogError::Entropy)?;
+            self.keys.remove(&migration.key_id);
+            self.keys.insert(
+                verifier.id(),
+                ApiKeyRecord {
+                    id: verifier.id(),
+                    principal_id: previous.principal_id,
+                    label: key_label.into(),
+                    verifier,
+                    active: false,
+                    roles: vec![BuiltInRole::Owner].into_boxed_slice(),
+                    custom_roles: Box::new([]),
+                    permission_ceiling: ProductAuthorization::ALL,
+                    scope_ceiling: vec![ProductScope::Instance].into_boxed_slice(),
+                    created_at_micros,
+                    expires_at_micros: None,
+                    revoked: false,
+                    published_epoch: epoch,
+                    predecessor_id: None,
+                    successor_id: None,
+                    overlap_until_micros: None,
+                    rotation_overlap_micros: None,
+                },
+            );
+            self.epoch = epoch;
+            self.legacy_bearer_migration = Some(LegacyBearerMigration {
+                operation_id,
+                key_id: issued.id(),
+                authorization_epoch: epoch,
+                created_at_micros,
+                request_digest,
+            });
+            self.legacy_bearer_verifier = Some(legacy_bearer_verifier);
+            return Ok((
+                previous.principal_id,
+                operation_id,
+                issued,
+                epoch,
+                Some(migration.key_id),
+            ));
+        }
+        if self.legacy_bearer_state != LegacyBearerState::NeverEnabled
+            || self.legacy_bearer_migration.is_some()
+        {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let (principal_id, issued) =
+            self.bootstrap_owner(display_name, key_label, created_at_micros)?;
+        let operation_id = SecurityId::generate().map_err(|_| AccessCatalogError::Entropy)?;
+        self.legacy_bearer_state = LegacyBearerState::MigrationPending;
+        self.legacy_bearer_migration = Some(LegacyBearerMigration {
+            operation_id,
+            key_id: issued.id(),
+            authorization_epoch: self.epoch,
+            created_at_micros,
+            request_digest,
+        });
+        self.legacy_bearer_verifier = Some(legacy_bearer_verifier);
+        Ok((principal_id, operation_id, issued, self.epoch, None))
+    }
+
+    fn activate_legacy_bearer_migration(
+        &mut self,
+        key_id: ApiKeyId,
+        expected_authorization_epoch: AuthorizationEpoch,
+        request_digest: [u8; 32],
+    ) -> Result<(SecurityId, AuthorizationEpoch), AccessCatalogError> {
+        let migration = self
+            .legacy_bearer_migration
+            .ok_or(AccessCatalogError::NotFound)?;
+        if self.legacy_bearer_state != LegacyBearerState::MigrationPending
+            || migration.key_id != key_id
+            || migration.authorization_epoch != expected_authorization_epoch
+            || migration.request_digest != request_digest
+            || self.epoch != expected_authorization_epoch
+        {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let epoch = self.activate_key(key_id)?;
+        self.legacy_bearer_state = LegacyBearerState::DualWindow;
+        Ok((migration.operation_id, epoch))
+    }
+
+    fn revoke_legacy_bearer(&mut self) -> Result<AuthorizationEpoch, AccessCatalogError> {
+        match self.legacy_bearer_state {
+            LegacyBearerState::Revoked => Ok(self.epoch),
+            LegacyBearerState::MigrationPending | LegacyBearerState::DualWindow => {
+                let epoch = self.next_epoch()?;
+                self.legacy_bearer_state = LegacyBearerState::Revoked;
+                self.legacy_bearer_verifier = None;
+                self.epoch = epoch;
+                Ok(epoch)
+            }
+            LegacyBearerState::NeverEnabled => Err(AccessCatalogError::Conflict),
+        }
     }
 
     /// Creates one disabled-by-default durable principal record.
@@ -2478,6 +3066,27 @@ impl AccessControlCatalog {
         !self.principals.is_empty()
     }
 
+    /// Returns the terminal-aware legacy-bearer compatibility state.
+    pub const fn legacy_bearer_state(&self) -> LegacyBearerState {
+        self.legacy_bearer_state
+    }
+
+    /// Returns redacted migration state without a verifier or secret.
+    pub fn legacy_bearer_inspection(&self) -> LegacyBearerMigrationInspection {
+        LegacyBearerMigrationInspection {
+            state: self.legacy_bearer_state,
+            authorization_epoch: self.epoch,
+            operation_id: self.legacy_bearer_migration.map(|value| value.operation_id),
+            key_id: self.legacy_bearer_migration.map(|value| value.key_id),
+            migration_authorization_epoch: self
+                .legacy_bearer_migration
+                .map(|value| value.authorization_epoch),
+            created_at_micros: self
+                .legacy_bearer_migration
+                .map(|value| value.created_at_micros),
+        }
+    }
+
     /// Returns one redacted principal record.
     pub fn principal(&self, id: SecurityId) -> Option<&SecurityPrincipalRecord> {
         self.principals.get(&id)
@@ -2779,11 +3388,40 @@ impl AccessControlCatalog {
         self.authority_for_key(key_id, logical_time_micros, directory_lineage)
     }
 
+    fn authenticate_terminal_replay_for_lineage(
+        &self,
+        candidate: &str,
+        logical_time_micros: i64,
+        directory_lineage: [u8; 24],
+    ) -> Result<AuthenticatedAuthority, AccessCatalogError> {
+        let key_id =
+            ApiKeyVerifier::candidate_id(candidate).ok_or(AccessCatalogError::Unauthorized)?;
+        let key = self
+            .keys
+            .get(&key_id)
+            .ok_or(AccessCatalogError::Unauthorized)?;
+        if !key.verifier.verifies(candidate) || !key.revoked {
+            return Err(AccessCatalogError::Unauthorized);
+        }
+        self.authority_for_key_lifecycle(key_id, logical_time_micros, directory_lineage, false)
+    }
+
     fn authority_for_key(
         &self,
         key_id: ApiKeyId,
         logical_time_micros: i64,
         directory_lineage: [u8; 24],
+    ) -> Result<AuthenticatedAuthority, AccessCatalogError> {
+        self.authority_for_key_lifecycle(key_id, logical_time_micros, directory_lineage, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn authority_for_key_lifecycle(
+        &self,
+        key_id: ApiKeyId,
+        logical_time_micros: i64,
+        directory_lineage: [u8; 24],
+        require_live: bool,
     ) -> Result<AuthenticatedAuthority, AccessCatalogError> {
         if directory_lineage == [0; 24] {
             return Err(AccessCatalogError::CorruptCatalog);
@@ -2792,22 +3430,32 @@ impl AccessControlCatalog {
             .keys
             .get(&key_id)
             .ok_or(AccessCatalogError::Unauthorized)?;
-        if !key.active
-            || key.revoked
-            || key
+        if require_live
+            && (!key.active
+                || key.revoked
+                || key
+                    .expires_at_micros
+                    .is_some_and(|expiry| logical_time_micros >= expiry))
+        {
+            return Err(AccessCatalogError::Unauthorized);
+        }
+        if !require_live
+            && key
                 .expires_at_micros
                 .is_some_and(|expiry| logical_time_micros >= expiry)
         {
             return Err(AccessCatalogError::Unauthorized);
         }
-        if key.successor_id.zip(key.overlap_until_micros).is_some_and(
-            |(successor_id, overlap_until)| {
-                self.keys
-                    .get(&successor_id)
-                    .is_some_and(|successor| successor.active)
-                    && logical_time_micros >= overlap_until
-            },
-        ) {
+        if require_live
+            && key.successor_id.zip(key.overlap_until_micros).is_some_and(
+                |(successor_id, overlap_until)| {
+                    self.keys
+                        .get(&successor_id)
+                        .is_some_and(|successor| successor.active)
+                        && logical_time_micros >= overlap_until
+                },
+            )
+        {
             return Err(AccessCatalogError::Unauthorized);
         }
         let principal = self
@@ -2867,6 +3515,7 @@ impl AccessControlCatalog {
             authorization,
             authorization_epoch: self.epoch,
             directory_lineage,
+            terminal_replay_only: false,
             valid_until_micros,
             effective_roles: effective_roles
                 .into_iter()
@@ -2878,6 +3527,7 @@ impl AccessControlCatalog {
                 .into_boxed_slice(),
             scope_ceiling: key.scope_ceiling.clone(),
             scoped_authorization: scoped_authorization.into_boxed_slice(),
+            catalog_cursor_key: catalog_cursor_key(key, directory_lineage),
         })
     }
 
@@ -2889,8 +3539,11 @@ impl AccessControlCatalog {
     /// cannot advance.
     pub fn revoke_key(&mut self, id: ApiKeyId) -> Result<AuthorizationEpoch, AccessCatalogError> {
         let current = self.keys.get(&id).ok_or(AccessCatalogError::NotFound)?;
-        if !current.active || current.revoked {
+        if !current.active {
             return Err(AccessCatalogError::Conflict);
+        }
+        if current.revoked {
+            return Ok(self.epoch);
         }
         let next_epoch = self
             .epoch
@@ -2981,9 +3634,12 @@ impl AccessControlCatalog {
                 .ok_or(AccessCatalogError::CorruptCatalog)?;
             successor.active = true;
             successor.published_epoch = next_epoch;
-            successor.predecessor_id = None;
-            successor.rotation_overlap_micros = None;
-            self.keys.remove(&predecessor_id);
+            let predecessor = self
+                .keys
+                .get_mut(&predecessor_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            predecessor.revoked = true;
+            predecessor.overlap_until_micros = Some(overlap_until_micros);
         } else {
             let successor = self
                 .keys
@@ -3186,6 +3842,12 @@ impl AccessControlCatalog {
         Ok(next_epoch)
     }
 
+    fn pending_key(&self, key_id: ApiKeyId) -> Option<&ApiKeyRecord> {
+        self.keys
+            .get(&key_id)
+            .filter(|key| !key.active && !key.revoked)
+    }
+
     fn pending_key_issue(
         &self,
         principal_id: SecurityId,
@@ -3237,7 +3899,7 @@ impl AccessControlCatalog {
         created_at_micros: i64,
     ) -> Result<(SecurityId, IssuedApiKey, AuthorizationEpoch), AccessCatalogError> {
         self.begin_owner_recovery_with_retired(label, created_at_micros)
-            .map(|(principal_id, issued, epoch, _)| (principal_id, issued, epoch))
+            .map(|(principal_id, _, issued, epoch, _)| (principal_id, issued, epoch))
     }
 
     fn begin_owner_recovery_with_retired(
@@ -3246,6 +3908,9 @@ impl AccessControlCatalog {
         created_at_micros: i64,
     ) -> Result<OwnerRecoveryStart, AccessCatalogError> {
         validate_display_name(label)?;
+        if self.pending_owner_recovery.is_some() {
+            return Err(AccessCatalogError::Conflict);
+        }
         let owner_principals: BTreeSet<_> = self
             .assignments
             .values()
@@ -3287,6 +3952,7 @@ impl AccessControlCatalog {
             return Err(AccessCatalogError::Conflict);
         }
         let epoch = self.next_epoch()?;
+        let operation_id = SecurityId::generate().map_err(|_| AccessCatalogError::Entropy)?;
         for (_, retired_key_id) in &removable {
             self.keys.remove(retired_key_id);
         }
@@ -3313,8 +3979,23 @@ impl AccessControlCatalog {
             },
         );
         self.epoch = epoch;
+        self.pending_owner_recovery = Some(PendingOwnerRecovery {
+            operation_id,
+            key_id: issued.id(),
+            authorization_epoch: epoch,
+            created_at_micros,
+            provenance: OwnerRecoveryProvenance::OfflineOperatingSystemOwner,
+        });
+        if self.legacy_bearer_state == LegacyBearerState::MigrationPending {
+            // Recovery supersedes the undelivered migration key in the same
+            // catalog generation. Retained migration metadata remains valid
+            // terminal provenance and no longer points at required authority.
+            self.legacy_bearer_state = LegacyBearerState::Revoked;
+            self.legacy_bearer_verifier = None;
+        }
         Ok((
             owner_principal,
+            operation_id,
             issued,
             epoch,
             removable
@@ -3342,7 +4023,16 @@ impl AccessControlCatalog {
         &mut self,
         id: ApiKeyId,
     ) -> Result<(AuthorizationEpoch, Box<[ApiKeyId]>), AccessCatalogError> {
-        let replacement = self.keys.get(&id).ok_or(AccessCatalogError::NotFound)?;
+        let pending = self
+            .pending_owner_recovery
+            .ok_or(AccessCatalogError::NotFound)?;
+        if pending.key_id != id {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let replacement = self
+            .keys
+            .get(&id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?;
         if replacement.active
             || replacement.revoked
             || replacement.roles.as_ref() != [BuiltInRole::Owner]
@@ -3380,7 +4070,40 @@ impl AccessControlCatalog {
         replacement.active = true;
         replacement.published_epoch = epoch;
         self.epoch = epoch;
-        Ok((epoch, retired.into_boxed_slice()))
+        self.pending_owner_recovery = None;
+        if self.legacy_bearer_state.is_enabled() {
+            self.legacy_bearer_state = LegacyBearerState::Revoked;
+            self.legacy_bearer_verifier = None;
+        }
+        Ok((self.epoch, retired.into_boxed_slice()))
+    }
+
+    fn abort_owner_recovery(
+        &mut self,
+        key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+    ) -> Result<(PendingOwnerRecovery, AuthorizationEpoch), AccessCatalogError> {
+        let pending = self
+            .pending_owner_recovery
+            .ok_or(AccessCatalogError::NotFound)?;
+        if pending.key_id != key_id
+            || pending.authorization_epoch != expected_epoch
+            || self.epoch != expected_epoch
+        {
+            return Err(AccessCatalogError::Conflict);
+        }
+        let key = self
+            .keys
+            .get(&key_id)
+            .ok_or(AccessCatalogError::CorruptCatalog)?;
+        if key.active || key.revoked {
+            return Err(AccessCatalogError::CorruptCatalog);
+        }
+        let epoch = self.next_epoch()?;
+        self.keys.remove(&key_id);
+        self.pending_owner_recovery = None;
+        self.epoch = epoch;
+        Ok((pending, epoch))
     }
 
     /// Returns one bounded page after an exclusive retained-event cursor.
@@ -3467,6 +4190,10 @@ impl AccessControlCatalog {
         push_count(&mut output, self.custom_assignments.len())?;
         push_count(&mut output, self.keys.len())?;
         push_count(&mut output, self.audit_index.len())?;
+        output.push(u8::from(self.pending_owner_recovery.is_some()));
+        output.push(self.legacy_bearer_state.tag());
+        output.push(u8::from(self.legacy_bearer_migration.is_some()));
+        output.push(u8::from(self.legacy_bearer_verifier.is_some()));
         for record in self.principals.values() {
             output.extend_from_slice(&record.id.to_be_bytes());
             output.push(u8::from(record.enabled));
@@ -3503,6 +4230,25 @@ impl AccessControlCatalog {
             output.extend_from_slice(&event.id.to_be_bytes());
             output.extend_from_slice(&event.commit_csn.to_be_bytes());
         }
+        if let Some(pending) = self.pending_owner_recovery {
+            output.extend_from_slice(&pending.operation_id.to_be_bytes());
+            output.extend_from_slice(pending.key_id.as_bytes());
+            output.extend_from_slice(&pending.authorization_epoch.get().to_be_bytes());
+            output.extend_from_slice(&pending.created_at_micros.to_be_bytes());
+            output.push(match pending.provenance {
+                OwnerRecoveryProvenance::OfflineOperatingSystemOwner => 1,
+            });
+        }
+        if let Some(migration) = self.legacy_bearer_migration {
+            output.extend_from_slice(&migration.operation_id.to_be_bytes());
+            output.extend_from_slice(migration.key_id.as_bytes());
+            output.extend_from_slice(&migration.authorization_epoch.get().to_be_bytes());
+            output.extend_from_slice(&migration.created_at_micros.to_be_bytes());
+            output.extend_from_slice(&migration.request_digest);
+        }
+        if let Some(verifier) = self.legacy_bearer_verifier {
+            output.extend_from_slice(&verifier);
+        }
         if output.len() > MAX_ACCESS_CATALOG_BYTES - CATALOG_DIGEST_BYTES {
             return Err(AccessCatalogError::LimitExceeded);
         }
@@ -3517,6 +4263,7 @@ impl AccessControlCatalog {
     ///
     /// Returns [`AccessCatalogError::CorruptCatalog`] for any invalid,
     /// duplicate, noncanonical, oversized, or digest-mismatched input.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(encoded: &[u8]) -> Result<Self, AccessCatalogError> {
         if encoded.len() < CATALOG_MAGIC.len() + 8 + 12 + CATALOG_DIGEST_BYTES
             || encoded.len() > MAX_ACCESS_CATALOG_BYTES
@@ -3531,7 +4278,12 @@ impl AccessControlCatalog {
         }
         let mut decoder = Decoder::new(body);
         let magic = decoder.take(CATALOG_MAGIC.len())?;
-        if magic != CATALOG_MAGIC && magic != CATALOG_V1_MAGIC {
+        if magic != CATALOG_MAGIC
+            && magic != CATALOG_V4_MAGIC
+            && magic != CATALOG_V3_MAGIC
+            && magic != CATALOG_V2_MAGIC
+            && magic != CATALOG_V1_MAGIC
+        {
             return Err(AccessCatalogError::CorruptCatalog);
         }
         let epoch = AuthorizationEpoch::new(decoder.u64()?);
@@ -3541,12 +4293,16 @@ impl AccessControlCatalog {
             .checked_mul(AccessControlLimits::V1.assignments_per_principal)
             .ok_or(AccessCatalogError::CorruptCatalog)?;
         let assignment_count = decoder.count(assignment_limit)?;
-        let custom_role_count = if magic == CATALOG_MAGIC {
+        let modern = magic == CATALOG_MAGIC
+            || magic == CATALOG_V4_MAGIC
+            || magic == CATALOG_V3_MAGIC
+            || magic == CATALOG_V2_MAGIC;
+        let custom_role_count = if modern {
             decoder.count(AccessControlLimits::V1.custom_roles)?
         } else {
             0
         };
-        let custom_assignment_count = if magic == CATALOG_MAGIC {
+        let custom_assignment_count = if modern {
             decoder.count(assignment_limit)?
         } else {
             0
@@ -3556,23 +4312,87 @@ impl AccessControlCatalog {
             .checked_mul(AccessControlLimits::V1.keys_per_principal)
             .ok_or(AccessCatalogError::CorruptCatalog)?;
         let key_count = decoder.count(key_limit)?;
-        let audit_count = if magic == CATALOG_MAGIC {
+        let audit_count = if modern {
             decoder.count(AccessControlLimits::V1.retained_audit_events)?
         } else {
             0
         };
+        let has_pending_owner_recovery =
+            if magic == CATALOG_MAGIC || magic == CATALOG_V4_MAGIC || magic == CATALOG_V3_MAGIC {
+                decoder.boolean()?
+            } else {
+                false
+            };
+        let legacy_bearer_state = if magic == CATALOG_MAGIC || magic == CATALOG_V4_MAGIC {
+            LegacyBearerState::from_tag(decoder.byte()?)
+                .ok_or(AccessCatalogError::CorruptCatalog)?
+        } else {
+            LegacyBearerState::NeverEnabled
+        };
+        let has_legacy_bearer_migration = if magic == CATALOG_MAGIC || magic == CATALOG_V4_MAGIC {
+            decoder.boolean()?
+        } else {
+            false
+        };
+        let has_legacy_bearer_verifier = if magic == CATALOG_MAGIC {
+            decoder.boolean()?
+        } else {
+            false
+        };
+        let principals = decode_principals(&mut decoder, principal_count)?;
+        let assignments = decode_assignments(&mut decoder, assignment_count)?;
+        let custom_roles = decode_custom_roles(&mut decoder, custom_role_count)?;
+        let custom_assignments = decode_custom_assignments(&mut decoder, custom_assignment_count)?;
+        let keys = if modern {
+            decode_keys_v2(&mut decoder, key_count)?
+        } else {
+            decode_keys_v1(&mut decoder, key_count)?
+        };
+        let audit_index = decode_audit_index(&mut decoder, audit_count)?;
+        let pending_owner_recovery = if has_pending_owner_recovery {
+            Some(PendingOwnerRecovery {
+                operation_id: decoder.security_id()?,
+                key_id: ApiKeyId::from_bytes(decoder.array()?)
+                    .ok_or(AccessCatalogError::CorruptCatalog)?,
+                authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+                created_at_micros: decoder.i64()?,
+                provenance: match decoder.byte()? {
+                    1 => OwnerRecoveryProvenance::OfflineOperatingSystemOwner,
+                    _ => return Err(AccessCatalogError::CorruptCatalog),
+                },
+            })
+        } else {
+            None
+        };
+        let legacy_bearer_migration = if has_legacy_bearer_migration {
+            Some(LegacyBearerMigration {
+                operation_id: decoder.security_id()?,
+                key_id: ApiKeyId::from_bytes(decoder.array()?)
+                    .ok_or(AccessCatalogError::CorruptCatalog)?,
+                authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+                created_at_micros: decoder.i64()?,
+                request_digest: decoder.array()?,
+            })
+        } else {
+            None
+        };
+        let legacy_bearer_verifier = if has_legacy_bearer_verifier {
+            Some(decoder.array()?)
+        } else {
+            None
+        };
         let catalog = Self {
             epoch,
-            principals: decode_principals(&mut decoder, principal_count)?,
-            assignments: decode_assignments(&mut decoder, assignment_count)?,
-            custom_roles: decode_custom_roles(&mut decoder, custom_role_count)?,
-            custom_assignments: decode_custom_assignments(&mut decoder, custom_assignment_count)?,
-            keys: if magic == CATALOG_MAGIC {
-                decode_keys_v2(&mut decoder, key_count)?
-            } else {
-                decode_keys_v1(&mut decoder, key_count)?
-            },
-            audit_index: decode_audit_index(&mut decoder, audit_count)?,
+            principals,
+            assignments,
+            custom_roles,
+            custom_assignments,
+            keys,
+            audit_index,
+            pending_owner_recovery,
+            legacy_bearer_state,
+            legacy_bearer_migration,
+            legacy_bearer_verifier,
         };
         if !decoder.is_empty() {
             return Err(AccessCatalogError::CorruptCatalog);
@@ -3580,6 +4400,12 @@ impl AccessControlCatalog {
         catalog.validate()?;
         let canonical = if magic == CATALOG_MAGIC {
             catalog.encode()?
+        } else if magic == CATALOG_V4_MAGIC {
+            catalog.encode_v4()?
+        } else if magic == CATALOG_V3_MAGIC {
+            catalog.encode_v3()?
+        } else if magic == CATALOG_V2_MAGIC {
+            catalog.encode_v2()?
         } else {
             catalog.encode_v1()?
         };
@@ -3593,6 +4419,10 @@ impl AccessControlCatalog {
         if !self.custom_roles.is_empty()
             || !self.custom_assignments.is_empty()
             || !self.audit_index.is_empty()
+            || self.pending_owner_recovery.is_some()
+            || self.legacy_bearer_state != LegacyBearerState::NeverEnabled
+            || self.legacy_bearer_migration.is_some()
+            || self.legacy_bearer_verifier.is_some()
             || self.keys.values().any(|key| {
                 !key.custom_roles.is_empty()
                     || key.scope_ceiling.as_ref() != [ProductScope::Instance]
@@ -3627,6 +4457,55 @@ impl AccessControlCatalog {
         let digest = blake3::hash(&output);
         output.extend_from_slice(digest.as_bytes());
         Ok(output)
+    }
+
+    fn encode_v2(&self) -> Result<Vec<u8>, AccessCatalogError> {
+        if self.pending_owner_recovery.is_some()
+            || self.legacy_bearer_state != LegacyBearerState::NeverEnabled
+            || self.legacy_bearer_migration.is_some()
+            || self.legacy_bearer_verifier.is_some()
+        {
+            return Err(AccessCatalogError::CorruptCatalog);
+        }
+        let mut encoded = self.encode()?;
+        encoded[..CATALOG_MAGIC.len()].copy_from_slice(CATALOG_V2_MAGIC);
+        let pending_flag = CATALOG_MAGIC.len() + 8 + 6 * std::mem::size_of::<u32>();
+        encoded.remove(pending_flag);
+        encoded.truncate(encoded.len() - CATALOG_DIGEST_BYTES);
+        let digest = blake3::hash(&encoded);
+        encoded.extend_from_slice(digest.as_bytes());
+        Ok(encoded)
+    }
+
+    fn encode_v3(&self) -> Result<Vec<u8>, AccessCatalogError> {
+        if self.legacy_bearer_state != LegacyBearerState::NeverEnabled
+            || self.legacy_bearer_migration.is_some()
+            || self.legacy_bearer_verifier.is_some()
+        {
+            return Err(AccessCatalogError::CorruptCatalog);
+        }
+        let mut encoded = self.encode()?;
+        encoded[..CATALOG_MAGIC.len()].copy_from_slice(CATALOG_V3_MAGIC);
+        let legacy_state = CATALOG_MAGIC.len() + 8 + 6 * std::mem::size_of::<u32>() + 1;
+        encoded.drain(legacy_state..legacy_state + 2);
+        encoded.truncate(encoded.len() - CATALOG_DIGEST_BYTES);
+        let digest = blake3::hash(&encoded);
+        encoded.extend_from_slice(digest.as_bytes());
+        Ok(encoded)
+    }
+
+    fn encode_v4(&self) -> Result<Vec<u8>, AccessCatalogError> {
+        if self.legacy_bearer_verifier.is_some() {
+            return Err(AccessCatalogError::CorruptCatalog);
+        }
+        let mut encoded = self.encode()?;
+        encoded[..CATALOG_MAGIC.len()].copy_from_slice(CATALOG_V4_MAGIC);
+        let verifier_flag = CATALOG_MAGIC.len() + 8 + 6 * std::mem::size_of::<u32>() + 3;
+        encoded.remove(verifier_flag);
+        encoded.truncate(encoded.len() - CATALOG_DIGEST_BYTES);
+        let digest = blake3::hash(&encoded);
+        encoded.extend_from_slice(digest.as_bytes());
+        Ok(encoded)
     }
 
     #[expect(
@@ -3674,6 +4553,47 @@ impl AccessControlCatalog {
             if assignments > limits.assignments_per_principal || keys > limits.keys_per_principal {
                 return Err(AccessCatalogError::LimitExceeded);
             }
+        }
+        match (self.legacy_bearer_state, self.legacy_bearer_migration) {
+            (LegacyBearerState::NeverEnabled, None) => {}
+            (
+                LegacyBearerState::MigrationPending | LegacyBearerState::DualWindow,
+                Some(migration),
+            ) => {
+                let key = self
+                    .keys
+                    .get(&migration.key_id)
+                    .ok_or(AccessCatalogError::CorruptCatalog)?;
+                let is_owner = self.assignments.values().any(|assignment| {
+                    assignment.principal_id == key.principal_id
+                        && assignment.role == BuiltInRole::Owner
+                        && assignment.scope == ProductScope::Instance
+                });
+                let pending = self.legacy_bearer_state == LegacyBearerState::MigrationPending;
+                if migration.authorization_epoch == AuthorizationEpoch::UNMANAGED
+                    || migration.authorization_epoch.get() > self.epoch.get()
+                    || migration.created_at_micros != key.created_at_micros
+                    || !is_owner
+                    || key.revoked
+                    || key.roles.as_ref() != [BuiltInRole::Owner]
+                    || key.permission_ceiling != ProductAuthorization::ALL
+                    || key.scope_ceiling.as_ref() != [ProductScope::Instance]
+                    || key.active == pending
+                {
+                    return Err(AccessCatalogError::CorruptCatalog);
+                }
+            }
+            (LegacyBearerState::Revoked, Some(migration)) => {
+                if migration.authorization_epoch == AuthorizationEpoch::UNMANAGED
+                    || migration.authorization_epoch.get() > self.epoch.get()
+                {
+                    return Err(AccessCatalogError::CorruptCatalog);
+                }
+            }
+            _ => return Err(AccessCatalogError::CorruptCatalog),
+        }
+        if self.legacy_bearer_state.is_enabled() != self.legacy_bearer_verifier.is_some() {
+            return Err(AccessCatalogError::CorruptCatalog);
         }
         for role in self.custom_roles.values() {
             validate_display_name(&role.display_name)?;
@@ -3763,6 +4683,27 @@ impl AccessControlCatalog {
                 return Err(AccessCatalogError::CorruptCatalog);
             }
         }
+        if let Some(pending) = self.pending_owner_recovery {
+            let key = self
+                .keys
+                .get(&pending.key_id)
+                .ok_or(AccessCatalogError::CorruptCatalog)?;
+            if pending.authorization_epoch == AuthorizationEpoch::UNMANAGED
+                || pending.authorization_epoch != self.epoch
+                || key.active
+                || key.revoked
+                || key.published_epoch != pending.authorization_epoch
+                || key.created_at_micros != pending.created_at_micros
+                || key.roles.as_ref() != [BuiltInRole::Owner]
+                || !key.custom_roles.is_empty()
+                || key.permission_ceiling != ProductAuthorization::ALL
+                || key.scope_ceiling.as_ref() != [ProductScope::Instance]
+                || key.predecessor_id.is_some()
+                || key.successor_id.is_some()
+            {
+                return Err(AccessCatalogError::CorruptCatalog);
+            }
+        }
         self.validate_rotation_acyclic()?;
         let owner_assignments: Vec<_> = self
             .assignments
@@ -3825,6 +4766,9 @@ impl AccessControlCatalog {
                 || !self.custom_assignments.is_empty()
                 || !self.keys.is_empty()
                 || !self.audit_index.is_empty()
+                || self.legacy_bearer_state != LegacyBearerState::NeverEnabled
+                || self.legacy_bearer_migration.is_some()
+                || self.legacy_bearer_verifier.is_some()
             {
                 return Err(AccessCatalogError::CorruptCatalog);
             }
@@ -3908,7 +4852,131 @@ fn effective_scopes(
         .collect()
 }
 
+fn catalog_cursor_key(key: &ApiKeyRecord, directory_lineage: [u8; 24]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-catalog-visible-cursor-key-v1\0");
+    hasher.update(&directory_lineage);
+    hasher.update(key.id.as_bytes());
+    hasher.update(key.verifier.digest());
+    *hasher.finalize().as_bytes()
+}
+
+#[allow(clippy::missing_errors_doc)]
 impl NativeProduct {
+    /// Injects one deterministic interruption into the next security commit.
+    ///
+    /// This hook exists only for crash/recovery conformance harnesses. Normal
+    /// product paths never arm it.
+    #[doc(hidden)]
+    pub fn interrupt_next_security_commit_for_test(
+        &mut self,
+        boundary: hyphae_native_runtime::CommitBoundary,
+    ) {
+        self.security_commit_interruption =
+            Some(crate::SecurityCommitInterruption::returning(boundary));
+    }
+
+    /// Installs a synchronous hook at the exact next security commit boundary.
+    ///
+    /// A process-crash harness uses this to notify its parent and park before
+    /// any mutation stack frame or destructor can unwind.
+    #[doc(hidden)]
+    pub fn hook_next_security_commit_for_test(
+        &mut self,
+        boundary: hyphae_native_runtime::CommitBoundary,
+        hook: fn(hyphae_native_runtime::CommitBoundary),
+    ) {
+        self.security_commit_interruption =
+            Some(crate::SecurityCommitInterruption::hooked(boundary, hook));
+    }
+
+    /// Reads one redacted durable idempotency marker for crash-matrix checks.
+    #[doc(hidden)]
+    pub fn security_mutation_observation_for_test(
+        &self,
+        actor: &AuthenticatedAuthority,
+        idempotency_token: u128,
+    ) -> Result<Option<SecurityMutationTestObservation>, ProductError> {
+        if idempotency_token == 0 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let fingerprint = security_mutation_fingerprint(actor, idempotency_token);
+        let snapshot = self.snapshot_bounded(0)?;
+        let Some(encoded) =
+            snapshot.structure_get_internal(&security_mutation_marker_key(fingerprint))
+        else {
+            return Ok(None);
+        };
+        let marker = decode_security_mutation_marker(encoded).map_err(map_catalog_error)?;
+        if marker.actor_principal_id != actor.principal_id || marker.actor_key_id != actor.key_id {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        let transaction_id = TransactionId::new(marker.transaction_id)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let commit = self
+            .database
+            .transaction_commit_receipt(transaction_id)
+            .map(Into::into)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        Ok(Some(SecurityMutationTestObservation {
+            result_security_id: marker.result_id.security_id(),
+            result_key_id: marker.result_id.api_key_id(),
+            authorization_epoch: marker.authorization_epoch,
+            commit,
+        }))
+    }
+
+    /// Reads redacted principals for an embedded crash-matrix harness.
+    #[doc(hidden)]
+    pub fn read_security_principals_for_test(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: SecurityPrincipalListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityPrincipalPage, ProductError> {
+        self.read_security_principals(actor, &request, logical_time_micros)
+    }
+
+    /// Reads redacted keys for an embedded crash-matrix harness.
+    #[doc(hidden)]
+    pub fn read_security_keys_for_test(
+        &self,
+        actor: &AuthenticatedAuthority,
+        request: SecurityKeyListRequest,
+        logical_time_micros: i64,
+    ) -> Result<SecurityKeyPage, ProductError> {
+        self.read_security_keys(actor, &request, logical_time_micros)
+    }
+
+    /// Returns the retained audit count without requiring an online actor.
+    #[doc(hidden)]
+    pub fn security_audit_count_for_test(&self) -> Result<usize, ProductError> {
+        self.load_access_control_catalog()
+            .map(|catalog| catalog.audit_index.len())
+    }
+
+    /// Returns the last redacted audit event for offline crash-matrix checks.
+    #[doc(hidden)]
+    pub fn last_security_audit_for_test(&self) -> Result<Option<SecurityAuditEvent>, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        let Some(encoded_catalog) = snapshot.structure_get_internal(ACCESS_CONTROL_STORAGE_KEY)
+        else {
+            return Ok(None);
+        };
+        let catalog = AccessControlCatalog::decode(encoded_catalog).map_err(map_catalog_error)?;
+        let Some(entry) = catalog.audit_index.last().copied() else {
+            return Ok(None);
+        };
+        let encoded = snapshot
+            .structure_get_internal(&audit_event_storage_key(entry))
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let event = decode_audit_event(encoded).map_err(map_catalog_error)?;
+        if event.id != entry.id || event.commit_csn != entry.commit_csn {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        Ok(Some(event))
+    }
+
     fn read_authorized_security_catalog<T>(
         &self,
         actor: &AuthenticatedAuthority,
@@ -3940,6 +5008,48 @@ impl NativeProduct {
     pub fn access_control_status(&self) -> Result<AccessControlStatus, ProductError> {
         self.load_access_control_catalog()
             .map(|catalog| catalog.status())
+    }
+
+    /// Returns whether this directory contains durable managed principals.
+    pub fn access_control_bootstrapped(&self) -> Result<bool, ProductError> {
+        self.load_access_control_catalog()
+            .map(|catalog| catalog.is_bootstrapped())
+    }
+
+    /// Returns redacted durable legacy-bearer migration state.
+    pub fn legacy_bearer_migration_inspection(
+        &self,
+    ) -> Result<LegacyBearerMigrationInspection, ProductError> {
+        self.load_access_control_catalog()
+            .map(|catalog| catalog.legacy_bearer_inspection())
+    }
+
+    /// Returns the keyed durable verifier while the compatibility bearer is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns corruption if durable state is not internally coherent.
+    pub(crate) fn legacy_bearer_verifier(
+        &self,
+    ) -> Result<Option<LegacyBearerVerifier>, ProductError> {
+        let catalog = self.load_access_control_catalog()?;
+        match (
+            catalog.legacy_bearer_state.is_enabled(),
+            catalog.legacy_bearer_verifier,
+        ) {
+            (true, Some(verifier)) => Ok(Some(LegacyBearerVerifier(verifier))),
+            (false, None) => Ok(None),
+            _ => Err(ProductError::from_code(ProductErrorCode::Corruption)),
+        }
+    }
+
+    pub(crate) fn legacy_bearer_digest_matches(
+        &self,
+        candidate: [u8; 32],
+    ) -> Result<bool, ProductError> {
+        Ok(self
+            .legacy_bearer_verifier()?
+            .is_some_and(|verifier| verifier.verifies_digest(candidate, self.catalog_cursor_key)))
     }
 
     pub(crate) fn read_security_status(
@@ -4071,6 +5181,29 @@ impl NativeProduct {
         self.authenticate_api_key_at(candidate, self.trusted_authorization_time()?)
     }
 
+    /// Authenticates a retained revoked key only for exact terminal replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same uniform authorization denial as normal authentication.
+    pub fn authenticate_api_key_for_terminal_replay(
+        &self,
+        candidate: &str,
+    ) -> Result<AuthenticatedAuthority, ProductError> {
+        let directory_lineage = self.database.directory_identity().lineage().encode();
+        let catalog = self.load_access_control_catalog()?;
+        let mut authority = catalog
+            .authenticate_terminal_replay_for_lineage(
+                candidate,
+                self.trusted_authorization_time()?,
+                directory_lineage,
+            )
+            .map_err(map_catalog_error)?;
+        authority.authorization_epoch = catalog.epoch;
+        authority.terminal_replay_only = true;
+        Ok(authority)
+    }
+
     fn authenticate_api_key_at(
         &self,
         candidate: &str,
@@ -4082,11 +5215,59 @@ impl NativeProduct {
             .map_err(map_catalog_error)
     }
 
+    #[cfg(test)]
     pub(crate) fn authenticate_api_key_trusted(
         &self,
         candidate: &str,
     ) -> Result<AuthenticatedAuthority, ProductError> {
         self.authenticate_api_key_at(candidate, self.trusted_authorization_time()?)
+    }
+
+    pub(crate) fn authenticate_api_key_request_trusted(
+        &self,
+        candidate: &str,
+    ) -> Result<crate::ApiKeyRequestAuthentication, ProductError> {
+        let directory_lineage = self.database.directory_identity().lineage().encode();
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let catalog = self.load_access_control_catalog()?;
+        let key_id = ApiKeyVerifier::candidate_id(candidate);
+        let Some(key) = key_id.and_then(|key_id| catalog.keys.get(&key_id)) else {
+            return Ok(crate::ApiKeyRequestAuthentication::PendingTerminal(
+                crate::PendingTerminalCredential { authority: None },
+            ));
+        };
+        if !key.verifier.verifies(candidate) {
+            return Ok(crate::ApiKeyRequestAuthentication::PendingTerminal(
+                crate::PendingTerminalCredential { authority: None },
+            ));
+        }
+        match catalog.authority_for_key(key.id, authorization_time_micros, directory_lineage) {
+            Ok(authority) => Ok(crate::ApiKeyRequestAuthentication::Authenticated(authority)),
+            Err(AccessCatalogError::Unauthorized) if key.revoked => {
+                let authority = catalog
+                    .authority_for_key_lifecycle(
+                        key.id,
+                        authorization_time_micros,
+                        directory_lineage,
+                        false,
+                    )
+                    .ok()
+                    .map(|mut authority| {
+                        authority.authorization_epoch = catalog.epoch;
+                        authority.terminal_replay_only = true;
+                        authority
+                    });
+                Ok(crate::ApiKeyRequestAuthentication::PendingTerminal(
+                    crate::PendingTerminalCredential { authority },
+                ))
+            }
+            Err(AccessCatalogError::Unauthorized) => {
+                Ok(crate::ApiKeyRequestAuthentication::PendingTerminal(
+                    crate::PendingTerminalCredential { authority: None },
+                ))
+            }
+            Err(error) => Err(map_catalog_error(error)),
+        }
     }
 
     pub(crate) fn revalidate_authenticated_authority(
@@ -4099,7 +5280,8 @@ impl NativeProduct {
             ));
         }
         let now = self.trusted_authorization_time()?;
-        if self.access_control_epoch_known.load(Ordering::Acquire)
+        if !authority.terminal_replay_only
+            && self.access_control_epoch_known.load(Ordering::Acquire)
             && self.access_control_epoch.load(Ordering::Acquire)
                 == authority.authorization_epoch.get()
             && authority
@@ -4178,7 +5360,7 @@ impl NativeProduct {
         display_name: &str,
         idempotency_token: u128,
         logical_time_micros: i64,
-        interruption: Option<hyphae_native_runtime::CommitBoundary>,
+        interruption: Option<crate::SecurityCommitInterruption>,
     ) -> Result<SecurityPrincipalMutationReceipt, ProductError> {
         let mut catalog = self.load_access_control_catalog()?;
         let authorization_time_micros = self.trusted_authorization_time()?;
@@ -4203,7 +5385,10 @@ impl NativeProduct {
             logical_time_micros,
         )? {
             return Ok(SecurityPrincipalMutationReceipt {
-                principal_id: replay.result_id,
+                principal_id: replay
+                    .result_id
+                    .security_id()
+                    .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?,
                 authorization_epoch: replay.authorization_epoch,
                 commit: replay.commit,
             });
@@ -4226,7 +5411,7 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                principal_id,
+                SecurityMutationResultId::Security(principal_id),
                 authorization_epoch,
             )?),
             interruption,
@@ -4306,7 +5491,10 @@ impl NativeProduct {
             logical_time_micros,
         )? {
             return Ok(RoleAssignmentMutationReceipt {
-                assignment_id: replay.result_id,
+                assignment_id: replay
+                    .result_id
+                    .security_id()
+                    .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?,
                 authorization_epoch: replay.authorization_epoch,
                 commit: replay.commit,
             });
@@ -4334,7 +5522,7 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                assignment_id,
+                SecurityMutationResultId::Security(assignment_id),
                 authorization_epoch,
             )?,
         )?;
@@ -4417,7 +5605,10 @@ impl NativeProduct {
             logical_time_micros,
         )? {
             return Ok(CustomRoleMutationReceipt {
-                role_id: replay.result_id,
+                role_id: replay
+                    .result_id
+                    .security_id()
+                    .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?,
                 authorization_epoch: replay.authorization_epoch,
                 commit: replay.commit,
             });
@@ -4440,7 +5631,7 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                role_id,
+                SecurityMutationResultId::Security(role_id),
                 authorization_epoch,
             )?,
         )?;
@@ -4513,7 +5704,10 @@ impl NativeProduct {
             logical_time_micros,
         )? {
             return Ok(RoleAssignmentMutationReceipt {
-                assignment_id: replay.result_id,
+                assignment_id: replay
+                    .result_id
+                    .security_id()
+                    .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?,
                 authorization_epoch: replay.authorization_epoch,
                 commit: replay.commit,
             });
@@ -4539,7 +5733,7 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                assignment_id,
+                SecurityMutationResultId::Security(assignment_id),
                 authorization_epoch,
             )?,
         )?;
@@ -4636,7 +5830,7 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                principal_id,
+                SecurityMutationResultId::None,
                 authorization_epoch,
             )?,
         )?;
@@ -4729,7 +5923,616 @@ impl NativeProduct {
                 request_digest,
                 &actor,
                 idempotency_token,
-                assignment_id,
+                SecurityMutationResultId::None,
+                authorization_epoch,
+            )?,
+        )?;
+        Ok(AccessControlMutationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Starts one inactive API-key issue and returns its secret exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_api_key_issue_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        label: &str,
+        roles: impl IntoIterator<Item = BuiltInRole>,
+        custom_roles: impl IntoIterator<Item = SecurityId>,
+        permission_ceiling: ProductAuthorization,
+        scope_ceiling: impl IntoIterator<Item = ProductScope>,
+        expires_at_micros: Option<i64>,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<ApiKeyStartReceipt, ProductError> {
+        self.start_api_key_issue_idempotent_with_interruption(
+            actor,
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            expires_at_micros,
+            idempotency_token,
+            logical_time_micros,
+            self_manage,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_api_key_issue_idempotent_with_interruption(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        principal_id: SecurityId,
+        label: &str,
+        roles: impl IntoIterator<Item = BuiltInRole>,
+        custom_roles: impl IntoIterator<Item = SecurityId>,
+        permission_ceiling: ProductAuthorization,
+        scope_ceiling: impl IntoIterator<Item = ProductScope>,
+        expires_at_micros: Option<i64>,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+        interruption: Option<crate::SecurityCommitInterruption>,
+    ) -> Result<ApiKeyStartReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let roles: BTreeSet<_> = roles.into_iter().collect();
+        let custom_roles: BTreeSet<_> = custom_roles.into_iter().collect();
+        let scope_ceiling: BTreeSet<_> = scope_ceiling.into_iter().collect();
+        authorize_key_issue_variant(
+            self,
+            &actor,
+            principal_id,
+            &roles,
+            &custom_roles,
+            permission_ceiling,
+            &scope_ceiling,
+            self_manage,
+        )?;
+        let body = key_issue_request_body(
+            principal_id,
+            label,
+            &roles,
+            &custom_roles,
+            permission_ceiling,
+            &scope_ceiling,
+            expires_at_micros,
+            self_manage,
+        )?;
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::IssueKeyStart,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if self
+            .replay_security_mutation(
+                &actor,
+                idempotency_token,
+                SecurityMutationOperation::IssueKeyStart,
+                request_digest,
+                logical_time_micros,
+            )?
+            .is_some()
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::SecretDeliveryConsumed,
+            ));
+        }
+        let (issued, authorization_epoch, retired_keys) = catalog
+            .begin_key_issue_with_roles_and_pruning(
+                principal_id,
+                label,
+                roles,
+                custom_roles,
+                permission_ceiling,
+                scope_ceiling,
+                authorization_time_micros,
+                expires_at_micros,
+            )
+            .map_err(map_catalog_error)?;
+        let key_id = issued.id();
+        let mut targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(key_id),
+        ];
+        targets.extend(retired_keys.iter().copied().map(SecurityAuditTarget::Key));
+        let audit = SecurityAuditDraft::actor(&actor, SecurityAuditAction::IssueKey, targets);
+        let commit = self.commit_access_control_catalog_with_marker(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            Some(SecurityMutationDraft::new(
+                SecurityMutationOperation::IssueKeyStart,
+                request_digest,
+                &actor,
+                idempotency_token,
+                SecurityMutationResultId::ApiKey(key_id),
+                authorization_epoch,
+            )?),
+            interruption,
+        )?;
+        Ok(ApiKeyStartReceipt {
+            key_id,
+            principal_id,
+            predecessor_key_id: None,
+            authorization_epoch,
+            commit,
+            secret: ApiKeySecretDelivery::new(issued),
+        })
+    }
+
+    /// Starts one inactive rotation successor and returns its secret once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_api_key_rotation_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        predecessor_key_id: ApiKeyId,
+        label: &str,
+        overlap_seconds: u64,
+        expires_at_micros: Option<i64>,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<ApiKeyStartReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let predecessor = catalog
+            .key(predecessor_key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+        authorize_key_rotation_target(&catalog, &actor, predecessor, self_manage)?;
+        let body = key_rotation_request_body(
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+            self_manage,
+        )?;
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::RotateKeyStart,
+            &actor,
+            idempotency_token,
+            &body,
+        )?;
+        if self
+            .replay_security_mutation(
+                &actor,
+                idempotency_token,
+                SecurityMutationOperation::RotateKeyStart,
+                request_digest,
+                logical_time_micros,
+            )?
+            .is_some()
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::SecretDeliveryConsumed,
+            ));
+        }
+        let principal_id = predecessor.principal_id();
+        let (issued, authorization_epoch, retired_ancestors) = catalog
+            .begin_key_rotation_with_pruning(
+                predecessor_key_id,
+                label,
+                overlap_seconds,
+                authorization_time_micros,
+                expires_at_micros,
+            )
+            .map_err(map_catalog_error)?;
+        let successor_key_id = issued.id();
+        let mut targets = vec![
+            SecurityAuditTarget::Key(predecessor_key_id),
+            SecurityAuditTarget::Key(successor_key_id),
+        ];
+        targets.extend(
+            retired_ancestors
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
+        );
+        let audit = SecurityAuditDraft::actor(&actor, SecurityAuditAction::RotateKey, targets);
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::RotateKeyStart,
+                request_digest,
+                &actor,
+                idempotency_token,
+                SecurityMutationResultId::ApiKey(successor_key_id),
+                authorization_epoch,
+            )?,
+        )?;
+        Ok(ApiKeyStartReceipt {
+            key_id: successor_key_id,
+            principal_id,
+            predecessor_key_id: Some(predecessor_key_id),
+            authorization_epoch,
+            commit,
+            secret: ApiKeySecretDelivery::new(issued),
+        })
+    }
+
+    /// Activates one exact pending issue after client-side durable output.
+    pub fn activate_api_key_issue_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        key_id: ApiKeyId,
+        confirmation_digest: ApiKeyConfirmationDigest,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<ApiKeyActivationReceipt, ProductError> {
+        self.activate_api_key_idempotent(
+            actor,
+            key_id,
+            confirmation_digest,
+            idempotency_token,
+            logical_time_micros,
+            self_manage,
+            false,
+        )
+    }
+
+    /// Activates one exact pending rotation after client-side durable output.
+    pub fn activate_api_key_rotation_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        successor_key_id: ApiKeyId,
+        confirmation_digest: ApiKeyConfirmationDigest,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<ApiKeyActivationReceipt, ProductError> {
+        self.activate_api_key_idempotent(
+            actor,
+            successor_key_id,
+            confirmation_digest,
+            idempotency_token,
+            logical_time_micros,
+            self_manage,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn activate_api_key_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        key_id: ApiKeyId,
+        confirmation_digest: ApiKeyConfirmationDigest,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+        rotation: bool,
+    ) -> Result<ApiKeyActivationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let operation = if rotation {
+            SecurityMutationOperation::RotateKeyActivate
+        } else {
+            SecurityMutationOperation::IssueKeyActivate
+        };
+        let body = key_target_request_body(key_id, self_manage, Some(confirmation_digest));
+        let request_digest =
+            security_mutation_request_digest(operation, actor, idempotency_token, &body)?;
+        if let Some(replay) = self.replay_security_mutation(
+            actor,
+            idempotency_token,
+            operation,
+            request_digest,
+            logical_time_micros,
+        )? {
+            if replay.result_id.api_key_id() != Some(key_id) {
+                return Err(ProductError::from_code(ProductErrorCode::Corruption));
+            }
+            return Ok(ApiKeyActivationReceipt {
+                key_id,
+                predecessor_key_id: replay.predecessor_key_id,
+                overlap_until_micros: replay.overlap_until_micros,
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let pending = catalog.pending_key(key_id).ok_or_else(|| {
+            ProductError::from_code(if rotation {
+                ProductErrorCode::AuthorizationDenied
+            } else {
+                ProductErrorCode::CatalogConflict
+            })
+        })?;
+        if pending.predecessor_id().is_some() != rotation {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        if rotation {
+            authorize_key_rotation_target(&catalog, &actor, pending, self_manage)?;
+        } else {
+            authorize_key_target_variant(&actor, pending, self_manage)?;
+        }
+        if !bool::from(
+            pending
+                .verifier
+                .confirmation_digest()
+                .as_bytes()
+                .ct_eq(confirmation_digest.as_bytes()),
+        ) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::ConfirmationDigestMismatch,
+            ));
+        }
+        let predecessor_key_id = pending.predecessor_id();
+        let (authorization_epoch, overlap_until_micros) = if rotation {
+            let (epoch, overlap) = catalog
+                .activate_rotated_key(key_id, authorization_time_micros)
+                .map_err(map_catalog_error)?;
+            (epoch, Some(overlap))
+        } else {
+            (
+                catalog.activate_key(key_id).map_err(map_catalog_error)?,
+                None,
+            )
+        };
+        let mut targets = vec![SecurityAuditTarget::Key(key_id)];
+        if let Some(predecessor) = predecessor_key_id {
+            targets.push(SecurityAuditTarget::Key(predecessor));
+        }
+        targets.sort_unstable();
+        let mut audit =
+            SecurityAuditDraft::actor(&actor, SecurityAuditAction::ActivateKey, targets);
+        if let Some(overlap) = overlap_until_micros {
+            audit =
+                audit.with_metadata([SecurityAuditMetadata::RotationOverlapUntilMicros(overlap)]);
+        }
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            authorization_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                operation,
+                request_digest,
+                &actor,
+                idempotency_token,
+                SecurityMutationResultId::ApiKey(key_id),
+                authorization_epoch,
+            )?
+            .with_activation(predecessor_key_id, overlap_until_micros),
+        )?;
+        Ok(ApiKeyActivationReceipt {
+            key_id,
+            predecessor_key_id,
+            overlap_until_micros,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Aborts one exact inactive issued key with durable idempotency.
+    pub fn abort_api_key_issue_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        key_id: ApiKeyId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        self.abort_api_key_idempotent(
+            actor,
+            key_id,
+            idempotency_token,
+            logical_time_micros,
+            self_manage,
+            false,
+        )
+    }
+
+    /// Aborts one exact inactive rotation successor with durable idempotency.
+    pub fn abort_api_key_rotation_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        successor_key_id: ApiKeyId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        self.abort_api_key_idempotent(
+            actor,
+            successor_key_id,
+            idempotency_token,
+            logical_time_micros,
+            self_manage,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn abort_api_key_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        key_id: ApiKeyId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+        rotation: bool,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let operation = if rotation {
+            SecurityMutationOperation::AbortKeyRotation
+        } else {
+            SecurityMutationOperation::AbortKeyIssue
+        };
+        let request_digest = security_mutation_request_digest(
+            operation,
+            &actor,
+            idempotency_token,
+            &key_target_request_body(key_id, self_manage, None),
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            operation,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(AccessControlMutationReceipt {
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        let pending = catalog.pending_key(key_id).ok_or_else(|| {
+            ProductError::from_code(if rotation {
+                ProductErrorCode::AuthorizationDenied
+            } else {
+                ProductErrorCode::CatalogConflict
+            })
+        })?;
+        if pending.predecessor_id().is_some() != rotation {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        if rotation {
+            authorize_key_rotation_target(&catalog, &actor, pending, self_manage)?;
+        } else {
+            authorize_key_target_variant(&actor, pending, self_manage)?;
+        }
+        let principal_id = pending.principal_id();
+        let label = pending.label().to_owned();
+        let predecessor_key_id = pending.predecessor_id();
+        let authorization_epoch = if rotation {
+            catalog
+                .abort_key_rotation(key_id)
+                .map_err(map_catalog_error)?
+        } else {
+            let (aborted, epoch) = catalog
+                .abort_pending_key_issue(principal_id, &label)
+                .map_err(map_catalog_error)?;
+            if aborted != key_id {
+                return Err(ProductError::from_code(ProductErrorCode::Corruption));
+            }
+            epoch
+        };
+        let mut targets = vec![SecurityAuditTarget::Key(key_id)];
+        if !rotation {
+            targets.push(SecurityAuditTarget::Principal(principal_id));
+        }
+        if let Some(predecessor) = predecessor_key_id {
+            targets.push(SecurityAuditTarget::Key(predecessor));
+        }
+        targets.sort_unstable();
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            if rotation {
+                SecurityAuditAction::AbortKeyRotation
+            } else {
+                SecurityAuditAction::AbortKeyIssue
+            },
+            targets,
+        );
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                operation,
+                request_digest,
+                &actor,
+                idempotency_token,
+                SecurityMutationResultId::None,
+                authorization_epoch,
+            )?,
+        )?;
+        Ok(AccessControlMutationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Revokes one exact active API key with durable idempotency.
+    pub fn revoke_api_key_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        target: ApiKeyId,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+        self_manage: bool,
+    ) -> Result<AccessControlMutationReceipt, ProductError> {
+        let mut catalog = self.load_access_control_catalog()?;
+        let authorization_time_micros = self.trusted_authorization_time()?;
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::RevokeKey,
+            actor,
+            idempotency_token,
+            &key_target_request_body(target, self_manage, None),
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            actor,
+            idempotency_token,
+            SecurityMutationOperation::RevokeKey,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(AccessControlMutationReceipt {
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        let actor = current_actor(
+            &catalog,
+            actor,
+            self.database.directory_identity().lineage().encode(),
+            authorization_time_micros,
+        )?;
+        let target_key = catalog
+            .key(target)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        authorize_key_target_variant(&actor, target_key, self_manage)?;
+        let authorization_epoch = catalog.revoke_key(target).map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::RevokeKey,
+            [SecurityAuditTarget::Key(target)],
+        );
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            SecurityMutationDraft::new(
+                SecurityMutationOperation::RevokeKey,
+                request_digest,
+                &actor,
+                idempotency_token,
+                SecurityMutationResultId::None,
                 authorization_epoch,
             )?,
         )?;
@@ -4808,6 +6611,7 @@ impl NativeProduct {
         let custom_roles: BTreeSet<_> = custom_roles.into_iter().collect();
         let scope_ceiling: BTreeSet<_> = scope_ceiling.into_iter().collect();
         authorize_key_issue(
+            self,
             &actor,
             principal_id,
             &roles,
@@ -4895,31 +6699,11 @@ impl NativeProduct {
             self.database.directory_identity().lineage().encode(),
             authorization_time_micros,
         )?;
-        let predecessor_principal = catalog
+        let predecessor = catalog
             .key(predecessor_key_id)
-            .map(ApiKeyRecord::principal_id)
-            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
-        let predecessor_is_owner = catalog
-            .key(predecessor_key_id)
-            .is_some_and(|key| key.roles.contains(&BuiltInRole::Owner));
-        if predecessor_is_owner
-            && !authority_allows_instance(&actor, ProductPermission::OwnershipManage)
-        {
-            return Err(ProductError::from_code(
-                ProductErrorCode::AuthorizationDenied,
-            ));
-        }
-        let allowed = if predecessor_principal == actor.principal_id {
-            authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
-                || authority_allows_instance(&actor, ProductPermission::SecurityManage)
-        } else {
-            authority_allows_instance(&actor, ProductPermission::SecurityManage)
-        };
-        if !allowed {
-            return Err(ProductError::from_code(
-                ProductErrorCode::AuthorizationDenied,
-            ));
-        }
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+        let self_manage = predecessor.principal_id == actor.principal_id;
+        authorize_key_rotation_target(&catalog, &actor, predecessor, self_manage)?;
         let (issued, _pending_epoch, retired_ancestors) = catalog
             .begin_key_rotation_with_pruning(
                 predecessor_key_id,
@@ -5138,50 +6922,19 @@ impl NativeProduct {
         target: ApiKeyId,
         logical_time_micros: i64,
     ) -> Result<AccessControlMutationReceipt, ProductError> {
-        let mut catalog = self.load_access_control_catalog()?;
-        let authorization_time_micros = self.trusted_authorization_time()?;
-        let actor = current_actor(
-            &catalog,
+        let self_manage = actor.principal_id
+            == self
+                .load_access_control_catalog()?
+                .key(target)
+                .map(ApiKeyRecord::principal_id)
+                .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        self.revoke_api_key_idempotent(
             actor,
-            self.database.directory_identity().lineage().encode(),
-            authorization_time_micros,
-        )?;
-        let target_principal = catalog
-            .key(target)
-            .map(ApiKeyRecord::principal_id)
-            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
-        let target_is_owner = catalog
-            .key(target)
-            .is_some_and(|key| key.roles.contains(&BuiltInRole::Owner));
-        if target_is_owner && !authority_allows_instance(&actor, ProductPermission::OwnershipManage)
-        {
-            return Err(ProductError::from_code(
-                ProductErrorCode::AuthorizationDenied,
-            ));
-        }
-        let allowed = if target_principal == actor.principal_id {
-            authority_allows_instance(&actor, ProductPermission::CredentialSelfManage)
-                || authority_allows_instance(&actor, ProductPermission::SecurityManage)
-        } else {
-            authority_allows_instance(&actor, ProductPermission::SecurityManage)
-        };
-        if !allowed {
-            return Err(ProductError::from_code(
-                ProductErrorCode::AuthorizationDenied,
-            ));
-        }
-        let authorization_epoch = catalog.revoke_key(target).map_err(map_catalog_error)?;
-        let audit = SecurityAuditDraft::actor(
-            &actor,
-            SecurityAuditAction::RevokeKey,
-            [SecurityAuditTarget::Key(target)],
-        );
-        let commit =
-            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
-        Ok(AccessControlMutationReceipt {
-            authorization_epoch,
-            commit,
-        })
+            target,
+            fresh_security_idempotency_token()?,
+            logical_time_micros,
+            self_manage,
+        )
     }
 
     /// Bootstraps one owner and writes its secret only to a new restricted file.
@@ -5202,6 +6955,7 @@ impl NativeProduct {
         output_path: impl AsRef<Path>,
         logical_time_micros: i64,
     ) -> Result<AccessControlBootstrapReceipt, ProductError> {
+        self.ensure_default_scalar_keyspace()?;
         let output_path = output_path.as_ref();
         let mut output = create_restricted_output(output_path)?;
         let mut catalog = self.load_access_control_catalog()?;
@@ -5253,6 +7007,185 @@ impl NativeProduct {
         })
     }
 
+    /// Publishes one inactive canonical Owner key for legacy-bearer migration.
+    ///
+    /// The caller must hold offline OS-owner authority. The bearer plaintext is
+    /// never persisted or audited; HYACAT05 retains only its product-keyed verifier.
+    pub fn start_legacy_bearer_migration_offline(
+        &mut self,
+        display_name: &str,
+        key_label: &str,
+        legacy_bearer: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<LegacyBearerMigrationStartReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        validate_legacy_bearer(legacy_bearer)?;
+        self.ensure_default_scalar_keyspace()?;
+        self.ensure_unmanaged_catalog_cursor_authority()?;
+        let request_digest =
+            legacy_bearer_migration_request_digest(display_name, key_label, legacy_bearer)?;
+        let legacy_bearer_verifier =
+            legacy_bearer_verifier(legacy_bearer, self.catalog_cursor_key)?;
+        let mut catalog = self.load_access_control_catalog()?;
+        let (principal_id, operation_id, issued, authorization_epoch, retired_key_id) = catalog
+            .begin_legacy_bearer_migration(
+                display_name,
+                key_label,
+                logical_time_micros,
+                request_digest,
+                legacy_bearer_verifier,
+            )
+            .map_err(map_catalog_error)?;
+        let mut targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(issued.id()),
+            SecurityAuditTarget::LegacyBearer,
+        ];
+        if let Some(retired_key_id) = retired_key_id {
+            targets.push(SecurityAuditTarget::Key(retired_key_id));
+        }
+        let audit = SecurityAuditDraft::offline(SecurityAuditAction::MigrateLegacyBearer, targets);
+        let commit =
+            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        Ok(LegacyBearerMigrationStartReceipt {
+            principal_id,
+            operation_id,
+            key_id: issued.id(),
+            authorization_epoch,
+            commit,
+            secret: issued,
+        })
+    }
+
+    /// Activates the exact canonical Owner key after its restricted file is durable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate_legacy_bearer_migration_offline(
+        &mut self,
+        key_id: ApiKeyId,
+        serialized_key: &str,
+        expected_authorization_epoch: AuthorizationEpoch,
+        display_name: &str,
+        key_label: &str,
+        legacy_bearer: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<LegacyBearerMigrationActivationReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        validate_legacy_bearer(legacy_bearer)?;
+        let request_digest =
+            legacy_bearer_migration_request_digest(display_name, key_label, legacy_bearer)?;
+        if let Some(receipt) = self.replay_legacy_bearer_migration_activation(
+            key_id,
+            expected_authorization_epoch,
+            request_digest,
+        )? {
+            return Ok(receipt);
+        }
+        let mut catalog = self.load_access_control_catalog()?;
+        let migration = catalog
+            .legacy_bearer_migration
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        let verifier = catalog
+            .keys
+            .get(&key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?
+            .verifier
+            .clone();
+        if !verifier.verifies(serialized_key) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::ConfirmationDigestMismatch,
+            ));
+        }
+        let (operation_id, authorization_epoch) = catalog
+            .activate_legacy_bearer_migration(key_id, expected_authorization_epoch, request_digest)
+            .map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::offline(
+            SecurityAuditAction::ActivateKey,
+            [
+                SecurityAuditTarget::Key(key_id),
+                SecurityAuditTarget::LegacyBearer,
+            ],
+        );
+        let (commit, _) = self.commit_access_control_catalog_recording_legacy_migration(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            migration,
+        )?;
+        Ok(LegacyBearerMigrationActivationReceipt {
+            operation_id,
+            key_id,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Permanently disables the synthetic legacy bearer under canonical Owner authority.
+    pub fn revoke_legacy_bearer_idempotent(
+        &mut self,
+        actor: &AuthenticatedAuthority,
+        idempotency_token: u128,
+        logical_time_micros: i64,
+    ) -> Result<LegacyBearerRevocationReceipt, ProductError> {
+        if idempotency_token == 0 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut catalog = self.load_access_control_catalog()?;
+        let actor = require_current_actor(
+            &catalog,
+            actor,
+            ProductPermission::OwnershipManage,
+            self.database.directory_identity().lineage().encode(),
+            self.trusted_authorization_time()?,
+        )?;
+        if !actor.effective_roles.contains(&BuiltInRole::Owner) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::AuthorizationDenied,
+            ));
+        }
+        let request_digest = security_mutation_request_digest(
+            SecurityMutationOperation::RevokeLegacyBearer,
+            &actor,
+            idempotency_token,
+            b"legacy-bearer",
+        )?;
+        if let Some(replay) = self.replay_security_mutation(
+            &actor,
+            idempotency_token,
+            SecurityMutationOperation::RevokeLegacyBearer,
+            request_digest,
+            logical_time_micros,
+        )? {
+            return Ok(LegacyBearerRevocationReceipt {
+                authorization_epoch: replay.authorization_epoch,
+                commit: replay.commit,
+            });
+        }
+        let authorization_epoch = catalog.revoke_legacy_bearer().map_err(map_catalog_error)?;
+        let marker = SecurityMutationDraft::new(
+            SecurityMutationOperation::RevokeLegacyBearer,
+            request_digest,
+            &actor,
+            idempotency_token,
+            SecurityMutationResultId::None,
+            authorization_epoch,
+        )?;
+        let audit = SecurityAuditDraft::actor(
+            &actor,
+            SecurityAuditAction::RevokeLegacyBearer,
+            [SecurityAuditTarget::LegacyBearer],
+        );
+        let commit = self.commit_access_control_catalog_idempotent(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            marker,
+        )?;
+        Ok(LegacyBearerRevocationReceipt {
+            authorization_epoch,
+            commit,
+        })
+    }
+
     /// Recovers the unique owner through a two-phase restricted-file swap.
     ///
     /// The caller must own the data directory exclusively. Phase one leaves
@@ -5270,18 +7203,15 @@ impl NativeProduct {
         output_path: impl AsRef<Path>,
         logical_time_micros: i64,
     ) -> Result<AccessControlBootstrapReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
         let output_path = output_path.as_ref();
-        let mut output = create_restricted_output(output_path)?;
         let mut catalog = self.load_access_control_catalog()?;
-        let (principal_id, issued, _pending_epoch, retired_pending_keys) =
+        let (principal_id, _operation_id, issued, _pending_epoch, retired_pending_keys) =
             match catalog.begin_owner_recovery_with_retired(key_label, logical_time_micros) {
                 Ok(value) => value,
-                Err(error) => {
-                    drop(output);
-                    remove_empty_output(output_path);
-                    return Err(map_catalog_error(error));
-                }
+                Err(error) => return Err(map_catalog_error(error)),
             };
+        let mut output = create_restricted_output(output_path)?;
         let mut pending_targets = vec![
             SecurityAuditTarget::Principal(principal_id),
             SecurityAuditTarget::Key(issued.id()),
@@ -5329,6 +7259,186 @@ impl NativeProduct {
         Ok(AccessControlBootstrapReceipt {
             principal_id,
             key_id: issued.id(),
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Reads redacted offline owner-recovery state after normal catalog open.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durability or corruption error if the current catalog cannot
+    /// be read. The verifier and secret are structurally absent.
+    pub fn inspect_owner_recovery_offline(&self) -> Result<OwnerRecoveryInspection, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        let catalog = self.load_access_control_catalog()?;
+        Ok(OwnerRecoveryInspection {
+            authorization_epoch: catalog.epoch,
+            pending: catalog.pending_owner_recovery,
+        })
+    }
+
+    /// Publishes one inactive owner replacement and returns its one-time secret.
+    ///
+    /// A caller must write and synchronize the returned secret to a restricted
+    /// new file before calling [`Self::resume_owner_recovery_offline`]. Existing
+    /// owner keys remain active. A second pending recovery is a catalog conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, conflict, limit, entropy, durability, owner-
+    /// authority, or corruption errors.
+    pub fn start_owner_recovery_offline(
+        &mut self,
+        key_label: &str,
+        logical_time_micros: i64,
+    ) -> Result<OwnerRecoveryStartReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        let mut catalog = self.load_access_control_catalog()?;
+        let (principal_id, operation_id, issued, authorization_epoch, retired_pending_keys) =
+            catalog
+                .begin_owner_recovery_with_retired(key_label, logical_time_micros)
+                .map_err(map_catalog_error)?;
+        let mut targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(issued.id()),
+        ];
+        targets.extend(
+            retired_pending_keys
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
+        );
+        let audit = SecurityAuditDraft::offline(SecurityAuditAction::RecoverOwner, targets);
+        let commit =
+            self.commit_access_control_catalog(&mut catalog, logical_time_micros, audit)?;
+        Ok(OwnerRecoveryStartReceipt {
+            principal_id,
+            operation_id,
+            key_id: issued.id(),
+            authorization_epoch,
+            commit,
+            secret: issued,
+        })
+    }
+
+    /// Activates one exact pending recovery after restricted-file validation.
+    ///
+    /// Exact replay after activation returns the retained activation commit.
+    /// Empty, partial, malformed, wrong-ID, and wrong-secret files fail before
+    /// mutation. Activation atomically removes every prior owner key.
+    ///
+    /// # Errors
+    ///
+    /// Returns not-found, conflict, authorization, durability, owner-authority,
+    /// I/O, or corruption errors.
+    pub fn resume_owner_recovery_offline(
+        &mut self,
+        pending_key_id: ApiKeyId,
+        serialized_key: &str,
+        expected_authorization_epoch: AuthorizationEpoch,
+        logical_time_micros: i64,
+    ) -> Result<OwnerRecoveryActivationReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        if let Some(receipt) =
+            self.replay_owner_recovery_activation(pending_key_id, expected_authorization_epoch)?
+        {
+            return Ok(receipt);
+        }
+        let mut catalog = self.load_access_control_catalog()?;
+        let pending = catalog
+            .pending_owner_recovery
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::ObjectNotFound))?;
+        if pending.key_id != pending_key_id
+            || pending.authorization_epoch != expected_authorization_epoch
+            || catalog.epoch != expected_authorization_epoch
+        {
+            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
+        }
+        let verifier = catalog
+            .keys
+            .get(&pending_key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?
+            .verifier
+            .clone();
+        if !verifier.verifies(serialized_key) {
+            return Err(ProductError::from_code(
+                ProductErrorCode::ConfirmationDigestMismatch,
+            ));
+        }
+        let principal_id = catalog
+            .keys
+            .get(&pending_key_id)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?
+            .principal_id;
+        let (authorization_epoch, retired_owner_keys) = catalog
+            .activate_recovered_owner_key_with_retired(pending_key_id)
+            .map_err(map_catalog_error)?;
+        let mut targets = vec![
+            SecurityAuditTarget::Principal(principal_id),
+            SecurityAuditTarget::Key(pending_key_id),
+        ];
+        targets.extend(
+            retired_owner_keys
+                .iter()
+                .copied()
+                .map(SecurityAuditTarget::Key),
+        );
+        let audit = SecurityAuditDraft::offline(SecurityAuditAction::ActivateKey, targets);
+        let (commit, _) = self.commit_access_control_catalog_recording_offline_recovery(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            OfflineOwnerRecoveryOutcome::Activated,
+            pending,
+        )?;
+        Ok(OwnerRecoveryActivationReceipt {
+            operation_id: pending.operation_id,
+            key_id: pending_key_id,
+            authorization_epoch,
+            commit,
+        })
+    }
+
+    /// Removes one exact inactive owner recovery without touching active keys.
+    ///
+    /// Exact replay after abort returns the retained abort commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns not-found, conflict, durability, owner-authority, or corruption
+    /// errors. No caller-supplied filesystem path is removed.
+    pub fn abort_owner_recovery_offline(
+        &mut self,
+        pending_key_id: ApiKeyId,
+        expected_authorization_epoch: AuthorizationEpoch,
+        logical_time_micros: i64,
+    ) -> Result<OwnerRecoveryAbortReceipt, ProductError> {
+        self.database.revalidate_offline_owner()?;
+        if let Some(receipt) =
+            self.replay_owner_recovery_abort(pending_key_id, expected_authorization_epoch)?
+        {
+            return Ok(receipt);
+        }
+        let mut catalog = self.load_access_control_catalog()?;
+        let (pending, authorization_epoch) = catalog
+            .abort_owner_recovery(pending_key_id, expected_authorization_epoch)
+            .map_err(map_catalog_error)?;
+        let audit = SecurityAuditDraft::offline(
+            SecurityAuditAction::AbortKeyIssue,
+            [SecurityAuditTarget::Key(pending_key_id)],
+        );
+        let (commit, _) = self.commit_access_control_catalog_recording_offline_recovery(
+            &mut catalog,
+            logical_time_micros,
+            audit,
+            OfflineOwnerRecoveryOutcome::Aborted,
+            pending,
+        )?;
+        Ok(OwnerRecoveryAbortReceipt {
+            operation_id: pending.operation_id,
+            key_id: pending_key_id,
             authorization_epoch,
             commit,
         })
@@ -5382,9 +7492,140 @@ impl NativeProduct {
             .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
         Ok(Some(SecurityMutationReplay {
             result_id: marker.result_id,
+            predecessor_key_id: marker.predecessor_key_id,
+            overlap_until_micros: marker.overlap_until_micros,
             authorization_epoch: marker.authorization_epoch,
             commit,
         }))
+    }
+
+    pub(crate) fn is_exact_terminal_self_replay(
+        &self,
+        actor: &AuthenticatedAuthority,
+        idempotency_token: u128,
+        key_id: ApiKeyId,
+        confirmation_digest: Option<ApiKeyConfirmationDigest>,
+    ) -> Result<bool, ProductError> {
+        let (operation, body) = match confirmation_digest {
+            Some(digest) => (
+                SecurityMutationOperation::RotateKeyActivate,
+                key_target_request_body(key_id, true, Some(digest)),
+            ),
+            None => (
+                SecurityMutationOperation::RevokeKey,
+                key_target_request_body(key_id, true, None),
+            ),
+        };
+        let request_digest =
+            security_mutation_request_digest(operation, actor, idempotency_token, &body)?;
+        self.replay_security_mutation(actor, idempotency_token, operation, request_digest, 0)
+            .map(|replay| replay.is_some())
+    }
+
+    fn replay_owner_recovery_activation(
+        &self,
+        key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+    ) -> Result<Option<OwnerRecoveryActivationReceipt>, ProductError> {
+        let Some((marker, commit)) = self.replay_owner_recovery_outcome(
+            key_id,
+            expected_epoch,
+            OfflineOwnerRecoveryOutcome::Activated,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(OwnerRecoveryActivationReceipt {
+            operation_id: marker.operation_id,
+            key_id,
+            authorization_epoch: marker.result_authorization_epoch,
+            commit,
+        }))
+    }
+
+    fn replay_legacy_bearer_migration_activation(
+        &self,
+        key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+        request_digest: [u8; 32],
+    ) -> Result<Option<LegacyBearerMigrationActivationReceipt>, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        let Some(encoded) = snapshot.structure_get_internal(LEGACY_BEARER_MIGRATION_MARKER_KEY)
+        else {
+            return Ok(None);
+        };
+        let marker = decode_legacy_bearer_migration_marker(encoded).map_err(map_catalog_error)?;
+        if marker.key_id != key_id
+            || marker.expected_authorization_epoch != expected_epoch
+            || marker.request_digest != request_digest
+        {
+            return Err(ProductError::from_code(
+                ProductErrorCode::IdempotencyConflict,
+            ));
+        }
+        let transaction_id = TransactionId::new(marker.transaction_id)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let commit = self
+            .database
+            .transaction_commit_receipt(transaction_id)
+            .map(Into::into)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        Ok(Some(LegacyBearerMigrationActivationReceipt {
+            operation_id: marker.operation_id,
+            key_id,
+            authorization_epoch: marker.result_authorization_epoch,
+            commit,
+        }))
+    }
+
+    fn replay_owner_recovery_abort(
+        &self,
+        key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+    ) -> Result<Option<OwnerRecoveryAbortReceipt>, ProductError> {
+        let Some((marker, commit)) = self.replay_owner_recovery_outcome(
+            key_id,
+            expected_epoch,
+            OfflineOwnerRecoveryOutcome::Aborted,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(OwnerRecoveryAbortReceipt {
+            operation_id: marker.operation_id,
+            key_id,
+            authorization_epoch: marker.result_authorization_epoch,
+            commit,
+        }))
+    }
+
+    fn replay_owner_recovery_outcome(
+        &self,
+        key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+        outcome: OfflineOwnerRecoveryOutcome,
+    ) -> Result<Option<(OfflineOwnerRecoveryMarker, ProductCommitReceipt)>, ProductError> {
+        let snapshot = self.snapshot_bounded(0)?;
+        let Some(encoded) =
+            snapshot.structure_get_internal(&offline_owner_recovery_marker_key(key_id))
+        else {
+            return Ok(None);
+        };
+        let marker = decode_offline_owner_recovery_marker(encoded).map_err(map_catalog_error)?;
+        if marker.key_id != key_id
+            || marker.expected_authorization_epoch != expected_epoch
+            || marker.outcome != outcome
+        {
+            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
+        }
+        let transaction_id = TransactionId::new(marker.transaction_id)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+        let commit = self
+            .database
+            .transaction_commit_receipt(transaction_id)
+            .map(Into::into)
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::Corruption))?;
+        Ok(Some((marker, commit)))
     }
 
     fn commit_access_control_catalog(
@@ -5400,6 +7641,167 @@ impl NativeProduct {
             None,
             None,
         )
+    }
+
+    fn commit_access_control_catalog_recording_offline_recovery(
+        &mut self,
+        catalog: &mut AccessControlCatalog,
+        logical_time_micros: i64,
+        audit: SecurityAuditDraft,
+        outcome: OfflineOwnerRecoveryOutcome,
+        pending: PendingOwnerRecovery,
+    ) -> Result<(ProductCommitReceipt, OfflineOwnerRecoveryMarker), ProductError> {
+        self.commit_access_control_catalog_recording_offline_recovery_at(
+            catalog,
+            logical_time_micros,
+            audit,
+            outcome,
+            pending,
+            None,
+        )
+    }
+
+    fn commit_access_control_catalog_recording_legacy_migration(
+        &mut self,
+        catalog: &mut AccessControlCatalog,
+        logical_time_micros: i64,
+        audit: SecurityAuditDraft,
+        migration: LegacyBearerMigration,
+    ) -> Result<(ProductCommitReceipt, LegacyBearerMigrationMarker), ProductError> {
+        let mut transaction = self
+            .database
+            .begin(logical_time_micros, ProductDurability::Strict.into())?;
+        let (transaction_id, pending_csn) = transaction.pending_commit_identity()?;
+        let appended = catalog
+            .append_audit_event(pending_csn.get(), audit)
+            .map_err(map_catalog_error)?;
+        transaction.set(
+            audit_event_storage_key(SecurityAuditIndexEntry {
+                id: appended.event.id,
+                commit_csn: appended.event.commit_csn,
+            }),
+            encode_audit_event(&appended.event).map_err(map_catalog_error)?,
+            None,
+        )?;
+        if let Some(evicted) = appended.evicted
+            && !transaction.delete_structure(audit_event_storage_key(evicted))?
+        {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        transaction.set(
+            ACCESS_CONTROL_STORAGE_KEY.to_vec(),
+            catalog.encode().map_err(map_catalog_error)?,
+            None,
+        )?;
+        let marker = LegacyBearerMigrationMarker {
+            operation_id: migration.operation_id,
+            key_id: migration.key_id,
+            expected_authorization_epoch: migration.authorization_epoch,
+            result_authorization_epoch: catalog.epoch,
+            request_digest: migration.request_digest,
+            transaction_id: transaction_id.get(),
+        };
+        transaction.set(
+            LEGACY_BEARER_MIGRATION_MARKER_KEY.to_vec(),
+            encode_legacy_bearer_migration_marker(marker),
+            None,
+        )?;
+        let commit_result = match self.security_commit_interruption.take() {
+            Some(interruption) => interruption.commit(transaction),
+            None => transaction.commit(),
+        };
+        let receipt = match commit_result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.access_control_epoch_known
+                    .store(false, Ordering::Release);
+                return Err(error.into());
+            }
+        };
+        if receipt.commit_csn != pending_csn {
+            self.access_control_epoch_known
+                .store(false, Ordering::Release);
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        self.observe_commit(&receipt);
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
+        Ok((receipt.into(), marker))
+    }
+
+    fn commit_access_control_catalog_recording_offline_recovery_at(
+        &mut self,
+        catalog: &mut AccessControlCatalog,
+        logical_time_micros: i64,
+        audit: SecurityAuditDraft,
+        outcome: OfflineOwnerRecoveryOutcome,
+        pending: PendingOwnerRecovery,
+        interruption: Option<crate::SecurityCommitInterruption>,
+    ) -> Result<(ProductCommitReceipt, OfflineOwnerRecoveryMarker), ProductError> {
+        let mut transaction = self
+            .database
+            .begin(logical_time_micros, ProductDurability::Strict.into())?;
+        let (transaction_id, pending_csn) = transaction.pending_commit_identity()?;
+        let appended = catalog
+            .append_audit_event(pending_csn.get(), audit)
+            .map_err(map_catalog_error)?;
+        transaction.set(
+            audit_event_storage_key(SecurityAuditIndexEntry {
+                id: appended.event.id,
+                commit_csn: appended.event.commit_csn,
+            }),
+            encode_audit_event(&appended.event).map_err(map_catalog_error)?,
+            None,
+        )?;
+        if let Some(evicted) = appended.evicted
+            && !transaction.delete_structure(audit_event_storage_key(evicted))?
+        {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        transaction.set(
+            ACCESS_CONTROL_STORAGE_KEY.to_vec(),
+            catalog.encode().map_err(map_catalog_error)?,
+            None,
+        )?;
+        let marker = OfflineOwnerRecoveryMarker {
+            outcome,
+            operation_id: pending.operation_id,
+            key_id: pending.key_id,
+            expected_authorization_epoch: pending.authorization_epoch,
+            result_authorization_epoch: catalog.epoch,
+            transaction_id: transaction_id.get(),
+        };
+        transaction.set(
+            offline_owner_recovery_marker_key(pending.key_id),
+            encode_offline_owner_recovery_marker(marker),
+            None,
+        )?;
+        let commit_result = match interruption.or_else(|| self.security_commit_interruption.take())
+        {
+            Some(interruption) => interruption.commit(transaction),
+            None => transaction.commit(),
+        };
+        let receipt = match commit_result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.access_control_epoch_known
+                    .store(false, Ordering::Release);
+                return Err(error.into());
+            }
+        };
+        if receipt.commit_csn != pending_csn {
+            self.access_control_epoch_known
+                .store(false, Ordering::Release);
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        self.observe_commit(&receipt);
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
+        Ok((receipt.into(), marker))
     }
 
     fn commit_access_control_catalog_idempotent(
@@ -5424,7 +7826,7 @@ impl NativeProduct {
         logical_time_micros: i64,
         audit: SecurityAuditDraft,
         marker: Option<SecurityMutationDraft>,
-        interruption: Option<hyphae_native_runtime::CommitBoundary>,
+        interruption: Option<crate::SecurityCommitInterruption>,
     ) -> Result<ProductCommitReceipt, ProductError> {
         let mut transaction = self
             .database
@@ -5483,14 +7885,17 @@ impl NativeProduct {
                     actor_principal_id: marker.actor_principal_id,
                     actor_key_id: marker.actor_key_id,
                     result_id: marker.result_id,
+                    predecessor_key_id: marker.predecessor_key_id,
+                    overlap_until_micros: marker.overlap_until_micros,
                     authorization_epoch: marker.authorization_epoch,
                     transaction_id: transaction_id.get(),
                 }),
                 None,
             )?;
         }
-        let commit_result = match interruption {
-            Some(boundary) => transaction.commit_with_interruption(boundary),
+        let commit_result = match interruption.or_else(|| self.security_commit_interruption.take())
+        {
+            Some(interruption) => interruption.commit(transaction),
             None => transaction.commit(),
         };
         let receipt = match commit_result {
@@ -5531,6 +7936,163 @@ fn security_mutation_fingerprint(
     hasher.update(actor.key_id.as_bytes());
     hasher.update(&idempotency_token.to_be_bytes());
     *hasher.finalize().as_bytes()
+}
+
+fn offline_owner_recovery_marker_key(key_id: ApiKeyId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(OFFLINE_OWNER_RECOVERY_MARKER_PREFIX.len() + 16);
+    key.extend_from_slice(OFFLINE_OWNER_RECOVERY_MARKER_PREFIX);
+    key.extend_from_slice(key_id.as_bytes());
+    key
+}
+
+fn encode_offline_owner_recovery_marker(marker: OfflineOwnerRecoveryMarker) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(OFFLINE_OWNER_RECOVERY_MARKER_BYTES);
+    encoded.extend_from_slice(OFFLINE_OWNER_RECOVERY_MARKER_MAGIC);
+    encoded.push(marker.outcome.tag());
+    encoded.extend_from_slice(&marker.operation_id.to_be_bytes());
+    encoded.extend_from_slice(marker.key_id.as_bytes());
+    encoded.extend_from_slice(&marker.expected_authorization_epoch.get().to_be_bytes());
+    encoded.extend_from_slice(&marker.result_authorization_epoch.get().to_be_bytes());
+    encoded.extend_from_slice(&marker.transaction_id.to_be_bytes());
+    let digest = blake3::hash(&encoded);
+    encoded.extend_from_slice(digest.as_bytes());
+    encoded
+}
+
+fn encode_legacy_bearer_migration_marker(marker: LegacyBearerMigrationMarker) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(LEGACY_BEARER_MIGRATION_MARKER_BYTES);
+    encoded.extend_from_slice(LEGACY_BEARER_MIGRATION_MARKER_MAGIC);
+    encoded.extend_from_slice(&marker.operation_id.to_be_bytes());
+    encoded.extend_from_slice(marker.key_id.as_bytes());
+    encoded.extend_from_slice(&marker.expected_authorization_epoch.get().to_be_bytes());
+    encoded.extend_from_slice(&marker.result_authorization_epoch.get().to_be_bytes());
+    encoded.extend_from_slice(&marker.request_digest);
+    encoded.extend_from_slice(&marker.transaction_id.to_be_bytes());
+    let digest = blake3::hash(&encoded);
+    encoded.extend_from_slice(digest.as_bytes());
+    encoded
+}
+
+fn decode_legacy_bearer_migration_marker(
+    encoded: &[u8],
+) -> Result<LegacyBearerMigrationMarker, AccessCatalogError> {
+    if encoded.len() != LEGACY_BEARER_MIGRATION_MARKER_BYTES
+        || &encoded[..LEGACY_BEARER_MIGRATION_MARKER_MAGIC.len()]
+            != LEGACY_BEARER_MIGRATION_MARKER_MAGIC
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let content_len = encoded.len() - CATALOG_DIGEST_BYTES;
+    if blake3::hash(&encoded[..content_len])
+        .as_bytes()
+        .ct_eq(&encoded[content_len..])
+        .unwrap_u8()
+        != 1
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let mut decoder =
+        Decoder::new(&encoded[LEGACY_BEARER_MIGRATION_MARKER_MAGIC.len()..content_len]);
+    let marker = LegacyBearerMigrationMarker {
+        operation_id: decoder.security_id()?,
+        key_id: ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?,
+        expected_authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+        result_authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+        request_digest: decoder.array()?,
+        transaction_id: u128::from_be_bytes(decoder.array()?),
+    };
+    if !decoder.is_empty()
+        || marker.expected_authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || marker.result_authorization_epoch.get()
+            != marker.expected_authorization_epoch.get().saturating_add(1)
+        || marker.transaction_id == 0
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    Ok(marker)
+}
+
+fn validate_legacy_bearer(legacy_bearer: &[u8]) -> Result<(), ProductError> {
+    if !(32..=4_096).contains(&legacy_bearer.len())
+        || !legacy_bearer
+            .iter()
+            .all(|byte| (0x21..=0x7e).contains(byte))
+        || legacy_bearer.starts_with(b"hyp1_")
+    {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    }
+    Ok(())
+}
+
+fn legacy_bearer_migration_request_digest(
+    display_name: &str,
+    key_label: &str,
+    legacy_bearer: &[u8],
+) -> Result<[u8; 32], ProductError> {
+    validate_display_name(display_name).map_err(map_catalog_error)?;
+    validate_display_name(key_label).map_err(map_catalog_error)?;
+    validate_legacy_bearer(legacy_bearer)?;
+    let bearer_digest = blake3::hash(legacy_bearer);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LEGACY_BEARER_MIGRATION_REQUEST_DOMAIN);
+    hasher.update(&(display_name.len() as u64).to_be_bytes());
+    hasher.update(display_name.as_bytes());
+    hasher.update(&(key_label.len() as u64).to_be_bytes());
+    hasher.update(key_label.as_bytes());
+    hasher.update(bearer_digest.as_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn legacy_bearer_verifier(
+    legacy_bearer: &[u8],
+    product_key: [u8; 32],
+) -> Result<[u8; 32], ProductError> {
+    validate_legacy_bearer(legacy_bearer)?;
+    Ok(legacy_bearer_verifier_from_digest(
+        *blake3::hash(legacy_bearer).as_bytes(),
+        product_key,
+    ))
+}
+
+fn legacy_bearer_verifier_from_digest(bearer_digest: [u8; 32], product_key: [u8; 32]) -> [u8; 32] {
+    *blake3::keyed_hash(&product_key, &bearer_digest).as_bytes()
+}
+
+fn decode_offline_owner_recovery_marker(
+    encoded: &[u8],
+) -> Result<OfflineOwnerRecoveryMarker, AccessCatalogError> {
+    if encoded.len() != OFFLINE_OWNER_RECOVERY_MARKER_BYTES
+        || &encoded[..OFFLINE_OWNER_RECOVERY_MARKER_MAGIC.len()]
+            != OFFLINE_OWNER_RECOVERY_MARKER_MAGIC
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let content_len = encoded.len() - CATALOG_DIGEST_BYTES;
+    let digest = blake3::hash(&encoded[..content_len]);
+    if digest.as_bytes().ct_eq(&encoded[content_len..]).unwrap_u8() != 1 {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    let mut decoder =
+        Decoder::new(&encoded[OFFLINE_OWNER_RECOVERY_MARKER_MAGIC.len()..content_len]);
+    let marker = OfflineOwnerRecoveryMarker {
+        outcome: OfflineOwnerRecoveryOutcome::from_tag(decoder.byte()?)
+            .ok_or(AccessCatalogError::CorruptCatalog)?,
+        operation_id: decoder.security_id()?,
+        key_id: ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?,
+        expected_authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+        result_authorization_epoch: AuthorizationEpoch::new(decoder.u64()?),
+        transaction_id: u128::from_be_bytes(decoder.array()?),
+    };
+    if !decoder.is_empty()
+        || marker.expected_authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || marker.result_authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || marker.result_authorization_epoch.get()
+            != marker.expected_authorization_epoch.get().saturating_add(1)
+        || marker.transaction_id == 0
+    {
+        return Err(AccessCatalogError::CorruptCatalog);
+    }
+    Ok(marker)
 }
 
 fn security_mutation_request_digest(
@@ -5581,7 +8143,27 @@ fn encode_security_mutation_marker(marker: SecurityMutationMarker) -> Vec<u8> {
     encoded.extend_from_slice(&marker.request_digest);
     encoded.extend_from_slice(&marker.actor_principal_id.to_be_bytes());
     encoded.extend_from_slice(marker.actor_key_id.as_bytes());
-    encoded.extend_from_slice(&marker.result_id.to_be_bytes());
+    match marker.result_id {
+        SecurityMutationResultId::None => {
+            encoded.push(0);
+            encoded.extend_from_slice(&[0; 16]);
+        }
+        SecurityMutationResultId::Security(id) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&id.to_be_bytes());
+        }
+        SecurityMutationResultId::ApiKey(id) => {
+            encoded.push(2);
+            encoded.extend_from_slice(id.as_bytes());
+        }
+    }
+    encoded.extend_from_slice(
+        &marker
+            .predecessor_key_id
+            .map_or([0; 16], |key_id| *key_id.as_bytes()),
+    );
+    encoded.push(u8::from(marker.overlap_until_micros.is_some()));
+    encoded.extend_from_slice(&marker.overlap_until_micros.unwrap_or(0).to_be_bytes());
     encoded.extend_from_slice(&marker.authorization_epoch.get().to_be_bytes());
     encoded.extend_from_slice(&marker.transaction_id.to_be_bytes());
     let digest = blake3::hash(&encoded);
@@ -5592,9 +8174,13 @@ fn encode_security_mutation_marker(marker: SecurityMutationMarker) -> Vec<u8> {
 fn decode_security_mutation_marker(
     encoded: &[u8],
 ) -> Result<SecurityMutationMarker, AccessCatalogError> {
-    if encoded.len() != SECURITY_MUTATION_MARKER_BYTES
-        || &encoded[..SECURITY_MUTATION_MARKER_MAGIC.len()] != SECURITY_MUTATION_MARKER_MAGIC
-    {
+    let v1 = encoded.len() == SECURITY_MUTATION_MARKER_V1_BYTES
+        && &encoded[..SECURITY_MUTATION_MARKER_V1_MAGIC.len()] == SECURITY_MUTATION_MARKER_V1_MAGIC;
+    let v2 = encoded.len() == SECURITY_MUTATION_MARKER_V2_BYTES
+        && &encoded[..SECURITY_MUTATION_MARKER_V2_MAGIC.len()] == SECURITY_MUTATION_MARKER_V2_MAGIC;
+    let v3 = encoded.len() == SECURITY_MUTATION_MARKER_BYTES
+        && &encoded[..SECURITY_MUTATION_MARKER_MAGIC.len()] == SECURITY_MUTATION_MARKER_MAGIC;
+    if !v1 && !v2 && !v3 {
         return Err(AccessCatalogError::CorruptCatalog);
     }
     let content_len = encoded.len() - CATALOG_DIGEST_BYTES;
@@ -5615,12 +8201,51 @@ fn decode_security_mutation_marker(
         .ok_or(AccessCatalogError::CorruptCatalog)?;
     let actor_key_id =
         ApiKeyId::from_bytes(decoder.array()?).ok_or(AccessCatalogError::CorruptCatalog)?;
-    let result_id = SecurityId::new(u128::from_be_bytes(decoder.array()?))
-        .ok_or(AccessCatalogError::CorruptCatalog)?;
+    let result_id = if v1 {
+        SecurityMutationResultId::Security(
+            SecurityId::new(u128::from_be_bytes(decoder.array()?))
+                .ok_or(AccessCatalogError::CorruptCatalog)?,
+        )
+    } else {
+        let kind = decoder.byte()?;
+        let bytes = decoder.array()?;
+        match kind {
+            0 if bytes == [0; 16] => SecurityMutationResultId::None,
+            1 => SecurityMutationResultId::Security(
+                SecurityId::new(u128::from_be_bytes(bytes))
+                    .ok_or(AccessCatalogError::CorruptCatalog)?,
+            ),
+            2 => SecurityMutationResultId::ApiKey(
+                ApiKeyId::from_bytes(bytes).ok_or(AccessCatalogError::CorruptCatalog)?,
+            ),
+            _ => return Err(AccessCatalogError::CorruptCatalog),
+        }
+    };
+    let (predecessor_key_id, overlap_until_micros) = if v3 {
+        let predecessor = decoder.array()?;
+        let predecessor_key_id = if predecessor == [0; 16] {
+            None
+        } else {
+            Some(ApiKeyId::from_bytes(predecessor).ok_or(AccessCatalogError::CorruptCatalog)?)
+        };
+        let overlap_present = decoder.boolean()?;
+        let overlap = decoder.i64()?;
+        let overlap_until_micros = if overlap_present {
+            Some(overlap)
+        } else if overlap == 0 {
+            None
+        } else {
+            return Err(AccessCatalogError::CorruptCatalog);
+        };
+        (predecessor_key_id, overlap_until_micros)
+    } else {
+        (None, None)
+    };
     let authorization_epoch = AuthorizationEpoch::new(u64::from_be_bytes(decoder.array()?));
     let transaction_id = u128::from_be_bytes(decoder.array()?);
     if !decoder.is_empty()
         || authorization_epoch == AuthorizationEpoch::UNMANAGED
+        || predecessor_key_id.is_some() != overlap_until_micros.is_some()
         || transaction_id == 0
     {
         return Err(AccessCatalogError::CorruptCatalog);
@@ -5631,6 +8256,8 @@ fn decode_security_mutation_marker(
         actor_principal_id,
         actor_key_id,
         result_id,
+        predecessor_key_id,
+        overlap_until_micros,
         authorization_epoch,
         transaction_id,
     })
@@ -5762,6 +8389,7 @@ fn require_current_actor(
 }
 
 fn authorize_key_issue(
+    product: &NativeProduct,
     actor: &AuthenticatedAuthority,
     principal_id: SecurityId,
     requested_roles: &BTreeSet<BuiltInRole>,
@@ -5769,6 +8397,7 @@ fn authorize_key_issue(
     permission_ceiling: ProductAuthorization,
     scope_ceiling: &BTreeSet<ProductScope>,
 ) -> Result<(), ProductError> {
+    let denied = || ProductError::from_code(ProductErrorCode::AuthorizationDenied);
     if requested_roles.contains(&BuiltInRole::Owner)
         && !authority_allows_instance(actor, ProductPermission::OwnershipManage)
     {
@@ -5788,20 +8417,646 @@ fn authorize_key_issue(
     let effective_roles: BTreeSet<_> = actor.effective_roles.iter().copied().collect();
     let effective_custom_roles: BTreeSet<_> =
         actor.effective_custom_roles.iter().copied().collect();
-    let actor_scope_ceiling: BTreeSet<_> = actor.scope_ceiling.iter().copied().collect();
-    let scope_is_subset = actor_scope_ceiling.contains(&ProductScope::Instance)
-        || scope_ceiling.is_subset(&actor_scope_ceiling);
-    if authority_allows_instance(actor, ProductPermission::CredentialSelfManage)
+    let scopes_are_covered =
+        authority_covers_scope_ceiling(product, actor, permission_ceiling, scope_ceiling).map_err(
+            |error| match error.code() {
+                ProductErrorCode::Io
+                | ProductErrorCode::Unavailable
+                | ProductErrorCode::Corruption => error,
+                _ => denied(),
+            },
+        )?;
+    if actor
+        .authorization
+        .allows(ProductPermission::CredentialSelfManage)
         && requested_roles.is_subset(&effective_roles)
         && requested_custom_roles.is_subset(&effective_custom_roles)
         && permission_ceiling.is_subset_of(actor.authorization)
-        && scope_is_subset
+        && scopes_are_covered
+    {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authorize_key_issue_variant(
+    product: &NativeProduct,
+    actor: &AuthenticatedAuthority,
+    principal_id: SecurityId,
+    requested_roles: &BTreeSet<BuiltInRole>,
+    requested_custom_roles: &BTreeSet<SecurityId>,
+    permission_ceiling: ProductAuthorization,
+    scope_ceiling: &BTreeSet<ProductScope>,
+    self_manage: bool,
+) -> Result<(), ProductError> {
+    if self_manage && principal_id != actor.principal_id {
+        return Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ));
+    }
+    if self_manage {
+        authorize_key_issue(
+            product,
+            actor,
+            principal_id,
+            requested_roles,
+            requested_custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+        )
+    } else if authority_allows_instance(actor, ProductPermission::SecurityManage)
+        && (!requested_roles.contains(&BuiltInRole::Owner)
+            || authority_allows_instance(actor, ProductPermission::OwnershipManage))
     {
         Ok(())
     } else {
         Err(ProductError::from_code(
             ProductErrorCode::AuthorizationDenied,
         ))
+    }
+}
+
+fn authority_covers_scope_ceiling(
+    product: &NativeProduct,
+    actor: &AuthenticatedAuthority,
+    permission_ceiling: ProductAuthorization,
+    requested: &BTreeSet<ProductScope>,
+) -> Result<bool, ProductError> {
+    if requested.is_empty() {
+        return Ok(false);
+    }
+    let object_ids = requested
+        .iter()
+        .chain(actor.scope_ceiling.iter())
+        .chain(
+            actor
+                .scoped_authorization
+                .iter()
+                .map(|scoped| &scoped.scope),
+        )
+        .filter_map(|scope| match scope {
+            ProductScope::Instance => None,
+            ProductScope::CatalogSubtree(object) | ProductScope::CatalogObject(object) => {
+                Some(*object)
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    let snapshot = product.catalog_snapshot()?;
+    let mut ancestry = BTreeMap::new();
+    for target in object_ids {
+        let mut ancestors = BTreeSet::new();
+        let mut current = target;
+        while let Some(object) = product.catalog_describe(&snapshot, current)? {
+            let Some(parent) = object.parent() else {
+                break;
+            };
+            if !ancestors.insert(parent) {
+                return Err(ProductError::from_code(ProductErrorCode::Corruption));
+            }
+            current = parent;
+        }
+        if product.catalog_describe(&snapshot, target)?.is_none() {
+            return Ok(false);
+        }
+        ancestry.insert(target, ancestors);
+    }
+    let is_descendant = |candidate: ObjectId, ancestor: ObjectId| {
+        ancestry
+            .get(&candidate)
+            .is_some_and(|ancestors| ancestors.contains(&ancestor))
+    };
+    Ok(requested.iter().copied().all(|requested_scope| {
+        every_required_permission(permission_ceiling, |permission| {
+            if !permission.supports_scope(requested_scope) {
+                return true;
+            }
+            actor
+                .scope_ceiling
+                .iter()
+                .copied()
+                .any(|ceiling| scope_covers_scope(ceiling, requested_scope, is_descendant))
+                && actor.scoped_authorization.iter().any(|scoped| {
+                    scoped.authorization.allows(permission)
+                        && scope_covers_scope(scoped.scope, requested_scope, is_descendant)
+                })
+        })
+    }))
+}
+
+fn scope_covers_scope(
+    available: ProductScope,
+    requested: ProductScope,
+    is_descendant: impl Fn(ObjectId, ObjectId) -> bool,
+) -> bool {
+    match (available, requested) {
+        (ProductScope::Instance, _) => true,
+        (_, ProductScope::Instance)
+        | (ProductScope::CatalogObject(_), ProductScope::CatalogSubtree(_)) => false,
+        (ProductScope::CatalogObject(available), ProductScope::CatalogObject(requested)) => {
+            available == requested
+        }
+        (
+            ProductScope::CatalogSubtree(available),
+            ProductScope::CatalogObject(requested) | ProductScope::CatalogSubtree(requested),
+        ) => available == requested || is_descendant(requested, available),
+    }
+}
+
+fn authorize_key_target_variant(
+    actor: &AuthenticatedAuthority,
+    target: &ApiKeyRecord,
+    self_manage: bool,
+) -> Result<(), ProductError> {
+    let owner = target.roles.contains(&BuiltInRole::Owner);
+    let allowed = if self_manage {
+        target.principal_id == actor.principal_id
+            && authority_allows_instance(actor, ProductPermission::CredentialSelfManage)
+    } else {
+        authority_allows_instance(actor, ProductPermission::SecurityManage)
+    };
+    if allowed && (!owner || authority_allows_instance(actor, ProductPermission::OwnershipManage)) {
+        Ok(())
+    } else {
+        Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ))
+    }
+}
+
+fn authorize_key_rotation_target(
+    catalog: &AccessControlCatalog,
+    actor: &AuthenticatedAuthority,
+    target: &ApiKeyRecord,
+    self_manage: bool,
+) -> Result<(), ProductError> {
+    authorize_key_target_variant(actor, target, self_manage)?;
+    if target.id == actor.key_id || actor.effective_roles.contains(&BuiltInRole::Owner) {
+        return Ok(());
+    }
+
+    let target_authority = catalog
+        .authority_for_key_lifecycle(target.id, i64::MIN, actor.directory_lineage, false)
+        .map_err(|_| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+    let actor_roles = actor
+        .effective_roles
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actor_custom_roles = actor
+        .effective_custom_roles
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let target_roles = target_authority
+        .effective_roles
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let target_custom_roles = target_authority
+        .effective_custom_roles
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let actor_scopes = actor.scope_ceiling.iter().copied().collect::<BTreeSet<_>>();
+    let target_scopes = target
+        .scope_ceiling
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let scopes_are_subset =
+        actor_scopes.contains(&ProductScope::Instance) || target_scopes.is_subset(&actor_scopes);
+
+    if target_authority
+        .authorization
+        .is_subset_of(actor.authorization)
+        && target_roles.is_subset(&actor_roles)
+        && target_custom_roles.is_subset(&actor_custom_roles)
+        && target.permission_ceiling.is_subset_of(actor.authorization)
+        && scopes_are_subset
+    {
+        Ok(())
+    } else {
+        Err(ProductError::from_code(
+            ProductErrorCode::AuthorizationDenied,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn key_issue_request_body(
+    principal_id: SecurityId,
+    label: &str,
+    roles: &BTreeSet<BuiltInRole>,
+    custom_roles: &BTreeSet<SecurityId>,
+    permission_ceiling: ProductAuthorization,
+    scope_ceiling: &BTreeSet<ProductScope>,
+    expires_at_micros: Option<i64>,
+    self_manage: bool,
+) -> Result<Vec<u8>, ProductError> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&principal_id.to_be_bytes());
+    body.push(u8::from(self_manage));
+    body.extend_from_slice(
+        &u64::try_from(label.len())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(label.as_bytes());
+    body.extend_from_slice(
+        &u64::try_from(roles.len())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    body.extend(roles.iter().map(|role| role.tag()));
+    body.extend_from_slice(
+        &u64::try_from(custom_roles.len())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    for role_id in custom_roles {
+        body.extend_from_slice(&role_id.to_be_bytes());
+    }
+    body.extend_from_slice(&permission_ceiling.bits().to_be_bytes());
+    body.extend_from_slice(
+        &u64::try_from(scope_ceiling.len())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    for scope in scope_ceiling {
+        encode_scope(&mut body, *scope);
+    }
+    encode_optional_i64(&mut body, expires_at_micros);
+    Ok(body)
+}
+
+fn key_rotation_request_body(
+    predecessor_key_id: ApiKeyId,
+    label: &str,
+    overlap_seconds: u64,
+    expires_at_micros: Option<i64>,
+    self_manage: bool,
+) -> Result<Vec<u8>, ProductError> {
+    let mut body = Vec::new();
+    body.extend_from_slice(predecessor_key_id.as_bytes());
+    body.push(u8::from(self_manage));
+    body.extend_from_slice(&overlap_seconds.to_be_bytes());
+    body.extend_from_slice(
+        &u64::try_from(label.len())
+            .map_err(|_| ProductError::from_code(ProductErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(label.as_bytes());
+    encode_optional_i64(&mut body, expires_at_micros);
+    Ok(body)
+}
+
+fn key_target_request_body(
+    key_id: ApiKeyId,
+    self_manage: bool,
+    confirmation_digest: Option<ApiKeyConfirmationDigest>,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(49);
+    body.extend_from_slice(key_id.as_bytes());
+    body.push(u8::from(self_manage));
+    if let Some(digest) = confirmation_digest {
+        body.extend_from_slice(digest.as_bytes());
+    }
+    body
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod public_key_lifecycle_tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    fn directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hyphae-public-key-lifecycle-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn public_issue_start_is_one_time_pending_and_exactly_activates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = directory("issue");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let data = root.join("data");
+        let owner_file = root.join("owner.key");
+        let mut product = NativeProduct::create(&data)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_file, 1)?;
+        let owner_secret = fs::read_to_string(&owner_file)?;
+        let actor = product.authenticate_api_key(&owner_secret, 2)?;
+        let started = product.start_api_key_issue_idempotent(
+            &actor,
+            actor.principal_id(),
+            "pending",
+            [BuiltInRole::Owner],
+            [],
+            ProductAuthorization::ALL,
+            [ProductScope::Instance],
+            None,
+            11,
+            3,
+            true,
+        )?;
+        let pending = started.secret.take().ok_or("missing one-time secret")?;
+        assert!(started.secret.is_consumed());
+        assert_eq!(
+            product
+                .start_api_key_issue_idempotent(
+                    &actor,
+                    actor.principal_id(),
+                    "pending",
+                    [BuiltInRole::Owner],
+                    [],
+                    ProductAuthorization::ALL,
+                    [ProductScope::Instance],
+                    None,
+                    11,
+                    3,
+                    true,
+                )
+                .expect_err("start replay returned a secret")
+                .code(),
+            ProductErrorCode::SecretDeliveryConsumed
+        );
+        assert_eq!(
+            product
+                .authenticate_api_key(pending.expose_secret(), 4)
+                .expect_err("pending key authenticated")
+                .code(),
+            ProductErrorCode::AuthorizationDenied
+        );
+        let mut wrong = *pending.confirmation_digest().as_bytes();
+        wrong[0] ^= 1;
+        assert_eq!(
+            product
+                .activate_api_key_issue_idempotent(
+                    &actor,
+                    started.key_id,
+                    ApiKeyConfirmationDigest::from_bytes(wrong),
+                    12,
+                    5,
+                    true,
+                )
+                .expect_err("wrong digest activated")
+                .code(),
+            ProductErrorCode::ConfirmationDigestMismatch
+        );
+        let activated = product.activate_api_key_issue_idempotent(
+            &actor,
+            started.key_id,
+            pending.confirmation_digest(),
+            13,
+            6,
+            true,
+        )?;
+        let replay = product.activate_api_key_issue_idempotent(
+            &actor,
+            started.key_id,
+            pending.confirmation_digest(),
+            13,
+            7,
+            true,
+        )?;
+        assert_eq!(activated, replay);
+        assert!(
+            product
+                .authenticate_api_key(pending.expose_secret(), 8)
+                .is_ok()
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn public_rotation_supports_zero_and_maximum_overlap_and_exact_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = directory("rotation");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let data = root.join("data");
+        let owner_file = root.join("owner.key");
+        let mut product = NativeProduct::create(&data)?;
+        let bootstrap =
+            product.bootstrap_access_control_to_file("Owner", "owner", &owner_file, 1)?;
+        let owner_secret = fs::read_to_string(&owner_file)?;
+        let actor = product.authenticate_api_key(&owner_secret, 2)?;
+        let pending = product.start_api_key_rotation_idempotent(
+            &actor,
+            bootstrap.key_id,
+            "pending rotation",
+            AccessControlLimits::V1.maximum_rotation_overlap_seconds,
+            None,
+            21,
+            3,
+            true,
+        )?;
+        product.abort_api_key_rotation_idempotent(&actor, pending.key_id, 22, 4, true)?;
+        let started = product.start_api_key_rotation_idempotent(
+            &actor,
+            bootstrap.key_id,
+            "zero rotation",
+            0,
+            None,
+            23,
+            5,
+            true,
+        )?;
+        let secret = started.secret.take().ok_or("missing rotation secret")?;
+        let activated = product.activate_api_key_rotation_idempotent(
+            &actor,
+            started.key_id,
+            secret.confirmation_digest(),
+            24,
+            6,
+            true,
+        )?;
+        assert_eq!(activated.predecessor_key_id, Some(bootstrap.key_id));
+        assert!(
+            product
+                .authenticate_api_key(secret.expose_secret(), 7)
+                .is_ok()
+        );
+        assert_eq!(
+            product
+                .authenticate_api_key(&owner_secret, 7)
+                .expect_err("zero-overlap predecessor remained active")
+                .code(),
+            ProductErrorCode::AuthorizationDenied
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reader_cannot_rotate_same_principal_admin_key_but_can_rotate_own_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = directory("rotation-authority");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let data = root.join("data");
+        let owner_file = root.join("owner.key");
+        let admin_file = root.join("admin.key");
+        let reader_file = root.join("reader.key");
+        let mut product = NativeProduct::create(&data)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_file, 1)?;
+        let owner_secret = fs::read_to_string(&owner_file)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let principal = product.create_security_principal(&owner, "Mixed authority", 2)?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        product.set_security_principal_enabled_idempotent(
+            &owner,
+            principal.principal_id,
+            true,
+            101,
+            3,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        product.assign_built_in_role(
+            &owner,
+            principal.principal_id,
+            BuiltInRole::Admin,
+            ProductScope::Instance,
+            4,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        product.assign_built_in_role(
+            &owner,
+            principal.principal_id,
+            BuiltInRole::Reader,
+            ProductScope::Instance,
+            5,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let admin = product.issue_api_key_to_file(
+            &owner,
+            principal.principal_id,
+            "admin",
+            [BuiltInRole::Admin],
+            BuiltInRole::Admin.authorization(),
+            None,
+            &admin_file,
+            6,
+        )?;
+        let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
+        let reader = product.issue_api_key_to_file(
+            &owner,
+            principal.principal_id,
+            "reader",
+            [BuiltInRole::Reader],
+            BuiltInRole::Reader.authorization(),
+            None,
+            &reader_file,
+            7,
+        )?;
+        let reader_secret = fs::read_to_string(&reader_file)?;
+        let actor = product.authenticate_api_key(&reader_secret, i64::MAX)?;
+
+        let denied = product
+            .start_api_key_rotation_idempotent(
+                &actor,
+                admin.key_id,
+                "forbidden",
+                0,
+                None,
+                102,
+                8,
+                true,
+            )
+            .expect_err("reader rotated a same-principal admin key");
+        let unknown = product
+            .start_api_key_rotation_idempotent(
+                &actor,
+                ApiKeyId::from_bytes([0xff; 16]).ok_or("invalid test key")?,
+                "unknown",
+                0,
+                None,
+                103,
+                8,
+                true,
+            )
+            .expect_err("unknown key disclosed rotation state");
+        assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+        assert_eq!(unknown.code(), denied.code());
+
+        let own = product.start_api_key_rotation_idempotent(
+            &actor,
+            reader.key_id,
+            "own",
+            0,
+            None,
+            104,
+            9,
+            true,
+        )?;
+        assert_eq!(own.predecessor_key_id, Some(reader.key_id));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_start_recovers_as_consumed_without_secret_redelivery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = directory("interrupted-start");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let data = root.join("data");
+        let owner_file = root.join("owner.key");
+        let mut product = NativeProduct::create(&data)?;
+        product.bootstrap_access_control_to_file("Owner", "owner", &owner_file, 1)?;
+        let owner_secret = fs::read_to_string(&owner_file)?;
+        let actor = product.authenticate_api_key(&owner_secret, 2)?;
+        assert!(
+            product
+                .start_api_key_issue_idempotent_with_interruption(
+                    &actor,
+                    actor.principal_id(),
+                    "crashed",
+                    [BuiltInRole::Owner],
+                    [],
+                    ProductAuthorization::ALL,
+                    [ProductScope::Instance],
+                    None,
+                    31,
+                    3,
+                    true,
+                    Some(crate::SecurityCommitInterruption::returning(
+                        hyphae_native_runtime::CommitBoundary::RootPublished,
+                    )),
+                )
+                .is_err()
+        );
+        drop(product);
+        let mut reopened = NativeProduct::open(&data)?;
+        let actor = reopened.authenticate_api_key(&owner_secret, 4)?;
+        assert_eq!(
+            reopened
+                .start_api_key_issue_idempotent(
+                    &actor,
+                    actor.principal_id(),
+                    "crashed",
+                    [BuiltInRole::Owner],
+                    [],
+                    ProductAuthorization::ALL,
+                    [ProductScope::Instance],
+                    None,
+                    31,
+                    5,
+                    true,
+                )
+                .expect_err("interrupted committed start redelivered a secret")
+                .code(),
+            ProductErrorCode::SecretDeliveryConsumed
+        );
+        assert_eq!(reopened.access_control_status()?.pending_keys, 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
 
@@ -5832,12 +9087,15 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::READ_CONTROL};
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
 
-        // An exclusive handle prevents another process from acquiring the
-        // inherited ACL before the protected DACL is installed and verified.
+        // An exclusive handle plus WRITE_DAC/WRITE_OWNER makes ACL replacement
+        // and owner assignment refer to this exact newly created file.
         options
-            .access_mode(GENERIC_WRITE | READ_CONTROL)
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .share_mode(0);
     }
     #[allow(unused_mut)]
@@ -5845,7 +9103,7 @@ fn create_restricted_output(path: &Path) -> Result<File, ProductError> {
         .open(path)
         .map_err(|_| ProductError::from_code(ProductErrorCode::Io))?;
     #[cfg(windows)]
-    if apply_windows_restricted_acl(path).is_err()
+    if apply_windows_restricted_acl(&file).is_err()
         || validate_windows_restricted_file(&file).is_err()
     {
         drop(file);
@@ -5875,7 +9133,7 @@ fn is_windows_named_stream(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
+fn apply_windows_restricted_acl(file: &File) -> std::io::Result<()> {
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{SeObjectType, SecurityInformation},
@@ -5891,17 +9149,24 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
         format!("D:P(A;;FA;;;{current_user})(A;;FA;;;{system})")
     };
     let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    let dacl = descriptor.dacl().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "restricted credential descriptor has no DACL",
+        )
+    })?;
+    let mut security_handle = file.try_clone()?;
+    wrappers::SetSecurityInfo(
+        &mut security_handle,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
         None,
         None,
-        descriptor.dacl(),
+        Some(dacl),
         None,
     )?;
-    wrappers::SetNamedSecurityInfo(
-        path.as_os_str(),
+    wrappers::SetSecurityInfo(
+        &mut security_handle,
         SeObjectType::SE_FILE_OBJECT,
         SecurityInformation::Owner,
         Some(current_user_sid.as_ref()),
@@ -5912,12 +9177,31 @@ fn apply_windows_restricted_acl(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+/// Applies and validates the platform account-only DACL for a new credential file.
+///
+/// # Errors
+///
+/// Returns an I/O error when the DACL cannot be installed or validated. The
+/// handle must refer to `path` and grant Windows DACL-write, owner-write, and
+/// security-descriptor-read access in addition to the caller's data access.
+pub fn restrict_windows_credential_file(path: &Path, file: &File) -> std::io::Result<()> {
+    if is_windows_named_stream(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "named streams cannot contain credentials",
+        ));
+    }
+    apply_windows_restricted_acl(file)?;
+    validate_windows_restricted_file(file)
+}
+
+#[cfg(windows)]
 /// Validates the account-only protected DACL on an opened credential file.
 ///
 /// # Errors
 ///
 /// Returns an I/O or permission error when the owner or DACL differs from the
-/// current process account plus LocalSystem authority.
+/// current process account plus `LocalSystem` authority.
 pub fn validate_windows_restricted_file(file: &File) -> std::io::Result<()> {
     use windows_permissions::{
         LocalBox, Sid,
@@ -6322,6 +9606,10 @@ fn encode_audit_event(event: &SecurityAuditEvent) -> Result<Vec<u8>, AccessCatal
                 output.push(3);
                 output.extend_from_slice(id.as_bytes());
             }
+            SecurityAuditTarget::LegacyBearer => {
+                output.push(4);
+                output.extend_from_slice(&[0; 16]);
+            }
         }
     }
     output.extend_from_slice(
@@ -6395,6 +9683,7 @@ fn decode_audit_event(encoded: &[u8]) -> Result<SecurityAuditEvent, AccessCatalo
             3 => SecurityAuditTarget::Key(
                 ApiKeyId::from_bytes(bytes).ok_or(AccessCatalogError::CorruptCatalog)?,
             ),
+            4 if bytes == [0; 16] => SecurityAuditTarget::LegacyBearer,
             _ => return Err(AccessCatalogError::CorruptCatalog),
         });
     }
@@ -6784,6 +10073,313 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_bearer_migration_is_durable_terminal_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let key_path = path.with_extension("legacy-owner-key");
+        remove_test_files(&[&key_path]);
+        let _ignored = fs::remove_dir_all(&path);
+        let bearer = b"legacy-bearer-canary-0123456789abcdef";
+        let mut product = NativeProduct::create(&path)?;
+        drop(product);
+
+        product = NativeProduct::open_offline_owner(&path)?;
+        let started = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical-owner",
+            bearer,
+            1,
+        )?;
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::MigrationPending
+        );
+        let secret = started.secret.expose_secret().to_owned();
+        fs::write(&key_path, &secret)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        }
+        let activated = product.activate_legacy_bearer_migration_offline(
+            started.key_id,
+            &secret,
+            started.authorization_epoch,
+            "Migrated owner",
+            "canonical-owner",
+            bearer,
+            2,
+        )?;
+        let replay = product.activate_legacy_bearer_migration_offline(
+            started.key_id,
+            &secret,
+            started.authorization_epoch,
+            "Migrated owner",
+            "canonical-owner",
+            bearer,
+            3,
+        )?;
+        assert_eq!(activated, replay);
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::DualWindow
+        );
+        drop(product);
+
+        let mut product = NativeProduct::open(&path)?;
+        let owner = product.authenticate_api_key(&secret, 0)?;
+        let revoked = product.revoke_legacy_bearer_idempotent(&owner, 77, 4)?;
+        let replay = product.revoke_legacy_bearer_idempotent(&owner, 77, 5)?;
+        assert_eq!(revoked, replay);
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        drop(product);
+        let reopened = NativeProduct::open(&path)?;
+        assert_eq!(
+            reopened.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        drop(reopened);
+        remove_test_files(&[&key_path]);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_recovery_activation_terminally_revokes_legacy_in_the_same_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let legacy = b"legacy-recovery-canary-0123456789abcdef";
+        let _ignored = fs::remove_dir_all(&path);
+        let mut product = NativeProduct::create(&path)?;
+        drop(product);
+        product = NativeProduct::open_offline_owner(&path)?;
+        let migrated = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy,
+            1,
+        )?;
+        let canonical = migrated.secret.expose_secret().to_owned();
+        product.activate_legacy_bearer_migration_offline(
+            migrated.key_id,
+            &canonical,
+            migrated.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy,
+            2,
+        )?;
+        let recovery = product.start_owner_recovery_offline("recovered", 3)?;
+        let recovered = recovery.secret.expose_secret().to_owned();
+        let receipt = product.resume_owner_recovery_offline(
+            recovery.key_id,
+            &recovered,
+            recovery.authorization_epoch,
+            4,
+        )?;
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        assert_eq!(
+            receipt.authorization_epoch,
+            product.access_control_status()?.epoch
+        );
+        drop(product);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_recovery_supersedes_pending_legacy_migration_without_invalid_catalog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let legacy = b"legacy-pending-recovery-canary-0123456789abcdef";
+        let _ignored = fs::remove_dir_all(&path);
+        drop(NativeProduct::create(&path)?);
+        let mut product = NativeProduct::open_offline_owner(&path)?;
+        let migrated = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy,
+            1,
+        )?;
+        let retired_migration_secret = migrated.secret.expose_secret().to_owned();
+        let recovery = product.start_owner_recovery_offline("recovered", 2)?;
+        let recovered_secret = recovery.secret.expose_secret().to_owned();
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        drop(product);
+
+        let mut reopened = NativeProduct::open_offline_owner(&path)?;
+        assert_eq!(
+            reopened.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        let receipt = reopened.resume_owner_recovery_offline(
+            recovery.key_id,
+            &recovered_secret,
+            recovery.authorization_epoch,
+            3,
+        )?;
+        assert_eq!(receipt.key_id, recovery.key_id);
+        assert!(
+            reopened
+                .authenticate_api_key(&retired_migration_secret, 0)
+                .is_err()
+        );
+        assert!(reopened.authenticate_api_key(&recovered_secret, 0).is_ok());
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_recovery_with_legacy_recovers_terminally_from_wal_appended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let legacy = b"legacy-recovery-wal-canary-0123456789abcdef";
+        let _ignored = fs::remove_dir_all(&path);
+        drop(NativeProduct::create(&path)?);
+        let mut product = NativeProduct::open_offline_owner(&path)?;
+        let migrated = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy,
+            1,
+        )?;
+        let canonical = migrated.secret.expose_secret().to_owned();
+        product.activate_legacy_bearer_migration_offline(
+            migrated.key_id,
+            &canonical,
+            migrated.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy,
+            2,
+        )?;
+        let recovery = product.start_owner_recovery_offline("recovered", 3)?;
+        let recovered = recovery.secret.expose_secret().to_owned();
+        product.interrupt_next_security_commit_for_test(
+            hyphae_native_runtime::CommitBoundary::WalAppended,
+        );
+        assert!(
+            product
+                .resume_owner_recovery_offline(
+                    recovery.key_id,
+                    &recovered,
+                    recovery.authorization_epoch,
+                    4,
+                )
+                .is_err()
+        );
+        drop(product);
+
+        let mut reopened = NativeProduct::open_offline_owner(&path)?;
+        assert_eq!(
+            reopened.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::Revoked
+        );
+        assert!(reopened.legacy_bearer_verifier()?.is_none());
+        let receipt = reopened.resume_owner_recovery_offline(
+            recovery.key_id,
+            &recovered,
+            recovery.authorization_epoch,
+            5,
+        )?;
+        assert_eq!(
+            receipt.authorization_epoch,
+            reopened.access_control_status()?.epoch
+        );
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pending_migration_can_be_restarted_after_secret_file_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let _ignored = fs::remove_dir_all(&path);
+        let legacy = b"legacy-restart-canary-0123456789abcdef";
+        let mut product = NativeProduct::create(&path)?;
+        drop(product);
+        product = NativeProduct::open_offline_owner(&path)?;
+        let first = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy,
+            1,
+        )?;
+        let first_id = first.key_id;
+        drop(first);
+        drop(product);
+
+        let mut product = NativeProduct::open_offline_owner(&path)?;
+        let replacement = product.start_legacy_bearer_migration_offline(
+            "Migrated owner",
+            "canonical",
+            legacy,
+            2,
+        )?;
+        assert_ne!(replacement.key_id, first_id);
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.key_id,
+            Some(replacement.key_id)
+        );
+        let secret = replacement.secret.expose_secret().to_owned();
+        product.activate_legacy_bearer_migration_offline(
+            replacement.key_id,
+            &secret,
+            replacement.authorization_epoch,
+            "Migrated owner",
+            "canonical",
+            legacy,
+            3,
+        )?;
+        assert_eq!(
+            product.legacy_bearer_migration_inspection()?.state,
+            LegacyBearerState::DualWindow
+        );
+        drop(product);
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hyacat05_persists_only_product_keyed_legacy_verifier_and_v4_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = b"legacy-durable-verifier-canary-0123456789abcdef";
+        let product_key = [0x5a; 32];
+        let bare_digest = *blake3::hash(legacy).as_bytes();
+        let keyed_verifier = legacy_bearer_verifier(legacy, product_key)?;
+        assert_ne!(keyed_verifier, bare_digest);
+
+        let mut catalog = AccessControlCatalog::empty();
+        let request_digest = legacy_bearer_migration_request_digest("Owner", "owner", legacy)?;
+        catalog.begin_legacy_bearer_migration(
+            "Owner",
+            "owner",
+            1,
+            request_digest,
+            keyed_verifier,
+        )?;
+        let encoded = catalog.encode()?;
+        assert_eq!(&encoded[..CATALOG_MAGIC.len()], CATALOG_MAGIC);
+        assert!(!encoded.windows(legacy.len()).any(|window| window == legacy));
+        assert_eq!(AccessControlCatalog::decode(&encoded)?, catalog);
+        assert!(catalog.encode_v4().is_err());
+        assert!(LegacyBearerVerifier(keyed_verifier).verifies(legacy, product_key));
+        assert!(!LegacyBearerVerifier(keyed_verifier).verifies_digest(bare_digest, [0; 32]));
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn restricted_output_has_current_account_and_system_dacl()
@@ -6817,6 +10413,47 @@ mod tests {
         assert!(!sddl.contains(";;;AU)"));
         drop(file);
         remove_test_files(&[&path]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_strips_an_inherited_parent_trustee()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use windows_permissions::{
+            LocalBox, SecurityDescriptor,
+            constants::{SeObjectType, SecurityInformation},
+            utilities, wrappers,
+        };
+
+        let root = temporary_directory().with_extension("restricted-parent");
+        let _ignored = fs::remove_dir_all(&root);
+        fs::create_dir(&root)?;
+        let current_sid = utilities::current_process_sid()?;
+        let current = current_sid.to_string();
+        let system = "S-1-5-18";
+        let sddl = if current == system {
+            format!("D:P(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        } else {
+            format!("D:P(A;OICI;FA;;;{current})(A;OICI;FA;;;{system})(A;OICI;FR;;;WD)")
+        };
+        let descriptor: LocalBox<SecurityDescriptor> = sddl.parse()?;
+        let dacl = descriptor.dacl().ok_or("test descriptor has no DACL")?;
+        wrappers::SetNamedSecurityInfo(
+            root.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )?;
+
+        let path = root.join("owner.key");
+        let file = create_restricted_output(&path)?;
+        validate_windows_restricted_file(&file)?;
+        drop(file);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -6893,6 +10530,7 @@ mod tests {
             authorization: ProductAuthorization::from_permissions([permission]),
             authorization_epoch: AuthorizationEpoch::INITIAL,
             directory_lineage: [1; 24],
+            terminal_replay_only: false,
             valid_until_micros: None,
             effective_roles: Box::new([]),
             effective_custom_roles: Box::new([]),
@@ -6902,6 +10540,7 @@ mod tests {
                 authorization: ProductAuthorization::from_permissions([permission]),
             }]
             .into_boxed_slice(),
+            catalog_cursor_key: [9; 32],
         })
     }
 
@@ -7137,7 +10776,11 @@ mod tests {
             SecurityAuditAction::from_tag(14),
             Some(SecurityAuditAction::RevokeAssignment)
         );
-        assert_eq!(SecurityAuditAction::from_tag(15), None);
+        assert_eq!(
+            SecurityAuditAction::from_tag(15),
+            Some(SecurityAuditAction::RevokeLegacyBearer)
+        );
+        assert_eq!(SecurityAuditAction::from_tag(16), None);
     }
 
     #[test]
@@ -8234,12 +11877,12 @@ mod tests {
                 catalog.begin_key_rotation(current_id, "rotated", 0, instant, None)?;
             let successor_id = successor.id();
             catalog.activate_rotated_key(successor_id, instant)?;
-            assert_eq!(catalog.keys.len(), 1);
-            assert!(catalog.key(current_id).is_none());
+            assert!(catalog.keys.len() <= 2);
+            assert!(catalog.key(current_id).is_some_and(ApiKeyRecord::revoked));
             current_id = successor_id;
         }
         let (_, _recovery, _) = catalog.begin_owner_recovery("recovery", 103)?;
-        assert_eq!(catalog.keys.len(), 2);
+        assert_eq!(catalog.keys.len(), 3);
 
         let mut overlapping = AccessControlCatalog::empty();
         let (_, initial) = overlapping.bootstrap_owner("Owner", "primary", 1)?;
@@ -8674,9 +12317,12 @@ mod tests {
         let _ignored = fs::remove_dir_all(&path);
         let _ignored = fs::remove_file(&owner_path);
         let _ignored = fs::remove_file(&recovery_path);
-        let mut product = NativeProduct::create(&path)?;
-        product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        let mut created = NativeProduct::create(&path)?;
+        created.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
         let old_secret = fs::read_to_string(&owner_path)?;
+        assert!(created.authenticate_api_key(&old_secret, 2).is_ok());
+        drop(created);
+        let mut product = NativeProduct::open_offline_owner(&path)?;
         assert!(product.authenticate_api_key(&old_secret, 2).is_ok());
         let recovered =
             product.recover_owner_access_offline_to_file("recovered", &recovery_path, 3)?;
@@ -8708,8 +12354,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_recovery_retry_audits_every_replaced_pending_key()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn owner_recovery_rejects_replacement_of_pending_key() -> Result<(), Box<dyn std::error::Error>>
+    {
         let path = temporary_directory();
         let owner_path = path.with_extension("owner-recovery-retry");
         let _ignored = fs::remove_dir_all(&path);
@@ -8719,7 +12365,7 @@ mod tests {
         let owner_secret = fs::read_to_string(&owner_path)?;
 
         let mut catalog = product.load_access_control_catalog()?;
-        let (principal_id, first_pending, _, first_retired) =
+        let (principal_id, _, first_pending, _, first_retired) =
             catalog.begin_owner_recovery_with_retired("recovery-first", 2)?;
         assert!(first_retired.is_empty());
         let first_pending_id = first_pending.id();
@@ -8736,21 +12382,12 @@ mod tests {
         )?;
 
         let mut catalog = product.load_access_control_catalog()?;
-        let (retry_principal_id, retry_pending, _, retry_retired) =
-            catalog.begin_owner_recovery_with_retired("recovery-retry", 3)?;
-        assert_eq!(retry_principal_id, principal_id);
-        assert_eq!(retry_retired.as_ref(), &[first_pending_id]);
-        let retry_pending_id = retry_pending.id();
-        let mut retry_targets = vec![
-            SecurityAuditTarget::Principal(principal_id),
-            SecurityAuditTarget::Key(retry_pending_id),
-        ];
-        retry_targets.extend(retry_retired.iter().copied().map(SecurityAuditTarget::Key));
-        product.commit_access_control_catalog(
-            &mut catalog,
-            3,
-            SecurityAuditDraft::offline(SecurityAuditAction::RecoverOwner, retry_targets),
-        )?;
+        assert_eq!(
+            catalog
+                .begin_owner_recovery_with_retired("recovery-retry", 3)
+                .map(|_| ()),
+            Err(AccessCatalogError::Conflict)
+        );
 
         let owner = product.authenticate_api_key(&owner_secret, i64::MAX)?;
         let audit_page = product.read_security_audit(&owner, None, 32, 4)?;
@@ -8759,9 +12396,6 @@ mod tests {
                 && event
                     .targets()
                     .contains(&SecurityAuditTarget::Key(first_pending_id))
-                && event
-                    .targets()
-                    .contains(&SecurityAuditTarget::Key(retry_pending_id))
         }));
         assert_eq!(product.access_control_status()?.pending_keys, 1);
 
@@ -8780,6 +12414,157 @@ mod tests {
     }
 
     #[test]
+    fn offline_owner_recovery_activation_and_abort_survive_unknown_ack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_directory();
+        let owner_path = path.with_extension("owner-offline-replay");
+        let _ignored = fs::remove_dir_all(&path);
+        let _ignored = fs::remove_file(&owner_path);
+        let mut created = NativeProduct::create(&path)?;
+        created.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+        drop(created);
+
+        let mut product = NativeProduct::open_offline_owner(&path)?;
+        let started = product.start_owner_recovery_offline("activate", 2)?;
+        let secret = started.secret.expose_secret().to_owned();
+        let pending_key = started.key_id;
+        let pending_epoch = started.authorization_epoch;
+        let activated =
+            product.resume_owner_recovery_offline(pending_key, &secret, pending_epoch, 3)?;
+        drop(product);
+        let mut reopened = NativeProduct::open_offline_owner(&path)?;
+        let replay =
+            reopened.resume_owner_recovery_offline(pending_key, &secret, pending_epoch, 4)?;
+        assert_eq!(activated, replay);
+
+        let started = reopened.start_owner_recovery_offline("abort", 5)?;
+        let aborted = reopened.abort_owner_recovery_offline(
+            started.key_id,
+            started.authorization_epoch,
+            6,
+        )?;
+        drop(reopened);
+        let mut reopened = NativeProduct::open_offline_owner(&path)?;
+        let replay = reopened.abort_owner_recovery_offline(
+            started.key_id,
+            started.authorization_epoch,
+            7,
+        )?;
+        assert_eq!(aborted, replay);
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+        fs::remove_file(owner_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn offline_owner_recovery_pending_catalog_round_trips_with_redacted_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut catalog = AccessControlCatalog::empty();
+        let (_, owner) = catalog.bootstrap_owner("Owner", "owner", 1)?;
+        catalog.activate_key(owner.id())?;
+        let (_, operation_id, pending, epoch, _) =
+            catalog.begin_owner_recovery_with_retired("pending", 2)?;
+        let pending_key = pending.id();
+        let encoded = catalog.encode()?;
+        assert!(!encoded.windows(5).any(|window| window == b"hyp1_"));
+        let decoded = AccessControlCatalog::decode(&encoded)?;
+        let provenance = decoded
+            .pending_owner_recovery
+            .ok_or("missing pending provenance")?;
+        assert_eq!(provenance.operation_id(), operation_id);
+        assert_eq!(provenance.key_id(), pending_key);
+        assert_eq!(provenance.authorization_epoch(), epoch);
+        assert_eq!(
+            provenance.provenance(),
+            OwnerRecoveryProvenance::OfflineOperatingSystemOwner
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_offline_owner_activation_boundary_recovers_pending_or_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use hyphae_native_runtime::CommitBoundary;
+
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let path = temporary_directory().with_extension(format!("owner-{boundary:?}"));
+            let owner_path = path.with_extension("owner-key");
+            let _ignored = fs::remove_dir_all(&path);
+            let _ignored = fs::remove_file(&owner_path);
+            let mut created = NativeProduct::create(&path)?;
+            created.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+            let old_secret = fs::read_to_string(&owner_path)?;
+            drop(created);
+            let mut product = NativeProduct::open_offline_owner(&path)?;
+            let started = product.start_owner_recovery_offline("pending", 2)?;
+            let new_secret = started.secret.expose_secret().to_owned();
+            let pending = product
+                .load_access_control_catalog()?
+                .pending_owner_recovery
+                .ok_or("missing pending recovery")?;
+            let mut catalog = product.load_access_control_catalog()?;
+            let principal_id = catalog
+                .key(started.key_id)
+                .ok_or("missing pending key")?
+                .principal_id();
+            let (authorization_epoch, retired) =
+                catalog.activate_recovered_owner_key_with_retired(started.key_id)?;
+            let mut targets = vec![
+                SecurityAuditTarget::Principal(principal_id),
+                SecurityAuditTarget::Key(started.key_id),
+            ];
+            targets.extend(retired.iter().copied().map(SecurityAuditTarget::Key));
+            let result = product.commit_access_control_catalog_recording_offline_recovery_at(
+                &mut catalog,
+                3,
+                SecurityAuditDraft::offline(SecurityAuditAction::ActivateKey, targets),
+                OfflineOwnerRecoveryOutcome::Activated,
+                pending,
+                Some(crate::SecurityCommitInterruption::returning(boundary)),
+            );
+            assert!(result.is_err());
+            drop(product);
+
+            let mut reopened = NativeProduct::open_offline_owner(&path)?;
+            let inspection = reopened.inspect_owner_recovery_offline()?;
+            if inspection.pending.is_some() {
+                assert!(reopened.authenticate_api_key(&old_secret, 4).is_ok());
+                assert!(reopened.authenticate_api_key(&new_secret, 4).is_err());
+                let receipt = reopened.resume_owner_recovery_offline(
+                    started.key_id,
+                    &new_secret,
+                    started.authorization_epoch,
+                    4,
+                )?;
+                assert_eq!(receipt.authorization_epoch, authorization_epoch);
+            } else {
+                assert!(reopened.authenticate_api_key(&old_secret, 4).is_err());
+                assert!(reopened.authenticate_api_key(&new_secret, 4).is_ok());
+                let receipt = reopened.resume_owner_recovery_offline(
+                    started.key_id,
+                    &new_secret,
+                    started.authorization_epoch,
+                    4,
+                )?;
+                assert_eq!(receipt.authorization_epoch, authorization_epoch);
+            }
+            drop(reopened);
+            fs::remove_dir_all(path)?;
+            fs::remove_file(owner_path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn security_mutation_marker_codecs_are_bounded_redacted_and_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let marker = SecurityMutationMarker {
@@ -8787,7 +12572,11 @@ mod tests {
             request_digest: [7; 32],
             actor_principal_id: SecurityId::new(1).ok_or("invalid principal")?,
             actor_key_id: ApiKeyId::from_bytes([2; 16]).ok_or("invalid key")?,
-            result_id: SecurityId::new(3).ok_or("invalid result")?,
+            result_id: SecurityMutationResultId::Security(
+                SecurityId::new(3).ok_or("invalid result")?,
+            ),
+            predecessor_key_id: None,
+            overlap_until_micros: None,
             authorization_epoch: AuthorizationEpoch::new(4),
             transaction_id: 5,
         };
@@ -8864,7 +12653,10 @@ mod tests {
                 .structure_get_internal(&security_mutation_marker_key(fingerprint))
                 .ok_or("missing mutation marker")?,
         )?;
-        assert_eq!(marker.result_id, first.principal_id);
+        assert_eq!(
+            marker.result_id,
+            SecurityMutationResultId::Security(first.principal_id)
+        );
         assert_eq!(marker.authorization_epoch, first.authorization_epoch);
         assert_eq!(marker.transaction_id, first.commit.transaction_id.get());
         drop(snapshot);
@@ -9251,7 +13043,7 @@ mod tests {
                     "Crash-safe principal",
                     token,
                     2,
-                    Some(boundary),
+                    Some(crate::SecurityCommitInterruption::returning(boundary)),
                 )
                 .is_err()
         );

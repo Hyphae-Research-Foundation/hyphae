@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -122,6 +122,7 @@ class _RetainingHttpPeer:
                         "HTTP/1.1 200 OK\r\n"
                         f"Content-Type: {PRODUCT_MEDIA_TYPE}\r\n"
                         f"Content-Length: {len(body)}\r\n"
+                        "X-Hyphae-Protocol-Minor: 3\r\n"
                         f"X-Hyphae-Request-Id: {request_id}\r\n"
                         "Connection: close\r\n\r\n"
                     ).encode()

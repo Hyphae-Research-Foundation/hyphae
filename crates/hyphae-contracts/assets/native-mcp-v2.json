@@ -1,8 +1,18 @@
 {
-  "schema": "hyphae-native-mcp-contract-v1",
-  "mcp_protocol": "2025-11-25",
-  "tool_schema_version": "hyphae-native-mcp-tools-v1",
-  "tool_page_size": 2,
+  "schema": "hyphae-native-mcp-contract-v2",
+  "mcp_protocol": "2025-06-18",
+  "tool_schema_version": "hyphae-native-mcp-tools-v2",
+  "tool_page_size": 100,
+  "resource_limits": {
+    "input_bytes": 4194304,
+    "output_bytes": 4194304,
+    "active_tool_calls": 1,
+    "pending_responses": 1
+  },
+  "cancellation": {
+    "method": "notifications/cancelled",
+    "idempotent": true
+  },
   "tools": [
     {
       "name": "hyphae_native_capabilities",
@@ -13,6 +23,7 @@
         "additionalProperties": false
       },
       "outputSchema": {
+        "type": "object",
         "oneOf": [
           {
             "type": "object",
@@ -56,7 +67,7 @@
             "additionalProperties": false,
             "required": ["schema", "error"],
             "properties": {
-              "schema": { "const": "hyphae-native-mcp-tool-error-v1" },
+              "schema": { "const": "hyphae-native-mcp-tool-error-v2" },
               "error": {
                 "type": "object",
                 "additionalProperties": false,
@@ -104,6 +115,7 @@
         "additionalProperties": false
       },
       "outputSchema": {
+        "type": "object",
         "oneOf": [
           {
             "type": "object",
@@ -138,7 +150,7 @@
             "additionalProperties": false,
             "required": ["schema", "error"],
             "properties": {
-              "schema": { "const": "hyphae-native-mcp-tool-error-v1" },
+              "schema": { "const": "hyphae-native-mcp-tool-error-v2" },
               "error": {
                 "type": "object",
                 "additionalProperties": false,
@@ -198,6 +210,7 @@
         }
       },
       "outputSchema": {
+        "type": "object",
         "oneOf": [
           {
             "type": "object",
@@ -232,7 +245,7 @@
             "additionalProperties": false,
             "required": ["schema", "error"],
             "properties": {
-              "schema": { "const": "hyphae-native-mcp-tool-error-v1" },
+              "schema": { "const": "hyphae-native-mcp-tool-error-v2" },
               "error": {
                 "type": "object",
                 "additionalProperties": false,

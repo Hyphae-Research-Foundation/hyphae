@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Validate one suite-specific G8 artifact and emit a closure-candidate receipt."""
 
@@ -31,7 +31,7 @@ CHECKPOINT_BOUNDARIES = {
 }
 SNAPSHOT_PIN_BOUNDARIES = {"record-synchronized", "record-published"}
 PROMOTION_BOUNDARIES = {"before-rename", "marker-renamed", "parent-synchronized"}
-SOFTWARE_LICENSE = "AGPL-3.0-only"
+SOFTWARE_LICENSE = "Apache-2.0"
 FIRST_PARTY_ARTIFACT_COUNT = 79
 FIRST_PARTY_IDENTITY_COUNT = 33
 

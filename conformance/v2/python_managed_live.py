@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Exercise the installed Python SDK against one real managed Native daemon."""
 
 from __future__ import annotations
@@ -34,6 +34,13 @@ WRITE_OPERATIONS = [
     "security_custom_role_create",
     "security_principal_create",
     "security_principal_set_enabled",
+]
+LIFECYCLE_OPERATIONS = [
+    "security_api_key_issue_abort",
+    "security_api_key_issue_activate",
+    "security_api_key_issue_start",
+    "security_api_key_revoke",
+    "security_legacy_bearer_revoke",
 ]
 FORBIDDEN_FIELDS = {
     "api_key",
@@ -248,7 +255,7 @@ def assert_security_mutations(
     auditor_http: HyphaeClient,
     auditor_assignment_id: int,
     stale_principal_cursor: object,
-) -> None:
+) -> int:
     created = _mutation_pair(
         "security_principal_create",
         lambda: owner_local.security_principal_create(
@@ -397,6 +404,116 @@ def assert_security_mutations(
     _authorization_denied(
         lambda: auditor_http.security_status(options=RequestOptions(request_id=260))
     )
+    return principal_id
+
+
+def assert_security_lifecycle(
+    owner_local: HyphaeClient,
+    owner_http: HyphaeClient,
+    principal_id: int,
+) -> None:
+    issue_arguments = {
+        "principal_id": principal_id,
+        "label": "Python managed terminal lifecycle",
+        "roles": ["reader"],
+        "custom_roles": [],
+        "permission_ceiling": [
+            "catalog.read",
+            "credential.self_manage",
+            "data.read",
+            "discover",
+            "proof.generate",
+            "proof.verify",
+            "search.execute",
+        ],
+        "scope_ceiling": [{"kind": "instance"}],
+        "expires_at_micros": None,
+    }
+    started = owner_local.security_api_key_issue_start(
+        issue_arguments,
+        options=_mutation_options(301, 201),
+    )
+    try:
+        owner_http.security_api_key_issue_start(
+            issue_arguments,
+            options=_mutation_options(302, 201),
+        )
+    except ProductError as error:
+        if error.code != "secret_delivery_consumed":
+            raise AssertionError("key Start replay returned the wrong error") from error
+    else:
+        raise AssertionError("key Start replay redelivered a secret")
+
+    key_id = started.value["key_id"]
+    secret = started.value["secret"]
+    confirmation_digest = _api_key_confirmation_digest(bytes(secret.expose()))
+    activated = owner_local.security_api_key_activate(
+        key_id,
+        confirmation_digest,
+        options=_mutation_options(303, 202),
+    )
+    replayed_activation = owner_http.security_api_key_activate(
+        key_id,
+        confirmation_digest,
+        options=_mutation_options(304, 202),
+    )
+    _same_response(activated, replayed_activation, "security_api_key_issue_activate")
+    secret.close()
+
+    aborted = owner_local.security_api_key_issue_start(
+        {**issue_arguments, "label": "Python managed pending abort"},
+        options=_mutation_options(305, 203),
+    )
+    aborted_key_id = aborted.value["key_id"]
+    aborted.value["secret"].close()
+    first_abort = owner_http.security_api_key_abort(
+        aborted_key_id,
+        options=_mutation_options(306, 204),
+    )
+    replayed_abort = owner_local.security_api_key_abort(
+        aborted_key_id,
+        options=_mutation_options(307, 204),
+    )
+    _same_response(first_abort, replayed_abort, "security_api_key_issue_abort")
+
+    first_revoke = owner_local.security_api_key_revoke(
+        key_id,
+        options=_mutation_options(308, 205),
+    )
+    replayed_revoke = owner_http.security_api_key_revoke(
+        key_id,
+        options=_mutation_options(309, 205),
+    )
+    _same_response(first_revoke, replayed_revoke, "security_api_key_revoke")
+
+    first_legacy_revoke = owner_http.security_legacy_bearer_revoke(
+        options=_mutation_options(310, 206)
+    )
+    replayed_legacy_revoke = owner_local.security_legacy_bearer_revoke(
+        options=_mutation_options(311, 206)
+    )
+    _same_response(
+        first_legacy_revoke,
+        replayed_legacy_revoke,
+        "security_legacy_bearer_revoke",
+    )
+
+
+def _api_key_confirmation_digest(serialized: bytes) -> bytes:
+    if (
+        len(serialized) != 102
+        or not serialized.startswith(b"hyp1_")
+        or serialized[37:38] != b"_"
+    ):
+        raise AssertionError("key Start returned a malformed secret")
+    try:
+        key_id = bytes.fromhex(serialized[5:37].decode("ascii"))
+        key_secret = bytes.fromhex(serialized[38:].decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise AssertionError("key Start returned a malformed secret") from error
+    from hyphae_sdk.v2.protocol import blake3
+
+    return blake3(b"hyphae-api-key-v1\0" + key_id + key_secret)
 
 
 def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
@@ -423,9 +540,9 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
         as owner_http,
     ):
         stale_principal_cursor = assert_security_reads(auditor_local, auditor_http)
-        if auditor_transport.negotiated_minor != 2:
-            raise AssertionError("managed Auditor local transport did not negotiate minor 2")
-        assert_security_mutations(
+        if auditor_transport.negotiated_minor != 3:
+            raise AssertionError("managed Auditor local transport did not negotiate minor 3")
+        lifecycle_principal_id = assert_security_mutations(
             owner_local,
             owner_http,
             auditor_local,
@@ -433,13 +550,22 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
             assignment_id,
             stale_principal_cursor,
         )
-        if owner_transport.negotiated_minor != 2:
-            raise AssertionError("managed Owner local transport did not negotiate minor 2")
+        assert_security_lifecycle(
+            owner_local,
+            owner_http,
+            lifecycle_principal_id,
+        )
+        if owner_transport.negotiated_minor != 3:
+            raise AssertionError("managed Owner local transport did not negotiate minor 3")
     return {
         "schema": "hyphae-python-managed-v2-transcript-v1",
         "status": "passed",
-        "protocol": {"major": 1, "minor": 2},
-        "operations": {"reads": READ_OPERATIONS, "writes": WRITE_OPERATIONS},
+        "protocol": {"major": 1, "minor": 3},
+        "operations": {
+            "lifecycle": LIFECYCLE_OPERATIONS,
+            "reads": READ_OPERATIONS,
+            "writes": WRITE_OPERATIONS,
+        },
         "cases": {
             "conflict": True,
             "next_operation_revocation": True,
@@ -448,6 +574,7 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
             "redaction": True,
             "replay": True,
             "stale_cursor": True,
+            "terminal_replay": True,
         },
     }
 

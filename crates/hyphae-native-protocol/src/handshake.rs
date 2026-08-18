@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_product::{ApiKeyCredential, MAX_API_KEY_CREDENTIAL_BYTES, ProductCapabilities};
 use thiserror::Error;
@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Current native-local protocol major version.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Current native-local protocol minor version.
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 /// Maximum combined UTF-8 bytes in handshake names.
 pub const MAX_HANDSHAKE_TEXT_BYTES: usize = 4 * 1024;
 /// Exact UTF-8 bytes in one Native API-key authentication trailer.

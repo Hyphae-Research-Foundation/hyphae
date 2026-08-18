@@ -1,0 +1,94 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-relicensing-repository-audit-v1",
+  "target_release": "1.2.0",
+  "generated_at_utc": "2026-08-16T00:07:09Z",
+  "source": {
+    "repository": "https://github.com/celiumsai/hyphae.git",
+    "commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
+    "tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
+    "reachable_commit_count": 847,
+    "tracked_path_count": 1270,
+    "tracked_path_list_sha256": "895f6913164254ebcf29816d33c93205929a1a8a1520c6372c8fb9bc728834bf",
+    "tree_entries_sha256": "0eecd0753ba92f3c29447e9db6c077022f7eb74ac0f68952cd9b0bc5b5482b01"
+  },
+  "author_inventory": {
+    "scope": "Every commit reachable from source.commit; commit authors are observations, not proof of copyright ownership.",
+    "canonical_commit_author_rows_sha256": "e6c2f05c734ae8b8ee9006a04b69388165c97a9b30aa07a9ff09d5a4a697bd47",
+    "actors": [
+      {
+        "id": "mario-gutierrez",
+        "kind": "human-alias-group",
+        "observed_identities": [
+          "Mario Gutierrez <terrizoaguimor@gmail.com>",
+          "Mario Gutiérrez <terrizoaguimor@gmail.com>"
+        ],
+        "commit_count": 662,
+        "canonical_commit_rows_sha256": "5c48f3e6607218d8cbdeadd061cd326cd2801bb9dfa4a4791a3e81eb07509678",
+        "authority_state": "accepted-interactive-owner-attestation"
+      },
+      {
+        "id": "ec2-user",
+        "kind": "owner-confirmed-operational-identity",
+        "observed_identities": [
+          "ec2-user <ec2-user@ip-10-77-21-117.ec2.internal>"
+        ],
+        "commit_count": 173,
+        "canonical_commit_rows_sha256": "1b38d5ffcba39d3bcf4e23d8cfddcbe7fbdad5373e92cea31d5d572f45043ac3",
+        "authority_state": "covered-by-owner-first-party-authority-attestation"
+      },
+      {
+        "id": "dependabot",
+        "kind": "automated-dependency-update-identity",
+        "observed_identities": [
+          "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>"
+        ],
+        "commit_count": 12,
+        "canonical_commit_rows_sha256": "45cbbae42dbc7380571115dfbd173f07ad00f98b810f67d101571b731b56b321",
+        "authority_state": "accepted-mechanical-first-party-review",
+        "review": "docs/gates/evidence/relicensing-1.2.0-dependabot-review.json"
+      }
+    ],
+    "commit_message_bytes_sha256": "a39bc8c8f04e29c14456e0e67d893f7daea5908bffb04e54e50840628d290c3b",
+    "co_author_or_co_developer_trailer_count": 0,
+    "signed_off_by_trailer_count": 12,
+    "signed_off_by_unique_values": [
+      "dependabot[bot] <support@github.com>"
+    ],
+    "signed_off_by_rows_sha256": "a54b736406476e448cf27ae84ccb7f28d55b78bc652ae27d246b039cb7f279ba"
+  },
+  "copyright_and_provenance": {
+    "repository_notice_holder": "Celiums Solutions LLC",
+    "notice_path": "NOTICE",
+    "notice_sha256": "afe4e5103c1690c0728af140c53f65b9cd0a794640d41575d5a3634e7bb2ead7",
+    "porting_ledger_path": "docs/porting/ledger.md",
+    "porting_ledger_sha256": "437149c259ec8e17d0665777dfdc56f517cebf6586e51ad99ca17256582dc32c",
+    "accepted_historical_ports": 0,
+    "complete_holder_set_state": "confirmed-by-interactive-owner-attestation",
+    "authority_evidence": "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json",
+    "result": "accepted-owner-attested-first-party-authority"
+  },
+  "prior_commitment_review": {
+    "repository_review": "No repository statement was found that requires future Hyphae releases to remain AGPL-3.0-only; immutable v1.1.0 history remains out of scope for change.",
+    "off_repository_contracts_grants_and_commitments": "absence-confirmed-by-interactive-owner-attestation",
+    "result": "accepted-owner-attestation"
+  },
+  "contribution_governance": {
+    "contributing_path": "CONTRIBUTING.md",
+    "contributing_sha256": "8df1c56b46661be8d436ec923314036df4f6a80a63db38a5e64551a8d3b3b270",
+    "contributing_sha256_scope": "source.commit pre-transition bytes; current governance is bound by the transition tree receipt",
+    "current_terms": {
+      "software_and_normative_specifications": "Apache-2.0",
+      "narrative_documentation": "CC-BY-SA-4.0",
+      "inbound_equals_outbound": true
+    },
+    "dco_present": true,
+    "dco_version": "1.1",
+    "dco_path": "DCO",
+    "cla_or_assignment_present": false,
+    "unstated_future_relicensing_authority_claimed": false,
+    "result": "accepted-effective-inbound-equals-outbound-with-dco",
+    "statement": "New contributions use the current outbound license for their classified purpose and require DCO 1.1 certification. No CLA, assignment, or unstated future relicensing grant is claimed."
+  },
+  "result": "accepted-source-bound-preflight-evidence"
+}

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native result proof v2
 
 Status: implemented G6 native operation proof

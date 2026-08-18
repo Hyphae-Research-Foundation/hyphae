@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Binary product-envelope HTTP /v2 transport."""
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from .protocol import (
 
 PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1"
 ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1"
+PROTOCOL_MINOR = "3"
 _STANDARD_HTTP_CONNECTION = http.client.HTTPConnection
 _STANDARD_HTTPS_CONNECTION = http.client.HTTPSConnection
 _CONNECT_PENDING = {
@@ -180,7 +181,15 @@ class HttpTransport:
             if options.deadline_micros is not None
             else None
         )
-        body = encode_product_request(operation, arguments, options)
+        body = encode_product_request(
+            operation, arguments, options, negotiated_minor=int(PROTOCOL_MINOR)
+        )
+        key_lifecycle = operation.startswith("security_api_key_") or operation == (
+            "security_legacy_bearer_revoke"
+        )
+        one_time_secret = operation.startswith("security_api_key_") and operation.endswith(
+            "_start"
+        )
         timeout_seconds = self._timeout_seconds
         if deadline_at is not None:
             remaining = deadline_at - time.time()
@@ -192,6 +201,7 @@ class HttpTransport:
             "Accept": f"{PRODUCT_MEDIA_TYPE}, {ERROR_MEDIA_TYPE}",
             "Content-Type": PRODUCT_MEDIA_TYPE,
             "Content-Length": str(len(body)),
+            "X-Hyphae-Protocol-Minor": PROTOCOL_MINOR,
             "X-Hyphae-Request-Id": str(request_id),
         }
         if options.deadline_micros is not None:
@@ -257,13 +267,38 @@ class HttpTransport:
                 _abort_connection(connection)
                 raise self._interrupted_error(context, request_id)
             connection.auto_open = 0
-            connection.request("POST", "/v2/execute", body=body, headers=headers)
+            connection.request(
+                "POST",
+                "/v2/security/keys" if key_lifecycle else "/v2/execute",
+                body=body,
+                headers=headers,
+            )
             with self._state_lock:
                 interrupted = self._closed or context.aborted
             if interrupted:
                 _abort_connection(connection)
                 raise self._interrupted_error(context, request_id)
             response = connection.getresponse()
+            selected_minor = response.getheader("X-Hyphae-Protocol-Minor")
+            response_request_id = response.getheader("X-Hyphae-Request-Id")
+            session_id = response.getheader("X-Hyphae-Session-Id")
+            if selected_minor != PROTOCOL_MINOR:
+                raise ClientError("HTTP v2 protocol minor is missing or unsupported")
+            if response_request_id != str(request_id):
+                raise ClientError("HTTP v2 response request ID mismatch")
+            if session_id is not None and (
+                len(session_id) != 32
+                or any(character not in "0123456789abcdef" for character in session_id)
+                or session_id == "0" * 32
+            ):
+                raise ClientError("HTTP v2 response session ID is invalid")
+            if one_time_secret and 200 <= response.status < 300 and (
+                response.getheader("Cache-Control")
+                != "no-store, private, max-age=0"
+                or response.getheader("Pragma") != "no-cache"
+                or response.getheader("Content-Encoding") is not None
+            ):
+                raise ClientError("HTTP API-key secret response is not cache-safe")
             response_socket = _response_socket(response)
             with self._state_lock:
                 interrupted = self._closed or context.aborted
@@ -273,13 +308,10 @@ class HttpTransport:
                 if response_socket is not None:
                     _abort_socket(response_socket)
                 raise self._interrupted_error(context, request_id)
-            session_id = response.getheader("X-Hyphae-Session-Id")
             if session_id is not None:
                 with self._state_lock:
                     if not self._closed:
                         self._session_id = session_id
-            if response.getheader("X-Hyphae-Request-Id") != str(request_id):
-                raise ClientError("HTTP v2 response request ID mismatch")
             declared = response.getheader("Content-Length")
             maximum = min(self._response_bytes, options.limits["max_response_bytes"])
             if declared is not None and (
@@ -308,7 +340,9 @@ class HttpTransport:
                     raise ClientError(
                         "HTTP v2 returned an unexpected status or media type"
                     )
-                return decode_product_response(encoded, request_id)
+                return decode_product_response(
+                    encoded, request_id, negotiated_minor=int(PROTOCOL_MINOR)
+                )
             if media_type == ERROR_MEDIA_TYPE:
                 raise ProductError(
                     decode_product_error(encoded), status=response.status

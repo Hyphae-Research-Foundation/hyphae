@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-daemon"
 description = "Multi-client UDS and Windows named-pipe daemon for Hyphae Native"

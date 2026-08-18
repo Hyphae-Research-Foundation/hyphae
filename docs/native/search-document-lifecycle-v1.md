@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native lexical document lifecycle v1
 
 Status: normative contract; compiler-reaching red gate, embedded/delta/local

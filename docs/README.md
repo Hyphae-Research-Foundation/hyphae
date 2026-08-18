@@ -1,8 +1,8 @@
 # Hyphae documentation
 
 This directory is the canonical human documentation for shipped Hyphae
-behavior.
-Its prose, specifications, and diagrams are licensed under
+behavior. Implementable normative specifications are licensed under
+[`Apache-2.0`](../LICENSE); narrative prose and diagrams are licensed under
 [`CC-BY-SA-4.0`](../LICENSE-DOCUMENTATION), subject to the trademark and
 third-party boundaries in [`LICENSE-POLICY.md`](../LICENSE-POLICY.md).
 Public wire behavior is normative in `contracts/`; durable encodings and
@@ -292,10 +292,11 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
 - [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
-- [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
+- [ADR-0025: AGPLv3 code and CC BY-SA documentation (superseded for the 1.2.0 target)](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
 - [ADR-0026: Bounded calibration resampling](adr/0026-calibration-resampling-policy.md)
 - [ADR-0027: Parallel search seed cohorts](adr/0027-parallel-search-seed-cohorts.md)
 - [ADR-0028: Native identity, RBAC, and API keys](adr/0028-native-identity-rbac-and-api-keys.md)
+- [ADR-0029: Apache-2.0 software and normative specifications](adr/0029-apache-2.0-software-and-normative-specifications.md)
 
 ## Documentation contract
 

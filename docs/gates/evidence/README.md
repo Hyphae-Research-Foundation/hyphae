@@ -496,7 +496,7 @@ For a tagged `push` or exact-tag recovery run, the primary payloads also include
 `hyphae-vVERSION.required-checks.json` with role `required-checks`. That report
 conforms structurally to
 [`packaging/required-checks-report-v1.schema.json`](../../../packaging/required-checks-report-v1.schema.json)
-and records exactly the 18 canonical required GitHub Actions checks. Seventeen
+and records exactly the 20 canonical required GitHub Actions checks. Nineteen
 records bind the reviewed PR head and the G8 closure record binds the tagged
 merge commit on `main`. Each ordered record carries the matching `head_sha`, unique
 check-run ID, workflow-run ID, canonical GitHub job URL, GitHub Actions app

@@ -1,0 +1,57 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-relicensing-representative-attestation-v1",
+  "target_release": "1.2.0",
+  "source": {
+    "repository": "https://github.com/celiumsai/hyphae.git",
+    "commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
+    "tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95"
+  },
+  "organization": "Celiums Solutions LLC",
+  "representative": {
+    "name": "Mario Gutiérrez",
+    "capacity": "owner and representative of Celiums Solutions LLC",
+    "attested_at_utc": "2026-08-16T13:15:26Z",
+    "authentication": "interactive-owner-attestation",
+    "authentication_reference": "Interactive instruction in the repository work session authorizing the effective transition; no external locator is published."
+  },
+  "statements_prepared_for_attestation": {
+    "transition_authorization": {
+      "confirmed": true,
+      "statement": "The owner authorizes this repository's current first-party software and normative specifications to transition to Apache-2.0 and its narrative documentation to remain CC-BY-SA-4.0."
+    },
+    "copyright_authority": {
+      "confirmed": true,
+      "statement": "The organization has written authority over every first-party contribution in the source scope and authorizes Apache-2.0 for software and normative specifications and CC-BY-SA-4.0 for narrative documentation."
+    },
+    "counsel_approval": {
+      "qualified_open_source_counsel": true,
+      "written_approval_received": true,
+      "confidential_record_not_embedded": true,
+      "reviewed_plan": "docs/roadmaps/1.2.0-relicensing.md",
+      "apache_section_6_and_trademarks_scope_confirmed": false,
+      "apache_section_6_and_trademarks_owner_acceptance": "The owner authorizes Apache-2.0 together with the existing TRADEMARKS.md boundary. This is owner acceptance, not a claim that counsel's written approval expressly covered Apache License section 6 or the trademark policy.",
+      "nonconfidential_record_locator_or_sha256": null,
+      "locator_or_sha256_publication_status": "intentionally-not-published"
+    },
+    "prior_commitments": {
+      "absence_confirmed": true,
+      "statement": "No contract, grant, program application, or public commitment incompatible with the planned Apache-2.0 and CC-BY-SA-4.0 target was identified."
+    }
+  },
+  "identity_dispositions": {
+    "ec2_user_commits": {
+      "commit_count": 173,
+      "authority_confirmed": true,
+      "statement": "The owner confirms that Celiums Solutions LLC's first-party relicensing authority covers all 173 commits authored under the ec2-user operational identity."
+    },
+    "dependabot_commits": {
+      "commit_count": 12,
+      "authority_confirmed": true,
+      "review": "docs/gates/evidence/relicensing-1.2.0-dependabot-review.json",
+      "statement": "The owner authorizes classification of the twelve individually reviewed mechanical dependency updates as first-party-maintained changes."
+    }
+  },
+  "missing_authentication": [],
+  "status": "accepted-interactive-owner-attestation"
+}

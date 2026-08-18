@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native access-control threat model v1
 
 Status: normative design contract; implementation evidence pending
@@ -74,6 +75,8 @@ An attacker may:
 | Principal or key enumeration | Missing, malformed, revoked, expired, and wrong credentials expose the same bounded unauthorized result | HTTP/local/MCP equality fixtures |
 | Privilege escalation through a key restriction | Effective permissions and scopes are intersections with current principal assignments; keys never add authority | Property/model tests over random role/key combinations |
 | Scope escape by catalog rename | Scopes bind stable `ObjectId`, not names; SQL authorizes bound objects | Rename and prepared-plan conformance |
+| Catalog pagination leaks hidden topology or becomes authority | Minor-3 listing traverses exact roots or the durable ancestor-descendant index, deduplicates overlaps before filters, hides physical accounting, redacts hidden parents, and authenticates opaque cursors to current key/session authority, epoch, snapshot, filters, family, and last visible ID | Exact/subtree/sibling/overlap, rename/drop-recreate, cursor tamper/cross-binding, and empty-page tests |
+| Raw scalar operation escapes object scope | `HYPDKB01` binds Get/Set/TTL to one lineage-bound canonical keyspace ID; malformed, absent-after-bootstrap, or mismatched definitions fail closed | Exact/unrelated scope, reopen, codec corruption, and crash-boundary tests |
 | Scope escape through SQL joins, views, links, or subqueries | Binder produces the complete referenced-object set before execution; every object must be admitted | Multi-object SQL and cross-engine negative tests |
 | Stale session after revocation or role removal | Per-operation authorization epoch check and expiry check | Long-lived HTTP, UDS, named-pipe, and embedded session tests |
 | Commit after authority loss | Stage and commit checks; authority loss before commit causes definite rollback | Concurrent revoke/commit histories and crash recovery |
@@ -84,7 +87,7 @@ An attacker may:
 | Key rotation creates an unbounded overlap | One explicit old/new pair, finite deadline, atomic publication, and exact terminal status | Rotation interruption and expiry tests |
 | Authentication-failure write amplification | Failures use bounded telemetry and rate controls; no durable event per untrusted attempt | Saturation and disk-growth gate |
 | Audit event forges or leaks a secret | Events are product-generated, append under WAL/CSN, and contain public IDs/redacted fields only | Crash, replay, redaction, and canonical-codec tests |
-| Offline bootstrap or recovery while server is active | Exclusive directory lock and no remote endpoint; output path must be a new restricted regular file | Process exclusion and filesystem failure tests |
+| Offline bootstrap or recovery while server is active | Exclusive directory lock and no remote endpoint; Unix stable non-symlink directory with UID equal to EUID; Windows stable non-reparse/no-ADS directory owned by current SID with protected current-SID/LocalSystem-only DACL; output path must be a new restricted regular file outside the data directory | Process exclusion, ownership/ACL/identity, output-containment, and filesystem failure tests |
 | Rollback to an older credential database | Normal manifest/WAL lineage verification plus caller-pinned external anchors where rollback resistance is required | Backup/restore lineage and pinned-anchor tests |
 | Local client spoofs another principal | Before bootstrap, kernel peer identity is trusted-local compatibility metadata; after bootstrap only a durable API key is authority and client-supplied identity remains diagnostic | UDS/named-pipe adversarial handshake and automatic-cutover tests |
 | Resource exhaustion through roles, grants, keys, or audit queries | Finite counts, name bytes, result pages, work budgets, deadlines, and admission | Exact-limit/one-past-limit tests |
@@ -105,6 +108,12 @@ An attacker may:
    backup/administration label.
 9. Proof generation never grants access to the wrapped operation.
 10. Authorization failure publishes no partial logical result or mutation.
+11. No request may provision or repair the default scalar keyspace; provisioning
+    occurs under the exclusive directory owner before the first Owner is
+    published. A bootstrapped directory with a missing or corrupt binding is
+    not ready.
+12. Catalog cursors are continuations, never capabilities. Each page resolves
+    current `catalog.read` roots before cursor validation or traversal.
 
 ## Bootstrap and recovery risks
 
@@ -115,11 +124,34 @@ verifier and a definite output receipt, or rolls back. The key file is created
 with exclusive creation and restrictive permissions before the transaction is
 acknowledged.
 
-Recovery assumes operating-system control of the offline directory. It creates
-one replacement owner credential, revokes prior owner credentials, increments
-the authorization epoch, and records the event. It does not delete other
-principals or silently grant them owner. A failed recovery leaves either the
-complete old authority or the complete new authority.
+Before the first Owner catalog is published, the product requires the complete
+default scalar Database/Schema/Keyspace and `HYPDKB01` binding. Preview
+directories with no durable principals may receive that additive migration as
+one strict transaction while holding the directory lock. Once bootstrapped,
+missing state is diagnosed as corruption rather than silently recreated or
+adopted by name.
+
+Recovery proves operating-system control of the offline directory before it
+reads the catalog. Unix binds pre-open, opened-handle, and post-open
+device/inode identity and requires directory UID equal to process EUID. Windows
+rejects ADS and reparse paths, binds a stable directory handle, and requires the
+current process SID as owner plus a protected DACL containing only current-SID
+and LocalSystem full-access trustees. The normal exclusive `LOCK` rejects a
+running daemon, HTTP edge, console, or embedded owner.
+
+Phase one creates exactly one explicit pending operation ID/key ID/epoch with
+offline-OS-owner provenance and an inactive verifier while retaining all old
+owner keys. A second recovery conflicts. The restricted output uses exclusive
+creation outside the data directory, is restricted before secret bytes, and is
+synchronized before any activation request. Resume requires the exact complete
+file, key ID, verifier, and expected epoch. Activation atomically enables the
+replacement, removes all prior owner keys, increments the epoch, and records a
+terminal replay marker with the commit receipt. Exact abort removes only the
+pending verifier/provenance and cannot delete caller paths or change active
+owners. Interrupted activation/abort can therefore be retried after reopen.
+Inspect exposes no verifier or secret. A failed recovery leaves complete old
+authority, pending old authority plus an inactive replacement, or complete new
+authority, never an implicitly active unknown secret.
 
 ## Legacy bearer migration risks
 
@@ -129,10 +161,22 @@ format or claims that it has a key ID. It issues a new canonical owner key and
 requires an explicit cutover and revocation. Missing legacy configuration does
 not reactivate a previously revoked credential.
 
-The current foundation does not yet activate that compatibility credential.
-Bootstrapped listeners reject a fixed bearer until migration, synthetic-owner
-binding, and revocation ship as one verified slice; this fail-closed interim
-does not consume the one-minor compatibility window.
+The durable state machine is `never_enabled -> migration_pending -> dual_window
+-> revoked`, with owner recovery allowed to move either enabled state directly
+to terminal `revoked`. `HYACAT05` makes downgrade rejection structural. Only an
+offline, OS-owner-authorized migration can enter pending; only durable
+restricted-key output can precede dual-window activation; and only canonical
+Owner authority can revoke. The bearer plaintext never enters durable state;
+enabled state stores only a BLAKE3 verifier keyed by the persisted product-local
+cursor authority. A bare digest copied from configuration or an offline artifact
+cannot authenticate, and missing keyed verifier material fails startup closed.
+`HYACAT04` and older formats cannot represent enabled verifier state and are not
+accepted as an enabled compatibility authority. Canonical-looking `hyp1` input
+never reaches legacy comparison. The
+synthetic session has no fabricated durable IDs, excludes security/ownership
+management, and checks the terminal state every operation. Compatibility is
+exactly Native HTTP 1.2; UDS, named pipe, non-loopback plaintext, normal
+bootstrap, restore, and 1.3 authentication cannot enable it.
 
 ## Residual and excluded threats
 

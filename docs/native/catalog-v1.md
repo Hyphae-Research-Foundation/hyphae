@@ -1,6 +1,7 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native catalog v1
 
-Status: normative contract. The runtime implements `HYCAT006`, including
+Status: normative contract. The runtime implements `HYCAT007`, including
 the scalable B+tree catalog, immutable definition blobs, buffered ID/name
 lookup, bounded relation-to-secondary-index edges, and durable monotonic object
 ID authority, logical V2 persistence, deterministic legacy wrappers, and
@@ -8,8 +9,29 @@ bounded object/dependency reads. Legacy definitions remain canonical
 `HYCOBJ01`; V2-native definitions use strict `HYCOBJ02`. DDL evolution beyond
 the current create/drop/rename behavior remains pending.
 
+`HYCAT007` is additive over `HYCAT006`. Prefix `0x06 || ancestor_id_be ||
+descendant_id_be` has an empty value and contains the reflexive transitive
+closure of the logical parent relation. Every live object has its self edge;
+every V2 descendant has one edge for each ancestor. Complete-load validation
+re-derives the set and rejects missing, extra, duplicate, dangling, cyclic,
+nonempty, or malformed entries. A strict explicit migration writes a new
+immutable root; open never mutates a directory. New catalog writes emit V7.
+The index supports subtree visibility without traversing unrelated global
+objects and remains ordered by ancestor then descendant `ObjectId`.
+
 The catalog is the shared namespace and type authority. It does not force the
 three engines to share one physical data model.
+
+The product provisions its wire-compatible default scalar namespace as one
+internal Database, one internal Schema, and one V2 Keyspace in the same strict
+native transaction as the internal `HYPDKB01` binding. IDs come from the
+catalog's durable `next_object_id` authority and are neither constants nor
+derived from names. The keyspace is exactly String/Binary/Binary,
+Canonical/PerValue/Durable/None with no relation schema. Open validates the
+binding lineage plus all three IDs, parents, owners, kinds, names, definition
+versions, types, ownership, TTL, memory, and eviction policy. It never adopts
+objects by name. Binding and definitions therefore become visible together or
+not at all without changing `HYCAT006`, WAL, or directory format versions.
 
 ## Object hierarchy
 

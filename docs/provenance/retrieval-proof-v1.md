@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Retrieval proof format v1
 
 Status: normative for Hyphae `0.2` exact, lexical, and hybrid retrieval.

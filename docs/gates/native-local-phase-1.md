@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local ecosystem phase-1 gate
 
 Status: release candidate. The current closure/revalidation state is maintained in

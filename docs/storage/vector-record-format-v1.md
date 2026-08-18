@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Durable vector record format v1
 
 Status: normative for Hyphae `0.2` disk format `2`.

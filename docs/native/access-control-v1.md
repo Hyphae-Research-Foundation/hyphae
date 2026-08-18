@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native access control v1
 
 Status: normative contract; implementation evidence pending
@@ -105,9 +106,25 @@ authority, bind failures for an out-of-scope existing object, a missing object,
 and malformed SQL expose the same authorization denial; binder diagnostics
 must not become a catalog-existence oracle.
 
-Raw structure operations bind to the canonical default keyspace object before
-scope evaluation. Search operations bind the requested stable collection or
-index. A transaction accumulates the union of every referenced scope and
+`ExecuteSql`, `AdminExplainSql`, and `TransactionStageSql` consume the exact
+binder result used for authorization. A read reuses its `PreparedStatement`
+object set. DML includes the target relation, every maintained secondary index,
+and every foreign-key relation or referenced index inspected by execution;
+`DELETE` also includes child relations inspected for incoming references.
+Staged SQL binds against the explicit transaction's private catalog and retains
+the exact object/permission union for commit reauthorization. Execution either
+reuses that binding or rejects a catalog-version mismatch; it never silently
+authorizes one binding and executes a fresh one. `AdminExplainSql` requires
+`observe` at instance scope plus `catalog.read` on every bound object. Only
+`CREATE TABLE` remains instance-scoped for `catalog.write` because the current
+catalog has no durable schema parent for a not-yet-created relation.
+
+Raw scalar `StructureGet`, `StructureSet`, and `StructureTtl` operations bind to
+the stable `ObjectId` in the strict internal `HYPDKB01` record before scope
+evaluation. They require `data.read` or `data.write` at that exact durable
+canonical keyspace, never merely at `instance`. The record is lineage-bound and
+names are not authority. Search operations bind the requested stable collection
+or index. A transaction accumulates the union of every referenced scope and
 reauthorizes the complete union before commit.
 
 Catalog listing currently requires instance-wide `catalog.read`. Object- and
@@ -175,7 +192,8 @@ immediate predecessor valid until the earlier of its overlap deadline,
 revocation, expiry, principal disablement, or role removal. A key cannot have
 multiple live successors. An interrupted inactive successor can be aborted by
 its known predecessor ID; abort is durable, audited, and never applies to an
-active successor. Zero-overlap activation removes the retired predecessor;
+active successor. Zero-overlap activation immediately revokes and retains the
+predecessor only as a verifier-bound terminal replay identity;
 later rotations prune only fully retired ancestors and include every pruned
 public key ID in the rotation audit event. A new successor is rejected while
 an older predecessor remains inside a live overlap window.
@@ -189,8 +207,16 @@ keys returns redacted metadata only.
 ### Self-management
 
 Self-management may create a key whose roles are a subset of the current key's
-effective roles and whose scope and permission ceilings are no broader. It may
-rotate or revoke only keys of the same principal. Quotas and deadlines remain
+effective roles and whose scope and permission ceilings are no broader. Every
+requested ceiling is checked independently against both the actor's credential
+ceiling and current effective scoped grants in one immutable catalog snapshot.
+`instance` covers all scopes; `catalog_subtree(parent)` covers only that stable
+`ObjectId` and its descendants; and `catalog_object(id)` covers only that exact
+stable ID. A descendant object or subtree is admitted by an ancestor subtree,
+while siblings and ancestors are denied. Multiple requested ceilings must all
+be covered. Missing, outside, and otherwise unresolvable requested scope
+relationships return the same authorization denial. Self-management may rotate
+or revoke only keys of the same principal. Quotas and deadlines remain
 mandatory.
 
 ## Effective authorization
@@ -211,11 +237,13 @@ Unknown or incomplete state fails closed. A transport may cache the result only
 while the global authorization epoch is unchanged. Expiration is evaluated
 even when the epoch did not change.
 
-Once the catalog is bootstrapped, every online CLI/TUI, local-daemon, and Native
+Once the catalog is bootstrapped, every online CLI/TUI and native local-daemon
 HTTP entry point selects managed API-key authentication automatically. Offline
 bootstrap/recovery is the only CLI exception. A public
 transport must never project an operating-system peer, loopback placement, or
-legacy fixed bearer into `ProductAuthorization::ALL` for that directory.
+legacy fixed bearer into `ProductAuthorization::ALL` for that directory. The
+sole exception is the explicit Native HTTP 1.2 migration window below; it uses
+a synthetic authority kind rather than unmanaged or fabricated managed IDs.
 Unmanaged sessions remain available only to an explicit trusted embedded
 caller and to an unbootstrapped directory before the offline owner bootstrap.
 Online CLI and TUI commands accept the credential only through
@@ -227,6 +255,36 @@ maintenance action has not yet been promoted into the central product
 operation registry fail closed after bootstrap instead of using a raw facade.
 The Unix reader binds pre-open, post-open, and opened-handle device/inode
 identity so a substituted path is rejected before any credential is parsed.
+
+### Offline owner recovery
+
+Offline owner recovery is not a public transport operation. The bounded CLI
+surface is `security owner inspect|recover|resume|abort-pending`; each command
+opens the directory directly under the exclusive native `LOCK` and requires
+OS-owner authority rather than a managed key. Unix requires a stable regular
+directory path, no symlink, and directory UID equal to process EUID. Windows
+rejects ADS/reparse paths and requires stable identity, current-process-SID
+ownership, and a protected DACL granting full access only to that SID and
+LocalSystem.
+
+The catalog has at most one pending owner-recovery record containing a fresh
+operation ID, replacement key ID, phase-one authorization epoch, creation time,
+and `offline_os_owner` provenance. `recover` publishes that record and inactive
+verifier without changing active owner keys. It rejects existing pending state
+with `catalog_conflict`. The new output file must not exist and must resolve
+outside the data directory; permissions/ACL are restricted before secret bytes,
+then file and, where the platform supports it, parent directory are
+synchronized. Windows parent-directory synchronization is explicitly not
+claimed.
+
+`resume` requires the exact key ID and phase-one epoch and reads a stable,
+restricted, complete canonical key file. It verifies key ID and secret against
+the pending verifier before a strict atomic commit activates the replacement
+and removes every prior owner key. `abort-pending` removes exactly the inactive
+key and provenance while preserving all active keys and never deleting a file.
+Both terminal operations persist a redacted replay marker bound to operation,
+key, expected epoch, result epoch, and transaction ID, making exact retry after
+reopen return the original commit. `inspect` returns only redacted provenance.
 
 ## Operations
 
@@ -287,11 +345,11 @@ identity, and receipt semantics. None of the six is eligible for `Prove`;
 wrapping one in proof generation is an invalid request rather than a
 read-authority shortcut.
 
-This slice does not include principal rename; custom-role rename, drop, or
-replacement; API-key issue or other secret delivery; key revocation;
-ownership transfer; legacy-bearer migration; or owner recovery. Those flows
-remain fail-closed until their own complete contracts and transport evidence
-land. The CLI exposes exactly these six mutations through the same typed
+This initial slice does not include principal rename; custom-role rename, drop,
+or replacement; API-key lifecycle; ownership transfer; legacy-bearer migration;
+or owner recovery. Later sections define the independently closed key,
+migration, and recovery boundaries. The CLI exposes exactly these six mutations
+through the same typed
 `ProductOperation` variants and emits only redacted durable receipts. The TUI
 remains read-only. Neither surface may call the access-control catalog
 directly.
@@ -323,18 +381,70 @@ run again after any principal exists.
 
 ## Legacy bearer migration
 
-The process-wide bearer is accepted for one compatibility minor as a synthetic
-`legacy-owner` credential when explicitly configured. It is not persisted or
-given a fabricated key ID. Offline migration creates a canonical owner key and
-records the transition. Operators must cut clients over and explicitly revoke
-legacy acceptance. New remote instances reject legacy-only setup after the
-compatibility window.
+The process-wide bearer is accepted only by Native HTTP during the exact 1.2
+compatibility minor, only after the offline command below, only when the
+listener explicitly receives the same restricted bearer file, and only on a
+loopback plaintext bind:
 
-That compatibility window is a target contract, not a claim of current
-availability. Until the synthetic `legacy-owner` credential, migration
-operation, and explicit revocation are implemented together, a bootstrapped
-catalog rejects the fixed bearer fail-closed; the promised minor window has
-not started.
+```text
+hyphae security --data-dir <DIR> legacy-bearer migrate \
+  --name <OWNER_NAME> --label <KEY_LABEL> \
+  --legacy-bearer-file <RESTRICTED_FILE> --key-out <NEW_RESTRICTED_FILE>
+```
+
+`HYACAT05` records one of `never_enabled`, `migration_pending`, `dual_window`,
+or terminal `revoked`, plus the durable keyed verifier required by either
+enabled state. Older `HYACAT01` through `HYACAT03` decode as `never_enabled`;
+`HYACAT04` remains readable only for non-enabled historical state because it
+cannot represent the keyed verifier. A binary that does not know `HYACAT05`
+rejects the magic rather than discarding terminal or verifier state. Phase one
+creates the canonical Owner principal,
+inactive `hyp1` key, migration ID, and `migration_pending` state under the
+offline lock and OS-owner authority. The bearer contributes to a
+domain-separated request digest and to a BLAKE3 verifier keyed by the persisted
+product-local cursor authority. The plaintext bearer, fragments, and bare
+bearer digest are never stored; only the keyed verifier is durable in the
+catalog/WAL, and audit/output surfaces remain redacted. The CLI creates
+and synchronizes a restricted key file before a second strict commit activates
+the key and `dual_window`. An exact activation retry returns the retained
+commit; conflicting inputs fail.
+
+If the migration process crashes after phase one, a restarted 1.2 Native HTTP
+edge may accept the explicitly configured legacy bearer while durable state is
+`migration_pending`; canonical-key authentication remains disabled until the
+restricted file is recovered and activation completes. This preserves a path
+to finish or terminally revoke migration without making normal bootstrap an
+implicit legacy enablement.
+
+The enabled bearer verifier has a durable `HYACAT05` representation. It is a
+keyed digest of the bearer digest under the persisted product-local cursor
+authority, not an offline bearer credential: neither a bare digest nor catalog
+bytes can authenticate without the product-local key and exact configured
+bearer. Missing verifier material, an enabled `HYACAT04` state, or any downgrade
+attempt fails closed. A canonical `hyp1_` candidate always takes the canonical
+parser/authenticator and never
+falls back to legacy comparison. The synthetic session is explicitly
+`legacy-owner`, has no `SecurityId` or `ApiKeyId`, and is revalidated against
+durable state on every operation. It can execute ordinary operations that the
+old fixed bearer could execute, but it has neither `security.manage` nor
+`ownership.manage`, cannot enter the managed security plane, and cannot revoke
+itself. UDS and named-pipe handshakes never accept it.
+
+Terminal revocation requires a canonical Owner key and an idempotency token:
+
+```text
+hyphae security --data-dir <DIR> --native-api-key-file <OWNER_KEY> \
+  legacy-bearer revoke --idempotency-token <NONZERO_U128>
+```
+
+Revocation and `revoke_legacy_bearer` audit publication share one strict commit.
+An already-retained synthetic session gets `authorization_denied` on its next
+operation; fresh legacy authentication gets the uniform unauthenticated
+response. Owner-recovery activation also changes pending or dual state to
+terminal `revoked` in its activation commit. Backup and restore preserve the
+state, so `revoked` cannot become enabled. The version constant permits auth
+only at 1.2. A 1.3-mode server refuses startup while pending/dual state exists,
+with an explicit instruction to revoke; it can start after terminal revocation.
 
 ## Owner recovery
 
@@ -349,6 +459,12 @@ Owner recovery is an offline operation requiring:
 Recovery revokes all current owner credentials, increments the authorization
 epoch, issues exactly one replacement owner key, and appends a durable event.
 It cannot ignore catalog/WAL corruption, change user data, or run remotely.
+
+The migrated HTTP bearer is represented durably only by a verifier keyed with
+the product-local persisted cursor authority; plaintext is never stored. Server startup must
+present the exact migrated bearer, and the sole product owner verifies every
+new legacy session again. Owner-recovery activation clears that verifier and
+publishes terminal revocation in the same strict commit.
 
 ## Audit contract
 
@@ -419,3 +535,51 @@ least-privilege invariants. Implementation closure additionally requires:
 - secret canaries across errors, logs, telemetry, TUI, artifacts, and receipts;
 - mutation testing of key parsing and authorization evaluation; and
 - Linux, macOS, and Windows exact-source receipts.
+### Public API-key lifecycle
+
+Protocol minor 3 makes key issue, rotation, activation, abort, and revoke core
+`ProductOperation` variants. Self variants require `credential.self_manage` and
+an exact actor-principal target. Administrative variants require
+`security.manage`; any owner-targeted key additionally requires
+`ownership.manage`.
+
+Issue and rotate are two-phase. Start strictly commits an inactive verifier and
+returns a fixed mutable one-time secret buffer. The client creates a new
+restricted file, writes and synchronizes it, synchronizes the parent directory,
+then sends Activate with the digest derived from that exact secret. No
+filesystem path is present in a product operation, Native frame, HTTP body,
+receipt, audit event, or telemetry event. A pending key never authenticates.
+Cancellation or disconnect before Activate leaves it pending for an exact Abort.
+
+Start is never automatically retried. Reusing its token and payload returns
+`secret_delivery_consumed`; reusing the token for a different operation or
+payload returns `idempotency_conflict`. Activate, Abort, and Revoke replay their
+original receipt before current-authority checks only when actor key, token,
+operation, and complete request digest match; no other operation can use a
+revoked replay identity. Exact replay returns the original durable redacted
+receipt. A wrong digest returns
+`confirmation_digest_mismatch` without activating the verifier. HTTP Start
+responses require `Cache-Control: no-store, private, max-age=0`, `Pragma:
+no-cache`, and no `Content-Encoding`.
+
+HTTP routes every self and administrative Start, Activate, Abort, and Revoke
+variant through `/v2/security/keys`. That family requires catalog-managed
+authority and strict durability; `/v2/execute` rejects lifecycle envelopes, so
+the generic family cannot bypass either constraint.
+
+At a transport boundary, a revoked canonical candidate is retained only as
+opaque pending terminal state after normal authentication fails. It does not
+open a session and is publicly indistinguishable from an unknown candidate.
+HTTP rejects it before handler and product-client dispatch on every method and
+path except `POST /v2/security/keys`; that route may consume it only after
+bounded body decode. A fresh local daemon connection may consume it only after
+the bounded first request frame is known. Only exact self-revoke or zero-overlap
+self-rotation activation replay can open terminal authority; every operation,
+token, target, confirmation digest, or marker mismatch is the uniform
+authentication denial.
+
+Sensitive Rust deliveries retain the 102 canonical bytes in fixed mutable
+storage, have redacted `Debug`, do not implement `Clone`, and overwrite the
+buffer on drop. Python exposes `SensitiveBytes`, backed by `bytearray`, with
+`close()` and context-manager cleanup. TypeScript exposes `Uint8Array` plus
+`clearSensitiveBytes()` for in-place overwrite.

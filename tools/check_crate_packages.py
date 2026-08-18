@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Verify the crates.io release graph and every generated package's assets."""
 
 from __future__ import annotations
@@ -9,6 +9,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.check_registry_publish import validate_publish_authority
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,6 +139,7 @@ def main() -> int:
     expected_crates, failures = validate_release_graph(
         release, packages, publishable_crates
     )
+    failures.extend(validate_publish_authority("crates-io", ROOT, dry_run=True))
     checked_assets = 0
 
     for mirror in release.get("mirrors", []):
@@ -177,6 +183,7 @@ def main() -> int:
             "LICENSE",
             "LICENSE-DOCUMENTATION",
             "LICENSE-POLICY.md",
+            "THIRD_PARTY_NOTICES.md",
         ):
             if required_license not in packaged:
                 failures.append(

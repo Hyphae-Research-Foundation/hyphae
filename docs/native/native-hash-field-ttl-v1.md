@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native hash field TTL v1
 
 Status: implemented; direct-Linux evidence is recorded in the

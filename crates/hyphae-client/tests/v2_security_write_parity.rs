@@ -1,15 +1,15 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
-//! Managed security mutation lifecycle across local Native v1.2 and HTTP `/v2/execute`.
+//! Managed security mutation lifecycle across local Native v1.3 and HTTP v2 routes.
 
 #![cfg(unix)]
 
 use std::{error::Error, fs, path::PathBuf, time::SystemTime};
 
 use hyphae_client::v2::{
-    BuiltInRole, ClientError, CustomRoleGrant, HttpTransport, HyphaeClient, ProductErrorCode,
-    ProductLimits, ProductOperation, ProductPermission, ProductResponse, ProductScope,
-    RequestOptions,
+    BuiltInRole, ClientError, CustomRoleGrant, HttpTransport, HyphaeClient, ProductAuthorization,
+    ProductErrorCode, ProductLimits, ProductOperation, ProductPermission, ProductResponse,
+    ProductScope, RequestOptions,
 };
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
@@ -109,6 +109,7 @@ async fn managed_security_mutations_replay_across_local_and_http_and_reject_conf
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn assert_mutation_lifecycle(
     local: &HyphaeClient,
     http: &HyphaeClient,
@@ -158,6 +159,73 @@ async fn assert_mutation_lifecycle(
             mutation_options(104),
         )
         .await?;
+    let started = local
+        .security_api_key_issue_start(
+            created.principal_id,
+            "transport-lifecycle",
+            vec![BuiltInRole::Reader],
+            Vec::new(),
+            ProductAuthorization::from_permissions([
+                ProductPermission::CatalogRead,
+                ProductPermission::CredentialSelfManage,
+                ProductPermission::DataRead,
+                ProductPermission::Discover,
+                ProductPermission::ProofGenerate,
+                ProductPermission::ProofVerify,
+                ProductPermission::SearchExecute,
+            ]),
+            vec![ProductScope::Instance],
+            None,
+            mutation_options(201),
+        )
+        .await?;
+    let start_replay = http
+        .security_api_key_issue_start(
+            created.principal_id,
+            "transport-lifecycle",
+            vec![BuiltInRole::Reader],
+            Vec::new(),
+            ProductAuthorization::from_permissions([
+                ProductPermission::CatalogRead,
+                ProductPermission::CredentialSelfManage,
+                ProductPermission::DataRead,
+                ProductPermission::Discover,
+                ProductPermission::ProofGenerate,
+                ProductPermission::ProofVerify,
+                ProductPermission::SearchExecute,
+            ]),
+            vec![ProductScope::Instance],
+            None,
+            mutation_options(201),
+        )
+        .await;
+    let Err(error) = start_replay else {
+        return Err("Start replay unexpectedly returned a response".into());
+    };
+    let ClientError::Product(error) = error else {
+        return Err(format!("Start replay returned {error:?}").into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::SecretDeliveryConsumed);
+    let secret = started.secret.take().ok_or("missing one-time SDK secret")?;
+    let confirmation_digest = secret.confirmation_digest();
+    let activated = local
+        .security_api_key_issue_activate(
+            started.key_id,
+            confirmation_digest,
+            false,
+            mutation_options(202),
+        )
+        .await?;
+    let replayed_activation = http
+        .security_api_key_issue_activate(
+            started.key_id,
+            confirmation_digest,
+            false,
+            mutation_options(202),
+        )
+        .await?;
+    assert_eq!(activated, replayed_activation);
+    assert!(!format!("{activated:?}").contains(secret.expose_secret()));
     let custom_assignment = local
         .security_custom_assignment_create(
             created.principal_id,
@@ -246,6 +314,7 @@ async fn assert_http_rejects_missing_and_zero_idempotency_before_dispatch(
                 hyphae_contracts::v2::REQUEST_ID_HEADER_V2,
                 (9_001 + offset).to_string(),
             )
+            .header(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3")
             .body(body)
             .send()
             .await?;

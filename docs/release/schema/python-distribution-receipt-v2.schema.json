@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "$id": "https://hyphae.dev/schema/python-distribution-receipt-v2",
   "description": "Structural validation only. Cross-field equality and publication semantics require tools/python_distribution_receipt.py as the mandatory semantic validator.",
   "type": "object",

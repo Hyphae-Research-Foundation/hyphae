@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Managed API-key scope admission across operations carrying explicit object IDs.
 
@@ -11,13 +11,13 @@ use hyphae_native_catalog::{
 use hyphae_native_product::proof::NativeProofGenerationLimits;
 use hyphae_native_product::{
     BoundedSearchQuery, BuiltInRole, CatalogCursor, CatalogDependencyRequest, CatalogListRequest,
-    NativeProduct, ProductAuthorization, ProductDocument, ProductDurability, ProductError,
-    ProductErrorCode, ProductLexicalBranch, ProductOperation, ProductPrincipal,
-    ProductRequestContext, ProductResponse, ProductScope, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
-    ProductSearchRequest, ProductSession, ProductSessionId, ProductSetAlgebraOperation,
-    ProductSqlResult, ProductStructureKey, ProductStructureMutation, ProductStructureReadRequest,
-    ProductValue,
+    CatalogVisibleListFilter, CatalogVisibleListRequest, NativeProduct, ProductAuthorization,
+    ProductDocument, ProductDurability, ProductError, ProductErrorCode, ProductLexicalBranch,
+    ProductOperation, ProductPermission, ProductPrincipal, ProductRequestContext, ProductResponse,
+    ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchRequest, ProductSession, ProductSessionId,
+    ProductSetAlgebraOperation, ProductSqlResult, ProductStructureKey, ProductStructureMutation,
+    ProductStructureReadRequest, ProductValue,
 };
 use hyphae_native_runtime::CatalogPageStop;
 use hyphae_native_types::{EngineKind, ObjectId};
@@ -102,6 +102,49 @@ impl ManagedFixture {
         ))
     }
 
+    fn narrowed_developer_session(
+        &mut self,
+        label: &str,
+        ceiling: ProductScope,
+        session_id: u128,
+    ) -> Result<ProductSession, Box<dyn Error>> {
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let principal = self.product.create_security_principal(&owner, label, 10)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product.assign_built_in_role(
+            &owner,
+            principal.principal_id,
+            BuiltInRole::Developer,
+            ProductScope::Instance,
+            11,
+        )?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 12)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let key_path = self.directory.with_extension(format!("{label}-key"));
+        let _ignored = fs::remove_file(&key_path);
+        self.product.issue_scoped_api_key_to_file(
+            &owner,
+            principal.principal_id,
+            label,
+            [BuiltInRole::Developer],
+            [],
+            BuiltInRole::Developer.authorization(),
+            [ceiling],
+            None,
+            &key_path,
+            13,
+        )?;
+        let secret = fs::read_to_string(&key_path)?;
+        let authority = self.product.authenticate_api_key(&secret, 0)?;
+        self.issued_keys.push(key_path);
+        Ok(ProductSession::new_authenticated(
+            ProductSessionId::new(session_id).ok_or("zero session ID")?,
+            authority,
+        ))
+    }
+
     fn create_sql_tables(&mut self) -> Result<(ObjectId, ObjectId), Box<dyn Error>> {
         let mut session = ProductSession::new(
             ProductSessionId::new(90).ok_or("zero fixture session ID")?,
@@ -111,6 +154,85 @@ impl ManagedFixture {
         let target = create_sql_table(&mut self.product, &mut session, 90, "scope_target_rows")?;
         let sibling = create_sql_table(&mut self.product, &mut session, 91, "scope_sibling_rows")?;
         Ok((target, sibling))
+    }
+
+    fn default_scalar_keyspace_id(&self) -> Result<ObjectId, Box<dyn Error>> {
+        let name = QualifiedName::new(
+            CatalogName::unquoted("hyphae_internal")?,
+            CatalogName::unquoted("system")?,
+            CatalogName::unquoted("default_scalar")?,
+        );
+        self.product
+            .catalog_resolve(&self.product.catalog_snapshot()?, &name)?
+            .map(|object| object.id())
+            .ok_or_else(|| "default scalar keyspace is missing".into())
+    }
+
+    fn scoped_session(
+        &mut self,
+        label: &str,
+        permissions: &[ProductPermission],
+        scopes: &[ProductScope],
+        session_id: u128,
+    ) -> Result<ProductSession, Box<dyn Error>> {
+        let grants = permissions
+            .iter()
+            .flat_map(|permission| {
+                scopes.iter().map(|scope| {
+                    hyphae_native_product::CustomRoleGrant::new(*permission, *scope)
+                        .ok_or("invalid scoped SQL grant")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.grant_session(label, &grants, permissions, scopes, session_id)
+    }
+
+    fn grant_session(
+        &mut self,
+        label: &str,
+        grants: &[hyphae_native_product::CustomRoleGrant],
+        permissions: &[ProductPermission],
+        scopes: &[ProductScope],
+        session_id: u128,
+    ) -> Result<ProductSession, Box<dyn Error>> {
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let principal = self.product.create_security_principal(&owner, label, 50)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let role =
+            self.product
+                .create_custom_security_role(&owner, label, grants.iter().copied(), 51)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product.assign_custom_security_role(
+            &owner,
+            principal.principal_id,
+            role.role_id,
+            52,
+        )?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        self.product
+            .set_security_principal_enabled(&owner, principal.principal_id, true, 53)?;
+        let owner = self.product.authenticate_api_key(&self.owner_secret, 0)?;
+        let key_path = self.directory.with_extension(format!("{label}-key"));
+        let _ignored = fs::remove_file(&key_path);
+        self.product.issue_scoped_api_key_to_file(
+            &owner,
+            principal.principal_id,
+            label,
+            [],
+            [role.role_id],
+            ProductAuthorization::from_permissions(permissions.iter().copied()),
+            scopes.iter().copied(),
+            None,
+            &key_path,
+            54,
+        )?;
+        let secret = fs::read_to_string(&key_path)?;
+        let authority = self.product.authenticate_api_key(&secret, 0)?;
+        self.issued_keys.push(key_path);
+        Ok(ProductSession::new_authenticated(
+            ProductSessionId::new(session_id).ok_or("zero session ID")?,
+            authority,
+        ))
     }
 }
 
@@ -226,17 +348,6 @@ fn operations_for(
         (
             "catalog describe",
             ProductOperation::CatalogDescribe { id: object },
-        ),
-        (
-            "catalog dependencies",
-            ProductOperation::CatalogDependencies(CatalogDependencyRequest {
-                object,
-                direction: DependencyDirection::Outgoing,
-                cursor: None,
-                item_limit: 8,
-                visit_limit: 8,
-                byte_limit: 4_096,
-            }),
         ),
         (
             "catalog create parent",
@@ -404,6 +515,21 @@ fn catalog_children(parent: ObjectId) -> ProductOperation {
     })
 }
 
+fn catalog_visible(
+    cursor: Option<hyphae_native_product::CatalogVisibleCursor>,
+) -> ProductOperation {
+    ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+        filter: CatalogVisibleListFilter {
+            parent: None,
+            kind: None,
+        },
+        cursor,
+        item_limit: 2,
+        visit_limit: 8,
+        byte_limit: 4_096,
+    })
+}
+
 fn dispatch_error(
     product: &mut NativeProduct,
     session: &mut ProductSession,
@@ -429,6 +555,88 @@ fn assert_uniform_authorization_errors(errors: &[ProductError]) -> Result<(), Bo
         assert_eq!(error.source_span(), None);
         assert_eq!(error.details(), first.details());
     }
+    Ok(())
+}
+
+fn self_issue(
+    fixture: &mut ManagedFixture,
+    session: &mut ProductSession,
+    request_id: u128,
+    scopes: Vec<ProductScope>,
+) -> Result<ProductResponse, Box<ProductError>> {
+    let principal_id = session
+        .principal()
+        .identity()
+        .parse()
+        .map_err(|_| Box::new(ProductError::from_code(ProductErrorCode::InvalidRequest)))?;
+    let mut request = context(session, request_id).with_idempotency_token(request_id);
+    request.durability = hyphae_native_product::ProductDurabilityPolicy::STRICT;
+    fixture
+        .product
+        .dispatch(
+            session,
+            &request,
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: format!("self-scope-{request_id}"),
+                roles: vec![BuiltInRole::Developer],
+                custom_roles: Vec::new(),
+                permission_ceiling: BuiltInRole::Developer.authorization(),
+                scope_ceiling: scopes,
+                expires_at_micros: None,
+            },
+        )
+        .map_err(Box::new)
+}
+
+#[test]
+fn self_issue_scope_hierarchy_uses_stable_catalog_ancestry() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("self-issue-hierarchy")?;
+    let parent = ObjectId::new(DATABASE_A)?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let sibling = ObjectId::new(SIBLING_OBJECT)?;
+    let mut session = fixture.narrowed_developer_session(
+        "self issue subtree",
+        ProductScope::CatalogSubtree(parent),
+        301,
+    )?;
+
+    for (request_id, scopes) in [
+        (1, vec![ProductScope::CatalogObject(child)]),
+        (2, vec![ProductScope::CatalogSubtree(child)]),
+        (
+            3,
+            vec![
+                ProductScope::CatalogObject(parent),
+                ProductScope::CatalogObject(child),
+            ],
+        ),
+    ] {
+        let response = self_issue(&mut fixture, &mut session, request_id, scopes)?;
+        let ProductResponse::SecurityApiKeyStarted(_started) = response else {
+            return Err("self issue returned the wrong response".into());
+        };
+    }
+
+    let mut errors = Vec::new();
+    for (request_id, scopes) in [
+        (10, vec![ProductScope::CatalogObject(sibling)]),
+        (11, vec![ProductScope::CatalogSubtree(sibling)]),
+        (12, vec![ProductScope::Instance]),
+        (
+            13,
+            vec![
+                ProductScope::CatalogObject(child),
+                ProductScope::CatalogObject(sibling),
+            ],
+        ),
+    ] {
+        let Err(error) = self_issue(&mut fixture, &mut session, request_id, scopes) else {
+            return Err("out-of-scope self issue succeeded".into());
+        };
+        errors.push(*error);
+    }
+    assert_uniform_authorization_errors(&errors)?;
     Ok(())
 }
 
@@ -572,6 +780,431 @@ fn catalog_list_requires_instance_authority_until_cursors_are_scope_opaque()
 }
 
 #[test]
+fn visible_catalog_exact_and_subtree_hide_siblings_and_hidden_parents() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = ManagedFixture::create("visible-catalog-scopes")?;
+    let database = ObjectId::new(DATABASE_A)?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let sibling = ObjectId::new(SIBLING_OBJECT)?;
+
+    let mut exact =
+        fixture.developer_session("visible exact", ProductScope::CatalogObject(child), 201)?;
+    let request = context(&exact, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut exact, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible exact returned wrong response".into());
+    };
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, child);
+    assert_eq!(page.items[0].parent, None);
+
+    let mut subtree = fixture.developer_session(
+        "visible subtree",
+        ProductScope::CatalogSubtree(database),
+        202,
+    )?;
+    let request = context(&subtree, 2);
+    let response = fixture
+        .product
+        .dispatch(&mut subtree, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible subtree returned wrong response".into());
+    };
+    let ids = page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+    assert!(ids.contains(&database));
+    assert!(ids.contains(&child));
+    assert!(!ids.contains(&sibling));
+    assert_eq!(
+        page.items
+            .iter()
+            .find(|item| item.id == child)
+            .and_then(|item| item.parent),
+        Some(database)
+    );
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_intersects_instance_grant_with_exact_key_ceiling() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = ManagedFixture::create("visible-catalog-exact-ceiling")?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let sibling = ObjectId::new(SIBLING_OBJECT)?;
+    let grant = hyphae_native_product::CustomRoleGrant::new(
+        ProductPermission::CatalogRead,
+        ProductScope::Instance,
+    )
+    .ok_or("invalid instance catalog grant")?;
+    let mut session = fixture.grant_session(
+        "visible exact ceiling",
+        &[grant],
+        &[ProductPermission::CatalogRead],
+        &[ProductScope::CatalogObject(child)],
+        220,
+    )?;
+
+    let request = context(&session, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut session, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible exact ceiling returned wrong response".into());
+    };
+    assert_eq!(
+        page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [child]
+    );
+    assert!(!page.items.iter().any(|item| item.id == sibling));
+    assert!(page.cursor.is_none());
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_cursor_rejects_cross_key_filter_tamper_trailing_and_oversize()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("visible-catalog-cursor")?;
+    let database = ObjectId::new(DATABASE_A)?;
+    let mut first = fixture.developer_session(
+        "visible first key",
+        ProductScope::CatalogSubtree(database),
+        203,
+    )?;
+    let request = context(&first, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut first, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible cursor returned wrong response".into());
+    };
+    let cursor = page.cursor.ok_or("missing visible cursor")?;
+
+    let mut changed_filter = CatalogVisibleListRequest {
+        filter: CatalogVisibleListFilter {
+            parent: Some(database),
+            kind: None,
+        },
+        cursor: Some(cursor.clone()),
+        item_limit: 2,
+        visit_limit: 8,
+        byte_limit: 4_096,
+    };
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        2,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+
+    let mut tampered = cursor.as_bytes().to_vec();
+    tampered[20] ^= 1;
+    changed_filter.filter.parent = None;
+    changed_filter.cursor = Some(hyphae_native_product::CatalogVisibleCursor::new(tampered)?);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        3,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+
+    let mut wrong_family = cursor.as_bytes().to_vec();
+    wrong_family[136] ^= 1;
+    changed_filter.cursor = Some(hyphae_native_product::CatalogVisibleCursor::new(
+        wrong_family,
+    )?);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        4,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+
+    let mut truncated = cursor.as_bytes().to_vec();
+    truncated.pop();
+    changed_filter.cursor = Some(hyphae_native_product::CatalogVisibleCursor::new(truncated)?);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        5,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+
+    let mut trailing = cursor.as_bytes().to_vec();
+    trailing.push(0);
+    changed_filter.cursor = Some(hyphae_native_product::CatalogVisibleCursor::new(trailing)?);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        6,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+
+    let mut second = fixture.developer_session(
+        "visible second key",
+        ProductScope::CatalogSubtree(database),
+        204,
+    )?;
+    changed_filter.cursor = Some(cursor);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut second,
+        7,
+        ProductOperation::CatalogVisibleList(changed_filter.clone()),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+    changed_filter.cursor = Some(hyphae_native_product::CatalogVisibleCursor::new(vec![
+        1;
+        257
+    ])?);
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut first,
+        8,
+        ProductOperation::CatalogVisibleList(changed_filter),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_scope_survives_rename_but_not_drop_recreate() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("visible-catalog-lifecycle")?;
+    let (target, _sibling) = fixture.create_sql_tables()?;
+    let mut scoped = fixture.developer_session(
+        "visible lifecycle exact",
+        ProductScope::CatalogObject(target),
+        211,
+    )?;
+    let mut owner = ProductSession::new(
+        ProductSessionId::new(212).ok_or("zero lifecycle owner session ID")?,
+        ProductPrincipal::new("visible lifecycle owner").ok_or("invalid lifecycle owner")?,
+        ProductAuthorization::ALL,
+    );
+
+    let request = context(&owner, 1);
+    fixture.product.dispatch(
+        &mut owner,
+        &request,
+        ProductOperation::ExecuteSql {
+            statement: "ALTER TABLE scope_target_rows RENAME TO scope_renamed_rows".to_owned(),
+            parameters: Vec::new(),
+        },
+    )?;
+    let request = context(&scoped, 2);
+    let response = fixture
+        .product
+        .dispatch(&mut scoped, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("renamed visible catalog returned wrong response".into());
+    };
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, target);
+    assert_eq!(page.items[0].name.object.display(), "scope_renamed_rows");
+
+    let request = context(&owner, 3);
+    fixture.product.dispatch(
+        &mut owner,
+        &request,
+        ProductOperation::ExecuteSql {
+            statement: "DROP TABLE scope_renamed_rows".to_owned(),
+            parameters: Vec::new(),
+        },
+    )?;
+    let replacement = create_sql_table(&mut fixture.product, &mut owner, 4, "scope_renamed_rows")?;
+    assert_ne!(replacement, target);
+    let request = context(&scoped, 5);
+    let response = fixture
+        .product
+        .dispatch(&mut scoped, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("recreated visible catalog returned wrong response".into());
+    };
+    assert!(page.items.is_empty());
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_overlapping_scopes_dedupe_in_object_id_order() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("visible-catalog-overlap")?;
+    let database = ObjectId::new(DATABASE_A)?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let grants = [
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::CatalogRead,
+            ProductScope::CatalogSubtree(database),
+        )
+        .ok_or("invalid subtree grant")?,
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::CatalogRead,
+            ProductScope::CatalogObject(child),
+        )
+        .ok_or("invalid object grant")?,
+    ];
+    let mut session = fixture.grant_session(
+        "visible overlap",
+        &grants,
+        &[ProductPermission::CatalogRead],
+        &[
+            ProductScope::CatalogSubtree(database),
+            ProductScope::CatalogObject(child),
+        ],
+        205,
+    )?;
+    let request = context(&session, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut session, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible overlap returned wrong response".into());
+    };
+    let ids = page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(ids.iter().filter(|id| **id == child).count(), 1);
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_filtered_empty_page_advances_only_visible_work() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("visible-catalog-empty")?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let mut session = fixture.developer_session(
+        "visible empty exact",
+        ProductScope::CatalogObject(child),
+        206,
+    )?;
+    let request = context(&session, 1);
+    let response = fixture.product.dispatch(
+        &mut session,
+        &request,
+        ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+            filter: CatalogVisibleListFilter {
+                parent: None,
+                kind: Some(CatalogObjectKind::Database),
+            },
+            cursor: None,
+            item_limit: 2,
+            visit_limit: 1,
+            byte_limit: 4_096,
+        }),
+    )?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible filtered page returned wrong response".into());
+    };
+    assert!(page.items.is_empty());
+    assert!(page.cursor.is_none());
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_cursor_conflicts_after_snapshot_change() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("visible-catalog-snapshot-conflict")?;
+    let database = ObjectId::new(DATABASE_A)?;
+    let mut session = fixture.developer_session(
+        "visible snapshot cursor",
+        ProductScope::CatalogSubtree(database),
+        207,
+    )?;
+    let request = context(&session, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut session, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible cursor returned wrong response".into());
+    };
+    let cursor = page.cursor.ok_or("missing visible snapshot cursor")?;
+
+    let mut owner = ProductSession::new(
+        ProductSessionId::new(208).ok_or("zero owner session ID")?,
+        ProductPrincipal::new("visible catalog mutation owner").ok_or("invalid owner")?,
+        ProductAuthorization::ALL,
+    );
+    let owner_request = context(&owner, 2);
+    fixture.product.dispatch(
+        &mut owner,
+        &owner_request,
+        ProductOperation::CatalogCreate {
+            object: logical_schema(903, "snapshot_change", DATABASE_A)?,
+        },
+    )?;
+
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut session,
+        3,
+        catalog_visible(Some(cursor)),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+    Ok(())
+}
+
+#[test]
+fn visible_catalog_cursor_conflicts_after_authorization_epoch_change() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = ManagedFixture::create("visible-catalog-epoch-conflict")?;
+    let database = ObjectId::new(DATABASE_A)?;
+    let mut session = fixture.developer_session(
+        "visible epoch cursor",
+        ProductScope::CatalogSubtree(database),
+        209,
+    )?;
+    let request = context(&session, 1);
+    let response = fixture
+        .product
+        .dispatch(&mut session, &request, catalog_visible(None))?;
+    let ProductResponse::CatalogVisiblePage(page) = response else {
+        return Err("visible epoch cursor returned wrong response".into());
+    };
+    let cursor = page.cursor.ok_or("missing visible epoch cursor")?;
+
+    let owner = fixture
+        .product
+        .authenticate_api_key(&fixture.owner_secret, 0)?;
+    fixture
+        .product
+        .create_security_principal(&owner, "advance cursor epoch", 20)?;
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut session,
+        2,
+        catalog_visible(Some(cursor)),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+    Ok(())
+}
+
+#[test]
+fn managed_catalog_dependencies_remains_instance_only() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("catalog-dependencies-instance-only")?;
+    let child = ObjectId::new(TARGET_OBJECT)?;
+    let mut scoped = fixture.developer_session(
+        "scoped dependency reader",
+        ProductScope::CatalogObject(child),
+        210,
+    )?;
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut scoped,
+        1,
+        ProductOperation::CatalogDependencies(CatalogDependencyRequest {
+            object: child,
+            direction: DependencyDirection::Outgoing,
+            cursor: None,
+            item_limit: 8,
+            visit_limit: 8,
+            byte_limit: 4_096,
+        }),
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    Ok(())
+}
+
+#[test]
 fn scoped_prepare_sql_masks_outside_missing_and_malformed_bind_results()
 -> Result<(), Box<dyn Error>> {
     let mut fixture = ManagedFixture::create("prepare-sql-oracle")?;
@@ -697,6 +1330,279 @@ fn scoped_execute_sql_masks_outside_missing_and_malformed_bind_results()
     );
     assert_uniform_authorization_errors(&errors)?;
     Ok(())
+}
+
+#[test]
+fn managed_default_scalar_operations_use_the_durable_exact_object_scope()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("default-scalar-scope")?;
+    let keyspace = fixture.default_scalar_keyspace_id()?;
+    let unrelated = ObjectId::new(TARGET_OBJECT)?;
+    let operations = || {
+        [
+            ProductOperation::StructureGet {
+                key: b"scoped-scalar".to_vec(),
+            },
+            ProductOperation::StructureSet {
+                key: b"scoped-scalar".to_vec(),
+                value: b"value".to_vec(),
+                expires_at_micros: Some(100),
+            },
+            ProductOperation::StructureTtl {
+                key: b"scoped-scalar".to_vec(),
+            },
+        ]
+    };
+
+    let mut exact = fixture.scoped_session(
+        "exact scalar scope",
+        &[ProductPermission::DataRead, ProductPermission::DataWrite],
+        &[ProductScope::CatalogObject(keyspace)],
+        87,
+    )?;
+    for (offset, operation) in operations().into_iter().enumerate() {
+        let request = context(&exact, 120 + u128::try_from(offset)?);
+        let result = fixture.product.dispatch(&mut exact, &request, operation);
+        assert!(
+            result.is_ok(),
+            "exact default keyspace scope failed: {result:?}"
+        );
+    }
+
+    let mut outside = fixture.scoped_session(
+        "unrelated scalar scope",
+        &[ProductPermission::DataRead, ProductPermission::DataWrite],
+        &[ProductScope::CatalogObject(unrelated)],
+        88,
+    )?;
+    for (offset, operation) in operations().into_iter().enumerate() {
+        let error = dispatch_error(
+            &mut fixture.product,
+            &mut outside,
+            130 + u128::try_from(offset)?,
+            operation,
+        )?;
+        assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end scope test keeps setup and all exact-object assertions together"
+)]
+fn managed_execute_sql_binds_exact_dml_indexes_and_join_objects() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("execute-sql-bound-objects")?;
+    let (target, sibling) = fixture.create_sql_tables()?;
+    let mut owner = ProductSession::new(
+        ProductSessionId::new(80).ok_or("zero owner session ID")?,
+        ProductPrincipal::new("sql fixture owner").ok_or("invalid owner")?,
+        ProductAuthorization::ALL,
+    );
+    let mut target_only = fixture.scoped_session(
+        "target SQL writer",
+        &[ProductPermission::CatalogRead, ProductPermission::DataWrite],
+        &[ProductScope::CatalogObject(target)],
+        81,
+    )?;
+    let request = context(&target_only, 80);
+    let response = fixture.product.dispatch(
+        &mut target_only,
+        &request,
+        ProductOperation::ExecuteSql {
+            statement: "INSERT INTO scope_target_rows (id, body) VALUES (?, ?)".to_owned(),
+            parameters: vec![
+                ProductValue::Signed(1),
+                ProductValue::Text("joined".to_owned()),
+            ],
+        },
+    )?;
+    assert!(matches!(response, ProductResponse::Sql { .. }));
+
+    let mut target_prover = fixture.scoped_session(
+        "target SQL prover",
+        &[
+            ProductPermission::CatalogRead,
+            ProductPermission::DataRead,
+            ProductPermission::ProofGenerate,
+        ],
+        &[ProductScope::CatalogObject(target)],
+        85,
+    )?;
+    let request = context(&target_prover, 79);
+    let response = fixture.product.dispatch(
+        &mut target_prover,
+        &request,
+        ProductOperation::Prove {
+            operation: Box::new(ProductOperation::ExecuteSql {
+                statement: "SELECT body FROM scope_target_rows WHERE id = ?".to_owned(),
+                parameters: vec![ProductValue::Signed(1)],
+            }),
+            limits: NativeProofGenerationLimits::default(),
+        },
+    )?;
+    assert!(matches!(response, ProductResponse::Proven { .. }));
+
+    let mut index_ids = Vec::new();
+    for (request_id, statement) in [
+        (
+            81,
+            "CREATE INDEX scope_target_body ON scope_target_rows (body)",
+        ),
+        (
+            82,
+            "CREATE UNIQUE INDEX scope_sibling_body ON scope_sibling_rows (body)",
+        ),
+    ] {
+        let request = context(&owner, request_id);
+        let response = fixture.product.dispatch(
+            &mut owner,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: statement.to_owned(),
+                parameters: Vec::new(),
+            },
+        )?;
+        let ProductResponse::Sql {
+            result:
+                ProductSqlResult::Command {
+                    object_id: Some(index),
+                    ..
+                },
+            ..
+        } = response
+        else {
+            return Err("index creation returned no identity".into());
+        };
+        index_ids.push(index);
+    }
+
+    let denied = dispatch_error(
+        &mut fixture.product,
+        &mut target_only,
+        90,
+        ProductOperation::ExecuteSql {
+            statement: "UPDATE scope_target_rows SET body = ? WHERE id = ?".to_owned(),
+            parameters: vec![
+                ProductValue::Text("changed".to_owned()),
+                ProductValue::Signed(1),
+            ],
+        },
+    )?;
+    assert_eq!(denied.code(), ProductErrorCode::AuthorizationDenied);
+
+    let mut missing_sibling_index = fixture.scoped_session(
+        "incomplete joined SQL reader",
+        &[ProductPermission::CatalogRead, ProductPermission::DataRead],
+        &[
+            ProductScope::CatalogObject(target),
+            ProductScope::CatalogObject(sibling),
+        ],
+        84,
+    )?;
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut missing_sibling_index,
+        92,
+        ProductOperation::ExecuteSql {
+            statement: "SELECT scope_target_rows.id, scope_sibling_rows.body FROM scope_target_rows INNER JOIN scope_sibling_rows ON scope_target_rows.body = scope_sibling_rows.body WHERE scope_target_rows.id = ?".to_owned(),
+            parameters: vec![ProductValue::Signed(1)],
+        },
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    assert_eq!(index_ids.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn managed_explain_requires_instance_observe_and_object_catalog_read() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = ManagedFixture::create("explain-split-scope")?;
+    let (target, sibling) = fixture.create_sql_tables()?;
+    let grants = [
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::Observe,
+            ProductScope::Instance,
+        )
+        .ok_or("invalid observe grant")?,
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::CatalogRead,
+            ProductScope::CatalogObject(target),
+        )
+        .ok_or("invalid catalog grant")?,
+    ];
+    let mut target_explainer = fixture.grant_session(
+        "target SQL explainer",
+        &grants,
+        &[ProductPermission::Observe, ProductPermission::CatalogRead],
+        &[ProductScope::Instance],
+        83,
+    )?;
+    let request = context(&target_explainer, 100);
+    let response = fixture.product.dispatch(
+        &mut target_explainer,
+        &request,
+        ProductOperation::AdminExplainSql {
+            statement: "SELECT body FROM scope_target_rows WHERE id = ?".to_owned(),
+        },
+    )?;
+    assert!(matches!(response, ProductResponse::Explain(_)));
+    let error = dispatch_error(
+        &mut fixture.product,
+        &mut target_explainer,
+        101,
+        ProductOperation::AdminExplainSql {
+            statement: "SELECT body FROM scope_sibling_rows WHERE id = ?".to_owned(),
+        },
+    )?;
+    assert_eq!(error.code(), ProductErrorCode::AuthorizationDenied);
+    assert_ne!(target, sibling);
+    Ok(())
+}
+
+#[test]
+fn scoped_explain_masks_outside_missing_and_malformed_bind_results() -> Result<(), Box<dyn Error>> {
+    let mut fixture = ManagedFixture::create("explain-sql-oracle")?;
+    let (target, _sibling) = fixture.create_sql_tables()?;
+    let grants = [
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::Observe,
+            ProductScope::Instance,
+        )
+        .ok_or("invalid observe grant")?,
+        hyphae_native_product::CustomRoleGrant::new(
+            ProductPermission::CatalogRead,
+            ProductScope::CatalogObject(target),
+        )
+        .ok_or("invalid catalog grant")?,
+    ];
+    let mut scoped = fixture.grant_session(
+        "scoped SQL explain oracle",
+        &grants,
+        &[ProductPermission::Observe, ProductPermission::CatalogRead],
+        &[ProductScope::Instance],
+        86,
+    )?;
+    let mut errors = Vec::new();
+    for (offset, statement) in [
+        "SELECT body FROM scope_sibling_rows WHERE id = ?",
+        "SELECT body FROM scope_missing_rows WHERE id = ?",
+        "NOT SQL",
+    ]
+    .iter()
+    .enumerate()
+    {
+        errors.push(dispatch_error(
+            &mut fixture.product,
+            &mut scoped,
+            110 + u128::try_from(offset)?,
+            ProductOperation::AdminExplainSql {
+                statement: (*statement).to_owned(),
+            },
+        )?);
+    }
+    assert_uniform_authorization_errors(&errors)
 }
 
 #[test]

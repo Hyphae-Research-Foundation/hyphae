@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Review dependency changes without requiring a hosted dependency-graph API."""
 
 from __future__ import annotations
@@ -67,15 +67,18 @@ NPM_PROJECTS = {
     "sdks/typescript/package.json": "sdks/typescript/package-lock.json",
     "integrations/javascript/package.json": "integrations/javascript/package-lock.json",
     "integrations/host-smoke/package.json": "integrations/host-smoke/package-lock.json",
+    "conformance/mcp/hosts/package.json": "conformance/mcp/hosts/package-lock.json",
 }
 NPM_LOCKS = tuple(NPM_PROJECTS.values())
 PYTHON_MANIFESTS = ("sdks/python/pyproject.toml",)
+PYTHON_BUILD_EVIDENCE = "sdks/python/build-dependencies.json"
 REGISTERED_DEPENDENCY_FILES = (
     set(CARGO_MANIFESTS)
     | set(CARGO_LOCKS)
     | set(NPM_PROJECTS)
     | set(NPM_LOCKS)
     | set(PYTHON_MANIFESTS)
+    | {PYTHON_BUILD_EVIDENCE}
 )
 DEPENDENCY_BASENAMES = frozenset(
     {
@@ -139,6 +142,7 @@ DEPENDENCY_BASENAMES = frozenset(
         "yarn.lock",
     }
 )
+EXACT_DEPENDENCY_FILENAMES = frozenset({"build-dependencies.json"})
 PIP_REQUIREMENT_FILE = re.compile(
     r"(?:requirements|constraints).*\.(?:in|txt)"
 )
@@ -214,12 +218,16 @@ def npm_dependencies(text: str | None) -> dict[str, dict[str, Any]]:
             raise ValueError(f"npm dependency lacks version: {location}")
         resolved = package.get("resolved")
         integrity = package.get("integrity")
+        license_value = package.get("license")
         if resolved and resolved.startswith("http") and not integrity:
             raise ValueError(f"npm dependency lacks integrity: {name}@{version}")
+        if not isinstance(license_value, str) or not license_value.strip():
+            raise ValueError(f"npm dependency lacks license evidence: {name}@{version}")
         key = f"{name}@{version}|{location}"
         dependencies[key] = {
             "dev": bool(package.get("dev", False)),
             "integrity": integrity,
+            "license": license_value,
             "resolved": resolved,
         }
     return dependencies
@@ -239,6 +247,58 @@ def python_dependencies(text: str | None) -> dict[str, dict[str, Any]]:
         for requirement in requirements:
             dependencies[f"{group}|{requirement}"] = {"group": group}
     return dependencies
+
+
+def validate_dependency_license_boundaries(head: str) -> None:
+    for manifest, lock in NPM_PROJECTS.items():
+        packages = npm_dependencies(read_revision(head, lock))
+        if manifest == "conformance/mcp/hosts/package.json":
+            claude = [
+                value
+                for key, value in packages.items()
+                if key.startswith("@anthropic-ai/claude-code")
+            ]
+            licenses = [value["license"] for value in claude]
+            expected = ["SEE LICENSE IN LICENSE.md"] * 8 + [
+                "SEE LICENSE IN README.md"
+            ]
+            if len(claude) != 9 or sorted(licenses) != sorted(expected):
+                raise ValueError("Claude Code proprietary license boundary differs")
+        if any(
+            key.startswith("@img/sharp-libvips-")
+            and value["license"] != "LGPL-3.0-or-later"
+            for key, value in packages.items()
+        ):
+            raise ValueError(f"{lock}: sharp/libvips LGPL license evidence differs")
+
+    python = python_dependencies(read_revision(head, PYTHON_MANIFESTS[0]))
+    if python.get("build|setuptools==80.9.0") != {"group": "build"}:
+        raise ValueError("Python build dependency must retain exact setuptools authority")
+    build_evidence = json.loads(read_revision(head, PYTHON_BUILD_EVIDENCE) or "null")
+    expected_build_evidence = {
+        "name": "setuptools",
+        "version": "80.9.0",
+        "license": "MIT",
+        "scope": "build-only-not-bundled",
+        "artifacts": [
+            {
+                "filename": "setuptools-80.9.0-py3-none-any.whl",
+                "sha256": "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922",
+            },
+            {
+                "filename": "setuptools-80.9.0.tar.gz",
+                "sha256": "f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c",
+            },
+        ],
+    }
+    if (
+        not isinstance(build_evidence, dict)
+        or build_evidence.get("$comment") != "SPDX-License-Identifier: Apache-2.0"
+        or build_evidence.get("schema") != "hyphae-python-build-dependencies-v1"
+        or build_evidence.get("packages") != [expected_build_evidence]
+        or build_evidence.get("runtime_dependencies") != []
+    ):
+        raise ValueError("Python build dependency hash and license evidence differs")
 
 
 def merge_base(base: str, head: str) -> str:
@@ -262,6 +322,8 @@ def is_dependency_manifest_or_lock(path: str) -> bool:
     candidate = PurePosixPath(path.replace("\\", "/"))
     basename = candidate.name.casefold()
     if basename in DEPENDENCY_BASENAMES:
+        return True
+    if basename in EXACT_DEPENDENCY_FILENAMES:
         return True
     if PIP_REQUIREMENT_FILE.fullmatch(basename) is not None:
         return True
@@ -397,6 +459,7 @@ def review(base: str, head: str) -> dict[str, Any]:
     merge_base_commit = merge_base(base_commit, head_commit)
     changed = changed_dependency_files(merge_base_commit, head_commit)
     validate_manifest_lock_pairs(changed, head_commit)
+    validate_dependency_license_boundaries(head_commit)
     ecosystems: dict[str, Any] = {}
     for path in CARGO_LOCKS:
         ecosystems[path] = dependency_diff(

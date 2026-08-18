@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fail-closed checker for the Native access-control v1 design contract."""
 
 from __future__ import annotations
@@ -26,10 +26,12 @@ OPERATION_SCOPE_RESOLUTION = {
     "prepared_objects",
     "bound_sql_objects",
     "bound_sql_parent_objects",
-    "default_keyspace",
+    "bound_sql_objects_transaction_union",
+    "durable_default_scalar_keyspace",
     "transaction_union",
     "originating_principal",
     "underlying_operation",
+    "authorized_roots",
 }
 
 EXPECTED_PERMISSIONS = {
@@ -123,6 +125,7 @@ EXPECTED_LIMITS = {
     "security_result_rows": 1000,
     "maximum_rotation_overlap_seconds": 604800,
     "authentication_verifiers_per_request": 1,
+    "concurrent_transport_authentication_tasks_per_adapter": 256,
     "authorization_cache_entries": 4096,
     "security_idempotency_shards": 64,
     "security_idempotency_records_per_shard": 64,
@@ -148,6 +151,27 @@ CURRENT_SECURITY_WRITE_OPERATIONS = {
     "security.custom_role_create": "SecurityCustomRoleCreate",
     "security.principal_create": "SecurityPrincipalCreate",
     "security.principal_set_enabled": "SecurityPrincipalSetEnabled",
+    "security.key_issue_start": "SecurityApiKeyIssueStart",
+    "security.key_issue_activate": "SecurityApiKeyIssueActivate",
+    "security.key_rotate_start": "SecurityApiKeyRotateStart",
+    "security.key_rotate_activate": "SecurityApiKeyRotateActivate",
+    "security.key_issue_abort": "SecurityApiKeyIssueAbort",
+    "security.key_rotate_abort": "SecurityApiKeyRotateAbort",
+    "security.key_revoke": "SecurityApiKeyRevoke",
+}
+
+CURRENT_OWNER_OPERATIONS = {
+    "security.legacy_bearer_revoke": "SecurityLegacyBearerRevoke",
+}
+
+CURRENT_SECURITY_SELF_WRITE_OPERATIONS = {
+    "security.key_issue_self_start": "SecurityApiKeyIssueSelfStart",
+    "security.key_issue_self_activate": "SecurityApiKeyIssueSelfActivate",
+    "security.key_rotate_self_start": "SecurityApiKeyRotateSelfStart",
+    "security.key_rotate_self_activate": "SecurityApiKeyRotateSelfActivate",
+    "security.key_issue_self_abort": "SecurityApiKeyIssueSelfAbort",
+    "security.key_rotate_self_abort": "SecurityApiKeyRotateSelfAbort",
+    "security.key_revoke_self": "SecurityApiKeyRevokeSelf",
 }
 
 AMBIGUOUS_SECURITY_WRITE_FAMILIES = {
@@ -334,6 +358,29 @@ def validate_operations(
         require_current_read_rule(operations_by_id, operation, permission)
     for operation, variant in CURRENT_SECURITY_WRITE_OPERATIONS.items():
         require_current_write_rule(operations_by_id, operation, variant)
+    for operation, variant in CURRENT_SECURITY_SELF_WRITE_OPERATIONS.items():
+        require_current_self_write_rule(operations_by_id, operation, variant)
+    for operation, variant in CURRENT_OWNER_OPERATIONS.items():
+        row = operations_by_id.get(operation)
+        if (
+            row is None
+            or row["status"] != "current"
+            or row["source_variant"] != variant
+            or row["classification"] != "fixed"
+            or row["required_all"] != ["ownership.manage"]
+            or row["scope_resolution"] != "instance"
+            or row["allowed_roles"] != ["owner"]
+        ):
+            fail(f"current Owner operation {operation} differs from the terminal boundary")
+    lifecycle_variants = set(CURRENT_SECURITY_WRITE_OPERATIONS.values()) | set(
+        CURRENT_SECURITY_SELF_WRITE_OPERATIONS.values()
+    )
+    operation_source = source.read_text(encoding="utf-8")
+    for forbidden in ("PathBuf", "std::path", "key_out", "output_path"):
+        for variant in lifecycle_variants:
+            marker = operation_source.find(variant)
+            if marker >= 0 and forbidden in operation_source[marker : marker + 900]:
+                fail(f"API-key lifecycle variant {variant} contains filesystem field {forbidden}")
 
     source_variants = product_operation_variants(source)
     if covered_variants != source_variants:
@@ -348,6 +395,28 @@ def validate_operations(
     require_variant_rule(operations_by_variant, "AdminCheckpoint", ["maintain"], False)
     require_variant_rule(operations_by_variant, "Doctor", ["maintain"], False)
     require_variant_rule(operations_by_variant, "Prove", ["proof.generate"], True)
+    explain_rows = operations_by_variant.get("AdminExplainSql", [])
+    if (
+        len(explain_rows) != 1
+        or explain_rows[0]["required_all"] != ["catalog.read", "observe"]
+        or explain_rows[0]["scope_resolution"] != "bound_sql_objects"
+    ):
+        fail("AdminExplainSql must split instance observe from bound catalog authority")
+    stage_sql_rows = operations_by_variant.get("TransactionStageSql", [])
+    if (
+        len(stage_sql_rows) != 1
+        or stage_sql_rows[0]["classification"] != "parsed_and_bound_dml"
+        or stage_sql_rows[0]["scope_resolution"]
+        != "bound_sql_objects_transaction_union"
+    ):
+        fail("TransactionStageSql must retain the private bound-object union")
+    for variant in ("StructureGet", "StructureSet", "StructureTtl"):
+        rows = operations_by_variant.get(variant, [])
+        if (
+            len(rows) != 1
+            or rows[0]["scope_resolution"] != "durable_default_scalar_keyspace"
+        ):
+            fail(f"{variant} must resolve the durable default scalar keyspace")
 
     sql_rows = operations_by_variant.get("ExecuteSql", [])
     sql_rules = {
@@ -410,6 +479,22 @@ def require_current_write_rule(
         fail(f"current security write operation {operation} differs from the 1.2 slice")
 
 
+def require_current_self_write_rule(
+    operations: dict[str, dict[str, Any]], operation: str, variant: str
+) -> None:
+    row = operations.get(operation)
+    if (
+        row is None
+        or row["status"] != "current"
+        or row["source_variant"] != variant
+        or row["classification"] != "fixed"
+        or row["required_all"] != ["credential.self_manage"]
+        or row["scope_resolution"] != "originating_principal"
+        or row["inherits_underlying"] is not False
+    ):
+        fail(f"current self key operation {operation} differs from the 1.2 slice")
+
+
 def require_variant_rule(
     operations: dict[str, list[dict[str, Any]]],
     variant: str,
@@ -445,6 +530,7 @@ def validate_key_format(contract: dict[str, Any]) -> None:
             "verifier",
             "verifier_domain_hex",
             "secret_return",
+            "activation_confirmation",
         },
         "key_format",
     )
@@ -460,7 +546,8 @@ def validate_key_format(contract: dict[str, Any]) -> None:
         "pattern": r"^hyp1_[0-9a-f]{32}_[0-9a-f]{64}$",
         "verifier": "blake3-domain-separated-v1",
         "verifier_domain_hex": "6879706861652d6170692d6b65792d763100",
-        "secret_return": "restricted-file-once",
+        "secret_return": "one-time-start-response-client-restricted-file",
+        "activation_confirmation": "blake3-domain-separated-verifier-digest",
     }
     if key_format != expected:
         fail("key format differs from Native access-control v1")
@@ -499,6 +586,26 @@ def validate_policies(contract: dict[str, Any]) -> None:
         fail("scope policy does not define the canonical scope set")
     if scope.get("name_is_authority") is not False:
         fail("scope policy permits mutable names as authority")
+    if (
+        scope.get("sql_authorization") != "binder-owned-exact-object-set"
+        or scope.get("sql_binding_reuse")
+        != "same-binding-or-catalog-version-rejection"
+        or scope.get("sql_dml_dependencies")
+        != "target-secondary-indexes-and-foreign-key-relations-indexes"
+        or scope.get("sql_explain_authorization")
+        != "observe-at-instance-and-catalog-read-at-every-bound-object"
+    ):
+        fail("scope policy weakens binder-owned SQL authorization")
+    if (
+        scope.get("default_scalar_authorization")
+        != "data-read-write-at-durable-canonical-keyspace-object"
+        or scope.get("default_scalar_binding")
+        != "strict-hypdkb01-lineage-and-object-id"
+        or scope.get("catalog_visible_scope")
+        != "exact-grant-permission-and-key-scope-intersection"
+        or scope.get("catalog_visible_migration") != "explicit-upgrade-only"
+    ):
+        fail("scope policy weakens the durable default scalar binding")
     required_authorization = {
         "deny_by_default": True,
         "role_inheritance": False,
@@ -521,8 +628,33 @@ def validate_policies(contract: dict[str, Any]) -> None:
         fail("bootstrap policy differs from the offline one-owner boundary")
     if (
         migration.get("legacy_bearer_minor_releases") != 1
+        or migration.get("compatibility_version") != "1.2"
+        or migration.get("transport") != "native-http-only"
+        or migration.get("durable_states")
+        != ["never_enabled", "migration_pending", "dual_window", "revoked"]
+        or migration.get("revoked_terminal") is not True
+        or migration.get("canonical_input_fallback") is not False
+        or migration.get("non_loopback_plaintext") is not False
+        or migration.get("legacy_principal") != "legacy-owner"
+        or migration.get("fabricated_security_id") is not False
+        or migration.get("fabricated_api_key_id") is not False
+        or migration.get("bearer_plaintext_persisted") is not False
+        or migration.get("catalog_format") != "HYACAT05"
+        or migration.get("bearer_verifier_persisted") is not True
+        or migration.get("bearer_verifier")
+        != "blake3-product-local-keyed-digest-of-bearer-digest"
+        or migration.get("bearer_verifier_key")
+        != "persisted-product-local-cursor-authority"
+        or migration.get("offline_bare_digest_authentication") is not False
+        or migration.get("enabled_state_requires_verifier") is not True
+        or migration.get("older_format_enabled_state") != "fail-closed"
+        or migration.get("configured_bearer_match") != "exact"
         or migration.get("automatic_persistence") is not False
+        or migration.get("issues_canonical_owner_key") is not True
         or migration.get("explicit_legacy_revocation") is not True
+        or migration.get("owner_recovery_revokes_legacy") is not True
+        or migration.get("owner_recovery_revocation_atomic") is not True
+        or migration.get("next_minor_authentication") is not False
     ):
         fail("legacy bearer migration is not bounded and explicit")
     if (
@@ -539,6 +671,10 @@ def validate_policies(contract: dict[str, Any]) -> None:
         or audit.get("mutation_idempotency")
         != "required-nonzero-actor-key-request-digest"
         or audit.get("mutation_replay") != "same-receipt-or-conflict"
+        or audit.get("terminal_self_replay")
+        != "exact-revoked-request-identity-only-after-bounded-body-or-frame"
+        or audit.get("mutation_response_preflight")
+        != "canonical-wire-upper-bound-before-publication"
         or audit.get("mutation_durability") != "strict"
     ):
         fail("audit policy can leak secrets or amplify unauthenticated writes")
@@ -562,6 +698,61 @@ def validate_documents(repository: Path) -> None:
         path = repository / relative
         if not path.is_file() or marker not in path.read_text(encoding="utf-8"):
             fail(f"required access-control document is missing its authority marker: {relative}")
+
+
+def validate_lifecycle_surfaces(repository: Path) -> None:
+    protocol = (repository / "crates/hyphae-native-protocol/src/product.rs").read_text(encoding="utf-8")
+    server = (repository / "crates/hyphae-server/src/native_v2/server.rs").read_text(encoding="utf-8")
+    openapi = (repository / "contracts/openapi/hyphae-v2.yaml").read_text(encoding="utf-8")
+    rust_http = (repository / "crates/hyphae-client/src/v2/http.rs").read_text(encoding="utf-8")
+    python_http = (repository / "sdks/python/src/hyphae_sdk/v2/http.py").read_text(encoding="utf-8")
+    typescript_http = (repository / "sdks/typescript/src/v2/http.ts").read_text(encoding="utf-8")
+    mcp = (repository / "contracts/native-mcp-v2.json").read_text(encoding="utf-8")
+    required = (
+        "REQUEST_SECURITY_API_KEY_ISSUE_SELF_START: u16 = 55",
+        "REQUEST_SECURITY_API_KEY_REVOKE: u16 = 68",
+        "RESPONSE_SECURITY_API_KEY_STARTED: u16 = 43",
+        "RESPONSE_SECURITY_API_KEY_ACTIVATED: u16 = 44",
+        "REQUEST_SECURITY_LEGACY_BEARER_REVOKE: u16 = 70",
+    )
+    if any(marker not in protocol for marker in required):
+        fail("minor-3 API-key lifecycle tags differ")
+    if (
+        '"/v2/security/keys"' not in server
+        or "OperationFamily::Any => !operation.is_key_lifecycle()" not in server
+        or "NativeHttpV2SessionMode::Managed" not in server
+        or "no-store, private, max-age=0" not in server
+        or "header::CONTENT_ENCODING" not in rust_http
+        or 'endpoint.set_path(endpoint_path)' not in rust_http
+        or '"X-Hyphae-Protocol-Minor": PROTOCOL_MINOR' not in python_http
+        or '"/v2/security/keys" if key_lifecycle else "/v2/execute"' not in python_http
+        or 'operation.startsWith("security_api_key_")' not in typescript_http
+        or 'keyLifecycle ? "/v2/security/keys" : "/v2/execute"' not in typescript_http
+        or "/v2/security/keys:" not in openapi
+        or "Generic /v2/execute rejects these variants" not in openapi
+    ):
+        fail("API-key lifecycle HTTP route, minor, or no-store authority is incomplete")
+    if any(marker in mcp for marker in ("key_issue", "key_rotate", "key_revoke", "key_abort")):
+        fail("API-key lifecycle operations must remain absent from MCP")
+    daemon = (repository / "crates/hyphae-native-daemon/src/lib.rs").read_text(encoding="utf-8")
+    if any(marker in daemon for marker in ("legacy_bearer", "LegacyBearer")):
+        fail("legacy bearer must remain absent from UDS and named-pipe authority")
+    if (
+        "LEGACY_BEARER_COMPATIBILITY_VERSION" not in (
+            repository / "crates/hyphae-native-product/src/access_catalog.rs"
+        ).read_text(encoding="utf-8")
+        or 'CATALOG_MAGIC: &[u8; 8] = b"HYACAT05"' not in (
+            repository / "crates/hyphae-native-product/src/access_catalog.rs"
+        ).read_text(encoding="utf-8")
+        or "legacy_bearer_verifier: Option<[u8; 32]>" not in (
+            repository / "crates/hyphae-native-product/src/access_catalog.rs"
+        ).read_text(encoding="utf-8")
+        or "legacy_bearer_token" not in server
+        or "legacy_credential_fingerprint" not in server
+        or "auth_slots: Arc<Semaphore>" not in server
+        or "authenticate_exact_terminal_replay" not in server
+    ):
+        fail("legacy bearer compatibility state or HTTP-only verifier is incomplete")
 
 
 def validate(contract: dict[str, Any], source: Path, repository: Path = ROOT) -> dict[str, Any]:
@@ -588,9 +779,9 @@ def validate(contract: dict[str, Any], source: Path, repository: Path = ROOT) ->
         },
         "access-control contract",
     )
-    if contract["$comment"] != "SPDX-License-Identifier: AGPL-3.0-only":
+    if contract["$comment"] != "SPDX-License-Identifier: Apache-2.0":
         fail("access-control contract lacks its canonical SPDX marker")
-    if contract["schema"] != SCHEMA or contract["status"] != "normative-design-implementation-pending":
+    if contract["schema"] != SCHEMA or contract["status"] != "current":
         fail("access-control schema identity or honest status is invalid")
     if contract["permission_encoding"] != {
         "internal_bits": 64,
@@ -605,9 +796,10 @@ def validate(contract: dict[str, Any], source: Path, repository: Path = ROOT) ->
     validate_policies(contract)
     validate_limits(contract)
     validate_documents(repository)
+    validate_lifecycle_surfaces(repository)
     return {
         "schema": SCHEMA,
-        "status": "contract-complete-implementation-pending",
+        "status": "passed",
         "permissions": len(EXPECTED_PERMISSIONS),
         "built_in_roles": len(EXPECTED_ROLES),
         "current_product_variants": current_variants,

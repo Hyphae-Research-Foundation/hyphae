@@ -83,7 +83,7 @@ or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
 `/v2/execute`. Both reconstruct `ProductError` typed fields and accept
 `RequestOptions` deadlines and cancellation.
 
-Managed local sessions negotiate Native 1.2 and authenticate in the bounded
+Managed local sessions negotiate Native 1.3 and authenticate in the bounded
 `HELLO` trailer. Security metadata responses contain no credential secret or
 verifier, and every security mutation requires a caller-selected nonzero
 idempotency token:

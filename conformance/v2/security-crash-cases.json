@@ -1,0 +1,76 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-security-crash-cases-v1",
+  "semantics": "process-crash-not-power-loss",
+  "boundaries": [
+    "BlobStaged",
+    "BlobPromoted",
+    "PageAppended",
+    "PageSynchronized",
+    "WalAppended",
+    "WalSynchronized",
+    "RootPublished"
+  ],
+  "recovery_rule": {
+    "prior": ["BlobStaged", "BlobPromoted", "PageAppended", "PageSynchronized"],
+    "complete": ["WalAppended", "WalSynchronized", "RootPublished"]
+  },
+  "invariants": [
+    "audit-commit-csn-coherent",
+    "disconnect-equivalent-reopen",
+    "epoch-result-marker-coherent",
+    "exactly-one-audit",
+    "exactly-one-mutation",
+    "no-active-unconfirmed-key",
+    "no-partial-state",
+    "original-owner-until-owner-activation",
+    "retry-conflicting-payload-rejected",
+    "retry-same-payload-stable",
+    "secrets-never-persisted"
+  ],
+  "cases": [
+    {"id":"offline.legacy_bearer_activate","api":"activate_legacy_bearer_migration_offline","kind":"offline","product_operation":null,"semantic_family":"legacy-bearer-activate","terminal_replay":true},
+    {"id":"offline.legacy_bearer_migrate","api":"start_legacy_bearer_migration_offline","kind":"offline","product_operation":null,"semantic_family":"legacy-bearer-migrate","terminal_replay":false},
+    {"id":"offline.owner_recovery_abort","api":"abort_owner_recovery_offline","kind":"offline","product_operation":null,"semantic_family":"owner-recovery-abort","terminal_replay":true},
+    {"id":"offline.owner_recovery_activate","api":"resume_owner_recovery_offline","kind":"offline","product_operation":null,"semantic_family":"owner-recovery-activate","terminal_replay":true},
+    {"id":"offline.owner_recovery_begin","api":"start_owner_recovery_offline","kind":"offline","product_operation":null,"semantic_family":"owner-recovery-begin","terminal_replay":false},
+    {"id":"security.assignment_create_built_in","api":"dispatch","kind":"product-operation","product_operation":"SecurityBuiltInAssignmentCreate","semantic_family":"assignment-create-built-in","terminal_replay":true},
+    {"id":"security.assignment_create_custom","api":"dispatch","kind":"product-operation","product_operation":"SecurityCustomAssignmentCreate","semantic_family":"assignment-create-custom","terminal_replay":true},
+    {"id":"security.assignment_revoke","api":"dispatch","kind":"product-operation","product_operation":"SecurityAssignmentRevoke","semantic_family":"assignment-revoke","terminal_replay":true},
+    {"id":"security.custom_role_create","api":"dispatch","kind":"product-operation","product_operation":"SecurityCustomRoleCreate","semantic_family":"custom-role-create","terminal_replay":true},
+    {"id":"security.key_issue_abort","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueAbort","semantic_family":"key-issue-abort","terminal_replay":true},
+    {"id":"security.key_issue_activate","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueActivate","semantic_family":"key-issue-activate","terminal_replay":true},
+    {"id":"security.key_issue_self_abort","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueSelfAbort","semantic_family":"key-issue-abort","terminal_replay":true},
+    {"id":"security.key_issue_self_activate","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueSelfActivate","semantic_family":"key-issue-activate","terminal_replay":true},
+    {"id":"security.key_issue_self_start","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueSelfStart","semantic_family":"key-issue-start","terminal_replay":false},
+    {"id":"security.key_issue_start","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyIssueStart","semantic_family":"key-issue-start","terminal_replay":false},
+    {"id":"security.key_revoke","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRevoke","semantic_family":"key-revoke","terminal_replay":true},
+    {"id":"security.key_revoke_self","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRevokeSelf","semantic_family":"key-revoke","terminal_replay":true},
+    {"id":"security.key_rotate_abort","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateAbort","semantic_family":"key-rotate-abort","terminal_replay":true},
+    {"id":"security.key_rotate_activate","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateActivate","semantic_family":"key-rotate-activate","terminal_replay":true},
+    {"id":"security.key_rotate_self_abort","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateSelfAbort","semantic_family":"key-rotate-abort","terminal_replay":true},
+    {"id":"security.key_rotate_self_activate","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateSelfActivate","semantic_family":"key-rotate-activate","terminal_replay":true},
+    {"id":"security.key_rotate_self_start","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateSelfStart","semantic_family":"key-rotate-start","terminal_replay":false},
+    {"id":"security.key_rotate_start","api":"dispatch","kind":"product-operation","product_operation":"SecurityApiKeyRotateStart","semantic_family":"key-rotate-start","terminal_replay":false},
+    {"id":"security.legacy_bearer_revoke","api":"dispatch","kind":"product-operation","product_operation":"SecurityLegacyBearerRevoke","semantic_family":"legacy-bearer-revoke","terminal_replay":true},
+    {"id":"security.principal_create","api":"dispatch","kind":"product-operation","product_operation":"SecurityPrincipalCreate","semantic_family":"principal-create","terminal_replay":true},
+    {"id":"security.principal_set_enabled","api":"dispatch","kind":"product-operation","product_operation":"SecurityPrincipalSetEnabled","semantic_family":"principal-set-enabled","terminal_replay":true}
+  ],
+  "evidence": [
+    {
+      "id": "injected-reopen-matrix",
+      "source": "crates/hyphae-native-product/examples/security_crash_support.rs",
+      "anchors": [
+        "every_offline_security_transition_recovers_at_every_real_commit_boundary",
+        "every_public_security_mutation_recovers_at_every_real_commit_boundary"
+      ],
+      "command": "cargo test --locked -p hyphae-native-product --test security_crash_matrix"
+    },
+    {
+      "id": "hosted-process-hard-kill",
+      "source": "crates/hyphae-native-product/examples/security_crash_matrix.rs",
+      "anchors": ["hyphae-security-process-crash-matrix-v2", "boundary_hook", "child-unwound", "signal-9", "child unwound before parent SIGKILL"],
+      "command": "cargo run --locked -p hyphae-native-product --example security_crash_matrix -- <commit> <environment> [shard-index shard-count]"
+    }
+  ]
+}

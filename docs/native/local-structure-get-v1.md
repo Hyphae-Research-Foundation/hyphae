@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local structure GET v1
 
 Status: implemented experimentally; direct-Linux correctness and latency

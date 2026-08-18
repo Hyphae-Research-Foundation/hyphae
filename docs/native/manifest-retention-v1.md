@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native manifest retention v1
 
 Status: normative contract; anchored retained-chain open, identity-preserving

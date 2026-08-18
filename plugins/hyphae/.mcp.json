@@ -7,6 +7,9 @@
         "mcp",
         "--base-url",
         "http://127.0.0.1:8787"
+      ],
+      "env_vars": [
+        "HYPHAE_NATIVE_API_KEY_FILE"
       ]
     }
   }

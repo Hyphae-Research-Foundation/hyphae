@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -37,6 +37,16 @@ pub fn bundle_native_witness(
     anchor: NativeProofAnchor,
     limits: &WitnessCodecLimits,
 ) -> Result<NativeWitnessArtifact, NativeProofError> {
+    bundle_native_witness_with_checkpoint(origin, anchor, limits, || true)
+}
+
+pub(crate) fn bundle_native_witness_with_checkpoint(
+    origin: impl AsRef<Path>,
+    anchor: NativeProofAnchor,
+    limits: &WitnessCodecLimits,
+    mut checkpoint: impl FnMut() -> bool,
+) -> Result<NativeWitnessArtifact, NativeProofError> {
+    witness_checkpoint(&mut checkpoint)?;
     super::codec::validate_anchor(anchor)?;
     validate_witness_limits(limits)?;
     let origin = origin.as_ref();
@@ -46,7 +56,15 @@ pub fn bundle_native_witness(
     }
     let mut entries = Vec::new();
     let mut accounting = WitnessAccounting::default();
-    collect_directory(origin, Path::new(""), &mut entries, &mut accounting, limits)?;
+    collect_directory(
+        origin,
+        Path::new(""),
+        &mut entries,
+        &mut accounting,
+        limits,
+        &mut checkpoint,
+    )?;
+    witness_checkpoint(&mut checkpoint)?;
     entries.sort_by(|left, right| left.path().as_bytes().cmp(right.path().as_bytes()));
     validate_entries(&entries, limits)?;
     let mut witness = NativeDirectoryWitness {
@@ -345,6 +363,7 @@ fn collect_directory(
     entries: &mut Vec<NativeWitnessEntry>,
     accounting: &mut WitnessAccounting,
     limits: &WitnessCodecLimits,
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(), NativeProofError> {
     let directory = if relative.as_os_str().is_empty() {
         root.to_path_buf()
@@ -353,6 +372,7 @@ fn collect_directory(
     };
     let reader = fs::read_dir(&directory).map_err(|source| io_error(&directory, source))?;
     for item in reader {
+        witness_checkpoint(checkpoint)?;
         let item = item.map_err(|source| io_error(&directory, source))?;
         let child_relative = relative.join(item.file_name());
         let path = relative_path_string(&child_relative, limits.max_path_bytes)?;
@@ -384,7 +404,14 @@ fn collect_directory(
                 ));
             }
             entries.push(NativeWitnessEntry::Directory { path });
-            collect_directory(root, &child_relative, entries, accounting, limits)?;
+            collect_directory(
+                root,
+                &child_relative,
+                entries,
+                accounting,
+                limits,
+                checkpoint,
+            )?;
         } else if file_type.is_file() {
             accounting.files = accounting
                 .files
@@ -393,7 +420,7 @@ fn collect_directory(
             if accounting.files > limits.max_files {
                 return Err(limit("witness files", accounting.files, limits.max_files));
             }
-            let (bytes, digest) = read_origin_file(&source_path, &metadata, limits)?;
+            let (bytes, digest) = read_origin_file(&source_path, &metadata, limits, checkpoint)?;
             let file_bytes =
                 u64::try_from(bytes.len()).map_err(|_| NativeProofError::LengthOverflow)?;
             accounting.file_bytes = accounting
@@ -423,6 +450,7 @@ fn read_origin_file(
     path: &Path,
     before: &fs::Metadata,
     limits: &WitnessCodecLimits,
+    checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<(Vec<u8>, [u8; 32]), NativeProofError> {
     if before.len() > limits.max_file_bytes {
         return Err(limit(
@@ -445,6 +473,7 @@ fn read_origin_file(
         .map_err(|_| NativeProofError::LengthOverflow)?;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES].into_boxed_slice();
     loop {
+        witness_checkpoint(checkpoint)?;
         let read = file
             .read(&mut buffer)
             .map_err(|source| io_error(path, source))?;
@@ -476,6 +505,14 @@ fn read_origin_file(
     }
     let digest = blake3(&bytes);
     Ok((bytes, digest))
+}
+
+fn witness_checkpoint(checkpoint: &mut dyn FnMut() -> bool) -> Result<(), NativeProofError> {
+    if checkpoint() {
+        Ok(())
+    } else {
+        Err(NativeProofError::Interrupted)
+    }
 }
 
 fn validate_entries(

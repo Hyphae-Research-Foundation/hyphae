@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native product error model v1
 
 Status: implemented shared G6 product contract in `hyphae-native-product`
@@ -91,6 +92,9 @@ operations and `after-recovery` for other I/O failures.
 | `unknown_commit` | `unavailable` | `unknown-commit` |
 | `backup_invalid` | `corruption` | `after-recovery` |
 | `idempotency_conflict` | `conflict` | `never` |
+| `secret_delivery_consumed` | `conflict` | `never` |
+| `confirmation_digest_mismatch` | `authorization` | `never` |
+| `upgrade_required` | `conflict` | `after-recovery` |
 
 The first 21 strings above are the originally accepted registry and retain
 their exact order and meaning. New v1 strings are appended only. A decoder that
@@ -179,6 +183,13 @@ A disconnect, cancellation, or timeout after publication may produce
 needed to resolve status. No adapter reports rollback unless rollback is
 proven, and no adapter automatically retries a possibly committed mutation
 without an idempotency contract.
+
+Direct mutating `ExecuteSql` does not run a cancellation/deadline checkpoint
+after its commit returns. A cancellation observed at or after that boundary
+therefore preserves the committed response and transaction receipt. If the
+commit call itself cannot prove its result, the response is `outcome-unknown`
+with the transaction identity; it is never rewritten as ordinary `cancelled`.
+Read-only SQL retains its final publication checkpoint.
 
 `ProductFailureBoundary` represents `none`, `active`, proven rollback, proven
 commit, and publication-unknown boundaries. Applying publication-unknown to

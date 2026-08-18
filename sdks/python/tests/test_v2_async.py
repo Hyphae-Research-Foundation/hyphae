@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -37,7 +37,12 @@ class RecordingTransport:
     ) -> Response:
         self.calls.append((operation, arguments, options))
         self.thread_names.append(threading.current_thread().name)
-        return Response(operation, arguments, options.checked_request_id())
+        kind = (
+            "security_mutated"
+            if operation == "security_legacy_bearer_revoke"
+            else operation
+        )
+        return Response(kind, arguments, options.checked_request_id())
 
     def abort(self, cancellation: object | None = None) -> None:
         del cancellation
@@ -295,6 +300,15 @@ class SyncLifecycleTests(unittest.TestCase):
 
 
 class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owner_legacy_bearer_revoke_is_typed(self) -> None:
+        transport = RecordingTransport()
+        async with AsyncHyphaeClient(transport) as client:
+            response = await client.security_legacy_bearer_revoke(
+                options=RequestOptions(request_id=2, idempotency_token=3)
+            )
+        self.assertEqual(response.kind, "security_mutated")
+        self.assertEqual(transport.calls[0][0], "security_legacy_bearer_revoke")
+
     async def test_execute_uses_owned_single_worker_and_close_is_terminal(self) -> None:
         transport = RecordingTransport()
         client = AsyncHyphaeClient(transport)
@@ -309,6 +323,18 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.closed, 1)
         with self.assertRaisesRegex(ClientError, "closed"):
             await client.execute("capabilities")
+
+    async def test_pending_queue_is_finite_and_rejects_without_submission(self) -> None:
+        transport = QueuedTransport()
+        client = AsyncHyphaeClient(transport, max_pending=1)
+        first = asyncio.create_task(client.execute("first"))
+        await self._wait_for(transport.first_started)
+        with self.assertRaisesRegex(ClientError, "queue is full"):
+            await client.execute("rejected")
+        self.assertEqual([call[0] for call in transport.calls], ["first"])
+        transport.release_first.set()
+        await first
+        await client.aclose()
 
     async def test_cancellation_aborts_and_waits_for_the_worker(self) -> None:
         transport = BlockingTransport()
@@ -328,20 +354,23 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         transport = QueuedTransport()
-        client = AsyncHyphaeClient(transport)
+        client = AsyncHyphaeClient(transport, max_pending=2)
         first = asyncio.create_task(client.execute("first"))
         await self._wait_for(transport.first_started)
         queued = asyncio.create_task(client.execute("queued"))
         await asyncio.sleep(0)
         queued.cancel()
-        await asyncio.sleep(0.05)
-        self.assertFalse(first.done())
-        self.assertFalse(transport.release_first.is_set())
-        transport.release_first.set()
-        self.assertEqual((await first).kind, "first")
         with self.assertRaises(asyncio.CancelledError):
             await queued
-        self.assertEqual([call[0] for call in transport.calls], ["first"])
+        self.assertFalse(first.done())
+        self.assertFalse(transport.release_first.is_set())
+        replacement = asyncio.create_task(client.execute("replacement"))
+        transport.release_first.set()
+        self.assertEqual((await first).kind, "first")
+        self.assertEqual((await replacement).kind, "replacement")
+        self.assertEqual(
+            [call[0] for call in transport.calls], ["first", "replacement"]
+        )
         await client.aclose()
 
     async def test_cancelling_active_request_does_not_abort_next_request(self) -> None:

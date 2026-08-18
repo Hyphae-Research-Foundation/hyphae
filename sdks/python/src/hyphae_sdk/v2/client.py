@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Equivalent high-level Hyphae v2 API over local and HTTP transports."""
 
 from __future__ import annotations
@@ -103,6 +103,13 @@ class HyphaeClient:
 
     def catalog_list(self, request: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         return self.execute("catalog_list", request, options=options)
+
+    def catalog_visible_list(self, request: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+        """List currently visible catalog objects; cursor values are opaque bytes."""
+
+        return self._execute_expected(
+            "catalog_visible_list", "catalog_visible_page", request, options=options
+        )
 
     def sql(self, statement: str, parameters: list[object] | None = None, *, options: RequestOptions | None = None) -> Response:
         return self.execute("sql_execute", {"statement": statement, "parameters": parameters or []}, options=options)
@@ -377,6 +384,99 @@ class HyphaeClient:
             "security_assignment_revoke",
             "security_mutated",
             {"assignment_id": assignment_id},
+            options=_security_mutation_options(options),
+        )
+
+    def security_api_key_issue_start(
+        self,
+        arguments: dict[str, object],
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_api_key_issue_self_start" if self_manage else "security_api_key_issue_start",
+            "security_api_key_started",
+            arguments,
+            options=_security_mutation_options(options),
+        )
+
+    def security_api_key_rotate_start(
+        self,
+        arguments: dict[str, object],
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_api_key_rotate_self_start" if self_manage else "security_api_key_rotate_start",
+            "security_api_key_started",
+            arguments,
+            options=_security_mutation_options(options),
+        )
+
+    def security_api_key_activate(
+        self,
+        key_id: bytes,
+        confirmation_digest: bytes,
+        *,
+        rotation: bool = False,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        operation = "security_api_key_rotate" if rotation else "security_api_key_issue"
+        operation += "_self_activate" if self_manage else "_activate"
+        return self._execute_expected(
+            operation,
+            "security_api_key_activated",
+            {
+                "successor_key_id" if rotation else "key_id": key_id,
+                "confirmation_digest": confirmation_digest,
+            },
+            options=_security_mutation_options(options),
+        )
+
+    def security_api_key_abort(
+        self,
+        key_id: bytes,
+        *,
+        rotation: bool = False,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        operation = "security_api_key_rotate" if rotation else "security_api_key_issue"
+        operation += "_self_abort" if self_manage else "_abort"
+        return self._execute_expected(
+            operation,
+            "security_mutated",
+            {"successor_key_id" if rotation else "key_id": key_id},
+            options=_security_mutation_options(options),
+        )
+
+    def security_api_key_revoke(
+        self,
+        key_id: bytes,
+        *,
+        self_manage: bool = False,
+        options: RequestOptions,
+    ) -> Response:
+        return self._execute_expected(
+            "security_api_key_revoke_self" if self_manage else "security_api_key_revoke",
+            "security_mutated",
+            {"key_id": key_id},
+            options=_security_mutation_options(options),
+        )
+
+    def security_legacy_bearer_revoke(
+        self,
+        *,
+        options: RequestOptions,
+    ) -> Response:
+        """Permanently revoke legacy-bearer compatibility as Owner."""
+
+        return self._execute_expected(
+            "security_legacy_bearer_revoke",
+            "security_mutated",
             options=_security_mutation_options(options),
         )
 

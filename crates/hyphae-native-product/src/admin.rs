@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Curated embedded administration and typed explain models.
 
@@ -949,6 +949,42 @@ impl EmbeddedAdmin<'_> {
         }))
     }
 
+    pub(crate) fn explain_bound_sql(
+        &mut self,
+        bound: &hyphae_native_runtime::BoundSqlStatement,
+        statement: &str,
+    ) -> Result<ProductExplain, ProductError> {
+        if statement.len() > crate::MAX_PRODUCT_SQL_STATEMENT_BYTES {
+            return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+        }
+        let identity = self.product.snapshot_bounded(0)?.identity();
+        if identity.catalog_version != bound.catalog_version() {
+            return Err(hyphae_native_runtime::SqlError::CatalogChanged.into());
+        }
+        let started = Instant::now();
+        let mut transaction = self
+            .product
+            .database
+            .begin_sql(0, DurabilityClass::Memory)
+            .map_err(ProductError::from)?;
+        let result = transaction.execute_sql(&format!("EXPLAIN {statement}"), &[]);
+        transaction.rollback();
+        self.product
+            .telemetry
+            .record_timing(TimingClass::Planning, started.elapsed());
+        if let Some(prepared) = bound.prepared_statement() {
+            let current = self
+                .product
+                .database
+                .prepare_sql_latest(statement)
+                .map_err(ProductError::from)?;
+            if current != *prepared {
+                return Err(hyphae_native_runtime::SqlError::CatalogChanged.into());
+            }
+        }
+        sql_plan_text(result.map_err(ProductError::from)?, identity)
+    }
+
     fn timed<T>(
         &mut self,
         operation: impl FnOnce(
@@ -984,6 +1020,34 @@ impl EmbeddedAdmin<'_> {
         }
         result
     }
+}
+
+fn sql_plan_text(
+    result: hyphae_native_runtime::SqlResult,
+    identity: SnapshotIdentity,
+) -> Result<ProductExplain, ProductError> {
+    let hyphae_native_runtime::SqlResult::Rows { columns, rows } = result else {
+        return Err(ProductError::from_code(ProductErrorCode::Internal));
+    };
+    let [column] = columns.as_slice() else {
+        return Err(ProductError::from_code(ProductErrorCode::Internal));
+    };
+    let [row] = rows.as_slice() else {
+        return Err(ProductError::from_code(ProductErrorCode::Internal));
+    };
+    let [crate::ProductValue::Text(text)] = row.as_slice() else {
+        return Err(ProductError::from_code(ProductErrorCode::Internal));
+    };
+    if column != "plan" || text.len() > MAX_SQL_PLAN_TEXT_BYTES {
+        return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+    }
+    Ok(ProductExplain::SqlPlanText(SqlPlanText {
+        version: SQL_PLAN_TEXT_VERSION,
+        text: text.clone(),
+        visible_csn: identity.visible_csn.map(hyphae_native_types::Csn::get),
+        catalog_version: identity.catalog_version.get(),
+        executed: false,
+    }))
 }
 
 impl NativeProduct {

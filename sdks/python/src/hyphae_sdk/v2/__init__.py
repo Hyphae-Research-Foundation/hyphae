@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from .async_client import AsyncHyphaeClient, AsyncTransaction
 from .client import AbortableTransport, HyphaeClient, Transport
@@ -13,6 +13,7 @@ from .models import (
     ProductErrorFields,
     RequestOptions,
     Response,
+    SensitiveBytes,
 )
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "ProductErrorFields",
     "RequestOptions",
     "Response",
+    "SensitiveBytes",
     "Transport",
     *_generated_all,
 ]

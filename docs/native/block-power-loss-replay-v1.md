@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native block-layer power-loss replay gate v1
 
 Status: normative test contract; harness and direct-Linux/ext4 receipt

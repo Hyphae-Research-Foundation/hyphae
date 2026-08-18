@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native structure-engine semantics v1
 
 Status: implemented structure contract retained by the closed G3 and G6
@@ -17,6 +18,12 @@ performance evidence remains open under G7.
 The structure engine is a first-class owner of keyspace data. It is not a
 Valkey process, RESP dispatcher, relational projection, or disposable cache by
 default.
+
+The legacy wire-compatible scalar key bytes remain in the existing physical
+scalar namespace. Product bootstrap only adds a durable logical owner for that
+unchanged data: the canonical default scalar keyspace selected by `HYPDKB01`.
+Reopening preserves its allocated `ObjectId`, so pre-binding scalar values stay
+readable while object-scoped authorization has a stable resource identity.
 
 ## Object ownership
 

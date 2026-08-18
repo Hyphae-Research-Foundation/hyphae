@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native canonical types v1
 
 Status: normative target contract; identities, logical-type descriptors,

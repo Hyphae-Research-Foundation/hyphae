@@ -38,6 +38,6 @@ end-to-end deadline; restore still composes legacy verification, reopen, and
 snapshot paths. Filesystem calls and `sync_all` are not preemptible, so callers
 that need an absolute elapsed-time ceiling must enforce it operationally.
 
-Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source and security
+Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

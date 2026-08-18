@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "$id": "https://hyphae.dev/contracts/json-schema/native-hardware-calibration-diagnostic-v1.schema.json",
   "title": "Hyphae Native thread-scaling calibration diagnostic v1",
   "description": "Diagnostic-only evidence. Source commit/tree come from an external exact-source authority; producer_executable_blake3 binds the independently hashed producer bytes. This schema never grants scheduling, governor, cache, G7, or closure authority.",

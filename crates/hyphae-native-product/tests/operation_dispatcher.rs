@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::expect_used)]
 
@@ -12,11 +12,11 @@ use std::{
 };
 
 use hyphae_native_product::{
-    AuthorizationEpoch, MetricId, MetricValue, NativeProduct, NativeProductService,
+    AuthorizationEpoch, BuiltInRole, MetricId, MetricValue, NativeProduct, NativeProductService,
     NativeProductServiceConfig, ProductAuthorization, ProductCommitOutcome, ProductDurability,
     ProductDurabilityPolicy, ProductErrorCode, ProductOperation, ProductPermission,
-    ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession, ProductSessionId,
-    ProductSqlResult, ProductValue, RestoreRequest,
+    ProductPrincipal, ProductRequestContext, ProductResponse, ProductScope, ProductSession,
+    ProductSessionId, ProductSqlResult, ProductValue, RestoreRequest,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -238,6 +238,49 @@ fn cancellation_deadline_and_authorization_fail_before_mutation() -> Result<(), 
     assert_eq!(snapshot.structure_get(b"denied"), None);
     assert_eq!(snapshot.structure_get(b"response-limited"), None);
     drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn api_key_start_response_limit_256_fails_before_mutation() -> Result<(), Box<dyn Error>> {
+    let path = temporary("key-start-response-limit");
+    let owner_path = path.with_extension("owner-key");
+    let _ = fs::remove_dir_all(&path);
+    let _ = fs::remove_file(&owner_path);
+    let mut product = NativeProduct::create(&path)?;
+    product.bootstrap_access_control_to_file("Owner", "owner", &owner_path, 1)?;
+    let owner_secret = fs::read_to_string(&owner_path)?;
+    let authority = product.authenticate_api_key(&owner_secret, 0)?;
+    let principal_id = authority.principal_id();
+    let mut session = ProductSession::new_authenticated(
+        ProductSessionId::new(77).ok_or("zero session")?,
+        authority,
+    );
+    let baseline = product.access_control_status()?;
+    let mut request = context(&session, 77, 2)
+        .with_authorization_epoch(session.authorization_epoch())
+        .with_idempotency_token(77);
+    request.limits.max_response_bytes = 256;
+    let error = product
+        .dispatch(
+            &mut session,
+            &request,
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: "too-small-response".to_owned(),
+                roles: vec![BuiltInRole::Owner],
+                custom_roles: Vec::new(),
+                permission_ceiling: ProductAuthorization::ALL,
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            },
+        )
+        .expect_err("256-byte key-start response was admitted");
+    assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+    assert_eq!(product.access_control_status()?, baseline);
+    drop(product);
+    fs::remove_file(owner_path)?;
     fs::remove_dir_all(path)?;
     Ok(())
 }
