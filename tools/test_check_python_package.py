@@ -53,7 +53,7 @@ class PythonPackageContractTests(unittest.TestCase):
     def test_checked_in_package_is_publishable(self) -> None:
         self.assertEqual(
             validate(),
-            {"name": "hyphae-sdk", "status": "passed", "version": "1.1.0"},
+            {"name": "hyphae-sdk", "status": "passed", "version": "1.2.0"},
         )
 
     def test_python_publish_rejects_apache_1_1_0(self) -> None:
@@ -82,7 +82,7 @@ class PythonPackageContractTests(unittest.TestCase):
     def test_python_version_must_equal_the_workspace_version(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
-            self.replace(root, 'version = "1.1.0"', 'version = "1.1.1"')
+            self.replace(root, 'version = "1.2.0"', 'version = "1.2.1"')
             with self.assertRaisesRegex(PythonPackageValidationError, "workspace"):
                 validate(root)
 

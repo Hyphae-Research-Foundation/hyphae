@@ -3,6 +3,7 @@
 
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,9 @@ from tools.run_native_g8_test_gate import SUITES
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
+WORKSPACE_VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))[
+    "workspace"
+]["package"]["version"]
 
 
 def write(directory: str, payload: dict) -> Path:
@@ -289,8 +293,8 @@ class G8ProducerTests(unittest.TestCase):
             "platform": target,
             "installed_smoke": "passed",
             "native_engines": ["sql", "structures", "search"],
-            "engine_version": "1.1.0",
-            "archive": f"hyphae-1.1.0-{target}.tar.gz",
+            "engine_version": WORKSPACE_VERSION,
+            "archive": f"hyphae-{WORKSPACE_VERSION}-{target}.tar.gz",
             "proofs_verified": 4,
             "archive_sha256": "c" * 64,
         }, platform=target)

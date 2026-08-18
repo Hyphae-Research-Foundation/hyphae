@@ -1,7 +1,7 @@
 # Native local ecosystem architecture
 
-Status: accepted architecture, implemented and published with Native `1.1.0`
-for the closed bounded G0-G8 profiles
+Status: accepted target architecture; implemented and published with Native
+`1.1.0` for the closed bounded G0-G8 profiles
 
 Hyphae phase 1 is one Rust process, one data directory, and three
 Hyphae-owned first-class engines. This document records the accepted design;
