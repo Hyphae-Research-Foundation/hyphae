@@ -109,6 +109,12 @@ class RelicensingCheckOrchestratorTests(unittest.TestCase):
         self.assertNotIn("fetch-tags: true", release_readiness)
         self.assertNotIn("git fetch --tags", release_readiness)
         self.assertNotIn("git fetch --no-tags --depth=1", release_readiness)
+        self.assertNotIn("raven-actions/actionlint", release_readiness)
+        self.assertIn(
+            "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            release_readiness,
+        )
+        self.assertIn('"$RUNNER_TEMP/actionlint"', release_readiness)
 
     def test_release_readiness_fetch_sequence_handles_depth_one_clone(self) -> None:
         tags = (

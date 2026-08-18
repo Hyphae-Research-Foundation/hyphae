@@ -813,7 +813,19 @@ jobs:
           cargo test -p hyphae-engine --example generate_disk_format_2_fixture --locked
           cargo test -p hyphae-engine --example generate_retrieval_goldens --locked
       - name: Verify workflow syntax
-        uses: raven-actions/actionlint@01fce4f43a270a612932cb1c64d40505a029f821 # v2.0.1
+        shell: bash
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_URL: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint-1.7.12.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" "$ACTIONLINT_URL"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          test "$("$RUNNER_TEMP/actionlint" -version)" = "1.7.12"
+          "$RUNNER_TEMP/actionlint"
       - name: Test deterministic packaging and checksums
         run: |
           python -m compileall -q packaging tools
