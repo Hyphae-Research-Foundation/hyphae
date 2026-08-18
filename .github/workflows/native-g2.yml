@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# This pull-request lane regenerates the prepared-plans/EXPLAIN evidence and
+# regression-tests the G2 evidence pipeline against an intentionally empty
+# baseline: with exactly one injected requirement, the readiness checker must
+# report 1/8 passed and a failed aggregate. It does not describe the current
+# G2 gate status; the retained closure authority is
+# docs/gates/evidence/closures/native-g2-a839037.json, and the complete
+# 8/8 lane is native-g2-complete.yml.
 name: Native G2 Relational
 
 on:
@@ -50,6 +57,11 @@ jobs:
             --reference native-g2-prepared-audit.json \
             --expected-commit "$G2_SHA" \
             --output native-g2-evidence-with-prepared.json
+          # Pipeline regression: the baseline evidence file is deliberately
+          # empty, so injecting this run's single requirement must leave the
+          # readiness checker failing with exactly 1/8 requirements passed.
+          # A different exit code or count means the checker or injection
+          # tooling regressed, not that the retained G2 closure changed.
           set +e
           PYTHONPATH=. python tools/check_native_g2_readiness.py \
             --profile config/native-g2-readiness-profile.json \
