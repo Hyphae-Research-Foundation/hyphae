@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native mixed-durability scheduler v1
 
 Status: normative target contract; mixed execution, FIFO barriers, bounded

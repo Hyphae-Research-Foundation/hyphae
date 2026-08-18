@@ -35,13 +35,21 @@ principal, role, or permission. Unknown input fields fail closed.
 
 ## Protocol and contract
 
-- MCP revision: `2025-11-25`.
+- Advertised MCP revision: `2025-06-18`, the revision negotiated by the pinned
+  Codex and Claude Code conformance hosts. This bounded adapter slice does not
+  expose tasks or other later-revision-only surfaces.
 - Transport: newline-delimited JSON-RPC 2.0 over stdin/stdout.
 - Maximum complete input message: 4 MiB.
+- Maximum complete output message: 4 MiB.
+- Concurrency: one active tool call and one pending response. A second call is
+  rejected immediately instead of entering an unbounded queue.
 - Lifecycle: `initialize`, `notifications/initialized`, `ping`, `tools/list`,
-  and `tools/call`.
-- `tools/list` returns a fixed maximum of two definitions per page. Only an
-  opaque cursor emitted at that boundary is accepted.
+  `tools/call`, and idempotent `notifications/cancelled`.
+- Cancellation remains live while a Native HTTP request is in flight; the
+  bounded reader/control path does not wait for that request to finish.
+- `tools/list` has a fixed maximum page of one hundred definitions, so the
+  complete fixed 3-tool registry is returned in one host-compatible page;
+  exhausted pages omit `nextCursor` rather than serializing JSON `null`.
 - MCP tasks are forbidden.
 
 The exact tool definitions live in
@@ -62,11 +70,13 @@ opaque, authorization-epoch-bound Native security cursor.
 ## Errors and redaction
 
 Malformed JSON-RPC or tool envelopes receive normal JSON-RPC errors. A valid
-tool call rejected by Native returns `isError: true` and structured content:
+tool call rejected by Native returns a typed structured result. It keeps
+`isError: false` so hosts that collapse MCP execution errors into an opaque
+control-plane error still preserve `structuredContent`:
 
 ```json
 {
-  "schema": "hyphae-native-mcp-tool-error-v1",
+  "schema": "hyphae-native-mcp-tool-error-v2",
   "error": {
     "code": "authorization_denied",
     "category": "authorization",

@@ -1,0 +1,305 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Registry publish
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Existing source tag; live publication accepts only v1.2.0
+        required: true
+        type: string
+      ecosystem:
+        description: Registry to verify or publish
+        required: true
+        type: choice
+        options:
+          - crates-io
+          - npm
+      dry_run:
+        description: Build and verify without registry publication
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: registry-publish-${{ inputs.ecosystem || 'pull-request' }}-${{ inputs.source_tag || github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Dry-run ${{ matrix.ecosystem }} packages
+    if: github.event_name == 'pull_request' || inputs.dry_run
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [crates-io, npm]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out unprivileged candidate source
+        if: github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || format('refs/tags/{0}', inputs.source_tag) }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'crates-io'
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Install pinned Node.js
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.16.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check unprivileged publication policy
+        if: github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem
+        run: python3 tools/check_registry_publish.py --ecosystem "${{ matrix.ecosystem }}" --dry-run
+      - name: Audit crates.io package inventory
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'crates-io'
+        run: python3 tools/check_crate_packages.py
+      - name: Dry-run crates.io packages
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'crates-io'
+        run: python3 tools/verify_crate_packages.py
+      - name: Audit npm package inventory
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
+        run: python3 tools/check_npm_packages.py
+      - name: Dry-run npm packages
+        if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
+        run: |
+          npm publish ./sdks/typescript --dry-run
+          npm publish ./integrations/javascript --dry-run
+
+  live:
+    name: Gate and publish ${{ inputs.ecosystem }}
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    runs-on: ubuntu-24.04
+    environment: registry-production
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      id-token: write
+    env:
+      AUTHORITY_RECEIPT: ${{ github.workspace }}/registry-authority.json
+      CONTROL_ROOT: ${{ github.workspace }}/control
+      EVIDENCE_RECEIPT: ${{ github.workspace }}/registry-evidence.json
+      EVIDENCE_ROOT: ${{ github.workspace }}/evidence
+      PUBLICATION_STATE: ${{ github.workspace }}/registry-publication-state.json
+      SOURCE_ROOT: ${{ github.workspace }}/source
+    steps:
+      - name: Reject a non-main live dispatch before checkout
+        shell: bash
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          test "${{ github.ref }}" = refs/heads/main
+          test "$WORKFLOW_REF" = 'celiumsai/hyphae/.github/workflows/registry-publish.yml@refs/heads/main'
+          test '${{ inputs.source_tag }}' = v1.2.0
+      - name: Check out trusted main control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          path: control
+          persist-credentials: false
+      - name: Check out immutable publication source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.source_tag }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Install pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.7
+      - name: Install pinned JSON Schema verifier
+        run: python -m pip install jsonschema==4.25.1
+      - name: Resolve external exact-SHA GitHub authority
+        id: authority
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem '${{ inputs.ecosystem }}' \
+            --root "$SOURCE_ROOT" \
+            --live-resolve \
+            --source-tag '${{ inputs.source_tag }}' \
+            --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Restore a prior reconciliation receipt on workflow rerun
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          name: registry-publication-${{ inputs.ecosystem }}-${{ steps.authority.outputs.source_commit }}
+          path: ${{ github.workspace }}
+      - name: Download exact Release readiness aggregate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority.outputs.release_run_id }}
+          name: hyphae-release-candidate
+          path: evidence/release-candidate
+      - name: Download exact signed release receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority.outputs.release_run_id }}
+          name: native-g8-signed-release-${{ steps.authority.outputs.source_commit }}
+          path: evidence/signed-release
+      - name: Download exact G8 closure aggregate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority.outputs.g8_run_id }}
+          name: native-g8-aggregate-${{ steps.authority.outputs.source_commit }}
+          path: evidence/g8
+      - name: Download exact security hard-kill aggregate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority.outputs.ci_run_id }}
+          name: security-hard-kill-${{ steps.authority.outputs.source_commit }}
+          path: evidence/security-hard-kill
+      - name: Download exact MCP real-host receipts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.authority.outputs.ci_run_id }}
+          name: mcp-real-hosts-${{ steps.authority.outputs.source_commit }}
+          path: evidence/mcp-real-hosts
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.1
+      - name: Verify transition, signed Release, G8, and exact target digests
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem '${{ inputs.ecosystem }}' \
+            --root "$SOURCE_ROOT" \
+            --live-evidence \
+            --source-tag '${{ inputs.source_tag }}' \
+            --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" \
+            --evidence-root "$EVIDENCE_ROOT" \
+            --evidence-receipt "$EVIDENCE_RECEIPT"
+      - name: Audit exact crates.io package inventory after source validation
+        if: inputs.ecosystem == 'crates-io'
+        working-directory: source
+        run: python3 tools/check_crate_packages.py
+      - name: Audit exact npm package inventory after source validation
+        if: inputs.ecosystem == 'npm'
+        working-directory: source
+        run: python3 tools/check_npm_packages.py
+      - name: Publish exact crates.io release
+        if: inputs.ecosystem == 'crates-io'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem crates-io --root "$SOURCE_ROOT" --live-recheck \
+            --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" --evidence-root "$EVIDENCE_ROOT" \
+            --evidence-receipt "$EVIDENCE_RECEIPT"
+          previous_layer=-1
+          while IFS= read -r package; do
+            layer="${package%%:*}"
+            package="${package#*:}"
+            if (( previous_layer >= 0 && layer != previous_layer )); then
+              PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+                --ecosystem crates-io --root "$SOURCE_ROOT" --wait-layer "$previous_layer" \
+                --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+                --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+                --authority-receipt "$AUTHORITY_RECEIPT" --publication-state "$PUBLICATION_STATE"
+            fi
+            PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+              --ecosystem crates-io --root "$SOURCE_ROOT" --live-recheck \
+              --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+              --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+              --authority-receipt "$AUTHORITY_RECEIPT" --evidence-root "$EVIDENCE_ROOT" \
+              --evidence-receipt "$EVIDENCE_RECEIPT"
+            PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+              --ecosystem crates-io --root "$SOURCE_ROOT" \
+              --authority-receipt "$AUTHORITY_RECEIPT" \
+              --evidence-root "$EVIDENCE_ROOT" --evidence-receipt "$EVIDENCE_RECEIPT" \
+              --publication-state "$PUBLICATION_STATE" -- \
+              cargo publish --locked -p "$package"
+            previous_layer="$layer"
+          done < <(python3 -c 'import json,os; print(*(f"{index}:{package}" for index,layer in enumerate(json.load(open(os.path.join(os.environ["SOURCE_ROOT"], "config/crates-io-release.json"), encoding="utf-8"))["layers"]) for package in layer), sep="\n")')
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem crates-io --root "$SOURCE_ROOT" --wait-layer "$previous_layer" \
+            --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" --publication-state "$PUBLICATION_STATE"
+      - name: Retain crates.io reconciliation receipt
+        if: always() && inputs.ecosystem == 'crates-io'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-publication-${{ inputs.ecosystem }}-${{ steps.authority.outputs.source_commit }}
+          path: ${{ env.PUBLICATION_STATE }}
+          if-no-files-found: error
+          overwrite: true
+      - name: Publish exact npm release
+        if: inputs.ecosystem == 'npm'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem npm --root "$SOURCE_ROOT" --live-recheck \
+            --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" --evidence-root "$EVIDENCE_ROOT" \
+            --evidence-receipt "$EVIDENCE_RECEIPT"
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem npm --root "$SOURCE_ROOT" \
+            --authority-receipt "$AUTHORITY_RECEIPT" \
+            --evidence-root "$EVIDENCE_ROOT" --evidence-receipt "$EVIDENCE_RECEIPT" \
+            --publication-state "$PUBLICATION_STATE" -- \
+            npm publish ./sdks/typescript --provenance --access public
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem npm --root "$SOURCE_ROOT" --live-recheck \
+            --source-tag '${{ inputs.source_tag }}' --repository '${{ github.repository }}' \
+            --workflow-sha '${{ github.workflow_sha }}' --workflow-run-id '${{ github.run_id }}' \
+            --authority-receipt "$AUTHORITY_RECEIPT" --evidence-root "$EVIDENCE_ROOT" \
+            --evidence-receipt "$EVIDENCE_RECEIPT"
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/check_registry_publish.py" \
+            --ecosystem npm --root "$SOURCE_ROOT" \
+            --authority-receipt "$AUTHORITY_RECEIPT" \
+            --evidence-root "$EVIDENCE_ROOT" --evidence-receipt "$EVIDENCE_RECEIPT" \
+            --publication-state "$PUBLICATION_STATE" -- \
+            npm publish ./integrations/javascript --provenance --access public
+      - name: Retain npm reconciliation receipt
+        if: always() && inputs.ecosystem == 'npm'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-publication-${{ inputs.ecosystem }}-${{ steps.authority.outputs.source_commit }}
+          path: ${{ env.PUBLICATION_STATE }}
+          if-no-files-found: error
+          overwrite: true

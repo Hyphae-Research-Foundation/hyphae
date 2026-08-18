@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::expect_used)]
 
@@ -344,7 +344,7 @@ fn lexical_proof_reexecutes_ordered_hits_and_work_evidence()
     transaction.index_document(index, b"second".to_vec(), "rust rust")?;
     transaction.commit()?;
     drop(runtime);
-    let mut product = NativeProduct::open(&path)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
     let mut session = session();
     let point_context = context(&session, 1);
     let (_, point) = generate_native_operation_proof(

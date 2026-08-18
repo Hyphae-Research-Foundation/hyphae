@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native group commit v1
 
 Status: normative target contract; bounded scheduler, independent admission,

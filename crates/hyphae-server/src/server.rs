@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     future::Future,
@@ -80,6 +80,7 @@ const FEATURES: [&str; 14] = [
     "typed_abstention",
 ];
 const WITNESS_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HTTP_BODY_READERS: usize = 256;
 
 #[derive(Clone, Debug)]
 struct RequestId(String);
@@ -90,6 +91,7 @@ struct ServerState {
     limits: ServerLimits,
     bearer_token: Option<BearerToken>,
     admission: Arc<Semaphore>,
+    body_slots: Arc<Semaphore>,
     ready: AtomicBool,
 }
 
@@ -150,6 +152,7 @@ impl HyphaeServer {
                 engine: Arc::new(Mutex::new(opened.engine)),
                 data_dir,
                 admission: Arc::new(Semaphore::new(config.limits.concurrent_operations)),
+                body_slots: Arc::new(Semaphore::new(MAX_HTTP_BODY_READERS)),
                 ready: AtomicBool::new(true),
                 limits: config.limits,
                 bearer_token: config.bearer_token,
@@ -768,6 +771,14 @@ async fn parse_json<T: DeserializeOwned>(
             request_id,
         ));
     }
+    validate_content_length(
+        request.headers(),
+        state.limits.request_body_bytes,
+        request_id,
+    )?;
+    let _body_slot = Arc::clone(&state.body_slots)
+        .try_acquire_owned()
+        .map_err(|_| busy(request_id))?;
     let bytes = tokio::time::timeout(
         state.limits.request_body_timeout,
         body::to_bytes(request.into_body(), state.limits.request_body_bytes),
@@ -790,6 +801,29 @@ async fn parse_json<T: DeserializeOwned>(
     validate_json_shape(&value, state.limits.json_depth, state.limits.json_nodes)
         .map_err(|()| ApiError::limit(request_id))?;
     serde_json::from_value(value).map_err(|_| ApiError::invalid(request_id))
+}
+
+fn validate_content_length(
+    headers: &HeaderMap,
+    maximum: usize,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(ApiError::invalid(request_id));
+    }
+    let length = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| ApiError::invalid(request_id))?;
+    if length > maximum {
+        return Err(ApiError::payload_too_large(request_id));
+    }
+    Ok(())
 }
 
 fn validate_json_shape(

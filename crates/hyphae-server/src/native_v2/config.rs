@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -62,6 +62,10 @@ pub struct NativeHttpV2Config {
     pub bind: SocketAddr,
     /// Optional bearer credential. A non-loopback bind requires one.
     pub bearer_token: Option<BearerToken>,
+    /// Explicit 1.2-only migrated legacy bearer for a bootstrapped directory.
+    pub legacy_bearer_token: Option<BearerToken>,
+    /// Product compatibility version selecting the bounded migration window.
+    pub legacy_compatibility_version: hyphae_native_product::LegacyBearerCompatibilityVersion,
     /// HTTP-only framing bounds.
     pub limits: NativeHttpV2Limits,
 }
@@ -71,6 +75,9 @@ impl Default for NativeHttpV2Config {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_NATIVE_HTTP_V2_PORT),
             bearer_token: None,
+            legacy_bearer_token: None,
+            legacy_compatibility_version:
+                hyphae_native_product::LEGACY_BEARER_COMPATIBILITY_VERSION,
             limits: NativeHttpV2Limits::default(),
         }
     }
@@ -94,6 +101,46 @@ impl NativeHttpV2Config {
             return Err(NativeHttpV2ConfigError::RemoteManagedBindRequiresTls { bind: self.bind });
         }
         self.limits.validate()
+    }
+
+    pub(super) fn validate_managed_legacy(
+        &self,
+        state: hyphae_native_product::LegacyBearerState,
+    ) -> Result<(), NativeHttpV2ConfigError> {
+        if self.bearer_token.is_some() {
+            return Err(NativeHttpV2ConfigError::ManagedAuthenticationConflict);
+        }
+        if self.legacy_bearer_token.is_some() && !self.bind.ip().is_loopback() {
+            return Err(NativeHttpV2ConfigError::RemoteManagedBindRequiresTls { bind: self.bind });
+        }
+        match (
+            self.legacy_compatibility_version.permits_authentication(),
+            state,
+            self.legacy_bearer_token.is_some(),
+        ) {
+            (
+                true,
+                hyphae_native_product::LegacyBearerState::MigrationPending
+                | hyphae_native_product::LegacyBearerState::DualWindow,
+                true,
+            )
+            | (
+                true | false,
+                hyphae_native_product::LegacyBearerState::NeverEnabled
+                | hyphae_native_product::LegacyBearerState::Revoked,
+                false,
+            ) => {}
+            (false, state, _) if state.is_enabled() => {
+                return Err(NativeHttpV2ConfigError::LegacyCompatibilityExpired { state });
+            }
+            (_, state, configured) => {
+                return Err(NativeHttpV2ConfigError::LegacyStateConfigurationMismatch {
+                    state,
+                    configured,
+                });
+            }
+        }
+        self.validate_managed()
     }
 }
 
@@ -123,4 +170,25 @@ pub enum NativeHttpV2ConfigError {
     /// HTTP framing cannot exceed the canonical product-envelope maximum.
     #[error("Native HTTP v2 limit exceeds the product-envelope maximum")]
     LimitAboveProductMaximum,
+    /// Durable state and explicit legacy configuration disagree.
+    #[error(
+        "Native HTTP legacy bearer configuration ({configured}) conflicts with durable state {state:?}"
+    )]
+    LegacyStateConfigurationMismatch {
+        /// Durable terminal-aware state.
+        state: hyphae_native_product::LegacyBearerState,
+        /// Whether a process-local legacy verifier was configured.
+        configured: bool,
+    },
+    /// The one-minor compatibility line no longer authenticates legacy bearers.
+    #[error(
+        "Native HTTP legacy bearer state {state:?} is enabled outside compatibility version 1.2; revoke it offline or with a canonical Owner key"
+    )]
+    LegacyCompatibilityExpired {
+        /// Durable enabled state requiring explicit revocation.
+        state: hyphae_native_product::LegacyBearerState,
+    },
+    /// Configured bearer does not match the durable migrated verifier.
+    #[error("configured Native HTTP legacy bearer does not match the migrated credential")]
+    LegacyBearerMismatch,
 }

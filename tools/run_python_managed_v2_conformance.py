@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Run the installed Python SDK against one real managed Native daemon."""
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import BinaryIO
 
 from tools.check_python_managed_v2_conformance import (
     CASES,
+    LIFECYCLE,
     READS,
     WRITES,
     validate_receipt,
@@ -204,8 +205,9 @@ def validate_transcript(value: object) -> dict[str, object]:
     if (
         value.get("schema") != "hyphae-python-managed-v2-transcript-v1"
         or value.get("status") != "passed"
-        or value.get("protocol") != {"major": 1, "minor": 2}
-        or value.get("operations") != {"reads": READS, "writes": WRITES}
+        or value.get("protocol") != {"major": 1, "minor": 3}
+        or value.get("operations")
+        != {"lifecycle": LIFECYCLE, "reads": READS, "writes": WRITES}
         or value.get("cases") != {name: True for name in CASES}
     ):
         raise LiveConformanceFailure("live transcript contract differs")
@@ -253,25 +255,11 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         data_dir = workspace / "data"
         owner_key = workspace / "owner.key"
         auditor_key = workspace / "auditor.key"
+        legacy_bearer = workspace / "legacy-bearer.key"
         fixture_metadata = workspace / "fixture.json"
         transcript_path = workspace / "transcript.json"
         python = install_wheel(workspace / "venv", wheel)
         run_setup([str(binary), "init", "--data-dir", str(data_dir)])
-        run_setup(
-            [
-                str(binary),
-                "security",
-                "--data-dir",
-                str(data_dir),
-                "bootstrap",
-                "--name",
-                "Python Managed Conformance Owner",
-                "--label",
-                "python-managed-conformance-owner",
-                "--key-out",
-                str(owner_key),
-            ]
-        )
         run_setup(
             [
                 str(fixture_binary),
@@ -279,12 +267,14 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                 str(data_dir),
                 "--owner-key-file",
                 str(owner_key),
+                "--legacy-bearer-file",
+                str(legacy_bearer),
                 "--auditor-key-out",
                 str(auditor_key),
                 "--metadata-out",
                 str(fixture_metadata),
             ],
-            credentials=(owner_key.read_bytes(),),
+            credentials=(b"python-managed-legacy-bearer-0123456789abcdef",),
         )
         credentials = (owner_key.read_bytes(), auditor_key.read_bytes())
         with (
@@ -302,6 +292,8 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                     "--http-bind",
                     "127.0.0.1:0",
                     "--native-api-key-auth",
+                    "--native-legacy-bearer-file",
+                    str(legacy_bearer),
                 ],
                 cwd=ROOT,
                 stdin=subprocess.DEVNULL,
@@ -372,13 +364,17 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                 "filename": fixture_binary.name,
                 "sha256": sha256(fixture_binary),
             },
-            "protocol": {"major": 1, "minor": 2},
+            "protocol": {"major": 1, "minor": 3},
             "transports": (
                 ["http-v2", "named-pipe"]
                 if lane == "windows"
                 else ["af-unix", "http-v2"]
             ),
-            "operations": {"reads": READS, "writes": WRITES},
+            "operations": {
+                "lifecycle": LIFECYCLE,
+                "reads": READS,
+                "writes": WRITES,
+            },
             "cases": {name: True for name in CASES},
             "transcript_sha256": sha256(transcript_path),
         }

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-protocol"
 description = "Portable native local protocol and product wire codecs for Hyphae Native"

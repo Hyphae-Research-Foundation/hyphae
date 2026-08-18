@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Native HTTP v2 JSON error and provisional-stream wire models.
 
@@ -15,6 +15,10 @@ pub const REQUEST_ID_HEADER_V2: &str = "x-hyphae-request-id";
 pub const DEADLINE_HEADER_V2: &str = "x-hyphae-deadline-micros";
 /// Opaque lowercase hexadecimal identity for retained HTTP session state.
 pub const SESSION_ID_HEADER_V2: &str = "x-hyphae-session-id";
+/// Exact Native product protocol minor offered by clients and selected by servers.
+pub const PROTOCOL_MINOR_HEADER_V2: &str = "x-hyphae-protocol-minor";
+/// Current exact Native HTTP v2 protocol minor value.
+pub const PROTOCOL_MINOR_VALUE_V2: &str = "3";
 
 /// Typed configured-limit evidence in a Native product error.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

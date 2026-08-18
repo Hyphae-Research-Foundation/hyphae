@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Direct Unix-domain transport integration coverage.
 
@@ -9,6 +9,7 @@ use std::{
     io::{Cursor, Read},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,15 +19,18 @@ use hyphae_native_runtime::{
     LocalProtocolError, LocalTransportError, UdsFrameConnection, UdsFrameListener, encode_frame,
 };
 
+static NEXT_TEMPORARY_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
+
 struct TemporaryDirectory(PathBuf);
 
 impl TemporaryDirectory {
     fn create() -> Result<Self, Box<dyn std::error::Error>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let id = NEXT_TEMPORARY_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
         // Hosted macOS exposes a TMPDIR long enough to exceed sockaddr_un's
         // pathname limit once the socket name is appended.
         let path = Path::new("/tmp").join(format!(
-            "hyphae-native-local-uds-test-{}-{timestamp}",
+            "hyphae-native-local-uds-test-{}-{timestamp}-{id}",
             std::process::id()
         ));
         fs::create_dir(&path)?;

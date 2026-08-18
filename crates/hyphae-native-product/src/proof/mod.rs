@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bounded native proof and complete directory-witness artifacts.
 
@@ -23,6 +23,7 @@ pub use model::{
 pub(crate) use operation::dispatch_proven_operation;
 pub use operation::{generate_native_operation_proof, reexecute_native_operation_proof};
 pub use verify::verify_native_proof_offline;
+pub(crate) use verify::verify_native_proof_offline_with_checkpoint;
 pub use witness::{
     bundle_native_witness, decode_native_witness, encode_native_witness, read_native_witness,
     write_native_witness,

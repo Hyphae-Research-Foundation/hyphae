@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Orchestrate a Rust-produced thread-scaling diagnostic receipt.
 
 The source commit and tree are supplied by an external exact-source authority;

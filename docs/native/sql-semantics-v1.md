@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Hyphae SQL semantics v1
 
 Status: normative target contract; catalog-typed `CREATE TABLE`, primary-key

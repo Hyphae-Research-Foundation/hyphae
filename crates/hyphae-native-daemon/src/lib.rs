@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Multi-client UDS and Windows named-pipe adapter over one product service owner.
 
@@ -13,13 +13,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use hyphae_native_product::{
-    ApiKeyCredential, NativeProduct, NativeProductClient, NativeProductService,
-    NativeProductServiceConfig, ProductAuthorization, ProductError, ProductErrorCode,
-    ProductOperation, ProductPermission, ProductPrincipal, ProductResponse, TimingClass,
+    ApiKeyCredential, ApiKeyRequestSessionAuthentication, NativeProduct, NativeProductClient,
+    NativeProductService, NativeProductServiceConfig, PendingTerminalCredential,
+    ProductAuthorization, ProductError, ProductErrorCode, ProductOperation, ProductPermission,
+    ProductPrincipal, ProductResponse, TimingClass,
 };
 use hyphae_native_protocol::{
     AsyncFrameIo, ControlError, FlowWindow, FrameIoError, FrameKind, HandshakeError, Hello,
@@ -32,7 +33,7 @@ use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{ListenerOptions, PeerCreds};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, broadcast},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, broadcast},
     task::{JoinHandle, JoinSet},
 };
 
@@ -49,8 +50,11 @@ use {
 
 /// Default maximum concurrently connected clients.
 pub const DEFAULT_MAX_CLIENTS: usize = 1_024;
+/// Maximum managed authentication tasks admitted globally by one daemon.
+pub const MAX_CONCURRENT_AUTHENTICATION_TASKS: usize = 256;
 /// Default maximum stream byte window.
 pub const DEFAULT_MAXIMUM_WINDOW: u64 = 16 * 1024 * 1024;
+const PENDING_TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(windows)]
 const WINDOWS_PIPE_PREFIX: &str = r"\\.\pipe\";
@@ -196,6 +200,11 @@ enum ConnectionCredential {
         authorization: ProductAuthorization,
     },
     Managed(ApiKeyCredential),
+}
+
+enum OpenedConnection {
+    Authenticated(NativeProductClient),
+    PendingTerminal(PendingTerminalCredential),
 }
 
 impl NativeDaemon {
@@ -457,6 +466,7 @@ async fn listener_loop(
     use interprocess::local_socket::tokio::prelude::*;
 
     let mut clients = JoinSet::new();
+    let authentication_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_AUTHENTICATION_TASKS));
     loop {
         tokio::select! {
             biased;
@@ -469,6 +479,10 @@ async fn listener_loop(
                     drop(stream);
                     continue;
                 }
+                let Ok(authentication_permit) = Arc::clone(&authentication_slots).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let service = service.clone();
                 let client_shutdown = shutdown.resubscribe();
                 let denied_client_identity = denied_client_identity.clone();
@@ -478,6 +492,7 @@ async fn listener_loop(
                         service,
                         config,
                         authentication,
+                        authentication_permit,
                         denied_client_identity,
                         client_shutdown,
                     )
@@ -533,6 +548,7 @@ async fn serve_connection(
     service: hyphae_native_product::NativeProductHandle,
     config: NativeDaemonConfig,
     authentication: DaemonAuthentication,
+    authentication_permit: OwnedSemaphorePermit,
     denied_client_identity: Option<String>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), DaemonError> {
@@ -569,10 +585,9 @@ async fn serve_connection(
         first.request_id,
     )
     .await;
-    let Some((hello, client, catalog_version)) = opened? else {
+    let Some((hello, opened, catalog_version)) = opened? else {
         return Ok(());
     };
-    let client = Arc::new(client);
     let policy = NegotiationPolicy {
         capabilities: match authentication {
             DaemonAuthentication::UnmanagedPeer => ProtocolCapabilities::G6,
@@ -584,23 +599,66 @@ async fn serve_connection(
         maximum_initial_window: u32::try_from(config.maximum_window)
             .map_err(|_| DaemonError::InvalidConfiguration)?,
     };
-    let welcome = negotiate(
-        &hello,
-        policy,
-        client.session_id().get(),
-        hyphae_native_product::capabilities(),
-        catalog_version,
-    )?;
-    codec
-        .send(
-            &mut stream.as_ref(),
-            FrameKind::Welcome,
-            0,
-            first.request_id,
-            &encode_welcome(welcome)?,
-        )
-        .await?;
+    match opened {
+        OpenedConnection::Authenticated(client) => {
+            drop(authentication_permit);
+            let welcome = negotiate(
+                &hello,
+                policy,
+                client.session_id().get(),
+                hyphae_native_product::capabilities(),
+                catalog_version,
+            )?;
+            codec
+                .send(
+                    &mut stream.as_ref(),
+                    FrameKind::Welcome,
+                    0,
+                    first.request_id,
+                    &encode_welcome(welcome)?,
+                )
+                .await?;
+            let client = Arc::new(client);
+            let result = serve_open_connection(
+                stream.clone(),
+                client.clone(),
+                welcome,
+                None,
+                config,
+                &mut shutdown,
+            )
+            .await;
+            if let Ok(client) = Arc::try_unwrap(client) {
+                let _ignored = client.close();
+            }
+            result
+        }
+        OpenedConnection::PendingTerminal(pending) => {
+            serve_pending_terminal_connection(
+                stream,
+                codec,
+                service,
+                hello,
+                policy,
+                pending,
+                authentication_permit,
+                config,
+                first.request_id,
+                shutdown,
+            )
+            .await
+        }
+    }
+}
 
+async fn serve_open_connection(
+    stream: Arc<interprocess::local_socket::tokio::Stream>,
+    client: Arc<NativeProductClient>,
+    welcome: hyphae_native_protocol::Welcome,
+    initial_frame: Option<hyphae_native_protocol::OwnedFrame>,
+    config: NativeDaemonConfig,
+    shutdown: &mut broadcast::Receiver<()>,
+) -> Result<(), DaemonError> {
     let negotiated_payload = usize::try_from(welcome.maximum_frame_payload)
         .map_err(|_| DaemonError::InvalidConfiguration)?;
     let codec = AsyncFrameIo::new(negotiated_payload)?;
@@ -610,19 +668,115 @@ async fn serve_connection(
     let window = Arc::new(Mutex::new(BTreeMap::new()));
     let window_notify = Arc::new(Notify::new());
     let result = connection_loop(
-        stream.clone(),
+        stream,
         &codec,
-        client.clone(),
+        client,
         welcome,
+        initial_frame,
         config,
         request_state.clone(),
         pending_controls.clone(),
         window.clone(),
         window_notify,
-        &mut shutdown,
+        shutdown,
     )
     .await;
     cleanup_connection_state(&request_state, &pending_controls, &window);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_pending_terminal_connection(
+    stream: Arc<interprocess::local_socket::tokio::Stream>,
+    _codec: AsyncFrameIo,
+    service: hyphae_native_product::NativeProductHandle,
+    hello: Hello,
+    policy: NegotiationPolicy,
+    pending: PendingTerminalCredential,
+    _authentication_permit: OwnedSemaphorePermit,
+    config: NativeDaemonConfig,
+    handshake_request_id: u64,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<(), DaemonError> {
+    let provisional = negotiate(&hello, policy, 1, hyphae_native_product::capabilities(), 0)?;
+    let mut codec = AsyncFrameIo::new(
+        usize::try_from(provisional.maximum_frame_payload)
+            .map_err(|_| DaemonError::InvalidConfiguration)?,
+    )?;
+    let mut reader = stream.as_ref();
+    let frame = tokio::select! {
+        result = tokio::time::timeout(
+            PENDING_TERMINAL_FRAME_TIMEOUT,
+            codec.receive(&mut reader),
+        ) => if let Ok(result) = result {
+            result?
+        } else {
+            send_handshake_error(
+                stream.as_ref(),
+                &codec,
+                handshake_request_id,
+                ProductError::from_code(ProductErrorCode::AuthorizationDenied),
+            )
+            .await?;
+            return Ok(());
+        },
+        _ = shutdown.recv() => return Ok(()),
+    };
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+    let denied = || ProductError::from_code(ProductErrorCode::AuthorizationDenied);
+    if frame.kind != FrameKind::Execute || frame.stream_id == 0 || frame.request_id == 0 {
+        send_handshake_error(stream.as_ref(), &codec, handshake_request_id, denied()).await?;
+        return Ok(());
+    }
+    let Ok(request) = decode_product_request_for_minor(&frame.payload, provisional.minor) else {
+        send_handshake_error(stream.as_ref(), &codec, handshake_request_id, denied()).await?;
+        return Ok(());
+    };
+    let Some(idempotency_token) = request.idempotency_token else {
+        send_handshake_error(stream.as_ref(), &codec, handshake_request_id, denied()).await?;
+        return Ok(());
+    };
+    let operation = request.operation.clone();
+    let client =
+        match service.open_exact_terminal_replay_session(pending, idempotency_token, operation) {
+            Ok(client) => client,
+            Err(error) if error.code() == ProductErrorCode::AuthorizationDenied => {
+                send_handshake_error(stream.as_ref(), &codec, handshake_request_id, denied())
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let welcome = negotiate(
+        &hello,
+        policy,
+        client.session_id().get(),
+        hyphae_native_product::capabilities(),
+        0,
+    )?;
+    codec
+        .send(
+            &mut stream.as_ref(),
+            FrameKind::Welcome,
+            0,
+            handshake_request_id,
+            &encode_welcome(welcome)?,
+        )
+        .await?;
+    let client = Arc::new(client);
+    // Authentication consumed the pipelined replay frame; admit that same
+    // frame instead of waiting for a duplicate request from the client.
+    let result = serve_open_connection(
+        stream.clone(),
+        client.clone(),
+        welcome,
+        Some(frame),
+        config,
+        &mut shutdown,
+    )
+    .await;
     if let Ok(client) = Arc::try_unwrap(client) {
         let _ignored = client.close();
     }
@@ -636,7 +790,7 @@ async fn open_connection_client(
     authentication: DaemonAuthentication,
     decoded: Result<(Hello, ConnectionCredential), DaemonError>,
     request_id: u64,
-) -> Result<Option<(Hello, NativeProductClient, u64)>, DaemonError> {
+) -> Result<Option<(Hello, OpenedConnection, u64)>, DaemonError> {
     let (hello, credential) = match decoded {
         Ok(decoded) => decoded,
         Err(DaemonError::Product(error))
@@ -664,11 +818,10 @@ async fn open_connection_client(
             authorization,
         } => service.open_session(principal, authorization)?,
         ConnectionCredential::Managed(credential) => {
-            match service.open_authenticated_session(credential) {
-                Ok(client) => client,
-                Err(error) if error.code() == ProductErrorCode::AuthorizationDenied => {
-                    send_handshake_error(stream, codec, request_id, error).await?;
-                    return Ok(None);
+            match service.open_api_key_request_session(credential) {
+                Ok(ApiKeyRequestSessionAuthentication::Authenticated(client)) => client,
+                Ok(ApiKeyRequestSessionAuthentication::PendingTerminal(pending)) => {
+                    return Ok(Some((hello, OpenedConnection::PendingTerminal(pending), 0)));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -695,7 +848,11 @@ async fn open_connection_client(
             _ => return Err(DaemonError::Task),
         },
     };
-    Ok(Some((hello, client, catalog_version)))
+    Ok(Some((
+        hello,
+        OpenedConnection::Authenticated(client),
+        catalog_version,
+    )))
 }
 
 fn decode_connection_credential(
@@ -778,6 +935,7 @@ async fn connection_loop(
     codec: &AsyncFrameIo,
     client: Arc<NativeProductClient>,
     welcome: hyphae_native_protocol::Welcome,
+    mut initial_frame: Option<hyphae_native_protocol::OwnedFrame>,
     config: NativeDaemonConfig,
     requests: RequestState,
     pending_controls: PendingControls,
@@ -793,14 +951,18 @@ async fn connection_loop(
     let mut responses = JoinSet::new();
     let mut next_generation = 1_u64;
     loop {
-        let received: Option<hyphae_native_protocol::OwnedFrame> = tokio::select! {
-            result = receive_codec.receive(&mut reader) => result?,
-            _ = shutdown.recv() => {
-                break;
-            }
-            completed = responses.join_next(), if !responses.is_empty() => {
-                match completed {
-                    Some(Ok(Ok(()) | Err(_)) | Err(_)) | None => continue,
+        let received = if let Some(frame) = initial_frame.take() {
+            Some(frame)
+        } else {
+            tokio::select! {
+                result = receive_codec.receive(&mut reader) => result?,
+                _ = shutdown.recv() => {
+                    break;
+                }
+                completed = responses.join_next(), if !responses.is_empty() => {
+                    match completed {
+                        Some(Ok(Ok(()) | Err(_)) | Err(_)) | None => continue,
+                    }
                 }
             }
         };

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
-"""Validate the bounded 1.2.0 target classification without closing preflight."""
+"""Validate bounded 1.2.0 classification and source-bound preflight evidence."""
 
 from __future__ import annotations
 
@@ -17,12 +17,44 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 CONTRACT_PATH = ROOT / "config" / "relicensing-1.2.0-classification.json"
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 MAX_GIT_OUTPUT = 4 * 1024 * 1024
 MAX_REPOSITORY_PATHS = 10_000
 MAX_CONTRACT_BYTES = 1024 * 1024
+MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}$")
+LEGAL_BASE_COMMIT = "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18"
+LEGAL_BASE_TREE = "51b283d27d0c0f5d194680de1d3e273b57f2ff95"
+DEPENDENCY_EVIDENCE_EVOLUTION = (
+    "Current exact dependency evidence evolved from legal base fcf2f918; the "
+    "base-derived filename is retained as the classification contract path."
+)
+DEPENDENCY_RECEIPT_PATH = (
+    "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json"
+)
+DEPENDENCY_AGGREGATE_PATH = (
+    "docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json"
+)
+REPOSITORY_AUDIT_PATH = (
+    "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json"
+)
+REPRESENTATIVE_ATTESTATION_PATH = (
+    "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+)
+DEPENDABOT_REVIEW_PATH = (
+    "docs/gates/evidence/relicensing-1.2.0-dependabot-review.json"
+)
+DEPENDABOT_REVIEW_METHOD = {
+    "scope": f"Every commit reachable from legal base source.commit {LEGAL_BASE_COMMIT} whose author is dependabot[bot].",
+    "review": "Each parent-to-commit patch, changed path set, numstat, author, committer, subject, and tree was inspected individually.",
+    "classification_rule": "A commit is mechanical only when its complete patch changes dependency versions, lock resolution, checksums, or immutable full-SHA action references and contains no authored product logic, prose, or license grant.",
+}
+TRANSITION_RECEIPT_PATH = "docs/gates/evidence/relicensing-1.2.0-transition.json"
 HISTORICAL_APACHE_LICENSE_SHA256 = (
     "cdf5cb75ba05132c2933df3d948450e0503ede64552ee3a4d3fb9f52dab096c0"
 )
@@ -33,6 +65,15 @@ HISTORICAL_APACHE_TAGS = (
     ("v1.0.0", "839ea6e2a806ed919610952cb17fd1dd61195d76"),
     ("v1.0.1", "84161cf067141b60f4847b965ef77c5b749749c0"),
 )
+HISTORICAL_V1_1_0 = {
+    "tag_object": "80b2f094c17ada6adc3bb879e20c3662bd93f4e4",
+    "commit": "e88f2ea2c3455a393e3ac0cd69e25486cc26888e",
+    "tree": "c131ab057c8ab05ed2e2389954f0e8145a71dbdb",
+    "license_sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "documentation_license_sha256": (
+        "23ee78c8bae49cf08ea2f0c84945c66b987ebe4520881fb51b3dad4fb43d07c2"
+    ),
+}
 SOFTWARE_CATEGORY_DEFINITION = (
     "Executable source, tests, examples, build and release tooling, configuration, "
     "machine-enforced data, schemas, generated models, and legal material distributed "
@@ -51,6 +92,7 @@ TOP_LEVEL_KEYS = {
     "boundaries",
     "effective_transition",
     "preflight",
+    "verification",
 }
 EXPECTED_LICENSES = {
     "software": "Apache-2.0",
@@ -125,6 +167,23 @@ EXPECTED_MIXED_RULE = {
     "prose_only": "narrative-documentation",
     "readme_default": "narrative-documentation",
 }
+EXPECTED_AGPL_ALLOWLIST = [
+    "CHANGELOG.md",
+    "LICENSE-POLICY.md",
+    "README.md",
+    "config/relicensing-1.2.0-classification.json",
+    "docs/adr/0025-agplv3-code-and-cc-by-sa-documentation.md",
+    "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
+    "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
+    "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json",
+    "docs/roadmap.md",
+    "docs/roadmaps/1.2.0-relicensing.md",
+    "tools/check_license_policy.py",
+    "tools/check_relicensing_preflight.py",
+    "tools/produce_relicensing_dependency_receipt.py",
+    "tools/test_check_license_policy.py",
+    "tools/test_check_native_v2_authority_conformance.py",
+]
 EXPECTED_GENERATED_COPIES = [
     {
         "source": "contracts/json-schema/",
@@ -146,37 +205,64 @@ EXPECTED_GENERATED_COPIES = [
     },
 ]
 EXPECTED_TRANSITION = {
-    "state": "preflight-only-not-effective",
-    "current_software_license": "AGPL-3.0-only",
+    "state": "effective-in-current-integration-tree",
+    "current_software_license": "Apache-2.0",
     "current_documentation_license": "CC-BY-SA-4.0",
-    "required_event": (
-        "one-atomic-relicensing-commit-after-all-preflight-evidence-is-accepted"
-    ),
+    "effective_at_utc": "2026-08-16T13:15:26Z",
+    "transition_receipt": TRANSITION_RECEIPT_PATH,
     "requires_all_preflight_evidence": True,
 }
 EXPECTED_PREFLIGHT = [
-    ("counsel-approval", "open-unclaimed", []),
-    ("copyright-relicensing-authority", "open-unclaimed", []),
-    ("prior-commitments", "open-unclaimed", []),
-    ("dependency-license-exact-sha", "open-unclaimed", []),
+    (
+        "counsel-approval",
+        "accepted-owner-attestation",
+        [REPRESENTATIVE_ATTESTATION_PATH],
+    ),
+    (
+        "copyright-relicensing-authority",
+        "accepted-owner-attestation",
+        [REPOSITORY_AUDIT_PATH, REPRESENTATIVE_ATTESTATION_PATH],
+    ),
+    (
+        "prior-commitments",
+        "accepted-owner-attestation",
+        [REPOSITORY_AUDIT_PATH, REPRESENTATIVE_ATTESTATION_PATH],
+    ),
+    (
+        "dependency-license-exact-sha",
+        "accepted-evidence",
+        [DEPENDENCY_AGGREGATE_PATH],
+    ),
     (
         "specification-classification",
-        "accepted-decision",
+        "accepted-evidence",
         [
             "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
             "config/relicensing-1.2.0-classification.json",
         ],
     ),
-    ("contribution-governance", "open-unclaimed", []),
+    (
+        "contribution-governance",
+        "accepted-evidence",
+        ["CONTRIBUTING.md", REPOSITORY_AUDIT_PATH],
+    ),
 ]
+BLOCKING_PREFLIGHT_STATUSES: set[str] = set()
+NONBLOCKING_PREFLIGHT_STATUSES = {
+    "accepted-owner-attestation",
+    "accepted-evidence",
+}
 REPRESENTATIVE_CLASSIFICATIONS = {
     ".github/assets/hyphae-lockup.svg": "reserved-trademark-asset",
     ".github/workflows/ci.yml": "software",
     "AGENTS.md": "narrative-documentation",
     "Cargo.toml": "software",
+    "DCO": "third-party-material",
+    "THIRD_PARTY_LICENSES.txt": "third-party-material",
     "LICENSE": "software",
     "LICENSE-DOCUMENTATION": "narrative-documentation",
     "NOTICE": "software",
+    "THIRD_PARTY_NOTICES.md": "software",
     "config/example.json": "software",
     "contracts/README.md": "narrative-documentation",
     "contracts/json-schema/example.schema.json": "normative-specification",
@@ -222,6 +308,20 @@ EXPECTED_RULES = [
         "reserved-trademark-asset",
         "exact",
         (".github/assets/hyphae-lockup-reversed.svg", ".github/assets/hyphae-lockup.svg"),
+    ),
+    (
+        "software-notice-documents",
+        19,
+        "software",
+        "basename",
+        ("THIRD_PARTY_NOTICES.md",),
+    ),
+    (
+        "third-party-material",
+        11,
+        "third-party-material",
+        "exact",
+        ("DCO", "THIRD_PARTY_LICENSES.txt"),
     ),
     (
         "documentation-license-texts",
@@ -697,8 +797,8 @@ def validate_contract(
     if not _require_keys(document, TOP_LEVEL_KEYS, "contract", failures):
         return ValidationResult(failures, classifications, blockers)
 
-    if document["$comment"] != "SPDX-License-Identifier: AGPL-3.0-only":
-        failures.append("contract.$comment: current preflight header must remain AGPL-3.0-only")
+    if document["$comment"] != "SPDX-License-Identifier: Apache-2.0":
+        failures.append("contract.$comment: effective header must be Apache-2.0")
     if document["schema"] != "hyphae-relicensing-classification-v1":
         failures.append("contract.schema: unsupported identifier")
     if document["target_release"] != "1.2.0" or VERSION.fullmatch(
@@ -840,7 +940,7 @@ def validate_contract(
             _validate_exact_paths(
                 third_party["exact_paths"],
                 "contract.boundaries.third_party.exact_paths",
-                [],
+                ["DCO", "THIRD_PARTY_LICENSES.txt"],
                 "third-party-material",
                 rules,
                 failures,
@@ -856,7 +956,7 @@ def validate_contract(
         "contract.effective_transition",
         failures,
     ) or document["effective_transition"] != EXPECTED_TRANSITION:
-        failures.append("contract.effective_transition: preflight-only state differs")
+        failures.append("contract.effective_transition: effective state differs")
 
     preflight = document["preflight"]
     if _require_keys(
@@ -865,10 +965,10 @@ def validate_contract(
         "contract.preflight",
         failures,
     ):
-        if preflight["overall_status"] != "blocked" or preflight[
+        if preflight["overall_status"] != "accepted" or preflight[
             "completion_claim"
-        ] is not False:
-            failures.append("contract.preflight: must truthfully remain blocked")
+        ] is not True:
+            failures.append("contract.preflight: accepted completion state differs")
         evidence_categories = preflight["evidence_categories"]
         if not isinstance(evidence_categories, list):
             failures.append("contract.preflight.evidence_categories: must be an array")
@@ -900,9 +1000,11 @@ def validate_contract(
                 actual_preflight.append(
                     (evidence_id, evidence["status"], evidence["evidence"])
                 )
-                if evidence["status"] == "open-unclaimed":
+                if evidence["status"] in BLOCKING_PREFLIGHT_STATUSES:
                     blockers.append(evidence_id)
-                elif evidence["status"] == "accepted-decision" and root is not None:
+                elif evidence["status"] not in NONBLOCKING_PREFLIGHT_STATUSES:
+                    failures.append(f"{location}.status: unsupported status")
+                if root is not None:
                     for path in evidence["evidence"]:
                         if not (root / path).is_file():
                             failures.append(f"{location}.evidence: missing {path}")
@@ -935,6 +1037,50 @@ def validate_contract(
             )
 
     _validate_generated_copies(document, rules, root, failures)
+    verification = document["verification"]
+    if not _require_keys(
+        verification,
+        {
+            "agpl_history_allowlist",
+            "distribution_copy_suffixes",
+            "historical_agpl_literal_allowlist",
+        },
+        "contract.verification",
+        failures,
+    ):
+        return ValidationResult(failures, classifications, blockers)
+    if verification["agpl_history_allowlist"] != EXPECTED_AGPL_ALLOWLIST:
+        failures.append("contract.verification.agpl_history_allowlist: frozen set differs")
+    if verification["distribution_copy_suffixes"] != ["/LICENSE-POLICY.md"]:
+        failures.append("contract.verification.distribution_copy_suffixes: frozen set differs")
+    if verification["historical_agpl_literal_allowlist"] != [
+        "AGPL-3.0-only",
+        "GNU Affero",
+    ]:
+        failures.append("contract.verification.historical_agpl_literal_allowlist: frozen set differs")
+    if root is not None and (root / ".git").exists():
+        observed_agpl: set[str] = set()
+        for path in repository_paths:
+            candidate = root / path
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            try:
+                encoded = candidate.read_bytes()
+            except OSError as error:
+                failures.append(f"{path}: cannot inspect effective license declarations: {error}")
+                continue
+            if b"AGPL-3.0-only" not in encoded and b"GNU Affero" not in encoded:
+                continue
+            if any(path.endswith(suffix) for suffix in verification["distribution_copy_suffixes"]):
+                continue
+            observed_agpl.add(path)
+        if observed_agpl != set(EXPECTED_AGPL_ALLOWLIST):
+            unexpected = sorted(observed_agpl - set(EXPECTED_AGPL_ALLOWLIST))
+            missing = sorted(set(EXPECTED_AGPL_ALLOWLIST) - observed_agpl)
+            if unexpected:
+                failures.append(f"effective AGPL allowlist: unexpected paths {unexpected}")
+            if missing:
+                failures.append(f"effective AGPL allowlist: expected historical paths missing {missing}")
     return ValidationResult(failures, classifications, blockers)
 
 
@@ -966,6 +1112,645 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("classification contract must be a JSON object")
     return value
+
+
+def _load_json_evidence(root: Path, relative: str) -> dict[str, Any]:
+    path = root / relative
+    if _path_uses_symlink(root, path) or not path.is_file():
+        raise ValueError(f"{relative}: evidence must be a regular non-symlink file")
+    encoded = path.read_bytes()
+    if len(encoded) > MAX_EVIDENCE_BYTES:
+        raise ValueError(f"{relative}: evidence exceeds {MAX_EVIDENCE_BYTES} bytes")
+    value = json.loads(
+        encoded.decode("utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_nonstandard_json_constant,
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"{relative}: evidence must be a JSON object")
+    return value
+
+
+def _source_binding(
+    evidence: dict[str, Any], relative: str, root: Path, failures: list[str]
+) -> tuple[str | None, str | None]:
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        failures.append(f"{relative}.source: must be an object")
+        return None, None
+    commit = source.get("commit")
+    tree = source.get("tree")
+    if not isinstance(commit, str) or GIT_OBJECT_ID.fullmatch(commit) is None:
+        failures.append(f"{relative}.source.commit: invalid full Git object ID")
+        commit = None
+    if not isinstance(tree, str) or GIT_OBJECT_ID.fullmatch(tree) is None:
+        failures.append(f"{relative}.source.tree: invalid full Git object ID")
+        tree = None
+    if commit is not None and tree is not None:
+        try:
+            actual_tree = _git_read(root, "rev-parse", f"{commit}^{{tree}}").decode(
+                "ascii"
+            ).strip()
+        except (subprocess.SubprocessError, UnicodeError, ValueError):
+            failures.append(f"{relative}.source.commit: object is unavailable")
+        else:
+            if actual_tree != tree:
+                failures.append(f"{relative}.source.tree: does not match source commit")
+    return commit, tree
+
+
+def _validate_digest(value: Any, location: str, failures: list[str]) -> None:
+    if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+        failures.append(f"{location}: invalid SHA-256")
+
+
+def _current_cargo_inputs(root: Path) -> list[dict[str, str]]:
+    encoded_paths = _git_read(
+        root,
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    paths = sorted(
+        path
+        for path in encoded_paths.decode("utf-8").split("\0")
+        if path
+        and (
+            path == "deny.toml"
+            or path.endswith("Cargo.toml")
+            or path.endswith("Cargo.lock")
+        )
+    )
+    inputs: list[dict[str, str]] = []
+    for path in paths:
+        candidate = root / path
+        if _path_uses_symlink(root, candidate) or not candidate.is_file():
+            raise ValueError(f"{path}: current Cargo input must be a regular file")
+        inputs.append(
+            {
+                "path": path,
+                "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            }
+        )
+    return inputs
+
+
+def validate_preflight_evidence(
+    root: Path = ROOT, *, require_transition_content: bool = True
+) -> list[str]:
+    failures: list[str] = []
+    try:
+        dependency = _load_json_evidence(root, DEPENDENCY_RECEIPT_PATH)
+        audit = _load_json_evidence(root, REPOSITORY_AUDIT_PATH)
+        attestation = _load_json_evidence(root, REPRESENTATIVE_ATTESTATION_PATH)
+        dependabot = _load_json_evidence(root, DEPENDABOT_REVIEW_PATH)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        return [str(error)]
+
+    dependency_commit, dependency_tree = _source_binding(
+        dependency, DEPENDENCY_RECEIPT_PATH, root, failures
+    )
+    try:
+        from tools.check_dependency_license_aggregate import validate_aggregate
+
+        failures.extend(validate_aggregate(root))
+    except (ImportError, OSError, ValueError) as error:
+        failures.append(f"{DEPENDENCY_AGGREGATE_PATH}: cannot validate aggregate: {error}")
+    audit_commit, audit_tree = _source_binding(
+        audit, REPOSITORY_AUDIT_PATH, root, failures
+    )
+    attestation_commit, attestation_tree = _source_binding(
+        attestation, REPRESENTATIVE_ATTESTATION_PATH, root, failures
+    )
+    dependabot_commit, dependabot_tree = _source_binding(
+        dependabot, DEPENDABOT_REVIEW_PATH, root, failures
+    )
+    if (audit_commit, audit_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: repository audit differs from exact legal base")
+    if (attestation_commit, attestation_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: owner attestation differs from exact legal base")
+    if (dependabot_commit, dependabot_tree) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append("preflight evidence: Dependabot review differs from exact legal base")
+
+    if dependency.get("schema") != "hyphae-relicensing-dependency-receipt-v1":
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.schema: unsupported identifier")
+    if dependency.get("target_release") != "1.2.0":
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.target_release: must be 1.2.0")
+    scope = dependency.get("scope")
+    if not isinstance(scope, dict) or scope.get("evidence_evolution") != (
+        DEPENDENCY_EVIDENCE_EVOLUTION
+    ):
+        failures.append(
+            f"{DEPENDENCY_RECEIPT_PATH}.scope: evidence evolution statement differs"
+        )
+    source = dependency.get("source")
+    source_mode = source.get("mode") if isinstance(source, dict) else None
+    if not isinstance(source, dict) or source_mode not in {
+        "clean-commit",
+        "integration-tree",
+    }:
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: unsupported source mode")
+    elif source_mode == "clean-commit" and source.get("worktree_clean") is not True:
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: clean source claim differs")
+    elif source_mode == "integration-tree" and source.get("worktree_clean") is not False:
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source: integration-tree claim differs")
+    if isinstance(source, dict) and (
+        source.get("legal_base_commit"), source.get("legal_base_tree")
+    ) != (LEGAL_BASE_COMMIT, LEGAL_BASE_TREE):
+        failures.append(
+            f"{DEPENDENCY_RECEIPT_PATH}.source: legal base identity differs"
+        )
+    if dependency_commit is not None:
+        try:
+            head = _git_read(root, "rev-parse", "HEAD^{commit}").decode("ascii").strip()
+            _git_read(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                LEGAL_BASE_COMMIT,
+                dependency_commit,
+            )
+            _git_read(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                dependency_commit,
+                head,
+            )
+        except (subprocess.SubprocessError, UnicodeError, ValueError):
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.source.commit: must descend from the legal base and anchor current HEAD"
+            )
+        else:
+            try:
+                current_tree = _git_read(root, "rev-parse", "HEAD^{tree}").decode(
+                    "ascii"
+                ).strip()
+            except (subprocess.SubprocessError, UnicodeError, ValueError):
+                current_tree = None
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.tree: current HEAD tree unavailable"
+                )
+            if source_mode == "clean-commit" and dependency_commit != head:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.commit: clean receipt must bind current HEAD"
+                )
+            if source_mode == "clean-commit" and dependency_tree != current_tree:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source.tree: clean receipt must bind current HEAD tree"
+                )
+            if source_mode == "clean-commit":
+                try:
+                    status = _git_read(
+                        root,
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    )
+                except (subprocess.SubprocessError, ValueError):
+                    failures.append(
+                        f"{DEPENDENCY_RECEIPT_PATH}.source: cannot verify clean source claim"
+                    )
+                else:
+                    if status:
+                        failures.append(
+                            f"{DEPENDENCY_RECEIPT_PATH}.source: clean source claim is false for current content"
+                        )
+    inventory = dependency.get("inventory")
+    if not isinstance(inventory, dict):
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.inventory: must be an object")
+    else:
+        packages = inventory.get("packages")
+        if not isinstance(packages, list) or not packages:
+            failures.append(f"{DEPENDENCY_RECEIPT_PATH}.inventory.packages: must be nonempty")
+        else:
+            expected_digest = hashlib.sha256(
+                json.dumps(
+                    packages,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if inventory.get("canonical_sha256") != expected_digest:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.inventory.canonical_sha256: digest differs"
+                )
+            if inventory.get("package_count") != len(packages):
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.inventory.package_count: count differs"
+                )
+            seen: set[tuple[str, str, str]] = set()
+            workspace_count = 0
+            observed_copyleft_candidates: set[tuple[str, str, str]] = set()
+            for index, package in enumerate(packages):
+                location = f"{DEPENDENCY_RECEIPT_PATH}.inventory.packages[{index}]"
+                if not isinstance(package, dict) or set(package) != {
+                    "license",
+                    "license_file",
+                    "name",
+                    "source",
+                    "version",
+                }:
+                    failures.append(f"{location}: malformed package identity")
+                    continue
+                identity = (
+                    package.get("name"),
+                    package.get("version"),
+                    package.get("source"),
+                )
+                if not all(isinstance(value, str) and value for value in identity):
+                    failures.append(f"{location}: incomplete package identity")
+                    continue
+                if identity in seen:
+                    failures.append(f"{location}: duplicate package identity")
+                seen.add(identity)
+                if package["source"].startswith("workspace:"):
+                    workspace_count += 1
+                elif isinstance(package.get("license"), str) and any(
+                    identifier in package["license"]
+                    for identifier in ("AGPL-", "GPL-", "LGPL-")
+                ):
+                    observed_copyleft_candidates.add(identity)
+                if package.get("license") is None and package.get("license_file") is None:
+                    failures.append(f"{location}: package has no license evidence")
+            if inventory.get("workspace_package_count") != workspace_count:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.inventory.workspace_package_count: count differs"
+                )
+            if inventory.get("external_package_count") != len(packages) - workspace_count:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.inventory.external_package_count: count differs"
+                )
+            if len(packages) != 299 or workspace_count != 27:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.inventory: frozen exact-source counts differ"
+                )
+    review = dependency.get("compatibility_review")
+    if not isinstance(review, dict):
+        failures.append(
+            f"{DEPENDENCY_RECEIPT_PATH}.compatibility_review: must be an object"
+        )
+    else:
+        deny = review.get("cargo_deny")
+        if not isinstance(deny, dict) or deny.get("exit_status") != 0:
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.compatibility_review.cargo_deny: must pass"
+            )
+        for key in (
+            "external_gpl_2_0_only_candidates",
+            "external_strong_copyleft_without_permissive_alternative",
+            "packages_without_license_or_license_file",
+        ):
+            if review.get(key) != []:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.compatibility_review.{key}: must be empty"
+                )
+        reported_candidates = review.get("external_copyleft_candidates")
+        if not isinstance(reported_candidates, list):
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.compatibility_review.external_copyleft_candidates: must be an array"
+            )
+        else:
+            reported_identities = {
+                (candidate.get("name"), candidate.get("version"), candidate.get("source"))
+                for candidate in reported_candidates
+                if isinstance(candidate, dict)
+            }
+            if reported_identities != observed_copyleft_candidates:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.compatibility_review.external_copyleft_candidates: inventory differs"
+                )
+        if review.get("result") != "pass" or dependency.get("result") != "pass":
+            failures.append(f"{DEPENDENCY_RECEIPT_PATH}.result: must be pass")
+    inputs = dependency.get("source_inputs")
+    if not isinstance(inputs, list) or not inputs:
+        failures.append(f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: must be nonempty")
+    elif dependency_commit is not None:
+        expected_inputs_digest = hashlib.sha256(
+            json.dumps(
+                inputs,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if not isinstance(source, dict) or source.get("source_inputs_sha256") != (
+            expected_inputs_digest
+        ):
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.source.source_inputs_sha256: digest differs"
+            )
+        seen_paths: set[str] = set()
+        for index, source_input in enumerate(inputs):
+            location = f"{DEPENDENCY_RECEIPT_PATH}.source_inputs[{index}]"
+            if not isinstance(source_input, dict) or set(source_input) != {"path", "sha256"}:
+                failures.append(f"{location}: malformed source input")
+                continue
+            path = source_input.get("path")
+            digest = source_input.get("sha256")
+            if not _is_normalized_path(path):
+                failures.append(f"{location}.path: invalid path")
+                continue
+            if path in seen_paths:
+                failures.append(f"{location}.path: duplicate path")
+            seen_paths.add(path)
+            _validate_digest(digest, f"{location}.sha256", failures)
+            try:
+                candidate = root / path
+                if _path_uses_symlink(root, candidate) or not candidate.is_file():
+                    raise ValueError("current input is not a regular file")
+                encoded = candidate.read_bytes()
+            except (OSError, subprocess.SubprocessError, ValueError):
+                failures.append(f"{location}.path: unavailable from current content")
+                continue
+            if isinstance(digest, str) and hashlib.sha256(encoded).hexdigest() != digest:
+                failures.append(f"{location}.sha256: source bytes differ")
+        try:
+            current_inputs = _current_cargo_inputs(root)
+        except (OSError, UnicodeError, subprocess.SubprocessError, ValueError) as error:
+            failures.append(
+                f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: cannot inventory current Cargo inputs: {error}"
+            )
+        else:
+            if inputs != current_inputs:
+                failures.append(
+                    f"{DEPENDENCY_RECEIPT_PATH}.source_inputs: current Cargo input set or digest differs"
+                )
+
+    if audit.get("schema") != "hyphae-relicensing-repository-audit-v1":
+        failures.append(f"{REPOSITORY_AUDIT_PATH}.schema: unsupported identifier")
+    if audit.get("result") != "accepted-source-bound-preflight-evidence":
+        failures.append(f"{REPOSITORY_AUDIT_PATH}.result: must be accepted")
+    audit_source = audit.get("source")
+    if isinstance(audit_source, dict) and audit_commit is not None:
+        try:
+            commit_count = int(
+                _git_read(root, "rev-list", "--count", audit_commit).decode("ascii").strip()
+            )
+            tracked_path_bytes = _git_read(
+                root, "ls-tree", "-r", "--name-only", audit_commit
+            )
+            tracked_paths = tracked_path_bytes.splitlines()
+            tree_entry_bytes = _git_read(root, "ls-tree", "-r", "--full-tree", audit_commit)
+        except (subprocess.SubprocessError, UnicodeError, ValueError):
+            failures.append(f"{REPOSITORY_AUDIT_PATH}.source: cannot recompute inventory")
+        else:
+            if audit_source.get("reachable_commit_count") != commit_count:
+                failures.append(
+                    f"{REPOSITORY_AUDIT_PATH}.source.reachable_commit_count: count differs"
+                )
+            if audit_source.get("tracked_path_count") != len(tracked_paths):
+                failures.append(
+                    f"{REPOSITORY_AUDIT_PATH}.source.tracked_path_count: count differs"
+                )
+            if audit_source.get("tracked_path_list_sha256") != hashlib.sha256(
+                tracked_path_bytes
+            ).hexdigest():
+                failures.append(
+                    f"{REPOSITORY_AUDIT_PATH}.source.tracked_path_list_sha256: digest differs"
+                )
+            if audit_source.get("tree_entries_sha256") != hashlib.sha256(
+                tree_entry_bytes
+            ).hexdigest():
+                failures.append(
+                    f"{REPOSITORY_AUDIT_PATH}.source.tree_entries_sha256: digest differs"
+                )
+    author_inventory = audit.get("author_inventory")
+    if not isinstance(author_inventory, dict):
+        failures.append(f"{REPOSITORY_AUDIT_PATH}.author_inventory: must be an object")
+    else:
+        actors = author_inventory.get("actors")
+        if not isinstance(actors, list) or not actors:
+            failures.append(
+                f"{REPOSITORY_AUDIT_PATH}.author_inventory.actors: must be nonempty"
+            )
+        elif any(
+            not isinstance(actor, dict)
+            or actor.get("authority_state")
+            not in {
+                "accepted-interactive-owner-attestation",
+                "covered-by-owner-first-party-authority-attestation",
+                "accepted-mechanical-first-party-review",
+            }
+            for actor in actors
+        ):
+            failures.append(f"{REPOSITORY_AUDIT_PATH}.author_inventory: authority state differs")
+        if isinstance(actors, list) and sum(
+            actor.get("commit_count", 0) for actor in actors if isinstance(actor, dict)
+        ) != 847:
+            failures.append(
+                f"{REPOSITORY_AUDIT_PATH}.author_inventory: commit counts differ"
+            )
+    governance = audit.get("contribution_governance")
+    if not isinstance(governance, dict) or governance.get("result") != (
+        "accepted-effective-inbound-equals-outbound-with-dco"
+    ):
+        failures.append(
+            f"{REPOSITORY_AUDIT_PATH}.contribution_governance: accepted governance differs"
+        )
+
+    if attestation.get("schema") != (
+        "hyphae-relicensing-representative-attestation-v1"
+    ):
+        failures.append(
+            f"{REPRESENTATIVE_ATTESTATION_PATH}.schema: unsupported identifier"
+        )
+    if attestation.get("status") != "accepted-interactive-owner-attestation":
+        failures.append(
+            f"{REPRESENTATIVE_ATTESTATION_PATH}.status: accepted status differs"
+        )
+    representative = attestation.get("representative")
+    if not isinstance(representative, dict) or representative.get("authentication") != (
+        "interactive-owner-attestation"
+    ):
+        failures.append(
+            f"{REPRESENTATIVE_ATTESTATION_PATH}.representative: unsupported authentication claim"
+        )
+    elif representative.get("name") != "Mario Gutiérrez" or representative.get(
+        "capacity"
+    ) != "owner and representative of Celiums Solutions LLC":
+        failures.append(f"{REPRESENTATIVE_ATTESTATION_PATH}.representative: identity differs")
+    missing = attestation.get("missing_authentication")
+    if missing != []:
+        failures.append(
+            f"{REPRESENTATIVE_ATTESTATION_PATH}.missing_authentication: must be empty"
+        )
+    statements = attestation.get("statements_prepared_for_attestation")
+    transition_authorization = (
+        statements.get("transition_authorization")
+        if isinstance(statements, dict)
+        else None
+    )
+    copyright_authority = (
+        statements.get("copyright_authority") if isinstance(statements, dict) else None
+    )
+    counsel = statements.get("counsel_approval") if isinstance(statements, dict) else None
+    prior_commitments = (
+        statements.get("prior_commitments") if isinstance(statements, dict) else None
+    )
+    dispositions = attestation.get("identity_dispositions")
+    ec2_user = dispositions.get("ec2_user_commits") if isinstance(dispositions, dict) else None
+    dependabot_disposition = (
+        dispositions.get("dependabot_commits") if isinstance(dispositions, dict) else None
+    )
+    decisive_booleans = {
+        "owner transition authorization": (
+            transition_authorization.get("confirmed")
+            if isinstance(transition_authorization, dict)
+            else None
+        ),
+        "copyright authority": (
+            copyright_authority.get("confirmed")
+            if isinstance(copyright_authority, dict)
+            else None
+        ),
+        "qualified counsel": (
+            counsel.get("qualified_open_source_counsel")
+            if isinstance(counsel, dict)
+            else None
+        ),
+        "counsel written approval": (
+            counsel.get("written_approval_received")
+            if isinstance(counsel, dict)
+            else None
+        ),
+        "confidential counsel record": (
+            counsel.get("confidential_record_not_embedded")
+            if isinstance(counsel, dict)
+            else None
+        ),
+        "prior commitment absence": (
+            prior_commitments.get("absence_confirmed")
+            if isinstance(prior_commitments, dict)
+            else None
+        ),
+        "ec2-user authority": (
+            ec2_user.get("authority_confirmed")
+            if isinstance(ec2_user, dict)
+            else None
+        ),
+        "Dependabot disposition": (
+            dependabot_disposition.get("authority_confirmed")
+            if isinstance(dependabot_disposition, dict)
+            else None
+        ),
+    }
+    for label, value in decisive_booleans.items():
+        if value is not True:
+            failures.append(
+                f"{REPRESENTATIVE_ATTESTATION_PATH}: {label} must be explicitly true"
+            )
+    if not isinstance(counsel, dict) or counsel.get(
+        "apache_section_6_and_trademarks_scope_confirmed"
+    ) is not False or counsel.get("nonconfidential_record_locator_or_sha256") is not None:
+        failures.append(
+            f"{REPRESENTATIVE_ATTESTATION_PATH}.counsel_approval: confidential scope must not be overstated"
+        )
+
+    if dependabot.get("schema") != "hyphae-relicensing-dependabot-review-v1":
+        failures.append(f"{DEPENDABOT_REVIEW_PATH}.schema: unsupported identifier")
+    reviews = dependabot.get("reviews")
+    if not isinstance(reviews, list) or not reviews:
+        failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: must be a nonempty array")
+    else:
+        if dependabot.get("reviewed_commit_count") != len(reviews) or dependabot.get(
+            "result"
+        ) != "accepted-mechanical-first-party-review":
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}: accepted review result differs")
+        try:
+            if dependabot_commit is None:
+                raise ValueError("Dependabot source commit is invalid")
+            observed = _git_read(
+                root,
+                "log",
+                dependabot_commit,
+                "--author=dependabot\\|dependabot\\[bot\\]",
+                "--format=%H",
+            ).decode("ascii").splitlines()
+        except (subprocess.SubprocessError, UnicodeError, ValueError):
+            observed = []
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: Git inventory unavailable")
+        reviewed = [review.get("commit") for review in reviews if isinstance(review, dict)]
+        if sorted(reviewed) != sorted(observed):
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.reviews: commit inventory differs")
+        method = dependabot.get("method")
+        ordered = "".join(f"{commit}\n" for commit in sorted(observed)).encode("ascii")
+        expected_method_keys = {*DEPENDABOT_REVIEW_METHOD, "ordered_commit_ids_sha256"}
+        if not isinstance(method, dict) or set(method) != expected_method_keys:
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: missing or unknown fields")
+            method = {}
+        elif any(method.get(key) != value for key, value in DEPENDABOT_REVIEW_METHOD.items()):
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: review method differs")
+        method_digest = method.get("ordered_commit_ids_sha256")
+        _validate_digest(
+            method_digest,
+            f"{DEPENDABOT_REVIEW_PATH}.method.ordered_commit_ids_sha256",
+            failures,
+        )
+        if method_digest != hashlib.sha256(ordered).hexdigest():
+            failures.append(f"{DEPENDABOT_REVIEW_PATH}.method: commit digest differs")
+        for index, review in enumerate(reviews):
+            location = f"{DEPENDABOT_REVIEW_PATH}.reviews[{index}]"
+            if not isinstance(review, dict):
+                failures.append(f"{location}: must be an object")
+                continue
+            commit = review.get("commit")
+            parent = review.get("parent")
+            if not isinstance(commit, str) or not isinstance(parent, str):
+                failures.append(f"{location}: commit or parent is invalid")
+                continue
+            try:
+                patch = _git_read_unbounded(root, "diff-tree", "--no-ext-diff", "--binary", "--full-index", parent, commit)
+                tree = _git_read(root, "rev-parse", f"{commit}^{{tree}}").decode("ascii").strip()
+                actual_parent = _git_read(root, "rev-parse", f"{commit}^").decode("ascii").strip()
+                subject = _git_read(root, "show", "-s", "--format=%s", commit).decode("utf-8").strip()
+                changed_paths = _git_read(
+                    root, "diff-tree", "--no-commit-id", "--name-only", "-r", commit
+                ).splitlines()
+                numstat = _git_read(
+                    root, "diff-tree", "--no-commit-id", "--numstat", "-r", commit
+                ).decode("utf-8").splitlines()
+            except (subprocess.SubprocessError, UnicodeError, ValueError):
+                failures.append(f"{location}: source commit cannot be recomputed")
+                continue
+            if review.get("patch_sha256") != hashlib.sha256(patch).hexdigest():
+                failures.append(f"{location}.patch_sha256: patch differs")
+            if review.get("tree") != tree:
+                failures.append(f"{location}.tree: tree differs")
+            if actual_parent != parent:
+                failures.append(f"{location}.parent: parent differs")
+            if review.get("subject") != subject:
+                failures.append(f"{location}.subject: subject differs")
+            if review.get("changed_path_count") != len(changed_paths):
+                failures.append(f"{location}.changed_path_count: count differs")
+            insertions = 0
+            deletions = 0
+            for row in numstat:
+                fields = row.split("\t", 2)
+                if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                    failures.append(f"{location}: non-text numstat is unsupported")
+                    break
+                insertions += int(fields[0])
+                deletions += int(fields[1])
+            if review.get("insertions") != insertions:
+                failures.append(f"{location}.insertions: count differs")
+            if review.get("deletions") != deletions:
+                failures.append(f"{location}.deletions: count differs")
+    if require_transition_content:
+        try:
+            from tools.check_relicensing_transition import (
+                validate_current_transition_content,
+            )
+
+            failures.extend(validate_current_transition_content(root))
+        except (ImportError, OSError, ValueError) as error:
+            failures.append(
+                f"{TRANSITION_RECEIPT_PATH}: cannot validate current transition content: {error}"
+            )
+    return failures
 
 
 def repository_paths(root: Path = ROOT) -> list[str]:
@@ -1005,6 +1790,19 @@ def _git_read(root: Path, *arguments: str) -> bytes:
         raise ValueError(
             f"historical git evidence exceeds {MAX_CONTRACT_BYTES} bytes"
         )
+    return completed.stdout
+
+
+def _git_read_unbounded(root: Path, *arguments: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    if len(completed.stdout) > MAX_EVIDENCE_BYTES:
+        raise ValueError(f"git evidence exceeds {MAX_EVIDENCE_BYTES} bytes")
     return completed.stdout
 
 
@@ -1052,6 +1850,36 @@ def validate_historical_release_evidence(root: Path = ROOT) -> list[str]:
             failures.append(
                 f"{tag}: unexpected LICENSE-DOCUMENTATION contradicts historical evidence"
             )
+    tag = "v1.1.0"
+    if _git_read(root, "rev-parse", "--verify", tag).decode("ascii").strip() != (
+        HISTORICAL_V1_1_0["tag_object"]
+    ):
+        failures.append(f"{tag}: immutable annotated tag object differs")
+    if _git_read(root, "cat-file", "-t", tag).decode("ascii").strip() != "tag":
+        failures.append(f"{tag}: immutable release tag is not annotated")
+    if _git_read(root, "rev-parse", f"{tag}^{{commit}}").decode("ascii").strip() != (
+        HISTORICAL_V1_1_0["commit"]
+    ):
+        failures.append(f"{tag}: immutable release commit differs")
+    if _git_read(root, "rev-parse", f"{tag}^{{tree}}").decode("ascii").strip() != (
+        HISTORICAL_V1_1_0["tree"]
+    ):
+        failures.append(f"{tag}: immutable release tree differs")
+    for path, key in (
+        ("LICENSE", "license_sha256"),
+        ("LICENSE-DOCUMENTATION", "documentation_license_sha256"),
+    ):
+        if hashlib.sha256(_git_read(root, "show", f"{tag}:{path}")).hexdigest() != (
+            HISTORICAL_V1_1_0[key]
+        ):
+            failures.append(f"{tag}: immutable {path} evidence differs")
+    cargo = tomllib.loads(
+        _git_read(root, "show", f"{tag}:Cargo.toml").decode("utf-8")
+    )
+    if cargo.get("workspace", {}).get("package", {}).get("license") != (
+        "AGPL-3.0-only"
+    ):
+        failures.append(f"{tag}: immutable Cargo.toml license evidence differs")
     return failures
 
 
@@ -1060,6 +1888,7 @@ def main() -> int:
         contract = load_contract()
         paths = repository_paths()
         historical_failures = validate_historical_release_evidence()
+        evidence_failures = validate_preflight_evidence()
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -1068,7 +1897,7 @@ def main() -> int:
         return 1
 
     result = validate_contract(contract, paths, ROOT)
-    failures = [*historical_failures, *result.failures]
+    failures = [*historical_failures, *evidence_failures, *result.failures]
     if failures:
         for failure in failures:
             print(f"error: {failure}", file=sys.stderr)
@@ -1077,12 +1906,9 @@ def main() -> int:
         "classification contract PASS: "
         f"{len(paths)} repository paths have deterministic target categories"
     )
-    print(f"open preflight blockers ({len(result.blockers)}):")
-    for blocker in result.blockers:
-        print(f"- {blocker}: open-unclaimed")
     print(
-        "preflight remains BLOCKED; Apache-2.0 is a 1.2.0 target and is not "
-        "effective in the current tree"
+        "preflight ACCEPTED: Apache-2.0 is effective for current first-party "
+        "software and normative specifications"
     )
     return 0
 

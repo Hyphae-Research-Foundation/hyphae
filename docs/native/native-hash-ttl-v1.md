@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native whole-hash TTL v1
 
 Status: implemented; evidence recorded in

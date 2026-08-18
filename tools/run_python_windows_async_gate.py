@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Run the installed Python wheel through real Windows named-pipe interrupts."""
 
 from __future__ import annotations

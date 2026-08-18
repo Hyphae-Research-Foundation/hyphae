@@ -97,6 +97,20 @@ never silently becomes a durable key. An offline migration command issues a
 new canonical owner key; operators switch clients and explicitly revoke the
 legacy credential. New remote installations require canonical keys.
 
+The compatibility line is exactly product 1.2 and Native HTTP only. Durable
+`HYACAT05` state is `never_enabled`, `migration_pending`, `dual_window`, or
+terminal `revoked`; older binaries fail on the new magic. Enabled state carries
+a durable BLAKE3 verifier keyed by the persisted product-local cursor authority.
+The bearer plaintext remains process-local and must be presented from the
+restricted configuration file; a bare bearer digest is never sufficient for
+offline authentication. Canonical `hyp1` never falls back, and the synthetic
+authority has no fabricated principal/key IDs or security/ownership management.
+Because `HYACAT04` cannot represent the keyed verifier, downgrade or an enabled
+older-format state fails closed rather than synthesizing authority.
+Owner recovery revokes enabled legacy state in the same activation commit. A
+1.3-mode server cannot authenticate it and refuses enabled-state startup until
+canonical Owner revocation completes.
+
 Owner recovery is offline only. It requires the exclusive data-directory lock,
 operating-system ownership of that directory, an explicit output file, and no
 active server. Recovery increments the authorization epoch, revokes every

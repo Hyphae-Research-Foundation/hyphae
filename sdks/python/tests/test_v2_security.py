@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from hyphae_sdk.v2 import (
     ProductError,
     RequestOptions,
     Response,
+    SensitiveBytes,
 )
 from hyphae_sdk.v2.local import LocalTransport
 from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
@@ -33,6 +34,7 @@ from hyphae_sdk.v2.protocol import (
     encode_frame,
     encode_hello,
     encode_product_request,
+    operation_required_minor,
 )
 
 
@@ -50,6 +52,43 @@ def _receipt() -> bytes:
         + bytes((43,)) * 32
         + struct.pack("<B7xQQ", 0, 1, 0)
     )
+
+
+def _api_key_started_response(
+    *,
+    key_id: bytes = bytes((0x11,)) * 16,
+    predecessor_key_id: bytes | None = None,
+    authorization_epoch: int = 7,
+    receipt: bytes | None = None,
+    secret: bytes = API_KEY.encode(),
+) -> bytes:
+    predecessor = (
+        b"\0" * 24
+        if predecessor_key_id is None
+        else struct.pack("<B7x", 1) + predecessor_key_id
+    )
+    body = (
+        key_id
+        + (1).to_bytes(16, "big")
+        + predecessor
+        + struct.pack("<Q", authorization_epoch)
+        + (_receipt() if receipt is None else receipt)
+        + struct.pack("<I", len(secret))
+        + secret
+    )
+    return _response(43, body)
+
+
+class SensitiveSecretTests(unittest.TestCase):
+    def test_sensitive_bytes_are_redacted_and_contextually_zeroized(self) -> None:
+        secret = SensitiveBytes(API_KEY.encode())
+        self.assertNotIn(API_KEY, repr(secret))
+        exposed = secret.expose()
+        with secret:
+            self.assertEqual(bytes(exposed), API_KEY.encode())
+        self.assertEqual(exposed, bytearray(b"\0" * len(API_KEY)))
+        with self.assertRaisesRegex(ClientError, "closed"):
+            secret.expose()
 
 
 def _welcome(minor: int, capabilities: int) -> bytes:
@@ -109,7 +148,7 @@ class SecurityProtocolTests(unittest.TestCase):
 
         self.assertEqual(struct.unpack_from("<H", legacy, 18)[0], 0)
         self.assertEqual(legacy[:18], current[:18])
-        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 2)
+        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 3)
         self.assertEqual(authenticated[49], 1)
         self.assertEqual(struct.unpack_from("<H", authenticated, 50)[0], 102)
         self.assertEqual(struct.unpack_from("<Q", authenticated, 20)[0], 0xFF)
@@ -175,12 +214,14 @@ class SecurityProtocolTests(unittest.TestCase):
                 True,
             ),
             ("security_assignment_revoke", {"assignment_id": 3}, True),
+            ("security_legacy_bearer_revoke", {}, True),
         )
         for offset, (operation, arguments, mutation) in enumerate(cases):
             with self.subTest(operation=operation):
                 options = RequestOptions(idempotency_token=17 if mutation else None)
-                wire = encode_product_request(operation, arguments, options, negotiated_minor=2)
-                self.assertEqual(struct.unpack_from("<H", wire, 12)[0], 42 + offset)
+                wire = encode_product_request(operation, arguments, options, negotiated_minor=3)
+                expected_tag = 70 if operation == "security_legacy_bearer_revoke" else 42 + offset
+                self.assertEqual(struct.unpack_from("<H", wire, 12)[0], expected_tag)
                 self.assertEqual(decode_product_request(wire)[:2], (operation, arguments))
                 self.assertNotIn(b"hyp1_", wire)
 
@@ -189,10 +230,10 @@ class SecurityProtocolTests(unittest.TestCase):
                 operation,
                 arguments,
                 RequestOptions(logical_time_micros=10, idempotency_token=17),
-                negotiated_minor=2,
+                negotiated_minor=3,
             )
             for operation, arguments, mutation in cases
-            if mutation
+            if mutation and operation != "security_legacy_bearer_revoke"
         )
         self.assertEqual(
             blake3(write_transcript).hex(),
@@ -228,6 +269,53 @@ class SecurityProtocolTests(unittest.TestCase):
                 RequestOptions(),
                 negotiated_minor=0,
             )
+        lifecycle = {
+            "security_api_key_issue_self_start",
+            "security_api_key_issue_start",
+            "security_api_key_issue_self_activate",
+            "security_api_key_issue_activate",
+            "security_api_key_rotate_self_start",
+            "security_api_key_rotate_start",
+            "security_api_key_rotate_self_activate",
+            "security_api_key_rotate_activate",
+            "security_api_key_issue_self_abort",
+            "security_api_key_issue_abort",
+            "security_api_key_rotate_self_abort",
+            "security_api_key_rotate_abort",
+            "security_api_key_revoke_self",
+            "security_api_key_revoke",
+        }
+        self.assertTrue(all(operation_required_minor(operation) == 3 for operation in lifecycle))
+        self.assertEqual(operation_required_minor("security_legacy_bearer_revoke"), 3)
+        memory_revoke = bytearray(
+            encode_product_request(
+                "security_legacy_bearer_revoke",
+                {},
+                RequestOptions(idempotency_token=1),
+                negotiated_minor=3,
+            )
+        )
+        memory_revoke[88] = 2
+        with self.assertRaisesRegex(ClientError, "strict durability"):
+            decode_product_request(bytes(memory_revoke))
+        for operation in (*lifecycle, "security_legacy_bearer_revoke"):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ClientError, "strict durability"):
+                    encode_product_request(
+                        operation,
+                        {} if operation == "security_legacy_bearer_revoke" else (
+                            {"key_id": bytes((1,)) * 16}
+                            if operation in {
+                                "security_api_key_issue_self_abort",
+                                "security_api_key_issue_abort",
+                                "security_api_key_revoke_self",
+                                "security_api_key_revoke",
+                            }
+                            else {"successor_key_id": bytes((1,)) * 16}
+                        ),
+                        RequestOptions(idempotency_token=1, durability="memory"),
+                        negotiated_minor=3,
+                    )
 
     def test_security_status_page_and_mutation_responses_decode_without_secrets(self) -> None:
         status = _response(
@@ -311,6 +399,116 @@ class SecurityProtocolTests(unittest.TestCase):
         with self.assertRaises(ClientError):
             decode_product_response(bytes(bad_cursor), 26, negotiated_minor=2)
 
+    def test_security_audit_decodes_legacy_bearer_target(self) -> None:
+        event = (
+            (1).to_bytes(16, "big")
+            + struct.pack("<QB7x", 2, 0)
+            + b"\0" * 32
+            + struct.pack("<BB6xI4x", 10, 0, 1)
+            + struct.pack("<B7x", 4)
+            + b"\0" * 16
+            + struct.pack("<I4x", 0)
+        )
+        page = struct.pack("<I4x", 1) + b"\0" * 24 + event
+        decoded = decode_product_response(
+            _response(37, page), 27, negotiated_minor=3
+        )
+        self.assertEqual(decoded.value["events"][0]["targets"], [
+            {"kind": "legacy_bearer"}
+        ])
+
+    def test_api_key_started_decodes_only_canonical_matching_secret(self) -> None:
+        response = decode_product_response(
+            _api_key_started_response(predecessor_key_id=bytes((3,)) * 16),
+            28,
+            negotiated_minor=3,
+        )
+        self.assertEqual(response.kind, "security_api_key_started")
+        self.assertEqual(response.value["key_id"], bytes((0x11,)) * 16)
+        self.assertEqual(response.value["predecessor_key_id"], bytes((3,)) * 16)
+        secret = response.value["secret"]
+        self.assertIsInstance(secret, SensitiveBytes)
+        with secret:
+            self.assertEqual(bytes(secret.expose()), API_KEY.encode())
+
+        malformed = (
+            b"hyp1_" + b"1" * 32 + b"_" + b"A" * 64,
+            b"hyp2_" + b"1" * 32 + b"_" + b"2" * 64,
+            API_KEY.encode()[:-1],
+            API_KEY.encode() + b"0",
+            b"\xff" + API_KEY.encode()[1:],
+        )
+        for candidate in malformed:
+            with self.subTest(candidate=candidate[:8]):
+                with self.assertRaisesRegex(ClientError, "noncanonical"):
+                    decode_product_response(
+                        _api_key_started_response(secret=candidate),
+                        29,
+                        negotiated_minor=3,
+                    )
+
+        mismatch = b"hyp1_" + b"2" * 32 + b"_" + b"3" * 64
+        with self.assertRaisesRegex(ClientError, "differs from its receipt"):
+            decode_product_response(
+                _api_key_started_response(secret=mismatch),
+                30,
+                negotiated_minor=3,
+            )
+
+    def test_api_key_started_rejects_zero_ids_epoch_and_invalid_commit_receipts(self) -> None:
+        cases = {
+            "zero key": _api_key_started_response(key_id=b"\0" * 16),
+            "zero predecessor": _api_key_started_response(
+                predecessor_key_id=b"\0" * 16
+            ),
+            "zero epoch": _api_key_started_response(authorization_epoch=0),
+        }
+        receipt_offsets = {
+            "transaction": (0, 16),
+            "commit csn": (16, 8),
+            "catalog version": (24, 8),
+            "commit lsn": (32, 8),
+            "WAL digest": (40, 32),
+            "cohort size": (80, 8),
+        }
+        for name, (offset, length) in receipt_offsets.items():
+            receipt = bytearray(_receipt())
+            receipt[offset:offset + length] = b"\0" * length
+            cases[name] = _api_key_started_response(receipt=bytes(receipt))
+        invalid_durability = bytearray(_receipt())
+        invalid_durability[72] = 3
+        cases["durability"] = _api_key_started_response(
+            receipt=bytes(invalid_durability)
+        )
+        invalid_position = bytearray(_receipt())
+        invalid_position[88:96] = struct.pack("<Q", 1)
+        cases["cohort position"] = _api_key_started_response(
+            receipt=bytes(invalid_position)
+        )
+
+        for name, encoded in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ClientError):
+                    decode_product_response(encoded, 31, negotiated_minor=3)
+
+    def test_api_key_started_rejects_every_truncation_and_trailing_bytes(self) -> None:
+        encoded = _api_key_started_response()
+        for prefix in range(len(encoded)):
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(ClientError):
+                    decode_product_response(
+                        encoded[:prefix], 32, negotiated_minor=3
+                    )
+        trailing = bytearray(encoded + b"\0")
+        struct.pack_into("<I", trailing, 8, len(trailing))
+        with self.assertRaisesRegex(ClientError, "trailing"):
+            decode_product_response(bytes(trailing), 32, negotiated_minor=3)
+
+    def test_api_key_activated_rejects_zero_key_ids(self) -> None:
+        body = b"\0" * 16 + b"\0" * 24 + b"\0" * 16 + struct.pack("<Q", 7) + _receipt()
+        with self.assertRaisesRegex(ClientError, "identity is zero"):
+            decode_product_response(_response(44, body), 33, negotiated_minor=3)
+
 
 class _HttpResponse:
     status = 200
@@ -322,6 +520,7 @@ class _HttpResponse:
         return {
             "Content-Length": str(len(self._body)),
             "Content-Type": PRODUCT_MEDIA_TYPE,
+            "X-Hyphae-Protocol-Minor": "3",
             "X-Hyphae-Request-Id": "27",
         }.get(name)
 
@@ -332,6 +531,7 @@ class _HttpResponse:
 class _HttpConnection:
     body = b""
     headers: dict[str, str] = {}
+    path = ""
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del args, kwargs
@@ -342,8 +542,9 @@ class _HttpConnection:
         pass
 
     def request(self, method: str, path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        if method != "POST" or path != "/v2/execute":
+        if method != "POST":
             raise AssertionError("unexpected HTTP request")
+        type(self).path = path
         type(self).body = kwargs["body"]
         type(self).headers = kwargs["headers"]
 
@@ -402,10 +603,41 @@ class ManagedHttpTests(unittest.TestCase):
         self.assertNotIn(API_KEY, repr(transport))
         self.assertEqual(response.kind, "security_principal_mutated")
 
+    @patch("http.client.HTTPSConnection", _HttpConnection)
+    def test_http_routes_every_api_key_lifecycle_operation_to_dedicated_family(self) -> None:
+        transport = HttpTransport("https://example.test", bearer_token=API_KEY)
+        operations = (
+            ("security_api_key_issue_self_start", {"principal_id": 1, "label": "issue", "roles": [], "custom_roles": [], "permission_ceiling": ["credential.self_manage"], "scope_ceiling": [{"kind": "instance"}], "expires_at_micros": None}),
+            ("security_api_key_issue_start", {"principal_id": 1, "label": "issue", "roles": [], "custom_roles": [], "permission_ceiling": ["credential.self_manage"], "scope_ceiling": [{"kind": "instance"}], "expires_at_micros": None}),
+            ("security_api_key_issue_self_activate", {"key_id": bytes((1,)) * 16, "confirmation_digest": bytes((2,)) * 32}),
+            ("security_api_key_issue_activate", {"key_id": bytes((1,)) * 16, "confirmation_digest": bytes((2,)) * 32}),
+            ("security_api_key_rotate_self_start", {"predecessor_key_id": bytes((1,)) * 16, "label": "rotate", "overlap_seconds": 0, "expires_at_micros": None}),
+            ("security_api_key_rotate_start", {"predecessor_key_id": bytes((1,)) * 16, "label": "rotate", "overlap_seconds": 0, "expires_at_micros": None}),
+            ("security_api_key_rotate_self_activate", {"successor_key_id": bytes((1,)) * 16, "confirmation_digest": bytes((2,)) * 32}),
+            ("security_api_key_rotate_activate", {"successor_key_id": bytes((1,)) * 16, "confirmation_digest": bytes((2,)) * 32}),
+            ("security_api_key_issue_self_abort", {"key_id": bytes((1,)) * 16}),
+            ("security_api_key_issue_abort", {"key_id": bytes((1,)) * 16}),
+            ("security_api_key_rotate_self_abort", {"successor_key_id": bytes((1,)) * 16}),
+            ("security_api_key_rotate_abort", {"successor_key_id": bytes((1,)) * 16}),
+            ("security_api_key_revoke_self", {"key_id": bytes((1,)) * 16}),
+            ("security_api_key_revoke", {"key_id": bytes((1,)) * 16}),
+            ("security_legacy_bearer_revoke", {}),
+        )
+        for offset, (operation, arguments) in enumerate(operations):
+            with self.subTest(operation=operation):
+                with self.assertRaises(ClientError):
+                    transport.execute(
+                        operation,
+                        arguments,
+                        RequestOptions(request_id=100 + offset, idempotency_token=100 + offset),
+                    )
+                self.assertEqual(_HttpConnection.path, "/v2/security/keys")
+                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3")
+
 
 @unittest.skipIf(os.name == "nt", "AF_UNIX live parity runs on POSIX")
 class LocalLiveTests(unittest.TestCase):
-    def test_unmanaged_local_preserves_the_legacy_minor_zero_hello(self) -> None:
+    def test_unmanaged_local_offers_current_lifecycle_minor_and_accepts_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             endpoint = os.path.join(directory, "hyphae.sock")
             ready = threading.Event()
@@ -441,7 +673,7 @@ class LocalLiveTests(unittest.TestCase):
             transport.close()
             thread.join(2)
             self.assertFalse(thread.is_alive())
-            self.assertEqual(observed["hello"], encode_hello())
+            self.assertEqual(observed["hello"], encode_hello(maximum_minor=PROTOCOL_MINOR))
 
     def test_malformed_and_wrong_credentials_reach_the_owner_and_deny_uniformly(self) -> None:
         candidates = ("x" * 102, API_KEY)
@@ -493,7 +725,7 @@ class LocalLiveTests(unittest.TestCase):
             self.assertEqual(denials[0], denials[1])
             self.assertEqual(denials[0].code, "authorization_denied")
 
-    def test_managed_local_negotiates_minor_two_and_executes_security_status(self) -> None:
+    def test_managed_local_negotiates_minor_three_and_executes_security_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             endpoint = os.path.join(directory, "hyphae.sock")
             ready = threading.Event()
@@ -513,7 +745,7 @@ class LocalLiveTests(unittest.TestCase):
                             FRAME_KINDS["welcome"],
                             0,
                             hello_frame.request_id,
-                            _welcome(2, G6_CAPABILITIES | API_KEY_AUTH_CAPABILITY),
+                            _welcome(3, G6_CAPABILITIES | API_KEY_AUTH_CAPABILITY),
                         )
                     )
                     request_frame = _read_frame(connection)
@@ -552,7 +784,7 @@ class LocalLiveTests(unittest.TestCase):
                     "security_status", {}, RequestOptions(request_id=17)
                 )
                 self.assertEqual(response.kind, "security_status")
-                self.assertEqual(transport.negotiated_minor, 2)
+                self.assertEqual(transport.negotiated_minor, 3)
                 self.assertNotIn(API_KEY, repr(transport))
             thread.join(2)
             self.assertFalse(thread.is_alive())
@@ -604,6 +836,7 @@ class SecurityClientTests(unittest.TestCase):
                     "security_built_in_assignment_create": "security_assignment_mutated",
                     "security_custom_assignment_create": "security_assignment_mutated",
                     "security_assignment_revoke": "security_mutated",
+                    "security_legacy_bearer_revoke": "security_mutated",
                 }.get(operation, operation)
                 return Response(expected, {}, options.checked_request_id())
 
@@ -629,6 +862,7 @@ class SecurityClientTests(unittest.TestCase):
         )
         client.security_custom_assignment_create(1, 2, options=write_options)
         client.security_assignment_revoke(3, options=write_options)
+        client.security_legacy_bearer_revoke(options=write_options)
         self.assertEqual([call[0] for call in transport.calls], [
             "security_status",
             "security_principal_list",
@@ -642,6 +876,7 @@ class SecurityClientTests(unittest.TestCase):
             "security_built_in_assignment_create",
             "security_custom_assignment_create",
             "security_assignment_revoke",
+            "security_legacy_bearer_revoke",
         ])
         self.assertTrue(all(call[2].idempotency_token == 31 for call in transport.calls[6:]))
         with self.assertRaisesRegex(ClientError, "idempotency_token"):

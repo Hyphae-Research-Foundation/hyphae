@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{net::IpAddr, sync::Arc, time::Duration};
 
@@ -11,6 +11,7 @@ const DEFAULT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const PRODUCT_MEDIA_TYPE: &str = hyphae_contracts::v2::PRODUCT_MEDIA_TYPE_V2;
 const ERROR_MEDIA_TYPE: &str = hyphae_contracts::v2::PRODUCT_ERROR_MEDIA_TYPE_V2;
+const PROTOCOL_MINOR_VALUE: &str = hyphae_contracts::v2::PROTOCOL_MINOR_VALUE_V2;
 
 /// Binary product-envelope HTTP `/v2` transport.
 #[derive(Clone, Debug)]
@@ -97,18 +98,28 @@ impl HttpTransport {
         if options.cancellation.is_cancelled() {
             return Err(product_error(ProductErrorCode::Cancelled, request_id));
         }
-        let encoded =
-            hyphae_native_protocol::encode_product_request(&hyphae_native_protocol::WireRequest {
+        let endpoint_path = endpoint_path(&operation);
+        let one_time_secret = matches!(
+            operation,
+            ProductOperation::SecurityApiKeyIssueSelfStart { .. }
+                | ProductOperation::SecurityApiKeyIssueStart { .. }
+                | ProductOperation::SecurityApiKeyRotateSelfStart { .. }
+                | ProductOperation::SecurityApiKeyRotateStart { .. }
+        );
+        let encoded = hyphae_native_protocol::encode_product_request_for_minor(
+            &hyphae_native_protocol::WireRequest {
                 operation,
                 logical_time_micros: options.logical_time_micros,
                 deadline_micros: options.deadline_micros,
                 idempotency_token: options.idempotency_token,
                 limits: options.limits,
                 durability: options.durability,
-            })
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            },
+            hyphae_native_protocol::PROTOCOL_MINOR,
+        )
+        .map_err(|error| ClientError::Protocol(error.to_string()))?;
         let mut endpoint = self.origin.clone();
-        endpoint.set_path("/v2/execute");
+        endpoint.set_path(endpoint_path);
         let mut request = self
             .http
             .post(endpoint)
@@ -120,6 +131,10 @@ impl HttpTransport {
             .header(
                 hyphae_contracts::v2::REQUEST_ID_HEADER_V2,
                 request_id.to_string(),
+            )
+            .header(
+                hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                PROTOCOL_MINOR_VALUE,
             )
             .body(encoded);
         if let Some(session_id) = self.session_id.lock().await.clone() {
@@ -162,23 +177,74 @@ impl HttpTransport {
                 return Err(product_error(ProductErrorCode::Cancelled, request_id));
             }
         };
-        let status = response.status();
-        if let Some(session_id) = response
+        let selected_minor = response
             .headers()
-            .get(hyphae_contracts::v2::SESSION_ID_HEADER_V2)
-            .and_then(|value| value.to_str().ok())
+            .get_all(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2)
+            .iter()
+            .collect::<Vec<_>>();
+        if selected_minor.len() != 1
+            || selected_minor[0].as_bytes() != PROTOCOL_MINOR_VALUE.as_bytes()
         {
-            *self.session_id.lock().await = Some(session_id.to_owned());
+            return Err(ClientError::Http(
+                "HTTP v2 protocol minor is missing or unsupported".to_owned(),
+            ));
         }
-        let response_request_id = response
+        let status = response.status();
+        if one_time_secret && status.is_success() {
+            let cache_control = response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok());
+            let pragma = response
+                .headers()
+                .get(header::PRAGMA)
+                .and_then(|value| value.to_str().ok());
+            if cache_control != Some("no-store, private, max-age=0")
+                || pragma != Some("no-cache")
+                || response.headers().contains_key(header::CONTENT_ENCODING)
+            {
+                return Err(ClientError::Http(
+                    "HTTP API-key secret response is not cache-safe".to_owned(),
+                ));
+            }
+        }
+        let response_session_headers = response
             .headers()
-            .get("x-hyphae-request-id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        if response_request_id != Some(request_id) {
+            .get_all(hyphae_contracts::v2::SESSION_ID_HEADER_V2)
+            .iter()
+            .collect::<Vec<_>>();
+        let response_session_id = if let [value] = response_session_headers.as_slice() {
+            value
+                .to_str()
+                .ok()
+                .filter(|value| is_valid_session_id(value))
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
+        if !response_session_headers.is_empty() && response_session_id.is_none() {
+            return Err(ClientError::Http(
+                "HTTP v2 response session ID is invalid".to_owned(),
+            ));
+        }
+        let response_request_ids = response
+            .headers()
+            .get_all(hyphae_contracts::v2::REQUEST_ID_HEADER_V2)
+            .iter()
+            .collect::<Vec<_>>();
+        if response_request_ids.len() != 1
+            || response_request_ids[0]
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(request_id)
+        {
             return Err(ClientError::Http(
                 "HTTP v2 response request ID mismatch".to_owned(),
             ));
+        }
+        if let Some(session_id) = response_session_id {
+            *self.session_id.lock().await = Some(session_id);
         }
         let media_type = response
             .headers()
@@ -207,8 +273,11 @@ impl HttpTransport {
                 "HTTP v2 returned an unexpected status or media type".to_owned(),
             ));
         }
-        hyphae_native_protocol::decode_product_response(&encoded)
-            .map_err(|error| ClientError::Protocol(error.to_string()))
+        hyphae_native_protocol::decode_product_response_for_minor(
+            &encoded,
+            hyphae_native_protocol::PROTOCOL_MINOR,
+        )
+        .map_err(|error| ClientError::Protocol(error.to_string()))
     }
 }
 
@@ -216,6 +285,22 @@ impl Transport for HttpTransport {
     fn execute(&self, operation: ProductOperation, options: RequestOptions) -> ResponseFuture<'_> {
         Box::pin(self.execute_inner(operation, options))
     }
+}
+
+fn endpoint_path(operation: &ProductOperation) -> &'static str {
+    if operation.is_key_lifecycle() {
+        "/v2/security/keys"
+    } else {
+        "/v2/execute"
+    }
+}
+
+fn is_valid_session_id(value: &str) -> bool {
+    value.len() == 32
+        && value != "00000000000000000000000000000000"
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn read_bounded(
@@ -309,7 +394,25 @@ impl ProductCodeExt for ProductErrorCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, HttpTransport};
+    #![allow(clippy::expect_used)]
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use hyphae_native_product::{
+        ApiKeyConfirmationDigest, ApiKeyId, BuiltInRole, ProductAuthorization, ProductOperation,
+        ProductScope, SecurityId,
+    };
+
+    use super::{ClientError, HttpTransport, PRODUCT_MEDIA_TYPE, RequestOptions, endpoint_path};
+
+    fn capabilities_response() -> Vec<u8> {
+        hyphae_native_protocol::encode_product_response(
+            &hyphae_native_product::ProductResponse::Capabilities(
+                hyphae_native_product::capabilities(),
+            ),
+        )
+        .expect("encode capabilities response")
+    }
 
     #[test]
     fn durable_bearer_requires_tls_outside_canonical_loopback() {
@@ -354,5 +457,195 @@ mod tests {
         }
 
         assert!(HttpTransport::new("http://example.test").is_ok());
+    }
+
+    #[test]
+    fn every_api_key_lifecycle_variant_uses_the_dedicated_route() {
+        let principal_id = SecurityId::new(1).expect("nonzero principal");
+        let key_id = ApiKeyId::from_bytes([1; 16]).expect("nonzero key");
+        let confirmation_digest = ApiKeyConfirmationDigest::from_bytes([2; 32]);
+        let operations = [
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: "self issue".to_owned(),
+                roles: vec![BuiltInRole::Reader],
+                custom_roles: Vec::new(),
+                permission_ceiling: BuiltInRole::Reader.authorization(),
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyIssueStart {
+                principal_id,
+                label: "admin issue".to_owned(),
+                roles: vec![BuiltInRole::Reader],
+                custom_roles: Vec::new(),
+                permission_ceiling: ProductAuthorization::ALL,
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyIssueSelfActivate {
+                key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyIssueActivate {
+                key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyRotateSelfStart {
+                predecessor_key_id: key_id,
+                label: "self rotate".to_owned(),
+                overlap_seconds: 0,
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyRotateStart {
+                predecessor_key_id: key_id,
+                label: "admin rotate".to_owned(),
+                overlap_seconds: 0,
+                expires_at_micros: None,
+            },
+            ProductOperation::SecurityApiKeyRotateSelfActivate {
+                successor_key_id: key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyRotateActivate {
+                successor_key_id: key_id,
+                confirmation_digest,
+            },
+            ProductOperation::SecurityApiKeyIssueSelfAbort { key_id },
+            ProductOperation::SecurityApiKeyIssueAbort { key_id },
+            ProductOperation::SecurityApiKeyRotateSelfAbort {
+                successor_key_id: key_id,
+            },
+            ProductOperation::SecurityApiKeyRotateAbort {
+                successor_key_id: key_id,
+            },
+            ProductOperation::SecurityApiKeyRevokeSelf { key_id },
+            ProductOperation::SecurityApiKeyRevoke { key_id },
+            ProductOperation::SecurityLegacyBearerRevoke,
+        ];
+        for operation in operations {
+            assert_eq!(endpoint_path(&operation), "/v2/security/keys");
+        }
+        assert_eq!(
+            endpoint_path(&ProductOperation::Capabilities),
+            "/v2/execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_minor_must_be_exact_before_session_retention() {
+        for selected_minor in [None, Some("2"), Some("garbage")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test HTTP peer");
+            let address = listener.local_addr().expect("test HTTP address");
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+                let mut request = vec![0; 8 * 1024];
+                let length = stream.read(&mut request).await.expect("read HTTP request");
+                let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+                assert!(request.contains("x-hyphae-protocol-minor: 3\r\n"));
+                let minor = selected_minor.map_or_else(String::new, |minor| {
+                    format!("X-Hyphae-Protocol-Minor: {minor}\r\n")
+                });
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {PRODUCT_MEDIA_TYPE}\r\nContent-Length: 0\r\nX-Hyphae-Request-Id: 71\r\nX-Hyphae-Session-Id: 11111111111111111111111111111111\r\n{minor}Connection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write HTTP response");
+            });
+            let transport =
+                HttpTransport::new(&format!("http://{address}")).expect("construct HTTP transport");
+            let error = transport
+                .execute_inner(
+                    ProductOperation::Capabilities,
+                    RequestOptions {
+                        request_id: Some(71),
+                        ..RequestOptions::default()
+                    },
+                )
+                .await
+                .expect_err("nonexact selected minor must fail");
+            assert!(matches!(
+                error,
+                ClientError::Http(ref message)
+                    if message == "HTTP v2 protocol minor is missing or unsupported"
+            ));
+            assert!(transport.session_id.lock().await.is_none());
+            peer.await.expect("join HTTP peer");
+        }
+    }
+
+    #[tokio::test]
+    async fn swapped_response_cannot_poison_the_next_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP peer");
+        let address = listener.local_addr().expect("test HTTP address");
+        let body = capabilities_response();
+        let peer = tokio::spawn(async move {
+            for (request_id, response_id, session) in [
+                (
+                    71,
+                    99,
+                    "X-Hyphae-Session-Id: 11111111111111111111111111111111\r\n",
+                ),
+                (72, 72, ""),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+                let mut request = vec![0; 8 * 1024];
+                let length = stream.read(&mut request).await.expect("read HTTP request");
+                let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+                assert!(request.contains(&format!("x-hyphae-request-id: {request_id}\r\n")));
+                assert!(!request.contains("x-hyphae-session-id:"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {PRODUCT_MEDIA_TYPE}\r\nContent-Length: {}\r\nX-Hyphae-Protocol-Minor: 3\r\nX-Hyphae-Request-Id: {response_id}\r\n{session}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write HTTP response");
+                stream
+                    .write_all(&body)
+                    .await
+                    .expect("write HTTP response body");
+            }
+        });
+        let transport =
+            HttpTransport::new(&format!("http://{address}")).expect("construct HTTP transport");
+        let error = transport
+            .execute_inner(
+                ProductOperation::Capabilities,
+                RequestOptions {
+                    request_id: Some(71),
+                    ..RequestOptions::default()
+                },
+            )
+            .await
+            .expect_err("swapped response must fail");
+        assert!(matches!(
+            error,
+            ClientError::Http(ref message) if message == "HTTP v2 response request ID mismatch"
+        ));
+        assert!(transport.session_id.lock().await.is_none());
+        let second = transport
+            .execute_inner(
+                ProductOperation::Capabilities,
+                RequestOptions {
+                    request_id: Some(72),
+                    ..RequestOptions::default()
+                },
+            )
+            .await
+            .expect("valid next request");
+        assert!(matches!(
+            second,
+            hyphae_native_product::ProductResponse::Capabilities(_)
+        ));
+        assert!(transport.session_id.lock().await.is_none());
+        peer.await.expect("join HTTP peer");
     }
 }

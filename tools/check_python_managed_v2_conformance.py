@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Validate source-bound Python managed Native v2 conformance receipts."""
 
 from __future__ import annotations
@@ -34,6 +34,13 @@ WRITES = [
     "security_principal_create",
     "security_principal_set_enabled",
 ]
+LIFECYCLE = [
+    "security_api_key_issue_abort",
+    "security_api_key_issue_activate",
+    "security_api_key_issue_start",
+    "security_api_key_revoke",
+    "security_legacy_bearer_revoke",
+]
 CASES = {
     "conflict",
     "next_operation_revocation",
@@ -42,6 +49,7 @@ CASES = {
     "redaction",
     "replay",
     "stale_cursor",
+    "terminal_replay",
 }
 FORBIDDEN_FIELDS = {
     "api_key",
@@ -106,7 +114,7 @@ def validate_schema_contract(schema: dict[str, Any]) -> None:
 
     if (
         schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
-        or schema.get("$comment") != "SPDX-License-Identifier: AGPL-3.0-only"
+        or schema.get("$comment") != "SPDX-License-Identifier: Apache-2.0"
         or schema.get("$id")
         != "https://hyphae.dev/schema/python-managed-v2-conformance-receipt-v1"
         or schema.get("type") != "object"
@@ -122,9 +130,13 @@ def validate_schema_contract(schema: dict[str, Any]) -> None:
         or properties["status"] != {"const": "passed"}
         or properties["platform"].get("enum") != sorted(PLATFORMS)
         or properties["protocol"].get("properties")
-        != {"major": {"const": 1}, "minor": {"const": 2}}
+        != {"major": {"const": 1}, "minor": {"const": 3}}
         or properties["operations"].get("properties")
-        != {"reads": {"const": READS}, "writes": {"const": WRITES}}
+        != {
+            "lifecycle": {"const": LIFECYCLE},
+            "reads": {"const": READS},
+            "writes": {"const": WRITES},
+        }
         or properties["cases"].get("properties")
         != {name: {"const": True} for name in sorted(CASES)}
     ):
@@ -176,7 +188,7 @@ def validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     fixture_digest = _digest(fixture.get("sha256"), 64, "fixture binary digest")
 
     protocol = _exact_keys(receipt.get("protocol"), {"major", "minor"}, "protocol")
-    if protocol != {"major": 1, "minor": 2}:
+    if protocol != {"major": 1, "minor": 3}:
         fail("protocol version differs")
     expected_transports = (
         ["http-v2", "named-pipe"]
@@ -186,9 +198,9 @@ def validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     if receipt.get("transports") != expected_transports:
         fail("transport inventory differs from platform")
     operations = _exact_keys(
-        receipt.get("operations"), {"reads", "writes"}, "operations"
+        receipt.get("operations"), {"lifecycle", "reads", "writes"}, "operations"
     )
-    if operations != {"reads": READS, "writes": WRITES}:
+    if operations != {"lifecycle": LIFECYCLE, "reads": READS, "writes": WRITES}:
         fail("operation inventory differs")
     cases = _exact_keys(receipt.get("cases"), CASES, "cases")
     if any(cases[name] is not True for name in CASES):

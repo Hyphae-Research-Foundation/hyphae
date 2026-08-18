@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Command-line entry point for the single native Hyphae executable.
 
@@ -37,29 +37,30 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
-    AccessControlLimits, AccessControlStatus, BackupInfo, BackupRequest, BuiltInRole,
-    CatalogDependencyRequest, CatalogListRequest, CompactionRequest, CompactionTarget,
+    AccessControlLimits, AccessControlStatus, ApiKeyId, AuthorizationEpoch, BackupInfo,
+    BackupRequest, BuiltInRole, CatalogDependencyRequest, CatalogListRequest, CatalogVisibleCursor,
+    CatalogVisibleListFilter, CatalogVisibleListRequest, CompactionRequest, CompactionTarget,
     CustomRoleGrant, DoctorRequest, DoctorStatus, MetricValue, MigrationLexicalIndexInput,
     MigrationVectorIndexInput, NativeProduct, ObjectId, ProductAggregation, ProductAuthorization,
     ProductCommitOutcome, ProductCommitReceipt, ProductDocValue, ProductDocument,
-    ProductDurability, ProductExplain, ProductExplicitTransactionStatus, ProductFacetRequest,
-    ProductHashEntry, ProductLexicalBranch, ProductListSide, ProductMissingPlacement,
-    ProductNamedAggregation, ProductOperation, ProductPermission, ProductResponse, ProductScope,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
-    ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductSearchResults,
-    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
-    ProductSqlResult, ProductStructureKey, ProductStructureMutation,
-    ProductStructureMutationResult, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionHandle, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
-    ProductTransactionStageResult, ProductTransactionStatus, ProductTransactionVectorMutation,
-    ProductTtl, ProductValue, ProductVector, ProductVectorBranch, ProductVectorExecution,
-    ProductVectorStrategy, ProgressControl, RestorePhase, RestoreRequest,
-    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditAction,
-    SecurityAuditMetadata, SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult,
-    SecurityAuditTarget, SecurityCursor, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
-    SecurityPrincipalListRequest, SecurityPrincipalPage, SecurityRoleListRequest, SecurityRolePage,
-    SecurityRoleSummary, SnapshotIdentity, StructureKind, VerifyBackupRequest, capabilities,
-    verify_backup,
+    ProductDurability, ProductError, ProductErrorCode, ProductExplain,
+    ProductExplicitTransactionStatus, ProductFacetRequest, ProductHashEntry, ProductLexicalBranch,
+    ProductListSide, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
+    ProductPermission, ProductResponse, ProductScope, ProductSearchDocumentDelete,
+    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchOperator, ProductSearchRequest, ProductSearchResults, ProductSearchSort,
+    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSqlResult,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation, ProductTransactionStageResult,
+    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
+    ProductVector, ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
+    ProgressControl, RestorePhase, RestoreRequest, SecurityAssignmentListRequest,
+    SecurityAssignmentPage, SecurityAuditAction, SecurityAuditMetadata, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor, SecurityId,
+    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest, SecurityPrincipalPage,
+    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
+    StructureKind, VerifyBackupRequest, capabilities, verify_backup,
 };
 use hyphae_native_runtime::{
     CalibrationMode, CalibrationRequest, GovernorMode, GovernorPolicyError, HardwareCalibration,
@@ -71,7 +72,10 @@ use hyphae_query::Value as LegacyValue;
 use hyphae_storage::{
     SnapshotContents, SnapshotReadLimits, load_snapshot, load_snapshot_for_migration,
 };
-use native_client::EmbeddedClient;
+use native_client::{
+    EmbeddedClient, OfflineOwnerClient, ensure_key_output_outside_data_dir,
+    read_legacy_bearer_file, reserve_restricted_api_key_file,
+};
 use serde::{Deserialize, Deserializer, de::Visitor};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -159,6 +163,12 @@ enum Command {
     },
     /// Initialize a new native data directory, failing if the path exists.
     Init(LocalDirectory),
+    /// Explicitly upgrade durable native metadata under the directory lock.
+    Upgrade {
+        /// Native data directory to upgrade.
+        #[arg(long, env = "HYPHAE_DATA_DIR")]
+        data_dir: PathBuf,
+    },
     /// Discover native product capabilities and hard limits.
     Capabilities(LocalDirectory),
     /// Inspect the native logical catalog.
@@ -299,6 +309,9 @@ enum Command {
         /// Require durable Native API keys on local and HTTP v2 transports.
         #[arg(long)]
         native_api_key_auth: bool,
+        /// Restricted 1.2-only legacy bearer file for Native HTTP only.
+        #[arg(long, requires = "http_bind")]
+        native_legacy_bearer_file: Option<PathBuf>,
         /// Format-2 `/v1` listener. Native HTTP uses `--http-bind`.
         #[arg(long)]
         bind: Option<SocketAddr>,
@@ -501,7 +514,7 @@ enum SecurityCommand {
     /// Inspect redacted API-key metadata.
     Key {
         #[command(subcommand)]
-        operation: SecurityListCommand,
+        operation: SecurityKeyCommand,
     },
     /// Inspect retained durable security events.
     Audit {
@@ -519,6 +532,77 @@ enum SecurityCommand {
         /// New owner-only API-key file. Existing paths are never overwritten.
         #[arg(long)]
         key_out: PathBuf,
+    },
+    /// Inspect or resolve pending owner recovery while the directory is offline.
+    Owner {
+        #[command(subcommand)]
+        operation: SecurityOwnerCommand,
+    },
+    /// Migrate or terminally revoke Native HTTP legacy-bearer compatibility.
+    LegacyBearer {
+        #[command(subcommand)]
+        operation: SecurityLegacyBearerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityLegacyBearerCommand {
+    /// Create canonical Owner/key state, durably write the key, then activate dual-window.
+    Migrate {
+        /// Human-readable canonical Owner name.
+        #[arg(long)]
+        name: String,
+        /// Non-secret canonical Owner-key label.
+        #[arg(long)]
+        label: String,
+        /// Existing restricted legacy bearer file.
+        #[arg(long)]
+        legacy_bearer_file: PathBuf,
+        /// New restricted canonical Owner key file.
+        #[arg(long)]
+        key_out: PathBuf,
+    },
+    /// Permanently disable the legacy bearer using a canonical Owner key.
+    Revoke {
+        /// Nonzero replay-or-conflict token.
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecurityOwnerCommand {
+    /// Inspect redacted pending owner-recovery provenance.
+    Inspect,
+    /// Start recovery, write a new restricted key, and leave activation pending.
+    Recover {
+        /// Non-secret credential label.
+        #[arg(long)]
+        label: String,
+        /// New restricted key file outside the data directory.
+        #[arg(long)]
+        key_out: PathBuf,
+    },
+    /// Validate the exact restricted key file and atomically activate it.
+    Resume {
+        /// Public pending key identity.
+        #[arg(long)]
+        pending_key_id: String,
+        /// Existing restricted file containing the complete pending key.
+        #[arg(long)]
+        key_file: PathBuf,
+        /// Exact authorization generation reported by recover or inspect.
+        #[arg(long)]
+        expected_authorization_epoch: u64,
+    },
+    /// Delete only the exact pending recovery record and inactive key.
+    AbortPending {
+        /// Public pending key identity.
+        #[arg(long)]
+        pending_key_id: String,
+        /// Exact authorization generation reported by recover or inspect.
+        #[arg(long)]
+        expected_authorization_epoch: u64,
     },
 }
 
@@ -667,6 +751,77 @@ enum SecurityListCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SecurityKeyCommand {
+    /// Return one bounded page in stable order.
+    List {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Issue one inactive key, write it locally, then activate it.
+    Issue {
+        #[arg(long)]
+        principal_id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long, value_enum, required = true)]
+        role: Vec<AssignableBuiltInRole>,
+        #[arg(long)]
+        custom_role: Vec<String>,
+        #[arg(long, required = true)]
+        permission: Vec<String>,
+        #[arg(long, required = true)]
+        scope: Vec<String>,
+        #[arg(long)]
+        expires_at_micros: Option<i64>,
+        #[arg(long)]
+        self_manage: bool,
+        #[arg(long)]
+        key_out: PathBuf,
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Rotate one key, write the successor locally, then activate it.
+    Rotate {
+        #[arg(long)]
+        predecessor_key_id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long, default_value_t = 0)]
+        overlap_seconds: u64,
+        #[arg(long)]
+        expires_at_micros: Option<i64>,
+        #[arg(long)]
+        self_manage: bool,
+        #[arg(long)]
+        key_out: PathBuf,
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Revoke one exact active key.
+    Revoke {
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        self_manage: bool,
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+    /// Abort one exact inactive issue or rotation successor.
+    Abort {
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        rotation: bool,
+        #[arg(long)]
+        self_manage: bool,
+        #[arg(long, value_parser = parse_nonzero_idempotency_token)]
+        idempotency_token: u128,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CatalogCommand {
     /// List one bounded stable-ID ordered catalog page.
     List {
@@ -680,6 +835,9 @@ enum CatalogCommand {
         kind: Option<CatalogKind>,
         #[arg(long)]
         parent: Option<u128>,
+        /// Opaque continuation token emitted by the preceding visible page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Describe one logical catalog object by stable ID.
     Describe {
@@ -1502,6 +1660,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
         Command::Snapshot { data_dir } => compatibility(compatibility::snapshot(&data_dir)),
         Command::Migrate { operation } => migration(operation).map_err(Into::into),
         Command::Init(local) => init(&local).map_err(Into::into),
+        Command::Upgrade { data_dir } => upgrade(&data_dir).map_err(Into::into),
         Command::Capabilities(local) => {
             dispatch(&local, ProductOperation::Capabilities).map_err(Into::into)
         }
@@ -1584,6 +1743,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             endpoint,
             http_bind,
             native_api_key_auth,
+            native_legacy_bearer_file,
             bind,
             bearer_token_file,
         } => {
@@ -1596,11 +1756,21 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                 if bind.is_some() || bearer_token_file.is_some() {
                     return Err(RunFailure::Native(CliFailure::invalid()));
                 }
-                native_service::serve(data_dir, endpoint, http_bind, native_api_key_auth)
-                    .await
-                    .map_err(Into::into)
+                native_service::serve(
+                    data_dir,
+                    endpoint,
+                    http_bind,
+                    native_api_key_auth,
+                    native_legacy_bearer_file,
+                )
+                .await
+                .map_err(Into::into)
             } else {
-                if endpoint.is_some() || http_bind.is_some() || native_api_key_auth {
+                if endpoint.is_some()
+                    || http_bind.is_some()
+                    || native_api_key_auth
+                    || native_legacy_bearer_file.is_some()
+                {
                     return Err(RunFailure::Compatibility(
                         "native serve options cannot be used with a format-2 directory".into(),
                     ));
@@ -1629,6 +1799,19 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
         .await
         .map_err(Into::into),
     }
+}
+
+fn upgrade(data_dir: &Path) -> Result<(), CliFailure> {
+    let mut product = NativeProduct::open_for_upgrade(data_dir)?;
+    let default_scalar_keyspace = product.upgrade_default_scalar_keyspace_binding()?;
+    let catalog_scope_index = product.upgrade_catalog_scope_index()?.is_some();
+    print_json(&json!({
+        "schema": "hyphae-native-upgrade-v1",
+        "status": "upgraded",
+        "data_dir": data_dir,
+        "default_scalar_keyspace_created": default_scalar_keyspace,
+        "catalog_scope_index_created": catalog_scope_index,
+    }))
 }
 
 fn hardware(command: HardwareCommand) -> Result<(), CliFailure> {
@@ -2497,10 +2680,15 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             byte_limit,
             kind,
             parent,
-        } => ProductOperation::CatalogList(CatalogListRequest {
-            parent: parent.map(object_id).transpose()?,
-            kind: kind.map(Into::into),
-            cursor: None,
+            cursor,
+        } => ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+            filter: CatalogVisibleListFilter {
+                parent: parent.map(object_id).transpose()?,
+                kind: kind.map(Into::into),
+            },
+            cursor: cursor
+                .map(|token| decode_catalog_cursor_token(&token))
+                .transpose()?,
             item_limit: limit,
             visit_limit,
             byte_limit,
@@ -2653,6 +2841,43 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
         }
     };
     dispatch(local, operation)
+}
+
+fn encode_catalog_cursor_token(bytes: &[u8]) -> String {
+    let mut token = String::with_capacity(7 + bytes.len().saturating_mul(2));
+    token.push_str("hycatv1:");
+    token.push_str(&encode_hex(bytes));
+    token
+}
+
+fn decode_catalog_cursor_token(token: &str) -> Result<CatalogVisibleCursor, CliFailure> {
+    let conflict = || CliFailure::from(ProductError::from_code(ProductErrorCode::CatalogConflict));
+    let encoded = token.strip_prefix("hycatv1:").ok_or_else(&conflict)?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return Err(conflict());
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = decode_hex_nibble(pair[0]).ok_or_else(&conflict)?;
+            let low = decode_hex_nibble(pair[1]).ok_or_else(&conflict)?;
+            Ok((high << 4) | low)
+        })
+        .collect::<Result<Vec<_>, CliFailure>>()?;
+    let cursor = CatalogVisibleCursor::new(bytes).map_err(CliFailure::from)?;
+    if encode_catalog_cursor_token(cursor.as_bytes()) != token {
+        return Err(conflict());
+    }
+    Ok(cursor)
+}
+
+const fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn sql(local: &LocalDirectory, command: SqlCommand) -> Result<(), CliFailure> {
@@ -3092,9 +3317,7 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
         SecurityCommand::Principal { operation } => security_principal(local, operation),
         SecurityCommand::Role { operation } => security_role(local, operation),
         SecurityCommand::Assignment { operation } => security_assignment(local, operation),
-        SecurityCommand::Key { operation } => {
-            security_metadata(local, SecurityListKind::Key, operation)
-        }
+        SecurityCommand::Key { operation } => security_key(local, operation),
         SecurityCommand::Audit { operation } => security_audit(local, operation),
         SecurityCommand::Bootstrap {
             name,
@@ -3118,7 +3341,413 @@ fn security(local: &LocalDirectory, command: SecurityCommand) -> Result<(), CliF
                 "commit": commit_json(receipt.commit),
             }))
         }
+        SecurityCommand::Owner { operation } => security_owner(&local.data_dir, operation),
+        SecurityCommand::LegacyBearer { operation } => security_legacy_bearer(local, operation),
     }
+}
+
+fn security_legacy_bearer(
+    local: &LocalDirectory,
+    command: SecurityLegacyBearerCommand,
+) -> Result<(), CliFailure> {
+    match command {
+        SecurityLegacyBearerCommand::Migrate {
+            name,
+            label,
+            legacy_bearer_file,
+            key_out,
+        } => {
+            if local.native_api_key_file.is_some() || local.native_api_key_stdin {
+                return Err(CliFailure::invalid());
+            }
+            validate_security_display_name(&name)?;
+            validate_security_display_name(&label)?;
+            ensure_key_output_outside_data_dir(&local.data_dir, &key_out)?;
+            let legacy_bearer = read_legacy_bearer_file(&legacy_bearer_file)?;
+            let mut output = reserve_restricted_api_key_file(&key_out)?;
+            let mut client = OfflineOwnerClient::open(&local.data_dir)?;
+            let started = client.start_legacy(&name, &label, &legacy_bearer)?;
+            output.write_secret(started.secret.expose_secret_bytes())?;
+            let activated = client.activate_legacy(
+                started.key_id,
+                started.secret.expose_secret(),
+                started.authorization_epoch,
+                &name,
+                &label,
+                &legacy_bearer,
+            )?;
+            print_json(&json!({
+                "schema": "hyphae-native-legacy-bearer-migration-v1",
+                "operation": "security.legacy_bearer_migrate",
+                "status": "dual_window",
+                "principal_id": started.principal_id.to_string(),
+                "operation_id": activated.operation_id.to_string(),
+                "key_id": activated.key_id.to_string(),
+                "authorization_epoch": activated.authorization_epoch.get(),
+                "key_file": key_out,
+                "commit": commit_json(activated.commit),
+            }))
+        }
+        SecurityLegacyBearerCommand::Revoke { idempotency_token } => {
+            let mut client = open_client(local)?;
+            let response = client.dispatch_with_idempotency(
+                ProductOperation::SecurityLegacyBearerRevoke,
+                idempotency_token,
+            )?;
+            let ProductResponse::SecurityMutated(receipt) = response else {
+                return Err(CliFailure::internal());
+            };
+            print_json(&json!({
+                "schema": "hyphae-native-legacy-bearer-revocation-v1",
+                "operation": "security.legacy_bearer_revoke",
+                "status": "revoked",
+                "authorization_epoch": receipt.authorization_epoch.get(),
+                "commit": commit_json(receipt.commit),
+            }))
+        }
+    }
+}
+
+fn security_owner(data_dir: &Path, command: SecurityOwnerCommand) -> Result<(), CliFailure> {
+    match command {
+        SecurityOwnerCommand::Inspect => {
+            let inspection = OfflineOwnerClient::open(data_dir)?.inspect()?;
+            let pending = inspection.pending.map(|pending| {
+                json!({
+                    "operation_id": pending.operation_id().to_string(),
+                    "pending_key_id": pending.key_id().to_string(),
+                    "authorization_epoch": pending.authorization_epoch().get(),
+                    "created_at_micros": pending.created_at_micros(),
+                    "provenance": "offline_os_owner",
+                })
+            });
+            print_json(&json!({
+                "schema": "hyphae-native-owner-recovery-v1",
+                "operation": "security.owner_inspect",
+                "authorization_epoch": inspection.authorization_epoch.get(),
+                "pending": pending,
+            }))
+        }
+        SecurityOwnerCommand::Recover { label, key_out } => {
+            validate_security_display_name(&label)?;
+            ensure_key_output_outside_data_dir(data_dir, &key_out)?;
+            let mut output = reserve_restricted_api_key_file(&key_out)?;
+            let mut client = OfflineOwnerClient::open(data_dir)?;
+            let receipt = client.start(&label)?;
+            output.write_secret(receipt.secret.expose_secret_bytes())?;
+            print_json(&json!({
+                "schema": "hyphae-native-owner-recovery-v1",
+                "operation": "security.owner_recover",
+                "status": "pending",
+                "operation_id": receipt.operation_id.to_string(),
+                "pending_key_id": receipt.key_id.to_string(),
+                "authorization_epoch": receipt.authorization_epoch.get(),
+                "key_file": key_out,
+                "commit": commit_json(receipt.commit),
+            }))
+        }
+        SecurityOwnerCommand::Resume {
+            pending_key_id,
+            key_file,
+            expected_authorization_epoch,
+        } => {
+            let pending_key_id = parse_api_key_id(&pending_key_id)?;
+            let expected_epoch = parse_managed_authorization_epoch(expected_authorization_epoch)?;
+            let mut client = OfflineOwnerClient::open(data_dir)?;
+            let receipt = client.resume(pending_key_id, &key_file, expected_epoch)?;
+            print_json(&json!({
+                "schema": "hyphae-native-owner-recovery-v1",
+                "operation": "security.owner_resume",
+                "status": "activated",
+                "operation_id": receipt.operation_id.to_string(),
+                "key_id": receipt.key_id.to_string(),
+                "authorization_epoch": receipt.authorization_epoch.get(),
+                "commit": commit_json(receipt.commit),
+            }))
+        }
+        SecurityOwnerCommand::AbortPending {
+            pending_key_id,
+            expected_authorization_epoch,
+        } => {
+            let pending_key_id = parse_api_key_id(&pending_key_id)?;
+            let expected_epoch = parse_managed_authorization_epoch(expected_authorization_epoch)?;
+            let mut client = OfflineOwnerClient::open(data_dir)?;
+            let receipt = client.abort(pending_key_id, expected_epoch)?;
+            print_json(&json!({
+                "schema": "hyphae-native-owner-recovery-v1",
+                "operation": "security.owner_abort_pending",
+                "status": "aborted",
+                "operation_id": receipt.operation_id.to_string(),
+                "pending_key_id": receipt.key_id.to_string(),
+                "authorization_epoch": receipt.authorization_epoch.get(),
+                "commit": commit_json(receipt.commit),
+            }))
+        }
+    }
+}
+
+fn parse_managed_authorization_epoch(value: u64) -> Result<AuthorizationEpoch, CliFailure> {
+    (value != 0)
+        .then_some(AuthorizationEpoch::new(value))
+        .ok_or_else(CliFailure::invalid)
+}
+
+#[allow(clippy::too_many_lines)]
+fn security_key(local: &LocalDirectory, command: SecurityKeyCommand) -> Result<(), CliFailure> {
+    match command {
+        SecurityKeyCommand::List { cursor, limit } => security_metadata(
+            local,
+            SecurityListKind::Key,
+            SecurityListCommand::List { cursor, limit },
+        ),
+        SecurityKeyCommand::Issue {
+            principal_id,
+            label,
+            role,
+            custom_role,
+            permission,
+            scope,
+            expires_at_micros,
+            self_manage,
+            key_out,
+            idempotency_token,
+        } => {
+            validate_security_display_name(&label)?;
+            let principal_id = parse_security_id(&principal_id)?;
+            let custom_roles = custom_role
+                .iter()
+                .map(|value| parse_security_id(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let permissions = permission
+                .iter()
+                .map(|value| ProductPermission::parse(value).ok_or_else(CliFailure::invalid))
+                .collect::<Result<Vec<_>, _>>()?;
+            let operation = if self_manage {
+                ProductOperation::SecurityApiKeyIssueSelfStart {
+                    principal_id,
+                    label,
+                    roles: role
+                        .into_iter()
+                        .map(AssignableBuiltInRole::product)
+                        .collect(),
+                    custom_roles,
+                    permission_ceiling: ProductAuthorization::from_permissions(permissions),
+                    scope_ceiling: scope
+                        .iter()
+                        .map(|value| parse_product_scope(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    expires_at_micros,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyIssueStart {
+                    principal_id,
+                    label,
+                    roles: role
+                        .into_iter()
+                        .map(AssignableBuiltInRole::product)
+                        .collect(),
+                    custom_roles,
+                    permission_ceiling: ProductAuthorization::from_permissions(permissions),
+                    scope_ceiling: scope
+                        .iter()
+                        .map(|value| parse_product_scope(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    expires_at_micros,
+                }
+            };
+            key_start_write_activate(
+                local,
+                operation,
+                false,
+                self_manage,
+                &key_out,
+                idempotency_token,
+            )
+        }
+        SecurityKeyCommand::Rotate {
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+            self_manage,
+            key_out,
+            idempotency_token,
+        } => {
+            validate_security_display_name(&label)?;
+            let predecessor_key_id = parse_api_key_id(&predecessor_key_id)?;
+            let operation = if self_manage {
+                ProductOperation::SecurityApiKeyRotateSelfStart {
+                    predecessor_key_id,
+                    label,
+                    overlap_seconds,
+                    expires_at_micros,
+                }
+            } else {
+                ProductOperation::SecurityApiKeyRotateStart {
+                    predecessor_key_id,
+                    label,
+                    overlap_seconds,
+                    expires_at_micros,
+                }
+            };
+            key_start_write_activate(
+                local,
+                operation,
+                true,
+                self_manage,
+                &key_out,
+                idempotency_token,
+            )
+        }
+        SecurityKeyCommand::Revoke {
+            key_id,
+            self_manage,
+            idempotency_token,
+        } => {
+            let key_id = parse_api_key_id(&key_id)?;
+            let operation = if self_manage {
+                ProductOperation::SecurityApiKeyRevokeSelf { key_id }
+            } else {
+                ProductOperation::SecurityApiKeyRevoke { key_id }
+            };
+            let response = dispatch_security_mutation(local, operation, idempotency_token)?;
+            print_key_mutation("security.key_revoke", key_id, &response)
+        }
+        SecurityKeyCommand::Abort {
+            key_id,
+            rotation,
+            self_manage,
+            idempotency_token,
+        } => {
+            let key_id = parse_api_key_id(&key_id)?;
+            let operation = match (rotation, self_manage) {
+                (false, true) => ProductOperation::SecurityApiKeyIssueSelfAbort { key_id },
+                (false, false) => ProductOperation::SecurityApiKeyIssueAbort { key_id },
+                (true, true) => ProductOperation::SecurityApiKeyRotateSelfAbort {
+                    successor_key_id: key_id,
+                },
+                (true, false) => ProductOperation::SecurityApiKeyRotateAbort {
+                    successor_key_id: key_id,
+                },
+            };
+            let response = dispatch_security_mutation(local, operation, idempotency_token)?;
+            print_key_mutation("security.key_abort", key_id, &response)
+        }
+    }
+}
+
+fn key_start_write_activate(
+    local: &LocalDirectory,
+    start: ProductOperation,
+    rotation: bool,
+    self_manage: bool,
+    key_out: &Path,
+    idempotency_token: u128,
+) -> Result<(), CliFailure> {
+    ensure_key_output_outside_data_dir(&local.data_dir, key_out)?;
+    let mut output = reserve_restricted_api_key_file(key_out)?;
+    let mut client = open_client(local)?;
+    let response = client.dispatch_with_idempotency(start, idempotency_token)?;
+    let ProductResponse::SecurityApiKeyStarted(started) = response else {
+        return Err(CliFailure::internal());
+    };
+    let secret = started.secret.take().ok_or_else(CliFailure::internal)?;
+    let confirmation_digest = secret.confirmation_digest();
+    if let Err(error) = output.write_secret(secret.expose_secret_bytes()) {
+        let abort_token = lifecycle_abort_token(idempotency_token);
+        let abort = match (rotation, self_manage) {
+            (false, true) => ProductOperation::SecurityApiKeyIssueSelfAbort {
+                key_id: started.key_id,
+            },
+            (false, false) => ProductOperation::SecurityApiKeyIssueAbort {
+                key_id: started.key_id,
+            },
+            (true, true) => ProductOperation::SecurityApiKeyRotateSelfAbort {
+                successor_key_id: started.key_id,
+            },
+            (true, false) => ProductOperation::SecurityApiKeyRotateAbort {
+                successor_key_id: started.key_id,
+            },
+        };
+        match client.dispatch_with_idempotency(abort, abort_token) {
+            Ok(ProductResponse::SecurityMutated(_)) => {}
+            Ok(_) | Err(_) => {
+                eprintln!("pending_key_id={}", started.key_id);
+            }
+        }
+        return Err(error);
+    }
+    let activation_token = lifecycle_activation_token(idempotency_token);
+    let activate = match (rotation, self_manage) {
+        (false, true) => ProductOperation::SecurityApiKeyIssueSelfActivate {
+            key_id: started.key_id,
+            confirmation_digest,
+        },
+        (false, false) => ProductOperation::SecurityApiKeyIssueActivate {
+            key_id: started.key_id,
+            confirmation_digest,
+        },
+        (true, true) => ProductOperation::SecurityApiKeyRotateSelfActivate {
+            successor_key_id: started.key_id,
+            confirmation_digest,
+        },
+        (true, false) => ProductOperation::SecurityApiKeyRotateActivate {
+            successor_key_id: started.key_id,
+            confirmation_digest,
+        },
+    };
+    let response = client.dispatch_with_idempotency(activate, activation_token)?;
+    let ProductResponse::SecurityApiKeyActivated(receipt) = response else {
+        return Err(CliFailure::internal());
+    };
+    print_json(&json!({
+        "schema": "hyphae-native-api-key-lifecycle-v1",
+        "operation": if rotation { "security.key_rotate" } else { "security.key_issue" },
+        "key_id": receipt.key_id.to_string(),
+        "predecessor_key_id": receipt.predecessor_key_id.map(|id| id.to_string()),
+        "overlap_until_micros": receipt.overlap_until_micros,
+        "authorization_epoch": receipt.authorization_epoch.get(),
+        "commit": commit_json(receipt.commit),
+    }))
+}
+
+fn lifecycle_activation_token(start_token: u128) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-cli-api-key-activation-idempotency-v1\0");
+    hasher.update(&start_token.to_be_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    u128::from_be_bytes(bytes).max(1)
+}
+
+fn lifecycle_abort_token(start_token: u128) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-cli-api-key-abort-idempotency-v1\0");
+    hasher.update(&start_token.to_be_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    u128::from_be_bytes(bytes).max(1)
+}
+
+fn print_key_mutation(
+    operation: &str,
+    key_id: ApiKeyId,
+    response: &ProductResponse,
+) -> Result<(), CliFailure> {
+    let ProductResponse::SecurityMutated(receipt) = response else {
+        return Err(CliFailure::internal());
+    };
+    print_json(&json!({
+        "schema": "hyphae-native-api-key-lifecycle-v1",
+        "operation": operation,
+        "key_id": key_id.to_string(),
+        "authorization_epoch": receipt.authorization_epoch.get(),
+        "commit": commit_json(receipt.commit),
+    }))
+}
+
+fn parse_api_key_id(value: &str) -> Result<ApiKeyId, CliFailure> {
+    value.parse().map_err(|_| CliFailure::invalid())
 }
 
 fn security_principal(
@@ -3714,6 +4343,15 @@ fn response_json(response: ProductResponse) -> Value {
             "visited": page.visited,
             "returned_bytes": page.returned_bytes,
         }),
+        ProductResponse::CatalogVisiblePage(page) => json!({
+            "items": page.items.into_iter().map(|item| json!({
+                "id": item.id.get().to_string(),
+                "kind": catalog_kind(item.kind),
+                "name": item.name.to_string(),
+                "parent": item.parent.map(|parent| parent.get().to_string()),
+            })).collect::<Vec<_>>(),
+            "cursor": page.cursor.map(|cursor| encode_catalog_cursor_token(cursor.as_bytes())),
+        }),
         ProductResponse::CatalogDefinition(definition) => json!({
             "found": definition.is_some(),
             "object": definition.map(|object| json!({
@@ -4067,6 +4705,7 @@ const fn security_audit_action(action: SecurityAuditAction) -> &'static str {
         SecurityAuditAction::MigrateLegacyBearer => "migrate_legacy_bearer",
         SecurityAuditAction::SetPrincipalEnabled => "set_principal_enabled",
         SecurityAuditAction::RevokeAssignment => "revoke_assignment",
+        SecurityAuditAction::RevokeLegacyBearer => "revoke_legacy_bearer",
     }
 }
 
@@ -4086,6 +4725,7 @@ fn security_audit_target_json(target: SecurityAuditTarget) -> Value {
             json!({ "kind": "assignment", "id": id.to_string() })
         }
         SecurityAuditTarget::Key(id) => json!({ "kind": "key", "id": id.to_string() }),
+        SecurityAuditTarget::LegacyBearer => json!({ "kind": "legacy_bearer" }),
     }
 }
 

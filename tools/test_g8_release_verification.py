@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from collections import Counter
 import json
@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "packaging"))
 
 from g8_release_verification import (  # noqa: E402
     expected_archives,
+    expected_hyphae_identities,
     verify,
     verify_cyclonedx_hyphae_licenses,
     verify_spdx_hyphae_licenses,
@@ -25,7 +26,7 @@ COMMIT = "a" * 40
 TAG = "v1.0.1"
 
 
-def spdx(license_identifier: str = "AGPL-3.0-only") -> dict:
+def spdx(license_identifier: str = "Apache-2.0") -> dict:
     return {
         "packages": [
             {
@@ -49,7 +50,7 @@ def spdx(license_identifier: str = "AGPL-3.0-only") -> dict:
     }
 
 
-def cyclonedx(license_identifier: str = "AGPL-3.0-only") -> dict:
+def cyclonedx(license_identifier: str = "Apache-2.0") -> dict:
     return {
         "components": [
             {
@@ -67,6 +68,17 @@ def cyclonedx(license_identifier: str = "AGPL-3.0-only") -> dict:
 
 
 class G8ReleaseVerificationTests(unittest.TestCase):
+    def test_repository_release_authority_remains_79_artifacts_33_identities(
+        self,
+    ) -> None:
+        identities = expected_hyphae_identities()
+        self.assertEqual(sum(identities.values()), 79)
+        self.assertEqual(len(identities), 33)
+        self.assertNotIn(
+            "hyphae-mcp-conformance-hosts",
+            {name for name, _, _ in identities},
+        )
+
     def test_expected_archives_rejects_noncanonical_tag(self) -> None:
         with self.assertRaises(ValueError):
             expected_archives("1.0")
@@ -116,7 +128,7 @@ class G8ReleaseVerificationTests(unittest.TestCase):
             self.assertEqual(result["attestation_verifications"], 12)
             self.assertEqual(blob.call_count, 8)
             self.assertEqual(attestation.call_count, 12)
-            self.assertEqual(result["software_license"], "AGPL-3.0-only")
+            self.assertEqual(result["software_license"], "Apache-2.0")
             self.assertEqual(
                 result["license_authority"],
                 "tracked-package-manifests-and-local-locks-v1",
@@ -132,7 +144,7 @@ class G8ReleaseVerificationTests(unittest.TestCase):
             self.assertIn("--tag-object", run.call_args_list[0].args)
             self.assertIn("--tag-target", run.call_args_list[0].args)
 
-    def test_spdx_requires_declared_and_concluded_agpl_for_hyphae_only(self) -> None:
+    def test_spdx_requires_declared_and_concluded_apache_for_hyphae_only(self) -> None:
         self.assertEqual(
             verify_spdx_hyphae_licenses(spdx()), ["hyphae-native-runtime"]
         )
@@ -143,12 +155,12 @@ class G8ReleaseVerificationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, field):
                     verify_spdx_hyphae_licenses(payload)
 
-    def test_cyclonedx_requires_agpl_for_nested_hyphae_components_only(self) -> None:
+    def test_cyclonedx_requires_apache_for_nested_hyphae_components_only(self) -> None:
         payload = cyclonedx()
         payload["components"][0]["components"] = [
             {
                 "name": "hyphae-core",
-                "licenses": [{"expression": "AGPL-3.0-only"}],
+                "licenses": [{"expression": "Apache-2.0"}],
             }
         ]
         self.assertEqual(

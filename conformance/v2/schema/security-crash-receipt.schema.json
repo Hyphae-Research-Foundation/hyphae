@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://hyphae.dev/schema/security-process-crash-matrix-v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "source_commit", "environment", "target", "semantics", "shard_index", "shard_count", "case_count", "boundary_case_count", "observations"],
+  "properties": {
+    "schema": {"const": "hyphae-security-process-crash-matrix-v2"},
+    "status": {"const": "passed"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "environment": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "target": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+    "semantics": {"const": "process-crash-not-power-loss"},
+    "shard_index": {"type": "integer", "minimum": 0},
+    "shard_count": {"type": "integer", "minimum": 1, "maximum": 26},
+    "case_count": {"type": "integer", "minimum": 1, "maximum": 26},
+    "boundary_case_count": {"type": "integer", "minimum": 7, "maximum": 182},
+    "observations": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 182,
+      "items": {"$ref": "#/$defs/observation"}
+    }
+  },
+  "$defs": {
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "semantic_family", "kind", "product_operation", "boundary", "expected_state", "recovered_state", "boundary_hook_reached", "child_unwound", "termination", "recovery_verified"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "semantic_family": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["product-operation", "offline"]},
+        "product_operation": {"type": ["string", "null"]},
+        "boundary": {"enum": ["BlobStaged", "BlobPromoted", "PageAppended", "PageSynchronized", "WalAppended", "WalSynchronized", "RootPublished"]},
+        "expected_state": {"enum": ["prior", "complete"]},
+        "recovered_state": {"enum": ["prior", "complete"]},
+        "boundary_hook_reached": {"const": true},
+        "child_unwound": {"const": false},
+        "termination": {"const": "signal-9"},
+        "recovery_verified": {"const": true}
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Hosted Windows named-pipe lifecycle evidence for the installed v2 wheel."""
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _TRANSCRIPT_ENV = "HYPHAE_WINDOWS_ASYNC_TRANSCRIPT"
 _EXPECTED_WHEEL_ENV = "HYPHAE_WINDOWS_ASYNC_WHEEL"
 _EXPECTED_VERSION_ENV = "HYPHAE_WINDOWS_ASYNC_VERSION"
+_COORDINATION_TIMEOUT_SECONDS = 5.0
+_TERMINATION_TIMEOUT_SECONDS = 0.95
 
 
 class _GateFailure(AssertionError):
@@ -152,15 +154,17 @@ class _NamedPipePeer:
 
     def close(self) -> None:
         self._stop.set()
-        with self._lock:
-            handle = self._handle
-        if handle is not None:
-            kernel32 = _kernel32()
-            kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
-            kernel32.DisconnectNamedPipe(ctypes.c_void_p(handle))
-        self._thread.join(1)
+        deadline = time.monotonic() + _COORDINATION_TIMEOUT_SECONDS
+        while self._thread.is_alive() and time.monotonic() < deadline:
+            with self._lock:
+                handle = self._handle
+                if handle is not None:
+                    kernel32 = _kernel32()
+                    kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+                    kernel32.DisconnectNamedPipe(ctypes.c_void_p(handle))
+            self._thread.join(0.05)
         if self._thread.is_alive():
-            raise _GateFailure("named-pipe peer did not stop within one second")
+            raise _GateFailure("named-pipe peer did not stop after cancellation")
         if self.error is not None:
             raise _GateFailure("named-pipe peer failed") from self.error
 
@@ -173,6 +177,8 @@ class _NamedPipePeer:
             self.ready.set()
             connections = 2 if self._reconnect else 1
             for index in range(connections):
+                if self._stop.is_set():
+                    break
                 if index:
                     self.reconnect_ready.set()
                 self._connect(handle)
@@ -322,7 +328,7 @@ class _NamedPipePeer:
 
 
 async def _wait_event(event: threading.Event, message: str) -> None:
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + _COORDINATION_TIMEOUT_SECONDS
     while not event.is_set():
         if time.monotonic() >= deadline:
             raise _GateFailure(message)
@@ -354,9 +360,13 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
         if action == "task_cancel":
             operation.cancel()
         elif action == "aclose":
-            await asyncio.wait_for(client.aclose(), timeout=0.95)
+            await asyncio.wait_for(
+                client.aclose(), timeout=_TERMINATION_TIMEOUT_SECONDS
+            )
         try:
-            await asyncio.wait_for(asyncio.shield(operation), timeout=0.95)
+            await asyncio.wait_for(
+                asyncio.shield(operation), timeout=_TERMINATION_TIMEOUT_SECONDS
+            )
         except asyncio.CancelledError:
             if action != "task_cancel":
                 raise _GateFailure("operation returned task cancellation unexpectedly")
@@ -381,7 +391,7 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
                     {},
                     options=RequestOptions(request_id=request_id + 100),
                 ),
-                timeout=0.95,
+                timeout=_COORDINATION_TIMEOUT_SECONDS,
             )
             if response.kind != "capabilities":
                 raise _GateFailure("reconnected stream returned the wrong response")

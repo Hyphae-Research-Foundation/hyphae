@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-g6-conformance-runner"
 version = "0.0.0"
 edition = "2024"
 publish = false
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 
 [dependencies]
 hyphae-native-product = { path = "../../../../crates/hyphae-native-product" }

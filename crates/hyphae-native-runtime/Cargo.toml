@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-runtime"
 description = "Experimental native transactional runtime joining Hyphae's relational, structure, and search kernels"
@@ -17,6 +18,7 @@ include = [
     "LICENSE-DOCUMENTATION",
     "LICENSE-POLICY.md",
     "README.md",
+    "THIRD_PARTY_NOTICES.md",
     "src/**",
     "tests/**",
 ]
@@ -40,10 +42,18 @@ unicode-casefold.workspace = true
 unicode-normalization.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+same-file.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-permissions.workspace = true
+windows-sys.workspace = true
 
 [lints]
 workspace = true

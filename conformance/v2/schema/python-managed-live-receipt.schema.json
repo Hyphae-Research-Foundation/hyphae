@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "$id": "https://hyphae.dev/schema/python-managed-v2-conformance-receipt-v1",
   "type": "object",
   "additionalProperties": false,
@@ -43,7 +43,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["major", "minor"],
-      "properties": {"major": {"const": 1}, "minor": {"const": 2}}
+      "properties": {"major": {"const": 1}, "minor": {"const": 3}}
     },
     "transports": {
       "oneOf": [
@@ -54,8 +54,9 @@
     "operations": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["reads", "writes"],
+      "required": ["lifecycle", "reads", "writes"],
       "properties": {
+        "lifecycle": {"const": ["security_api_key_issue_abort", "security_api_key_issue_activate", "security_api_key_issue_start", "security_api_key_revoke", "security_legacy_bearer_revoke"]},
         "reads": {"const": ["security_assignment_list", "security_audit_read", "security_key_list", "security_principal_list", "security_role_list", "security_status"]},
         "writes": {"const": ["security_assignment_revoke", "security_built_in_assignment_create", "security_custom_assignment_create", "security_custom_role_create", "security_principal_create", "security_principal_set_enabled"]}
       }
@@ -63,7 +64,7 @@
     "cases": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["conflict", "next_operation_revocation", "pagination", "readback", "redaction", "replay", "stale_cursor"],
+      "required": ["conflict", "next_operation_revocation", "pagination", "readback", "redaction", "replay", "stale_cursor", "terminal_replay"],
       "properties": {
         "conflict": {"const": true},
         "next_operation_revocation": {"const": true},
@@ -71,7 +72,8 @@
         "readback": {"const": true},
         "redaction": {"const": true},
         "replay": {"const": true},
-        "stale_cursor": {"const": true}
+        "stale_cursor": {"const": true},
+        "terminal_replay": {"const": true}
       }
     },
     "transcript_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

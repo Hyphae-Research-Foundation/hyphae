@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -282,6 +282,12 @@ impl CatalogState {
 
     pub(crate) fn logical_object(&self, id: ObjectId) -> Option<&LogicalCatalogObject> {
         self.logical_objects.get(&id)
+    }
+
+    pub(crate) fn parent(&self, id: ObjectId) -> Option<ObjectId> {
+        self.logical_objects
+            .get(&id)
+            .and_then(LogicalCatalogObject::parent)
     }
 
     pub(crate) fn object_qualified(&self, name: &QualifiedName) -> Option<&CatalogObject> {

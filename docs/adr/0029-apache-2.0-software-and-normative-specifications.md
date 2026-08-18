@@ -1,10 +1,10 @@
 # ADR-0029: Apache-2.0 software and normative specifications
 
-- Status: Accepted
+- Status: Accepted and effective
 - Date: 2026-08-15
 - Owners: Celiums Solutions LLC
-- Supersedes: ADR-0025 for the `1.2.0` target and later releases; ADR-0025
-  remains the immutable authority for `1.1.0` and the current preflight tree
+- Supersedes: ADR-0025 for the current integration tree and `1.2.0` onward;
+  ADR-0025 remains the immutable authority for `1.1.0`
 
 ## Context
 
@@ -14,12 +14,11 @@ single-process, embeddable engine rather than a hosted service boundary. The
 AGPL network condition therefore does not protect its primary product surface,
 while strong copyleft creates adoption friction for embedding applications.
 
-The project has accepted a target direction for `1.2.0`, but copyright and
+The project first accepted a target direction for `1.2.0` while copyright and
 relicensing authority, prior commitments, dependency compatibility,
-contribution governance, and counsel approval are not established merely by
-that product decision. The repository needs a complete classification before
-legal preflight can finish, without changing the license currently attached to
-any source file or package.
+contribution governance, and counsel approval remained preflight conditions.
+Those conditions were subsequently accepted through source-bound evidence and
+the interactive owner attestation recorded for the effective transition.
 
 ## Decision
 
@@ -31,16 +30,16 @@ Published grants are not revoked or rewritten:
 |---|---|---|
 | `0.1.0` through `1.0.1` | `Apache-2.0` | `not-separately-specified` |
 | `1.1.0` | `AGPL-3.0-only` | `CC-BY-SA-4.0` |
-| `1.2.0` onward | target `Apache-2.0` | target `Apache-2.0` for normative specifications and `CC-BY-SA-4.0` for narrative documentation |
+| current integration tree and `1.2.0` onward | `Apache-2.0` | `Apache-2.0` for normative specifications and `CC-BY-SA-4.0` for narrative documentation |
 
 The tags in the first row contain the root Apache License 2.0 text and declare
 `Apache-2.0` in the root `README.md` and `Cargo.toml`. They do not contain a
 `LICENSE-DOCUMENTATION` or another separate documentation grant, so this ADR
 does not infer `CC-BY-4.0` or any other documentation license for them.
 
-The last row is a target, not a claim about the current checkout. ADR-0025 and
-the existing `LICENSE`, SPDX headers, package manifests, and generated metadata
-remain effective until the atomic transition described below.
+The last row became effective in the current integration tree at
+`2026-08-16T13:15:26Z`. ADR-0025 and the published `v1.1.0` artifacts remain
+historically accurate and are not retroactively changed.
 
 ### Exact categories
 
@@ -77,9 +76,7 @@ remain narrative. Historical prose and receipts may accurately quote AGPL or
 other historical terms without changing the license of the document itself.
 
 The root `NOTICE` is Apache legal material distributed with the software and
-therefore targets the software category. Its current content and effective
-license remain unchanged during preflight; it is included in release archives
-now so the eventual transition cannot omit it.
+therefore uses the software category. It remains included in release archives.
 
 The machine-readable authority for exact path rules, precedence, generated
 copies, and current blocker state is
@@ -111,14 +108,20 @@ license inventories, provenance records, historical release records, and the
 porting ledger are factual evidence and must not be mechanically rewritten as
 first-party license declarations.
 
-### Effective transition and stop conditions
+### Effective transition
 
-This ADR closes only the specification-classification decision; that product
-choice does not constitute counsel approval of this ADR or the transition. The
-target becomes effective only through one atomic relicensing commit after
-every required preflight category has accepted, source-bound evidence. Until
-then, new files retain the current AGPL software headers and current manifests
-and license texts do not change.
+The transition became effective in the current integration tree after every
+required category was accepted. The owner attestation records authority over
+all first-party contributions, written counsel approval, absence of
+incompatible commitments, coverage of the 173 `ec2-user` commits, and owner
+acceptance of the Apache section 6 boundary with existing `TRADEMARKS.md`. It
+does not falsely claim that counsel's confidential approval expressly covered
+section 6 or the trademark policy, and no public locator or hash is claimed.
+
+The twelve Dependabot commits were reviewed individually and accepted as
+mechanical first-party-maintained changes. Exact source bindings and review
+summaries are in the transition evidence. New contributions use
+inbound-equals-outbound terms and DCO 1.1 without a CLA or assignment.
 
 The transition stops if any of the following remains open or disputed:
 
@@ -130,8 +133,9 @@ The transition stops if any of the following remains open or disputed:
 - counsel-approved contribution governance; or
 - the ability to change every first-party authority coherently in one commit.
 
-No tag, package, crate, binary, or release may claim Apache-2.0 for `1.2.0`
-while a stop condition is open.
+The accepted source-bound evidence and the current integration-tree digest are
+recorded in `docs/gates/evidence/relicensing-1.2.0-transition.json`. A checker
+failure reopens the transition rather than permitting a partial declaration.
 
 ## Consequences
 
@@ -140,15 +144,15 @@ while a stop condition is open.
 - Implementers may use one permissive license for software and normative
   specifications without applying ShareAlike to an implementation.
 - Narrative adaptations retain attribution and ShareAlike obligations.
-- Current AGPL checks must stay green during preflight; this decision does not
-  authorize piecemeal SPDX, manifest, or license-text edits.
+- Current first-party checks require Apache-2.0 coherently across SPDX,
+  manifests, package metadata, SBOM conclusions, and license texts.
 - ADR-0025 remains in decision history and accurately governs `1.1.0`.
 
 ## Verification
 
-`tools/check_relicensing_preflight.py` strictly validates the classification
-contract, classifies every tracked or pending first-party repository path,
-checks the pinned historical tags and declarations, checks generated
-contract-copy inheritance, and prints open preflight blockers separately. A
-successful classification check means only that this contract is internally
-consistent; it does not mean the relicensing is complete.
+`tools/check_relicensing_preflight.py` strictly validates the effective
+classification contract, accepted evidence, all tracked or pending repository
+paths, pinned historical tags, generated-copy inheritance, and the transition
+tree digest. `tools/check_license_policy.py` verifies the expected license for
+every classified first-party path and rejects stale effective AGPL declarations
+outside its explicit historical-evidence allowlist.

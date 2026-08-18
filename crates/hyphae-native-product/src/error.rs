@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Transport-independent product errors and engine-to-product mappings.
 
@@ -313,6 +313,10 @@ pub enum ProductErrorCode {
     CatalogConflict,
     /// An idempotency identity was previously committed for another request.
     IdempotencyConflict,
+    /// A one-time key-start response was already delivered for this token.
+    SecretDeliveryConsumed,
+    /// API-key activation confirmation did not match the pending verifier.
+    ConfirmationDigestMismatch,
     /// The request deadline elapsed before a definite result.
     DeadlineExceeded,
     /// The caller cancelled the request before a definite result.
@@ -325,6 +329,8 @@ pub enum ProductErrorCode {
     UnknownCommit,
     /// Backup authority is malformed or fails verification.
     BackupInvalid,
+    /// Durable metadata is valid but requires an explicit local upgrade.
+    UpgradeRequired,
     /// A future v1 code not recognized by this build.
     Unknown(ProductErrorIdentifier),
 }
@@ -357,12 +363,15 @@ impl ProductErrorCode {
             Self::InvalidRequest => "invalid_request",
             Self::CatalogConflict => "catalog_conflict",
             Self::IdempotencyConflict => "idempotency_conflict",
+            Self::SecretDeliveryConsumed => "secret_delivery_consumed",
+            Self::ConfirmationDigestMismatch => "confirmation_digest_mismatch",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Cancelled => "cancelled",
             Self::AuthorizationDenied => "authorization_denied",
             Self::Unavailable => "unavailable",
             Self::UnknownCommit => "unknown_commit",
             Self::BackupInvalid => "backup_invalid",
+            Self::UpgradeRequired => "upgrade_required",
             Self::Unknown(raw) => raw.as_str(),
         }
     }
@@ -398,12 +407,15 @@ impl ProductErrorCode {
             "invalid_request" => Self::InvalidRequest,
             "catalog_conflict" => Self::CatalogConflict,
             "idempotency_conflict" => Self::IdempotencyConflict,
+            "secret_delivery_consumed" => Self::SecretDeliveryConsumed,
+            "confirmation_digest_mismatch" => Self::ConfirmationDigestMismatch,
             "deadline_exceeded" => Self::DeadlineExceeded,
             "cancelled" => Self::Cancelled,
             "authorization_denied" => Self::AuthorizationDenied,
             "unavailable" => Self::Unavailable,
             "unknown_commit" => Self::UnknownCommit,
             "backup_invalid" => Self::BackupInvalid,
+            "upgrade_required" => Self::UpgradeRequired,
             _ => Self::Unknown(ProductErrorIdentifier::new(raw)?),
         })
     }
@@ -640,6 +652,24 @@ pub const PRODUCT_ERROR_REGISTRY_V1: &[ProductErrorDefinition] = &[
         ProductErrorCategory::Conflict,
         Some(ProductRetry::Never),
         "native idempotency identity conflicts with the request",
+    ),
+    definition(
+        ProductErrorCode::SecretDeliveryConsumed,
+        ProductErrorCategory::Conflict,
+        Some(ProductRetry::Never),
+        "API key secret delivery was already consumed",
+    ),
+    definition(
+        ProductErrorCode::ConfirmationDigestMismatch,
+        ProductErrorCategory::Authorization,
+        Some(ProductRetry::Never),
+        "API key activation confirmation does not match",
+    ),
+    definition(
+        ProductErrorCode::UpgradeRequired,
+        ProductErrorCategory::Conflict,
+        Some(ProductRetry::AfterRecovery),
+        "native durable metadata requires explicit upgrade",
     ),
 ];
 
@@ -1366,6 +1396,9 @@ impl From<NativeRuntimeError> for ProductError {
             NativeRuntimeError::Directory(NativeDirectoryError::AlreadyLocked(_)) => {
                 Self::from_code(ProductErrorCode::DataDirectoryLocked)
             }
+            NativeRuntimeError::Directory(NativeDirectoryError::OfflineOwnerAuthorityDenied) => {
+                Self::from_code(ProductErrorCode::AuthorizationDenied)
+            }
             NativeRuntimeError::Directory(NativeDirectoryError::Format2Directory(_)) => {
                 Self::from_code(ProductErrorCode::Format2Directory)
             }
@@ -1549,6 +1582,7 @@ impl From<SqlError> for ProductError {
                     ),
                 )
             }
+            SqlError::ExecutionInterrupted => Self::from_code(ProductErrorCode::Cancelled),
             SqlError::Runtime(source) => source.into(),
         }
     }

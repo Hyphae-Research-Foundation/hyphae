@@ -20,10 +20,13 @@ The client consumes only public versioned contracts and never opens or owns a
 local Hyphae data directory.
 
 The additive `hyphae_client::v2` module exposes equivalent high-level Native
-operations over canonical HTTP `/v2/execute` product envelopes and exact
-`HYPHLCL1` AF_UNIX/Windows named-pipe transport. It uses product-owned contract
-types and preserves typed product errors, deadlines, cancellation, and
-transaction outcome state.
+operations over canonical HTTP v2 product envelopes and exact `HYPHLCL1`
+AF_UNIX/Windows named-pipe transport. API-key lifecycle operations use only
+`/v2/security/keys`; the generic `/v2/execute` route rejects them. The client
+offers protocol minor 3 and validates the exact selected response minor before
+retaining session state or decoding a body. It uses product-owned contract types
+and preserves typed product errors, deadlines, cancellation, and transaction
+outcome state.
 
 Native v2 bearer credentials may use plaintext `http://` only with a canonical
 loopback host (`127.0.0.0/8`, `[::1]`, or exact `localhost`).
@@ -32,6 +35,6 @@ credential can be sent; remote managed endpoints require `https://`. This
 restriction is additive to `hyphae_client::v2` and does not change the
 published `/v1` client.
 
-Code is AGPL-3.0-only; documentation is CC-BY-SA-4.0. Source, examples, and
+Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source, examples, and
 security policy:
 [`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).

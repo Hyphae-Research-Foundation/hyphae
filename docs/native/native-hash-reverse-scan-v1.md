@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native reverse hash scan v1
 
 Status: accepted implementation target.

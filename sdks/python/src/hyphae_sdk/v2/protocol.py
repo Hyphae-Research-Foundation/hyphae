@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Exact dependency-free HYPHLCL1 and product-envelope codecs."""
 
 from __future__ import annotations
@@ -8,13 +8,13 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
-from .models import ClientError, ProductErrorFields, RequestOptions, Response
+from .models import ClientError, ProductErrorFields, RequestOptions, Response, SensitiveBytes
 
 
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 2
+PROTOCOL_MINOR = 3
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -22,6 +22,7 @@ MAX_SECURITY_TEXT_BYTES = 128
 MAX_SECURITY_LIST_ROWS = 1_000
 MAX_SECURITY_GRANTS = 256
 MAX_SECURITY_ASSIGNMENTS = 128
+MAX_CATALOG_VISIBLE_ITEMS = 4_096
 FRAME_KINDS = {
     "hello": 1,
     "welcome": 2,
@@ -88,6 +89,22 @@ REQUEST_KINDS = {
     "security_built_in_assignment_create": 51,
     "security_custom_assignment_create": 52,
     "security_assignment_revoke": 53,
+    "catalog_visible_list": 54,
+    "security_api_key_issue_self_start": 55,
+    "security_api_key_issue_start": 56,
+    "security_api_key_issue_self_activate": 57,
+    "security_api_key_issue_activate": 58,
+    "security_api_key_rotate_self_start": 59,
+    "security_api_key_rotate_start": 60,
+    "security_api_key_rotate_self_activate": 61,
+    "security_api_key_rotate_activate": 62,
+    "security_api_key_issue_self_abort": 63,
+    "security_api_key_issue_abort": 64,
+    "security_api_key_rotate_self_abort": 65,
+    "security_api_key_rotate_abort": 66,
+    "security_api_key_revoke_self": 67,
+    "security_api_key_revoke": 68,
+    "security_legacy_bearer_revoke": 70,
 }
 
 SECURITY_READ_OPERATIONS = frozenset({
@@ -105,7 +122,27 @@ SECURITY_WRITE_OPERATIONS = frozenset({
     "security_built_in_assignment_create",
     "security_custom_assignment_create",
     "security_assignment_revoke",
+    "security_api_key_issue_self_start",
+    "security_api_key_issue_start",
+    "security_api_key_issue_self_activate",
+    "security_api_key_issue_activate",
+    "security_api_key_rotate_self_start",
+    "security_api_key_rotate_start",
+    "security_api_key_rotate_self_activate",
+    "security_api_key_rotate_activate",
+    "security_api_key_issue_self_abort",
+    "security_api_key_issue_abort",
+    "security_api_key_rotate_self_abort",
+    "security_api_key_rotate_abort",
+    "security_api_key_revoke_self",
+    "security_api_key_revoke",
+    "security_legacy_bearer_revoke",
 })
+API_KEY_LIFECYCLE_OPERATIONS = frozenset(
+    operation for operation in SECURITY_WRITE_OPERATIONS
+    if operation.startswith("security_api_key_")
+    or operation == "security_legacy_bearer_revoke"
+)
 SECURITY_READ_RESPONSE_KINDS = frozenset(range(32, 38))
 SECURITY_WRITE_RESPONSE_KINDS = frozenset(range(38, 42))
 
@@ -146,6 +183,7 @@ SECURITY_AUDIT_ACTIONS = (
     "abort_key_issue",
     "set_principal_enabled",
     "revoke_assignment",
+    "revoke_legacy_bearer",
 )
 
 DEFAULT_PROOF_LIMITS = {
@@ -222,8 +260,8 @@ def encode_hello(
     """Encode a legacy-compatible HELLO.
 
     The default remains the original 1.0 byte sequence. Current transports
-    opt into minor 2 explicitly so old callers and published fixtures do not
-    change beneath them.
+    opt into the current lifecycle minor explicitly so old callers and
+    published fixtures do not change beneath them.
     """
 
     if not 0 <= maximum_minor <= PROTOCOL_MINOR:
@@ -336,8 +374,12 @@ def operation_required_minor(
     if operation == "proof_generate" and arguments is not None:
         nested = arguments.get("operation")
         return operation_required_minor(nested) if isinstance(nested, str) else 0
+    if operation in API_KEY_LIFECYCLE_OPERATIONS:
+        return 3
     if operation in SECURITY_WRITE_OPERATIONS:
         return 2
+    if operation == "catalog_visible_list":
+        return 3
     if operation in SECURITY_READ_OPERATIONS:
         return 1
     return 0
@@ -346,6 +388,8 @@ def operation_required_minor(
 def response_required_minor(kind: int) -> int:
     if kind in SECURITY_WRITE_RESPONSE_KINDS:
         return 2
+    if kind in {42, 43, 44}:
+        return 3
     if kind in SECURITY_READ_RESPONSE_KINDS:
         return 1
     return 0
@@ -366,6 +410,8 @@ def encode_product_request(
     ):
         raise ClientError("native operation is unavailable at the negotiated protocol minor")
     limits = options.limits
+    if operation in API_KEY_LIFECYCLE_OPERATIONS and options.durability != "strict":
+        raise ClientError("API-key lifecycle requires strict durability")
     if options.deadline_micros is not None and options.deadline_micros <= 0:
         raise ClientError("deadline_micros must be positive")
     if any(
@@ -424,11 +470,20 @@ def decode_product_request(encoded: bytes) -> tuple[str, dict[str, Any], Request
         raise ClientError("unsupported product request kind")
     if operation in SECURITY_WRITE_OPERATIONS and token is None:
         raise ClientError("security mutation requires a nonzero idempotency_token")
+    if operation in API_KEY_LIFECYCLE_OPERATIONS and options.durability != "strict":
+        raise ClientError("API-key lifecycle requires strict durability")
     return operation, _decode_operation(operation, payload[offset:]), options
 
 
 def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
-    if operation in {"capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"}:
+    if operation in {
+        "capabilities",
+        "admin_status",
+        "admin_checkpoint",
+        "telemetry",
+        "transaction_begin",
+        "security_legacy_bearer_revoke",
+    }:
         return b""
     if operation in {"structure_get", "structure_ttl"}:
         return _bytes(arguments["key"])
@@ -482,6 +537,22 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         return struct.pack("<BB6x", parent is not None, kind_tag) + (
             int(parent).to_bytes(16, "little") if parent is not None else b""
         ) + _encode_cursor(arguments.get("cursor")) + struct.pack(
+            "<QQQ",
+            arguments["item_limit"],
+            arguments["visit_limit"],
+            arguments["byte_limit"],
+        )
+    if operation == "catalog_visible_list":
+        parent = arguments.get("parent")
+        kind = arguments.get("kind")
+        cursor = arguments.get("cursor")
+        if cursor is not None and not isinstance(cursor, bytes):
+            raise ClientError("catalog visible cursor must be bytes")
+        return struct.pack(
+            "<BB6x", parent is not None, 0 if kind is None else _catalog_kind_tag(kind)
+        ) + (
+            int(parent).to_bytes(16, "little") if parent is not None else b""
+        ) + _bytes(cursor or b"") + struct.pack(
             "<QQQ",
             arguments["item_limit"],
             arguments["visit_limit"],
@@ -580,6 +651,36 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         return _security_id(arguments["principal_id"]) + _security_id(arguments["role_id"])
     if operation == "security_assignment_revoke":
         return _security_id(arguments["assignment_id"])
+    if operation in {"security_api_key_issue_self_start", "security_api_key_issue_start"}:
+        expiry = arguments.get("expires_at_micros")
+        return (
+            _security_id(arguments["principal_id"])
+            + _security_text(arguments["label"])
+            + _encode_built_in_roles(arguments["roles"])
+            + _encode_security_ids(arguments.get("custom_roles", []))
+            + struct.pack("<Q", _permission_bits(arguments["permission_ceiling"]))
+            + _encode_product_scopes(arguments["scope_ceiling"])
+            + struct.pack("<B7xq", expiry is not None, expiry or 0)
+        )
+    if operation in {"security_api_key_issue_self_activate", "security_api_key_issue_activate"}:
+        return _api_key_id(arguments["key_id"]) + _confirmation_digest(arguments["confirmation_digest"])
+    if operation in {"security_api_key_rotate_self_start", "security_api_key_rotate_start"}:
+        expiry = arguments.get("expires_at_micros")
+        return (
+            _api_key_id(arguments["predecessor_key_id"])
+            + _security_text(arguments["label"])
+            + struct.pack("<Q", arguments["overlap_seconds"])
+            + struct.pack("<B7xq", expiry is not None, expiry or 0)
+        )
+    if operation in {"security_api_key_rotate_self_activate", "security_api_key_rotate_activate"}:
+        return _api_key_id(arguments["successor_key_id"]) + _confirmation_digest(arguments["confirmation_digest"])
+    if operation in {
+        "security_api_key_issue_self_abort", "security_api_key_issue_abort",
+        "security_api_key_revoke_self", "security_api_key_revoke",
+    }:
+        return _api_key_id(arguments["key_id"])
+    if operation in {"security_api_key_rotate_self_abort", "security_api_key_rotate_abort"}:
+        return _api_key_id(arguments["successor_key_id"])
     raise ClientError(f"binary operation encoder is not implemented for {operation}")
 
 
@@ -644,6 +745,39 @@ def _api_key_id(value: Any) -> bytes:
     if not isinstance(value, bytes) or len(value) != 16 or value == b"\0" * 16:
         raise ClientError("API key identity must contain 16 nonzero bytes")
     return value
+
+
+def _confirmation_digest(value: Any) -> bytes:
+    if not isinstance(value, bytes) or len(value) != 32:
+        raise ClientError("API key confirmation digest must contain 32 bytes")
+    return value
+
+
+def _permission_bits(values: Any) -> int:
+    if not isinstance(values, list) or not values:
+        raise ClientError("API key permission ceiling must be a nonempty list")
+    try:
+        return sum(1 << PRODUCT_PERMISSIONS.index(value) for value in set(values))
+    except ValueError as error:
+        raise ClientError("API key permission ceiling is invalid") from error
+
+
+def _encode_built_in_roles(values: Any) -> bytes:
+    if not isinstance(values, list) or len(values) > len(BUILT_IN_ROLES):
+        raise ClientError("API key roles are invalid")
+    return struct.pack("<I4x", len(values)) + b"".join(_built_in_role(value) for value in values)
+
+
+def _encode_security_ids(values: Any) -> bytes:
+    if not isinstance(values, list) or len(values) > MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("API key custom roles are invalid")
+    return struct.pack("<I4x", len(values)) + b"".join(_security_id(value) for value in values)
+
+
+def _encode_product_scopes(values: Any) -> bytes:
+    if not isinstance(values, list) or not 0 < len(values) <= MAX_SECURITY_ASSIGNMENTS:
+        raise ClientError("API key scope ceiling is invalid")
+    return struct.pack("<I4x", len(values)) + b"".join(_encode_product_scope(value) for value in values)
 
 
 def _built_in_role(value: Any) -> bytes:
@@ -803,6 +937,7 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         "telemetry",
         "transaction_begin",
         "security_status",
+        "security_legacy_bearer_revoke",
     }:
         if encoded:
             raise ClientError("parameterless request has trailing bytes")
@@ -831,6 +966,24 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         result = {"handle": reader.u64()}
     elif operation == "transaction_status_by_idempotency":
         result = {"idempotency_token": reader.u128()}
+    elif operation == "catalog_visible_list":
+        has_parent = reader.boolean()
+        kind = reader.u8()
+        reader.zeroes(6)
+        kinds = (
+            "database", "schema", "relation", "secondary_index", "keyspace",
+            "structure", "search_collection", "analyzer", "cross_engine_link",
+        )
+        if kind > len(kinds):
+            raise ClientError("catalog object kind is invalid")
+        result = {
+            "parent": reader.u128() if has_parent else None,
+            "kind": None if kind == 0 else kinds[kind - 1],
+            "cursor": reader.bytes() or None,
+            "item_limit": reader.u64(),
+            "visit_limit": reader.u64(),
+            "byte_limit": reader.u64(),
+        }
     elif operation == "structure_read":
         result = _decode_structure_read_request(reader)
     elif operation in {
@@ -876,6 +1029,48 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         }
     elif operation == "security_assignment_revoke":
         result = {"assignment_id": _decode_security_id(reader)}
+    elif operation in {"security_api_key_issue_self_start", "security_api_key_issue_start"}:
+        principal_id = _decode_security_id(reader)
+        label = _decode_security_text(reader)
+        role_count = reader.u32()
+        reader.zeroes(4)
+        roles = [_decode_built_in_role(reader) for _ in range(role_count)]
+        custom_count = reader.u32()
+        reader.zeroes(4)
+        custom_roles = [_decode_security_id(reader) for _ in range(custom_count)]
+        permission_bits = reader.u64()
+        scope_count = reader.u32()
+        reader.zeroes(4)
+        result = {
+            "principal_id": principal_id,
+            "label": label,
+            "roles": roles,
+            "custom_roles": custom_roles,
+            "permission_ceiling": [
+                permission for tag, permission in enumerate(PRODUCT_PERMISSIONS)
+                if permission_bits & (1 << tag)
+            ],
+            "scope_ceiling": [_decode_product_scope(reader) for _ in range(scope_count)],
+            "expires_at_micros": _decode_optional_i64(reader),
+        }
+    elif operation in {"security_api_key_issue_self_activate", "security_api_key_issue_activate"}:
+        result = {"key_id": reader.take(16), "confirmation_digest": reader.take(32)}
+    elif operation in {"security_api_key_rotate_self_start", "security_api_key_rotate_start"}:
+        result = {
+            "predecessor_key_id": reader.take(16),
+            "label": _decode_security_text(reader),
+            "overlap_seconds": reader.u64(),
+            "expires_at_micros": _decode_optional_i64(reader),
+        }
+    elif operation in {"security_api_key_rotate_self_activate", "security_api_key_rotate_activate"}:
+        result = {"successor_key_id": reader.take(16), "confirmation_digest": reader.take(32)}
+    elif operation in {
+        "security_api_key_issue_self_abort", "security_api_key_issue_abort",
+        "security_api_key_revoke_self", "security_api_key_revoke",
+    }:
+        result = {"key_id": reader.take(16)}
+    elif operation in {"security_api_key_rotate_self_abort", "security_api_key_rotate_abort"}:
+        result = {"successor_key_id": reader.take(16)}
     else:
         raise ClientError(f"binary operation decoder is not implemented for {operation}")
     reader.finish()
@@ -1236,6 +1431,36 @@ def decode_product_response(
         value = _decode_commit_outcome(reader)
         reader.finish()
         return Response("catalog_created", value, request_id)
+    if kind == 42:
+        cursor = reader.bytes()
+        count = reader.u32()
+        if count > MAX_CATALOG_VISIBLE_ITEMS or count > reader.remaining // 36:
+            raise ClientError("catalog visible page item count exceeds its bound")
+        items = []
+        for _ in range(count):
+            object_id = reader.u128()
+            object_kind = reader.u8()
+            has_parent = reader.boolean()
+            reader.zeroes(6)
+            if object_id == 0:
+                raise ClientError("catalog visible object identity is zero")
+            if not 1 <= object_kind <= 9:
+                raise ClientError("catalog visible object kind is invalid")
+            parent = reader.u128() if has_parent else None
+            if parent == 0:
+                raise ClientError("catalog visible parent identity is zero")
+            items.append({
+                "id": object_id,
+                "object_kind": object_kind,
+                "parent": parent,
+                "name": _decode_qualified_name(reader),
+            })
+        reader.finish()
+        return Response(
+            "catalog_visible_page",
+            {"cursor": cursor or None, "items": items},
+            request_id,
+        )
     if kind == 17:
         if reader.u8() != 0:
             raise ClientError("explain response is not an SQL plan")
@@ -1398,6 +1623,30 @@ def decode_product_response(
         }
         reader.finish()
         return Response("security_mutated", value, request_id)
+    if kind == 43:
+        key_id = _decode_api_key_id(reader)
+        principal_id = _decode_security_id(reader)
+        predecessor_key_id = _decode_optional_api_key_id(reader)
+        value = {
+            "key_id": key_id,
+            "principal_id": principal_id,
+            "predecessor_key_id": predecessor_key_id,
+            "authorization_epoch": _decode_authorization_epoch(reader),
+            "commit": _decode_commit_receipt(reader),
+            "secret": _decode_api_key_secret(reader, key_id),
+        }
+        reader.finish()
+        return Response("security_api_key_started", value, request_id)
+    if kind == 44:
+        value = {
+            "key_id": _decode_api_key_id(reader),
+            "predecessor_key_id": _decode_optional_api_key_id(reader),
+            "overlap_until_micros": _decode_optional_i64(reader),
+            "authorization_epoch": _decode_authorization_epoch(reader),
+            "commit": _decode_commit_receipt(reader),
+        }
+        reader.finish()
+        return Response("security_api_key_activated", value, request_id)
     raise ClientError(f"unsupported product response kind: {kind}")
 
 
@@ -1406,6 +1655,42 @@ def _decode_authorization_epoch(reader: _Reader) -> int:
     if value == 0:
         raise ClientError("authorization epoch is zero")
     return value
+
+
+def _decode_optional_api_key_id(reader: _Reader) -> bytes | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    value = reader.take(16)
+    if not present and value != b"\0" * 16:
+        raise ClientError("optional API key identity is malformed")
+    if present and value == b"\0" * 16:
+        raise ClientError("optional API key identity is zero")
+    return value if present else None
+
+
+def _decode_api_key_secret(reader: _Reader, expected_id: bytes) -> SensitiveBytes:
+    secret = reader.bytes()
+    lower_hex = b"0123456789abcdef"
+    if (
+        len(secret) != API_KEY_BYTES
+        or secret[:5] != b"hyp1_"
+        or secret[37:38] != b"_"
+        or any(byte not in lower_hex for byte in secret[5:37])
+        or any(byte not in lower_hex for byte in secret[38:])
+    ):
+        raise ClientError("API key secret is noncanonical")
+    if secret[5:37] != expected_id.hex().encode("ascii"):
+        raise ClientError("API key secret identity differs from its receipt")
+    return SensitiveBytes(secret)
+
+
+def _decode_optional_i64(reader: _Reader) -> int | None:
+    present = reader.boolean()
+    reader.zeroes(7)
+    value = reader.i64()
+    if not present and value != 0:
+        raise ClientError("optional instant is malformed")
+    return value if present else None
 
 
 def _decode_security_status(reader: _Reader) -> dict[str, Any]:
@@ -1662,6 +1947,9 @@ def _decode_security_audit_event(reader: _Reader) -> dict[str, Any]:
         target_kind = reader.u8()
         reader.zeroes(7)
         target_wire = reader.take(16)
+        if target_kind == 4 and target_wire == b"\0" * 16:
+            targets.append({"kind": "legacy_bearer"})
+            continue
         if target_kind > 3 or target_wire == b"\0" * 16:
             raise ClientError("security audit target is invalid")
         targets.append({
@@ -2299,6 +2587,16 @@ def _decode_commit_receipt(reader: _Reader) -> dict[str, Any]:
     value["durability"] = ("strict", "group", "memory")[tag]
     value["durability_cohort_size"] = reader.u64()
     value["durability_cohort_position"] = reader.u64()
+    if (
+        value["transaction_id"] == 0
+        or value["commit_csn"] == 0
+        or value["catalog_version"] == 0
+        or value["commit_lsn"] == 0
+        or value["wal_block_digest"] == b"\0" * 32
+        or value["durability_cohort_size"] == 0
+        or value["durability_cohort_position"] >= value["durability_cohort_size"]
+    ):
+        raise ClientError("commit receipt is noncanonical")
     return value
 
 
@@ -2589,6 +2887,10 @@ class _Reader:
         value = self.encoded[self.offset:self.offset + length]
         self.offset += length
         return value
+
+    @property
+    def remaining(self) -> int:
+        return len(self.encoded) - self.offset
 
     def zeroes(self, length: int) -> None:
         if self.take(length) != b"\0" * length:

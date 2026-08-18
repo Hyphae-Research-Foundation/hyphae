@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Stable `/v1` error codes
 
 Every error body has exactly `code`, `message`, and `request_id`. Messages are

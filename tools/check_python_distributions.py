@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Inspect Python wheel and sdist contents without installing them."""
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def validate_metadata(encoded: bytes, version: str) -> None:
         fail("distribution metadata name/version differs from the release")
     if metadata.get("Requires-Python") != ">=3.11":
         fail("distribution metadata lost the supported Python floor")
-    if metadata.get("License-Expression") != "AGPL-3.0-only":
+    if metadata.get("License-Expression") != "Apache-2.0":
         fail("distribution metadata lost the SPDX license expression")
     if metadata.get_all("Requires-Dist", failobj=[]):
         fail("distribution unexpectedly declares runtime dependencies")
@@ -88,6 +88,7 @@ def validate_sdist(path: Path, version: str) -> int:
                 f"{root}LICENSE",
                 f"{root}LICENSE-DOCUMENTATION",
                 f"{root}LICENSE-POLICY.md",
+                f"{root}THIRD_PARTY_NOTICES.md",
                 f"{root}src/hyphae_sdk/py.typed",
             }
             if not required.issubset(names):

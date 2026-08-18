@@ -2,18 +2,18 @@
 
 Copyright 2026 Celiums Solutions LLC.
 
-Hyphae uses separate licenses for software and documentation:
+Hyphae uses separate licenses by dominant purpose:
 
-- Software is licensed under the GNU Affero General Public License version 3 only
-  (`AGPL-3.0-only`). This includes source code, tests, examples, build and
-  release tooling, machine-readable contracts and schemas, generated code,
-  configuration used to build or operate the product, and executable samples.
-  The complete terms are in [`LICENSE`](LICENSE).
-- Documentation is licensed under the Creative Commons Attribution-ShareAlike
-  4.0 International license (`CC-BY-SA-4.0`). This includes repository prose,
-  guides, ADRs, diagrams, and documentation-only illustrations unless a file
-  states otherwise. The complete terms are in
-  [`LICENSE-DOCUMENTATION`](LICENSE-DOCUMENTATION).
+- Software and implementable normative specifications are licensed under the
+  Apache License 2.0 (`Apache-2.0`). This includes source, tests, examples,
+  tooling, configuration, machine-enforced data, schemas, public contracts,
+  generated code, and normative specifications. The complete terms are in
+  [`LICENSE`](LICENSE).
+- Narrative documentation is licensed under the Creative Commons
+  Attribution-ShareAlike 4.0 International license (`CC-BY-SA-4.0`). This
+  includes prose-only guides, governance, ADRs, roadmaps, and README files
+  unless a higher-precedence classification rule applies. The complete terms
+  are in [`LICENSE-DOCUMENTATION`](LICENSE-DOCUMENTATION).
 
 The Hyphae name, logos, product marks, and brand identity are not granted under
 either license. Their use is governed by
@@ -23,17 +23,21 @@ Third-party components and materials retain their own licenses; see
 dependency metadata, and
 the source-porting ledger where applicable.
 
-This policy applies to the repository after its adoption on 2026-08-10 and to
-future releases. Published releases through `v1.0.1` remain available under
-their original Apache-2.0 terms. Those prior grants are not revoked.
+The current integration tree adopted this policy on 2026-08-16. Published
+releases and immutable tags retain the terms under which they were published:
 
-Section 13 of AGPLv3 requires an operator who modifies Hyphae and lets users
-interact with that modified version remotely through a computer network to
-offer those users the Corresponding Source of the running modified version.
-This policy does not extend the license to the Hyphae trademarks or to
-third-party components under their own terms.
+| Release | Software | Documentation |
+|---|---|---|
+| `v0.1.0` through `v1.0.1` | `Apache-2.0` | not separately specified |
+| `v1.1.0` | `AGPL-3.0-only` | `CC-BY-SA-4.0` |
+| current tree and `v1.2.0` onward | `Apache-2.0` | `Apache-2.0` for normative specifications; `CC-BY-SA-4.0` for narrative documentation |
+
+Those prior grants are not revoked. Historical records may quote their exact
+terms without becoming current first-party declarations.
 
 Unless a contribution is explicitly accompanied by different accepted terms,
-submitting code or machine-readable contracts to this repository means
-licensing that contribution under `AGPL-3.0-only`; submitting documentation
-means licensing it under `CC-BY-SA-4.0`.
+submitting software or a normative specification means licensing it under
+`Apache-2.0`; submitting narrative documentation means licensing it under
+`CC-BY-SA-4.0`. Inbound and outbound terms match. Contributions also require a
+DCO 1.1 sign-off as described in the repository contribution policy; no CLA or
+assignment is implied.

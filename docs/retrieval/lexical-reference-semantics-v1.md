@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Lexical retrieval reference semantics v1
 
 Status: normative for Hyphae `0.2`.

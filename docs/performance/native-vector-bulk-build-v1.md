@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native vector bulk-build experiment v1
 
 Status: P4 experimental interface; no durable generation or release claim

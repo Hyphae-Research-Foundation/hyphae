@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Hyphae 0.2 retrieval benchmark methodology
 
 Status: normative local evidence procedure

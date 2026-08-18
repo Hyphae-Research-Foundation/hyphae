@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{fmt, io, path::PathBuf};
 
@@ -636,6 +636,8 @@ pub enum NativeProofError {
     WitnessAnchorMismatch,
     /// The supplied witness differs from the exact artifact referenced by the proof.
     WitnessReferenceMismatch,
+    /// A caller-owned cooperative checkpoint interrupted proof work.
+    Interrupted,
 }
 
 impl fmt::Display for NativeProofError {
@@ -687,6 +689,7 @@ impl fmt::Display for NativeProofError {
             Self::WitnessReferenceMismatch => {
                 formatter.write_str("native witness does not match the proof reference")
             }
+            Self::Interrupted => formatter.write_str("native proof operation was interrupted"),
         }
     }
 }

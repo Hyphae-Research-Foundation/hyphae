@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fail-closed static contract for the publishable Python SDK."""
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ WORKFLOW = Path(".github/workflows/python-publish.yml")
 EXPECTED_NAME = "hyphae-sdk"
 REQUIRED_URLS = {"Homepage", "Documentation", "Repository", "Issues", "Changelog"}
 PYPI_ACTION = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+APACHE_RELEASE_VERSION = "1.2.0"
 
 
 class PythonPackageValidationError(ValueError):
@@ -82,8 +83,14 @@ def validate(
         fail("Python SDK runtime must remain standard-library only")
     if manifest.get("build-system", {}).get("requires") != ["setuptools==80.9.0"]:
         fail("Python build backend dependency must remain exactly pinned")
-    if project.get("license") != "AGPL-3.0-only":
+    if project.get("license") != "Apache-2.0":
         fail("Python SDK license expression must match the repository")
+    classifiers = project.get("classifiers")
+    if not isinstance(classifiers, list) or any(
+        isinstance(classifier, str) and classifier.startswith("License ::")
+        for classifier in classifiers
+    ):
+        fail("PEP 639 license expression must not be duplicated by a classifier")
     readme = project.get("readme")
     if readme != {"file": "README.md", "content-type": "text/markdown"}:
         fail("Python long description must be bound to its checked-in README")
@@ -100,6 +107,8 @@ def validate(
         "sdks/python/LICENSE",
         "sdks/python/LICENSE-DOCUMENTATION",
         "sdks/python/LICENSE-POLICY.md",
+        "sdks/python/THIRD_PARTY_NOTICES.md",
+        "sdks/python/build-dependencies.json",
         "sdks/python/src/hyphae_sdk/py.typed",
     ):
         if not (root / relative).is_file():
@@ -164,6 +173,7 @@ def validate(
         "actions/runs/${{ github.run_id }}/artifacts?per_page=100",
         "--independent-build-receipt independent-a/builder-receipt.json",
         "--independent-build-receipt independent-b/builder-receipt.json",
+        'test "$version" = "1.2.0"',
     }
     if any(fragment not in workflow for fragment in required_workflow):
         fail("Python Trusted Publishing workflow is incomplete")
@@ -244,6 +254,10 @@ def validate(
     publish_job = workflow_job(workflow, "publish")
     if "actions/checkout" in publish_job or "\n        run:" in publish_job:
         fail("OIDC publish job must not execute repository code or shell commands")
+    # The checked-in source remains 1.1.0 until release preparation, but every
+    # workflow path that can reach OIDC must reject it first.
+    if f'test "$version" = "{APACHE_RELEASE_VERSION}"' not in workflow:
+        fail("Apache Python publication must be gated on version 1.2.0")
     contract_root = workflow_root or root
     if not (
         contract_root / "docs/release/schema/python-distribution-receipt-v2.schema.json"

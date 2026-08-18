@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the managed Native v2 authority conformance corpus."""
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from tools.check_native_v2_authority_conformance import (
     AuthorityConformanceError,
     CORPUS,
     ROOT,
+    authority_contract_digest,
     validate,
 )
 
@@ -29,7 +30,7 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
     def test_checked_in_corpus_is_complete_and_source_bound(self) -> None:
         result = validate(payload(), CONTRACT, ROOT)
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["operations"], 12)
+        self.assertEqual(result["operations"], 13)
         self.assertEqual(result["authentication_denials"], 5)
         self.assertEqual(result["evidence_rows"], 9)
 
@@ -72,7 +73,7 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
                 mutate(corpus["operations"])
                 corpus["operations"].sort(key=lambda row: row["id"])
                 with self.assertRaisesRegex(
-                    AuthorityConformanceError, "exact twelve operations"
+                AuthorityConformanceError, "exact managed operations"
                 ):
                     validate(corpus, CONTRACT, ROOT)
 
@@ -101,14 +102,15 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
                 "crates/hyphae-native-protocol/src/product.rs",
                 "crates/hyphae-native-protocol/tests/golden_vectors.rs",
                 "crates/hyphae-native-product/src/error.rs",
+                "crates/hyphae-native-product/src/access_catalog.rs",
             ):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source = (ROOT / relative).read_text(encoding="utf-8")
                 if relative.endswith("handshake.rs"):
                     source = source.replace(
-                        "pub const PROTOCOL_MINOR: u16 = 2;",
                         "pub const PROTOCOL_MINOR: u16 = 3;",
+                        "pub const PROTOCOL_MINOR: u16 = 4;",
                     )
                 target.write_text(source, encoding="utf-8")
             with self.assertRaisesRegex(
@@ -143,6 +145,27 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
         corpus["digests"]["authority_contract_sha256"] = "f" * 64
         with self.assertRaisesRegex(AuthorityConformanceError, "contract digest"):
             validate(corpus, CONTRACT, ROOT)
+
+    def test_contract_digest_excludes_spdx_but_spdx_still_fails_closed(self) -> None:
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        relicensed = copy.deepcopy(contract)
+        relicensed["$comment"] = "SPDX-License-Identifier: AGPL-3.0-only"
+        self.assertEqual(
+            authority_contract_digest(contract), authority_contract_digest(relicensed)
+        )
+
+        semantic_change = copy.deepcopy(contract)
+        semantic_change["limits"]["security_result_rows"] += 1
+        self.assertNotEqual(
+            authority_contract_digest(contract),
+            authority_contract_digest(semantic_change),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            changed_contract = Path(directory) / "native-access-control-v1.json"
+            changed_contract.write_text(json.dumps(relicensed), encoding="utf-8")
+            with self.assertRaisesRegex(AuthorityConformanceError, "SPDX marker"):
+                validate(payload(), changed_contract, ROOT)
 
     def test_evidence_anchors_and_requirement_coverage_fail_closed(self) -> None:
         corpus = payload()

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Managed security read-plane parity across local protocol and HTTP `/v2/execute`.
 
@@ -13,9 +13,9 @@ use hyphae_client::v2::{
 };
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
-    ApiKeyId, AuthenticatedAuthority, BuiltInRole, MetricId, MetricValue, NativeProduct,
-    NativeProductService, NativeProductServiceConfig, ProductDurabilityPolicy, ProductErrorCode,
-    ProductLimits, ProductScope, TelemetryRegistry,
+    ApiKeyId, BuiltInRole, MetricId, MetricValue, NativeProduct, NativeProductService,
+    NativeProductServiceConfig, ProductDurabilityPolicy, ProductErrorCode, ProductLimits,
+    ProductScope, TelemetryRegistry,
 };
 use hyphae_server::{NativeHttpV2Config, NativeHttpV2Server};
 
@@ -58,7 +58,7 @@ struct ManagedFixture {
     directory: TestDirectory,
     service: NativeProductService,
     handle: hyphae_native_product::NativeProductHandle,
-    owner: AuthenticatedAuthority,
+    owner_secret: String,
     credential: String,
     key_id: ApiKeyId,
     telemetry: TelemetryRegistry,
@@ -96,7 +96,6 @@ impl ManagedFixture {
             5,
         )?;
         let credential = fs::read_to_string(auditor_path)?;
-        let owner = product.authenticate_api_key(&owner_secret, 5)?;
         let telemetry = product.telemetry().clone();
         let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
         let handle = service.handle();
@@ -104,7 +103,7 @@ impl ManagedFixture {
             directory,
             service,
             handle,
-            owner,
+            owner_secret,
             credential,
             key_id: issued.key_id,
             telemetry,
@@ -160,9 +159,18 @@ async fn managed_security_reads_are_identical_and_revalidate_revocation()
     )
     .await?;
 
-    fixture
-        .handle
-        .revoke_api_key(fixture.owner, fixture.key_id, 6)?;
+    let owner =
+        fixture
+            .handle
+            .open_authenticated_session(hyphae_native_product::ApiKeyCredential::new(
+                &fixture.owner_secret,
+            )?)?;
+    owner.dispatch(
+        owner.request_context(99, 6).with_idempotency_token(99),
+        ProductOperation::SecurityApiKeyRevoke {
+            key_id: fixture.key_id,
+        },
+    )?;
     assert_authorization_denied(local.security_status(RequestOptions::default()).await);
     assert_authorization_denied(
         http.execute(ProductOperation::SecurityStatus, RequestOptions::default())

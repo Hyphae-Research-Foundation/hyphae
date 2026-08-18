@@ -1,0 +1,25 @@
+{
+  "schema": "hyphae-mcp-host-install-lock-v1",
+  "hosts": {
+    "codex": {
+      "package": "@openai/codex",
+      "version": "0.147.0",
+      "executable": "codex",
+      "version_output": "codex-cli 0.147.0",
+      "sha256": {
+        "darwin-arm64": "19c4f144c5226a9f17c58e6f0fa854843b0f77a6eb420f40e2745a12f10f5d37",
+        "linux-x64": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40"
+      }
+    },
+    "claude-code": {
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.233",
+      "executable": "claude",
+      "version_output": "2.1.233 (Claude Code)",
+      "sha256": {
+        "darwin-arm64": "bc466b6cde63edafc773f471a1fb98787fabb31f52240c8616ce7e1f587b212d",
+        "linux-x64": "55d281096f57d411ebbdd94dbf5e9ff3accb7c05713e37348c2c11d4b83bf9d9"
+      }
+    }
+  }
+}

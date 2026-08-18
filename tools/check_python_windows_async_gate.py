@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Validate the source- and wheel-bound Windows async named-pipe receipt."""
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def validate_schema_contract(schema: dict[str, Any]) -> None:
     }
     if (
         schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
-        or schema.get("$comment") != "SPDX-License-Identifier: AGPL-3.0-only"
+        or schema.get("$comment") != "SPDX-License-Identifier: Apache-2.0"
         or schema.get("$id")
         != "https://hyphae.dev/schema/python-windows-async-receipt-v1"
         or schema.get("type") != "object"

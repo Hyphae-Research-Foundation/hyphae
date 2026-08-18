@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Python SDK G6 lane runner over native-local or HTTP v2."""
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Stable CLI exit classes and product-error rendering.
 
@@ -114,6 +114,7 @@ impl From<NativeProofError> for CliFailure {
     fn from(error: NativeProofError) -> Self {
         let code = match error {
             NativeProofError::Io { .. } => ProductErrorCode::Io,
+            NativeProofError::Interrupted => ProductErrorCode::Cancelled,
             NativeProofError::DestinationExists(_) => ProductErrorCode::DataDirectoryExists,
             NativeProofError::LimitExceeded { .. } | NativeProofError::LengthOverflow => {
                 ProductErrorCode::LimitExceeded

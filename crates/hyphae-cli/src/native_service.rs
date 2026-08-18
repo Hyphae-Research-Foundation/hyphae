@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Explicit native local daemon and optional HTTP v2 edge sharing one owner.
 
@@ -9,13 +9,14 @@ use hyphae_native_product::{NativeProduct, NativeProductService, NativeProductSe
 use hyphae_server::{NativeHttpV2Config, NativeHttpV2Server};
 use tokio::{sync::watch, task::JoinHandle};
 
-use crate::{exit::CliFailure, native::default_endpoint};
+use crate::{exit::CliFailure, native::default_endpoint, native_client::read_legacy_bearer_file};
 
 pub(crate) async fn serve(
     data_dir: PathBuf,
     endpoint: Option<String>,
     http_bind: Option<SocketAddr>,
     native_api_key_auth: bool,
+    native_legacy_bearer_file: Option<PathBuf>,
 ) -> Result<(), CliFailure> {
     let product = NativeProduct::open(&data_dir)?;
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
@@ -34,11 +35,22 @@ pub(crate) async fn serve(
     let (http_shutdown, http_receive) = watch::channel(false);
     let http = match http_bind {
         Some(bind) => {
+            if !bind.ip().is_loopback() {
+                return Err(CliFailure::invalid());
+            }
+            let legacy_bearer_token = native_legacy_bearer_file
+                .as_deref()
+                .map(read_legacy_bearer_file)
+                .transpose()?
+                .map(|bearer| hyphae_server::BearerToken::new(bearer.expose()))
+                .transpose()
+                .map_err(|_| CliFailure::invalid())?;
             let config = NativeHttpV2Config {
                 bind,
+                legacy_bearer_token,
                 ..NativeHttpV2Config::default()
             };
-            let server = if managed {
+            let server = if managed && config.legacy_bearer_token.is_none() {
                 NativeHttpV2Server::new_managed(handle, config)?
             } else {
                 NativeHttpV2Server::new(handle, config)?

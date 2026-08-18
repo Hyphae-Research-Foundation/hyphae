@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Transport-independent product operations and embedded dispatcher.
 
@@ -7,6 +7,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyphae_native_catalog::{CatalogObjectV2, LogicalCatalogObject, StructureKind};
 use hyphae_native_runtime::{
@@ -18,16 +21,28 @@ use hyphae_native_types::TransactionId;
 
 pub use hyphae_native_runtime::CommitBoundary;
 
+fn sql_mutation_checkpoint(context: &ProductRequestContext) -> bool {
+    #[cfg(test)]
+    if let Some(remaining) = &context.cancel_sql_mutation_after_checkpoints
+        && remaining.fetch_sub(1, Ordering::AcqRel) == 1
+    {
+        context.cancellation.cancel();
+    }
+    context.checkpoint().is_ok()
+}
+
 use crate::proof::{NativeOperationProofArtifact, NativeProofGenerationLimits};
 
-use crate::session::ProductAuthorizationRequirement;
+use crate::session::{ProductAuthorizationRequirement, ProductSessionSqlBindingKey};
 use crate::{
-    AccessControlMutationReceipt, AccessControlStatus, AdminStatus, AuthorizationEpoch, BackupInfo,
+    AccessControlMutationReceipt, AccessControlStatus, AdminStatus, ApiKeyActivationReceipt,
+    ApiKeyConfirmationDigest, ApiKeyId, ApiKeyStartReceipt, AuthorizationEpoch, BackupInfo,
     BackupPhase, BackupProductError, BackupRequest, BuiltInRole, CatalogDependencyRequest,
-    CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage, CustomRoleGrant,
-    CustomRoleMutationReceipt, DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId,
-    ProductAuthorization, ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt,
-    ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode, ProductExplain,
+    CatalogListRequest, CatalogObject, CatalogObjectSummary, CatalogPage,
+    CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt,
+    DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
+    ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
+    ProductDurability, ProductError, ProductErrorCode, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
     ProductHashEntry, ProductLimits, ProductListSide, ProductPermission, ProductPreparedHandle,
     ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
@@ -101,6 +116,12 @@ pub struct ProductRequestContext {
     pub authorization_epoch: AuthorizationEpoch,
     /// Durability policy for every mutating operation.
     pub durability: ProductDurabilityPolicy,
+    /// Test-only deterministic SQL mutation cancellation countdown.
+    #[cfg(test)]
+    pub(crate) cancel_sql_mutation_after_checkpoints: Option<Arc<AtomicUsize>>,
+    /// Test-only cancellation immediately after the commit reports publication.
+    #[cfg(test)]
+    pub(crate) cancel_sql_mutation_at_commit: bool,
 }
 
 impl ProductRequestContext {
@@ -124,6 +145,10 @@ impl ProductRequestContext {
             authorization,
             authorization_epoch: AuthorizationEpoch::UNMANAGED,
             durability: ProductDurabilityPolicy::default(),
+            #[cfg(test)]
+            cancel_sql_mutation_after_checkpoints: None,
+            #[cfg(test)]
+            cancel_sql_mutation_at_commit: false,
         }
     }
 
@@ -157,6 +182,11 @@ impl ProductRequestContext {
             return Err(self.error(ProductErrorCode::DeadlineExceeded));
         }
         Ok(())
+    }
+
+    pub(crate) fn deadline_elapsed(&self) -> bool {
+        self.deadline_micros
+            .is_some_and(|deadline| unix_time_micros() >= deadline)
     }
 
     fn error(&self, code: ProductErrorCode) -> ProductError {
@@ -220,6 +250,8 @@ pub enum ProductOperation {
     },
     /// List one bounded current catalog page.
     CatalogList(CatalogListRequest),
+    /// List only catalog objects visible under the current durable authority.
+    CatalogVisibleList(CatalogVisibleListRequest),
     /// List one bounded current dependency page.
     CatalogDependencies(CatalogDependencyRequest),
     /// Describe one current logical V2 object.
@@ -457,6 +489,122 @@ pub enum ProductOperation {
         /// Stable assignment identity.
         assignment_id: SecurityId,
     },
+    /// Starts one self-managed inactive API key.
+    SecurityApiKeyIssueSelfStart {
+        /// Stable target principal, which must equal the actor principal.
+        principal_id: SecurityId,
+        /// Non-secret bounded label.
+        label: String,
+        /// Canonically selected built-in roles.
+        roles: Vec<BuiltInRole>,
+        /// Canonically selected custom-role identities.
+        custom_roles: Vec<SecurityId>,
+        /// Permission ceiling no wider than the actor.
+        permission_ceiling: ProductAuthorization,
+        /// Scope ceiling no wider than the actor.
+        scope_ceiling: Vec<ProductScope>,
+        /// Optional exclusive expiry.
+        expires_at_micros: Option<i64>,
+    },
+    /// Starts one administratively managed inactive API key.
+    SecurityApiKeyIssueStart {
+        /// Stable target principal.
+        principal_id: SecurityId,
+        /// Non-secret bounded label.
+        label: String,
+        /// Canonically selected built-in roles.
+        roles: Vec<BuiltInRole>,
+        /// Canonically selected custom-role identities.
+        custom_roles: Vec<SecurityId>,
+        /// Credential permission ceiling.
+        permission_ceiling: ProductAuthorization,
+        /// Credential scope ceiling.
+        scope_ceiling: Vec<ProductScope>,
+        /// Optional exclusive expiry.
+        expires_at_micros: Option<i64>,
+    },
+    /// Activates one exact self-managed pending issue.
+    SecurityApiKeyIssueSelfActivate {
+        /// Public pending key identity.
+        key_id: ApiKeyId,
+        /// Confirmation digest derived from the delivered secret.
+        confirmation_digest: ApiKeyConfirmationDigest,
+    },
+    /// Activates one exact administratively managed pending issue.
+    SecurityApiKeyIssueActivate {
+        /// Public pending key identity.
+        key_id: ApiKeyId,
+        /// Confirmation digest derived from the delivered secret.
+        confirmation_digest: ApiKeyConfirmationDigest,
+    },
+    /// Starts one self-managed inactive rotation successor.
+    SecurityApiKeyRotateSelfStart {
+        /// Active predecessor identity.
+        predecessor_key_id: ApiKeyId,
+        /// Non-secret successor label.
+        label: String,
+        /// Bounded predecessor overlap after activation.
+        overlap_seconds: u64,
+        /// Optional successor expiry.
+        expires_at_micros: Option<i64>,
+    },
+    /// Starts one administratively managed inactive rotation successor.
+    SecurityApiKeyRotateStart {
+        /// Active predecessor identity.
+        predecessor_key_id: ApiKeyId,
+        /// Non-secret successor label.
+        label: String,
+        /// Bounded predecessor overlap after activation.
+        overlap_seconds: u64,
+        /// Optional successor expiry.
+        expires_at_micros: Option<i64>,
+    },
+    /// Activates one exact self-managed rotation successor.
+    SecurityApiKeyRotateSelfActivate {
+        /// Public successor identity.
+        successor_key_id: ApiKeyId,
+        /// Confirmation digest derived from the delivered secret.
+        confirmation_digest: ApiKeyConfirmationDigest,
+    },
+    /// Activates one exact administratively managed rotation successor.
+    SecurityApiKeyRotateActivate {
+        /// Public successor identity.
+        successor_key_id: ApiKeyId,
+        /// Confirmation digest derived from the delivered secret.
+        confirmation_digest: ApiKeyConfirmationDigest,
+    },
+    /// Aborts one exact self-managed pending issue.
+    SecurityApiKeyIssueSelfAbort {
+        /// Exact pending issue identity.
+        key_id: ApiKeyId,
+    },
+    /// Aborts one exact administratively managed pending issue.
+    SecurityApiKeyIssueAbort {
+        /// Exact pending issue identity.
+        key_id: ApiKeyId,
+    },
+    /// Aborts one exact self-managed pending rotation.
+    SecurityApiKeyRotateSelfAbort {
+        /// Exact pending successor identity.
+        successor_key_id: ApiKeyId,
+    },
+    /// Aborts one exact administratively managed pending rotation.
+    SecurityApiKeyRotateAbort {
+        /// Exact pending successor identity.
+        successor_key_id: ApiKeyId,
+    },
+    /// Revokes one exact self-managed active key.
+    SecurityApiKeyRevokeSelf {
+        /// Exact active key identity.
+        key_id: ApiKeyId,
+    },
+    /// Revokes one exact administratively managed active key.
+    SecurityApiKeyRevoke {
+        /// Exact active key identity.
+        key_id: ApiKeyId,
+    },
+    /// Permanently revokes the migrated Native HTTP legacy bearer.
+    SecurityLegacyBearerRevoke,
     /// Execute one eligible read and retain an offline-verifiable semantic proof.
     Prove {
         /// Read operation to execute exactly once for proof generation.
@@ -476,6 +624,8 @@ pub enum ProductResponse {
     CatalogObject(ProductRead<CatalogObject>),
     /// One bounded logical catalog page.
     CatalogPage(CatalogPage<CatalogObjectSummary>),
+    /// Scope-visible logical catalog page with an opaque continuation.
+    CatalogVisiblePage(CatalogVisiblePage),
     /// One bounded logical dependency page.
     CatalogDependencyPage(CatalogPage<hyphae_native_catalog::DependencyEdge>),
     /// Optional complete logical catalog definition.
@@ -566,6 +716,10 @@ pub enum ProductResponse {
     SecurityAssignmentMutated(RoleAssignmentMutationReceipt),
     /// One durable access-control state-change receipt.
     SecurityMutated(AccessControlMutationReceipt),
+    /// One-time first-phase API-key secret delivery.
+    SecurityApiKeyStarted(ApiKeyStartReceipt),
+    /// Definite issue or rotation activation receipt.
+    SecurityApiKeyActivated(ApiKeyActivationReceipt),
     /// Actual read response paired with its complete portable proof artifacts.
     Proven {
         /// Response produced by the operation integrated with proof generation.
@@ -635,13 +789,43 @@ pub(crate) fn dispatch(
     {
         session.rollback_active_transaction_after_authority_loss(*handle);
     }
+    let sql_binding_key = request_sql_binding_key(context, &operation);
     let result = admitted.and_then(|()| {
         let execution_started = Instant::now();
         let result = dispatch_inner(product, session, context, operation);
         telemetry.record_timing(TimingClass::EngineExecution, execution_started.elapsed());
         result
     });
+    if let Some(key) = sql_binding_key {
+        let _ = session.take_sql_binding(key);
+    }
     record_dispatch_result(&telemetry, context, result)
+}
+
+fn request_sql_binding_key(
+    context: &ProductRequestContext,
+    operation: &ProductOperation,
+) -> Option<ProductSessionSqlBindingKey> {
+    match operation {
+        ProductOperation::ExecuteSql { .. } => {
+            Some(ProductSessionSqlBindingKey::Execute(context.request_id))
+        }
+        ProductOperation::AdminExplainSql { .. } => {
+            Some(ProductSessionSqlBindingKey::Explain(context.request_id))
+        }
+        ProductOperation::TransactionStageSql { handle, .. } => {
+            Some(ProductSessionSqlBindingKey::Stage {
+                request_id: context.request_id,
+                handle: *handle,
+            })
+        }
+        ProductOperation::Prove { operation, .. }
+            if matches!(operation.as_ref(), ProductOperation::ExecuteSql { .. }) =>
+        {
+            Some(ProductSessionSqlBindingKey::Execute(context.request_id))
+        }
+        _ => None,
+    }
 }
 
 fn record_admission(
@@ -727,6 +911,7 @@ fn dispatch_inner(
     operation: ProductOperation,
 ) -> Result<ProductResponse, ProductError> {
     let read_only = !operation.is_mutating();
+    let key_self_manage = operation.is_self_key_lifecycle();
     let mut response_limit_already_enforced = false;
     let response = match operation {
         ProductOperation::Capabilities => ProductResponse::Capabilities(product.capabilities()),
@@ -739,6 +924,38 @@ fn dispatch_inner(
         ProductOperation::CatalogList(request) => {
             let snapshot = product.catalog_snapshot()?;
             let response = ProductResponse::CatalogPage(product.catalog_list(&snapshot, request)?);
+            admit_response(context, &response)?;
+            response_limit_already_enforced = true;
+            response
+        }
+        ProductOperation::CatalogVisibleList(request) => {
+            let authority = session.authenticated_authority()?;
+            if authority.is_none() {
+                product.ensure_unmanaged_catalog_cursor_authority()?;
+            }
+            let snapshot = product.catalog_snapshot()?;
+            let (scopes, cursor_key, authorization_epoch) = match authority {
+                None => (
+                    vec![ProductScope::Instance],
+                    unmanaged_catalog_cursor_key(product.catalog_cursor_key, session.principal()),
+                    context.authorization_epoch,
+                ),
+                Some(authority) => {
+                    let scopes = exact_catalog_visible_scopes(product, &authority, &snapshot)?;
+                    (
+                        scopes,
+                        authority.catalog_cursor_key(),
+                        authority.authorization_epoch(),
+                    )
+                }
+            };
+            let response = ProductResponse::CatalogVisiblePage(product.catalog_visible_list(
+                &snapshot,
+                &scopes,
+                cursor_key,
+                authorization_epoch,
+                &request,
+            )?);
             admit_response(context, &response)?;
             response_limit_already_enforced = true;
             response
@@ -803,7 +1020,13 @@ fn dispatch_inner(
             if prepared.maximum_result_rows() > context.limits.max_count {
                 return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
             }
-            let result = product.execute_prepared(prepared, &parameters)?;
+            context.checkpoint()?;
+            let result = product
+                .execute_prepared_with_checkpoint(prepared, &parameters, || {
+                    context.checkpoint().is_ok()
+                })
+                .map_err(|error| map_execution_interruption(error, context))?;
+            context.checkpoint()?;
             let response = ProductResponse::Sql {
                 result: result.value,
                 snapshot: Some(result.snapshot),
@@ -816,7 +1039,17 @@ fn dispatch_inner(
         ProductOperation::ExecuteSql {
             statement,
             parameters,
-        } => execute_sql(product, session, context, &statement, &parameters)?,
+        } => {
+            let bound = session
+                .take_sql_binding(ProductSessionSqlBindingKey::Execute(context.request_id))?
+                .ok_or_else(|| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+            context.checkpoint()?;
+            let response = execute_sql(product, session, context, &statement, &parameters, &bound)?;
+            if bound.class() == SqlStatementClass::Read {
+                context.checkpoint()?;
+            }
+            response
+        }
         ProductOperation::StructureGet { key } => ProductResponse::StructureValue(
             product
                 .database
@@ -881,18 +1114,28 @@ fn dispatch_inner(
         }
         ProductOperation::TransactionStageSql { handle, mutation } => {
             context.checkpoint()?;
+            let bound = session
+                .take_sql_binding(ProductSessionSqlBindingKey::Stage {
+                    request_id: context.request_id,
+                    handle,
+                })?
+                .ok_or_else(|| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+            let authorization = sql_binding_requirement(bound.class(), &bound);
             ProductResponse::TransactionStaged(stage_transaction(
                 &product.database,
                 session,
                 handle,
-                &ProductAuthorizationRequirement::instance(authorization([
-                    ProductPermission::CatalogRead,
-                    ProductPermission::DataWrite,
-                ])),
+                &authorization,
+                context.limits,
                 |batch| {
                     validate_transaction_sql(&mutation)?;
-                    let result =
-                        batch.execute_sql_dml(&mutation.statement, &mutation.parameters)?;
+                    let result = batch
+                        .execute_bound_sql_with_checkpoint(&bound, &mutation.parameters, || {
+                            sql_mutation_checkpoint(context)
+                        })
+                        .map_err(ProductError::from)
+                        .map_err(|error| map_execution_interruption(error, context))?;
+                    context.checkpoint()?;
                     Ok(ProductTransactionStageResult::Sql(result.into()))
                 },
             )?)
@@ -908,6 +1151,7 @@ fn dispatch_inner(
                 session,
                 handle,
                 &authorization,
+                context.limits,
                 |batch| {
                     let result = apply_structure_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Structure(result))
@@ -925,6 +1169,7 @@ fn dispatch_inner(
                 session,
                 handle,
                 &authorization,
+                context.limits,
                 |batch| {
                     apply_search_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Search)
@@ -942,6 +1187,7 @@ fn dispatch_inner(
                 session,
                 handle,
                 &authorization,
+                context.limits,
                 |batch| {
                     let changed = apply_vector_mutation(batch, mutation)?;
                     Ok(ProductTransactionStageResult::Vector(changed))
@@ -1022,10 +1268,11 @@ fn dispatch_inner(
         ProductOperation::SearchCollection {
             collection,
             request,
-        } => ProductResponse::IntegratedSearch(product.search_collection(
+        } => ProductResponse::IntegratedSearch(product.search_collection_with_checkpoint(
             collection,
             &request,
             context.logical_time_micros,
+            || context.checkpoint(),
         )?),
         ProductOperation::SearchIngest { collection, batch } => {
             ProductResponse::SearchIngested(product.ingest_search_batch(
@@ -1071,11 +1318,19 @@ fn dispatch_inner(
             query,
             limit,
         } => {
+            context.checkpoint()?;
             let snapshot = product.snapshot_bounded(context.logical_time_micros)?;
             let result = snapshot
                 .inner
-                .search_bounded(index, &query, limit, search_limits(context.limits, limit))
-                .map_err(|error| map_search_error(&error))?;
+                .search_bounded_with_checkpoint(
+                    index,
+                    &query,
+                    limit,
+                    search_limits(context.limits, limit),
+                    || !context.cancellation.is_cancelled() && !context.deadline_elapsed(),
+                )
+                .map_err(|error| map_search_error(&error, context))?;
+            context.checkpoint()?;
             let response = ProductResponse::Search(ProductSearchResults {
                 hits: result
                     .hits
@@ -1106,7 +1361,14 @@ fn dispatch_inner(
             ProductResponse::AdminCheckpoint(receipt)
         }
         ProductOperation::AdminExplainSql { statement } => {
-            ProductResponse::Explain(product.administration().explain_sql(&statement)?)
+            let bound = session
+                .take_sql_binding(ProductSessionSqlBindingKey::Explain(context.request_id))?
+                .ok_or_else(|| ProductError::from_code(ProductErrorCode::AuthorizationDenied))?;
+            ProductResponse::Explain(
+                product
+                    .administration()
+                    .explain_bound_sql(&bound, &statement)?,
+            )
         }
         ProductOperation::Doctor(request) => {
             ProductResponse::Doctor(product.doctor_opened(request.logical_time_micros))
@@ -1155,17 +1417,29 @@ fn dispatch_inner(
             witness,
             trusted_anchor,
         } => {
+            context.checkpoint()?;
             let started = Instant::now();
-            let result = crate::proof::verify_native_proof_offline(
+            let result = crate::proof::verify_native_proof_offline_with_checkpoint(
                 &proof,
                 &witness,
                 crate::proof::ExternalTrustedAnchor::new(trusted_anchor),
                 &crate::proof::NativeVerificationLimits::default(),
+                || context.checkpoint().is_ok(),
             );
             product
                 .telemetry
                 .record_timing(TimingClass::ProofVerification, started.elapsed());
-            ProductResponse::ProofVerification(result.map_err(|error| map_proof_error(&error))?)
+            context.checkpoint()?;
+            ProductResponse::ProofVerification(result.map_err(|error| {
+                if matches!(error, crate::proof::NativeProofError::Interrupted) {
+                    context
+                        .checkpoint()
+                        .err()
+                        .unwrap_or_else(|| map_proof_error(&error))
+                } else {
+                    map_proof_error(&error)
+                }
+            })?)
         }
         ProductOperation::SecurityStatus => {
             let actor = managed_actor(session, context)?;
@@ -1292,17 +1566,157 @@ fn dispatch_inner(
                 context.logical_time_micros,
             )?)
         }
+        ProductOperation::SecurityApiKeyIssueSelfStart {
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            expires_at_micros,
+        }
+        | ProductOperation::SecurityApiKeyIssueStart {
+            principal_id,
+            label,
+            roles,
+            custom_roles,
+            permission_ceiling,
+            scope_ceiling,
+            expires_at_micros,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityApiKeyStarted(product.start_api_key_issue_idempotent(
+                &actor,
+                principal_id,
+                &label,
+                roles,
+                custom_roles,
+                permission_ceiling,
+                scope_ceiling,
+                expires_at_micros,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyIssueSelfActivate {
+            key_id,
+            confirmation_digest,
+        }
+        | ProductOperation::SecurityApiKeyIssueActivate {
+            key_id,
+            confirmation_digest,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityApiKeyActivated(product.activate_api_key_issue_idempotent(
+                &actor,
+                key_id,
+                confirmation_digest,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyRotateSelfStart {
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+        }
+        | ProductOperation::SecurityApiKeyRotateStart {
+            predecessor_key_id,
+            label,
+            overlap_seconds,
+            expires_at_micros,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityApiKeyStarted(product.start_api_key_rotation_idempotent(
+                &actor,
+                predecessor_key_id,
+                &label,
+                overlap_seconds,
+                expires_at_micros,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyRotateSelfActivate {
+            successor_key_id,
+            confirmation_digest,
+        }
+        | ProductOperation::SecurityApiKeyRotateActivate {
+            successor_key_id,
+            confirmation_digest,
+        } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityApiKeyActivated(product.activate_api_key_rotation_idempotent(
+                &actor,
+                successor_key_id,
+                confirmation_digest,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyIssueSelfAbort { key_id }
+        | ProductOperation::SecurityApiKeyIssueAbort { key_id } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityMutated(product.abort_api_key_issue_idempotent(
+                &actor,
+                key_id,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyRotateSelfAbort { successor_key_id }
+        | ProductOperation::SecurityApiKeyRotateAbort { successor_key_id } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityMutated(product.abort_api_key_rotation_idempotent(
+                &actor,
+                successor_key_id,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityApiKeyRevokeSelf { key_id }
+        | ProductOperation::SecurityApiKeyRevoke { key_id } => {
+            let actor = managed_actor(session, context)?;
+            ProductResponse::SecurityMutated(product.revoke_api_key_idempotent(
+                &actor,
+                key_id,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+                key_self_manage,
+            )?)
+        }
+        ProductOperation::SecurityLegacyBearerRevoke => {
+            let actor = managed_actor(session, context)?;
+            let receipt = product.revoke_legacy_bearer_idempotent(
+                &actor,
+                required_idempotency_token(context)?,
+                context.logical_time_micros,
+            )?;
+            ProductResponse::SecurityMutated(AccessControlMutationReceipt {
+                authorization_epoch: receipt.authorization_epoch,
+                commit: receipt.commit,
+            })
+        }
         ProductOperation::Prove { operation, limits } => {
-            if operation.requires_managed_authority() {
+            if operation.requires_managed_authority() || operation.is_key_lifecycle() {
                 return Err(context.error(ProductErrorCode::InvalidRequest));
             }
             let started = Instant::now();
+            context.checkpoint()?;
             let result = crate::proof::dispatch_proven_operation(
                 product, session, context, &operation, limits,
             );
             product
                 .telemetry
                 .record_timing(TimingClass::ProofConstruction, started.elapsed());
+            context.checkpoint()?;
             return result.map_err(|error| map_proof_error(&error));
         }
     };
@@ -1320,7 +1734,36 @@ fn admit_operation(
     operation: &ProductOperation,
 ) -> Result<(), ProductError> {
     validate_context(session, context)?;
-    let current_authority = validate_durable_authority(product, session)?;
+    if session.is_legacy_owner()
+        && (!product
+            .legacy_bearer_migration_inspection()?
+            .state
+            .is_enabled()
+            || operation.requires_managed_authority()
+            || operation
+                .required_permissions()?
+                .allows(ProductPermission::SecurityManage)
+            || operation
+                .required_permissions()?
+                .allows(ProductPermission::OwnershipManage))
+    {
+        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    }
+    let mut terminal_replay = false;
+    let current_authority = match validate_durable_authority(product, session) {
+        Ok(authority) => authority,
+        Err(error)
+            if error.code() == ProductErrorCode::AuthorizationDenied
+                && exact_terminal_self_replay(product, session, context, operation)? =>
+        {
+            terminal_replay = true;
+            let actor = session
+                .authenticated_authority()?
+                .ok_or_else(|| context.error(ProductErrorCode::AuthorizationDenied))?;
+            Some(actor)
+        }
+        Err(error) => return Err(error),
+    };
     if operation.requires_managed_authority() && current_authority.is_none() {
         return Err(context.error(ProductErrorCode::AuthorizationDenied));
     }
@@ -1344,21 +1787,31 @@ fn admit_operation(
     if operation.requires_idempotency_token() && context.idempotency_token.is_none() {
         return Err(context.error(ProductErrorCode::InvalidRequest));
     }
+    if operation.is_key_lifecycle() && context.durability != ProductDurabilityPolicy::STRICT {
+        return Err(context.error(ProductErrorCode::InvalidRequest));
+    }
+    if let Some((count, bytes)) = operation.mutation_response_cost() {
+        // A mutation is never published if its canonical wire response cannot be retained.
+        context.limits.admit_response(count, bytes, bytes)?;
+    }
     let requirement = operation_authorization_requirement(
         product,
         session,
+        context,
         operation,
         current_authority.as_deref(),
     )?;
-    context.checkpoint()?;
-    let authorized = match current_authority.as_ref() {
-        Some(authority) => authority_satisfies_requirement(product, authority, &requirement)?,
-        None => session
-            .authorization()
-            .allows_all(requirement.permissions()),
-    };
-    if !authorized {
-        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    if !terminal_replay {
+        context.checkpoint()?;
+        let authorized = match current_authority.as_ref() {
+            Some(authority) => authority_satisfies_requirement(product, authority, &requirement)?,
+            None => session
+                .authorization()
+                .allows_all(requirement.permissions()),
+        };
+        if !authorized {
+            return Err(context.error(ProductErrorCode::AuthorizationDenied));
+        }
     }
     if operation_uses_internal_structure_namespace(operation) {
         return Err(context.error(ProductErrorCode::InvalidRequest));
@@ -1366,11 +1819,36 @@ fn admit_operation(
     let (count, bytes, work, memory) = operation.request_cost();
     context.limits.admit_request(count, bytes, work, memory)?;
     operation.validate_limits(context.limits)?;
-    if let Some((count, bytes)) = operation.mutation_response_cost() {
-        // A mutation is never published if its bounded response cannot be retained.
-        context.limits.admit_response(count, bytes, bytes)?;
-    }
     Ok(())
+}
+
+fn exact_terminal_self_replay(
+    product: &NativeProduct,
+    session: &ProductSession,
+    context: &ProductRequestContext,
+    operation: &ProductOperation,
+) -> Result<bool, ProductError> {
+    let Some(actor) = session.authenticated_authority()? else {
+        return Ok(false);
+    };
+    let Some(token) = context.idempotency_token else {
+        return Ok(false);
+    };
+    match operation {
+        ProductOperation::SecurityApiKeyRotateSelfActivate {
+            successor_key_id,
+            confirmation_digest,
+        } => product.is_exact_terminal_self_replay(
+            &actor,
+            token,
+            *successor_key_id,
+            Some(*confirmation_digest),
+        ),
+        ProductOperation::SecurityApiKeyRevokeSelf { key_id } if *key_id == actor.key_id() => {
+            product.is_exact_terminal_self_replay(&actor, token, *key_id, None)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn managed_actor(
@@ -1434,9 +1912,14 @@ fn validate_durable_authority(
     Ok(Some(current))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive operation-to-scope mapping is the fail-closed authorization boundary"
+)]
 fn operation_authorization_requirement(
     product: &NativeProduct,
     session: &ProductSession,
+    context: &ProductRequestContext,
     operation: &ProductOperation,
     authority: Option<&crate::AuthenticatedAuthority>,
 ) -> Result<ProductAuthorizationRequirement, ProductError> {
@@ -1446,7 +1929,11 @@ fn operation_authorization_requirement(
             ProductAuthorizationRequirement::object(permissions, *id)
         }
         ProductOperation::CatalogDependencies(request) => {
-            ProductAuthorizationRequirement::object(permissions, request.object)
+            if authority.is_some() {
+                ProductAuthorizationRequirement::instance(permissions)
+            } else {
+                ProductAuthorizationRequirement::object(permissions, request.object)
+            }
         }
         ProductOperation::CatalogCreate { object } => object.parent().map_or_else(
             || ProductAuthorizationRequirement::instance(permissions),
@@ -1472,6 +1959,47 @@ fn operation_authorization_requirement(
             })?;
             requirement_for_objects(permissions, prepared.referenced_object_ids())
         }
+        ProductOperation::ExecuteSql {
+            statement,
+            parameters,
+        } => {
+            let bound = product
+                .database
+                .bind_sql_latest(statement, parameters)
+                .map_err(|error| mask_scoped_sql_bind_error(error, authority, permissions))?;
+            let requirement = sql_binding_requirement(bound.class(), &bound);
+            session.retain_sql_binding(
+                ProductSessionSqlBindingKey::Execute(context.request_id),
+                bound,
+            )?;
+            requirement
+        }
+        ProductOperation::AdminExplainSql { statement } => {
+            let catalog_read = authorization([ProductPermission::CatalogRead]);
+            let explain_permissions =
+                authorization([ProductPermission::CatalogRead, ProductPermission::Observe]);
+            let bound = product
+                .database
+                .bind_sql_latest(statement, &[])
+                .map_err(|error| {
+                    mask_scoped_sql_bind_error(error, authority, explain_permissions)
+                })?;
+            if bound.class() != SqlStatementClass::Read {
+                return Err(ProductError::from_code(ProductErrorCode::SqlInvalidSyntax));
+            }
+            let mut requirement = ProductAuthorizationRequirement::instance(authorization([
+                ProductPermission::Observe,
+            ]));
+            requirement.union(&requirement_for_objects(
+                catalog_read,
+                bound.referenced_object_ids().iter().copied(),
+            ));
+            session.retain_sql_binding(
+                ProductSessionSqlBindingKey::Explain(context.request_id),
+                bound,
+            )?;
+            requirement
+        }
         ProductOperation::DeallocatePrepared { handle }
         | ProductOperation::ExecutePrepared { handle, .. } => {
             session.prepared(*handle).map_or_else(
@@ -1479,6 +2007,12 @@ fn operation_authorization_requirement(
                 |prepared| requirement_for_objects(permissions, prepared.referenced_object_ids()),
             )
         }
+        ProductOperation::StructureGet { .. }
+        | ProductOperation::StructureSet { .. }
+        | ProductOperation::StructureTtl { .. } => ProductAuthorizationRequirement::object(
+            permissions,
+            product.default_scalar_keyspace_id()?,
+        ),
         ProductOperation::StructureMutate { mutations } => requirement_for_objects(
             permissions,
             mutations
@@ -1507,6 +2041,27 @@ fn operation_authorization_requirement(
         ProductOperation::TransactionStageVector { mutation, .. } => {
             ProductAuthorizationRequirement::object(permissions, mutation.index())
         }
+        ProductOperation::TransactionStageSql { handle, mutation } => {
+            let transaction = session
+                .active_transaction(*handle)
+                .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+            let bound = transaction
+                .batch
+                .bind_sql(&mutation.statement, &mutation.parameters)
+                .map_err(|error| mask_scoped_sql_bind_error(error, authority, permissions))?;
+            if bound.class() != SqlStatementClass::DataMutation {
+                return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+            }
+            let requirement = sql_binding_requirement(bound.class(), &bound);
+            session.retain_sql_binding(
+                ProductSessionSqlBindingKey::Stage {
+                    request_id: context.request_id,
+                    handle: *handle,
+                },
+                bound,
+            )?;
+            requirement
+        }
         ProductOperation::TransactionCommit { handle } => {
             session.active_transaction(*handle).map_or_else(
                 || ProductAuthorizationRequirement::unscoped(permissions),
@@ -1514,8 +2069,9 @@ fn operation_authorization_requirement(
             )
         }
         ProductOperation::Prove { operation, .. } => {
-            let mut inner =
-                operation_authorization_requirement(product, session, operation, authority)?;
+            let mut inner = operation_authorization_requirement(
+                product, session, context, operation, authority,
+            )?;
             inner.add_permission_to_bound_targets(ProductPermission::ProofGenerate);
             inner
         }
@@ -1523,15 +2079,48 @@ fn operation_authorization_requirement(
         | ProductOperation::TransactionRollback { .. }
         | ProductOperation::ExplicitTransactionStatus { .. }
         | ProductOperation::TransactionStatus { .. }
-        | ProductOperation::TransactionStatusByIdempotency { .. } => {
+        | ProductOperation::TransactionStatusByIdempotency { .. }
+        | ProductOperation::CatalogVisibleList(_)
+        | ProductOperation::SecurityApiKeyIssueSelfStart { .. } => {
             ProductAuthorizationRequirement::unscoped(permissions)
         }
-        // CatalogList remains instance-only until its physical traversal and
-        // continuation are scope-opaque. Other unbound surfaces also fail
-        // closed at the instance boundary.
+        // Historical CatalogList remains instance-only. Other unbound surfaces
+        // also fail closed at the instance boundary.
         _ => ProductAuthorizationRequirement::instance(permissions),
     };
     Ok(requirement)
+}
+
+fn mask_scoped_sql_bind_error(
+    error: hyphae_native_runtime::SqlError,
+    authority: Option<&crate::AuthenticatedAuthority>,
+    permissions: ProductAuthorization,
+) -> ProductError {
+    if authority.is_some_and(|current| !current.allows_instance_authorization(permissions)) {
+        ProductError::from_code(ProductErrorCode::AuthorizationDenied)
+    } else {
+        ProductError::from(error)
+    }
+}
+
+fn sql_binding_requirement(
+    class: SqlStatementClass,
+    bound: &hyphae_native_runtime::BoundSqlStatement,
+) -> ProductAuthorizationRequirement {
+    let permissions = match class {
+        SqlStatementClass::Read => {
+            authorization([ProductPermission::CatalogRead, ProductPermission::DataRead])
+        }
+        SqlStatementClass::DataMutation => {
+            authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite])
+        }
+        SqlStatementClass::CatalogMutation => authorization([ProductPermission::CatalogWrite]),
+    };
+    if class == SqlStatementClass::CatalogMutation && bound.requires_instance_catalog_write() {
+        ProductAuthorizationRequirement::instance(permissions)
+    } else {
+        requirement_for_objects(permissions, bound.referenced_object_ids().iter().copied())
+    }
 }
 
 fn requirement_for_objects(
@@ -1550,6 +2139,10 @@ fn requirement_for_objects(
         ));
     }
     requirement
+}
+
+fn unmanaged_catalog_cursor_key(base: [u8; 32], principal: &ProductPrincipal) -> [u8; 32] {
+    *blake3::keyed_hash(&base, principal.identity().as_bytes()).as_bytes()
 }
 
 fn authority_satisfies_requirement(
@@ -1610,6 +2203,73 @@ fn catalog_ancestry_at(
     Ok(ancestry)
 }
 
+fn exact_catalog_visible_scopes(
+    product: &NativeProduct,
+    authority: &crate::AuthenticatedAuthority,
+    snapshot: &crate::ProductCatalogSnapshot,
+) -> Result<Vec<crate::ProductScope>, ProductError> {
+    let grants = authority
+        .scoped_authorization()
+        .iter()
+        .filter(|scoped| scoped.authorization.allows(ProductPermission::CatalogRead))
+        .map(|scoped| scoped.scope)
+        .collect::<Vec<_>>();
+    let object_ids = grants
+        .iter()
+        .chain(authority.scope_ceiling())
+        .filter_map(|scope| match scope {
+            crate::ProductScope::Instance => None,
+            crate::ProductScope::CatalogSubtree(id) | crate::ProductScope::CatalogObject(id) => {
+                Some(*id)
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    let ancestry = catalog_ancestry_at(product, snapshot, &object_ids)?;
+    let is_descendant = |candidate: ObjectId, ancestor: ObjectId| {
+        ancestry
+            .get(&candidate)
+            .is_some_and(|ancestors| ancestors.contains(&ancestor))
+    };
+    let mut intersections = BTreeSet::new();
+    for grant in grants {
+        for ceiling in authority.scope_ceiling() {
+            if let Some(scope) = intersect_catalog_scopes(grant, *ceiling, is_descendant) {
+                intersections.insert(scope);
+            }
+        }
+    }
+    Ok(intersections.into_iter().collect())
+}
+
+fn intersect_catalog_scopes(
+    left: crate::ProductScope,
+    right: crate::ProductScope,
+    is_descendant: impl Fn(ObjectId, ObjectId) -> bool,
+) -> Option<crate::ProductScope> {
+    use crate::ProductScope::{CatalogObject, CatalogSubtree, Instance};
+
+    match (left, right) {
+        (Instance, scope) | (scope, Instance) => Some(scope),
+        (CatalogObject(left), CatalogObject(right)) => {
+            (left == right).then_some(CatalogObject(left))
+        }
+        (CatalogObject(object), CatalogSubtree(root))
+        | (CatalogSubtree(root), CatalogObject(object)) => {
+            (object == root || is_descendant(object, root)).then_some(CatalogObject(object))
+        }
+        (CatalogSubtree(left), CatalogSubtree(right)) if left == right => {
+            Some(CatalogSubtree(left))
+        }
+        (CatalogSubtree(left), CatalogSubtree(right)) if is_descendant(left, right) => {
+            Some(CatalogSubtree(left))
+        }
+        (CatalogSubtree(left), CatalogSubtree(right)) if is_descendant(right, left) => {
+            Some(CatalogSubtree(right))
+        }
+        (CatalogSubtree(_), CatalogSubtree(_)) => None,
+    }
+}
+
 fn operation_uses_internal_structure_namespace(operation: &ProductOperation) -> bool {
     match operation {
         ProductOperation::StructureGet { key }
@@ -1653,6 +2313,7 @@ fn execute_sql(
     context: &ProductRequestContext,
     statement: &str,
     parameters: &[ProductValue],
+    bound: &hyphae_native_runtime::BoundSqlStatement,
 ) -> Result<ProductResponse, ProductError> {
     if statement.len() > crate::MAX_PRODUCT_SQL_STATEMENT_BYTES {
         return Err(ProductError::sql_statement_limit(
@@ -1666,15 +2327,46 @@ fn execute_sql(
             parameters.len(),
         ));
     }
-    if sql_statement_class(statement)? == SqlStatementClass::Read {
-        let prepared = product.prepare_sql(statement)?;
-        if prepared.maximum_result_rows() > context.limits.max_count {
-            return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+    if bound.class() == SqlStatementClass::Read {
+        if let Some(prepared) = bound.prepared_statement() {
+            if prepared
+                .maximum_result_rows()
+                .is_none_or(|rows| rows > context.limits.max_count)
+            {
+                return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+            }
+            let result = product
+                .execute_bound_sql_with_checkpoint(bound, parameters, || {
+                    context.checkpoint().is_ok()
+                })
+                .map_err(|error| map_execution_interruption(error, context))?;
+            let response = ProductResponse::Sql {
+                result: result.value,
+                snapshot: Some(result.snapshot),
+                commit: None,
+            };
+            admit_response(context, &response)?;
+            return Ok(response);
         }
-        let result = product.execute_prepared(&prepared, parameters)?;
+
+        let identity = product
+            .snapshot_bounded(context.logical_time_micros)?
+            .identity();
+        let mut transaction = product.database.begin_sql(
+            context.logical_time_micros,
+            context.durability.durability.into(),
+        )?;
+        if identity.catalog_version != bound.catalog_version() {
+            return Err(hyphae_native_runtime::SqlError::CatalogChanged.into());
+        }
+        let result = transaction
+            .execute_bound_sql_with_checkpoint(bound, parameters, || context.checkpoint().is_ok())
+            .map_err(ProductError::from)
+            .map_err(|error| map_execution_interruption(error, context))?;
+        transaction.rollback();
         let response = ProductResponse::Sql {
-            result: result.value,
-            snapshot: Some(result.snapshot),
+            result: result.into(),
+            snapshot: Some(identity),
             commit: None,
         };
         admit_response(context, &response)?;
@@ -1685,8 +2377,11 @@ fn execute_sql(
         context.logical_time_micros,
         context.durability.durability.into(),
     )?;
-    let result = transaction.execute_sql(statement, parameters)?;
-    let no_mutation = sql_command_can_be_noop(statement)
+    let result = transaction
+        .execute_bound_sql_with_checkpoint(bound, parameters, || sql_mutation_checkpoint(context))
+        .map_err(ProductError::from)
+        .map_err(|error| map_execution_interruption(error, context))?;
+    let no_mutation = sql_command_can_be_noop(bound.class(), statement)
         && matches!(
             result,
             hyphae_native_runtime::SqlResult::Command {
@@ -1746,6 +2441,10 @@ fn commit(
     let resolution_id = ProductTransactionId::from(resolution.resolution_id);
     match transaction.commit() {
         Ok(receipt) => {
+            #[cfg(test)]
+            if context.cancel_sql_mutation_at_commit {
+                context.cancellation.cancel();
+            }
             telemetry.record_timing(TimingClass::WalAppend, receipt.wal_append_time);
             telemetry.record_timing(
                 TimingClass::PageSynchronization,
@@ -2463,6 +3162,7 @@ fn stage_transaction(
     session: &mut ProductSession,
     handle: ProductTransactionHandle,
     authorization: &ProductAuthorizationRequirement,
+    limits: ProductLimits,
     stage: impl FnOnce(&mut NativeWriteBatch) -> Result<ProductTransactionStageResult, ProductError>,
 ) -> Result<ProductTransactionStageReceipt, ProductError> {
     let current = session
@@ -2478,6 +3178,14 @@ fn stage_transaction(
     let result = stage(&mut candidate_batch)?;
     let changed = candidate_batch.mutation_count() > before;
     let operation_ordinal = staged_operations + 1;
+    let receipt = ProductTransactionStageReceipt {
+        handle,
+        operation_ordinal,
+        changed,
+        result,
+    };
+    let response_bytes = transaction_stage_response_bytes(&receipt);
+    limits.admit_response(1, response_bytes, response_bytes)?;
     let source = session
         .take_active_transaction(handle)
         .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
@@ -2490,12 +3198,107 @@ fn stage_transaction(
         authorization: retained_authorization,
     };
     session.replace_active_transaction(handle, candidate);
-    Ok(ProductTransactionStageReceipt {
-        handle,
-        operation_ordinal,
-        changed,
-        result,
+    Ok(receipt)
+}
+
+fn transaction_stage_response_bytes(receipt: &ProductTransactionStageReceipt) -> usize {
+    // Product limits count the complete canonical Native response envelope.
+    const ENVELOPE_AND_STAGE_HEADER_BYTES: usize = 16 + 8 + 8 + 1 + 1;
+    ENVELOPE_AND_STAGE_HEADER_BYTES.saturating_add(match &receipt.result {
+        ProductTransactionStageResult::Sql(result) => sql_result_wire_bytes(result),
+        ProductTransactionStageResult::Structure(result) => {
+            structure_mutation_result_wire_bytes(result)
+        }
+        ProductTransactionStageResult::Search => 0,
+        ProductTransactionStageResult::Vector(_) => 1,
     })
+}
+
+fn structure_mutation_result_wire_bytes(result: &ProductStructureMutationResult) -> usize {
+    match result {
+        ProductStructureMutationResult::Unit => 1,
+        ProductStructureMutationResult::Integer(_)
+        | ProductStructureMutationResult::Count(_)
+        | ProductStructureMutationResult::StreamId(_) => 9,
+        ProductStructureMutationResult::Boolean(_) => 2,
+        ProductStructureMutationResult::Value(value) => value
+            .as_ref()
+            .map_or(2, |value| 6_usize.saturating_add(value.len())),
+    }
+}
+
+fn sql_result_wire_bytes(result: &ProductSqlResult) -> usize {
+    match result {
+        ProductSqlResult::Command { object_id, .. } => {
+            16_usize.saturating_add(usize::from(object_id.is_some()).saturating_mul(16))
+        }
+        ProductSqlResult::Rows { columns, rows } => {
+            let columns = columns.iter().fold(0_usize, |total, column| {
+                total.saturating_add(4).saturating_add(column.len())
+            });
+            let values = rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .fold(0_usize, |total, value| {
+                    total.saturating_add(value_wire_bytes(value, 0))
+                });
+            16_usize.saturating_add(columns).saturating_add(values)
+        }
+    }
+}
+
+fn value_wire_bytes(value: &ProductValue, depth: usize) -> usize {
+    if depth > 8 {
+        return usize::MAX;
+    }
+    match value {
+        ProductValue::Null => 1,
+        ProductValue::Boolean(_) => 2,
+        ProductValue::Signed(_)
+        | ProductValue::Unsigned(_)
+        | ProductValue::Float64(_)
+        | ProductValue::Time(_)
+        | ProductValue::Timestamp(_) => 9,
+        ProductValue::Decimal(_) | ProductValue::Uuid(_) | ProductValue::Interval { .. } => 17,
+        ProductValue::Float32(_) | ProductValue::Date(_) => 5,
+        ProductValue::Text(value) | ProductValue::Json(value) => {
+            5_usize.saturating_add(value.len())
+        }
+        ProductValue::Binary(value) => 5_usize.saturating_add(value.len()),
+        ProductValue::Array(values) => values.iter().fold(5_usize, |total, value| {
+            total.saturating_add(value_wire_bytes(value, depth + 1))
+        }),
+        ProductValue::Map(entries) => entries.iter().fold(5_usize, |total, (key, value)| {
+            total
+                .saturating_add(value_wire_bytes(key, depth + 1))
+                .saturating_add(value_wire_bytes(value, depth + 1))
+        }),
+        ProductValue::Vector(values) => 5_usize.saturating_add(values.len().saturating_mul(4)),
+        _ => usize::MAX,
+    }
+}
+
+fn restore_success_response_bytes(request: &RestoreRequest) -> usize {
+    // A successful restore always returns both request paths, a healthy doctor
+    // report with recovery evidence, and all six ordered restore phases.
+    222_usize
+        .saturating_add(request.backup.as_os_str().as_encoded_bytes().len())
+        .saturating_add(request.destination.as_os_str().as_encoded_bytes().len())
+}
+
+fn restore_response_bytes(info: &crate::RestoreInfo) -> usize {
+    let doctor_bytes = 44_usize
+        .saturating_add(usize::from(info.doctor.directory_lineage.is_some()).saturating_mul(24))
+        .saturating_add(usize::from(info.doctor.recovery.is_some()).saturating_mul(64));
+    16_usize
+        .saturating_add(4)
+        .saturating_add(info.data_path.as_os_str().as_encoded_bytes().len())
+        .saturating_add(4)
+        .saturating_add(info.backup.path.as_os_str().as_encoded_bytes().len())
+        .saturating_add(56)
+        .saturating_add(doctor_bytes)
+        .saturating_add(4)
+        .saturating_add(info.phases.len())
 }
 
 fn validate_transaction_sql(mutation: &ProductTransactionSqlMutation) -> Result<(), ProductError> {
@@ -2633,10 +3436,86 @@ fn commit_publication_may_be_unknown(error: &hyphae_native_runtime::NativeRuntim
 }
 
 impl ProductOperation {
+    /// Returns the stable registry name for a durable security mutation.
+    ///
+    /// Offline owner-recovery and legacy migration calls are intentionally not
+    /// `ProductOperation` variants and are inventoried separately.
+    #[doc(hidden)]
+    pub const fn security_mutation_registry_name(&self) -> Option<&'static str> {
+        match self {
+            Self::SecurityPrincipalCreate { .. } => Some("SecurityPrincipalCreate"),
+            Self::SecurityPrincipalSetEnabled { .. } => Some("SecurityPrincipalSetEnabled"),
+            Self::SecurityCustomRoleCreate { .. } => Some("SecurityCustomRoleCreate"),
+            Self::SecurityBuiltInAssignmentCreate { .. } => Some("SecurityBuiltInAssignmentCreate"),
+            Self::SecurityCustomAssignmentCreate { .. } => Some("SecurityCustomAssignmentCreate"),
+            Self::SecurityAssignmentRevoke { .. } => Some("SecurityAssignmentRevoke"),
+            Self::SecurityApiKeyIssueSelfStart { .. } => Some("SecurityApiKeyIssueSelfStart"),
+            Self::SecurityApiKeyIssueStart { .. } => Some("SecurityApiKeyIssueStart"),
+            Self::SecurityApiKeyIssueSelfActivate { .. } => Some("SecurityApiKeyIssueSelfActivate"),
+            Self::SecurityApiKeyIssueActivate { .. } => Some("SecurityApiKeyIssueActivate"),
+            Self::SecurityApiKeyRotateSelfStart { .. } => Some("SecurityApiKeyRotateSelfStart"),
+            Self::SecurityApiKeyRotateStart { .. } => Some("SecurityApiKeyRotateStart"),
+            Self::SecurityApiKeyRotateSelfActivate { .. } => {
+                Some("SecurityApiKeyRotateSelfActivate")
+            }
+            Self::SecurityApiKeyRotateActivate { .. } => Some("SecurityApiKeyRotateActivate"),
+            Self::SecurityApiKeyIssueSelfAbort { .. } => Some("SecurityApiKeyIssueSelfAbort"),
+            Self::SecurityApiKeyIssueAbort { .. } => Some("SecurityApiKeyIssueAbort"),
+            Self::SecurityApiKeyRotateSelfAbort { .. } => Some("SecurityApiKeyRotateSelfAbort"),
+            Self::SecurityApiKeyRotateAbort { .. } => Some("SecurityApiKeyRotateAbort"),
+            Self::SecurityApiKeyRevokeSelf { .. } => Some("SecurityApiKeyRevokeSelf"),
+            Self::SecurityApiKeyRevoke { .. } => Some("SecurityApiKeyRevoke"),
+            Self::SecurityLegacyBearerRevoke => Some("SecurityLegacyBearerRevoke"),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this is a strict managed credential-lifecycle write.
+    #[must_use]
+    pub fn is_key_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::SecurityApiKeyIssueSelfStart { .. }
+                | Self::SecurityApiKeyIssueStart { .. }
+                | Self::SecurityApiKeyIssueSelfActivate { .. }
+                | Self::SecurityApiKeyIssueActivate { .. }
+                | Self::SecurityApiKeyRotateSelfStart { .. }
+                | Self::SecurityApiKeyRotateStart { .. }
+                | Self::SecurityApiKeyRotateSelfActivate { .. }
+                | Self::SecurityApiKeyRotateActivate { .. }
+                | Self::SecurityApiKeyIssueSelfAbort { .. }
+                | Self::SecurityApiKeyIssueAbort { .. }
+                | Self::SecurityApiKeyRotateSelfAbort { .. }
+                | Self::SecurityApiKeyRotateAbort { .. }
+                | Self::SecurityApiKeyRevokeSelf { .. }
+                | Self::SecurityApiKeyRevoke { .. }
+                | Self::SecurityLegacyBearerRevoke
+        )
+    }
+
+    fn is_self_key_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::SecurityApiKeyIssueSelfStart { .. }
+                | Self::SecurityApiKeyIssueSelfActivate { .. }
+                | Self::SecurityApiKeyRotateSelfStart { .. }
+                | Self::SecurityApiKeyRotateSelfActivate { .. }
+                | Self::SecurityApiKeyIssueSelfAbort { .. }
+                | Self::SecurityApiKeyRotateSelfAbort { .. }
+                | Self::SecurityApiKeyRevokeSelf { .. }
+        )
+    }
+
     fn validate_limits(&self, limits: ProductLimits) -> Result<(), ProductError> {
         let valid = match self {
             Self::CatalogList(request) => {
                 request.byte_limit <= limits.max_response_bytes
+                    && request.byte_limit <= limits.max_memory_bytes
+            }
+            Self::CatalogVisibleList(request) => {
+                request.cursor.as_ref().is_none_or(|cursor| {
+                    cursor.encoded_len() <= crate::MAX_CATALOG_VISIBLE_CURSOR_BYTES
+                }) && request.byte_limit <= limits.max_response_bytes
                     && request.byte_limit <= limits.max_memory_bytes
             }
             Self::CatalogDependencies(request) => {
@@ -2673,19 +3552,25 @@ impl ProductOperation {
             } => operation.validate_limits(limits).is_ok(),
             _ => true,
         };
-        if valid {
+        if !valid
+            && matches!(self, Self::CatalogVisibleList(request) if request.cursor.as_ref().is_some_and(|cursor| cursor.encoded_len() > crate::MAX_CATALOG_VISIBLE_CURSOR_BYTES))
+        {
+            Err(ProductError::from_code(ProductErrorCode::CatalogConflict))
+        } else if valid {
             Ok(())
         } else {
             Err(ProductError::from_code(ProductErrorCode::LimitExceeded))
         }
     }
 
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
     fn required_permissions(&self) -> Result<ProductAuthorization, ProductError> {
         let required = match self {
             Self::Capabilities => authorization([ProductPermission::Discover]),
             Self::CatalogObject { .. }
             | Self::CatalogObjectNamed { .. }
             | Self::CatalogList(_)
+            | Self::CatalogVisibleList(_)
             | Self::CatalogDependencies(_)
             | Self::CatalogDescribe { .. }
             | Self::CatalogResolve { .. } => authorization([ProductPermission::CatalogRead]),
@@ -2751,7 +3636,32 @@ impl ProductOperation {
             | Self::SecurityAssignmentRevoke { .. } => {
                 authorization([ProductPermission::SecurityManage])
             }
+            Self::SecurityApiKeyIssueSelfStart { .. }
+            | Self::SecurityApiKeyIssueSelfActivate { .. }
+            | Self::SecurityApiKeyRotateSelfStart { .. }
+            | Self::SecurityApiKeyRotateSelfActivate { .. }
+            | Self::SecurityApiKeyIssueSelfAbort { .. }
+            | Self::SecurityApiKeyRotateSelfAbort { .. }
+            | Self::SecurityApiKeyRevokeSelf { .. } => {
+                authorization([ProductPermission::CredentialSelfManage])
+            }
+            Self::SecurityApiKeyIssueStart { roles, .. } if roles.contains(&BuiltInRole::Owner) => {
+                authorization([
+                    ProductPermission::SecurityManage,
+                    ProductPermission::OwnershipManage,
+                ])
+            }
+            Self::SecurityApiKeyIssueStart { .. }
+            | Self::SecurityApiKeyIssueActivate { .. }
+            | Self::SecurityApiKeyRotateStart { .. }
+            | Self::SecurityApiKeyRotateActivate { .. }
+            | Self::SecurityApiKeyIssueAbort { .. }
+            | Self::SecurityApiKeyRotateAbort { .. }
+            | Self::SecurityApiKeyRevoke { .. } => {
+                authorization([ProductPermission::SecurityManage])
+            }
             Self::SecurityAuditRead(_) => authorization([ProductPermission::AuditRead]),
+            Self::SecurityLegacyBearerRevoke => authorization([ProductPermission::OwnershipManage]),
             Self::VerifyProof { .. } => authorization([ProductPermission::ProofVerify]),
             Self::Prove { operation, .. } => operation
                 .required_permissions()?
@@ -2767,12 +3677,14 @@ impl ProductOperation {
     /// explicit transaction are deliberately excluded even when they do not
     /// publish durable product state.
     #[must_use]
+    #[allow(clippy::match_same_arms)]
     pub fn is_read_only(&self) -> bool {
         match self {
             Self::Capabilities
             | Self::CatalogObject { .. }
             | Self::CatalogObjectNamed { .. }
             | Self::CatalogList(_)
+            | Self::CatalogVisibleList(_)
             | Self::CatalogDependencies(_)
             | Self::CatalogDescribe { .. }
             | Self::CatalogResolve { .. }
@@ -2827,9 +3739,25 @@ impl ProductOperation {
             | Self::SecurityBuiltInAssignmentCreate { .. }
             | Self::SecurityCustomAssignmentCreate { .. }
             | Self::SecurityAssignmentRevoke { .. } => false,
+            Self::SecurityApiKeyIssueSelfStart { .. }
+            | Self::SecurityApiKeyIssueStart { .. }
+            | Self::SecurityApiKeyIssueSelfActivate { .. }
+            | Self::SecurityApiKeyIssueActivate { .. }
+            | Self::SecurityApiKeyRotateSelfStart { .. }
+            | Self::SecurityApiKeyRotateStart { .. }
+            | Self::SecurityApiKeyRotateSelfActivate { .. }
+            | Self::SecurityApiKeyRotateActivate { .. }
+            | Self::SecurityApiKeyIssueSelfAbort { .. }
+            | Self::SecurityApiKeyIssueAbort { .. }
+            | Self::SecurityApiKeyRotateSelfAbort { .. }
+            | Self::SecurityApiKeyRotateAbort { .. }
+            | Self::SecurityApiKeyRevokeSelf { .. }
+            | Self::SecurityApiKeyRevoke { .. } => false,
+            Self::SecurityLegacyBearerRevoke => false,
         }
     }
 
+    #[allow(clippy::match_same_arms)]
     fn requires_managed_authority(&self) -> bool {
         match self {
             Self::SecurityStatus
@@ -2844,6 +3772,21 @@ impl ProductOperation {
             | Self::SecurityBuiltInAssignmentCreate { .. }
             | Self::SecurityCustomAssignmentCreate { .. }
             | Self::SecurityAssignmentRevoke { .. } => true,
+            Self::SecurityApiKeyIssueSelfStart { .. }
+            | Self::SecurityApiKeyIssueStart { .. }
+            | Self::SecurityApiKeyIssueSelfActivate { .. }
+            | Self::SecurityApiKeyIssueActivate { .. }
+            | Self::SecurityApiKeyRotateSelfStart { .. }
+            | Self::SecurityApiKeyRotateStart { .. }
+            | Self::SecurityApiKeyRotateSelfActivate { .. }
+            | Self::SecurityApiKeyRotateActivate { .. }
+            | Self::SecurityApiKeyIssueSelfAbort { .. }
+            | Self::SecurityApiKeyIssueAbort { .. }
+            | Self::SecurityApiKeyRotateSelfAbort { .. }
+            | Self::SecurityApiKeyRotateAbort { .. }
+            | Self::SecurityApiKeyRevokeSelf { .. }
+            | Self::SecurityApiKeyRevoke { .. } => true,
+            Self::SecurityLegacyBearerRevoke => true,
             Self::Prove { operation, .. } => operation.requires_managed_authority(),
             _ => false,
         }
@@ -2868,6 +3811,21 @@ impl ProductOperation {
                 | Self::SecurityBuiltInAssignmentCreate { .. }
                 | Self::SecurityCustomAssignmentCreate { .. }
                 | Self::SecurityAssignmentRevoke { .. }
+                | Self::SecurityApiKeyIssueSelfStart { .. }
+                | Self::SecurityApiKeyIssueStart { .. }
+                | Self::SecurityApiKeyIssueSelfActivate { .. }
+                | Self::SecurityApiKeyIssueActivate { .. }
+                | Self::SecurityApiKeyRotateSelfStart { .. }
+                | Self::SecurityApiKeyRotateStart { .. }
+                | Self::SecurityApiKeyRotateSelfActivate { .. }
+                | Self::SecurityApiKeyRotateActivate { .. }
+                | Self::SecurityApiKeyIssueSelfAbort { .. }
+                | Self::SecurityApiKeyIssueAbort { .. }
+                | Self::SecurityApiKeyRotateSelfAbort { .. }
+                | Self::SecurityApiKeyRotateAbort { .. }
+                | Self::SecurityApiKeyRevokeSelf { .. }
+                | Self::SecurityApiKeyRevoke { .. }
+                | Self::SecurityLegacyBearerRevoke
         ) || matches!(
             self,
             Self::ExecuteSql { statement, .. }
@@ -2887,6 +3845,21 @@ impl ProductOperation {
                 | Self::SecurityBuiltInAssignmentCreate { .. }
                 | Self::SecurityCustomAssignmentCreate { .. }
                 | Self::SecurityAssignmentRevoke { .. }
+                | Self::SecurityApiKeyIssueSelfStart { .. }
+                | Self::SecurityApiKeyIssueStart { .. }
+                | Self::SecurityApiKeyIssueSelfActivate { .. }
+                | Self::SecurityApiKeyIssueActivate { .. }
+                | Self::SecurityApiKeyRotateSelfStart { .. }
+                | Self::SecurityApiKeyRotateStart { .. }
+                | Self::SecurityApiKeyRotateSelfActivate { .. }
+                | Self::SecurityApiKeyRotateActivate { .. }
+                | Self::SecurityApiKeyIssueSelfAbort { .. }
+                | Self::SecurityApiKeyIssueAbort { .. }
+                | Self::SecurityApiKeyRotateSelfAbort { .. }
+                | Self::SecurityApiKeyRotateAbort { .. }
+                | Self::SecurityApiKeyRevokeSelf { .. }
+                | Self::SecurityApiKeyRevoke { .. }
+                | Self::SecurityLegacyBearerRevoke
         )
     }
 
@@ -2896,6 +3869,7 @@ impl ProductOperation {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::match_same_arms)]
     fn request_cost_parts(&self) -> (usize, usize, usize) {
         match self {
             Self::Capabilities
@@ -2923,6 +3897,14 @@ impl ProductOperation {
             Self::CatalogList(request) => (
                 request.item_limit,
                 0,
+                request.visit_limit.max(request.item_limit),
+            ),
+            Self::CatalogVisibleList(request) => (
+                request.item_limit,
+                request
+                    .cursor
+                    .as_ref()
+                    .map_or(0, crate::CatalogVisibleCursor::encoded_len),
                 request.visit_limit.max(request.item_limit),
             ),
             Self::CatalogDependencies(request) => (
@@ -2998,6 +3980,42 @@ impl ProductOperation {
             }
             Self::SecurityBuiltInAssignmentCreate { .. } => (1, 64, 1),
             Self::SecurityCustomAssignmentCreate { .. } => (1, 32, 1),
+            Self::SecurityApiKeyIssueSelfStart {
+                label,
+                roles,
+                custom_roles,
+                scope_ceiling,
+                ..
+            }
+            | Self::SecurityApiKeyIssueStart {
+                label,
+                roles,
+                custom_roles,
+                scope_ceiling,
+                ..
+            } => {
+                let bytes = label
+                    .len()
+                    .saturating_add(roles.len())
+                    .saturating_add(custom_roles.len().saturating_mul(16))
+                    .saturating_add(scope_ceiling.len().saturating_mul(24));
+                (1, bytes, bytes.max(1))
+            }
+            Self::SecurityApiKeyRotateSelfStart { label, .. }
+            | Self::SecurityApiKeyRotateStart { label, .. } => {
+                (1, label.len().saturating_add(40), label.len().max(1))
+            }
+            Self::SecurityApiKeyIssueSelfActivate { .. }
+            | Self::SecurityApiKeyIssueActivate { .. }
+            | Self::SecurityApiKeyRotateSelfActivate { .. }
+            | Self::SecurityApiKeyRotateActivate { .. } => (1, 48, 1),
+            Self::SecurityApiKeyIssueSelfAbort { .. }
+            | Self::SecurityApiKeyIssueAbort { .. }
+            | Self::SecurityApiKeyRotateSelfAbort { .. }
+            | Self::SecurityApiKeyRotateAbort { .. }
+            | Self::SecurityApiKeyRevokeSelf { .. }
+            | Self::SecurityApiKeyRevoke { .. } => (1, 16, 1),
+            Self::SecurityLegacyBearerRevoke => (1, 0, 1),
             Self::Restore(request) => (
                 1,
                 request
@@ -3026,10 +4044,6 @@ impl ProductOperation {
             | Self::StructureSet { .. }
             | Self::StructureMutate { .. }
             | Self::TransactionBegin
-            | Self::TransactionStageSql { .. }
-            | Self::TransactionStageStructure { .. }
-            | Self::TransactionStageSearch { .. }
-            | Self::TransactionStageVector { .. }
             | Self::TransactionCommit { .. }
             | Self::TransactionRollback { .. }
             | Self::SearchIngest { .. }
@@ -3041,7 +4055,24 @@ impl ProductOperation {
             | Self::SecurityCustomRoleCreate { .. }
             | Self::SecurityBuiltInAssignmentCreate { .. }
             | Self::SecurityCustomAssignmentCreate { .. }
-            | Self::SecurityAssignmentRevoke { .. } => Some((1, 256)),
+            | Self::SecurityAssignmentRevoke { .. }
+            | Self::SecurityApiKeyIssueSelfActivate { .. }
+            | Self::SecurityApiKeyIssueActivate { .. }
+            | Self::SecurityApiKeyRotateSelfActivate { .. }
+            | Self::SecurityApiKeyRotateActivate { .. }
+            | Self::SecurityApiKeyIssueSelfAbort { .. }
+            | Self::SecurityApiKeyIssueAbort { .. }
+            | Self::SecurityApiKeyRotateSelfAbort { .. }
+            | Self::SecurityApiKeyRotateAbort { .. }
+            | Self::SecurityApiKeyRevokeSelf { .. }
+            | Self::SecurityApiKeyRevoke { .. }
+            | Self::SecurityLegacyBearerRevoke => Some((1, 256)),
+            Self::SecurityApiKeyIssueSelfStart { .. }
+            | Self::SecurityApiKeyIssueStart { .. }
+            | Self::SecurityApiKeyRotateSelfStart { .. }
+            | Self::SecurityApiKeyRotateStart { .. } => {
+                Some((1, ApiKeyStartReceipt::wire_size_bound()))
+            }
             Self::ExecuteSql { .. } => self.is_mutating().then_some((1, 256)),
             Self::Backup(request) => Some((
                 1,
@@ -3052,15 +4083,7 @@ impl ProductOperation {
                     .len()
                     .saturating_add(128),
             )),
-            Self::Restore(request) => Some((
-                1,
-                request
-                    .destination
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .len()
-                    .saturating_add(512),
-            )),
+            Self::Restore(request) => Some((1, restore_success_response_bytes(request))),
             _ => None,
         }
     }
@@ -3107,6 +4130,18 @@ impl ProductResponse {
             Self::Capabilities(_) => (1, 64),
             Self::CatalogObject(read) => (1, catalog_object_bytes(&read.value)),
             Self::CatalogPage(page) => (page.items.len(), page.returned_bytes),
+            Self::CatalogVisiblePage(page) => (
+                page.items.len(),
+                page.items
+                    .iter()
+                    .map(|item| qualified_name_bytes(&item.name).saturating_add(40))
+                    .sum::<usize>()
+                    .saturating_add(
+                        page.cursor
+                            .as_ref()
+                            .map_or(0, crate::CatalogVisibleCursor::encoded_len),
+                    ),
+            ),
             Self::CatalogDependencyPage(page) => (page.items.len(), page.returned_bytes),
             Self::CatalogDefinition(None) => (0, 0),
             Self::CatalogDefinition(Some(object)) => (1, qualified_name_bytes(object.name())),
@@ -3118,7 +4153,6 @@ impl ProductResponse {
             | Self::StructureTtl(_)
             | Self::TransactionStatus(_)
             | Self::ExplicitTransactionStatus(_)
-            | Self::TransactionStaged(_)
             | Self::TransactionCommitted(_)
             | Self::TransactionRolledBack(_)
             | Self::AdminCheckpoint(_)
@@ -3127,7 +4161,10 @@ impl ProductResponse {
             | Self::SecurityPrincipalMutated(_)
             | Self::SecurityCustomRoleMutated(_)
             | Self::SecurityAssignmentMutated(_)
-            | Self::SecurityMutated(_) => (1, 256),
+            | Self::SecurityMutated(_)
+            | Self::SecurityApiKeyStarted(_)
+            | Self::SecurityApiKeyActivated(_) => (1, 256),
+            Self::TransactionStaged(receipt) => (1, transaction_stage_response_bytes(receipt)),
             Self::Explain(explanation) => (1, format!("{explanation:?}").len()),
             Self::Sql { result, .. } => sql_result_cost(result),
             Self::StructureValue(value) => (
@@ -3152,7 +4189,7 @@ impl ProductResponse {
             Self::SecurityAssignmentPage(page) => (page.items.len(), page.encoded_size_bound()),
             Self::SecurityKeyPage(page) => (page.items.len(), page.encoded_size_bound()),
             Self::SecurityAuditPage(page) => (page.events.len(), page.encoded_size_bound()),
-            Self::Restore(info) => (1, info.data_path.as_os_str().as_encoded_bytes().len() + 512),
+            Self::Restore(info) => (1, restore_response_bytes(info)),
             Self::Telemetry(snapshot) => (
                 snapshot.metrics.len().saturating_add(snapshot.events.len()),
                 snapshot
@@ -3182,7 +4219,10 @@ fn sql_statement_class(statement: &str) -> Result<SqlStatementClass, ProductErro
     classify_sql_statement(statement).map_err(ProductError::from)
 }
 
-fn sql_command_can_be_noop(statement: &str) -> bool {
+fn sql_command_can_be_noop(class: SqlStatementClass, statement: &str) -> bool {
+    if class != SqlStatementClass::DataMutation {
+        return false;
+    }
     let first = statement
         .trim_start()
         .split(|character: char| character.is_ascii_whitespace() || character == '(')
@@ -3206,8 +4246,12 @@ fn search_limits(limits: ProductLimits, requested_hits: usize) -> BoundedSearchL
     }
 }
 
-fn map_search_error(error: &BoundedSearchError) -> ProductError {
+fn map_search_error(error: &BoundedSearchError, context: &ProductRequestContext) -> ProductError {
     match error {
+        BoundedSearchError::ExecutionInterrupted => context
+            .checkpoint()
+            .err()
+            .unwrap_or_else(|| context.error(ProductErrorCode::Cancelled)),
         BoundedSearchError::UnknownIndex => {
             ProductError::from_code(ProductErrorCode::ObjectNotFound)
         }
@@ -3222,6 +4266,17 @@ fn map_search_error(error: &BoundedSearchError) -> ProductError {
             ProductError::from_code(ProductErrorCode::LimitExceeded)
         }
         _ => ProductError::from_code(ProductErrorCode::InvalidRequest),
+    }
+}
+
+fn map_execution_interruption(
+    error: ProductError,
+    context: &ProductRequestContext,
+) -> ProductError {
+    if error.code() == ProductErrorCode::Cancelled {
+        context.checkpoint().err().unwrap_or(error)
+    } else {
+        error
     }
 }
 
@@ -3245,6 +4300,9 @@ fn map_backup_error(error: BackupProductError, context: &ProductRequestContext) 
 
 fn map_proof_error(error: &crate::proof::NativeProofError) -> ProductError {
     match error {
+        crate::proof::NativeProofError::Interrupted => {
+            ProductError::from_code(ProductErrorCode::Cancelled)
+        }
         crate::proof::NativeProofError::LimitExceeded { .. }
         | crate::proof::NativeProofError::LengthOverflow => {
             ProductError::from_code(ProductErrorCode::LimitExceeded)
@@ -3392,5 +4450,29 @@ mod security_response_cost_tests {
         assert_eq!(ProductResponse::SecurityKeyPage(keys).cost(), (0, 72));
         assert_eq!(ProductResponse::SecurityAuditPage(audit).cost(), (0, 48));
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn api_key_lifecycle_is_always_rejected_from_prove() {
+        let Some(key_id) = ApiKeyId::from_bytes([1; 16]) else {
+            panic!("nonzero key id");
+        };
+        let Some(principal_id) = SecurityId::new(1) else {
+            panic!("nonzero principal");
+        };
+        assert!(ProductOperation::SecurityApiKeyRevoke { key_id }.is_key_lifecycle());
+        assert!(
+            ProductOperation::SecurityApiKeyIssueSelfStart {
+                principal_id,
+                label: "pending".to_owned(),
+                roles: vec![BuiltInRole::Owner],
+                custom_roles: Vec::new(),
+                permission_ceiling: ProductAuthorization::ALL,
+                scope_ceiling: vec![ProductScope::Instance],
+                expires_at_micros: None,
+            }
+            .is_key_lifecycle()
+        );
     }
 }

@@ -1,24 +1,30 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Process-local CLI client over the native product dispatcher.
 
 use std::{
-    fs::{self, File},
-    io::{self, Read},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::Path,
+    time::Duration,
 };
 
-#[cfg(windows)]
-use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use hyphae_native_product::{
-    MAX_API_KEY_CREDENTIAL_BYTES, NativeProduct, ProductAuthorization, ProductDurability,
-    ProductError, ProductErrorCode, ProductOperation, ProductPrincipal, ProductResponse,
-    ProductSession, ProductSessionId,
+    ApiKeyId, AuthorizationEpoch, LegacyBearerMigrationActivationReceipt,
+    LegacyBearerMigrationStartReceipt, MAX_API_KEY_CREDENTIAL_BYTES, NativeProduct,
+    OwnerRecoveryAbortReceipt, OwnerRecoveryActivationReceipt, OwnerRecoveryInspection,
+    OwnerRecoveryStartReceipt, ProductAuthorization, ProductCancellationToken, ProductDurability,
+    ProductError, ProductErrorCode, ProductLimits, ProductOperation, ProductPrincipal,
+    ProductResponse, ProductSession, ProductSessionId,
 };
 use uuid::Uuid;
 
 use crate::{exit::CliFailure, native::logical_time_micros};
+
+const CONSOLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct ApiKeyBuffer(Vec<u8>);
 
@@ -62,6 +68,110 @@ pub(crate) struct EmbeddedClient {
     next_request_id: u128,
 }
 
+/// Exclusive credential-free client for OS-owner-authorized offline recovery.
+pub(crate) struct OfflineOwnerClient {
+    product: NativeProduct,
+}
+
+pub(crate) struct LegacyBearerBuffer(Vec<u8>);
+
+impl LegacyBearerBuffer {
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for LegacyBearerBuffer {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl OfflineOwnerClient {
+    pub(crate) fn open(data_dir: &Path) -> Result<Self, CliFailure> {
+        NativeProduct::open_offline_owner(data_dir)
+            .map(|product| Self { product })
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn inspect(&self) -> Result<OwnerRecoveryInspection, CliFailure> {
+        self.product
+            .inspect_owner_recovery_offline()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn start(&mut self, label: &str) -> Result<OwnerRecoveryStartReceipt, CliFailure> {
+        self.product
+            .start_owner_recovery_offline(label, logical_time_micros())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn resume(
+        &mut self,
+        pending_key_id: ApiKeyId,
+        key_file: &Path,
+        expected_epoch: AuthorizationEpoch,
+    ) -> Result<OwnerRecoveryActivationReceipt, CliFailure> {
+        let key = read_api_key_file(key_file)?;
+        self.product
+            .resume_owner_recovery_offline(
+                pending_key_id,
+                key.credential()?,
+                expected_epoch,
+                logical_time_micros(),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn abort(
+        &mut self,
+        pending_key_id: ApiKeyId,
+        expected_epoch: AuthorizationEpoch,
+    ) -> Result<OwnerRecoveryAbortReceipt, CliFailure> {
+        self.product
+            .abort_owner_recovery_offline(pending_key_id, expected_epoch, logical_time_micros())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn start_legacy(
+        &mut self,
+        name: &str,
+        label: &str,
+        legacy_bearer: &LegacyBearerBuffer,
+    ) -> Result<LegacyBearerMigrationStartReceipt, CliFailure> {
+        self.product
+            .start_legacy_bearer_migration_offline(
+                name,
+                label,
+                legacy_bearer.expose(),
+                logical_time_micros(),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn activate_legacy(
+        &mut self,
+        key_id: ApiKeyId,
+        serialized_key: &str,
+        expected_epoch: AuthorizationEpoch,
+        name: &str,
+        label: &str,
+        legacy_bearer: &LegacyBearerBuffer,
+    ) -> Result<LegacyBearerMigrationActivationReceipt, CliFailure> {
+        self.product
+            .activate_legacy_bearer_migration_offline(
+                key_id,
+                serialized_key,
+                expected_epoch,
+                name,
+                label,
+                legacy_bearer.expose(),
+                logical_time_micros(),
+            )
+            .map_err(Into::into)
+    }
+}
+
 impl EmbeddedClient {
     pub(crate) fn open(
         product: NativeProduct,
@@ -73,8 +183,14 @@ impl EmbeddedClient {
         let session_id = session_id()?;
         if status.bootstrapped {
             let credential = credential.ok_or_else(authorization_denied)?;
-            let authority =
-                product.authenticate_api_key(credential.credential()?, logical_time_micros())?;
+            let candidate = credential.credential()?;
+            let authority = match product.authenticate_api_key(candidate, logical_time_micros()) {
+                Ok(authority) => authority,
+                Err(error) if error.code() == ProductErrorCode::AuthorizationDenied => {
+                    product.authenticate_api_key_for_terminal_replay(candidate)?
+                }
+                Err(error) => return Err(error.into()),
+            };
             return Ok(Self {
                 product,
                 session: ProductSession::new_authenticated(session_id, authority),
@@ -106,7 +222,21 @@ impl EmbeddedClient {
         operation: ProductOperation,
         durability: ProductDurability,
     ) -> Result<ProductResponse, Box<ProductError>> {
-        self.dispatch_request(operation, durability, None)
+        self.dispatch_request(operation, durability, None, None)
+    }
+
+    pub(crate) fn dispatch_bounded(
+        &mut self,
+        operation: ProductOperation,
+        cancellation: ProductCancellationToken,
+        limits: ProductLimits,
+    ) -> Result<ProductResponse, Box<ProductError>> {
+        self.dispatch_request(
+            operation,
+            ProductDurability::Strict,
+            None,
+            Some((cancellation, limits)),
+        )
     }
 
     pub(crate) fn dispatch_with_idempotency(
@@ -123,6 +253,7 @@ impl EmbeddedClient {
             operation,
             ProductDurability::Strict,
             Some(idempotency_token),
+            None,
         )
     }
 
@@ -131,6 +262,7 @@ impl EmbeddedClient {
         operation: ProductOperation,
         durability: ProductDurability,
         idempotency_token: Option<u128>,
+        bounded: Option<(ProductCancellationToken, ProductLimits)>,
     ) -> Result<ProductResponse, Box<ProductError>> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
@@ -148,6 +280,18 @@ impl EmbeddedClient {
         .with_authorization_epoch(self.session.authorization_epoch());
         if let Some(idempotency_token) = idempotency_token {
             context = context.with_idempotency_token(idempotency_token);
+        }
+        if let Some((cancellation, limits)) = bounded {
+            context.cancellation = cancellation;
+            context.limits = limits;
+            let timeout_micros = i64::try_from(CONSOLE_REQUEST_TIMEOUT.as_micros())
+                .map_err(|_| Box::new(ProductError::from_code(ProductErrorCode::Internal)))?;
+            context.deadline_micros = Some(
+                context
+                    .logical_time_micros
+                    .checked_add(timeout_micros)
+                    .ok_or_else(|| Box::new(ProductError::from_code(ProductErrorCode::Internal)))?,
+            );
         }
         context.durability.durability = durability;
         self.product
@@ -245,6 +389,166 @@ pub(crate) fn read_api_key_file(path: &Path) -> Result<ApiKeyBuffer, CliFailure>
     .map_err(|_| authorization_denied())?;
     validate_open_api_key_file(path, &path_metadata, &file).map_err(|_| authorization_denied())?;
     read_bounded(file).map_err(|_| authorization_denied())
+}
+
+pub(crate) fn read_legacy_bearer_file(path: &Path) -> Result<LegacyBearerBuffer, CliFailure> {
+    #[cfg(windows)]
+    if is_windows_named_stream(path) {
+        return Err(authorization_denied());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| authorization_denied())?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(authorization_denied());
+    }
+    #[cfg(not(windows))]
+    let mut file = File::open(path).map_err(|_| authorization_denied())?;
+    #[cfg(windows)]
+    let mut file = (|| -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL},
+        };
+
+        OpenOptions::new()
+            .access_mode(GENERIC_READ | READ_CONTROL)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })()
+    .map_err(|_| authorization_denied())?;
+    validate_open_api_key_file(path, &metadata, &file).map_err(|_| authorization_denied())?;
+    let mut bytes = Vec::with_capacity(128);
+    Read::by_ref(&mut file)
+        .take(4_099)
+        .read_to_end(&mut bytes)
+        .map_err(|_| authorization_denied())?;
+    if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+    } else if bytes.ends_with(b"\n") {
+        bytes.truncate(bytes.len() - 1);
+    }
+    if !(32..=4_096).contains(&bytes.len())
+        || bytes.iter().any(|byte| !(0x21..=0x7e).contains(byte))
+        || bytes.starts_with(b"hyp1_")
+    {
+        bytes.fill(0);
+        return Err(authorization_denied());
+    }
+    Ok(LegacyBearerBuffer(bytes))
+}
+
+pub(crate) struct RestrictedKeyOutputReservation {
+    path: std::path::PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl RestrictedKeyOutputReservation {
+    pub(crate) fn write_secret(&mut self, secret: &[u8]) -> Result<(), CliFailure> {
+        let file = self.file.as_mut().ok_or_else(CliFailure::internal)?;
+        if let Err(error) = file.write_all(secret).and_then(|()| file.sync_all()) {
+            return Err(error.into());
+        }
+        sync_parent_io(&self.path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RestrictedKeyOutputReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.file.take();
+            let _ignored = fs::remove_file(&self.path);
+            let _ignored = sync_parent_io(&self.path);
+        }
+    }
+}
+
+pub(crate) fn reserve_restricted_api_key_file(
+    path: &Path,
+) -> Result<RestrictedKeyOutputReservation, CliFailure> {
+    #[cfg(windows)]
+    if is_windows_named_stream(path) {
+        return Err(CliFailure::invalid());
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER},
+        };
+        options
+            .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .share_mode(0);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    if hyphae_native_product::restrict_windows_credential_file(path, &file).is_err() {
+        drop(file);
+        let _ignored = fs::remove_file(path);
+        return Err(CliFailure::invalid());
+    }
+    if let Err(error) = file.sync_all().and_then(|()| sync_parent_io(path)) {
+        drop(file);
+        let _ignored = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(RestrictedKeyOutputReservation {
+        path: path.to_path_buf(),
+        file: Some(file),
+        committed: false,
+    })
+}
+
+pub(crate) fn ensure_key_output_outside_data_dir(
+    data_dir: &Path,
+    output: &Path,
+) -> Result<(), CliFailure> {
+    if output.try_exists()? {
+        return Err(CliFailure::from(ProductError::from_code(
+            ProductErrorCode::Io,
+        )));
+    }
+    let data = same_file::Handle::from_path(data_dir).map_err(|_| CliFailure::invalid())?;
+    let canonical_data = fs::canonicalize(data_dir).map_err(|_| CliFailure::invalid())?;
+    let output_parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut ancestor = Some(output_parent);
+    while let Some(path) = ancestor {
+        if path.try_exists()? {
+            let candidate =
+                same_file::Handle::from_path(path).map_err(|_| CliFailure::invalid())?;
+            let canonical_candidate = fs::canonicalize(path).map_err(|_| CliFailure::invalid())?;
+            if candidate == data || canonical_candidate.starts_with(&canonical_data) {
+                return Err(CliFailure::invalid());
+            }
+        }
+        ancestor = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_io(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_io(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -404,6 +708,30 @@ mod tests {
             .err()
             .ok_or("named-stream key file was accepted")?;
         assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_remains_exclusive_until_reservation_drops() -> Result<(), Box<dyn Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("hyphae-key-reservation-{}", Uuid::now_v7()));
+        fs::create_dir(&directory)?;
+        let path = directory.join("owner.key");
+        let mut output = reserve_restricted_api_key_file(&path)?;
+        output.write_secret(&[b'x'; MAX_API_KEY_CREDENTIAL_BYTES])?;
+
+        let error = read_api_key_file(&path)
+            .err()
+            .ok_or("live exclusive key reservation was reopened")?;
+        assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+
+        drop(output);
+        assert_eq!(
+            read_api_key_file(&path)?.credential()?.len(),
+            MAX_API_KEY_CREDENTIAL_BYTES
+        );
         fs::remove_dir_all(directory)?;
         Ok(())
     }

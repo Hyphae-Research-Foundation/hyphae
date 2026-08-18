@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local all-engine transaction v1
 
 Status: normative implemented contract with direct-Linux baseline evidence;

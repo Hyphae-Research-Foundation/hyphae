@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Serial AF_UNIX and Windows named-pipe HYPHLCL1 transport."""
 
 from __future__ import annotations
@@ -248,6 +248,11 @@ class LocalTransport:
         options: RequestOptions,
     ) -> Response:
         request_id = options.checked_request_id()
+        terminal_replay = operation in {
+            "security_api_key_revoke_self",
+            "security_api_key_rotate_self_activate",
+        }
+        fresh_terminal_replay = terminal_replay and self._current_stream() is None
         if options.cancellation.cancelled:
             raise product_error("cancelled", request_id)
         self._check_deadline(options)
@@ -257,10 +262,25 @@ class LocalTransport:
                 interrupted = context is not None and context.aborted
             if interrupted:
                 raise self._interrupted_error(options)
+            terminal_payload = (
+                encode_product_request(
+                    operation,
+                    arguments,
+                    options,
+                    negotiated_minor=PROTOCOL_MINOR,
+                )
+                if fresh_terminal_replay
+                else None
+            )
             self._connect(
                 ((request_id + 1) & ((1 << 64) - 1)) or 1,
                 options,
+                terminal_request=(1, request_id, terminal_payload)
+                if terminal_payload is not None
+                else None,
             )
+            if terminal_payload is not None:
+                self._next_stream_id = 2
         stream_id = self._next_stream_id
         self._next_stream_id = self._next_stream_id % 0xFFFFFFFF + 1
         if self._negotiated_minor is None:
@@ -281,7 +301,8 @@ class LocalTransport:
             frame_kind = FRAME_KINDS["deallocate"]
         else:
             frame_kind = FRAME_KINDS["execute"]
-        self._write(encode_frame(frame_kind, stream_id, request_id, payload), options)
+        if not fresh_terminal_replay:
+            self._write(encode_frame(frame_kind, stream_id, request_id, payload), options)
         provisional = bytearray()
         credited = 0
         maximum = min(options.limits["max_response_bytes"], 16 * 1024 * 1024)
@@ -424,6 +445,7 @@ class LocalTransport:
         self,
         request_id: int,
         options: RequestOptions | None = None,
+        terminal_request: tuple[int, int, bytes] | None = None,
     ) -> None:
         request_options = options or RequestOptions(request_id=request_id)
         self._check_deadline(request_options)
@@ -440,7 +462,7 @@ class LocalTransport:
                 self._connect_unix(stream, request_options)
             self._publish_stream(stream, request_options)
             hello = (
-                encode_hello(self._client_identity)
+                encode_hello(self._client_identity, maximum_minor=PROTOCOL_MINOR)
                 if not self._managed
                 else encode_authenticated_hello(
                     self._api_key or b"",
@@ -452,6 +474,17 @@ class LocalTransport:
                 encode_frame(FRAME_KINDS["hello"], 0, request_id, hello),
                 request_options,
             )
+            if terminal_request is not None:
+                stream_id, terminal_request_id, payload = terminal_request
+                self._write(
+                    encode_frame(
+                        FRAME_KINDS["execute"],
+                        stream_id,
+                        terminal_request_id,
+                        payload,
+                    ),
+                    request_options,
+                )
             frame = self._read_frame(request_options)
             if frame.kind == FRAME_KINDS["failure"]:
                 raise ProductError(decode_product_error(frame.payload))

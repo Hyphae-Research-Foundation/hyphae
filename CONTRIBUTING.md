@@ -47,7 +47,25 @@ documentation, compatibility, and release procedures.
 ## Contribution licensing
 
 Contributors must have authority to submit their work. Unless explicitly
-accepted under different terms, submitted software, tests, machine-readable
-contracts, and tooling are licensed under `AGPL-3.0-only`; submitted
-documentation is licensed under `CC-BY-SA-4.0`. See
-[LICENSE-POLICY.md](LICENSE-POLICY.md) for the complete scope.
+accepted under different terms, submitted software, tests, tooling,
+machine-readable contracts, and implementable normative specifications are
+licensed under `Apache-2.0`. Narrative documentation is licensed under
+`CC-BY-SA-4.0`. The inbound license for each contribution is therefore the
+same as the outbound license assigned by [LICENSE-POLICY.md](LICENSE-POLICY.md).
+No CLA or copyright assignment is required by this repository.
+
+Every commit must certify the [Developer Certificate of Origin 1.1](DCO) by
+including a real-name sign-off matching the contributor identity:
+
+```text
+Signed-off-by: Legal Name <email@example.com>
+```
+
+Use `git commit -s` to add the sign-off. The sign-off certifies contributor
+authority and the DCO statements; it does not assign copyright or grant the
+project an unstated relicensing right.
+
+CI checks every commit introduced by a pull request after DCO-policy adoption;
+earlier repository history is exempt. The only documented automated-author
+exception is `dependabot[bot]`, and its commits must still carry the bot's DCO
+sign-off. No other bot or automation attribution substitutes for a sign-off.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Generate a SLSA provenance v1 predicate for one native archive build."""
 
 from __future__ import annotations

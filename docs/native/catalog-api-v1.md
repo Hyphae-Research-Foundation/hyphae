@@ -1,6 +1,7 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native catalog API v1
 
-Status: logical G6 model, canonical codec, `HYCAT006` persistence, and bounded
+Status: logical G6 model, canonical codec, `HYCAT007` persistence, and bounded
 snapshot runtime reads implemented
 
 This API exposes bounded product views over the native catalog. It extends the
@@ -13,6 +14,10 @@ CLI, HTTP, or SDK schemas independent catalog authorities.
   snapshot.
 - `list_objects(parent, kind, start_after, limit)` returns stable-ID ordered
   summaries with an exclusive cursor.
+- `visible_list(parent, kind, opaque_cursor, limits)` is the protocol-minor-3
+  product operation. It starts from the caller's authorized exact-object and
+  subtree roots, merges overlaps in `ObjectId` order, and returns only visible
+  summaries plus one opaque byte token.
 - `describe_object(id)` returns one complete versioned definition.
 - `resolve_name(qualified_name)` returns the stable ID and complete identity.
 - `list_dependencies(id, direction, start_after, limit)` returns explicit
@@ -21,6 +26,32 @@ CLI, HTTP, or SDK schemas independent catalog authorities.
   versions plus hard maxima.
 
 All operations are snapshot-bound, byte/count bounded, and deterministic.
+
+`CatalogList` and its response layout remain the historical instance-only
+minor-0 operation byte-for-byte through minors 1 and 2. Scoped callers use the
+additive `CatalogVisibleList`; minor 2 rejects that variant before dispatch.
+Its public request and response contain no cursor snapshot, last-position,
+visit count, returned-byte count, stop reason, or physical key. The token is
+bounded and authenticated over the durable API-key/session authority,
+authorization epoch, immutable snapshot identity, filters, operation family,
+and last visible `ObjectId`. Truncation, trailing bytes, oversize, tampering,
+cross-key/session, cross-epoch, cross-filter, cross-family, and stale-snapshot
+reuse all return the same `catalog_conflict`. A cursor never grants authority;
+current authorization is resolved first on every page.
+
+`CatalogVisibleList` is strictly read-only. It never upgrades an older catalog
+root. Operators run the explicit `hyphae upgrade --data-dir <PATH>` while
+holding the normal directory lock before serving scoped catalog reads.
+
+Scope traversal does not scan the global object namespace and filter later.
+Visible roots are the exact intersection of current grants, the key permission
+ceiling, and the key scope ceiling; an instance grant with an exact-object key
+ceiling therefore exposes only that exact object.
+Exact scopes use object point reads. Subtrees use the durable `HYCAT007`
+ancestor-descendant namespace. Overlapping exact/subtree roots are deduplicated
+before filters and work bounds. Hidden objects cannot cause empty-page work
+metadata because no such metadata is public, and a parent ID is included only
+when that parent is independently visible.
 
 ## Product hierarchy
 
@@ -35,7 +66,7 @@ dependency edges. `derive_logical_dependency_edges` validates hierarchy and
 referential closure; `dependency_edges_for` provides outgoing dependencies and
 incoming dependents over the same canonical edge set. Bounded snapshot-backed
 `list_objects`, `describe_object`, `resolve_name`, and `list_dependencies`
-traverse immutable `HYCAT006` namespaces with item, visit, and byte bounds.
+traverse immutable catalog namespaces with item, visit, and byte bounds.
 
 A keyspace definition fixes key/value types, family policy, ownership,
 logical-time/TTL policy, memory class, eviction policy, and optional

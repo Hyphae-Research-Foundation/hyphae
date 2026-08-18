@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Multi-client daemon handshake, completion, flow control, and disconnect tests.
 
@@ -19,10 +19,9 @@ use std::{
 
 use hyphae_native_daemon::{DaemonError, NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{
-    ApiKeyId, AuthenticatedAuthority, BuiltInRole, MetricId, MetricValue, NativeProduct,
-    NativeProductService, NativeProductServiceConfig, ProductAuthorization,
-    ProductDurabilityPolicy, ProductErrorCode, ProductLimits, ProductOperation, ProductResponse,
-    ProductScope, TelemetryRegistry,
+    ApiKeyId, BuiltInRole, MetricId, MetricValue, NativeProduct, NativeProductService,
+    NativeProductServiceConfig, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
+    ProductLimits, ProductOperation, ProductResponse, ProductScope, TelemetryRegistry,
 };
 use hyphae_native_protocol::{
     AsyncFrameIo, FrameKind, Hello, OwnedFrame, ProtocolCapabilities, ProvisionalStream,
@@ -34,6 +33,8 @@ use interprocess::local_socket::GenericFilePath;
 use interprocess::local_socket::tokio::{Stream, prelude::*};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ACK_LOSS_INITIAL_WINDOW: u32 = 1;
 
 struct TestDirectory {
     root: PathBuf,
@@ -88,9 +89,33 @@ impl Client {
     }
 
     async fn connect_authenticated(path: &Path, api_key: &str) -> Result<Self, Box<dyn Error>> {
+        Self::connect_authenticated_for_request(path, api_key, None).await
+    }
+
+    async fn connect_authenticated_for_request(
+        path: &Path,
+        api_key: &str,
+        request: Option<&WireRequest>,
+    ) -> Result<Self, Box<dyn Error>> {
         let hello = Hello {
             capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
             required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            ..Hello::default()
+        };
+        let payload = encode_authenticated_hello(&hello, api_key)?;
+        let terminal = request.map(encode_product_request).transpose()?;
+        Self::connect_with_payload_and_request(path, hello, &payload, terminal.as_deref()).await
+    }
+
+    async fn connect_authenticated_with_window(
+        path: &Path,
+        api_key: &str,
+        initial_window: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let hello = Hello {
+            capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            initial_window,
             ..Hello::default()
         };
         let payload = encode_authenticated_hello(&hello, api_key)?;
@@ -102,6 +127,15 @@ impl Client {
         hello: Hello,
         payload: &[u8],
     ) -> Result<Self, Box<dyn Error>> {
+        Self::connect_with_payload_and_request(path, hello, payload, None).await
+    }
+
+    async fn connect_with_payload_and_request(
+        path: &Path,
+        hello: Hello,
+        payload: &[u8],
+        request: Option<&[u8]>,
+    ) -> Result<Self, Box<dyn Error>> {
         let path = path.to_string_lossy();
         let name = path.to_fs_name::<GenericFilePath>()?;
         let stream = Stream::connect(name).await?;
@@ -109,6 +143,11 @@ impl Client {
         codec
             .send(&mut &stream, FrameKind::Hello, 0, 1, payload)
             .await?;
+        if let Some(request) = request {
+            codec
+                .send(&mut &stream, FrameKind::Execute, 1, 2, request)
+                .await?;
+        }
         let mut receive = AsyncFrameIo::new(16 * 1024 * 1024)?;
         let welcome = receive
             .receive(&mut &stream)
@@ -200,6 +239,24 @@ impl Client {
         }
     }
 
+    /// Receives response `DATA` while leaving terminal `END` unread.
+    async fn response_data_started(
+        &self,
+        stream_id: u32,
+        request_id: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut receive = AsyncFrameIo::new(self.codec.maximum_payload())?;
+        let frame = receive
+            .receive(&mut &self.stream)
+            .await?
+            .ok_or("stream ended before response DATA")?;
+        assert_eq!(
+            (frame.kind, frame.stream_id, frame.request_id),
+            (FrameKind::Data, stream_id, request_id)
+        );
+        Ok(())
+    }
+
     async fn failure_code(
         &self,
         stream_id: u32,
@@ -235,7 +292,7 @@ async fn handshake_response(path: &Path, payload: &[u8]) -> Result<OwnedFrame, B
 
 struct ManagedReaderFixture {
     product: NativeProduct,
-    owner: AuthenticatedAuthority,
+    owner_secret: String,
     reader_secret: String,
     reader_key_id: ApiKeyId,
 }
@@ -274,7 +331,7 @@ fn managed_reader_product(test: &TestDirectory) -> Result<ManagedReaderFixture, 
     )?;
     Ok(ManagedReaderFixture {
         product,
-        owner,
+        owner_secret,
         reader_secret: fs::read_to_string(reader_path)?,
         reader_key_id: issued.key_id,
     })
@@ -541,7 +598,16 @@ async fn managed_missing_malformed_and_wrong_credentials_are_uniform() -> Result
     ];
     let mut errors = Vec::new();
     for payload in payloads {
-        let response = handshake_response(&test.socket, &payload).await?;
+        let path = test.socket.to_string_lossy();
+        let stream = Stream::connect(path.to_fs_name::<GenericFilePath>()?).await?;
+        let mut codec = AsyncFrameIo::new(16 * 1024 * 1024)?;
+        codec
+            .send(&mut &stream, FrameKind::Hello, 0, 1, &payload)
+            .await?;
+        let response = codec
+            .receive(&mut &stream)
+            .await?
+            .ok_or("server closed before authentication denial")?;
         assert_eq!(response.kind, FrameKind::Failure);
         errors.push(decode_failure(&response.payload)?);
     }
@@ -656,7 +722,7 @@ async fn security_operations_require_their_minor_and_reject_retired_shapes_befor
     )?;
 
     let current = Client::connect_authenticated(&test.socket, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 2);
+    assert_eq!(current.negotiated_minor, 3);
     current
         .send_request(1, 2, &request(ProductOperation::SecurityStatus))
         .await?;
@@ -754,7 +820,15 @@ async fn managed_revocation_denies_the_next_operation_on_the_same_connection()
         ProductResponse::StructureValue(Some(b"value".to_vec()))
     );
 
-    handle.revoke_api_key(fixture.owner, fixture.reader_key_id, 5)?;
+    let owner = handle.open_authenticated_session(hyphae_native_product::ApiKeyCredential::new(
+        &fixture.owner_secret,
+    )?)?;
+    owner.dispatch(
+        owner.request_context(99, 5).with_idempotency_token(99),
+        ProductOperation::SecurityApiKeyRevoke {
+            key_id: fixture.reader_key_id,
+        },
+    )?;
     client
         .send_request(
             2,
@@ -779,6 +853,165 @@ async fn managed_revocation_denies_the_next_operation_on_the_same_connection()
     );
 
     drop(client);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_connection_replays_self_revoke_after_ack_loss() -> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("self-revoke-reconnect")?;
+    let fixture = managed_reader_product(&test)?;
+    let actor_secret = fixture.owner_secret.clone();
+    let actor = fixture.product.authenticate_api_key(&actor_secret, 0)?;
+    let actor_key_id = actor.key_id();
+    let daemon = NativeDaemon::start_authenticated(
+        fixture.product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let mut revoke = request(ProductOperation::SecurityApiKeyRevokeSelf {
+        key_id: actor_key_id,
+    });
+    revoke.idempotency_token = Some(0x7a01);
+    revoke.durability = ProductDurabilityPolicy::STRICT;
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.socket,
+            &actor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
+        )
+        .await?;
+        client.send_request(1, 2, &revoke).await?;
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
+
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(&test.socket, &actor_secret, Some(&revoke)),
+    )
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
+    assert!(matches!(response, ProductResponse::SecurityMutated(_)));
+    drop(replay);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_fresh_connection_has_no_nonterminal_or_mismatch_oracle()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("revoked-no-oracle")?;
+    let fixture = managed_reader_product(&test)?;
+    let actor_secret = fixture.owner_secret.clone();
+    let actor = fixture.product.authenticate_api_key(&actor_secret, 0)?;
+    let actor_key_id = actor.key_id();
+    let mut product = fixture.product;
+    product.revoke_api_key(&actor, actor_key_id, 1)?;
+    let daemon = NativeDaemon::start_authenticated(
+        product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let mut wrong_replay = request(ProductOperation::SecurityApiKeyRevokeSelf {
+        key_id: actor_key_id,
+    });
+    wrong_replay.idempotency_token = Some(0xdead);
+    wrong_replay.durability = ProductDurabilityPolicy::STRICT;
+    for body in [request(ProductOperation::Capabilities), wrong_replay] {
+        let hello = Hello {
+            capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            ..Hello::default()
+        };
+        let hello_payload = encode_authenticated_hello(&hello, &actor_secret)?;
+        let encoded = encode_product_request(&body)?;
+        let path = test.socket.to_string_lossy();
+        let stream = Stream::connect(path.to_fs_name::<GenericFilePath>()?).await?;
+        let mut codec = AsyncFrameIo::new(16 * 1024 * 1024)?;
+        codec
+            .send(&mut &stream, FrameKind::Hello, 0, 1, &hello_payload)
+            .await?;
+        codec
+            .send(&mut &stream, FrameKind::Execute, 1, 2, &encoded)
+            .await?;
+        let denied = codec
+            .receive(&mut &stream)
+            .await?
+            .ok_or("server closed before uniform denial")?;
+        assert_eq!(
+            (denied.kind, denied.stream_id, denied.request_id),
+            (FrameKind::Failure, 0, 1)
+        );
+        assert_eq!(
+            decode_failure(&denied.payload)?.code(),
+            ProductErrorCode::AuthorizationDenied
+        );
+    }
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_connection_replays_zero_overlap_self_rotation_after_ack_loss()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("self-rotate-reconnect")?;
+    let fixture = managed_reader_product(&test)?;
+    let predecessor_secret = fixture.owner_secret.clone();
+    let mut product = fixture.product;
+    let actor = product.authenticate_api_key(&predecessor_secret, 0)?;
+    let predecessor_key_id = actor.key_id();
+    let started = product.start_api_key_rotation_idempotent(
+        &actor,
+        predecessor_key_id,
+        "zero-overlap",
+        0,
+        None,
+        0x7a02,
+        6,
+        true,
+    )?;
+    let successor = started.secret.take().ok_or("missing successor secret")?;
+    let successor_key_id = started.key_id;
+    let confirmation_digest = successor.confirmation_digest();
+    let daemon = NativeDaemon::start_authenticated(
+        product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let mut activate = request(ProductOperation::SecurityApiKeyRotateSelfActivate {
+        successor_key_id,
+        confirmation_digest,
+    });
+    activate.idempotency_token = Some(0x7a03);
+    activate.durability = ProductDurabilityPolicy::STRICT;
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.socket,
+            &predecessor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
+        )
+        .await?;
+        client.send_request(1, 2, &activate).await?;
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
+
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(
+            &test.socket,
+            &predecessor_secret,
+            Some(&activate),
+        ),
+    )
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
+    assert!(matches!(
+        response,
+        ProductResponse::SecurityApiKeyActivated(ref receipt)
+            if receipt.key_id == successor_key_id
+                && receipt.predecessor_key_id == Some(predecessor_key_id)
+    ));
+    drop(replay);
     daemon.shutdown().await?;
     Ok(())
 }
