@@ -773,8 +773,6 @@ jobs:
           BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin \
-            "refs/tags/v0.2.1:refs/tags/v0.2.1"
           test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
           while IFS= read -r package; do
             "$RUNNER_TEMP/cargo-semver-checks" semver-checks \

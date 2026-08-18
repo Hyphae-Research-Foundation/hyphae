@@ -3370,7 +3370,7 @@ fn security_legacy_bearer(
             output.write_secret(started.secret.expose_secret_bytes())?;
             let activated = client.activate_legacy(
                 started.key_id,
-                &key_out,
+                started.secret.expose_secret(),
                 started.authorization_epoch,
                 &name,
                 &label,

@@ -152,17 +152,16 @@ impl OfflineOwnerClient {
     pub(crate) fn activate_legacy(
         &mut self,
         key_id: ApiKeyId,
-        key_file: &Path,
+        serialized_key: &str,
         expected_epoch: AuthorizationEpoch,
         name: &str,
         label: &str,
         legacy_bearer: &LegacyBearerBuffer,
     ) -> Result<LegacyBearerMigrationActivationReceipt, CliFailure> {
-        let key = read_api_key_file(key_file)?;
         self.product
             .activate_legacy_bearer_migration_offline(
                 key_id,
-                key.credential()?,
+                serialized_key,
                 expected_epoch,
                 name,
                 label,
@@ -709,6 +708,30 @@ mod tests {
             .err()
             .ok_or("named-stream key file was accepted")?;
         assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_output_remains_exclusive_until_reservation_drops() -> Result<(), Box<dyn Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("hyphae-key-reservation-{}", Uuid::now_v7()));
+        fs::create_dir(&directory)?;
+        let path = directory.join("owner.key");
+        let mut output = reserve_restricted_api_key_file(&path)?;
+        output.write_secret(&[b'x'; MAX_API_KEY_CREDENTIAL_BYTES])?;
+
+        let error = read_api_key_file(&path)
+            .err()
+            .ok_or("live exclusive key reservation was reopened")?;
+        assert_eq!(error.error().code(), ProductErrorCode::AuthorizationDenied);
+
+        drop(output);
+        assert_eq!(
+            read_api_key_file(&path)?.credential()?.len(),
+            MAX_API_KEY_CREDENTIAL_BYTES
+        );
         fs::remove_dir_all(directory)?;
         Ok(())
     }

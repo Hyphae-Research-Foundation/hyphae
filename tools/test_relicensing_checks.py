@@ -108,6 +108,7 @@ class RelicensingCheckOrchestratorTests(unittest.TestCase):
         self.assertNotIn("fetch-depth: 0", release_readiness)
         self.assertNotIn("fetch-tags: true", release_readiness)
         self.assertNotIn("git fetch --tags", release_readiness)
+        self.assertNotIn("git fetch --no-tags --depth=1", release_readiness)
 
     def test_release_readiness_fetch_sequence_handles_depth_one_clone(self) -> None:
         tags = (
