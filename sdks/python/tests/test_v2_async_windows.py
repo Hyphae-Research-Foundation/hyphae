@@ -12,6 +12,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -44,10 +45,16 @@ _ERROR_PIPE_CONNECTED = 535
 _ERROR_OPERATION_ABORTED = 995
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _TRANSCRIPT_ENV = "HYPHAE_WINDOWS_ASYNC_TRANSCRIPT"
+_FAILURE_ENV = "HYPHAE_WINDOWS_ASYNC_FAILURE"
 _EXPECTED_WHEEL_ENV = "HYPHAE_WINDOWS_ASYNC_WHEEL"
 _EXPECTED_VERSION_ENV = "HYPHAE_WINDOWS_ASYNC_VERSION"
 _COORDINATION_TIMEOUT_SECONDS = 5.0
 _TERMINATION_TIMEOUT_SECONDS = 0.95
+# The deadline must expire only after the client finishes connect, HELLO,
+# WELCOME, and EXECUTE on a loaded hosted runner, yet still fire early enough
+# that the typed failure lands inside _TERMINATION_TIMEOUT_SECONDS and the
+# certified sub-second interrupt bound measured from the observed stall.
+_DEADLINE_OFFSET_SECONDS = 0.60
 
 
 class _GateFailure(AssertionError):
@@ -347,7 +354,7 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
             options=RequestOptions(
                 request_id=request_id,
                 deadline_micros=(
-                    int((time.time() + 0.30) * 1_000_000)
+                    int((time.time() + _DEADLINE_OFFSET_SECONDS) * 1_000_000)
                     if action == "deadline"
                     else None
                 ),
@@ -423,6 +430,49 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
             peer.close()
 
 
+def _describe_failure(error: BaseException, depth: int = 0) -> dict[str, object]:
+    # Static exception types, _GateFailure literals from this module, numeric
+    # OS error codes, and source-reference traceback frames only; never
+    # runtime material such as endpoint names, frames, or handles.
+    described: dict[str, object] = {"type": type(error).__name__}
+    if isinstance(error, _GateFailure):
+        described["message"] = str(error)
+    if isinstance(error, OSError):
+        described["errno"] = error.errno
+        described["winerror"] = getattr(error, "winerror", None)
+    described["frames"] = [
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(error.__traceback__)[-10:]
+    ]
+    cause = error.__cause__ or error.__context__
+    if cause is not None and cause is not error and depth < 5:
+        described["cause"] = _describe_failure(cause, depth + 1)
+    return described
+
+
+def _record_failure(case: str, error: BaseException) -> None:
+    failure_path = os.environ.get(_FAILURE_ENV)
+    if not failure_path:
+        return
+    try:
+        Path(failure_path).write_text(
+            json.dumps(
+                {
+                    "schema": "hyphae-python-windows-async-failure-v1",
+                    "status": "failed",
+                    "failed_case": case,
+                    "failure": _describe_failure(error),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 async def run_windows_async_cases() -> dict[str, dict[str, object]]:
     observations: dict[str, dict[str, object]] = {}
     request_id = 1000
@@ -432,9 +482,12 @@ async def run_windows_async_cases() -> dict[str, dict[str, object]]:
             ("deadline", "deadline_reconnect"),
             ("aclose", "aclose_terminal"),
         ):
-            observations[f"{stall}_{suffix}"] = await _exercise(
-                stall, action, request_id
-            )
+            case = f"{stall}_{suffix}"
+            try:
+                observations[case] = await _exercise(stall, action, request_id)
+            except BaseException as error:
+                _record_failure(case, error)
+                raise
             request_id += 1000
     return observations
 

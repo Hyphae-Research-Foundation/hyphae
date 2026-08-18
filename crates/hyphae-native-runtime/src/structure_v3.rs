@@ -5665,6 +5665,9 @@ enum LiveStructureKindV3 {
     Collection,
 }
 
+/// Retained for the accepted migration integration; the codec bytes are
+/// frozen ahead of the command-surface wiring that will consume this state.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DeltaScalarStateV3 {
     pub(super) scalar: Option<StructureEntry>,
@@ -5708,6 +5711,9 @@ pub(super) fn delta_scalar_envelope_latest_at_v3(
     Ok(DeltaScalarEnvelopeStateV3 { scalar, collection })
 }
 
+/// Retained for the accepted migration integration; see
+/// [`DeltaScalarStateV3`].
+#[allow(dead_code)]
 pub(super) fn delta_scalar_state_latest_at_v3(
     pages: &PageStore,
     blobs: &BlobStore,

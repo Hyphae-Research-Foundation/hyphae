@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// The module implements the deprecated pre-daemon UDS transport; internal
+// references to the deprecated types are expected until removal.
+#![allow(deprecated)]
+
 use std::{
     fs, io,
     os::unix::{
@@ -31,6 +35,11 @@ impl EndpointIdentity {
 }
 
 /// Filesystem-owned Unix-domain listener for native local frames.
+#[deprecated(
+    since = "1.2.0",
+    note = "predates the cross-platform daemon transport; serve local \
+            clients through `hyphae-native-daemon` instead"
+)]
 #[derive(Debug)]
 pub struct UdsFrameListener {
     listener: UnixListener,
@@ -129,6 +138,11 @@ impl Drop for UdsFrameListener {
 }
 
 /// One blocking Unix-domain connection carrying ordered native local frames.
+#[deprecated(
+    since = "1.2.0",
+    note = "predates the cross-platform daemon transport; connect through \
+            the `hyphae-client` local protocol client instead"
+)]
 #[derive(Debug)]
 pub struct UdsFrameConnection {
     stream: UnixStream,

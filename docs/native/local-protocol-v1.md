@@ -30,7 +30,9 @@ engine communication. Embedded calls remain direct Rust calls.
 
 - Unix: Unix domain socket with filesystem permissions.
 - Windows: named pipe with an explicit security descriptor.
-- Optional TCP loopback: disabled by default and requires authentication.
+- TCP loopback: not implemented by the native daemon. Remote access uses the
+  optional loopback HTTP `/v2` adapter; a native TCP transport would require
+  its own accepted contract before implementation.
 
 Shared-memory rings require a later accepted safety/crash ADR. No transport is
 used between native engines inside the process.

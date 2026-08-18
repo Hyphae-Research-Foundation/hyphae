@@ -1192,7 +1192,9 @@ fn execute_vector_branch(
             exact_rerank,
             ..
         } => (ef_search, exact_rerank, true),
-        ProductVectorExecution::Exact => unreachable!("exact branch returned above"),
+        // The exact branch returns earlier in this function; treat an
+        // impossible residue as an invalid request instead of panicking.
+        ProductVectorExecution::Exact => return Err(invalid_request()),
     };
     let options = AnnSearchOptions::new(branch.candidate_limit, ef_search, exact_rerank)
         .map_err(|_| invalid_request())?;

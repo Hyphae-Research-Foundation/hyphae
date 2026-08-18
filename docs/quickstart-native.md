@@ -1,7 +1,8 @@
-# Native 1.0 quickstart
+# Native quickstart
 
-Status: implemented for `1.0.0`; publication requires G8 evidence on the exact
-release commit. G7 performance certification is tracked separately.
+Status: current for the published Native releases (`1.1.0` and later); the
+closed G0-G8 profiles and their receipts are indexed by the
+[native gate status](gates/native-gate-status.md).
 
 This guide exercises the Native SQL, structure, and integrated search engines
 through one binary and one owned data directory. It starts no listener and

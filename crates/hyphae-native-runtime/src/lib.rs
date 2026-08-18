@@ -52,7 +52,6 @@ mod set_lifecycle_equivalence;
 mod set_ttl_equivalence;
 mod snapshot_pins;
 mod sql;
-#[allow(dead_code)]
 mod structure_v3;
 mod wal_codec;
 
@@ -154,6 +153,7 @@ pub use local_search::{
     encode_local_transaction_index_document, encode_local_transaction_replace_document,
 };
 #[cfg(unix)]
+#[allow(deprecated)]
 pub use local_session::{LocalDataSession, LocalSessionError};
 pub use local_sql::{
     LOCAL_SQL_EXECUTE_HEADER_SIZE, LOCAL_SQL_PREPARE_HEADER_SIZE, LOCAL_SQL_PREPARED_RECEIPT_SIZE,
@@ -183,6 +183,7 @@ pub use local_transaction::{
 };
 pub mod migration;
 #[cfg(unix)]
+#[allow(deprecated)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
 pub use migration::{
     MigrationDocument, MigrationLexicalField, MigrationLexicalIndex, MigrationManifest,
@@ -5156,7 +5157,7 @@ impl NativeDatabase {
         if path.exists() {
             return Err(NativeRuntimeError::DataDirectoryExists);
         }
-        fs::create_dir(path)?;
+        create_restricted_data_directory(path)?;
         let directory_guard = if pending {
             NativeDirectoryGuard::initialize_pending(path)?
         } else {
@@ -33978,6 +33979,28 @@ fn sync_page_generation_directory(data_directory: &Path) -> Result<(), std::io::
     std::fs::File::open(data_directory)?.sync_all()
 }
 
+/// Creates a native data directory restricted to its owning user.
+///
+/// The directory holds raw WAL, page, blob, and security-catalog bytes plus
+/// the default local-protocol endpoint, so group/other filesystem access
+/// would bypass durable RBAC on a shared host. Unix applies `0o700` in the
+/// `mkdir` call itself, so no window exists in which another local user can
+/// enter the directory or retain a handle to it. Windows relies on the
+/// profile-directory ACL inherited from the parent.
+#[cfg(unix)]
+fn create_restricted_data_directory(path: &Path) -> Result<(), NativeRuntimeError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_restricted_data_directory(path: &Path) -> Result<(), NativeRuntimeError> {
+    fs::create_dir(path)?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn sync_page_generation_directory(data_directory: &Path) -> Result<(), std::io::Error> {
     fs::metadata(data_directory).map(|_| ())
@@ -36832,6 +36855,28 @@ mod tests {
         assert_eq!(fields[2], "epoch=1");
         assert_eq!(database.directory_identity().directory_id(), directory_id);
         assert_eq!(database.directory_identity().history_epoch(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_database_create_restricts_the_data_directory_to_the_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let created = TestDirectory::new();
+        let _database = NativeDatabase::create(created.path())?;
+        assert_eq!(
+            fs::metadata(created.path())?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        let pending = TestDirectory::new();
+        let _importer = NativeDatabase::create_pending(pending.path())?;
+        assert_eq!(
+            fs::metadata(pending.path())?.permissions().mode() & 0o777,
+            0o700
+        );
         Ok(())
     }
 

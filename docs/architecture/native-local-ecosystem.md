@@ -1,10 +1,13 @@
 # Native local ecosystem architecture
 
-Status: accepted target architecture; not shipped behavior
+Status: accepted target architecture; implemented and published with Native
+`1.1.0` for the closed bounded G0-G8 profiles
 
-Hyphae's phase-1 target is one Rust process, one data directory, and three
-Hyphae-owned first-class engines. This document describes the target and must
-not be read as a capability claim for `0.2.1`.
+Hyphae phase 1 is one Rust process, one data directory, and three
+Hyphae-owned first-class engines. This document records the accepted design;
+the shipped capability boundary is the
+[Native capability matrix](../product/native-capabilities.md), and it is not
+a capability claim for the format-2 compatibility product.
 
 ## Product thesis
 

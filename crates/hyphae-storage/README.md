@@ -9,16 +9,15 @@ Durable local storage primitives for [Hyphae](https://hyphae.dev): an
 append-only checksummed and digest-chained log, atomic/idempotent mutation,
 recovery, snapshots, compaction, backups, and verified restore.
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
-
 ```toml
 [dependencies]
-hyphae-storage = "0.2.1"
+hyphae-storage = "1.2.0"
 ```
 
-Most applications should use `hyphae-engine`. Use this lower-level crate only
-when directly implementing the documented durable formats and ownership model.
+This crate owns the format-2 compatibility disk format. New applications
+should embed the Native product facade in `hyphae-native-product`; format-2
+embeddings use `hyphae-engine`. Use this lower-level crate only when directly
+implementing the documented durable formats and ownership model.
 
 `StorageLimits::default()` defines a complete finite recovery policy: one
 shared 60-second cooperative deadline, 2 GiB active-log/snapshot files, 1 GiB

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Exercises the deprecated pre-daemon local session/transport on purpose.
+#![allow(deprecated)]
+
 //! Contract and integration tests for the explicit local all-engine transaction.
 
 use std::num::NonZeroU64;

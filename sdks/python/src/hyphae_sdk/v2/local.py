@@ -44,6 +44,8 @@ _WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\"
 _MAXIMUM_FRAME_PAYLOAD = 16 * 1024 * 1024
 _WINDOWS_THREAD_TERMINATE = 0x0001
 _WINDOWS_ERROR_NOT_FOUND = 1168
+_WINDOWS_PIPE_BUSY_RETRY_SECONDS = 2.0
+_WINDOWS_PIPE_WAIT_MILLIS = 50
 
 
 def _noop() -> None:
@@ -441,6 +443,39 @@ class LocalTransport:
             self._negotiated_minor = None
         self._close_stream(stream)
 
+    def _open_windows_pipe(self, options: RequestOptions) -> BinaryIO:
+        # CreateFile fails while every instance of the pipe sits between
+        # DisconnectNamedPipe and ConnectNamedPipe; the documented client
+        # protocol is to wait for a listening instance and retry. The CRT
+        # collapses ERROR_PIPE_BUSY to EINVAL, so that signature retries
+        # within a bounded window while the request stays uncancelled and
+        # inside its deadline.
+        path = _WINDOWS_PIPE_PREFIX + self._endpoint
+        retry_deadline = time.monotonic() + _WINDOWS_PIPE_BUSY_RETRY_SECONDS
+        while True:
+            try:
+                return open(path, "r+b", buffering=0)
+            except OSError as error:
+                if (
+                    error.errno != errno.EINVAL
+                    or options.cancellation.cancelled
+                    or time.monotonic() >= retry_deadline
+                ):
+                    raise
+                self._check_deadline(options)
+            self._wait_windows_pipe(path)
+
+    @staticmethod
+    def _wait_windows_pipe(path: str) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+        if not kernel32.WaitNamedPipeW(path, _WINDOWS_PIPE_WAIT_MILLIS):
+            time.sleep(_WINDOWS_PIPE_WAIT_MILLIS / 1000)
+
     def _connect(
         self,
         request_id: int,
@@ -451,10 +486,8 @@ class LocalTransport:
         self._check_deadline(request_options)
         try:
             if os.name == "nt":
-                stream: socket.socket | BinaryIO = open(
-                    _WINDOWS_PIPE_PREFIX + self._endpoint,
-                    "r+b",
-                    buffering=0,
+                stream: socket.socket | BinaryIO = self._open_windows_pipe(
+                    request_options
                 )
             else:
                 stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

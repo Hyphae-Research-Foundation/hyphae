@@ -334,6 +334,8 @@ impl HyphaeEngine {
         match self.query_internal(query, limits, None) {
             Ok(result) => Ok(result),
             Err(BoundedEngineQueryError::Engine(source)) => Err(source),
+            // INVARIANT: `query_internal` receives no byte budget here, so
+            // the budget-exceeded variant cannot be produced on this path.
             Err(BoundedEngineQueryError::ScannedByteBudgetExceeded { .. }) => {
                 unreachable!("legacy query execution does not enforce an aggregate byte limit")
             }

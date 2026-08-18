@@ -151,23 +151,30 @@ def main() -> int:
             extracted.mkdir(parents=True)
             package_roots: dict[str, Path] = {}
 
+            # One invocation packages every publication crate together, so
+            # Cargo resolves exact internal dependencies against the crates
+            # packaged in the same run. Per-crate invocations resolve against
+            # the live registry index and fail while the candidate version is
+            # deliberately unpublished.
+            package_selectors: list[str] = []
             for package in packages:
-                subprocess.run(
-                    [
-                        "cargo",
-                        "package",
-                        "--locked",
-                        "--no-verify",
-                        "--allow-dirty",
-                        "-p",
-                        package,
-                        "--target-dir",
-                        str(package_target),
-                    ],
-                    cwd=ROOT,
-                    check=True,
-                    timeout=900,
-                )
+                package_selectors.extend(("-p", package))
+            subprocess.run(
+                [
+                    "cargo",
+                    "package",
+                    "--locked",
+                    "--no-verify",
+                    "--allow-dirty",
+                    *package_selectors,
+                    "--target-dir",
+                    str(package_target),
+                ],
+                cwd=ROOT,
+                check=True,
+                timeout=1800,
+            )
+            for package in packages:
                 archive = package_target / "package" / f"{package}-{version}.crate"
                 if not archive.is_file():
                     raise ValueError(

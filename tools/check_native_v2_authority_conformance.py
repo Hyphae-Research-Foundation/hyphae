@@ -142,7 +142,7 @@ ROLE_MATRIX_EVIDENCE = {
 PYTHON_MANAGED_LIVE_COMMAND = (
     "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae "
     "--fixture-binary target/debug/hyphae-v2-fixture "
-    "--wheel dist/hyphae_sdk-1.1.0-py3-none-any.whl "
+    "--wheel dist/hyphae_sdk-1.2.0-py3-none-any.whl "
     "--output python-managed-v2-conformance.json"
 )
 PYTHON_MANAGED_LIVE_ID = "python-managed-live"

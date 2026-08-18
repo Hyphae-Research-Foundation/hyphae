@@ -1,10 +1,11 @@
 # Native 1.0 capabilities and limits
 
-Status: implemented in the current source tree for the closed bounded G0-G7
-profiles. G7 operational-scale performance is closed with an explicitly
+Status: implemented and published with Native `1.1.0` for the closed bounded
+G0-G8 profiles. G7 operational-scale performance is closed with an explicitly
 environment-bound C-60 authority; dedicated-hardware latency and background
-interference remain non-claims. G8 release authorization remains open, so this
-is not a published `1.1.0` claim.
+interference remain non-claims. G8 closed on the exact `1.1.0` release commit;
+the [1.1.0 publication receipt](../release/receipts/1.1.0.md) records the
+published artifacts.
 
 Hyphae Native is one process, one executable, and one exclusively owned data
 directory. It works offline and embeds no external database, cache, search

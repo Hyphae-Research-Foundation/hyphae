@@ -43,7 +43,7 @@ argument.
 
 MCP is an optional `hyphae mcp` stdio mode in the same executable. It opens no
 data directory and calls only the public HTTP client. It implements the stable
-MCP revision `2025-11-25` as newline-delimited UTF-8 JSON-RPC 2.0, advertises
+MCP revision `2025-06-18` as newline-delimited UTF-8 JSON-RPC 2.0, advertises
 only tools, caps each input message at 4 MiB, embeds the canonical input/output
 schemas, returns both `structuredContent` and a JSON text fallback, and marks
 mutation tools as destructive. Streamable HTTP and experimental MCP tasks are

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// Exercises the deprecated pre-daemon local session/transport on purpose.
+#![allow(deprecated)]
+
 //! Native local structure operation codec and UDS session coverage.
 
 use hyphae_native_runtime::{
