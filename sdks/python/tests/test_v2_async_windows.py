@@ -48,6 +48,11 @@ _EXPECTED_WHEEL_ENV = "HYPHAE_WINDOWS_ASYNC_WHEEL"
 _EXPECTED_VERSION_ENV = "HYPHAE_WINDOWS_ASYNC_VERSION"
 _COORDINATION_TIMEOUT_SECONDS = 5.0
 _TERMINATION_TIMEOUT_SECONDS = 0.95
+# The deadline must expire only after the client finishes connect, HELLO,
+# WELCOME, and EXECUTE on a loaded hosted runner, yet still fire early enough
+# that the typed failure lands inside _TERMINATION_TIMEOUT_SECONDS and the
+# certified sub-second interrupt bound measured from the observed stall.
+_DEADLINE_OFFSET_SECONDS = 0.60
 
 
 class _GateFailure(AssertionError):
@@ -347,7 +352,7 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
             options=RequestOptions(
                 request_id=request_id,
                 deadline_micros=(
-                    int((time.time() + 0.30) * 1_000_000)
+                    int((time.time() + _DEADLINE_OFFSET_SECONDS) * 1_000_000)
                     if action == "deadline"
                     else None
                 ),
