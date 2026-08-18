@@ -210,12 +210,17 @@ enum OpenedConnection {
 impl NativeDaemon {
     /// Binds the platform local endpoint and starts multi-client admission.
     ///
-    /// Unix endpoints are filesystem UDS paths with mode `0600`. Windows
-    /// endpoints are named-pipe namespace identities. The safe audited
-    /// `interprocess` wrapper supplies the stable named-pipe server and peer
-    /// credential implementation absent from `std`. A bootstrapped access
-    /// catalog automatically requires the authenticated `HELLO`; OS-peer
-    /// compatibility remains available only before bootstrap.
+    /// Unix endpoints are filesystem UDS paths with mode `0600`. The default
+    /// endpoint lives inside the owner-only (`0o700`) native data directory;
+    /// an operator selecting a custom Unix endpoint outside the data
+    /// directory must place it in an owner-only parent directory, because the
+    /// socket mode is applied after the listener binds. Windows endpoints are
+    /// named-pipe namespace identities protected by an owner/LocalSystem
+    /// DACL. The safe audited `interprocess` wrapper supplies the stable
+    /// named-pipe server and peer credential implementation absent from
+    /// `std`. A bootstrapped access catalog automatically requires the
+    /// authenticated `HELLO`; OS-peer compatibility remains available only
+    /// before bootstrap.
     pub fn start(
         product: NativeProduct,
         endpoint: impl Into<String>,
