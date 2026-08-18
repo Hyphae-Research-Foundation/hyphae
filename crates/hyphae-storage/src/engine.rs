@@ -481,6 +481,8 @@ impl StorageEngine {
         match self.scan_page_with_byte_limit(after, limit, u64::MAX) {
             Ok(page) => Ok(page),
             Err(ScanPageError::Storage(source)) => Err(source),
+            // INVARIANT: the budget passed above is `u64::MAX`; no in-memory
+            // page can exceed it, so the budget variant cannot be produced.
             Err(ScanPageError::ByteBudgetExceeded { .. }) => {
                 unreachable!("an in-memory page cannot exceed the u64 byte limit")
             }

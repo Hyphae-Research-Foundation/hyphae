@@ -712,7 +712,10 @@ fn aggregate(
                     AggregateOperation::Sum => values.reduce(|left, right| left + right),
                     AggregateOperation::Min => values.reduce(f64::min),
                     AggregateOperation::Max => values.reduce(f64::max),
-                    AggregateOperation::Count => unreachable!(),
+                    // Count is fully handled by the first match arm; a
+                    // source-bound count is an invalid aggregate rather
+                    // than a panic.
+                    AggregateOperation::Count => return Err(ConvergenceError::InvalidAggregate),
                 };
                 if value.is_some_and(|number| !number.is_finite()) {
                     return Err(ConvergenceError::NumericOverflow);

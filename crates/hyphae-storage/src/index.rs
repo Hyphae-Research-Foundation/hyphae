@@ -547,6 +547,10 @@ impl MaterializedIndex {
                     let mut table = write.open_table(VECTORS)?;
                     table.remove(composite_key.as_slice())?;
                 }
+                // INVARIANT: the lexical pass earlier in this function
+                // consumes these variants via `continue`, so this arm cannot
+                // execute. It cannot become a typed error without adding a
+                // variant to the frozen public format-2 error enums.
                 Mutation::Put { .. }
                 | Mutation::Delete { .. }
                 | Mutation::DefineLexicalIndex { .. } => unreachable!(
@@ -805,6 +809,8 @@ impl MaterializedIndex {
         match self.scan_vectors_inner(space, max_candidates, max_bytes, None) {
             Ok(entries) => Ok(entries),
             Err(VectorScanError::Index(source)) => Err(source),
+            // INVARIANT: `scan_vectors_inner` receives no timeout here, so
+            // the timeout-bearing variant cannot be produced on this path.
             Err(VectorScanError::ExactRetrieval(_)) => {
                 unreachable!("an unbounded vector scan cannot time out")
             }

@@ -553,7 +553,15 @@ impl<'database, Clock: NativeSchedulerClock + ?Sized> LocalDataSession<'database
                         ),
                     }
                 }
-                _ => unreachable!("transaction search opcode was prevalidated"),
+                // The caller prevalidates transaction search opcodes; answer
+                // an impossible residue with a bounded protocol failure
+                // instead of terminating the session process.
+                _ => self.send_failure(
+                    connection,
+                    stream_id,
+                    request_id,
+                    LocalFailureCode::InvalidRequest,
+                ),
             }
         } else if self.active_transaction.is_some() {
             self.send_failure(

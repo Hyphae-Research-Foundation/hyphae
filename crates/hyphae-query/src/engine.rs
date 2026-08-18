@@ -292,6 +292,8 @@ fn execute_with_clock_without_byte_limit(
     match execute_with_clock_impl(shards, query, limits, None, clock) {
         Ok(result) => Ok(result),
         Err(BoundedQueryError::Query(source)) => Err(source),
+        // INVARIANT: `max_scanned_bytes` is `None` on this path, so the
+        // bounded-only variants cannot be produced by the shared executor.
         Err(
             BoundedQueryError::ScannedByteBudgetExceeded { .. }
             | BoundedQueryError::RecordDocument(_),
