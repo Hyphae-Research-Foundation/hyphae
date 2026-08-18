@@ -8,6 +8,7 @@ use std::{
     error::Error,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig, connect};
@@ -26,6 +27,8 @@ use interprocess::local_socket::traits::StreamCommon as _;
 use tokio::io::AsyncWriteExt as _;
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ACK_LOSS_INITIAL_WINDOW: u32 = 1;
 
 struct TestDirectory {
     root: PathBuf,
@@ -87,6 +90,21 @@ impl Client {
         let terminal = request.map(encode_product_request).transpose()?;
         Self::connect_with_payload_and_request(endpoint, &hello, &payload, terminal.as_deref())
             .await
+    }
+
+    async fn connect_authenticated_with_window(
+        endpoint: &str,
+        api_key: &str,
+        initial_window: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let hello = Hello {
+            capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            initial_window,
+            ..Hello::default()
+        };
+        let payload = encode_authenticated_hello(&hello, api_key)?;
+        Self::connect_with_payload(endpoint, &hello, &payload).await
     }
 
     async fn connect_with_payload(
@@ -185,6 +203,24 @@ impl Client {
                 _ => return Err("unexpected response frame".into()),
             }
         }
+    }
+
+    /// Receives response `DATA` while leaving terminal `END` unread.
+    async fn response_data_started(
+        &self,
+        stream_id: u32,
+        request_id: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut receive = AsyncFrameIo::new(self.codec.maximum_payload())?;
+        let frame = receive
+            .receive(&mut &self.stream)
+            .await?
+            .ok_or("stream ended before response DATA")?;
+        assert_eq!(
+            (frame.kind, frame.stream_id, frame.request_id),
+            (FrameKind::Data, stream_id, request_id)
+        );
+        Ok(())
     }
 
     async fn failure_code(
@@ -336,26 +372,33 @@ async fn fresh_named_pipe_replays_self_revoke_after_ack_loss() -> Result<(), Box
     });
     revoke.idempotency_token = Some(0x7a01);
     revoke.durability = ProductDurabilityPolicy::STRICT;
-    let client = Client::connect_authenticated(&test.endpoint, &actor_secret).await?;
-    client
-        .codec
-        .send(
-            &mut &client.stream,
-            FrameKind::Execute,
-            1,
-            2,
-            &encode_product_request(&revoke)?,
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.endpoint,
+            &actor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
         )
         .await?;
-    drop(client);
-
-    let replay =
-        Client::connect_authenticated_for_request(&test.endpoint, &actor_secret, Some(&revoke))
+        client
+            .codec
+            .send(
+                &mut &client.stream,
+                FrameKind::Execute,
+                1,
+                2,
+                &encode_product_request(&revoke)?,
+            )
             .await?;
-    assert!(matches!(
-        replay.response(1, 2).await?,
-        ProductResponse::SecurityMutated(_)
-    ));
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
+
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(&test.endpoint, &actor_secret, Some(&revoke)),
+    )
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
+    assert!(matches!(response, ProductResponse::SecurityMutated(_)));
     drop(replay);
     daemon.shutdown().await?;
     Ok(())
@@ -391,27 +434,38 @@ async fn fresh_named_pipe_replays_zero_overlap_self_rotation_after_ack_loss()
     });
     activate.idempotency_token = Some(0x7a03);
     activate.durability = ProductDurabilityPolicy::STRICT;
-    let client = Client::connect_authenticated(&test.endpoint, &predecessor_secret).await?;
-    client
-        .codec
-        .send(
-            &mut &client.stream,
-            FrameKind::Execute,
-            1,
-            2,
-            &encode_product_request(&activate)?,
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.endpoint,
+            &predecessor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
         )
         .await?;
-    drop(client);
+        client
+            .codec
+            .send(
+                &mut &client.stream,
+                FrameKind::Execute,
+                1,
+                2,
+                &encode_product_request(&activate)?,
+            )
+            .await?;
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
 
-    let replay = Client::connect_authenticated_for_request(
-        &test.endpoint,
-        &predecessor_secret,
-        Some(&activate),
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(
+            &test.endpoint,
+            &predecessor_secret,
+            Some(&activate),
+        ),
     )
-    .await?;
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
     assert!(matches!(
-        replay.response(1, 2).await?,
+        response,
         ProductResponse::SecurityApiKeyActivated(ref receipt)
             if receipt.key_id == successor_key_id
                 && receipt.predecessor_key_id == Some(predecessor_key_id)

@@ -623,6 +623,7 @@ async fn serve_connection(
                 stream.clone(),
                 client.clone(),
                 welcome,
+                None,
                 config,
                 &mut shutdown,
             )
@@ -654,6 +655,7 @@ async fn serve_open_connection(
     stream: Arc<interprocess::local_socket::tokio::Stream>,
     client: Arc<NativeProductClient>,
     welcome: hyphae_native_protocol::Welcome,
+    initial_frame: Option<hyphae_native_protocol::OwnedFrame>,
     config: NativeDaemonConfig,
     shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<(), DaemonError> {
@@ -670,6 +672,7 @@ async fn serve_open_connection(
         &codec,
         client,
         welcome,
+        initial_frame,
         config,
         request_state.clone(),
         pending_controls.clone(),
@@ -763,10 +766,13 @@ async fn serve_pending_terminal_connection(
         )
         .await?;
     let client = Arc::new(client);
+    // Authentication consumed the pipelined replay frame; admit that same
+    // frame instead of waiting for a duplicate request from the client.
     let result = serve_open_connection(
         stream.clone(),
         client.clone(),
         welcome,
+        Some(frame),
         config,
         &mut shutdown,
     )
@@ -929,6 +935,7 @@ async fn connection_loop(
     codec: &AsyncFrameIo,
     client: Arc<NativeProductClient>,
     welcome: hyphae_native_protocol::Welcome,
+    mut initial_frame: Option<hyphae_native_protocol::OwnedFrame>,
     config: NativeDaemonConfig,
     requests: RequestState,
     pending_controls: PendingControls,
@@ -944,14 +951,18 @@ async fn connection_loop(
     let mut responses = JoinSet::new();
     let mut next_generation = 1_u64;
     loop {
-        let received: Option<hyphae_native_protocol::OwnedFrame> = tokio::select! {
-            result = receive_codec.receive(&mut reader) => result?,
-            _ = shutdown.recv() => {
-                break;
-            }
-            completed = responses.join_next(), if !responses.is_empty() => {
-                match completed {
-                    Some(Ok(Ok(()) | Err(_)) | Err(_)) | None => continue,
+        let received = if let Some(frame) = initial_frame.take() {
+            Some(frame)
+        } else {
+            tokio::select! {
+                result = receive_codec.receive(&mut reader) => result?,
+                _ = shutdown.recv() => {
+                    break;
+                }
+                completed = responses.join_next(), if !responses.is_empty() => {
+                    match completed {
+                        Some(Ok(Ok(()) | Err(_)) | Err(_)) | None => continue,
+                    }
                 }
             }
         };

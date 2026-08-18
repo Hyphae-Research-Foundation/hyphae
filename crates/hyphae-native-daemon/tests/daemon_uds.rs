@@ -33,6 +33,8 @@ use interprocess::local_socket::GenericFilePath;
 use interprocess::local_socket::tokio::{Stream, prelude::*};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ACK_LOSS_INITIAL_WINDOW: u32 = 1;
 
 struct TestDirectory {
     root: PathBuf,
@@ -103,6 +105,21 @@ impl Client {
         let payload = encode_authenticated_hello(&hello, api_key)?;
         let terminal = request.map(encode_product_request).transpose()?;
         Self::connect_with_payload_and_request(path, hello, &payload, terminal.as_deref()).await
+    }
+
+    async fn connect_authenticated_with_window(
+        path: &Path,
+        api_key: &str,
+        initial_window: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let hello = Hello {
+            capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            required_capabilities: ProtocolCapabilities::G6_AUTHENTICATED,
+            initial_window,
+            ..Hello::default()
+        };
+        let payload = encode_authenticated_hello(&hello, api_key)?;
+        Self::connect_with_payload(path, hello, &payload).await
     }
 
     async fn connect_with_payload(
@@ -220,6 +237,24 @@ impl Client {
                 _ => return Err("unexpected response frame".into()),
             }
         }
+    }
+
+    /// Receives response `DATA` while leaving terminal `END` unread.
+    async fn response_data_started(
+        &self,
+        stream_id: u32,
+        request_id: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut receive = AsyncFrameIo::new(self.codec.maximum_payload())?;
+        let frame = receive
+            .receive(&mut &self.stream)
+            .await?
+            .ok_or("stream ended before response DATA")?;
+        assert_eq!(
+            (frame.kind, frame.stream_id, frame.request_id),
+            (FrameKind::Data, stream_id, request_id)
+        );
+        Ok(())
     }
 
     async fn failure_code(
@@ -834,22 +869,29 @@ async fn fresh_connection_replays_self_revoke_after_ack_loss() -> Result<(), Box
         test.socket.to_string_lossy(),
         NativeDaemonConfig::default(),
     )?;
-    let client = Client::connect_authenticated(&test.socket, &actor_secret).await?;
     let mut revoke = request(ProductOperation::SecurityApiKeyRevokeSelf {
         key_id: actor_key_id,
     });
     revoke.idempotency_token = Some(0x7a01);
     revoke.durability = ProductDurabilityPolicy::STRICT;
-    client.send_request(1, 2, &revoke).await?;
-    drop(client);
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.socket,
+            &actor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
+        )
+        .await?;
+        client.send_request(1, 2, &revoke).await?;
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
 
-    let replay =
-        Client::connect_authenticated_for_request(&test.socket, &actor_secret, Some(&revoke))
-            .await?;
-    assert!(matches!(
-        replay.response(1, 2).await?,
-        ProductResponse::SecurityMutated(_)
-    ));
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(&test.socket, &actor_secret, Some(&revoke)),
+    )
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
+    assert!(matches!(response, ProductResponse::SecurityMutated(_)));
     drop(replay);
     daemon.shutdown().await?;
     Ok(())
@@ -936,24 +978,35 @@ async fn fresh_connection_replays_zero_overlap_self_rotation_after_ack_loss()
         test.socket.to_string_lossy(),
         NativeDaemonConfig::default(),
     )?;
-    let client = Client::connect_authenticated(&test.socket, &predecessor_secret).await?;
     let mut activate = request(ProductOperation::SecurityApiKeyRotateSelfActivate {
         successor_key_id,
         confirmation_digest,
     });
     activate.idempotency_token = Some(0x7a03);
     activate.durability = ProductDurabilityPolicy::STRICT;
-    client.send_request(1, 2, &activate).await?;
-    drop(client);
+    {
+        let client = Client::connect_authenticated_with_window(
+            &test.socket,
+            &predecessor_secret,
+            ACK_LOSS_INITIAL_WINDOW,
+        )
+        .await?;
+        client.send_request(1, 2, &activate).await?;
+        tokio::time::timeout(TEST_IO_TIMEOUT, client.response_data_started(1, 2)).await??;
+    }
 
-    let replay = Client::connect_authenticated_for_request(
-        &test.socket,
-        &predecessor_secret,
-        Some(&activate),
+    let replay = tokio::time::timeout(
+        TEST_IO_TIMEOUT,
+        Client::connect_authenticated_for_request(
+            &test.socket,
+            &predecessor_secret,
+            Some(&activate),
+        ),
     )
-    .await?;
+    .await??;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, replay.response(1, 2)).await??;
     assert!(matches!(
-        replay.response(1, 2).await?,
+        response,
         ProductResponse::SecurityApiKeyActivated(ref receipt)
             if receipt.key_id == successor_key_id
                 && receipt.predecessor_key_id == Some(predecessor_key_id)
