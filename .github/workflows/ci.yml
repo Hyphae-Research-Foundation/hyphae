@@ -721,9 +721,20 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          # Relicensing recomputes ancestry-bound legal evidence from this exact SHA.
+          git fetch --unshallow --no-tags origin "$CANDIDATE_COMMIT"
+          test "$(git rev-list --count fcf2f918e1539cfb7d67fd52abf0c7d57169ec18)" = 847
+          git merge-base --is-ancestor \
+            fcf2f918e1539cfb7d67fd52abf0c7d57169ec18 "$CANDIDATE_COMMIT"
+          git fetch --atomic --no-tags origin \
+            "refs/tags/v0.1.0:refs/tags/v0.1.0" \
+            "refs/tags/v0.2.0:refs/tags/v0.2.0" \
+            "refs/tags/v0.2.1:refs/tags/v0.2.1" \
+            "refs/tags/v1.0.0:refs/tags/v1.0.0" \
+            "refs/tags/v1.0.1:refs/tags/v1.0.1" \
+            "refs/tags/v1.1.0:refs/tags/v1.1.0"
           while read -r tag expected_object expected_commit; do
             tag_ref="refs/tags/${tag}"
-            git fetch --no-tags --depth=1 origin "${tag_ref}:${tag_ref}"
             test "$(git cat-file -t "$tag_ref")" = tag
             test "$(git rev-parse "$tag_ref")" = "$expected_object"
             test "$(git rev-parse "${tag_ref}^{commit}")" = "$expected_commit"
@@ -735,11 +746,6 @@ jobs:
           v1.0.1 4a81737036c8122d23db632947666eaa03dfe61d 84161cf067141b60f4847b965ef77c5b749749c0
           v1.1.0 80b2f094c17ada6adc3bb879e20c3662bd93f4e4 e88f2ea2c3455a393e3ac0cd69e25486cc26888e
           TAGS
-          # Relicensing also recomputes ancestry-bound legal evidence from this SHA.
-          git fetch --unshallow --no-tags origin "$CANDIDATE_COMMIT"
-          test "$(git rev-list --count fcf2f918e1539cfb7d67fd52abf0c7d57169ec18)" = 847
-          git merge-base --is-ancestor \
-            fcf2f918e1539cfb7d67fd52abf0c7d57169ec18 "$CANDIDATE_COMMIT"
           test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch

@@ -4,15 +4,23 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from tools.relicensing_checks import ROOT, main
 
 
 class RelicensingCheckOrchestratorTests(unittest.TestCase):
+    @staticmethod
+    def git(repository: Path, *arguments: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(repository), *arguments], text=True
+        ).strip()
+
     def test_stale_receipt_fails_without_refresh_by_default(self) -> None:
         calls: list[tuple[str, ...]] = []
 
@@ -64,15 +72,33 @@ class RelicensingCheckOrchestratorTests(unittest.TestCase):
         )
         self.assertIn("fetch-depth: 1", release_readiness)
         self.assertIn("fetch-tags: false", release_readiness)
+        candidate_fetch = (
+            'git fetch --unshallow --no-tags origin "$CANDIDATE_COMMIT"'
+        )
+        tag_fetch = """\
+          git fetch --atomic --no-tags origin \\
+            "refs/tags/v0.1.0:refs/tags/v0.1.0" \\
+            "refs/tags/v0.2.0:refs/tags/v0.2.0" \\
+            "refs/tags/v0.2.1:refs/tags/v0.2.1" \\
+            "refs/tags/v1.0.0:refs/tags/v1.0.0" \\
+            "refs/tags/v1.0.1:refs/tags/v1.0.1" \\
+            "refs/tags/v1.1.0:refs/tags/v1.1.0"
+"""
+        self.assertIn(candidate_fetch, release_readiness)
+        self.assertIn(tag_fetch, release_readiness)
+        self.assertLess(
+            release_readiness.index(candidate_fetch),
+            release_readiness.index(tag_fetch),
+        )
         self.assertIn(
-            'git fetch --no-tags --depth=1 origin "${tag_ref}:${tag_ref}"',
+            'tag_ref="refs/tags/${tag}"',
             release_readiness,
         )
         self.assertIn('git cat-file -t "$tag_ref"', release_readiness)
         self.assertIn('git rev-parse "${tag_ref}^{commit}"', release_readiness)
         self.assertIn(expected_tags, release_readiness)
-        self.assertIn(
-            'git fetch --unshallow --no-tags origin "$CANDIDATE_COMMIT"',
+        self.assertNotIn(
+            'git fetch --no-tags --depth=1 origin "${tag_ref}:${tag_ref}"',
             release_readiness,
         )
         self.assertIn(
@@ -82,6 +108,62 @@ class RelicensingCheckOrchestratorTests(unittest.TestCase):
         self.assertNotIn("fetch-depth: 0", release_readiness)
         self.assertNotIn("fetch-tags: true", release_readiness)
         self.assertNotIn("git fetch --tags", release_readiness)
+
+    def test_release_readiness_fetch_sequence_handles_depth_one_clone(self) -> None:
+        tags = (
+            "v0.1.0",
+            "v0.2.0",
+            "v0.2.1",
+            "v1.0.0",
+            "v1.0.1",
+            "v1.1.0",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            clone = Path(directory) / "clone"
+            candidate = self.git(ROOT, "rev-parse", "HEAD")
+            clone.mkdir()
+
+            def run(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", "-C", str(clone), *arguments], check=True
+                )
+
+            run("init", "-q")
+            run("remote", "add", "origin", ROOT.as_uri())
+            run("fetch", "-q", "--depth=1", "--no-tags", "origin", candidate)
+            run("checkout", "-q", "--detach", candidate)
+            self.assertTrue((clone / ".git/shallow").is_file())
+
+            run(
+                "fetch",
+                "-q",
+                "--unshallow",
+                "--no-tags",
+                "origin",
+                candidate,
+            )
+            run(
+                "fetch",
+                "-q",
+                "--atomic",
+                "--no-tags",
+                "origin",
+                *(f"refs/tags/{tag}:refs/tags/{tag}" for tag in tags),
+            )
+
+            self.assertFalse((clone / ".git/shallow").exists())
+            self.assertEqual(self.git(clone, "rev-parse", "HEAD"), candidate)
+            for tag in tags:
+                tag_ref = f"refs/tags/{tag}"
+                self.assertEqual(self.git(clone, "cat-file", "-t", tag_ref), "tag")
+                self.assertEqual(
+                    self.git(clone, "rev-parse", tag_ref),
+                    self.git(ROOT, "rev-parse", tag_ref),
+                )
+                self.assertEqual(
+                    self.git(clone, "rev-parse", f"{tag_ref}^{{commit}}"),
+                    self.git(ROOT, "rev-parse", f"{tag_ref}^{{commit}}"),
+                )
 
     def test_explicit_refresh_is_last_mutating_step_and_validation_follows(self) -> None:
         calls: list[tuple[str, ...]] = []
