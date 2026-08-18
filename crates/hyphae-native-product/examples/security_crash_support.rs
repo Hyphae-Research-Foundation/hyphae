@@ -111,16 +111,26 @@ struct TestDirectory {
 
 impl TestDirectory {
     fn create(label: &str) -> Result<Self, Box<dyn Error>> {
-        let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "hyphae-security-crash-{label}-{}-{suffix}",
-            std::process::id()
-        ));
+        let mut root = None;
+        for _ in 0..1_024 {
+            let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "hyphae-security-crash-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    root = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let root = root.ok_or("failed to allocate a unique security crash directory")?;
         let data = root.join("data");
         let owner_key = root.join("owner.key");
         let actor_key = root.join("actor.key");
-        let _ignored = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             data,
@@ -178,6 +188,20 @@ pub(crate) fn every_offline_security_transition_recovers_at_every_real_commit_bo
             assert_offline_case(case, boundary)?;
         }
     }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn secret_scan_covers_lock_file_after_directory_owner_closes()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::create("secret-scan-lock-file")?;
+    drop(NativeProduct::create(&directory.data)?);
+    fs::write(directory.data.join("LOCK"), b"hyp1_secret-scan-canary")?;
+
+    let error = assert_no_serialized_secret(&directory.data, &[])
+        .err()
+        .ok_or("secret scan ignored the released lock file")?;
+    assert!(error.to_string().contains("LOCK"));
     Ok(())
 }
 
@@ -446,11 +470,11 @@ pub(crate) fn assert_managed_case(
         true,
         &prepared.baseline_status,
     )?;
-    assert_no_serialized_secret(&prepared.directory.data, &prepared.known_secrets)?;
     drop(owner);
     drop(actor);
     drop(session);
     drop(product);
+    assert_no_serialized_secret(&prepared.directory.data, &prepared.known_secrets)?;
     let disconnected = NativeProduct::open(&prepared.directory.data)?;
     let final_status = disconnected.access_control_status()?;
     assert_eq!(final_status.epoch, marker.authorization_epoch);
@@ -1045,6 +1069,7 @@ fn assert_owner_start(boundary: CommitBoundary) -> Result<(), Box<dyn Error>> {
                 .principal_id()
         );
     }
+    drop(reopened);
     assert_no_serialized_secret(&directory.data, &[old_secret])
 }
 
@@ -1103,6 +1128,7 @@ fn assert_owner_activate(boundary: CommitBoundary) -> Result<(), Box<dyn Error>>
             .commit_csn(),
         receipt.commit.commit_csn
     );
+    drop(reopened);
     assert_no_serialized_secret(&directory.data, &[old_secret, new_secret])
 }
 
@@ -1141,6 +1167,7 @@ fn assert_owner_abort(boundary: CommitBoundary) -> Result<(), Box<dyn Error>> {
             .commit_csn(),
         receipt.commit.commit_csn
     );
+    drop(reopened);
     assert_no_serialized_secret(&directory.data, &[old_secret, pending_secret])
 }
 
@@ -1209,6 +1236,7 @@ fn assert_legacy_start(boundary: CommitBoundary) -> Result<(), Box<dyn Error>> {
                 .ok_or("missing key")?
         );
     }
+    drop(reopened);
     assert_no_serialized_secret(&directory.data, &[])
 }
 
@@ -1290,6 +1318,7 @@ fn assert_legacy_activate(boundary: CommitBoundary) -> Result<(), Box<dyn Error>
             .commit_csn(),
         receipt.commit.commit_csn
     );
+    drop(reopened);
     assert_no_serialized_secret(&directory.data, &[secret])
 }
 
@@ -1509,19 +1538,23 @@ fn assert_no_serialized_secret(directory: &Path, known: &[String]) -> Result<(),
                 continue;
             }
             let bytes = fs::read(entry.path())?;
-            assert!(!bytes.windows(5).any(|window| window == b"hyp1_"));
-            for secret in known {
-                assert!(
-                    !bytes
-                        .windows(secret.len())
-                        .any(|window| window == secret.as_bytes())
-                );
-            }
-            assert!(
-                !bytes
+            if bytes.windows(5).any(|window| window == b"hyp1_")
+                || known
+                    .iter()
+                    .filter(|secret| !secret.is_empty())
+                    .any(|secret| {
+                        bytes
+                            .windows(secret.len())
+                            .any(|window| window == secret.as_bytes())
+                    })
+                || bytes
                     .windows(LEGACY_BEARER.len())
                     .any(|window| window == LEGACY_BEARER)
-            );
+            {
+                return Err(
+                    format!("serialized secret found in {}", entry.path().display()).into(),
+                );
+            }
         }
     }
     Ok(())

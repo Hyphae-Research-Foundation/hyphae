@@ -985,6 +985,8 @@ fn verify_managed(
         }
     }
     verify_managed_retry(&mut product, directory, case, complete)?;
+    drop(owner);
+    drop(product);
     assert_secret_free(&data, &[&meta.secret, &owner_secret])
 }
 
@@ -1192,6 +1194,7 @@ fn verify_offline(
             }
         }
     }
+    drop(product);
     assert_secret_free(&data, &[&meta.secret])
 }
 

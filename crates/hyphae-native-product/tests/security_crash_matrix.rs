@@ -24,3 +24,8 @@ fn every_offline_security_transition_recovers_at_every_real_commit_boundary()
 fn self_terminal_mutations_replay_after_the_actor_key_is_retired() -> Result<(), Box<dyn Error>> {
     security_crash_support::self_terminal_mutations_replay_after_the_actor_key_is_retired()
 }
+
+#[test]
+fn secret_scan_covers_lock_file_after_directory_owner_closes() -> Result<(), Box<dyn Error>> {
+    security_crash_support::secret_scan_covers_lock_file_after_directory_owner_closes()
+}
