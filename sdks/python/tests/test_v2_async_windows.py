@@ -12,6 +12,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -430,15 +431,19 @@ async def _exercise(stall: str, action: str, request_id: int) -> dict[str, objec
 
 
 def _describe_failure(error: BaseException, depth: int = 0) -> dict[str, object]:
-    # Static exception types, _GateFailure literals from this module, and
-    # numeric OS error codes only; never runtime material such as endpoint
-    # names, frames, or handles.
+    # Static exception types, _GateFailure literals from this module, numeric
+    # OS error codes, and source-reference traceback frames only; never
+    # runtime material such as endpoint names, frames, or handles.
     described: dict[str, object] = {"type": type(error).__name__}
     if isinstance(error, _GateFailure):
         described["message"] = str(error)
     if isinstance(error, OSError):
         described["errno"] = error.errno
         described["winerror"] = getattr(error, "winerror", None)
+    described["frames"] = [
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in traceback.extract_tb(error.__traceback__)[-10:]
+    ]
     cause = error.__cause__ or error.__context__
     if cause is not None and cause is not error and depth < 5:
         described["cause"] = _describe_failure(cause, depth + 1)
