@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native lexical tombstone compaction v1
 
 Status: implemented at `fea5925dc37bb1b8c9dbecaca4bc407e5199d3b2`;

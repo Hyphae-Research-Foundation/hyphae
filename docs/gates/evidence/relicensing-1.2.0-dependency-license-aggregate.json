@@ -1,0 +1,298 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "compatibility_review": {
+    "generic_incompatible_or_unreviewed_licenses": [],
+    "lgpl_obligations": {
+      "obligations": [
+        "Preserve the applicable LGPL-3.0-or-later notices and license text with any redistributed covered binary.",
+        "Provide the complete corresponding source for the LGPL-covered library, or a valid written or network source offer permitted by LGPL-3.0-or-later.",
+        "Preserve recipients' practical right to replace or relink the LGPL-covered library, including required installation information.",
+        "Do not include these development-only packages in Hyphae runtime, SDK, crate, Python, npm, or native release archive payloads."
+      ],
+      "packages": [
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-darwin-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-arm",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-ppc64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-riscv64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-s390x",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linuxmusl-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linuxmusl-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-wasm32",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-arm64",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-ia32",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/host-smoke/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-x64",
+          "version": "0.35.3"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-darwin-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-arm",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-ppc64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-riscv64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-s390x",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linux-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linuxmusl-arm64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-libvips-linuxmusl-x64",
+          "version": "1.3.2"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-wasm32",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-arm64",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-ia32",
+          "version": "0.35.3"
+        },
+        {
+          "license": "Apache-2.0 AND LGPL-3.0-or-later",
+          "lock": "integrations/javascript/package-lock.json",
+          "path": "node_modules/@img/sharp-win32-x64",
+          "version": "0.35.3"
+        }
+      ]
+    },
+    "proprietary_tooling_exception": {
+      "lock": "conformance/mcp/hosts/package-lock.json",
+      "packages": [
+        {
+          "license": "SEE LICENSE IN README.md",
+          "path": "node_modules/@anthropic-ai/claude-code",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-darwin-arm64",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-darwin-x64",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-linux-arm64",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-linux-arm64-musl",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-linux-x64",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-linux-x64-musl",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-win32-arm64",
+          "version": "2.1.233"
+        },
+        {
+          "license": "SEE LICENSE IN LICENSE.md",
+          "path": "node_modules/@anthropic-ai/claude-code-win32-x64",
+          "version": "2.1.233"
+        }
+      ],
+      "scope": "opt-in-development-and-real-host-conformance-only-not-redistributable-by-hyphae"
+    },
+    "result": "pass"
+  },
+  "inventories": {
+    "npm": [
+      {
+        "canonical_sha256": "876edf5f73612c4b89d37a0b92cc4f7f14f15249bd8c932218e66a7044b864b9",
+        "lock": "conformance/mcp/hosts/package-lock.json",
+        "package_count": 16,
+        "result": "pass",
+        "sha256": "5f06a6b44b6d02603bb9bd70623df0019eda9cf73598c606071923eea86dd0e1"
+      },
+      {
+        "canonical_sha256": "54937054408a9f6565997ce5031984b960c98decbe023a09cbbe992c827016eb",
+        "lock": "integrations/host-smoke/package-lock.json",
+        "package_count": 312,
+        "result": "pass",
+        "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
+      },
+      {
+        "canonical_sha256": "536e6467efdf5bb74bb5357e64b47e8486b19080601e30a36735ec0ae99b0585",
+        "lock": "integrations/javascript/package-lock.json",
+        "package_count": 298,
+        "result": "pass",
+        "sha256": "8176e094235c2f89cbdf6451394cffd280005a1fef9bedb27616250955d2554b"
+      },
+      {
+        "canonical_sha256": "f3d3675e6a0a99ea69323198b0462a887b08ffd6ca0e0d8992cb3d3da71e90d1",
+        "lock": "sdks/typescript/package-lock.json",
+        "package_count": 3,
+        "result": "pass",
+        "sha256": "8cacc04c290fadf431cac6a15a3986bf2611ecc25706ad80bd072e705a9f1644"
+      }
+    ],
+    "python": {
+      "canonical_sha256": "1750947f0394546b79d29c52c813f7d2dbaddc16b6e833a0a5bd007738b18313",
+      "inventory": "sdks/python/build-dependencies.json",
+      "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
+      "manifest": "sdks/python/pyproject.toml",
+      "manifest_sha256": "2261584895a9125aa9b0f6f74c9c7ada3af06a51d01f18f176851c7e95e5f19b",
+      "package_count": 1,
+      "result": "pass",
+      "runtime_dependency_count": 0
+    },
+    "rust": {
+      "canonical_sha256": "54172b4776f09b3975239b69538059bbe524cc6ccdb2b39339bd9a8a604495a6",
+      "package_count": 299,
+      "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
+      "result": "pass",
+      "sha256": "82a33ed64635a54039f48aa365623a9c401214a420d2b1b23eb43950085e4ad6"
+    }
+  },
+  "result": "pass",
+  "schema": "hyphae-relicensing-dependency-license-aggregate-v1",
+  "source": {
+    "mode": "content-bound-integration-tree",
+    "rust_receipt_anchor": {
+      "commit": "ae82ea814bc0074c3c8bd8a14b0f6b79e831c70c",
+      "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
+      "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
+      "mode": "integration-tree",
+      "tree": "fbad07aa0efb49dedb429f1ebbb845642452f377"
+    }
+  },
+  "target_release": "1.2.0"
+}

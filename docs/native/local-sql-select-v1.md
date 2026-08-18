@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local SQL SELECT v1
 
 Status: implemented and retained by the closed G2 and G6 gates. DDL, DML,

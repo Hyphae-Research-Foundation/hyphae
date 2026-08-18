@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native hardware profile v1
 
 Status: Linux, macOS, and Windows discovery adapters implemented; topology

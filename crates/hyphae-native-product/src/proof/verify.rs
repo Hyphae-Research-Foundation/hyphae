@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use super::{
     codec::decode_native_proof,
@@ -25,7 +25,25 @@ pub fn verify_native_proof_offline(
     trusted_anchor: ExternalTrustedAnchor,
     limits: &NativeVerificationLimits,
 ) -> Result<NativeProofVerificationReport, NativeProofError> {
+    verify_native_proof_offline_with_checkpoint(
+        proof_bytes,
+        witness_bytes,
+        trusted_anchor,
+        limits,
+        || true,
+    )
+}
+
+pub(crate) fn verify_native_proof_offline_with_checkpoint(
+    proof_bytes: &[u8],
+    witness_bytes: &[u8],
+    trusted_anchor: ExternalTrustedAnchor,
+    limits: &NativeVerificationLimits,
+    mut checkpoint: impl FnMut() -> bool,
+) -> Result<NativeProofVerificationReport, NativeProofError> {
+    proof_checkpoint(&mut checkpoint)?;
     let proof = decode_native_proof(proof_bytes, &limits.proof)?;
+    proof_checkpoint(&mut checkpoint)?;
     let witness = decode_native_witness(witness_bytes, &limits.witness)?;
     let proof_anchor_digest = proof.content.anchor.digest();
     if proof_anchor_digest != trusted_anchor.digest() {
@@ -45,6 +63,7 @@ pub fn verify_native_proof_offline(
     let mut directory_count = 0_usize;
     let mut total_file_bytes = 0_u64;
     for entry in &witness.entries {
+        proof_checkpoint(&mut checkpoint)?;
         match entry {
             NativeWitnessEntry::Directory { .. } => {
                 directory_count = directory_count
@@ -63,6 +82,7 @@ pub fn verify_native_proof_offline(
             }
         }
     }
+    proof_checkpoint(&mut checkpoint)?;
     let semantic_reexecution_performed =
         super::operation::reexecute_native_operation_proof(&proof, &witness, limits)?;
     Ok(NativeProofVerificationReport {
@@ -83,4 +103,12 @@ pub fn verify_native_proof_offline(
         total_file_bytes,
         semantic_reexecution_performed,
     })
+}
+
+fn proof_checkpoint(checkpoint: &mut impl FnMut() -> bool) -> Result<(), NativeProofError> {
+    if checkpoint() {
+        Ok(())
+    } else {
+        Err(NativeProofError::Interrupted)
+    }
 }

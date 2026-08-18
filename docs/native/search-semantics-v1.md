@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native search-engine semantics v1
 
 Status: normative bounded G6 contract; canonical tokenization, BM25, native

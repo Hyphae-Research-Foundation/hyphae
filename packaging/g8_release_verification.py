@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Reverify the complete signed release layout and emit G8 evidence."""
 
@@ -29,7 +29,7 @@ ROOT = Path(
     )
 ).resolve()
 RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
-SOFTWARE_LICENSE = "AGPL-3.0-only"
+SOFTWARE_LICENSE = "Apache-2.0"
 
 
 def is_hyphae_component(name: object) -> bool:

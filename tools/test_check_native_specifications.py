@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 import copy
 import json
@@ -53,6 +53,45 @@ class NativeSpecificationTests(unittest.TestCase):
             for name in REQUIRED_SPECS:
                 (root / name).write_text(f"# {name} v1\n", encoding="utf-8")
             with self.assertRaisesRegex(GateFailure, "not explicitly accepted"):
+                validate_profile(root, profile)
+
+    def test_leading_comments_preserve_heading_and_version_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = {
+                "schema": "hyphae-native-specification-profile-v1",
+                "architecture": "architecture.md",
+                "specifications": [f"{name}" for name in sorted(REQUIRED_SPECS)],
+            }
+            (root / "architecture.md").write_text(
+                "<!-- SPDX-License-Identifier: Apache-2.0 -->\n"
+                "# Architecture\n\nStatus: accepted target architecture\n",
+                encoding="utf-8",
+            )
+            for name in REQUIRED_SPECS:
+                (root / name).write_text(
+                    "<!-- SPDX-License-Identifier: Apache-2.0 -->\n"
+                    "<!--\nInitial contract comment.\n-->\n"
+                    f"# {name} v1\n",
+                    encoding="utf-8",
+                )
+
+            summary = validate_profile(root, profile)
+            self.assertEqual(summary["document_count"], len(REQUIRED_SPECS) + 1)
+
+            affected = root / sorted(REQUIRED_SPECS)[0]
+            affected.write_text(
+                "<!-- SPDX-License-Identifier: Apache-2.0 -->\n# Unversioned heading\n\nBody mentions v1.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(GateFailure, "lacks versioned heading"):
+                validate_profile(root, profile)
+
+            affected.write_text(
+                "Preamble\n# Restored heading v1\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(GateFailure, "lacks versioned heading"):
                 validate_profile(root, profile)
 
 

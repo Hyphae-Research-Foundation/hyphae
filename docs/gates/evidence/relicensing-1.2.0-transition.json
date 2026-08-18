@@ -1,0 +1,64 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-relicensing-transition-receipt-v1",
+  "target_release": "1.2.0",
+  "effective_at_utc": "2026-08-16T13:15:26Z",
+  "status": "effective-in-current-integration-tree",
+  "source": {
+    "repository": "https://github.com/celiumsai/hyphae.git",
+    "base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
+    "base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
+    "worktree_state": "content-bound-integration-tree",
+    "base_event": {
+      "kind": "interactive-owner-attestation",
+      "evidence": "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+    }
+  },
+  "transitioned_tree": {
+    "digest_domain": "hyphae-relicensing-transition-tree-v1",
+    "content_sha256": "8d4ab22774935820a2a9c72368af7998343a32596e538b94355dc0776b7a3cc2",
+    "path_count": 1345,
+    "excluded_paths": [
+      "docs/gates/evidence/relicensing-1.2.0-transition.json"
+    ],
+    "category_counts": {
+      "narrative-documentation": 271,
+      "normative-specification": 160,
+      "reserved-trademark-asset": 2,
+      "software": 911,
+      "third-party-material": 2
+    },
+    "statement": "The digest binds sorted path names and current content bytes for every tracked or nonignored pending path except this self-referential receipt. The owner-attested base commit must remain an ancestor, so the same receipt validates both the pre-commit integration tree and the committed tree with identical content without predicting a future commit ID."
+  },
+  "licenses": {
+    "software": "Apache-2.0",
+    "normative_specifications": "Apache-2.0",
+    "narrative_documentation": "CC-BY-SA-4.0",
+    "reserved_trademark_assets": "no-project-license-grant",
+    "third_party_material": "retains-original-terms"
+  },
+  "accepted_evidence": [
+    "CONTRIBUTING.md",
+    "config/relicensing-1.2.0-classification.json",
+    "docs/adr/0029-apache-2.0-software-and-normative-specifications.md",
+    "docs/gates/evidence/relicensing-1.2.0-dependabot-review.json",
+    "docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json",
+    "docs/gates/evidence/relicensing-1.2.0-repository-audit-fcf2f918.json",
+    "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
+  ],
+  "owner_attestation": {
+    "name": "Mario Gutiérrez",
+    "capacity": "owner and representative of Celiums Solutions LLC",
+    "authentication": "interactive-owner-attestation"
+  },
+  "counsel_record": {
+    "written_approval_received": true,
+    "confidential_record_published": false,
+    "public_locator_or_sha256": null,
+    "apache_section_6_and_trademarks": "owner acceptance of Apache-2.0 with existing TRADEMARKS.md; no claim that counsel's written scope expressly covered this issue"
+  },
+  "history": {
+    "rewritten": false,
+    "published_tags_unchanged": true
+  }
+}

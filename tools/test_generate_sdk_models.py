@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class GenerateSdkModelsTests(unittest.TestCase):
         }
         document = {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$comment": "SPDX-License-Identifier: AGPL-3.0-only",
+            "$comment": "SPDX-License-Identifier: Apache-2.0",
             "title": "ExactRetrievalRequestV1",
             "$defs": {"ExactRetrievalRequestV1": definition},
             **definition,
@@ -38,7 +38,7 @@ class GenerateSdkModelsTests(unittest.TestCase):
         )
         self.assertEqual(
             document["$comment"],
-            "SPDX-License-Identifier: AGPL-3.0-only",
+            "SPDX-License-Identifier: Apache-2.0",
         )
         models: dict[str, dict[str, object]] = {}
         add_model(models, "ExactRetrievalRequestV1", projected, "exact.schema.json")

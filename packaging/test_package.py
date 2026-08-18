@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -15,13 +15,15 @@ import tomllib
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from package import build_archive, product_version
+from package import INCLUDED_DOCUMENTS, build_archive, product_version
 from finalize_release import (
     create_checksums,
     release_assets,
     require_matching_tag,
+    require_apache_release_version as require_final_apache_release_version,
     validate_release_layout,
     verify_checksums,
 )
@@ -334,6 +336,11 @@ def add_final_signature_bundles(directory: Path) -> None:
 
 
 class PackageTests(unittest.TestCase):
+    def test_apache_publication_is_blocked_until_version_1_2_0(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "1.2.0"):
+            require_final_apache_release_version("1.1.0")
+        require_final_apache_release_version("1.2.0")
+
     def test_release_candidate_versions_are_aligned(self) -> None:
         cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         version = cargo["workspace"]["package"]["version"]
@@ -503,6 +510,20 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(first.read_bytes(), second.read_bytes())
                 self.assertTrue(first.name.startswith(f"hyphae-{product_version()}-"))
 
+    def test_release_archives_include_notice_and_the_complete_document_set(self) -> None:
+        self.assertEqual(
+            INCLUDED_DOCUMENTS,
+            (
+                "LICENSE",
+                "LICENSE-DOCUMENTATION",
+                "LICENSE-POLICY.md",
+                "NOTICE",
+                "README.md",
+                "THIRD_PARTY_NOTICES.md",
+                "THIRD_PARTY_LICENSES.txt",
+            ),
+        )
+
     def test_checksum_manifest_is_complete_and_tamper_evident(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hyphae-checksums-") as temporary:
             root = Path(temporary)
@@ -516,9 +537,11 @@ class PackageTests(unittest.TestCase):
 
     def test_release_tag_and_slsa_predicate_are_bound_to_source(self) -> None:
         identity = source_identity(git_object("HEAD^{commit}"))
-        require_matching_tag(identity.tag)
-        with self.assertRaisesRegex(RuntimeError, "does not match"):
-            require_matching_tag("v0.0.0")
+        with patch("finalize_release.source_identity") as source:
+            source.return_value = SimpleNamespace(version="1.2.0", tag="v1.2.0")
+            require_matching_tag("v1.2.0")
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                require_matching_tag("v0.0.0")
         predicate = build_predicate(
             target="x86_64-unknown-linux-gnu",
             commit=identity.commit,
@@ -1163,6 +1186,22 @@ class PackageTests(unittest.TestCase):
                 commit=commit,
                 excluded_run_id="999",
             )
+
+        for name in ("Security hard-kill aggregate", "MCP real hosts"):
+            with self.subTest(missing=name), self.assertRaisesRegex(
+                ValueError, "lacks a prior run"
+            ):
+                build_report(
+                    [run for run in runs if run["name"] != name],
+                    workflow_runs=workflow_runs,
+                    job_runs=job_runs,
+                    pull_requests=pull_requests,
+                    head_pull_requests=head_pull_requests,
+                    pull_request_events=pull_request_events,
+                    repository=REPOSITORY_SLUG,
+                    commit=commit,
+                    excluded_run_id="999",
+                )
 
         failed_latest = copy.deepcopy(runs[0])
         # GitHub defines "latest" by completion time, not by check-run ID.

@@ -1,14 +1,18 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Product principals, authorization, sessions, and prepared handles.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex, RwLock},
+};
 
 use hyphae_native_runtime::NativeWriteBatch;
 use hyphae_native_types::TransactionId;
 
 use crate::{
-    ProductCommitReceipt, ProductDurability, ProductExplicitTransactionStatus,
+    AuthenticatedAuthority, AuthorizationEpoch, BoundSqlStatement, ObjectId, ProductCommitReceipt,
+    ProductDurability, ProductError, ProductErrorCode, ProductExplicitTransactionStatus,
     ProductPreparedStatement, ProductTransactionHandle,
 };
 
@@ -26,6 +30,72 @@ pub(crate) struct ActiveProductTransaction {
     pub(crate) batch: NativeWriteBatch,
     pub(crate) staged_operations: usize,
     pub(crate) durability: ProductDurability,
+    pub(crate) authorization: ProductAuthorizationRequirement,
+}
+
+/// Canonical permission and stable-object union retained across deferred work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProductAuthorizationRequirement {
+    pub(crate) unscoped: ProductAuthorization,
+    pub(crate) instance: ProductAuthorization,
+    pub(crate) objects: BTreeMap<ObjectId, ProductAuthorization>,
+}
+
+impl ProductAuthorizationRequirement {
+    pub(crate) const fn unscoped(permissions: ProductAuthorization) -> Self {
+        Self {
+            unscoped: permissions,
+            instance: ProductAuthorization::NONE,
+            objects: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) const fn instance(permissions: ProductAuthorization) -> Self {
+        Self {
+            unscoped: ProductAuthorization::NONE,
+            instance: permissions,
+            objects: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn object(permissions: ProductAuthorization, object: ObjectId) -> Self {
+        Self {
+            unscoped: ProductAuthorization::NONE,
+            instance: ProductAuthorization::NONE,
+            objects: BTreeMap::from([(object, permissions)]),
+        }
+    }
+
+    pub(crate) fn union(&mut self, other: &Self) {
+        self.unscoped = self.unscoped.union(other.unscoped);
+        self.instance = self.instance.union(other.instance);
+        for (object, permissions) in &other.objects {
+            self.objects
+                .entry(*object)
+                .and_modify(|current| *current = current.union(*permissions))
+                .or_insert(*permissions);
+        }
+    }
+
+    pub(crate) fn permissions(&self) -> ProductAuthorization {
+        self.objects.values().copied().fold(
+            self.unscoped.union(self.instance),
+            ProductAuthorization::union,
+        )
+    }
+
+    pub(crate) fn add_permission_to_bound_targets(&mut self, permission: ProductPermission) {
+        let additional = ProductAuthorization::from_permissions([permission]);
+        if self.instance != ProductAuthorization::NONE {
+            self.instance = self.instance.union(additional);
+        }
+        if self.objects.is_empty() && self.instance == ProductAuthorization::NONE {
+            self.unscoped = self.unscoped.union(additional);
+        }
+        for permissions in self.objects.values_mut() {
+            *permissions = permissions.union(additional);
+        }
+    }
 }
 
 /// Stable identity for one process-local product session.
@@ -65,58 +135,107 @@ impl ProductPrincipal {
 }
 
 /// Product permission checked before operation execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum ProductPermission {
-    /// Capability discovery.
-    Discover = 0,
+    /// Read bounded durable security events.
+    AuditRead = 0,
+    /// Create and verify a new backup.
+    BackupCreate = 1,
+    /// Verify a backup without activating it.
+    BackupVerify = 2,
     /// Catalog reads.
-    CatalogRead = 1,
+    CatalogRead = 3,
     /// Catalog mutation.
-    CatalogWrite = 2,
+    CatalogWrite = 4,
+    /// Create, rotate, or revoke the caller's narrowed credentials.
+    CredentialSelfManage = 5,
     /// SQL and structure reads.
-    DataRead = 3,
-    /// SQL and structure mutation.
-    DataWrite = 4,
-    /// Search execution.
-    Search = 5,
-    /// Administration and doctor.
-    Admin = 6,
-    /// Backup creation.
-    Backup = 7,
+    DataRead = 6,
+    /// SQL, structure, and search-data mutation.
+    DataWrite = 7,
+    /// Capability discovery.
+    Discover = 8,
+    /// Checkpoint, doctor, compaction, vacuum, and retention operations.
+    Maintain = 9,
+    /// Status, telemetry, and bounded explain observation.
+    Observe = 10,
+    /// Ownership transfer and recovery policy.
+    OwnershipManage = 11,
+    /// Generate a proof for an otherwise-authorized read.
+    ProofGenerate = 12,
     /// Offline proof verification.
-    ProofVerify = 8,
+    ProofVerify = 13,
+    /// Restore a verified backup into a new directory.
+    Restore = 14,
+    /// Lexical, vector, ANN, and hybrid search execution.
+    SearchExecute = 15,
+    /// Mutate principals, roles, assignments, and credentials.
+    SecurityManage = 16,
+    /// Read redacted security metadata.
+    SecurityRead = 17,
 }
 
 /// Closed permission set supplied by the authentication boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProductAuthorization(u16);
+pub struct ProductAuthorization(u64);
 
 impl ProductAuthorization {
     /// No permissions.
     pub const NONE: Self = Self(0);
     /// Every permission known to this product version.
-    pub const ALL: Self = Self((1 << 9) - 1);
-    /// Discovery plus all immutable read operations.
+    pub const ALL: Self = Self((1 << 18) - 1);
+    /// Discovery plus ordinary application read, search, and proof operations.
     pub const READ_ONLY: Self = Self(
         (1 << ProductPermission::Discover as u8)
             | (1 << ProductPermission::CatalogRead as u8)
             | (1 << ProductPermission::DataRead as u8)
-            | (1 << ProductPermission::Search as u8),
+            | (1 << ProductPermission::SearchExecute as u8)
+            | (1 << ProductPermission::ProofGenerate as u8)
+            | (1 << ProductPermission::ProofVerify as u8),
     );
 
     /// Builds an authorization set from explicit permissions.
     pub fn from_permissions(permissions: impl IntoIterator<Item = ProductPermission>) -> Self {
-        let mut bits = 0_u16;
+        let mut bits = 0_u64;
         for permission in permissions {
-            bits |= 1_u16 << permission as u8;
+            bits |= 1_u64 << permission as u8;
         }
         Self(bits)
     }
 
     /// Returns whether the permission is granted.
     pub const fn allows(self, permission: ProductPermission) -> bool {
-        self.0 & (1_u16 << permission as u8) != 0
+        self.0 & (1_u64 << permission as u8) != 0
+    }
+
+    /// Returns whether every permission in `required` is granted.
+    pub const fn allows_all(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    /// Combines two additive permission sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns the canonical known-permission wire mask.
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// Reconstructs an authorization mask only when every bit is known.
+    pub const fn from_known_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 }
 
@@ -198,6 +317,8 @@ pub struct ProductSession {
     id: ProductSessionId,
     principal: ProductPrincipal,
     authorization: ProductAuthorization,
+    authorization_epoch: AuthorizationEpoch,
+    authority: ProductSessionAuthority,
     prepared: BTreeMap<ProductPreparedHandle, ProductPreparedStatement>,
     next_prepared: u64,
     maximum_prepared: usize,
@@ -205,33 +326,146 @@ pub struct ProductSession {
     transaction_order: VecDeque<ProductTransactionId>,
     maximum_transactions: usize,
     active_transactions: BTreeMap<ProductTransactionHandle, ActiveProductTransaction>,
+    sql_bindings: Mutex<BTreeMap<ProductSessionSqlBindingKey, BoundSqlStatement>>,
     explicit_statuses: BTreeMap<ProductTransactionHandle, ProductExplicitTransactionStatus>,
     explicit_status_order: VecDeque<ProductTransactionHandle>,
     next_transaction_handle: u64,
     maximum_active_transactions: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProductSessionSqlBindingKey {
+    Execute(u128),
+    Explain(u128),
+    Stage {
+        request_id: u128,
+        handle: ProductTransactionHandle,
+    },
+}
+
+#[derive(Debug)]
+enum ProductSessionAuthority {
+    Unmanaged,
+    Managed(RwLock<Arc<AuthenticatedAuthority>>),
+    LegacyOwner,
+}
+
 impl ProductSession {
-    /// Creates one direct embedded session with default retention bounds.
+    /// Creates one explicitly unmanaged embedded session with default bounds.
+    ///
+    /// The caller is the trusted local authority. Remote adapters must use an
+    /// authenticated session and must not derive permissions from peer input.
     pub fn new(
         id: ProductSessionId,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
     ) -> Self {
+        Self::new_at_epoch(id, principal, authorization, AuthorizationEpoch::UNMANAGED)
+    }
+
+    /// Creates one explicitly unmanaged embedded session at a caller epoch.
+    pub fn new_at_epoch(
+        id: ProductSessionId,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
+    ) -> Self {
         Self::with_limits(
             id,
             principal,
             authorization,
+            authorization_epoch,
             DEFAULT_PRODUCT_PREPARED_HANDLES,
             DEFAULT_PRODUCT_TRANSACTION_STATUSES,
             DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
         )
     }
 
+    /// Creates one managed embedded session from an unforgeable authority.
+    ///
+    /// Every dispatched operation revalidates the authority against the
+    /// current durable catalog and trusted wall clock.
+    pub fn new_authenticated(id: ProductSessionId, authority: AuthenticatedAuthority) -> Self {
+        Self::with_authenticated_limits(
+            id,
+            authority,
+            DEFAULT_PRODUCT_PREPARED_HANDLES,
+            DEFAULT_PRODUCT_TRANSACTION_STATUSES,
+            DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
+        )
+    }
+
+    /// Creates the synthetic 1.2 legacy-owner session without fabricated IDs.
+    ///
+    /// This constructor is reserved to the Native HTTP compatibility adapter.
+    /// Every operation revalidates the durable terminal state in the product.
+    pub fn new_legacy_owner(id: ProductSessionId) -> Self {
+        let principal = ProductPrincipal::new("legacy-owner").unwrap_or(Self::legacy_principal());
+        let mut session = Self::with_limits(
+            id,
+            principal,
+            ProductAuthorization::ALL
+                .without(crate::ProductPermission::OwnershipManage)
+                .without(crate::ProductPermission::SecurityManage),
+            AuthorizationEpoch::UNMANAGED,
+            DEFAULT_PRODUCT_PREPARED_HANDLES,
+            DEFAULT_PRODUCT_TRANSACTION_STATUSES,
+            DEFAULT_PRODUCT_ACTIVE_TRANSACTIONS,
+        );
+        session.authority = ProductSessionAuthority::LegacyOwner;
+        session
+    }
+
     pub(crate) fn with_limits(
         id: ProductSessionId,
         principal: ProductPrincipal,
         authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
+        maximum_prepared: usize,
+        maximum_transactions: usize,
+        maximum_active_transactions: usize,
+    ) -> Self {
+        Self::with_limits_and_authority(
+            id,
+            principal,
+            authorization,
+            authorization_epoch,
+            None,
+            maximum_prepared,
+            maximum_transactions,
+            maximum_active_transactions,
+        )
+    }
+
+    pub(crate) fn with_authenticated_limits(
+        id: ProductSessionId,
+        authority: AuthenticatedAuthority,
+        maximum_prepared: usize,
+        maximum_transactions: usize,
+        maximum_active_transactions: usize,
+    ) -> Self {
+        Self::with_limits_and_authority(
+            id,
+            authority.principal().clone(),
+            authority.authorization(),
+            authority.authorization_epoch(),
+            Some(authority),
+            maximum_prepared,
+            maximum_transactions,
+            maximum_active_transactions,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor centralizes every bounded session field"
+    )]
+    fn with_limits_and_authority(
+        id: ProductSessionId,
+        principal: ProductPrincipal,
+        authorization: ProductAuthorization,
+        authorization_epoch: AuthorizationEpoch,
+        authenticated_authority: Option<AuthenticatedAuthority>,
         maximum_prepared: usize,
         maximum_transactions: usize,
         maximum_active_transactions: usize,
@@ -240,6 +474,11 @@ impl ProductSession {
             id,
             principal,
             authorization,
+            authorization_epoch,
+            authority: authenticated_authority
+                .map_or(ProductSessionAuthority::Unmanaged, |value| {
+                    ProductSessionAuthority::Managed(RwLock::new(Arc::new(value)))
+                }),
             prepared: BTreeMap::new(),
             next_prepared: 1,
             maximum_prepared,
@@ -247,6 +486,7 @@ impl ProductSession {
             transaction_order: VecDeque::new(),
             maximum_transactions,
             active_transactions: BTreeMap::new(),
+            sql_bindings: Mutex::new(BTreeMap::new()),
             explicit_statuses: BTreeMap::new(),
             explicit_status_order: VecDeque::new(),
             next_transaction_handle: 1,
@@ -267,6 +507,55 @@ impl ProductSession {
     /// Returns immutable authorization bound at session creation.
     pub const fn authorization(&self) -> ProductAuthorization {
         self.authorization
+    }
+
+    /// Returns the durable authorization generation bound at authentication.
+    pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
+        self.authorization_epoch
+    }
+
+    pub(crate) fn authenticated_authority(
+        &self,
+    ) -> Result<Option<Arc<AuthenticatedAuthority>>, ProductError> {
+        match &self.authority {
+            ProductSessionAuthority::Unmanaged | ProductSessionAuthority::LegacyOwner => Ok(None),
+            ProductSessionAuthority::Managed(authority) => authority
+                .read()
+                .map(|authority| Some(Arc::clone(&authority)))
+                .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable)),
+        }
+    }
+
+    pub(crate) fn refresh_authenticated_authority(
+        &self,
+        authority: Arc<AuthenticatedAuthority>,
+    ) -> Result<(), ProductError> {
+        match &self.authority {
+            ProductSessionAuthority::Unmanaged | ProductSessionAuthority::LegacyOwner => {
+                Err(ProductError::from_code(ProductErrorCode::Internal))
+            }
+            ProductSessionAuthority::Managed(cached) => {
+                *cached
+                    .write()
+                    .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))? =
+                    authority;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        matches!(self.authority, ProductSessionAuthority::Managed(_))
+    }
+
+    pub(crate) fn is_legacy_owner(&self) -> bool {
+        matches!(self.authority, ProductSessionAuthority::LegacyOwner)
+    }
+
+    fn legacy_principal() -> ProductPrincipal {
+        ProductPrincipal {
+            identity: Box::<str>::from("legacy-owner"),
+        }
     }
 
     pub(crate) fn retain_prepared(
@@ -291,6 +580,29 @@ impl ProductSession {
 
     pub(crate) fn deallocate(&mut self, handle: ProductPreparedHandle) -> bool {
         self.prepared.remove(&handle).is_some()
+    }
+
+    pub(crate) fn retain_sql_binding(
+        &self,
+        key: ProductSessionSqlBindingKey,
+        binding: BoundSqlStatement,
+    ) -> Result<(), ProductError> {
+        self.sql_bindings
+            .lock()
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))?
+            .insert(key, binding);
+        Ok(())
+    }
+
+    pub(crate) fn take_sql_binding(
+        &self,
+        key: ProductSessionSqlBindingKey,
+    ) -> Result<Option<BoundSqlStatement>, ProductError> {
+        Ok(self
+            .sql_bindings
+            .lock()
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))?
+            .remove(&key))
     }
 
     pub(crate) fn record_transaction(
@@ -343,6 +655,9 @@ impl ProductSession {
                 batch,
                 staged_operations: 0,
                 durability,
+                authorization: ProductAuthorizationRequirement::unscoped(
+                    ProductAuthorization::NONE,
+                ),
             },
         );
         self.record_explicit_status(handle, status);
@@ -383,6 +698,24 @@ impl ProductSession {
         handle: ProductTransactionHandle,
     ) -> Option<ActiveProductTransaction> {
         self.active_transactions.remove(&handle)
+    }
+
+    pub(crate) fn rollback_active_transaction_after_authority_loss(
+        &mut self,
+        handle: ProductTransactionHandle,
+    ) {
+        let Some(transaction) = self.active_transactions.remove(&handle) else {
+            return;
+        };
+        let discarded_operations = transaction.staged_operations;
+        transaction.batch.rollback();
+        self.record_explicit_status(
+            handle,
+            ProductExplicitTransactionStatus::RolledBack {
+                handle,
+                discarded_operations,
+            },
+        );
     }
 
     pub(crate) fn record_explicit_status(

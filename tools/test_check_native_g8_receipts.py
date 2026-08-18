@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 import json
 import hashlib
@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.check_native_g8_receipts import GateFailure, aggregate, authority, validate_receipt
+from tools.check_native_g8_receipts import (
+    GateFailure,
+    aggregate,
+    authority,
+    validate_aggregate,
+    validate_receipt,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +129,30 @@ class G8ReceiptTests(unittest.TestCase):
                     write_receipt(receipts, row, platform)
             with self.assertRaises(GateFailure):
                 aggregate(ROOT, receipts, COMMIT)
+
+    def test_closed_aggregate_mutations_fail_closed(self) -> None:
+        _, rows = authority(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            receipts = Path(directory)
+            for row in rows.values():
+                for platform in row["platforms"]:
+                    write_receipt(receipts, row, platform)
+            with self.semantic_validator(rows):
+                valid = aggregate(ROOT, receipts, COMMIT)
+        mutations = (
+            lambda value: value.update(source_commit="b" * 40),
+            lambda value: value.update(claims=[]),
+            lambda value: value.update(closure_declared=False),
+            lambda value: value["requirements"].pop("native-soak"),
+            lambda value: value["requirements"]["native-soak"]["linux"]["audit"].update(status="failed"),
+            lambda value: value["requirements"]["native-soak"]["linux"].update(receipt_sha256="bad"),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                candidate = json.loads(json.dumps(valid))
+                mutation(candidate)
+                with self.assertRaises(GateFailure):
+                    validate_aggregate(candidate, COMMIT, ROOT)
 
 
 if __name__ == "__main__":

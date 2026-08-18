@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_types::{
     CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
@@ -92,6 +92,7 @@ pub(crate) enum Opcode {
     CreateCatalogObjectV2 = 51,
     CleanupStructureRetirementV3 = 52,
     PublishInitialAnnBulk = 53,
+    MigrateCatalogV7 = 54,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -873,6 +874,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::CreateCatalogObjectV2 as u8 => {
             (Opcode::CreateCatalogObjectV2, EngineKind::Kernel)
         }
+        value if value == Opcode::MigrateCatalogV7 as u8 => {
+            (Opcode::MigrateCatalogV7, EngineKind::Kernel)
+        }
         _ => return Err(WalSemanticError::InvalidBody),
     })
 }
@@ -981,6 +985,7 @@ fn validate_mutation_shape(
             | Opcode::MigrateStructureV3
             | Opcode::VacuumPageGeneration
             | Opcode::CompactSearch
+            | Opcode::MigrateCatalogV7
     ) {
         return validate_empty_maintenance_shape(has_target, value_length, expires_at_micros, key);
     }

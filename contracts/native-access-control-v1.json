@@ -1,0 +1,924 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-native-access-control-v1",
+  "status": "current",
+  "permission_encoding": {
+    "internal_bits": 64,
+    "wire_encoding": "lowercase-dotted-ascii",
+    "unknown_permission": "deny"
+  },
+  "permissions": [
+    {
+      "id": "audit.read",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "backup.create",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "backup.verify",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "catalog.read",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "catalog.write",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "credential.self_manage",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "data.read",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "data.write",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "discover",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "maintain",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "observe",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "ownership.manage",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "proof.generate",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "proof.verify",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "restore",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "search.execute",
+      "scopes": ["catalog_object", "catalog_subtree", "instance"]
+    },
+    {
+      "id": "security.manage",
+      "scopes": ["instance"]
+    },
+    {
+      "id": "security.read",
+      "scopes": ["instance"]
+    }
+  ],
+  "built_in_roles": [
+    {
+      "id": "admin",
+      "permissions": [
+        "audit.read",
+        "backup.create",
+        "backup.verify",
+        "catalog.read",
+        "catalog.write",
+        "credential.self_manage",
+        "data.read",
+        "data.write",
+        "discover",
+        "maintain",
+        "observe",
+        "proof.generate",
+        "proof.verify",
+        "restore",
+        "search.execute",
+        "security.manage",
+        "security.read"
+      ]
+    },
+    {
+      "id": "auditor",
+      "permissions": [
+        "audit.read",
+        "backup.verify",
+        "catalog.read",
+        "credential.self_manage",
+        "discover",
+        "observe",
+        "proof.verify",
+        "security.read"
+      ]
+    },
+    {
+      "id": "developer",
+      "permissions": [
+        "catalog.read",
+        "catalog.write",
+        "credential.self_manage",
+        "data.read",
+        "data.write",
+        "discover",
+        "observe",
+        "proof.generate",
+        "proof.verify",
+        "search.execute"
+      ]
+    },
+    {
+      "id": "operator",
+      "permissions": [
+        "audit.read",
+        "backup.create",
+        "backup.verify",
+        "catalog.read",
+        "credential.self_manage",
+        "discover",
+        "maintain",
+        "observe",
+        "proof.verify"
+      ]
+    },
+    {
+      "id": "owner",
+      "permissions": [
+        "audit.read",
+        "backup.create",
+        "backup.verify",
+        "catalog.read",
+        "catalog.write",
+        "credential.self_manage",
+        "data.read",
+        "data.write",
+        "discover",
+        "maintain",
+        "observe",
+        "ownership.manage",
+        "proof.generate",
+        "proof.verify",
+        "restore",
+        "search.execute",
+        "security.manage",
+        "security.read"
+      ]
+    },
+    {
+      "id": "reader",
+      "permissions": [
+        "catalog.read",
+        "credential.self_manage",
+        "data.read",
+        "discover",
+        "proof.generate",
+        "proof.verify",
+        "search.execute"
+      ]
+    },
+    {
+      "id": "writer",
+      "permissions": [
+        "catalog.read",
+        "credential.self_manage",
+        "data.read",
+        "data.write",
+        "discover",
+        "proof.generate",
+        "proof.verify",
+        "search.execute"
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "id": "capabilities",
+      "status": "current",
+      "source_variant": "Capabilities",
+      "classification": "fixed",
+      "required_all": ["discover"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.object",
+      "status": "current",
+      "source_variant": "CatalogObject",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.object_named",
+      "status": "current",
+      "source_variant": "CatalogObjectNamed",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "resolved_name",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.list",
+      "status": "current",
+      "source_variant": "CatalogList",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "request_page",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.visible_list",
+      "status": "current",
+      "source_variant": "CatalogVisibleList",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "authorized_roots",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.dependencies",
+      "status": "current",
+      "source_variant": "CatalogDependencies",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.describe",
+      "status": "current",
+      "source_variant": "CatalogDescribe",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.resolve",
+      "status": "current",
+      "source_variant": "CatalogResolve",
+      "classification": "fixed",
+      "required_all": ["catalog.read"],
+      "scope_resolution": "resolved_name",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "catalog.create",
+      "status": "current",
+      "source_variant": "CatalogCreate",
+      "classification": "fixed",
+      "required_all": ["catalog.write"],
+      "scope_resolution": "parent_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner"]
+    },
+    {
+      "id": "sql.prepare_read",
+      "status": "current",
+      "source_variant": "PrepareSql",
+      "classification": "parsed_and_bound_read",
+      "required_all": ["catalog.read", "data.read"],
+      "scope_resolution": "bound_sql_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "sql.deallocate_prepared",
+      "status": "current",
+      "source_variant": "DeallocatePrepared",
+      "classification": "prepared_read",
+      "required_all": ["data.read"],
+      "scope_resolution": "prepared_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "sql.execute_prepared",
+      "status": "current",
+      "source_variant": "ExecutePrepared",
+      "classification": "prepared_read",
+      "required_all": ["catalog.read", "data.read"],
+      "scope_resolution": "prepared_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "sql.execute_read",
+      "status": "current",
+      "source_variant": "ExecuteSql",
+      "classification": "parsed_and_bound_read",
+      "required_all": ["catalog.read", "data.read"],
+      "scope_resolution": "bound_sql_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "sql.execute_write",
+      "status": "current",
+      "source_variant": "ExecuteSql",
+      "classification": "parsed_and_bound_dml",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "bound_sql_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "sql.execute_ddl",
+      "status": "current",
+      "source_variant": "ExecuteSql",
+      "classification": "parsed_and_bound_ddl",
+      "required_all": ["catalog.write"],
+      "scope_resolution": "bound_sql_parent_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner"]
+    },
+    {
+      "id": "structure.get",
+      "status": "current",
+      "source_variant": "StructureGet",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "durable_default_scalar_keyspace",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "structure.set",
+      "status": "current",
+      "source_variant": "StructureSet",
+      "classification": "fixed",
+      "required_all": ["data.write"],
+      "scope_resolution": "durable_default_scalar_keyspace",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "structure.ttl",
+      "status": "current",
+      "source_variant": "StructureTtl",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "durable_default_scalar_keyspace",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "structure.mutate",
+      "status": "current",
+      "source_variant": "StructureMutate",
+      "classification": "fixed",
+      "required_all": ["data.write"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "structure.read",
+      "status": "current",
+      "source_variant": "StructureRead",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "transaction.begin",
+      "status": "current",
+      "source_variant": "TransactionBegin",
+      "classification": "write_transaction",
+      "required_all": ["data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.stage_sql",
+      "status": "current",
+      "source_variant": "TransactionStageSql",
+      "classification": "parsed_and_bound_dml",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "bound_sql_objects_transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.stage_structure",
+      "status": "current",
+      "source_variant": "TransactionStageStructure",
+      "classification": "fixed",
+      "required_all": ["data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.stage_search",
+      "status": "current",
+      "source_variant": "TransactionStageSearch",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.stage_vector",
+      "status": "current",
+      "source_variant": "TransactionStageVector",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.commit",
+      "status": "current",
+      "source_variant": "TransactionCommit",
+      "classification": "write_transaction",
+      "required_all": ["data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.rollback",
+      "status": "current",
+      "source_variant": "TransactionRollback",
+      "classification": "write_transaction",
+      "required_all": ["data.write"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "transaction.explicit_status",
+      "status": "current",
+      "source_variant": "ExplicitTransactionStatus",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "transaction_union",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "transaction.status",
+      "status": "current",
+      "source_variant": "TransactionStatus",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "originating_principal",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "transaction.status_by_idempotency",
+      "status": "current",
+      "source_variant": "TransactionStatusByIdempotency",
+      "classification": "fixed",
+      "required_all": ["data.read"],
+      "scope_resolution": "originating_principal",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "search.execute",
+      "status": "current",
+      "source_variant": "Search",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "search.execute"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "search.collection_execute",
+      "status": "current",
+      "source_variant": "SearchCollection",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "search.execute"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "search.ingest",
+      "status": "current",
+      "source_variant": "SearchIngest",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "search.document_update",
+      "status": "current",
+      "source_variant": "SearchDocumentUpdate",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "search.document_delete",
+      "status": "current",
+      "source_variant": "SearchDocumentDelete",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "request_object",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "admin.status",
+      "status": "current",
+      "source_variant": "AdminStatus",
+      "classification": "fixed",
+      "required_all": ["observe"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner"]
+    },
+    {
+      "id": "admin.checkpoint",
+      "status": "current",
+      "source_variant": "AdminCheckpoint",
+      "classification": "fixed",
+      "required_all": ["maintain"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "operator", "owner"]
+    },
+    {
+      "id": "admin.explain_sql",
+      "status": "current",
+      "source_variant": "AdminExplainSql",
+      "classification": "parsed_and_bound_explain",
+      "required_all": ["catalog.read", "observe"],
+      "scope_resolution": "bound_sql_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner"]
+    },
+    {
+      "id": "admin.doctor",
+      "status": "current",
+      "source_variant": "Doctor",
+      "classification": "fixed",
+      "required_all": ["maintain"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "operator", "owner"]
+    },
+    {
+      "id": "backup.create",
+      "status": "current",
+      "source_variant": "Backup",
+      "classification": "fixed",
+      "required_all": ["backup.create"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "operator", "owner"]
+    },
+    {
+      "id": "restore",
+      "status": "current",
+      "source_variant": "Restore",
+      "classification": "fixed",
+      "required_all": ["restore"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "telemetry.read",
+      "status": "current",
+      "source_variant": "Telemetry",
+      "classification": "fixed",
+      "required_all": ["observe"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner"]
+    },
+    {
+      "id": "proof.verify",
+      "status": "current",
+      "source_variant": "VerifyProof",
+      "classification": "fixed",
+      "required_all": ["proof.verify"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {
+      "id": "proof.generate",
+      "status": "current",
+      "source_variant": "Prove",
+      "classification": "wrapped_operation",
+      "required_all": ["proof.generate"],
+      "scope_resolution": "underlying_operation",
+      "inherits_underlying": true,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "backup.verify",
+      "status": "planned-1.2",
+      "source_variant": null,
+      "classification": "fixed",
+      "required_all": ["backup.verify"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "operator", "owner"]
+    },
+    {
+      "id": "security.status",
+      "status": "current",
+      "source_variant": "SecurityStatus",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
+      "id": "security.principal_list",
+      "status": "current",
+      "source_variant": "SecurityPrincipalList",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
+      "id": "security.principal_create",
+      "status": "current",
+      "source_variant": "SecurityPrincipalCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.principal_set_enabled",
+      "status": "current",
+      "source_variant": "SecurityPrincipalSetEnabled",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.role_list",
+      "status": "current",
+      "source_variant": "SecurityRoleList",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
+      "id": "security.custom_role_create",
+      "status": "current",
+      "source_variant": "SecurityCustomRoleCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.assignment_list",
+      "status": "current",
+      "source_variant": "SecurityAssignmentList",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
+      "id": "security.assignment_create_built_in",
+      "status": "current",
+      "source_variant": "SecurityBuiltInAssignmentCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.assignment_create_custom",
+      "status": "current",
+      "source_variant": "SecurityCustomAssignmentCreate",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.assignment_revoke",
+      "status": "current",
+      "source_variant": "SecurityAssignmentRevoke",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.key_list",
+      "status": "current",
+      "source_variant": "SecurityKeyList",
+      "classification": "fixed",
+      "required_all": ["security.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "owner"]
+    },
+    {
+      "id": "security.key_issue_start",
+      "status": "current",
+      "source_variant": "SecurityApiKeyIssueStart",
+      "classification": "fixed",
+      "required_all": ["security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
+      "id": "security.key_issue_self_start",
+      "status": "current",
+      "source_variant": "SecurityApiKeyIssueSelfStart",
+      "classification": "fixed",
+      "required_all": ["credential.self_manage"],
+      "scope_resolution": "originating_principal",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "developer", "operator", "owner", "reader", "writer"]
+    },
+    {"id":"security.key_issue_activate","status":"current","source_variant":"SecurityApiKeyIssueActivate","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_issue_self_activate","status":"current","source_variant":"SecurityApiKeyIssueSelfActivate","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.key_rotate_start","status":"current","source_variant":"SecurityApiKeyRotateStart","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_rotate_self_start","status":"current","source_variant":"SecurityApiKeyRotateSelfStart","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.key_rotate_activate","status":"current","source_variant":"SecurityApiKeyRotateActivate","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_rotate_self_activate","status":"current","source_variant":"SecurityApiKeyRotateSelfActivate","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.key_issue_abort","status":"current","source_variant":"SecurityApiKeyIssueAbort","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_issue_self_abort","status":"current","source_variant":"SecurityApiKeyIssueSelfAbort","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.key_rotate_abort","status":"current","source_variant":"SecurityApiKeyRotateAbort","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_rotate_self_abort","status":"current","source_variant":"SecurityApiKeyRotateSelfAbort","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.key_revoke","status":"current","source_variant":"SecurityApiKeyRevoke","classification":"fixed","required_all":["security.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["admin","owner"]},
+    {"id":"security.key_revoke_self","status":"current","source_variant":"SecurityApiKeyRevokeSelf","classification":"fixed","required_all":["credential.self_manage"],"scope_resolution":"originating_principal","inherits_underlying":false,"allowed_roles":["admin","auditor","developer","operator","owner","reader","writer"]},
+    {"id":"security.legacy_bearer_revoke","status":"current","source_variant":"SecurityLegacyBearerRevoke","classification":"fixed","required_all":["ownership.manage"],"scope_resolution":"instance","inherits_underlying":false,"allowed_roles":["owner"]},
+    {
+      "id": "security.audit_read",
+      "status": "current",
+      "source_variant": "SecurityAuditRead",
+      "classification": "fixed",
+      "required_all": ["audit.read"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "auditor", "operator", "owner"]
+    },
+    {
+      "id": "security.ownership_transfer",
+      "status": "planned-1.2",
+      "source_variant": null,
+      "classification": "fixed",
+      "required_all": ["ownership.manage", "security.manage"],
+      "scope_resolution": "instance",
+      "inherits_underlying": false,
+      "allowed_roles": ["owner"]
+    }
+  ],
+  "key_format": {
+    "version": 1,
+    "prefix": "hyp1_",
+    "alphabet": "lowercase-hexadecimal",
+    "key_id_bits": 128,
+    "key_id_characters": 32,
+    "secret_bits": 256,
+    "secret_characters": 64,
+    "serialized_bytes": 102,
+    "pattern": "^hyp1_[0-9a-f]{32}_[0-9a-f]{64}$",
+    "verifier": "blake3-domain-separated-v1",
+    "verifier_domain_hex": "6879706861652d6170692d6b65792d763100",
+    "secret_return": "one-time-start-response-client-restricted-file",
+    "activation_confirmation": "blake3-domain-separated-verifier-digest"
+  },
+  "scope_policy": {
+    "kinds": ["instance", "catalog_subtree", "catalog_object"],
+    "catalog_identity": "nonzero-object-id",
+    "name_is_authority": false,
+    "sql_authorization": "binder-owned-exact-object-set",
+    "sql_binding_reuse": "same-binding-or-catalog-version-rejection",
+    "sql_dml_dependencies": "target-secondary-indexes-and-foreign-key-relations-indexes",
+    "sql_explain_authorization": "observe-at-instance-and-catalog-read-at-every-bound-object",
+    "default_scalar_authorization": "data-read-write-at-durable-canonical-keyspace-object",
+    "default_scalar_binding": "strict-hypdkb01-lineage-and-object-id",
+    "catalog_visible_scope": "exact-grant-permission-and-key-scope-intersection",
+    "catalog_visible_migration": "explicit-upgrade-only",
+    "transaction_authorization": "stage-and-commit-union"
+  },
+  "authorization_policy": {
+    "deny_by_default": true,
+    "role_inheritance": false,
+    "negative_grants": false,
+    "key_may_widen_principal": false,
+    "revocation_effective": "next-operation",
+    "expiry_check": "every-operation",
+    "prepared_reauthorization": true,
+    "commit_reauthorization": true,
+    "unknown_state": "deny"
+  },
+  "bootstrap_policy": {
+    "mode": "offline-exclusive-lock",
+    "allowed_when": "no-durable-principals",
+    "initial_role": "owner",
+    "secret_output": "new-restricted-file",
+    "terminal_output_default": false
+  },
+  "migration_policy": {
+    "legacy_bearer_minor_releases": 1,
+    "compatibility_version": "1.2",
+    "transport": "native-http-only",
+    "durable_states": ["never_enabled", "migration_pending", "dual_window", "revoked"],
+    "revoked_terminal": true,
+    "canonical_input_fallback": false,
+    "non_loopback_plaintext": false,
+    "legacy_principal": "legacy-owner",
+    "fabricated_security_id": false,
+    "fabricated_api_key_id": false,
+    "bearer_plaintext_persisted": false,
+    "catalog_format": "HYACAT05",
+    "bearer_verifier_persisted": true,
+    "bearer_verifier": "blake3-product-local-keyed-digest-of-bearer-digest",
+    "bearer_verifier_key": "persisted-product-local-cursor-authority",
+    "offline_bare_digest_authentication": false,
+    "enabled_state_requires_verifier": true,
+    "older_format_enabled_state": "fail-closed",
+    "configured_bearer_match": "exact",
+    "automatic_persistence": false,
+    "issues_canonical_owner_key": true,
+    "explicit_legacy_revocation": true,
+    "owner_recovery_revokes_legacy": true,
+    "owner_recovery_revocation_atomic": true,
+    "next_minor_authentication": false
+  },
+  "recovery_policy": {
+    "mode": "offline-exclusive-lock",
+    "requires_os_directory_authority": true,
+    "revokes_existing_owner_credentials": true,
+    "increments_authorization_epoch": true,
+    "changes_user_data": false,
+    "bypasses_integrity_validation": false
+  },
+  "audit_policy": {
+    "security_mutations": "durable-wal-csn",
+    "authentication_failures": "bounded-telemetry",
+    "secrets_allowed": false,
+    "bounded_cursor_reads": true,
+    "mutation_idempotency": "required-nonzero-actor-key-request-digest",
+    "mutation_replay": "same-receipt-or-conflict",
+    "terminal_self_replay": "exact-revoked-request-identity-only-after-bounded-body-or-frame",
+    "mutation_response_preflight": "canonical-wire-upper-bound-before-publication",
+    "mutation_durability": "strict"
+  },
+  "limits": {
+    "principals": 4096,
+    "custom_roles": 1024,
+    "grants_per_role": 256,
+    "assignments_per_principal": 128,
+    "keys_per_principal": 64,
+    "display_name_bytes": 128,
+    "audit_event_bytes": 4096,
+    "retained_audit_events": 100000,
+    "audit_result_rows": 1000,
+    "security_result_rows": 1000,
+    "maximum_rotation_overlap_seconds": 604800,
+    "authentication_verifiers_per_request": 1,
+    "concurrent_transport_authentication_tasks_per_adapter": 256,
+    "authorization_cache_entries": 4096,
+    "security_idempotency_shards": 64,
+    "security_idempotency_records_per_shard": 64
+  }
+}

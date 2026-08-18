@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-cli"
 version.workspace = true
@@ -21,6 +22,7 @@ path = "src/main.rs"
 [dependencies]
 blake3.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 hyphae-client.workspace = true
 hyphae-contracts.workspace = true
 hyphae-core.workspace = true
@@ -34,11 +36,19 @@ hyphae-query.workspace = true
 hyphae-retrieval.workspace = true
 hyphae-server.workspace = true
 hyphae-storage.workspace = true
+ratatui.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 [lints]

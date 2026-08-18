@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native ANN durable routing v1
 
 Status: experimental implementation contract; no P4 or G7 closure claim

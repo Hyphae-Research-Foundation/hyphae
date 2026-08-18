@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 """Validate local documentation links, coverage, examples, and CLI drift."""
 
@@ -20,6 +20,25 @@ TOP_END = "<!-- cli-commands:end -->"
 REMOTE_START = "<!-- remote-commands:start -->"
 REMOTE_END = "<!-- remote-commands:end -->"
 IGNORED_DIRECTORIES = {".git", "node_modules", "target"}
+MCP_PROTOCOL = "2025-06-18"
+MCP_TOOL_PAGE_SIZE = 100
+TUI_REFERENCE_STATEMENTS = (
+    "Overview, SQL, Structures, Search, Catalog, Backups, Operations,",
+    "Proofs, and Security",
+    "Tab or Right moves to the next workspace; Shift-Tab or Left moves to the",
+    "Esc or\nCtrl-C first requests cooperative cancellation",
+    "refuses exit, and waits for the operation's terminal response",
+    "Every page is capped at 12 rows",
+)
+TUI_IMPLEMENTATION_STATEMENTS = (
+    "const ALL: [Self; 9]",
+    "KeyCode::Tab | KeyCode::Right => self.next_view()",
+    "KeyCode::BackTab | KeyCode::Left => self.previous_view()",
+    "KeyCode::Esc =>",
+    "KeyCode::Char('c')",
+    '"Cancellation requested; exit is refused until the operation cooperates."',
+    "const SECURITY_PAGE_ROWS: usize = 12;",
+)
 
 
 def markdown_files(root: Path) -> list[Path]:
@@ -176,6 +195,72 @@ def validate_cli(root: Path, binary: Path) -> list[str]:
     return errors
 
 
+def validate_tui_reference(root: Path) -> list[str]:
+    reference = (root / "docs/cli/reference.md").read_text(encoding="utf-8")
+    implementation = (root / "crates/hyphae-cli/src/tui.rs").read_text(encoding="utf-8")
+    errors = [
+        f"docs/cli/reference.md: missing current TUI statement: {fragment}"
+        for fragment in TUI_REFERENCE_STATEMENTS
+        if fragment not in reference
+    ]
+    errors.extend(
+        f"TUI implementation drift: missing documented control: {fragment}"
+        for fragment in TUI_IMPLEMENTATION_STATEMENTS
+        if fragment not in implementation
+    )
+    return errors
+
+
+def validate_mcp(root: Path) -> list[str]:
+    errors: list[str] = []
+    contract_paths = [
+        root / "contracts/native-mcp-v2.json",
+        root / "crates/hyphae-contracts/assets/native-mcp-v2.json",
+    ]
+    contracts = [json.loads(path.read_text(encoding="utf-8")) for path in contract_paths]
+    if contracts[0] != contracts[1]:
+        errors.append("MCP contract drift: source and embedded asset differ")
+    contract = contracts[0]
+    tools = contract.get("tools")
+    tool_names = (
+        [tool.get("name") for tool in tools if isinstance(tool, dict)]
+        if isinstance(tools, list)
+        else []
+    )
+    if contract.get("mcp_protocol") != MCP_PROTOCOL:
+        errors.append(
+            "MCP protocol drift: "
+            f"contract={contract.get('mcp_protocol')!r}, expected={MCP_PROTOCOL!r}"
+        )
+    if contract.get("tool_page_size") != MCP_TOOL_PAGE_SIZE:
+        errors.append(
+            "MCP tool page drift: "
+            f"contract={contract.get('tool_page_size')!r}, expected={MCP_TOOL_PAGE_SIZE}"
+        )
+    if len(tool_names) != len(set(tool_names)) or any(not name for name in tool_names):
+        errors.append("MCP tool drift: names must be nonempty and unique")
+
+    readme = (root / "mcp/README.md").read_text(encoding="utf-8")
+    for fragment in [
+        f"`{MCP_PROTOCOL}`",
+        f"maximum page of one hundred definitions",
+        f"fixed {len(tool_names)}-tool registry",
+        *[f"`{name}`" for name in tool_names],
+    ]:
+        if fragment not in readme:
+            errors.append(f"mcp/README.md: missing contract value: {fragment}")
+    implementation = (root / "crates/hyphae-cli/src/mcp.rs").read_text(encoding="utf-8")
+    implementation_values = [
+        f'const MCP_PROTOCOL: &str = "{MCP_PROTOCOL}";',
+        f"const TOOL_PAGE_SIZE: usize = {MCP_TOOL_PAGE_SIZE};",
+        *[f'    "{name}",' for name in tool_names],
+    ]
+    for fragment in implementation_values:
+        if fragment not in implementation:
+            errors.append(f"MCP implementation drift: missing contract value: {fragment}")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -189,6 +274,8 @@ def main() -> int:
     errors = validate_links(root, files)
     errors.extend(validate_index(root))
     errors.extend(validate_json_examples(root))
+    errors.extend(validate_mcp(root))
+    errors.extend(validate_tui_reference(root))
     if arguments.binary is not None:
         binary = arguments.binary.resolve()
         if not binary.is_file():

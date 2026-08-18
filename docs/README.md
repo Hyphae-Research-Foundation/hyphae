@@ -1,8 +1,8 @@
 # Hyphae documentation
 
 This directory is the canonical human documentation for shipped Hyphae
-behavior.
-Its prose, specifications, and diagrams are licensed under
+behavior. Implementable normative specifications are licensed under
+[`Apache-2.0`](../LICENSE); narrative prose and diagrams are licensed under
 [`CC-BY-SA-4.0`](../LICENSE-DOCUMENTATION), subject to the trademark and
 third-party boundaries in [`LICENSE-POLICY.md`](../LICENSE-POLICY.md).
 Public wire behavior is normative in `contracts/`; durable encodings and
@@ -48,6 +48,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [0.2.1 publication receipt](release/receipts/0.2.1.md)
 - [1.1.0 publication receipt](release/receipts/1.1.0.md)
 - [Publish the Rust crates](release/crates-io.md)
+- [Publish the Python SDK](release/pypi.md)
 - [Compatibility and versioning](compatibility/versioning.md)
 
 ## Understand correctness
@@ -88,6 +89,9 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native ANN semantics v1](native/ann-semantics-v1.md)
 - [Native local protocol v1](native/local-protocol-v1.md)
 - [Native local product contract v1](native/local-product-v1.md)
+- [Native access control v1](native/access-control-v1.md)
+- [Hyphae 1.2.0 operator and agent experience plan](roadmaps/1.2.0-operator-and-agent-experience.md)
+- [Hyphae 1.2.0 relicensing plan](roadmaps/1.2.0-relicensing.md)
 - [Native product error model v1](native/product-error-v1.md)
 - [Native catalog API v1](native/catalog-api-v1.md)
 - [Native product EXPLAIN v1](native/explain-v1.md)
@@ -143,6 +147,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Retrieval proof format v1](provenance/retrieval-proof-v1.md)
 - [Baseline threat model](security/threat-model.md)
 - [Server threat model](security/server-threat-model.md)
+- [Native access-control threat model](security/native-access-control-threat-model.md)
 
 ### Durable formats
 
@@ -287,9 +292,11 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [ADR-0022: Cloud-ready local primitives](adr/0022-cloud-ready-local-primitives.md)
 - [ADR-0023: Native local product and competitive scope](adr/0023-native-local-product-and-competitive-scope.md)
 - [ADR-0024: Incarnation-fenced structure lifecycle](adr/0024-incarnation-fenced-structure-lifecycle.md)
-- [ADR-0025: AGPLv3 code and CC BY-SA documentation](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
+- [ADR-0025: AGPLv3 code and CC BY-SA documentation (superseded for the 1.2.0 target)](adr/0025-agplv3-code-and-cc-by-sa-documentation.md)
 - [ADR-0026: Bounded calibration resampling](adr/0026-calibration-resampling-policy.md)
 - [ADR-0027: Parallel search seed cohorts](adr/0027-parallel-search-seed-cohorts.md)
+- [ADR-0028: Native identity, RBAC, and API keys](adr/0028-native-identity-rbac-and-api-keys.md)
+- [ADR-0029: Apache-2.0 software and normative specifications](adr/0029-apache-2.0-software-and-normative-specifications.md)
 
 ## Documentation contract
 

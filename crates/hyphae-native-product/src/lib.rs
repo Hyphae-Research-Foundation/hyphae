@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Transport-independent contracts and a curated embedded facade for Hyphae Native.
 //!
@@ -9,11 +9,14 @@
 
 #![allow(clippy::result_large_err)]
 
+mod access_catalog;
+mod access_control;
 mod admin;
 mod backup;
 mod cancellation;
 mod capabilities;
 mod catalog;
+mod default_scalar_keyspace;
 mod doctor;
 pub mod error;
 pub mod error_codec;
@@ -27,8 +30,13 @@ mod session;
 mod structures;
 mod telemetry;
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+};
 
+pub use access_catalog::*;
+pub use access_control::*;
 pub use admin::*;
 pub use backup::*;
 pub use cancellation::*;
@@ -40,7 +48,7 @@ pub use error_codec::*;
 pub use hyphae_native_catalog::{
     CatalogName, CatalogObject, LogicalCatalogObject, QualifiedName, StructureKind,
 };
-pub use hyphae_native_runtime::BoundedSearchQuery;
+pub use hyphae_native_runtime::{BoundSqlStatement, BoundedSearchQuery};
 use hyphae_native_runtime::{
     HnswConfig, NativeDatabase, NativeSnapshot, PreparedStatement, SqlError, SqlResult,
     Vector as RuntimeVector, VectorMetric as RuntimeVectorMetric,
@@ -102,6 +110,10 @@ impl ProductPreparedStatement {
     pub const fn maximum_result_rows(&self) -> usize {
         self.maximum_result_rows
     }
+
+    pub(crate) fn referenced_object_ids(&self) -> std::collections::BTreeSet<ObjectId> {
+        self.inner.referenced_object_ids()
+    }
 }
 
 /// Maximum UTF-8 statement bytes admitted by the current embedded product slice.
@@ -112,6 +124,8 @@ pub const MAX_PRODUCT_SQL_PARAMETERS: usize = 1_024;
 pub const MAX_PRODUCT_SQL_ROWS: usize = 1_024;
 
 const MIGRATION_STORAGE_PREFIX: &[u8] = b"\0hyphae.migration.v1\0";
+const CATALOG_CURSOR_AUTHORITY_KEY: &[u8] = b"\0hyphae.catalog-visible.v1\0cursor-key";
+const INTERNAL_STRUCTURE_KEY_PREFIX: &[u8] = b"\0hyphae.";
 const MIGRATION_SEARCH_BATCH_SIZE: usize = 512;
 
 /// One source lexical index prepared for offline migration.
@@ -233,12 +247,22 @@ impl ProductSnapshot {
 
     /// Returns one scalar structure value at the snapshot logical time.
     pub fn structure_get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.inner.get(key)
+        (!is_internal_structure_key(key))
+            .then(|| self.inner.get(key))
+            .flatten()
     }
 
     /// Returns one scalar structure TTL state.
     pub fn structure_ttl(&self, key: &[u8]) -> ProductTtl {
-        self.inner.ttl(key).into()
+        if is_internal_structure_key(key) {
+            ProductTtl::Missing
+        } else {
+            self.inner.ttl(key).into()
+        }
+    }
+
+    pub(crate) fn structure_get_internal(&self, key: &[u8]) -> Option<&[u8]> {
+        self.inner.get(key)
     }
 
     /// Executes one catalog-bound prepared SQL read.
@@ -265,7 +289,58 @@ impl ProductSnapshot {
 #[derive(Debug)]
 pub struct NativeProduct {
     pub(crate) database: NativeDatabase,
+    pub(crate) default_scalar_keyspace_id: Option<ObjectId>,
     pub(crate) telemetry: TelemetryRegistry,
+    pub(crate) access_control_epoch: AtomicU64,
+    pub(crate) access_control_epoch_known: AtomicBool,
+    pub(crate) authorization_time_watermark: AtomicI64,
+    pub(crate) catalog_cursor_key: [u8; 32],
+    security_commit_interruption: Option<SecurityCommitInterruption>,
+    #[cfg(test)]
+    pub(crate) access_control_catalog_loads: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SecurityCommitInterruption {
+    boundary: hyphae_native_runtime::CommitBoundary,
+    hook: Option<fn(hyphae_native_runtime::CommitBoundary)>,
+}
+
+impl SecurityCommitInterruption {
+    pub(crate) const fn returning(boundary: hyphae_native_runtime::CommitBoundary) -> Self {
+        Self {
+            boundary,
+            hook: None,
+        }
+    }
+
+    pub(crate) const fn hooked(
+        boundary: hyphae_native_runtime::CommitBoundary,
+        hook: fn(hyphae_native_runtime::CommitBoundary),
+    ) -> Self {
+        Self {
+            boundary,
+            hook: Some(hook),
+        }
+    }
+
+    pub(crate) fn commit(
+        self,
+        transaction: hyphae_native_runtime::NativeTransaction<'_>,
+    ) -> Result<hyphae_native_runtime::CommitReceipt, hyphae_native_runtime::NativeRuntimeError>
+    {
+        match self.hook {
+            Some(hook) => transaction.commit_with_boundary_hook_for_test(self.boundary, hook),
+            None => transaction.commit_with_interruption(self.boundary),
+        }
+    }
+}
+
+fn catalog_cursor_process_key() -> Result<[u8; 32], ProductError> {
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key)
+        .map_err(|_| ProductError::from_code(ProductErrorCode::Unavailable))?;
+    Ok(key)
 }
 
 /// Deterministic explicit-transaction interruption used only by focused recovery tests.
@@ -345,6 +420,41 @@ pub fn commit_explicit_transaction_with_interruption_for_test(
 }
 
 impl NativeProduct {
+    pub(crate) fn ensure_unmanaged_catalog_cursor_authority(&mut self) -> Result<(), ProductError> {
+        if let Some(encoded) = self
+            .database
+            .get_latest_structure(CATALOG_CURSOR_AUTHORITY_KEY, 0)?
+        {
+            self.catalog_cursor_key = encoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+            return Ok(());
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        transaction.set(
+            CATALOG_CURSOR_AUTHORITY_KEY.to_vec(),
+            self.catalog_cursor_key.to_vec(),
+            None,
+        )?;
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(())
+    }
+
+    fn initialize_catalog_cursor_authority(&mut self) -> Result<(), ProductError> {
+        if let Some(encoded) = self
+            .database
+            .get_latest_structure(CATALOG_CURSOR_AUTHORITY_KEY, 0)?
+        {
+            self.catalog_cursor_key = encoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProductError::from_code(ProductErrorCode::Corruption))?;
+        }
+        Ok(())
+    }
+
     /// Returns the owned native data-directory path.
     pub fn data_directory(&self) -> &Path {
         self.database.data_directory()
@@ -388,7 +498,11 @@ impl NativeProduct {
         &mut self,
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<ProductCommitReceipt, ProductError> {
-        if entries.is_empty() {
+        if entries.is_empty()
+            || entries
+                .iter()
+                .any(|(key, _)| is_internal_structure_key(key))
+        {
             return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
         }
         let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
@@ -415,7 +529,7 @@ impl NativeProduct {
             storage_key.extend_from_slice(&(key.len() as u64).to_be_bytes());
             storage_key.extend_from_slice(key);
             snapshot
-                .structure_get(&storage_key)
+                .structure_get_internal(&storage_key)
                 .is_some_and(|actual| actual == value)
         }))
     }
@@ -429,6 +543,12 @@ impl NativeProduct {
         &self,
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<bool, ProductError> {
+        if entries
+            .iter()
+            .any(|(key, _)| is_internal_structure_key(key))
+        {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
         let snapshot = self.snapshot_bounded(0)?;
         Ok(entries.iter().all(|(key, value)| {
             snapshot
@@ -592,12 +712,22 @@ impl NativeProduct {
     ///
     /// Returns a stable product error when the directory cannot be created.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, ProductError> {
-        NativeDatabase::create(path)
-            .map(|database| Self {
-                database,
-                telemetry: TelemetryRegistry::default(),
-            })
-            .map_err(Into::into)
+        let database = NativeDatabase::create(path)?;
+        let catalog_cursor_key = catalog_cursor_process_key()?;
+        let mut product = Self {
+            database,
+            default_scalar_keyspace_id: None,
+            telemetry: TelemetryRegistry::default(),
+            access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+            access_control_epoch_known: AtomicBool::new(true),
+            authorization_time_watermark: AtomicI64::new(i64::MIN),
+            catalog_cursor_key,
+            security_commit_interruption: None,
+            #[cfg(test)]
+            access_control_catalog_loads: AtomicU64::new(0),
+        };
+        product.ensure_default_scalar_keyspace()?;
+        Ok(product)
     }
 
     /// Creates a Native migration target that is not authoritative until
@@ -607,10 +737,19 @@ impl NativeProduct {
     ///
     /// Returns an error when the target cannot be initialized.
     pub fn create_pending(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        let catalog_cursor_key = catalog_cursor_process_key()?;
         NativeDatabase::create_pending(path)
             .map(|database| Self {
                 database,
+                default_scalar_keyspace_id: None,
                 telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(true),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                catalog_cursor_key,
+                security_commit_interruption: None,
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
             })
             .map_err(Into::into)
     }
@@ -621,12 +760,22 @@ impl NativeProduct {
     ///
     /// Returns an error when the path is not an unpromoted migration target.
     pub fn open_pending(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        let catalog_cursor_key = catalog_cursor_process_key()?;
         NativeDatabase::open_pending(path)
             .map(|database| Self {
                 database,
+                default_scalar_keyspace_id: None,
                 telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(false),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                catalog_cursor_key,
+                security_commit_interruption: None,
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
             })
             .map_err(Into::into)
+            .and_then(Self::initialize_pending_internal_state)
     }
 
     /// Publishes a pending migration target after the importer has validated it.
@@ -635,6 +784,7 @@ impl NativeProduct {
     ///
     /// Returns an error when marker promotion or directory synchronization fails.
     pub fn promote_pending(&mut self) -> Result<(), ProductError> {
+        self.ensure_default_scalar_keyspace()?;
         self.database.promote_pending().map_err(Into::into)
     }
 
@@ -644,16 +794,149 @@ impl NativeProduct {
     ///
     /// Returns a stable product error for ownership, I/O, or corruption.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        let catalog_cursor_key = catalog_cursor_process_key()?;
         NativeDatabase::open(path)
             .map(|database| {
                 let telemetry = TelemetryRegistry::default();
                 telemetry.increment(MetricId::Recoveries, 1);
                 Self {
                     database,
+                    default_scalar_keyspace_id: None,
                     telemetry,
+                    access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                    access_control_epoch_known: AtomicBool::new(false),
+                    authorization_time_watermark: AtomicI64::new(i64::MIN),
+                    catalog_cursor_key,
+                    security_commit_interruption: None,
+                    #[cfg(test)]
+                    access_control_catalog_loads: AtomicU64::new(0),
                 }
             })
             .map_err(Into::into)
+            .and_then(Self::initialize_internal_state)
+    }
+
+    /// Opens an existing directory for an explicit, lock-held metadata upgrade.
+    ///
+    /// A missing pre-1.2 default scalar binding is accepted only by this
+    /// constructor. Any present malformed binding still fails as corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns ownership, lock, recovery, or durable corruption errors.
+    pub fn open_for_upgrade(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        let catalog_cursor_key = catalog_cursor_process_key()?;
+        let database = NativeDatabase::open(path)?;
+        let telemetry = TelemetryRegistry::default();
+        telemetry.increment(MetricId::Recoveries, 1);
+        let mut product = Self {
+            database,
+            default_scalar_keyspace_id: None,
+            telemetry,
+            access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+            access_control_epoch_known: AtomicBool::new(false),
+            authorization_time_watermark: AtomicI64::new(i64::MIN),
+            catalog_cursor_key,
+            security_commit_interruption: None,
+            #[cfg(test)]
+            access_control_catalog_loads: AtomicU64::new(0),
+        };
+        let catalog = product.load_access_control_catalog()?;
+        product.initialize_upgrade_default_scalar_keyspace()?;
+        product.initialize_catalog_cursor_authority()?;
+        product
+            .access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        product
+            .access_control_epoch_known
+            .store(true, Ordering::Release);
+        Ok(product)
+    }
+
+    /// Opens a directory exclusively after validating offline OS-owner authority.
+    ///
+    /// This constructor is reserved for bounded owner-recovery operations. It
+    /// does not authenticate a managed credential or create a listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable owner-authority, lock, recovery, or corruption error.
+    pub fn open_offline_owner(path: impl AsRef<Path>) -> Result<Self, ProductError> {
+        let catalog_cursor_key = catalog_cursor_process_key()?;
+        NativeDatabase::open_offline_owner(path)
+            .map(|database| Self {
+                database,
+                default_scalar_keyspace_id: None,
+                telemetry: TelemetryRegistry::default(),
+                access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+                access_control_epoch_known: AtomicBool::new(false),
+                authorization_time_watermark: AtomicI64::new(i64::MIN),
+                catalog_cursor_key,
+                security_commit_interruption: None,
+                #[cfg(test)]
+                access_control_catalog_loads: AtomicU64::new(0),
+            })
+            .map_err(Into::into)
+            .and_then(Self::initialize_internal_state)
+    }
+
+    /// Explicitly migrates an unbootstrapped preview directory to the durable
+    /// default scalar keyspace binding and returns the opened product.
+    ///
+    /// The directory lock is held from verified open through the strict atomic
+    /// binding commit. A directory with any durable principal or an existing
+    /// malformed binding fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable ownership, corruption, durability, or bootstrap-state
+    /// error. It never adopts catalog objects by name.
+    pub fn open_with_preview_default_scalar_migration(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, ProductError> {
+        let database = NativeDatabase::open(path)?;
+        let catalog_cursor_key = catalog_cursor_process_key()?;
+        let telemetry = TelemetryRegistry::default();
+        telemetry.increment(MetricId::Recoveries, 1);
+        let mut product = Self {
+            database,
+            default_scalar_keyspace_id: None,
+            telemetry,
+            access_control_epoch: AtomicU64::new(AuthorizationEpoch::UNMANAGED.get()),
+            access_control_epoch_known: AtomicBool::new(false),
+            authorization_time_watermark: AtomicI64::new(i64::MIN),
+            catalog_cursor_key,
+            security_commit_interruption: None,
+            #[cfg(test)]
+            access_control_catalog_loads: AtomicU64::new(0),
+        };
+        let catalog = product.load_access_control_catalog()?;
+        if catalog.is_bootstrapped() {
+            return Err(ProductError::from_code(ProductErrorCode::Corruption));
+        }
+        if product.has_default_scalar_binding()? {
+            return product.initialize_internal_state();
+        }
+        product.ensure_default_scalar_keyspace()?;
+        product.initialize_internal_state()
+    }
+
+    fn initialize_internal_state(mut self) -> Result<Self, ProductError> {
+        let catalog = self.load_access_control_catalog()?;
+        self.initialize_default_scalar_keyspace(catalog.is_bootstrapped())?;
+        self.initialize_catalog_cursor_authority()?;
+        self.access_control_epoch
+            .store(catalog.epoch().get(), Ordering::Release);
+        self.access_control_epoch_known
+            .store(true, Ordering::Release);
+        Ok(self)
+    }
+
+    fn initialize_pending_internal_state(mut self) -> Result<Self, ProductError> {
+        let catalog = self.load_access_control_catalog()?;
+        self.initialize_pending_default_scalar_keyspace(catalog.is_bootstrapped())?;
+        self.initialize_catalog_cursor_authority()?;
+        Ok(self)
     }
 
     /// Returns this instance's bounded process-local telemetry registry.
@@ -670,6 +953,19 @@ impl NativeProduct {
             kind: TelemetryEventKind::Doctor,
         });
         let mut report = doctor(request);
+        report.telemetry_registry_version = TELEMETRY_REGISTRY_VERSION;
+        report.process_start_identity = self.telemetry.process_start_identity();
+        report.session_start_identity = self.telemetry.session_start_identity();
+        report
+    }
+
+    pub(crate) fn doctor_opened(&self, logical_time_micros: i64) -> DoctorReport {
+        self.telemetry.increment(MetricId::DoctorRuns, 1);
+        self.telemetry.record_event(TelemetryEvent {
+            captured_at_micros: logical_time_micros,
+            kind: TelemetryEventKind::Doctor,
+        });
+        let mut report = doctor::doctor_opened(&self.database, logical_time_micros);
         report.telemetry_registry_version = TELEMETRY_REGISTRY_VERSION;
         report.process_start_identity = self.telemetry.process_start_identity();
         report.session_start_identity = self.telemetry.session_start_identity();
@@ -796,6 +1092,15 @@ impl NativeProduct {
         prepared: &ProductPreparedStatement,
         parameters: &[ProductValue],
     ) -> Result<ProductRead<ProductSqlResult>, ProductError> {
+        self.execute_prepared_with_checkpoint(prepared, parameters, || true)
+    }
+
+    pub(crate) fn execute_prepared_with_checkpoint(
+        &self,
+        prepared: &ProductPreparedStatement,
+        parameters: &[ProductValue],
+        checkpoint: impl FnMut() -> bool,
+    ) -> Result<ProductRead<ProductSqlResult>, ProductError> {
         if prepared.directory_lineage != self.database.directory_identity().lineage().encode() {
             return Err(foreign_prepared_error());
         }
@@ -810,7 +1115,11 @@ impl NativeProduct {
         }
         let (visible_csn, catalog_version, root_digest, value) = self
             .database
-            .execute_prepared_latest_identified(&prepared.inner, parameters)
+            .execute_prepared_latest_identified_with_checkpoint(
+                &prepared.inner,
+                parameters,
+                checkpoint,
+            )
             .map_err(ProductError::from)?;
         let snapshot = SnapshotIdentity {
             directory_lineage: self.database.directory_identity().lineage().encode(),
@@ -824,6 +1133,58 @@ impl NativeProduct {
             value: ProductSqlResult::from(value),
         })
     }
+
+    /// Executes the prepared plan retained by one exact SQL read binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable SQL error for a non-read binding, stale catalog, or
+    /// invalid parameter set.
+    pub fn execute_bound_sql(
+        &self,
+        bound: &BoundSqlStatement,
+        parameters: &[ProductValue],
+    ) -> Result<ProductRead<ProductSqlResult>, ProductError> {
+        self.execute_bound_sql_with_checkpoint(bound, parameters, || true)
+    }
+
+    pub(crate) fn execute_bound_sql_with_checkpoint(
+        &self,
+        bound: &BoundSqlStatement,
+        parameters: &[ProductValue],
+        checkpoint: impl FnMut() -> bool,
+    ) -> Result<ProductRead<ProductSqlResult>, ProductError> {
+        let prepared = bound
+            .prepared_statement()
+            .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+        if parameters.len() > MAX_PRODUCT_SQL_PARAMETERS {
+            return Err(ProductError::sql_parameter_limit(
+                MAX_PRODUCT_SQL_PARAMETERS,
+                parameters.len(),
+            ));
+        }
+        if parameters.len() != prepared.parameter_count() {
+            return Err(ProductError::from(SqlError::ParameterMismatch));
+        }
+        let (visible_csn, catalog_version, root_digest, value) = self
+            .database
+            .execute_prepared_latest_identified_with_checkpoint(prepared, parameters, checkpoint)
+            .map_err(ProductError::from)?;
+        Ok(ProductRead {
+            snapshot: SnapshotIdentity {
+                directory_lineage: self.database.directory_identity().lineage().encode(),
+                visible_csn: Some(visible_csn),
+                catalog_version,
+                root_digest,
+                logical_time_micros: 0,
+            },
+            value: ProductSqlResult::from(value),
+        })
+    }
+}
+
+pub(crate) fn is_internal_structure_key(key: &[u8]) -> bool {
+    key.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
 }
 
 const fn migration_hnsw_seed(index: ObjectId) -> u64 {
@@ -1077,7 +1438,7 @@ mod tests {
         transaction.execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[])?;
         transaction.commit()?;
         drop(runtime);
-        let product = NativeProduct::open(&path)?;
+        let product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
 
         let prepared = product.prepare_sql("SELECT id FROM items WHERE id = ?")?;
         assert_eq!(prepared.parameter_count(), 1);
@@ -1123,7 +1484,7 @@ mod tests {
         transaction.execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[])?;
         transaction.commit()?;
         drop(left_runtime);
-        let left = NativeProduct::open(&left_path)?;
+        let left = NativeProduct::open_with_preview_default_scalar_migration(&left_path)?;
         let right = NativeProduct::create(&right_path)?;
         let prepared = left.prepare_sql("SELECT id FROM items WHERE id = ?")?;
         let error = right
@@ -1152,7 +1513,7 @@ mod tests {
         transaction.execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[])?;
         transaction.commit()?;
         drop(left_runtime);
-        let left = NativeProduct::open(&left_path)?;
+        let left = NativeProduct::open_with_preview_default_scalar_migration(&left_path)?;
         let right = NativeProduct::create(&right_path)?;
         let prepared = left.prepare_sql("SELECT id FROM items WHERE id = ?")?;
         let snapshot = right.snapshot_bounded(0)?;

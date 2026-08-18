@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "hyphae-native-btree"
 description = "Immutable copy-on-write B+tree over Hyphae native pages"

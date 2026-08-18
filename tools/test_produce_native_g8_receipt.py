@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 
 import json
 import tempfile
@@ -72,10 +72,10 @@ def signed_release() -> dict:
         "archive_count": 4,
         "signature_verifications": 12,
         "attestation_verifications": 12,
-        "software_license": "AGPL-3.0-only",
+        "software_license": "Apache-2.0",
         "license_authority": "tracked-package-manifests-and-local-locks-v1",
-        "first_party_artifact_count": 78,
-        "first_party_identity_count": 32,
+        "first_party_artifact_count": 79,
+        "first_party_identity_count": 33,
         "spdx_hyphae_components": ["hyphae-native-runtime"],
         "cyclonedx_hyphae_components": ["hyphae-native-runtime"],
         "spdx_sha256": "1" * 64,
@@ -304,8 +304,8 @@ class G8ProducerTests(unittest.TestCase):
         for field, value in (
             ("software_license", "GPL-3.0-only"),
             ("license_authority", "untrusted"),
-            ("first_party_artifact_count", 77),
-            ("first_party_identity_count", 31),
+            ("first_party_artifact_count", 78),
+            ("first_party_identity_count", 32),
             ("spdx_hyphae_components", []),
             ("cyclonedx_hyphae_components", []),
             ("spdx_hyphae_components", ["third-party-runtime"]),

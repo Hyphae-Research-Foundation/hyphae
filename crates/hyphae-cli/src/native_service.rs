@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Explicit native local daemon and optional HTTP v2 edge sharing one owner.
 
@@ -9,27 +9,53 @@ use hyphae_native_product::{NativeProduct, NativeProductService, NativeProductSe
 use hyphae_server::{NativeHttpV2Config, NativeHttpV2Server};
 use tokio::{sync::watch, task::JoinHandle};
 
-use crate::{exit::CliFailure, native::default_endpoint};
+use crate::{exit::CliFailure, native::default_endpoint, native_client::read_legacy_bearer_file};
 
 pub(crate) async fn serve(
     data_dir: PathBuf,
     endpoint: Option<String>,
     http_bind: Option<SocketAddr>,
+    native_api_key_auth: bool,
+    native_legacy_bearer_file: Option<PathBuf>,
 ) -> Result<(), CliFailure> {
     let product = NativeProduct::open(&data_dir)?;
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
     let handle = service.handle();
+    let managed = native_api_key_auth || handle.access_control_bootstrapped();
     let endpoint = endpoint.unwrap_or_else(|| default_endpoint(&data_dir));
-    let daemon =
-        NativeDaemon::start_with_service(service, endpoint, NativeDaemonConfig::default())?;
+    let daemon = if native_api_key_auth {
+        NativeDaemon::start_with_service_authenticated(
+            service,
+            endpoint,
+            NativeDaemonConfig::default(),
+        )?
+    } else {
+        NativeDaemon::start_with_service(service, endpoint, NativeDaemonConfig::default())?
+    };
     let (http_shutdown, http_receive) = watch::channel(false);
     let http = match http_bind {
         Some(bind) => {
+            if !bind.ip().is_loopback() {
+                return Err(CliFailure::invalid());
+            }
+            let legacy_bearer_token = native_legacy_bearer_file
+                .as_deref()
+                .map(read_legacy_bearer_file)
+                .transpose()?
+                .map(|bearer| hyphae_server::BearerToken::new(bearer.expose()))
+                .transpose()
+                .map_err(|_| CliFailure::invalid())?;
             let config = NativeHttpV2Config {
                 bind,
+                legacy_bearer_token,
                 ..NativeHttpV2Config::default()
             };
-            let bound = NativeHttpV2Server::new(handle, config)?.bind().await?;
+            let server = if managed && config.legacy_bearer_token.is_none() {
+                NativeHttpV2Server::new_managed(handle, config)?
+            } else {
+                NativeHttpV2Server::new(handle, config)?
+            };
+            let bound = server.bind().await?;
             let address = bound.local_addr();
             let task = tokio::spawn(async move {
                 bound

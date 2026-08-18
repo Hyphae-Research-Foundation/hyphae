@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
-import { ClientError, DEFAULT_LIMITS, type ProductErrorFields, type RequestOptions, type Response } from "./models.js";
+import { ClientError, DEFAULT_LIMITS, SensitiveBytes, type ProductErrorFields, type RequestOptions, type Response } from "./models.js";
 
 export const MAX_PAYLOAD = 16 * 1024 * 1024;
 export const FRAME_HEADER_SIZE = 32;
@@ -59,7 +59,55 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   transaction_status_by_idempotency: 39,
   explicit_transaction_status: 40,
   proof_generate: 41,
+  security_status: 42,
+  security_principal_list: 43,
+  security_role_list: 44,
+  security_assignment_list: 45,
+  security_key_list: 46,
+  security_audit_read: 47,
+  security_principal_create: 48,
+  security_principal_set_enabled: 49,
+  security_custom_role_create: 50,
+  security_built_in_assignment_create: 51,
+  security_custom_assignment_create: 52,
+  security_assignment_revoke: 53,
+  catalog_visible_list: 54,
+  security_api_key_issue_self_start: 55,
+  security_api_key_issue_start: 56,
+  security_api_key_issue_self_activate: 57,
+  security_api_key_issue_activate: 58,
+  security_api_key_rotate_self_start: 59,
+  security_api_key_rotate_start: 60,
+  security_api_key_rotate_self_activate: 61,
+  security_api_key_rotate_activate: 62,
+  security_api_key_issue_self_abort: 63,
+  security_api_key_issue_abort: 64,
+  security_api_key_rotate_self_abort: 65,
+  security_api_key_rotate_abort: 66,
+  security_api_key_revoke_self: 67,
+  security_api_key_revoke: 68,
+  security_legacy_bearer_revoke: 70,
 };
+
+const BUILT_IN_ROLES = ["owner", "admin", "operator", "developer", "writer", "reader", "auditor"] as const;
+const PRODUCT_PERMISSIONS = ["audit.read", "backup.create", "backup.verify", "catalog.read", "catalog.write", "credential.self_manage", "data.read", "data.write", "discover", "maintain", "observe", "ownership.manage", "proof.generate", "proof.verify", "restore", "search.execute", "security.manage", "security.read"] as const;
+const SECURITY_AUDIT_ACTIONS = ["bootstrap_owner", "activate_key", "create_principal", "create_custom_role", "assign_built_in_role", "assign_custom_role", "issue_key", "rotate_key", "revoke_key", "recover_owner", "migrate_legacy_bearer", "abort_key_rotation", "abort_key_issue", "set_principal_enabled", "revoke_assignment", "revoke_legacy_bearer"] as const;
+const MAX_SECURITY_LIST_ROWS = 1_000;
+const MAX_SECURITY_ASSIGNMENTS = 128;
+const MAX_SECURITY_GRANTS = 128;
+const MAX_CATALOG_VISIBLE_ITEMS = 4_096;
+const API_KEY_BYTES = 102;
+const MAX_PRODUCT_COUNT = 4_096;
+const MAX_SQL_ROWS = 4_096;
+const MAX_SQL_COLUMNS = 4_096;
+const MAX_TELEMETRY_METRICS = 256;
+const MAX_TELEMETRY_EVENTS = 1_024;
+const MAX_SEARCH_HITS = 1_024;
+const MAX_DOC_VALUES_PER_HIT = 64;
+const MAX_SEARCH_FACETS = 8;
+const MAX_SEARCH_FACET_BUCKETS = 10_000;
+const MAX_SEARCH_AGGREGATIONS = 16;
+const MAX_SEARCH_VECTOR_BRANCHES = 16;
 
 const DEFAULT_PROOF_LIMITS = {
   result_items: 10_000n,
@@ -136,7 +184,8 @@ export function decodeFrame(encoded: Uint8Array): Frame {
   };
 }
 
-export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2"): Uint8Array {
+export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 3) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -144,6 +193,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2"): Uint8A
   view.setUint32(8, encoded.byteLength, true);
   view.setUint16(12, 1, true);
   view.setUint16(14, 1, true);
+  view.setUint16(18, maximumMinor, true);
   view.setBigUint64(20, 0x7fn, true);
   view.setBigUint64(28, 0x7fn, true);
   view.setUint32(36, MAX_PAYLOAD, true);
@@ -159,12 +209,51 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2"): Uint8A
   return encoded;
 }
 
+export function encodeAuthenticatedHello(
+  apiKey: string | Uint8Array,
+  clientIdentity = "hyphae-typescript-sdk-v2",
+  maximumMinor = 3,
+): Uint8Array {
+  const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
+  if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
+  const encoded = encodeHello(clientIdentity, maximumMinor);
+  const authenticated = new Uint8Array(encoded.byteLength + authentication.byteLength);
+  authenticated.set(encoded);
+  authenticated.set(authentication, encoded.byteLength);
+  const view = new DataView(authenticated.buffer);
+  view.setUint32(8, authenticated.byteLength, true);
+  view.setBigUint64(20, 0xffn, true);
+  view.setBigUint64(28, 0xffn, true);
+  view.setUint8(49, 1);
+  view.setUint16(50, authentication.byteLength, true);
+  authentication.fill(0);
+  return authenticated;
+}
+
+export function operationRequiredMinor(operation: string, args: Readonly<Record<string, unknown>> = {}): number {
+  if (operation === "proof_generate") {
+    const nested = args.operation;
+    return typeof nested === "string" ? operationRequiredMinor(nested, (args.arguments ?? {}) as Readonly<Record<string, unknown>>) : 0;
+  }
+  if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
+  if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
+  if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  return 0;
+}
+
+export function responseRequiredMinor(kind: number): number {
+  if (kind >= 32 && kind <= 37) return 1;
+  if (kind >= 38 && kind <= 41) return 2;
+  if (kind >= 42 && kind <= 44) return 3;
+  return 0;
+}
+
 export function decodeWelcome(encoded: Uint8Array): Readonly<Record<string, number | bigint>> {
   if (encoded.byteLength !== 94 || new TextDecoder().decode(encoded.subarray(0, 8)) !== "HYPWEL01") {
     throw new ClientError("native welcome is malformed");
   }
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getBigUint64(24, true) === 0n) {
+  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 3 || view.getBigUint64(24, true) === 0n) {
     throw new ClientError("native welcome values are invalid");
   }
   return {
@@ -182,12 +271,19 @@ export function encodeProductRequest(
   operation: string,
   args: Readonly<Record<string, unknown>>,
   options: RequestOptions = {},
+  negotiatedMinor?: number,
 ): Uint8Array {
   const kind = REQUEST_KIND[operation];
   if (kind === undefined) throw new ClientError(`unsupported native operation: ${operation}`);
+  if (negotiatedMinor !== undefined && negotiatedMinor < operationRequiredMinor(operation, args)) {
+    throw new ClientError("native operation is unavailable at the negotiated protocol minor");
+  }
   const limits = options.limits ?? DEFAULT_LIMITS;
   if (options.deadlineMicros !== undefined && options.deadlineMicros <= 0n) throw new ClientError("deadlineMicros must be positive");
   if (!Object.values(limits).every((value) => Number.isSafeInteger(value) && value > 0)) throw new ClientError("product limits must be positive safe integers");
+  const securityMutation = (kind >= 48 && kind <= 53) || (kind >= 55 && kind <= 68) || kind === 70;
+  if (securityMutation && options.idempotencyToken === undefined) throw new ClientError("security mutation requires a nonzero idempotencyToken");
+  if (securityMutation && (options.durability ?? "strict") !== "strict") throw new ClientError("security mutation requires strict durability");
   const body = encodeOperation(operation, args);
   const extended = options.idempotencyToken !== undefined;
   const contextBytes = extended ? 80 : 64;
@@ -243,11 +339,17 @@ export function decodeProductRequest(encoded: Uint8Array): {
     },
     durability: (["strict", "group", "memory"] as const)[view.getUint8(56 + offset)] ?? "strict",
   };
+  const securityMutation = (kind >= 48 && kind <= 53) || (kind >= 55 && kind <= 68) || kind === 70;
+  if (securityMutation && token === 0n) throw new ClientError("security mutation requires a nonzero idempotencyToken");
+  if (securityMutation && options.durability !== "strict") throw new ClientError("security mutation requires strict durability");
   return { operation, args: decodeOperation(operation, payload.subarray(extended ? 80 : 64)), options };
 }
 
-export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): Response {
+export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, negotiatedMinor?: number): Response {
   const [kind, payload] = envelope(encoded, "HYPRSP01");
+  if (negotiatedMinor !== undefined && negotiatedMinor < responseRequiredMinor(kind)) {
+    throw new ClientError("native response is unavailable at the negotiated protocol minor");
+  }
   const reader = new Reader(payload);
   if (kind === 1) {
     const value = {
@@ -321,7 +423,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): R
       tokenVisits: reader.u64(),
       tokenComparisons: reader.u64(),
       fuzzySteps: reader.u64(),
-      hits: Array.from({ length: count }, () => ({ documentId: reader.bytes(), score: reader.f64() })),
+      hits: Array.from({ length: boundedCount(count, MAX_PRODUCT_COUNT, reader, 12, "search hit") }, () => ({ documentId: reader.bytes(), score: reader.f64() })),
     };
     reader.finish();
     return { kind: "search", value, requestId };
@@ -371,6 +473,77 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): R
     const value = decodeCommitOutcome(reader);
     reader.finish();
     return { kind: "catalog_created", value, requestId };
+  }
+  if (kind === 42) {
+    const cursor = reader.bytes();
+    const count = reader.u32();
+    if (count > MAX_CATALOG_VISIBLE_ITEMS || count > Math.floor(reader.remaining / 36)) {
+      throw new ClientError("catalog visible page item count exceeds its bound");
+    }
+    const items = Array.from({ length: count }, () => {
+      const id = reader.u128();
+      const objectKind = reader.u8();
+      const hasParent = reader.boolean();
+      reader.zeroes(6);
+      return { id, objectKind, parent: hasParent ? reader.u128() : undefined, name: decodeQualifiedName(reader) };
+    });
+    reader.finish();
+    return { kind: "catalog_visible_page", value: { cursor: cursor.byteLength === 0 ? undefined : cursor, items }, requestId };
+  }
+  if (kind === 43) {
+    const keyId = checkedNonzeroBytes(reader.take(16), "API key identity");
+    const value = {
+      keyId,
+      principalId: decodeSecurityId(reader),
+      predecessorKeyId: decodeOptionalApiKeyId(reader),
+      authorizationEpoch: reader.u64(),
+      commit: decodeCommitReceipt(reader),
+      secret: decodeApiKeySecret(reader, keyId),
+    };
+    if (value.authorizationEpoch === 0n) throw new ClientError("authorization epoch is zero");
+    reader.finish();
+    return { kind: "security_api_key_started", value, requestId };
+  }
+  if (kind === 44) {
+    const value = {
+      keyId: checkedNonzeroBytes(reader.take(16), "API key identity"),
+      predecessorKeyId: decodeOptionalApiKeyId(reader),
+      overlapUntilMicros: decodeOptionalI64(reader),
+      authorizationEpoch: decodeAuthorizationEpoch(reader),
+      commit: decodeCommitReceipt(reader),
+    };
+    reader.finish();
+    return { kind: "security_api_key_activated", value, requestId };
+  }
+  if (kind === 32) {
+    const value = decodeSecurityStatus(reader);
+    reader.finish();
+    return { kind: "security_status", value, requestId };
+  }
+  if (kind >= 33 && kind <= 36) {
+    const family = (["principal", "role", "assignment", "key"] as const)[kind - 33];
+    if (family === undefined) throw new ClientError("security page family is invalid");
+    const value = decodeSecurityPage(reader, family);
+    reader.finish();
+    return { kind: `security_${family}_page`, value, requestId };
+  }
+  if (kind === 37) {
+    const value = decodeSecurityAuditPage(reader);
+    reader.finish();
+    return { kind: "security_audit_page", value, requestId };
+  }
+  if (kind >= 38 && kind <= 40) {
+    const identity = ["principalId", "roleId", "assignmentId"][kind - 38];
+    const responseKind = ["security_principal_mutated", "security_custom_role_mutated", "security_assignment_mutated"][kind - 38];
+    if (identity === undefined || responseKind === undefined) throw new ClientError("security mutation response is invalid");
+    const value = { [identity]: decodeSecurityId(reader), authorizationEpoch: decodeAuthorizationEpoch(reader), commit: decodeCommitReceipt(reader) };
+    reader.finish();
+    return { kind: responseKind, value, requestId };
+  }
+  if (kind === 41) {
+    const value = { authorizationEpoch: decodeAuthorizationEpoch(reader), commit: decodeCommitReceipt(reader) };
+    reader.finish();
+    return { kind: "security_mutated", value, requestId };
   }
   if (kind === 17) {
     if (reader.u8() !== 0) throw new ClientError("explain response is not an SQL plan");
@@ -435,7 +608,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): R
     return { kind: "search_ingested", value, requestId };
   }
   if (kind === 31) {
-    const response = decodeProductResponse(reader.bytes(), requestId);
+    const response = decodeProductResponse(reader.bytes(), requestId, negotiatedMinor);
     const value = {
       response,
       proof: reader.bytes(),
@@ -463,7 +636,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint): R
       phases: [] as number[],
     };
     const phaseCount = reader.u32();
-    value.phases = Array.from({ length: phaseCount }, () => reader.u8());
+    value.phases = Array.from({ length: boundedCount(phaseCount, 6, reader, 1, "restore phase") }, () => reader.u8());
     reader.finish();
     return { kind: "restore", value, requestId };
   }
@@ -506,9 +679,10 @@ function decodeCatalogPage(reader: Reader, dependencies: boolean): Readonly<Reco
   const visited = reader.u64();
   const returnedBytes = reader.u64();
   const count = reader.u32();
+  const bounded = boundedCount(count, MAX_PRODUCT_COUNT, reader, dependencies ? 33 : 48, "catalog page item");
   const items = dependencies
-    ? Array.from({ length: count }, () => ({ dependent: reader.u128(), prerequisite: reader.u128(), kind: reader.u8() }))
-    : Array.from({ length: count }, () => {
+    ? Array.from({ length: bounded }, () => ({ dependent: reader.u128(), prerequisite: reader.u128(), kind: reader.u8() }))
+    : Array.from({ length: bounded }, () => {
       const id = reader.u128();
       const objectKind = reader.u8();
       const hasParent = reader.boolean();
@@ -566,14 +740,17 @@ function decodeTelemetry(reader: Reader): Readonly<Record<string, unknown>> {
   const droppedEvents = reader.u64();
   const metricCount = reader.u32();
   const eventCount = reader.u32();
-  const metrics = Array.from({ length: metricCount }, () => {
+  if (metricCount > MAX_TELEMETRY_METRICS || eventCount > MAX_TELEMETRY_EVENTS) {
+    throw new ClientError("telemetry response count exceeds its bound");
+  }
+  const metrics = Array.from({ length: boundedCount(metricCount, MAX_TELEMETRY_METRICS, reader, 5, "telemetry metric") }, () => {
     const name = reader.text();
     const kind = reader.u8();
     if (kind === 0 || kind === 1) return { name, kind: kind === 0 ? "counter" : "gauge", value: reader.u64() };
     if (kind === 2) return { name, kind: "histogram", count: reader.u64(), sumMicros: reader.u64(), buckets: Array.from({ length: 11 }, () => reader.u64()) };
     throw new ClientError("telemetry metric kind is invalid");
   });
-  const events = Array.from({ length: eventCount }, () => {
+  const events = Array.from({ length: boundedCount(eventCount, MAX_TELEMETRY_EVENTS, reader, 16, "telemetry event") }, () => {
     const capturedAtMicros = reader.i64();
     const kind = reader.u8();
     const category = reader.u8();
@@ -601,7 +778,213 @@ function decodeCommitReceipt(reader: Reader): Readonly<Record<string, unknown>> 
   const walBlockDigest = reader.take(32);
   const durability = reader.u8();
   reader.zeroes(7);
-  return { transactionId, commitCsn, catalogVersion, commitLsn, walBlockDigest, durability, durabilityCohortSize: reader.u64(), durabilityCohortPosition: reader.u64() };
+  const durabilityCohortSize = reader.u64();
+  const durabilityCohortPosition = reader.u64();
+  if (transactionId === 0n || commitCsn === 0n || catalogVersion === 0n || commitLsn === 0n ||
+      walBlockDigest.every((byte) => byte === 0) || durability > 2 || durabilityCohortSize === 0n ||
+      durabilityCohortPosition >= durabilityCohortSize) {
+    throw new ClientError("commit receipt is noncanonical");
+  }
+  return { transactionId, commitCsn, catalogVersion, commitLsn, walBlockDigest, durability, durabilityCohortSize, durabilityCohortPosition };
+}
+
+function decodeOptionalApiKeyId(reader: Reader): Uint8Array | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const value = reader.take(16);
+  if (!present && value.some((byte) => byte !== 0)) throw new ClientError("optional API key identity is malformed");
+  return present ? checkedNonzeroBytes(value, "optional API key identity") : undefined;
+}
+
+function decodeOptionalI64(reader: Reader): bigint | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const value = reader.i64();
+  if (!present && value !== 0n) throw new ClientError("optional instant is malformed");
+  return present ? value : undefined;
+}
+
+function decodeAuthorizationEpoch(reader: Reader): bigint {
+  const value = reader.u64();
+  if (value === 0n) throw new ClientError("authorization epoch is zero");
+  return value;
+}
+
+function decodeSecurityStatus(reader: Reader): Readonly<Record<string, unknown>> {
+  const bootstrapped = reader.boolean();
+  reader.zeroes(7);
+  const authorizationEpoch = reader.u64();
+  const names = ["principals", "assignments", "customRoles", "customAssignments", "keys", "pendingKeys", "auditEvents"] as const;
+  const counts: Record<string, bigint> = {};
+  for (const name of names) counts[name] = reader.u64();
+  const empty = Object.values(counts).every((value) => value === 0n);
+  if ((bootstrapped && (authorizationEpoch === 0n || counts.principals === 0n || counts.assignments === 0n)) ||
+      (!bootstrapped && (authorizationEpoch !== 0n || !empty)) || (counts.principals ?? 0n) > 4_096n ||
+      (counts.assignments ?? 0n) + (counts.customAssignments ?? 0n) > (counts.principals ?? 0n) * 128n ||
+      (counts.customRoles ?? 0n) > 1_024n || (counts.keys ?? 0n) > (counts.principals ?? 0n) * 64n ||
+      (counts.pendingKeys ?? 0n) > (counts.keys ?? 0n) ||
+      (counts.auditEvents ?? 0n) > 100_000n) {
+    throw new ClientError("security status is invalid");
+  }
+  return { bootstrapped, authorizationEpoch, ...counts };
+}
+
+type SecurityFamily = "principal" | "role" | "assignment" | "key";
+
+function decodeSecurityPage(reader: Reader, family: SecurityFamily): Readonly<Record<string, unknown>> {
+  const authorizationEpoch = decodeAuthorizationEpoch(reader);
+  const count = reader.u32();
+  reader.zeroes(4);
+  if (count > MAX_SECURITY_LIST_ROWS || count > reader.remaining) throw new ClientError("security page item count is invalid");
+  const nextCursor = decodeSecurityCursor(reader, family);
+  if (nextCursor !== undefined && nextCursor.authorization_epoch !== authorizationEpoch) {
+    throw new ClientError("security page cursor epoch differs from its page");
+  }
+  const decoders = {
+    principal: decodeSecurityPrincipal,
+    role: decodeSecurityRole,
+    assignment: decodeSecurityAssignment,
+    key: decodeSecurityKey,
+  } as const;
+  const items = Array.from({ length: count }, () => decoders[family](reader));
+  return { authorizationEpoch, items, nextCursor };
+}
+
+function decodeSecurityPrincipal(reader: Reader): Readonly<Record<string, unknown>> {
+  const id = decodeSecurityId(reader);
+  const enabled = reader.boolean();
+  reader.zeroes(7);
+  return { id, displayName: decodeSecurityText(reader), enabled };
+}
+
+function decodeSecurityRole(reader: Reader): Readonly<Record<string, unknown>> {
+  const kind = reader.u8();
+  if (kind === 0) {
+    const role = decodeBuiltInRole(reader);
+    reader.zeroes(6);
+    return { kind: "built_in", role, displayName: role, grants: [] };
+  }
+  if (kind === 1) {
+    reader.zeroes(7);
+    return { kind: "custom", id: decodeSecurityId(reader), displayName: decodeSecurityText(reader), grants: decodeSecurityGrants(reader) };
+  }
+  throw new ClientError("security role kind is invalid");
+}
+
+function decodeSecurityAssignment(reader: Reader): Readonly<Record<string, unknown>> {
+  const id = decodeSecurityId(reader);
+  const principalId = decodeSecurityId(reader);
+  const kind = reader.u8();
+  if (kind === 0) {
+    const role = decodeBuiltInRole(reader);
+    reader.zeroes(6);
+    return { id, principalId, kind: "built_in", role, scope: decodeProductScope(reader) };
+  }
+  if (kind === 1) {
+    reader.zeroes(7);
+    return { id, principalId, kind: "custom", roleId: decodeSecurityId(reader) };
+  }
+  throw new ClientError("security assignment kind is invalid");
+}
+
+function decodeSecurityKey(reader: Reader): Readonly<Record<string, unknown>> {
+  const id = checkedNonzeroBytes(reader.take(16), "API key identity");
+  const principalId = decodeSecurityId(reader);
+  const flags = reader.u8();
+  reader.zeroes(7);
+  if ((flags & ~3) !== 0) throw new ClientError("security key flags are invalid");
+  const label = decodeSecurityText(reader);
+  const roleCount = reader.u32();
+  reader.zeroes(4);
+  if (roleCount > BUILT_IN_ROLES.length) throw new ClientError("security key role count is invalid");
+  const roles = Array.from({ length: roleCount }, () => decodeBuiltInRole(reader));
+  const customCount = reader.u32();
+  reader.zeroes(4);
+  if (customCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("security key custom-role count is invalid");
+  const customRoles = Array.from({ length: customCount }, () => decodeSecurityId(reader));
+  const permissionCeilingBits = reader.u64();
+  if (permissionCeilingBits >> BigInt(PRODUCT_PERMISSIONS.length) !== 0n) throw new ClientError("security key permission ceiling has unknown bits");
+  const scopeCount = reader.u32();
+  reader.zeroes(4);
+  if (scopeCount === 0 || scopeCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("security key scope count is invalid");
+  const scopeCeiling = Array.from({ length: scopeCount }, () => decodeProductScope(reader));
+  const createdAtMicros = reader.i64();
+  const expiresAtMicros = decodeFixedOptionalI64(reader);
+  const publishedEpoch = decodeAuthorizationEpoch(reader);
+  const predecessorId = decodeOptionalApiKeyId(reader);
+  const successorId = decodeOptionalApiKeyId(reader);
+  const overlapUntilMicros = decodeFixedOptionalI64(reader);
+  const rotationOverlapMicros = decodeOptionalU64(reader);
+  return {
+    id, principalId, label, active: (flags & 1) !== 0, revoked: (flags & 2) !== 0, roles, customRoles,
+    permissionCeiling: PRODUCT_PERMISSIONS.filter((_, index) => (permissionCeilingBits & 1n << BigInt(index)) !== 0n),
+    scopeCeiling, createdAtMicros, expiresAtMicros, publishedEpoch, predecessorId, successorId,
+    overlapUntilMicros, rotationOverlapMicros,
+  };
+}
+
+function decodeSecurityAuditPage(reader: Reader): Readonly<Record<string, unknown>> {
+  const count = reader.u32();
+  reader.zeroes(4);
+  if (count > MAX_SECURITY_LIST_ROWS || count > reader.remaining) throw new ClientError("security audit page count is invalid");
+  const nextCursor = decodeOptionalSecurityId(reader);
+  const events = Array.from({ length: count }, () => decodeSecurityAuditEvent(reader));
+  return { events, nextCursor };
+}
+
+function decodeSecurityAuditEvent(reader: Reader): Readonly<Record<string, unknown>> {
+  const id = decodeSecurityId(reader);
+  const commitCsn = reader.u64();
+  if (commitCsn === 0n) throw new ClientError("security audit commit CSN is zero");
+  const hasActor = reader.boolean();
+  reader.zeroes(7);
+  const principalWire = reader.take(16);
+  const keyWire = reader.take(16);
+  const actorPrincipalId = hasActor ? securityIdFromBytes(principalWire) : undefined;
+  const actorKeyId = hasActor ? checkedNonzeroBytes(keyWire, "security audit actor key") : undefined;
+  if (!hasActor && (principalWire.some((byte) => byte !== 0) || keyWire.some((byte) => byte !== 0))) throw new ClientError("absent security audit actor is noncanonical");
+  const action = SECURITY_AUDIT_ACTIONS[reader.u8()];
+  const result = reader.u8();
+  reader.zeroes(6);
+  if (action === undefined || result !== 0) throw new ClientError("security audit action or result is invalid");
+  const targetCount = reader.u32();
+  reader.zeroes(4);
+  if (targetCount === 0 || targetCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("security audit target count is invalid");
+  const targets = Array.from({ length: targetCount }, () => {
+    const tag = reader.u8();
+    reader.zeroes(7);
+    const raw = reader.take(16);
+    if (tag === 4 && raw.every((byte) => byte === 0)) return { kind: "legacy_bearer" };
+    const kind = (["principal", "role", "assignment", "key"] as const)[tag];
+    if (kind === undefined) throw new ClientError("security audit target is invalid");
+    return { kind, id: kind === "key" ? checkedNonzeroBytes(raw, "API key identity") : securityIdFromBytes(raw) };
+  });
+  const metadataCount = reader.u32();
+  reader.zeroes(4);
+  if (metadataCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("security audit metadata count is invalid");
+  const metadata = Array.from({ length: metadataCount }, () => {
+    const kind = (["expires_at_micros", "rotation_overlap_until_micros"] as const)[reader.u8()];
+    reader.zeroes(7);
+    if (kind === undefined) throw new ClientError("security audit metadata is invalid");
+    return { kind, value: reader.i64() };
+  });
+  return { id, commitCsn, actorPrincipalId, actorKeyId, action, result: "succeeded", targets, metadata };
+}
+
+function decodeFixedOptionalI64(reader: Reader): bigint | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const value = reader.i64();
+  if (!present && value !== 0n) throw new ClientError("absent optional instant is noncanonical");
+  return present ? value : undefined;
+}
+
+function decodeOptionalU64(reader: Reader): bigint | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const value = reader.u64();
+  if (!present && value !== 0n) throw new ClientError("absent optional integer is noncanonical");
+  return present ? value : undefined;
 }
 
 function decodeCommitOutcome(reader: Reader): Readonly<Record<string, unknown>> {
@@ -675,7 +1058,13 @@ function decodeSqlResult(reader: Reader): Readonly<Record<string, unknown>> {
     reader.zeroes(7);
     const columnCount = reader.u32();
     const rowCount = reader.u32();
+    if (columnCount > MAX_SQL_COLUMNS || rowCount > MAX_SQL_ROWS || columnCount > Math.floor(reader.remaining / 4)) {
+      throw new ClientError("SQL row or column count exceeds its bound");
+    }
     const columns = Array.from({ length: columnCount }, () => reader.text());
+    if (rowCount > 0 && columnCount > 0 && BigInt(rowCount) * BigInt(columnCount) > BigInt(reader.remaining)) {
+      throw new ClientError("SQL cell count exceeds its envelope bound");
+    }
     const rows = Array.from({ length: rowCount }, () => Array.from({ length: columnCount }, () => decodeValue(reader, 0)));
     return { kind: "rows", columns, rows };
   }
@@ -698,9 +1087,9 @@ function decodeValue(reader: Reader, depth: number): unknown {
   if (tag === 11) return { timestampMicros: reader.i64() };
   if (tag === 12) return { months: reader.i32(), days: reader.i32(), nanoseconds: reader.i64() };
   if (tag === 13) return { uuid: reader.take(16) };
-  if (tag === 14) return Array.from({ length: reader.u32() }, () => decodeValue(reader, depth + 1));
-  if (tag === 15) return { map: Array.from({ length: reader.u32() }, () => [decodeValue(reader, depth + 1), decodeValue(reader, depth + 1)]) };
-  if (tag === 16) return { vector: Array.from({ length: reader.u32() }, () => reader.f32()) };
+  if (tag === 14) return Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 1, "SQL array value") }, () => decodeValue(reader, depth + 1));
+  if (tag === 15) return { map: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 2, "SQL map value") }, () => [decodeValue(reader, depth + 1), decodeValue(reader, depth + 1)]) };
+  if (tag === 16) return { vector: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "SQL vector value") }, () => reader.f32()) };
   if (tag === 17) return { json: reader.text() };
   throw new ClientError("SQL value kind is unsupported");
 }
@@ -879,7 +1268,7 @@ export function blake3(input: Uint8Array): Uint8Array {
 }
 
 function encodeOperation(operation: string, args: Readonly<Record<string, unknown>>): Uint8Array {
-  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"].includes(operation)) return new Uint8Array();
+  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin", "security_status", "security_legacy_bearer_revoke"].includes(operation)) return new Uint8Array();
   if (operation === "structure_get" || operation === "structure_ttl") return bytes(requireBytes(args.key));
   if (operation === "structure_set") {
     const key = bytes(requireBytes(args.key));
@@ -932,6 +1321,71 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
       u64(BigInt(args.visit_limit as number)),
       u64(BigInt(args.byte_limit as number)),
     );
+  }
+  if (operation === "catalog_visible_list") {
+    const parent = args.parent;
+    const cursor = args.cursor;
+    if (cursor !== undefined && !(cursor instanceof Uint8Array)) {
+      throw new ClientError("catalog visible cursor must be a Uint8Array");
+    }
+    const prefix = new Uint8Array(8);
+    prefix[0] = parent === undefined || parent === null ? 0 : 1;
+    prefix[1] = args.kind === undefined || args.kind === null ? 0 : catalogKindTag(String(args.kind));
+    return join(
+      prefix,
+      ...(parent === undefined || parent === null ? [] : [u128(BigInt(parent as bigint | number))]),
+      bytes(cursor instanceof Uint8Array ? cursor : new Uint8Array()),
+      u64(BigInt(args.item_limit as number)),
+      u64(BigInt(args.visit_limit as number)),
+      u64(BigInt(args.byte_limit as number)),
+    );
+  }
+  if (["security_principal_list", "security_role_list", "security_assignment_list", "security_key_list"].includes(operation)) {
+    const family = operation.slice("security_".length, -"_list".length);
+    return join(encodeSecurityCursor(args.cursor, family), securityLimit(args.limit));
+  }
+  if (operation === "security_audit_read") return join(optionalSecurityId(args.cursor), securityLimit(args.limit));
+  if (operation === "security_principal_create") return securityText(args.display_name);
+  if (operation === "security_principal_set_enabled") {
+    if (typeof args.enabled !== "boolean") throw new ClientError("security principal enabled state must be boolean");
+    return join(securityId(args.principal_id), Uint8Array.of(Number(args.enabled)), new Uint8Array(7));
+  }
+  if (operation === "security_custom_role_create") return join(securityText(args.display_name), encodeSecurityGrants(args.grants));
+  if (operation === "security_built_in_assignment_create") {
+    return join(securityId(args.principal_id), Uint8Array.of(builtInRoleTag(args.role)), new Uint8Array(7), encodeProductScope(args.scope));
+  }
+  if (operation === "security_custom_assignment_create") return join(securityId(args.principal_id), securityId(args.role_id));
+  if (operation === "security_assignment_revoke") return securityId(args.assignment_id);
+  if (operation === "security_api_key_issue_self_start" || operation === "security_api_key_issue_start") {
+    return join(
+      securityId(args.principal_id),
+      securityText(args.label),
+      builtInRoles(args.roles),
+      securityIds(args.custom_roles ?? []),
+      u64(permissionBits(args.permission_ceiling)),
+      productScopes(args.scope_ceiling),
+      optionalI64(args.expires_at_micros),
+    );
+  }
+  if (operation === "security_api_key_issue_self_activate" || operation === "security_api_key_issue_activate") {
+    return join(apiKeyId(args.key_id), confirmationDigest(args.confirmation_digest));
+  }
+  if (operation === "security_api_key_rotate_self_start" || operation === "security_api_key_rotate_start") {
+    return join(
+      apiKeyId(args.predecessor_key_id),
+      securityText(args.label),
+      u64(BigInt(args.overlap_seconds as bigint | number)),
+      optionalI64(args.expires_at_micros),
+    );
+  }
+  if (operation === "security_api_key_rotate_self_activate" || operation === "security_api_key_rotate_activate") {
+    return join(apiKeyId(args.successor_key_id), confirmationDigest(args.confirmation_digest));
+  }
+  if (["security_api_key_issue_self_abort", "security_api_key_issue_abort", "security_api_key_revoke_self", "security_api_key_revoke"].includes(operation)) {
+    return apiKeyId(args.key_id);
+  }
+  if (operation === "security_api_key_rotate_self_abort" || operation === "security_api_key_rotate_abort") {
+    return apiKeyId(args.successor_key_id);
   }
   if (operation === "catalog_dependencies") {
     const direction = new Uint8Array(8);
@@ -1302,31 +1756,34 @@ function encodeStructureKey(raw: unknown): Uint8Array {
 function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> {
   const tag = reader.u8();
   if (tag === 0) return { kind: "value", value: reader.boolean() ? reader.bytes() : undefined };
-  if (tag === 1) return { kind: "values", values: Array.from({ length: reader.u32() }, () => reader.bytes()) };
+  if (tag === 1) return { kind: "values", values: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "structure value") }, () => reader.bytes()) };
   if (tag === 2) return { kind: "counter", value: reader.boolean() ? reader.i64() : undefined };
   if (tag === 3) {
     const state = ["missing", "persistent", "remaining"][reader.u8()];
     if (state === undefined) throw new ClientError("structure TTL response is invalid");
     return { kind: "ttl", value: { state, ...(state === "remaining" ? { remainingMicros: reader.i64() } : {}) } };
   }
-  if (tag === 4) return { kind: "hash_entries", entries: Array.from({ length: reader.u32() }, () => ({ field: reader.bytes(), value: reader.bytes() })) };
+  if (tag === 4) return { kind: "hash_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "hash entry") }, () => ({ field: reader.bytes(), value: reader.bytes() })) };
   if (tag === 5) return { kind: "count", value: reader.u64() };
   if (tag === 6) return { kind: "boolean", value: reader.boolean() };
-  if (tag === 7) return { kind: "set_algebra", members: Array.from({ length: reader.u32() }, () => reader.bytes()), visited: reader.u64() };
+  if (tag === 7) return { kind: "set_algebra", members: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "set member") }, () => reader.bytes()), visited: reader.u64() };
   if (tag === 8) return { kind: "sorted_set_score", value: reader.boolean() ? reader.f64() : undefined };
   if (tag === 9) return { kind: "sorted_set_rank", value: reader.boolean() ? reader.u64() : undefined };
-  if (tag === 10) return { kind: "sorted_set_entries", entries: Array.from({ length: reader.u32() }, () => ({ member: reader.bytes(), score: reader.f64() })) };
-  if (tag === 11) return { kind: "stream_entries", entries: Array.from({ length: reader.u32() }, () => ({ id: reader.u64(), fields: Array.from({ length: reader.u32() }, () => [reader.bytes(), reader.bytes()]) })) };
+  if (tag === 10) return { kind: "sorted_set_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "sorted-set entry") }, () => ({ member: reader.bytes(), score: reader.f64() })) };
+  if (tag === 11) return { kind: "stream_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "stream entry") }, () => ({ id: reader.u64(), fields: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "stream field") }, () => [reader.bytes(), reader.bytes()]) })) };
   throw new ClientError("structure read response is invalid");
 }
 
 function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown>> {
   const snapshot = decodeSnapshot(reader);
-  const hits = Array.from({ length: reader.u32() }, () => {
+  const hits = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_HITS, 28, "integrated search hit") }, () => {
     const objectId = reader.u128();
     const score = reader.f64();
     const docValues: Record<string, unknown> = {};
     const valueCount = reader.u32();
+    if (valueCount > MAX_DOC_VALUES_PER_HIT || valueCount > Math.floor(reader.remaining / 5)) {
+      throw new ClientError("integrated doc-value count exceeds its bound");
+    }
     for (let index = 0; index < valueCount; index += 1) {
       const name = reader.text();
       const tag = reader.u8();
@@ -1335,13 +1792,13 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
     }
     return { objectId, score, docValues };
   });
-  const facets = Array.from({ length: reader.u32() }, () => ({
+  const facets = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_FACETS, 8, "integrated facet") }, () => ({
     field: reader.text(),
-    buckets: Array.from({ length: reader.u32() }, () => ({ value: decodeDocValue(reader), count: reader.u64() })),
+    buckets: Array.from({ length: readBoundedCount(reader, MAX_SEARCH_FACET_BUCKETS, 10, "facet bucket") }, () => ({ value: decodeDocValue(reader), count: reader.u64() })),
   }));
-  const aggregations = Array.from({ length: reader.u32() }, () => ({ name: reader.text(), value: decodeAggregationValue(reader) }));
+  const aggregations = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_AGGREGATIONS, 5, "search aggregation") }, () => ({ name: reader.text(), value: decodeAggregationValue(reader) }));
   const strategies = ["exact_filtered", "adaptive_exact_filtered", "filter_aware_ann", "adaptive_filter_aware_ann"];
-  const vectorBranches = Array.from({ length: reader.u32() }, () => {
+  const vectorBranches = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_VECTOR_BRANCHES, 36, "search vector branch") }, () => {
     const target = reader.text();
     const strategy = strategies[reader.u8()];
     if (strategy === undefined) throw new ClientError("integrated vector strategy is invalid");
@@ -1443,7 +1900,7 @@ function encodeQuery(raw: unknown, depth = 0): Uint8Array {
 }
 
 function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Record<string, unknown>> {
-  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin"].includes(operation)) {
+  if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin", "security_status", "security_legacy_bearer_revoke"].includes(operation)) {
     if (encoded.byteLength !== 0) throw new ClientError("parameterless request has trailing bytes");
     return {};
   }
@@ -1455,10 +1912,23 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
   const reader = new Reader(encoded);
   let args: Readonly<Record<string, unknown>>;
   if (operation === "catalog_create") args = { definition: reader.bytes() };
+  else if (operation === "catalog_visible_list") {
+    const hasParent = reader.boolean();
+    const kind = reader.u8();
+    reader.zeroes(6);
+    args = {
+      parent: hasParent ? reader.u128() : undefined,
+      kind: kind === 0 ? undefined : kind,
+      cursor: reader.bytes(),
+      item_limit: reader.u64(),
+      visit_limit: reader.u64(),
+      byte_limit: reader.u64(),
+    };
+  }
   else if (operation === "transaction_stage_sql") {
     const handle = reader.u64();
     const statement = reader.text();
-    const parameters = Array.from({ length: reader.u32() }, () => decodeValue(reader, 0));
+    const parameters = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 1, "SQL parameter") }, () => decodeValue(reader, 0));
     args = { handle, statement, parameters };
   }
   else if (operation === "transaction_stage_structure") args = { handle: reader.u64(), mutation: decodeStructureMutation(reader) };
@@ -1466,6 +1936,71 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
   else if (operation === "transaction_stage_vector") args = { handle: reader.u64(), mutation: decodeTransactionVectorMutation(reader) };
   else if (["transaction_commit", "transaction_rollback", "explicit_transaction_status"].includes(operation)) args = { handle: reader.u64() };
   else if (operation === "transaction_status_by_idempotency") args = { idempotency_token: reader.u128() };
+  else if (["security_principal_list", "security_role_list", "security_assignment_list", "security_key_list"].includes(operation)) {
+    const family = operation.slice("security_".length, -"_list".length);
+    args = { cursor: decodeSecurityCursor(reader, family), limit: decodeSecurityLimit(reader) };
+  }
+  else if (operation === "security_audit_read") args = { cursor: decodeOptionalSecurityId(reader), limit: decodeSecurityLimit(reader) };
+  else if (operation === "security_principal_create") args = { display_name: decodeSecurityText(reader) };
+  else if (operation === "security_principal_set_enabled") {
+    args = { principal_id: decodeSecurityId(reader), enabled: reader.boolean() };
+    reader.zeroes(7);
+  }
+  else if (operation === "security_custom_role_create") args = { display_name: decodeSecurityText(reader), grants: decodeSecurityGrants(reader) };
+  else if (operation === "security_built_in_assignment_create") {
+    const principal_id = decodeSecurityId(reader);
+    const role = decodeBuiltInRole(reader);
+    reader.zeroes(7);
+    args = { principal_id, role, scope: decodeProductScope(reader) };
+  }
+  else if (operation === "security_custom_assignment_create") args = { principal_id: decodeSecurityId(reader), role_id: decodeSecurityId(reader) };
+  else if (operation === "security_assignment_revoke") args = { assignment_id: decodeSecurityId(reader) };
+  else if (operation === "security_api_key_issue_self_start" || operation === "security_api_key_issue_start") {
+    const principal_id = decodeSecurityId(reader);
+    const label = decodeSecurityText(reader);
+    const roleCount = reader.u32();
+    reader.zeroes(4);
+    if (roleCount > BUILT_IN_ROLES.length) throw new ClientError("API key role count is invalid");
+    const roles = Array.from({ length: roleCount }, () => decodeBuiltInRole(reader));
+    const customCount = reader.u32();
+    reader.zeroes(4);
+    if (customCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("API key custom role count is invalid");
+    const custom_roles = Array.from({ length: customCount }, () => decodeSecurityId(reader));
+    const bits = reader.u64();
+    if (bits >> BigInt(PRODUCT_PERMISSIONS.length) !== 0n) throw new ClientError("API key permission ceiling is invalid");
+    const scopeCount = reader.u32();
+    reader.zeroes(4);
+    if (scopeCount === 0 || scopeCount > MAX_SECURITY_ASSIGNMENTS) throw new ClientError("API key scope ceiling is invalid");
+    args = {
+      principal_id,
+      label,
+      roles,
+      custom_roles,
+      permission_ceiling: PRODUCT_PERMISSIONS.filter((_, index) => (bits & 1n << BigInt(index)) !== 0n),
+      scope_ceiling: Array.from({ length: scopeCount }, () => decodeProductScope(reader)),
+      expires_at_micros: decodeFixedOptionalI64(reader),
+    };
+  }
+  else if (operation === "security_api_key_issue_self_activate" || operation === "security_api_key_issue_activate") {
+    args = { key_id: reader.take(16), confirmation_digest: reader.take(32) };
+  }
+  else if (operation === "security_api_key_rotate_self_activate" || operation === "security_api_key_rotate_activate") {
+    args = { successor_key_id: reader.take(16), confirmation_digest: reader.take(32) };
+  }
+  else if (operation === "security_api_key_rotate_self_start" || operation === "security_api_key_rotate_start") {
+    args = {
+      predecessor_key_id: checkedNonzeroBytes(reader.take(16), "API key identity"),
+      label: decodeSecurityText(reader),
+      overlap_seconds: reader.u64(),
+      expires_at_micros: decodeFixedOptionalI64(reader),
+    };
+  }
+  else if (["security_api_key_issue_self_abort", "security_api_key_issue_abort", "security_api_key_revoke_self", "security_api_key_revoke"].includes(operation)) {
+    args = { key_id: reader.take(16) };
+  }
+  else if (operation === "security_api_key_rotate_self_abort" || operation === "security_api_key_rotate_abort") {
+    args = { successor_key_id: reader.take(16) };
+  }
   else if (operation === "structure_read") args = decodeStructureReadRequest(reader);
   else throw new ClientError(`binary operation decoder is not implemented for ${operation}`);
   reader.finish();
@@ -1484,7 +2019,7 @@ function decodeStructureReadRequest(reader: Reader): Readonly<Record<string, unk
     const keyspace = reader.u128();
     const operation = ["union", "intersection", "difference"][reader.u8()];
     if (operation === undefined) throw new ClientError("set algebra operation is invalid");
-    return { kind, keyspace, operation, keys: Array.from({ length: reader.u32() }, () => reader.bytes()), output_member_limit: reader.u64(), visit_limit: reader.u64() };
+    return { kind, keyspace, operation, keys: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "set algebra key") }, () => reader.bytes()), output_member_limit: reader.u64(), visit_limit: reader.u64() };
   }
   const result: Record<string, unknown> = { kind, key: decodeStructureKey(reader) };
   if (kind === "ttl") {
@@ -1560,7 +2095,7 @@ function decodeStructureMutation(reader: Reader): Readonly<Record<string, unknow
     result.score = reader.f64();
     result.member = reader.bytes();
   }
-  else if (kind === "stream_add") result.fields = Array.from({ length: reader.u32() }, () => [reader.bytes(), reader.bytes()]);
+  else if (kind === "stream_add") result.fields = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "stream field") }, () => [reader.bytes(), reader.bytes()]);
   return result;
 }
 
@@ -1573,7 +2108,7 @@ function decodeTransactionSearchMutation(reader: Reader): Readonly<Record<string
 function decodeTransactionVectorMutation(reader: Reader): Readonly<Record<string, unknown>> {
   const kind = ["upsert", "delete"][reader.u8()];
   if (kind === undefined) throw new ClientError("transaction vector mutation kind is invalid");
-  return { kind, index: reader.u128(), object_id: reader.u128(), ...(kind === "delete" ? {} : { vector: Array.from({ length: reader.u32() }, () => reader.f32()) }) };
+  return { kind, index: reader.u128(), object_id: reader.u128(), ...(kind === "delete" ? {} : { vector: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "vector dimension") }, () => reader.f32()) }) };
 }
 
 function envelope(encoded: Uint8Array, expectedMagic: string): readonly [number, Uint8Array] {
@@ -1592,6 +2127,10 @@ class Reader {
 
   constructor(encoded: Uint8Array) {
     this.#encoded = encoded;
+  }
+
+  get remaining(): number {
+    return this.#encoded.byteLength - this.#offset;
   }
 
   take(length: number): Uint8Array {
@@ -1654,6 +2193,273 @@ function bytes(value: Uint8Array): Uint8Array {
   new DataView(encoded.buffer).setUint32(0, value.byteLength, true);
   encoded.set(value, 4);
   return encoded;
+}
+
+function checkedBytes(value: unknown, length: number, name: string): Uint8Array {
+  if (!(value instanceof Uint8Array) || value.byteLength !== length || value.every((byte) => byte === 0)) {
+    throw new ClientError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function apiKeyId(value: unknown): Uint8Array { return checkedBytes(value, 16, "API key identity"); }
+function confirmationDigest(value: unknown): Uint8Array { return checkedBytes(value, 32, "API key confirmation digest"); }
+
+function securityId(value: unknown): Uint8Array {
+  const id = BigInt(value as bigint | number);
+  if (id <= 0n || id >= 1n << 128n) throw new ClientError("security identity is invalid");
+  const encoded = u128(id);
+  encoded.reverse();
+  return encoded;
+}
+
+function securityText(value: unknown): Uint8Array {
+  if (typeof value !== "string") throw new ClientError("security text is invalid");
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength === 0 || encoded.byteLength > 128 || /[\u0000-\u001f\u007f]/u.test(value)) throw new ClientError("security text is invalid");
+  return bytes(encoded);
+}
+
+function builtInRoles(value: unknown): Uint8Array {
+  if (!Array.isArray(value) || value.length > 7) throw new ClientError("API key roles are invalid");
+  const roles = ["owner", "admin", "operator", "developer", "writer", "reader", "auditor"];
+  return join(u32(value.length), new Uint8Array(4), new Uint8Array(value.map((role) => {
+    const tag = roles.indexOf(String(role));
+    if (tag < 0) throw new ClientError("API key role is invalid");
+    return tag;
+  })));
+}
+
+function securityIds(value: unknown): Uint8Array {
+  if (!Array.isArray(value) || value.length > 128) throw new ClientError("API key custom roles are invalid");
+  return join(u32(value.length), new Uint8Array(4), ...value.map(securityId));
+}
+
+function permissionBits(value: unknown): bigint {
+  if (!Array.isArray(value) || value.length === 0) throw new ClientError("API key permission ceiling is invalid");
+  const permissions = ["audit.read", "backup.create", "backup.verify", "catalog.read", "catalog.write", "credential.self_manage", "data.read", "data.write", "discover", "maintain", "observe", "ownership.manage", "proof.generate", "proof.verify", "restore", "search.execute", "security.manage", "security.read"];
+  return [...new Set(value.map(String))].reduce((bits, permission) => {
+    const tag = permissions.indexOf(permission);
+    if (tag < 0) throw new ClientError("API key permission ceiling is invalid");
+    return bits | 1n << BigInt(tag);
+  }, 0n);
+}
+
+function productScopes(value: unknown): Uint8Array {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 128) throw new ClientError("API key scope ceiling is invalid");
+  return join(u32(value.length), new Uint8Array(4), ...value.map((scope) => {
+    if (typeof scope !== "object" || scope === null) throw new ClientError("API key scope is invalid");
+    const record = scope as Record<string, unknown>;
+    const encoded = new Uint8Array(24);
+    if (record.kind === "instance") return encoded;
+    encoded[0] = record.kind === "catalog_subtree" ? 1 : record.kind === "catalog_object" ? 2 : 255;
+    if (encoded[0] === 255) throw new ClientError("API key scope is invalid");
+    encoded.set(u128(BigInt(record.object_id as bigint | number)), 8);
+    return encoded;
+  }));
+}
+
+function optionalI64(value: unknown): Uint8Array {
+  const encoded = new Uint8Array(16);
+  if (value !== undefined && value !== null) {
+    encoded[0] = 1;
+    new DataView(encoded.buffer).setBigInt64(8, BigInt(value as bigint | number), true);
+  }
+  return encoded;
+}
+
+function securityLimit(value: unknown): Uint8Array {
+  const limit = Number(value ?? MAX_SECURITY_LIST_ROWS);
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_SECURITY_LIST_ROWS) throw new ClientError("security list limit is invalid");
+  return u64(BigInt(limit));
+}
+
+function builtInRoleTag(value: unknown): number {
+  const tag = BUILT_IN_ROLES.indexOf(String(value) as typeof BUILT_IN_ROLES[number]);
+  if (tag < 0) throw new ClientError("built-in security role is invalid");
+  return tag;
+}
+
+function encodeProductScope(value: unknown): Uint8Array {
+  if (typeof value !== "object" || value === null) throw new ClientError("security scope is invalid");
+  const scope = value as Readonly<Record<string, unknown>>;
+  const encoded = new Uint8Array(24);
+  if (scope.kind === "instance") return encoded;
+  encoded[0] = scope.kind === "catalog_subtree" ? 1 : scope.kind === "catalog_object" ? 2 : 255;
+  if (encoded[0] === 255) throw new ClientError("security scope kind is invalid");
+  encoded.set(u128(BigInt(scope.object_id as bigint | number)), 8);
+  return encoded;
+}
+
+function encodeSecurityGrants(value: unknown): Uint8Array {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SECURITY_GRANTS) throw new ClientError("custom-role grants are invalid");
+  return join(u32(value.length), new Uint8Array(4), ...value.map((raw) => {
+    if (typeof raw !== "object" || raw === null) throw new ClientError("custom-role grant is invalid");
+    const grant = raw as Readonly<Record<string, unknown>>;
+    const permission = PRODUCT_PERMISSIONS.indexOf(String(grant.permission) as typeof PRODUCT_PERMISSIONS[number]);
+    if (permission < 0) throw new ClientError("custom-role permission is invalid");
+    return join(Uint8Array.of(permission), new Uint8Array(7), encodeProductScope(grant.scope));
+  }));
+}
+
+function encodeSecurityCursor(value: unknown, family: string): Uint8Array {
+  if (value === undefined || value === null) return new Uint8Array(40);
+  if (typeof value !== "object") throw new ClientError("security cursor is invalid");
+  const cursor = value as Readonly<Record<string, unknown>>;
+  const epoch = BigInt(cursor.authorization_epoch as bigint | number);
+  if (epoch <= 0n || epoch >= 1n << 64n) throw new ClientError("security cursor authorization epoch is invalid");
+  const tags: Readonly<Record<string, Readonly<Record<string, number>>>> = {
+    principal: { principal: 1 }, role: { built_in_role: 2, custom_role: 3 }, assignment: { assignment: 4 }, key: { key: 5 },
+  };
+  const tag = tags[family]?.[String(cursor.kind)];
+  if (tag === undefined) throw new ClientError("security cursor family is invalid");
+  const payload = cursor.kind === "built_in_role"
+    ? join(Uint8Array.of(builtInRoleTag(cursor.after)), new Uint8Array(15))
+    : cursor.kind === "key" ? apiKeyId(cursor.after) : securityId(cursor.after);
+  return join(Uint8Array.of(1), new Uint8Array(7), u64(epoch), Uint8Array.of(tag), new Uint8Array(7), payload);
+}
+
+function optionalSecurityId(value: unknown): Uint8Array {
+  return value === undefined || value === null
+    ? new Uint8Array(24)
+    : join(Uint8Array.of(1), new Uint8Array(7), securityId(value));
+}
+
+function decodeSecurityLimit(reader: Reader): bigint {
+  const value = reader.u64();
+  if (value === 0n || value > BigInt(MAX_SECURITY_LIST_ROWS)) throw new ClientError("security list limit is invalid");
+  return value;
+}
+
+function decodeSecurityId(reader: Reader): bigint {
+  return securityIdFromBytes(reader.take(16));
+}
+
+function securityIdFromBytes(value: Uint8Array): bigint {
+  const reversed = value.slice().reverse();
+  const id = readU128(reversed, 0);
+  if (id === 0n) throw new ClientError("security identity is zero");
+  return id;
+}
+
+function checkedNonzeroBytes(value: Uint8Array, name: string): Uint8Array {
+  if (value.every((byte) => byte === 0)) throw new ClientError(`${name} is zero`);
+  return value;
+}
+
+function decodeApiKeySecret(reader: Reader, expectedId: Uint8Array): SensitiveBytes {
+  const secret = reader.bytes();
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(secret);
+  } catch (cause) {
+    secret.fill(0);
+    throw new ClientError("API key secret is noncanonical", { cause });
+  }
+  if (secret.byteLength !== API_KEY_BYTES || !/^hyp1_[0-9a-f]{32}_[0-9a-f]{64}$/u.test(text)) {
+    secret.fill(0);
+    throw new ClientError("API key secret is noncanonical");
+  }
+  const encodedId = hexBytes(text.slice(5, 37));
+  if (!equalBytes(encodedId, expectedId) || encodedId.every((byte) => byte === 0)) {
+    secret.fill(0);
+    throw new ClientError("API key secret identity differs from its receipt");
+  }
+  const wrapped = new SensitiveBytes(secret);
+  secret.fill(0);
+  return wrapped;
+}
+
+function hexBytes(value: string): Uint8Array {
+  const encoded = new Uint8Array(value.length / 2);
+  for (let index = 0; index < encoded.length; index += 1) {
+    encoded[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return encoded;
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && left.every((value, index) => value === right[index]);
+}
+
+function readBoundedCount(reader: Reader, maximum: number, minimumBytes: number, name: string): number {
+  return boundedCount(reader.u32(), maximum, reader, minimumBytes, name);
+}
+
+function boundedCount(count: number, maximum: number, reader: Reader, minimumBytes: number, name: string): number {
+  if (count > maximum || count > Math.floor(reader.remaining / minimumBytes)) {
+    throw new ClientError(`${name} count exceeds its bound`);
+  }
+  return count;
+}
+
+function decodeSecurityText(reader: Reader): string {
+  const value = reader.text();
+  if (value.length === 0 || new TextEncoder().encode(value).byteLength > 128 || /[\u0000-\u001f\u007f]/u.test(value)) throw new ClientError("security text is invalid");
+  return value;
+}
+
+function decodeBuiltInRole(reader: Reader): typeof BUILT_IN_ROLES[number] {
+  const role = BUILT_IN_ROLES[reader.u8()];
+  if (role === undefined) throw new ClientError("built-in security role is invalid");
+  return role;
+}
+
+function decodeProductScope(reader: Reader): Readonly<Record<string, unknown>> {
+  const kind = reader.u8();
+  reader.zeroes(7);
+  const objectId = reader.u128();
+  if (kind === 0) {
+    if (objectId !== 0n) throw new ClientError("instance scope has a nonzero identity");
+    return { kind: "instance" };
+  }
+  if ((kind !== 1 && kind !== 2) || objectId === 0n) throw new ClientError("security object scope is invalid");
+  return { kind: kind === 1 ? "catalog_subtree" : "catalog_object", object_id: objectId };
+}
+
+function decodeSecurityGrants(reader: Reader): ReadonlyArray<Readonly<Record<string, unknown>>> {
+  const count = reader.u32();
+  reader.zeroes(4);
+  if (count === 0 || count > MAX_SECURITY_GRANTS) throw new ClientError("custom-role grant count is invalid");
+  return Array.from({ length: count }, () => {
+    const permission = PRODUCT_PERMISSIONS[reader.u8()];
+    reader.zeroes(7);
+    if (permission === undefined) throw new ClientError("custom-role permission is invalid");
+    return { permission, scope: decodeProductScope(reader) };
+  });
+}
+
+function decodeSecurityCursor(reader: Reader, family: string): Readonly<Record<string, unknown>> | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const authorization_epoch = reader.u64();
+  const tag = reader.u8();
+  reader.zeroes(7);
+  const payload = reader.take(16);
+  if (!present) {
+    if (authorization_epoch !== 0n || tag !== 0 || payload.some((byte) => byte !== 0)) throw new ClientError("absent security cursor is noncanonical");
+    return undefined;
+  }
+  const expected: Readonly<Record<string, Readonly<Record<number, string>>>> = {
+    principal: { 1: "principal" }, role: { 2: "built_in_role", 3: "custom_role" }, assignment: { 4: "assignment" }, key: { 5: "key" },
+  };
+  const kind = expected[family]?.[tag];
+  if (authorization_epoch === 0n || kind === undefined) throw new ClientError("security cursor is invalid");
+  const after = kind === "built_in_role" ? BUILT_IN_ROLES[payload[0] ?? 255]
+    : kind === "key" ? checkedNonzeroBytes(payload, "security key cursor") : securityIdFromBytes(payload);
+  if (after === undefined) throw new ClientError("security role cursor is invalid");
+  return { authorization_epoch, kind, after };
+}
+
+function decodeOptionalSecurityId(reader: Reader): bigint | undefined {
+  const present = reader.boolean();
+  reader.zeroes(7);
+  const payload = reader.take(16);
+  if (!present) {
+    if (payload.some((byte) => byte !== 0)) throw new ClientError("absent security identity is noncanonical");
+    return undefined;
+  }
+  return securityIdFromBytes(payload);
 }
 
 function takeBytes(encoded: Uint8Array, offset: number): readonly [Uint8Array, number] {

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native product EXPLAIN v1
 
 Status: implemented G6 bounded contract

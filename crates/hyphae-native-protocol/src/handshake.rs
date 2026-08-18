@@ -1,20 +1,23 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
-use hyphae_native_product::ProductCapabilities;
+use hyphae_native_product::{ApiKeyCredential, MAX_API_KEY_CREDENTIAL_BYTES, ProductCapabilities};
 use thiserror::Error;
 
 /// Current native-local protocol major version.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Current native-local protocol minor version.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 3;
 /// Maximum combined UTF-8 bytes in handshake names.
 pub const MAX_HANDSHAKE_TEXT_BYTES: usize = 4 * 1024;
+/// Exact UTF-8 bytes in one Native API-key authentication trailer.
+pub const API_KEY_AUTH_TRAILER_BYTES: usize = MAX_API_KEY_CREDENTIAL_BYTES;
 
 const HELLO_MAGIC: &[u8; 8] = b"HYPHEL01";
 const WELCOME_MAGIC: &[u8; 8] = b"HYPWEL01";
 const HELLO_HEADER_SIZE: usize = 58;
 const WELCOME_SIZE: usize = 94;
 const COMPRESSION_NONE: u8 = 1;
+const AUTHENTICATION_API_KEY: u8 = 1;
 
 /// Closed v1 capability bit set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +40,8 @@ impl ProtocolCapabilities {
     pub const PEER_IDENTITY: Self = Self(1 << 5);
     /// Canonical `HYPERR01` failures.
     pub const PRODUCT_ERRORS: Self = Self(1 << 6);
+    /// Managed Native API-key authentication in the `HELLO` trailer.
+    pub const API_KEY_AUTH: Self = Self(1 << 7);
     /// Every capability required by the G6 local daemon.
     pub const G6: Self = Self(
         Self::STREAM_COMPLETION.0
@@ -47,10 +52,13 @@ impl ProtocolCapabilities {
             | Self::PEER_IDENTITY.0
             | Self::PRODUCT_ERRORS.0,
     );
+    /// G6 local-daemon capabilities with managed API-key authentication.
+    pub const G6_AUTHENTICATED: Self = Self(Self::G6.0 | Self::API_KEY_AUTH.0);
+    const KNOWN: Self = Self::G6_AUTHENTICATED;
 
     /// Constructs a bit set while rejecting unknown bits.
     pub const fn from_bits(bits: u64) -> Option<Self> {
-        if bits & !Self::G6.0 == 0 {
+        if bits & !Self::KNOWN.0 == 0 {
             Some(Self(bits))
         } else {
             None
@@ -117,6 +125,34 @@ impl Default for Hello {
             database: "main".to_owned(),
             schema: "public".to_owned(),
         }
+    }
+}
+
+/// Decoded managed `HELLO` with an ephemeral redacted credential.
+pub struct AuthenticatedHello {
+    hello: Hello,
+    credential: ApiKeyCredential,
+}
+
+impl AuthenticatedHello {
+    /// Returns the non-secret handshake envelope.
+    pub const fn hello(&self) -> &Hello {
+        &self.hello
+    }
+
+    /// Transfers the handshake and credential to the transport adapter.
+    pub fn into_parts(self) -> (Hello, ApiKeyCredential) {
+        (self.hello, self.credential)
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedHello")
+            .field("hello", &self.hello)
+            .field("credential", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -234,6 +270,49 @@ pub fn encode_hello(hello: &Hello) -> Result<Vec<u8>, HandshakeError> {
     Ok(encoded)
 }
 
+/// Encodes one canonical managed `HELLO` payload with an API-key trailer.
+pub fn encode_authenticated_hello(hello: &Hello, api_key: &str) -> Result<Vec<u8>, HandshakeError> {
+    validate_hello(hello)?;
+    validate_authenticated_capabilities(hello)?;
+    let authentication = api_key.as_bytes();
+    if authentication.len() != API_KEY_AUTH_TRAILER_BYTES {
+        return Err(HandshakeError::InvalidLimit);
+    }
+    let client = hello.client_identity.as_bytes();
+    let database = hello.database.as_bytes();
+    let schema = hello.schema.as_bytes();
+    let total = HELLO_HEADER_SIZE
+        .checked_add(client.len())
+        .and_then(|value| value.checked_add(database.len()))
+        .and_then(|value| value.checked_add(schema.len()))
+        .and_then(|value| value.checked_add(authentication.len()))
+        .ok_or(HandshakeError::InvalidLimit)?;
+    let total_u32 = u32::try_from(total).map_err(|_| HandshakeError::InvalidLimit)?;
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(HELLO_MAGIC);
+    encoded.extend_from_slice(&total_u32.to_le_bytes());
+    encoded.extend_from_slice(&hello.minimum_major.to_le_bytes());
+    encoded.extend_from_slice(&hello.maximum_major.to_le_bytes());
+    encoded.extend_from_slice(&hello.minimum_minor.to_le_bytes());
+    encoded.extend_from_slice(&hello.maximum_minor.to_le_bytes());
+    encoded.extend_from_slice(&hello.capabilities.bits().to_le_bytes());
+    encoded.extend_from_slice(&hello.required_capabilities.bits().to_le_bytes());
+    encoded.extend_from_slice(&hello.maximum_frame_payload.to_le_bytes());
+    encoded.extend_from_slice(&hello.maximum_in_flight.to_le_bytes());
+    encoded.extend_from_slice(&hello.initial_window.to_le_bytes());
+    encoded.push(COMPRESSION_NONE);
+    encoded.push(AUTHENTICATION_API_KEY);
+    put_u16_len(&mut encoded, authentication.len())?;
+    put_u16_len(&mut encoded, client.len())?;
+    put_u16_len(&mut encoded, database.len())?;
+    put_u16_len(&mut encoded, schema.len())?;
+    encoded.extend_from_slice(client);
+    encoded.extend_from_slice(database);
+    encoded.extend_from_slice(schema);
+    encoded.extend_from_slice(authentication);
+    Ok(encoded)
+}
+
 /// Decodes one exact canonical `HELLO` payload.
 pub fn decode_hello(encoded: &[u8]) -> Result<Hello, HandshakeError> {
     if encoded.len() < HELLO_HEADER_SIZE {
@@ -278,6 +357,73 @@ pub fn decode_hello(encoded: &[u8]) -> Result<Hello, HandshakeError> {
     Ok(hello)
 }
 
+/// Decodes one exact managed `HELLO` payload and redacts its API key.
+pub fn decode_authenticated_hello(encoded: &[u8]) -> Result<AuthenticatedHello, HandshakeError> {
+    if encoded.len() < HELLO_HEADER_SIZE {
+        return Err(HandshakeError::Truncated);
+    }
+    let declared_total = read_u32(&encoded[8..12]) as usize;
+    if declared_total > encoded.len() {
+        return Err(HandshakeError::Truncated);
+    }
+    if &encoded[..8] != HELLO_MAGIC
+        || declared_total != encoded.len()
+        || encoded[48] != COMPRESSION_NONE
+        || encoded[49] != AUTHENTICATION_API_KEY
+    {
+        return Err(HandshakeError::Malformed);
+    }
+    let authentication_length = usize::from(read_u16(&encoded[50..52]));
+    if authentication_length != API_KEY_AUTH_TRAILER_BYTES {
+        return Err(HandshakeError::InvalidLimit);
+    }
+    let client_length = usize::from(read_u16(&encoded[52..54]));
+    let database_length = usize::from(read_u16(&encoded[54..56]));
+    let schema_length = usize::from(read_u16(&encoded[56..58]));
+    let text_length = client_length
+        .checked_add(database_length)
+        .and_then(|value| value.checked_add(schema_length))
+        .ok_or(HandshakeError::InvalidLimit)?;
+    if text_length > MAX_HANDSHAKE_TEXT_BYTES {
+        return Err(HandshakeError::InvalidLimit);
+    }
+    let expected_total = HELLO_HEADER_SIZE
+        .checked_add(text_length)
+        .and_then(|value| value.checked_add(authentication_length))
+        .ok_or(HandshakeError::InvalidLimit)?;
+    if expected_total > encoded.len() {
+        return Err(HandshakeError::Truncated);
+    }
+    if expected_total != encoded.len() {
+        return Err(HandshakeError::Malformed);
+    }
+    let client_end = HELLO_HEADER_SIZE + client_length;
+    let database_end = client_end + database_length;
+    let schema_end = database_end + schema_length;
+    let hello = Hello {
+        minimum_major: read_u16(&encoded[12..14]),
+        maximum_major: read_u16(&encoded[14..16]),
+        minimum_minor: read_u16(&encoded[16..18]),
+        maximum_minor: read_u16(&encoded[18..20]),
+        capabilities: ProtocolCapabilities::from_bits(read_u64(&encoded[20..28]))
+            .ok_or(HandshakeError::Malformed)?,
+        required_capabilities: ProtocolCapabilities::from_bits(read_u64(&encoded[28..36]))
+            .ok_or(HandshakeError::Malformed)?,
+        maximum_frame_payload: read_u32(&encoded[36..40]),
+        maximum_in_flight: read_u32(&encoded[40..44]),
+        initial_window: read_u32(&encoded[44..48]),
+        client_identity: text(&encoded[HELLO_HEADER_SIZE..client_end])?,
+        database: text(&encoded[client_end..database_end])?,
+        schema: text(&encoded[database_end..schema_end])?,
+    };
+    validate_hello(&hello)?;
+    validate_authenticated_capabilities(&hello)?;
+    let api_key =
+        std::str::from_utf8(&encoded[schema_end..]).map_err(|_| HandshakeError::Malformed)?;
+    let credential = ApiKeyCredential::new(api_key).map_err(|_| HandshakeError::InvalidLimit)?;
+    Ok(AuthenticatedHello { hello, credential })
+}
+
 /// Selects one complete server handshake.
 pub fn negotiate(
     hello: &Hello,
@@ -297,11 +443,7 @@ pub fn negotiate(
     if !(hello.minimum_major..=hello.maximum_major).contains(&PROTOCOL_MAJOR) {
         return Err(HandshakeError::IncompatibleVersion);
     }
-    let minimum_minor = hello.minimum_minor;
-    let maximum_minor = PROTOCOL_MINOR;
-    if minimum_minor > maximum_minor {
-        return Err(HandshakeError::IncompatibleVersion);
-    }
+    let minor = negotiate_minor(PROTOCOL_MINOR, hello.minimum_minor, hello.maximum_minor)?;
     if !hello.capabilities.contains(hello.required_capabilities)
         || !policy.capabilities.contains(hello.required_capabilities)
     {
@@ -310,7 +452,7 @@ pub fn negotiate(
     let selected = hello.capabilities.intersection(policy.capabilities);
     Ok(Welcome {
         major: PROTOCOL_MAJOR,
-        minor: maximum_minor,
+        minor,
         capabilities: selected,
         session_id,
         maximum_frame_payload: hello
@@ -427,6 +569,33 @@ fn validate_hello(hello: &Hello) -> Result<(), HandshakeError> {
     Ok(())
 }
 
+fn validate_authenticated_capabilities(hello: &Hello) -> Result<(), HandshakeError> {
+    if hello
+        .capabilities
+        .contains(ProtocolCapabilities::API_KEY_AUTH)
+        && hello
+            .required_capabilities
+            .contains(ProtocolCapabilities::API_KEY_AUTH)
+    {
+        Ok(())
+    } else {
+        Err(HandshakeError::MissingCapability)
+    }
+}
+
+fn negotiate_minor(
+    server_maximum_minor: u16,
+    client_minimum_minor: u16,
+    client_maximum_minor: u16,
+) -> Result<u16, HandshakeError> {
+    let selected = server_maximum_minor.min(client_maximum_minor);
+    if client_minimum_minor > selected {
+        Err(HandshakeError::IncompatibleVersion)
+    } else {
+        Ok(selected)
+    }
+}
+
 fn put_u16_len(encoded: &mut Vec<u8>, length: usize) -> Result<(), HandshakeError> {
     encoded.extend_from_slice(
         &u16::try_from(length)
@@ -460,4 +629,27 @@ fn read_u64(bytes: &[u8]) -> u64 {
 
 fn read_u128(bytes: &[u8]) -> u128 {
     u128::from_le_bytes(bytes.try_into().unwrap_or([0; 16]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minor_negotiation_preserves_a_legacy_client_ceiling() {
+        assert_eq!(negotiate_minor(1, 0, 0), Ok(0));
+    }
+
+    #[test]
+    fn minor_negotiation_selects_the_highest_common_minor() {
+        assert_eq!(negotiate_minor(2, 1, 3), Ok(2));
+    }
+
+    #[test]
+    fn minor_negotiation_rejects_disjoint_intervals() {
+        assert_eq!(
+            negotiate_minor(0, 1, 1),
+            Err(HandshakeError::IncompatibleVersion)
+        );
+    }
 }

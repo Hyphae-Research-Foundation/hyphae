@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Integration coverage for bounded administration, telemetry, doctor, and backup surfaces.
 
@@ -271,7 +271,7 @@ fn sql_explain_is_versioned_bounded_opaque_text() -> Result<(), Box<dyn Error>> 
     transaction.commit()?;
     drop(runtime);
 
-    let mut product = NativeProduct::open(&path)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
     let ProductExplain::SqlPlanText(plan) = product
         .administration()
         .explain_sql("SELECT id FROM items WHERE id = 1")?
@@ -280,7 +280,7 @@ fn sql_explain_is_versioned_bounded_opaque_text() -> Result<(), Box<dyn Error>> 
     };
     assert_eq!(plan.version, SQL_PLAN_TEXT_VERSION);
     assert!(plan.text.starts_with("PrimaryKeyLookup("));
-    assert_eq!(plan.catalog_version, 2);
+    assert_eq!(plan.catalog_version, 3);
     assert!(!plan.executed);
     drop(product);
     fs::remove_dir_all(path)?;
@@ -314,7 +314,7 @@ fn typed_explain_goldens_cover_convergence_ann_and_hybrid() -> Result<(), Box<dy
             .search_ann(vectors, &query, AnnSearchOptions::new(1, 8, None)?)?;
     drop(database);
 
-    let product = NativeProduct::open(&path)?;
+    let product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
     let snapshot = product.snapshot_bounded(0)?;
     let convergence = snapshot.explain_convergence(&ConvergencePlan {
         sources: vec![ConvergenceSource::Structure(StructureSource::Scalar {
@@ -372,7 +372,7 @@ fn backup_restore_has_safe_cancellation_and_doctor_after_restore() -> Result<(),
     transaction.commit()?;
     drop(runtime);
 
-    let mut product = NativeProduct::open(&source)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&source)?;
     let backup_request = BackupRequest::new(&backup_path)?;
     let mut phases = Vec::new();
     product.administration().backup(&backup_request, |phase| {
@@ -412,6 +412,57 @@ fn backup_restore_has_safe_cancellation_and_doctor_after_restore() -> Result<(),
 }
 
 #[test]
+fn backup_restore_preserves_terminal_legacy_bearer_revocation() -> Result<(), Box<dyn Error>> {
+    let root = temporary("legacy-revoked-backup");
+    let source = root.join("source");
+    let backup_path = root.join("backup");
+    let restored_path = root.join("restored");
+    let observer_path = root.join("observer");
+    let _ignored = fs::remove_dir_all(&root);
+    fs::create_dir(&root)?;
+    let legacy = b"legacy-backup-canary-0123456789abcdef";
+    let mut product = NativeProduct::create(&source)?;
+    drop(product);
+    product = NativeProduct::open_offline_owner(&source)?;
+    let started =
+        product.start_legacy_bearer_migration_offline("Migrated owner", "canonical", legacy, 1)?;
+    let canonical = started.secret.expose_secret().to_owned();
+    product.activate_legacy_bearer_migration_offline(
+        started.key_id,
+        &canonical,
+        started.authorization_epoch,
+        "Migrated owner",
+        "canonical",
+        legacy,
+        2,
+    )?;
+    let owner = product.authenticate_api_key(&canonical, 0)?;
+    product.revoke_legacy_bearer_idempotent(&owner, 42, 3)?;
+    product
+        .administration()
+        .backup(&BackupRequest::new(&backup_path)?, |_| {
+            ProgressControl::Continue
+        })?;
+    drop(product);
+
+    let mut observer = NativeProduct::create(&observer_path)?;
+    observer
+        .administration()
+        .restore(&RestoreRequest::new(&backup_path, &restored_path)?, |_| {
+            ProgressControl::Continue
+        })?;
+    drop(observer);
+    let restored = NativeProduct::open(&restored_path)?;
+    assert_eq!(
+        restored.legacy_bearer_migration_inspection()?.state,
+        hyphae_native_product::LegacyBearerState::Revoked
+    );
+    drop(restored);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn restore_product_operation_runs_complete_progress_and_doctor() -> Result<(), Box<dyn Error>> {
     let root = temporary("restore-operation");
     let source = root.join("source");
@@ -424,7 +475,7 @@ fn restore_product_operation_runs_complete_progress_and_doctor() -> Result<(), B
     transaction.set(b"complete".to_vec(), b"state".to_vec(), None)?;
     transaction.commit()?;
     drop(runtime);
-    let mut product = NativeProduct::open(&source)?;
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&source)?;
     product
         .administration()
         .backup(&BackupRequest::new(&backup_path)?, |_| {
@@ -455,6 +506,66 @@ fn restore_product_operation_runs_complete_progress_and_doctor() -> Result<(), B
         Some(b"state".as_slice())
     );
     drop(reopened);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn restore_response_limit_fails_before_creating_the_destination() -> Result<(), Box<dyn Error>> {
+    let root = temporary("restore-response-limit");
+    let source = root.join("source");
+    let backup_path = root.join("backup");
+    let restored_path = root.join("must-not-exist");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root)?;
+    let runtime = NativeDatabase::create(&source)?;
+    drop(runtime);
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&source)?;
+    product
+        .administration()
+        .backup(&BackupRequest::new(&backup_path)?, |_| {
+            ProgressControl::Continue
+        })?;
+    let principal = ProductPrincipal::new("restore-limit-test").ok_or("invalid principal")?;
+    let mut session = ProductSession::new(
+        ProductSessionId::new(2).ok_or("invalid session")?,
+        principal.clone(),
+        ProductAuthorization::ALL,
+    );
+    let request = RestoreRequest::new(&backup_path, &restored_path)?;
+    let response_bound = 222
+        + request.backup.as_os_str().as_encoded_bytes().len()
+        + request.destination.as_os_str().as_encoded_bytes().len();
+    let mut context = ProductRequestContext::new(
+        101,
+        session.id(),
+        0,
+        principal.clone(),
+        ProductAuthorization::ALL,
+    );
+    context.limits.max_response_bytes = response_bound - 1;
+    let Err(error) = product.dispatch(
+        &mut session,
+        &context,
+        ProductOperation::Restore(request.clone()),
+    ) else {
+        return Err("restore ran despite an insufficient response bound".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::LimitExceeded
+    );
+    assert!(!restored_path.exists());
+
+    let mut exact =
+        ProductRequestContext::new(102, session.id(), 0, principal, ProductAuthorization::ALL);
+    exact.limits.max_response_bytes = response_bound;
+    assert!(matches!(
+        product.dispatch(&mut session, &exact, ProductOperation::Restore(request))?,
+        ProductResponse::Restore(_)
+    ));
+    assert!(restored_path.exists());
+    drop(product);
     fs::remove_dir_all(root)?;
     Ok(())
 }

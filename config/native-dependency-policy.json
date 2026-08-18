@@ -75,6 +75,14 @@
     },
     {
       "name": "bitflags",
+      "version": "1.3.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT/Apache-2.0",
+      "category": "Windows access-control primitive",
+      "rationale": "Typed Windows security-information and access-right flags used transitively by windows-permissions for restricted credential-file ACLs."
+    },
+    {
+      "name": "bitflags",
       "version": "2.13.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
@@ -210,6 +218,22 @@
       "rationale": "Operating-system bindings used by CPU detection, entropy, Tokio, Mio, interprocess, socket, signal, and error primitives."
     },
     {
+      "name": "linux-raw-sys",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "Linux platform binding primitive",
+      "rationale": "Target-conditioned Linux constants used transitively by rustix for reviewed filesystem and terminal operations."
+    },
+    {
+      "name": "log",
+      "version": "0.4.33",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT OR Apache-2.0",
+      "category": "workspace feature-unified diagnostic primitive",
+      "rationale": "Cargo's workspace resolver activates Mio's optional diagnostic facade through the TUI closure while the policy audits the daemon-rooted metadata graph; it supplies no storage, query, or logging backend semantics."
+    },
+    {
       "name": "memchr",
       "version": "2.8.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -282,6 +306,22 @@
       "rationale": "Compiler-version detection used by crc32c at build time."
     },
     {
+      "name": "rustix",
+      "version": "1.1.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "category": "operating-system filesystem primitive",
+      "rationale": "Safe target-conditioned filesystem and terminal adapters used by fs4, same-file, and the CLI closure."
+    },
+    {
+      "name": "same-file",
+      "version": "1.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Unlicense/MIT",
+      "category": "filesystem identity primitive",
+      "rationale": "Cross-platform same-file identity checks used by the native runtime and CLI without supplying storage semantics."
+    },
+    {
       "name": "semver",
       "version": "1.0.28",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -344,6 +384,14 @@
       "license": "MIT OR Apache-2.0",
       "category": "operating-system socket primitive",
       "rationale": "Cross-platform socket configuration used transitively by Tokio's local I/O runtime."
+    },
+    {
+      "name": "subtle",
+      "version": "2.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "BSD-3-Clause",
+      "category": "constant-time comparison primitive",
+      "rationale": "Constant-time comparison for durable API-key verifier material without supplying credential storage, hashing, or authorization policy."
     },
     {
       "name": "syn",
@@ -458,12 +506,52 @@
       "rationale": "Constructs the UTF-16 security descriptor used to restrict the native daemon's Windows named pipe."
     },
     {
+      "name": "winapi",
+      "version": "0.3.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT/Apache-2.0",
+      "category": "Windows platform binding primitive",
+      "rationale": "Target-conditioned Win32 security and access-token bindings used transitively by windows-permissions for restricted credential-file ACLs."
+    },
+    {
+      "name": "winapi-i686-pc-windows-gnu",
+      "version": "0.4.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT/Apache-2.0",
+      "category": "Windows target binding primitive",
+      "rationale": "Target-conditioned i686 GNU import libraries selected transitively by winapi; they supply no product semantics."
+    },
+    {
+      "name": "winapi-util",
+      "version": "0.1.11",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Unlicense OR MIT",
+      "category": "Windows filesystem identity primitive",
+      "rationale": "Target-conditioned Windows handle helpers used transitively by same-file for file identity checks."
+    },
+    {
+      "name": "winapi-x86_64-pc-windows-gnu",
+      "version": "0.4.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT/Apache-2.0",
+      "category": "Windows target binding primitive",
+      "rationale": "Target-conditioned x86_64 GNU import libraries selected transitively by winapi; they supply no product semantics."
+    },
+    {
       "name": "windows-link",
       "version": "0.2.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "Windows platform binding primitive",
       "rationale": "Link directives used transitively by windows-sys for Windows IPC, socket, signal, and error APIs."
+    },
+    {
+      "name": "windows-permissions",
+      "version": "0.2.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "Windows access-control wrapper",
+      "rationale": "Safe process-SID, security-descriptor, and handle-based ACL adapters used to create and validate restricted credential files without unsafe Hyphae code."
     },
     {
       "name": "windows-sys",

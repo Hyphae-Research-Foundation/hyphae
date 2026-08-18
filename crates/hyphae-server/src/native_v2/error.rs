@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 use std::{io, net::SocketAddr};
 
@@ -111,6 +111,10 @@ impl IntoResponse for NativeApiError {
             .status(self.status)
             .header(header::CONTENT_TYPE, content_type)
             .header(REQUEST_ID_HEADER, request_id)
+            .header(
+                hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                hyphae_contracts::v2::PROTOCOL_MINOR_VALUE_V2,
+            )
             .body(body)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         if self.authenticate {

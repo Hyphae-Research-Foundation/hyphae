@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native set member commands v1
 
 Status: implemented; [direct-Linux evidence captured on

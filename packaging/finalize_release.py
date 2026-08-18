@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Create or verify the canonical checksum and evidence-bound release layout."""
 
 from __future__ import annotations
@@ -33,10 +33,20 @@ ASSET_SUFFIXES = (
     EVIDENCE_SUFFIX,
 )
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
+APACHE_RELEASE_VERSION = "1.2.0"
+
+
+def require_apache_release_version(version: str) -> None:
+    if version != APACHE_RELEASE_VERSION:
+        raise RuntimeError(
+            f"Apache-2.0 publication requires version {APACHE_RELEASE_VERSION}; "
+            f"found {version}"
+        )
 
 
 def require_matching_tag(tag: str) -> None:
-    expected = source_identity(current_commit()).tag
+    identity = source_identity(current_commit())
+    expected = identity.tag
     if tag != expected:
         raise RuntimeError(
             f"release tag {tag!r} does not match release commit version {expected!r}"

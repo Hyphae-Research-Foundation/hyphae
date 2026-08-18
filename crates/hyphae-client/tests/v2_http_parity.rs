@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! Basic v2 transport connectivity coverage.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hyphae_client::v2::{HttpTransport, HyphaeClient, ProductResponse, RequestOptions};
+use hyphae_client::v2::{
+    CatalogVisibleCursor, CatalogVisibleListFilter, CatalogVisibleListRequest, HttpTransport,
+    HyphaeClient, ProductResponse, RequestOptions,
+};
 use hyphae_native_product::{NativeProduct, NativeProductService, NativeProductServiceConfig};
 use hyphae_server::{NativeHttpV2Config, NativeHttpV2Server};
 
@@ -35,6 +38,9 @@ async fn real_http_capabilities_execute() -> Result<(), Box<dyn std::error::Erro
     let real = HyphaeClient::new(HttpTransport::new(&format!("http://{address}"))?);
     let real_response = real.capabilities(RequestOptions::default()).await?;
     assert!(matches!(real_response, ProductResponse::Capabilities(_)));
+    let ids = visible_catalog_sequence(&real).await?;
+    assert!(!ids.is_empty());
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
 
     let _ignored = shutdown.0.send(());
     serve.await??;
@@ -64,6 +70,9 @@ async fn real_local_capabilities_execute() -> Result<(), Box<dyn std::error::Err
     let real = HyphaeClient::local(endpoint.to_string_lossy())?;
     let real_response = real.capabilities(RequestOptions::default()).await?;
     assert!(matches!(real_response, ProductResponse::Capabilities(_)));
+    let ids = visible_catalog_sequence(&real).await?;
+    assert!(!ids.is_empty());
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
 
     drop(real);
     let product = daemon.shutdown().await?;
@@ -73,4 +82,38 @@ async fn real_local_capabilities_execute() -> Result<(), Box<dyn std::error::Err
     }
     std::fs::remove_dir_all(path)?;
     Ok(())
+}
+
+async fn visible_catalog_sequence(
+    client: &HyphaeClient,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    loop {
+        let response = client
+            .catalog_visible_list(visible_catalog_request(cursor), RequestOptions::default())
+            .await?;
+        let ProductResponse::CatalogVisiblePage(page) = response else {
+            return Err("visible catalog returned another response variant".into());
+        };
+        ids.extend(page.items.into_iter().map(|item| item.id.get()));
+        let Some(next) = page.cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    Ok(ids)
+}
+
+fn visible_catalog_request(cursor: Option<CatalogVisibleCursor>) -> CatalogVisibleListRequest {
+    CatalogVisibleListRequest {
+        filter: CatalogVisibleListFilter {
+            parent: None,
+            kind: None,
+        },
+        cursor,
+        item_limit: 1,
+        visit_limit: 8,
+        byte_limit: 4_096,
+    }
 }

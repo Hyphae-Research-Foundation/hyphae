@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 
 //! First executable convergence slice for Hyphae's native local data engine.
 //!
@@ -220,8 +220,9 @@ pub use set_algebra::{
 };
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{
-    MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
-    NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlValue,
+    BoundSqlStatement, MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
+    NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlStatementClass, SqlValue,
+    classify_sql_statement,
 };
 
 use std::{
@@ -401,12 +402,14 @@ const CATALOG_FORMAT_VALUE_V3: &[u8] = b"HYCAT003";
 const CATALOG_FORMAT_VALUE_V4: &[u8] = b"HYCAT004";
 const CATALOG_FORMAT_VALUE_V5: &[u8] = b"HYCAT005";
 const CATALOG_FORMAT_VALUE_V6: &[u8] = b"HYCAT006";
+const CATALOG_FORMAT_VALUE_V7: &[u8] = b"HYCAT007";
 const CATALOG_ID_AUTHORITY_KEY: &[u8] = b"\x00\x01";
 const CATALOG_OBJECT_PREFIX: u8 = 1;
 const CATALOG_NAME_PREFIX: u8 = 2;
 const CATALOG_RELATION_INDEX_PREFIX: u8 = 3;
 const CATALOG_DEPENDENCY_OUTGOING_PREFIX: u8 = 4;
 const CATALOG_DEPENDENCY_INCOMING_PREFIX: u8 = 5;
+const CATALOG_ANCESTOR_DESCENDANT_PREFIX: u8 = 6;
 const CATALOG_VALUE_MAGIC: &[u8; 8] = b"HYCVAL01";
 const CATALOG_VALUE_HEADER_SIZE: usize = 16;
 const CATALOG_VALUE_INLINE: u8 = 0;
@@ -1306,6 +1309,28 @@ pub enum CommitBoundary {
     RootPublished,
 }
 
+#[derive(Clone, Copy)]
+struct CommitInterruption {
+    boundary: CommitBoundary,
+    hook: Option<fn(CommitBoundary)>,
+}
+
+impl CommitInterruption {
+    const fn returning(boundary: CommitBoundary) -> Self {
+        Self {
+            boundary,
+            hook: None,
+        }
+    }
+
+    const fn hooked(boundary: CommitBoundary, hook: fn(CommitBoundary)) -> Self {
+        Self {
+            boundary,
+            hook: Some(hook),
+        }
+    }
+}
+
 /// Deterministic group-commit boundary used by the native crash matrix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupCommitBoundary {
@@ -1926,6 +1951,53 @@ pub struct CatalogListRequest {
     pub byte_limit: usize,
 }
 
+/// One authority-derived namespace from which a visible catalog traversal starts.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CatalogVisibleScope {
+    /// The complete catalog is visible.
+    Instance,
+    /// Exactly one stable object is visible.
+    Object(ObjectId),
+    /// One stable object and all descendants are visible.
+    Subtree(ObjectId),
+}
+
+/// Bounded scope-first catalog request used by the product's opaque-cursor API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVisibleListRequest {
+    /// Canonical, deduplicated authority roots.
+    pub scopes: Vec<CatalogVisibleScope>,
+    /// Optional visible-parent filter.
+    pub parent: Option<ObjectId>,
+    /// Optional stable object-kind filter.
+    pub kind: Option<CatalogObjectKind>,
+    /// Exclusive visible stable-ID continuation.
+    pub start_after: Option<ObjectId>,
+    /// Maximum returned summaries.
+    pub item_limit: usize,
+    /// Maximum visible candidates considered.
+    pub visit_limit: usize,
+    /// Maximum canonical summary bytes returned.
+    pub byte_limit: usize,
+}
+
+/// Internal scope-first page. Work accounting is deliberately not public product data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogVisibleObjectPage {
+    /// Stable-ID ordered visible summaries.
+    pub items: Vec<CatalogObjectSummary>,
+    /// Last visible object considered when more authorized work remains.
+    pub continuation: Option<ObjectId>,
+    /// Whether every authorized namespace was exhausted.
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CatalogVisibleTraversal {
+    scope: CatalogVisibleScope,
+    current: Option<ObjectId>,
+}
+
 /// Why one bounded catalog traversal stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogPageStop {
@@ -2118,7 +2190,7 @@ struct PageCommitInput<'commit> {
     batch: &'commit NativeWriteBatch,
     staged_blobs: BTreeMap<[u8; 32], StagedBlob>,
     synchronize: bool,
-    interruption: Option<CommitBoundary>,
+    interruption: Option<CommitInterruption>,
 }
 
 struct PageCommitOutput {
@@ -3487,6 +3559,34 @@ impl NativeSnapshot {
             .documents(index)
             .ok_or(BoundedSearchError::UnknownIndex)?;
         bounded_search::search_documents(documents, query, limit, limits)
+    }
+
+    /// Executes a bounded lexical query with cooperative loop checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded search errors or an interruption error when the
+    /// callback returns `false`.
+    pub fn search_bounded_with_checkpoint(
+        &self,
+        index: ObjectId,
+        query: &BoundedSearchQuery,
+        limit: usize,
+        limits: BoundedSearchLimits,
+        mut checkpoint: impl FnMut() -> bool,
+    ) -> Result<BoundedSearchResults, BoundedSearchError> {
+        let documents = self
+            .state
+            .search
+            .documents(index)
+            .ok_or(BoundedSearchError::UnknownIndex)?;
+        bounded_search::search_documents_with_checkpoint(
+            documents,
+            query,
+            limit,
+            limits,
+            &mut checkpoint,
+        )
     }
 
     /// Returns the exact retained source text for one physical lexical index.
@@ -5190,6 +5290,21 @@ impl NativeDatabase {
         Self::open_with_marker(path.as_ref(), false)
     }
 
+    /// Opens one directory for an OS-owner-authorized offline operation.
+    ///
+    /// The directory path must remain a stable regular directory owned by the
+    /// effective Unix UID, or a stable non-reparse Windows directory owned by
+    /// the current account with the protected account-and-LocalSystem DACL.
+    /// The normal exclusive `LOCK` is acquired before recovery or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`], plus fail-closed operating-
+    /// system owner-authority validation errors.
+    pub fn open_offline_owner(path: impl AsRef<Path>) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker_mode(path.as_ref(), false, true)
+    }
+
     /// Admits recovery before opening, verifying, or repairing a native data directory.
     ///
     /// The installed governor remains attached to the returned handle. A zero
@@ -5246,9 +5361,20 @@ impl NativeDatabase {
     }
 
     fn open_with_marker(path: &Path, pending: bool) -> Result<Self, NativeRuntimeError> {
+        Self::open_with_marker_mode(path, pending, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_with_marker_mode(
+        path: &Path,
+        pending: bool,
+        offline_owner: bool,
+    ) -> Result<Self, NativeRuntimeError> {
         let open_started = Instant::now();
         let directory_guard = if pending {
             NativeDirectoryGuard::open_pending(path)?
+        } else if offline_owner {
+            NativeDirectoryGuard::open_offline_owner(path)?
         } else {
             NativeDirectoryGuard::open(path)?
         };
@@ -5356,6 +5482,19 @@ impl NativeDatabase {
     /// Returns the stable identity of this native data-directory history.
     pub const fn directory_identity(&self) -> &NativeDirectoryIdentity {
         self.directory_guard.identity()
+    }
+
+    /// Revalidates the path identity and OS-owner authority captured by
+    /// [`Self::open_offline_owner`]. Normal opens fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner-authority error if the directory path, identity,
+    /// ownership, reparse status, or Windows ACL changed.
+    pub fn revalidate_offline_owner(&self) -> Result<(), NativeRuntimeError> {
+        self.directory_guard
+            .revalidate_offline_owner(&self.data_directory)
+            .map_err(Into::into)
     }
 
     /// Returns recovery evidence produced when this handle was opened.
@@ -6079,6 +6218,47 @@ impl NativeDatabase {
         transaction.commit()
     }
 
+    /// Explicitly upgrades the current logical catalog to the scope-index format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported root or commit failure.
+    pub fn ensure_catalog_scope_index(
+        &mut self,
+        durability: DurabilityClass,
+    ) -> Result<Option<CommitReceipt>, NativeRuntimeError> {
+        let snapshot = self.coordinator.snapshot(0)?;
+        let Some(root) = snapshot.roots().root(SLOT_CATALOG) else {
+            return Ok(None);
+        };
+        let marker = BTree::from_root(root)
+            .get_cached_pinned(&self.pages, &self.buffer_pool, CATALOG_FORMAT_KEY)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if marker.bytes() == CATALOG_FORMAT_VALUE_V7 {
+            return Ok(None);
+        }
+        if !matches!(
+            marker.bytes(),
+            CATALOG_FORMAT_VALUE_V3
+                | CATALOG_FORMAT_VALUE_V4
+                | CATALOG_FORMAT_VALUE_V5
+                | CATALOG_FORMAT_VALUE_V6
+        ) {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        let mut transaction = self.begin(0, durability)?;
+        transaction.mutations.push(Mutation {
+            engine: EngineKind::Kernel,
+            opcode: Opcode::MigrateCatalogV7,
+            target: None,
+            key: Vec::new(),
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        transaction.dirty[0] = true;
+        transaction.commit().map(Some)
+    }
+
     /// Lists lightweight logical V2 summaries through a bounded immutable-root
     /// traversal.
     ///
@@ -6173,6 +6353,214 @@ impl NativeDatabase {
             page.continuation = None;
         }
         Ok(page)
+    }
+
+    /// Lists only candidates reached from caller-authorized catalog scopes.
+    ///
+    /// Exact-object scopes use point reads. Subtree scopes use the durable
+    /// ancestor-descendant namespace and instance scope uses the object
+    /// namespace. Overlapping roots are merged and deduplicated in `ObjectId`
+    /// order before filters are applied, so invisible global objects are never
+    /// traversed or charged as work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for noncanonical scopes, invalid bounds, an unsupported
+    /// catalog root, or durable catalog corruption.
+    pub fn catalog_visible_list(
+        &self,
+        snapshot: &NativeCatalogSnapshot,
+        request: &CatalogVisibleListRequest,
+    ) -> Result<CatalogVisibleObjectPage, NativeRuntimeError> {
+        self.require_catalog_snapshot(snapshot)?;
+        validate_catalog_read_limits(request.item_limit, request.visit_limit, request.byte_limit)?;
+        if request.scopes.is_empty()
+            || request.scopes.windows(2).any(|pair| pair[0] >= pair[1])
+            || request.scopes.contains(&CatalogVisibleScope::Instance) && request.scopes.len() != 1
+        {
+            return Err(NativeRuntimeError::InvalidCatalogReadLimit);
+        }
+        let Some(root) = snapshot.root else {
+            return Ok(CatalogVisibleObjectPage {
+                items: Vec::new(),
+                continuation: None,
+                exhausted: true,
+            });
+        };
+        self.require_catalog_v7(root)?;
+
+        let tree = BTree::from_root(root);
+        let mut traversal = request
+            .scopes
+            .iter()
+            .copied()
+            .map(|scope| {
+                self.next_catalog_visible_id(tree, root, scope, request.start_after)
+                    .map(|current| CatalogVisibleTraversal { scope, current })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::new();
+        let mut returned_bytes = 0_usize;
+        let mut considered = 0_usize;
+        let mut last_considered = None;
+        while let Some(id) = traversal.iter().filter_map(|state| state.current).min() {
+            for state in traversal
+                .iter_mut()
+                .filter(|state| state.current == Some(id))
+            {
+                state.current = self.next_catalog_visible_id(tree, root, state.scope, Some(id))?;
+            }
+            considered = considered.saturating_add(1);
+            last_considered = Some(id);
+            let object = self
+                .logical_catalog_object_at_root(root, id)?
+                .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+            if request
+                .parent
+                .is_some_and(|parent| object.parent() != Some(parent))
+                || request.kind.is_some_and(|kind| object.kind() != kind)
+            {
+                if considered == request.visit_limit {
+                    break;
+                }
+                continue;
+            }
+            let mut summary = logical_catalog_summary(&object);
+            if let Some(parent) = summary.parent
+                && !request.scopes.iter().copied().try_fold(
+                    false,
+                    |visible, scope| -> Result<bool, NativeRuntimeError> {
+                        Ok(visible
+                            || self
+                                .catalog_object_is_in_visible_scope(tree, root, scope, parent)?)
+                    },
+                )?
+            {
+                summary.parent = None;
+            }
+            let bytes = catalog_summary_bytes(&summary)?;
+            if returned_bytes
+                .checked_add(bytes)
+                .is_none_or(|total| total > request.byte_limit)
+            {
+                last_considered = items.last().map(|item: &CatalogObjectSummary| item.id);
+                break;
+            }
+            returned_bytes += bytes;
+            items.push(summary);
+            if items.len() == request.item_limit || considered == request.visit_limit {
+                break;
+            }
+        }
+        let exhausted = traversal.iter().all(|state| state.current.is_none())
+            && items.len() < request.item_limit;
+        if !exhausted && last_considered.is_none() {
+            return Err(NativeRuntimeError::InvalidCatalogReadLimit);
+        }
+        Ok(CatalogVisibleObjectPage {
+            items,
+            continuation: (!exhausted).then_some(last_considered).flatten(),
+            exhausted,
+        })
+    }
+
+    fn next_catalog_visible_id(
+        &self,
+        tree: BTree,
+        root: PageId,
+        scope: CatalogVisibleScope,
+        after: Option<ObjectId>,
+    ) -> Result<Option<ObjectId>, NativeRuntimeError> {
+        match scope {
+            CatalogVisibleScope::Object(id) => {
+                if after.is_some_and(|after| id <= after) {
+                    return Ok(None);
+                }
+                self.logical_catalog_object_at_root(root, id)
+                    .map(|object| object.map(|_| id))
+            }
+            CatalogVisibleScope::Instance => {
+                let start = after.map(catalog_object_key);
+                let mut current = None;
+                let mut failure = None;
+                let _ = tree.visit_prefix_cached(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &[CATALOG_OBJECT_PREFIX],
+                    start.as_deref(),
+                    |key, _| match decode_catalog_object_key(key) {
+                        Ok(id) => {
+                            current = Some(id);
+                            ControlFlow::Break(())
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            ControlFlow::Break(())
+                        }
+                    },
+                )?;
+                failure.map_or(Ok(current), Err)
+            }
+            CatalogVisibleScope::Subtree(ancestor) => {
+                let prefix = catalog_ancestor_descendant_prefix(ancestor);
+                let start = after.map(|after| catalog_ancestor_descendant_key(ancestor, after));
+                let mut current = None;
+                let mut failure = None;
+                let _ = tree.visit_prefix_cached(
+                    &self.pages,
+                    &self.buffer_pool,
+                    &prefix,
+                    start.as_deref(),
+                    |key, value| match decode_catalog_ancestor_descendant_entry(key, value) {
+                        Ok((found, descendant)) if found == ancestor => {
+                            current = Some(descendant);
+                            ControlFlow::Break(())
+                        }
+                        Ok(_) => {
+                            failure = Some(NativeRuntimeError::InvalidCatalogTree);
+                            ControlFlow::Break(())
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            ControlFlow::Break(())
+                        }
+                    },
+                )?;
+                failure.map_or(Ok(current), Err)
+            }
+        }
+    }
+
+    fn catalog_object_is_in_visible_scope(
+        &self,
+        tree: BTree,
+        root: PageId,
+        scope: CatalogVisibleScope,
+        object: ObjectId,
+    ) -> Result<bool, NativeRuntimeError> {
+        match scope {
+            CatalogVisibleScope::Instance => {
+                Ok(self.logical_catalog_object_at_root(root, object)?.is_some())
+            }
+            CatalogVisibleScope::Object(visible) => {
+                Ok(visible == object
+                    && self.logical_catalog_object_at_root(root, object)?.is_some())
+            }
+            CatalogVisibleScope::Subtree(ancestor) => {
+                if tree
+                    .get_cached_pinned(
+                        &self.pages,
+                        &self.buffer_pool,
+                        &catalog_ancestor_descendant_key(ancestor, object),
+                    )?
+                    .is_some()
+                {
+                    Ok(self.logical_catalog_object_at_root(root, object)?.is_some())
+                } else {
+                    Ok(false)
+                }
+            }
+        }
     }
 
     /// Describes one complete logical V2 object by stable identity.
@@ -6331,7 +6719,10 @@ impl NativeDatabase {
         let marker = BTree::from_root(root)
             .get_cached_pinned(&self.pages, &self.buffer_pool, CATALOG_FORMAT_KEY)?
             .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
-        if marker.bytes() == CATALOG_FORMAT_VALUE_V6 {
+        if matches!(
+            marker.bytes(),
+            CATALOG_FORMAT_VALUE_V6 | CATALOG_FORMAT_VALUE_V7
+        ) {
             Ok(())
         } else if marker.bytes() == CATALOG_FORMAT_VALUE_V3
             || marker.bytes() == CATALOG_FORMAT_VALUE_V4
@@ -6340,6 +6731,18 @@ impl NativeDatabase {
             Err(NativeRuntimeError::CatalogV2Unavailable)
         } else {
             Err(NativeRuntimeError::InvalidCatalogTree)
+        }
+    }
+
+    fn require_catalog_v7(&self, root: PageId) -> Result<(), NativeRuntimeError> {
+        self.require_catalog_v6(root)?;
+        let marker = BTree::from_root(root)
+            .get_cached_pinned(&self.pages, &self.buffer_pool, CATALOG_FORMAT_KEY)?
+            .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
+        if marker.bytes() == CATALOG_FORMAT_VALUE_V7 {
+            Ok(())
+        } else {
+            Err(NativeRuntimeError::CatalogV2Unavailable)
         }
     }
 
@@ -6531,7 +6934,10 @@ impl NativeDatabase {
             .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
         if !matches!(
             marker.bytes(),
-            CATALOG_FORMAT_VALUE_V4 | CATALOG_FORMAT_VALUE_V5 | CATALOG_FORMAT_VALUE_V6
+            CATALOG_FORMAT_VALUE_V4
+                | CATALOG_FORMAT_VALUE_V5
+                | CATALOG_FORMAT_VALUE_V6
+                | CATALOG_FORMAT_VALUE_V7
         ) {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
@@ -6919,6 +7325,37 @@ impl NativeDatabase {
         Ok(prepared)
     }
 
+    /// Parses and binds one SQL statement against the current catalog.
+    ///
+    /// Read bindings retain their prepared plan; write bindings retain the
+    /// parsed statement plus every relation, index, and foreign-key dependency
+    /// that execution may touch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for snapshot coordination, malformed SQL, invalid
+    /// parameters, or an unresolved catalog dependency.
+    pub fn bind_sql_latest(
+        &self,
+        statement: &str,
+        parameters: &[SqlValue],
+    ) -> Result<BoundSqlStatement, SqlError> {
+        let _permit = self.admit_foreground_bounded()?;
+        let metadata = self
+            .coordinator
+            .snapshot(0)
+            .map_err(NativeRuntimeError::from)?;
+        let catalog = load_catalog_state(&self.pages, &self.blobs, metadata.roots())?;
+        let ordered_secondary_indexes = self.ordered_secondary_indexes_at(&metadata, &catalog)?;
+        sql::bind_catalog(
+            metadata.catalog_version,
+            &catalog,
+            &ordered_secondary_indexes,
+            statement,
+            parameters,
+        )
+    }
+
     /// Executes one current catalog-bound SQL plan through physical roots.
     ///
     /// The execution captures one root-set snapshot and does not materialize
@@ -6952,6 +7389,23 @@ impl NativeDatabase {
         prepared: &PreparedStatement,
         parameters: &[SqlValue],
     ) -> Result<NativeSqlExecutionReceipt, SqlError> {
+        self.execute_prepared_latest_profiled_with_checkpoint(prepared, parameters, || true)
+    }
+
+    /// Executes a current catalog-bound SQL plan with a cooperative checkpoint.
+    ///
+    /// The callback runs during bounded scan, join, and vector-batch loops.
+    /// Returning `false` interrupts execution before a partial result is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profiled execution errors or [`SqlError::ExecutionInterrupted`].
+    pub fn execute_prepared_latest_profiled_with_checkpoint(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+        mut checkpoint: impl FnMut() -> bool,
+    ) -> Result<NativeSqlExecutionReceipt, SqlError> {
         let permit = match prepared.parallel_scan_limit() {
             Some(limit) => self.admit_parallel_foreground_bounded_io(
                 segmented_result_memory_bytes(limit),
@@ -6977,6 +7431,7 @@ impl NativeDatabase {
             prepared,
             parameters,
             permit.as_ref().map(DatabaseGovernorPermit::permit),
+            &mut checkpoint,
         )?;
         let execution = permit.map(DatabaseGovernorPermit::finish);
         Ok(NativeSqlExecutionReceipt {
@@ -7008,6 +7463,28 @@ impl NativeDatabase {
         parameters: &[SqlValue],
     ) -> Result<(Csn, CatalogVersion, [u8; 32], SqlResult), SqlError> {
         self.execute_prepared_latest_profiled(prepared, parameters)
+            .map(|receipt| {
+                (
+                    receipt.snapshot_csn,
+                    receipt.catalog_version,
+                    receipt.root_digest,
+                    receipt.result,
+                )
+            })
+    }
+
+    /// Executes one current prepared plan with cooperative loop checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_prepared_latest_profiled_with_checkpoint`].
+    pub fn execute_prepared_latest_identified_with_checkpoint(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[SqlValue],
+        checkpoint: impl FnMut() -> bool,
+    ) -> Result<(Csn, CatalogVersion, [u8; 32], SqlResult), SqlError> {
+        self.execute_prepared_latest_profiled_with_checkpoint(prepared, parameters, checkpoint)
             .map(|receipt| {
                 (
                     receipt.snapshot_csn,
@@ -18505,7 +18982,7 @@ impl NativeDatabase {
         if let Some((_, _, resolution)) = resolution_binding {
             transaction.resolution = Some(resolution);
         }
-        transaction.commit_report_at(interruption)
+        transaction.commit_report_at(interruption.map(CommitInterruption::returning))
     }
 
     fn validate_optimistic_batch_preflight(
@@ -20454,6 +20931,61 @@ impl NativeWriteBatch {
         self.state.catalog.next_object_id().map_err(Into::into)
     }
 
+    /// Returns the catalog version captured by this batch's private view.
+    pub const fn catalog_version(&self) -> CatalogVersion {
+        self.snapshot.catalog_version
+    }
+
+    /// Parses and binds SQL against this batch's private catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported syntax, invalid parameters, or an
+    /// unresolved catalog dependency.
+    pub fn bind_sql(
+        &self,
+        statement: &str,
+        parameters: &[SqlValue],
+    ) -> Result<BoundSqlStatement, SqlError> {
+        let ordered_secondary_indexes = sql::transaction_ordered_secondary_indexes(self);
+        sql::bind_catalog(
+            self.catalog_version(),
+            &self.state.catalog,
+            &ordered_secondary_indexes,
+            statement,
+            parameters,
+        )
+    }
+
+    /// Executes one exact SQL binding against this private catalog view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding is stale or execution fails.
+    pub fn execute_bound_sql(
+        &mut self,
+        bound: &BoundSqlStatement,
+        parameters: &[SqlValue],
+    ) -> Result<SqlResult, SqlError> {
+        self.execute_bound_sql_with_checkpoint(bound, parameters, || true)
+    }
+
+    /// Executes one exact SQL binding with cooperative bounded-loop checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bound execution errors or [`SqlError::ExecutionInterrupted`].
+    pub fn execute_bound_sql_with_checkpoint(
+        &mut self,
+        bound: &BoundSqlStatement,
+        parameters: &[SqlValue],
+        mut checkpoint: impl FnMut() -> bool,
+    ) -> Result<SqlResult, SqlError> {
+        self.require_materialized_mutation_entry()
+            .map_err(SqlError::from)?;
+        sql::execute_bound_transaction_with_checkpoint(self, bound, parameters, &mut checkpoint)
+    }
+
     /// Returns the number of physical mutations currently retained by this batch.
     pub fn mutation_count(&self) -> usize {
         self.mutations.len()
@@ -20575,9 +21107,18 @@ impl NativeWriteBatch {
         Ok(())
     }
 
+    #[cfg(test)]
     fn create_secondary_index_definition(
         &mut self,
         definition: &SecondaryIndexDefinition,
+    ) -> Result<(), NativeRuntimeError> {
+        self.create_secondary_index_definition_with_checkpoint(definition, &mut || true)
+    }
+
+    fn create_secondary_index_definition_with_checkpoint(
+        &mut self,
+        definition: &SecondaryIndexDefinition,
+        checkpoint: &mut dyn FnMut() -> bool,
     ) -> Result<(), NativeRuntimeError> {
         let id = definition.header.id;
         let relation = definition.relation;
@@ -20601,6 +21142,7 @@ impl NativeWriteBatch {
             .map(|(primary_key, row)| (primary_key.clone(), row.clone()))
             .collect::<Vec<_>>();
         for (primary_key, row) in rows {
+            runtime_sql_checkpoint(checkpoint)?;
             let projection = secondary_index_projection(&catalog, definition, &row)?;
             relational.insert_secondary_index(
                 id,
@@ -20635,15 +21177,32 @@ impl NativeWriteBatch {
         primary_key: impl Into<Vec<u8>>,
         row: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.insert_with_checkpoint(table, primary_key, row, &mut || true)
+    }
+
+    fn insert_with_checkpoint(
+        &mut self,
+        table: ObjectId,
+        primary_key: impl Into<Vec<u8>>,
+        row: impl Into<Vec<u8>>,
+        checkpoint: &mut dyn FnMut() -> bool,
+    ) -> Result<(), NativeRuntimeError> {
         self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
         let row = row.into();
         validate_relation_checks(&self.state.catalog, table, &row)?;
-        let projections = secondary_index_projections(&self.state.catalog, table, &row)?;
+        let projections = secondary_index_projections_with_checkpoint(
+            &self.state.catalog,
+            table,
+            &row,
+            checkpoint,
+        )?;
         let mut relational = self.state.relational.clone();
+        runtime_sql_checkpoint(checkpoint)?;
         relational.insert(table, primary_key.clone(), row.clone())?;
         for projection in &projections {
+            runtime_sql_checkpoint(checkpoint)?;
             relational.insert_secondary_index(
                 projection.index,
                 projection.key.clone(),
@@ -20675,6 +21234,16 @@ impl NativeWriteBatch {
         primary_key: impl Into<Vec<u8>>,
         row: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.update_with_checkpoint(table, primary_key, row, &mut || true)
+    }
+
+    fn update_with_checkpoint(
+        &mut self,
+        table: ObjectId,
+        primary_key: impl Into<Vec<u8>>,
+        row: impl Into<Vec<u8>>,
+        checkpoint: &mut dyn FnMut() -> bool,
+    ) -> Result<(), NativeRuntimeError> {
         self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
@@ -20685,13 +21254,34 @@ impl NativeWriteBatch {
             .select(table, &primary_key)
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
-        let old_projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        let old_projections = secondary_index_projections_with_checkpoint(
+            &self.state.catalog,
+            table,
+            &old_row,
+            checkpoint,
+        )?;
         validate_relation_checks(&self.state.catalog, table, &row)?;
-        let new_projections = secondary_index_projections(&self.state.catalog, table, &row)?;
+        let new_projections = secondary_index_projections_with_checkpoint(
+            &self.state.catalog,
+            table,
+            &row,
+            checkpoint,
+        )?;
         let mut relational = self.state.relational.clone();
-        remove_secondary_index_projections(&mut relational, &old_projections, &primary_key)?;
+        remove_secondary_index_projections_with_checkpoint(
+            &mut relational,
+            &old_projections,
+            &primary_key,
+            checkpoint,
+        )?;
+        runtime_sql_checkpoint(checkpoint)?;
         relational.update(table, &primary_key, row.clone())?;
-        insert_secondary_index_projections(&mut relational, &new_projections, &primary_key)?;
+        insert_secondary_index_projections_with_checkpoint(
+            &mut relational,
+            &new_projections,
+            &primary_key,
+            checkpoint,
+        )?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
             opcode: Opcode::UpdateRow,
@@ -20715,6 +21305,15 @@ impl NativeWriteBatch {
         table: ObjectId,
         primary_key: impl Into<Vec<u8>>,
     ) -> Result<(), NativeRuntimeError> {
+        self.delete_with_checkpoint(table, primary_key, &mut || true)
+    }
+
+    fn delete_with_checkpoint(
+        &mut self,
+        table: ObjectId,
+        primary_key: impl Into<Vec<u8>>,
+        checkpoint: &mut dyn FnMut() -> bool,
+    ) -> Result<(), NativeRuntimeError> {
         self.require_materialized_mutation_entry()?;
         self.state.catalog.require(table, EngineKind::Relational)?;
         let primary_key = primary_key.into();
@@ -20724,9 +21323,20 @@ impl NativeWriteBatch {
             .select(table, &primary_key)
             .ok_or(ModelError::MissingPrimaryKey)?
             .to_vec();
-        let projections = secondary_index_projections(&self.state.catalog, table, &old_row)?;
+        let projections = secondary_index_projections_with_checkpoint(
+            &self.state.catalog,
+            table,
+            &old_row,
+            checkpoint,
+        )?;
         let mut relational = self.state.relational.clone();
-        remove_secondary_index_projections(&mut relational, &projections, &primary_key)?;
+        remove_secondary_index_projections_with_checkpoint(
+            &mut relational,
+            &projections,
+            &primary_key,
+            checkpoint,
+        )?;
+        runtime_sql_checkpoint(checkpoint)?;
         relational.delete(table, &primary_key)?;
         self.mutations.push(Mutation {
             engine: EngineKind::Relational,
@@ -23706,7 +24316,27 @@ impl NativeTransaction<'_> {
         self,
         boundary: CommitBoundary,
     ) -> Result<CommitReceipt, NativeRuntimeError> {
-        self.commit_report_at(Some(boundary))
+        self.commit_report_at(Some(CommitInterruption::returning(boundary)))
+            .map(|report| report.commit)
+    }
+
+    /// Stops inside one exact commit boundary hook for a process-crash harness.
+    ///
+    /// The hook runs synchronously before commit frames, guards, or owned state
+    /// can unwind. A hard-kill hook is expected not to return; if it does, the
+    /// normal injected-crash error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::InjectedCrash`] if the hook returns, or
+    /// another persistence/validation error encountered before the boundary.
+    #[doc(hidden)]
+    pub fn commit_with_boundary_hook_for_test(
+        self,
+        boundary: CommitBoundary,
+        hook: fn(CommitBoundary),
+    ) -> Result<CommitReceipt, NativeRuntimeError> {
+        self.commit_report_at(Some(CommitInterruption::hooked(boundary, hook)))
             .map(|report| report.commit)
     }
 
@@ -23732,7 +24362,7 @@ impl NativeTransaction<'_> {
 
     fn commit_report_at(
         mut self,
-        interruption: Option<CommitBoundary>,
+        interruption: Option<CommitInterruption>,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
         let execution_started = Instant::now();
         if self.batch.mutations.is_empty() {
@@ -24356,6 +24986,7 @@ fn apply_mutations_to_state(
     for mutation in mutations {
         match mutation.opcode {
             Opcode::CreateCatalogObjectV2 => apply_catalog_v2_creation(state, mutation)?,
+            Opcode::MigrateCatalogV7 => validate_maintenance_mutation(mutation)?,
             Opcode::CreateTable
             | Opcode::InsertRow
             | Opcode::UpdateRow
@@ -24559,7 +25190,7 @@ fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntim
         Opcode::CompactStructure
         | Opcode::MigrateStructureV3
         | Opcode::CleanupStructureRetirementV3 => EngineKind::Structure,
-        Opcode::VacuumPageGeneration => EngineKind::Kernel,
+        Opcode::VacuumPageGeneration | Opcode::MigrateCatalogV7 => EngineKind::Kernel,
         Opcode::CompactSearch | Opcode::ConsolidateAnn => EngineKind::Search,
         _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
     };
@@ -24823,6 +25454,7 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             }
             Opcode::CompactStructure => vec![5],
             Opcode::MigrateStructureV3 => vec![8],
+            Opcode::MigrateCatalogV7 => vec![11],
             Opcode::CleanupStructureRetirementV3 => {
                 let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
                 identity.push(9);
@@ -25086,10 +25718,13 @@ fn collect_group_outcomes(
 }
 
 fn interrupt(
-    requested: Option<CommitBoundary>,
+    requested: Option<CommitInterruption>,
     current: CommitBoundary,
 ) -> Result<(), NativeRuntimeError> {
-    if requested == Some(current) {
+    if requested.is_some_and(|request| request.boundary == current) {
+        if let Some(hook) = requested.and_then(|request| request.hook) {
+            hook(current);
+        }
         Err(NativeRuntimeError::InjectedCrash(current))
     } else {
         Ok(())
@@ -25566,10 +26201,11 @@ fn catalog_requires_full_rebuild(
                 .get(pages, CATALOG_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?;
             match marker.as_slice() {
-                CATALOG_FORMAT_VALUE_V6 => Ok(false),
-                CATALOG_FORMAT_VALUE_V3 | CATALOG_FORMAT_VALUE_V4 | CATALOG_FORMAT_VALUE_V5 => {
-                    Ok(true)
-                }
+                CATALOG_FORMAT_VALUE_V7 => Ok(false),
+                CATALOG_FORMAT_VALUE_V3
+                | CATALOG_FORMAT_VALUE_V4
+                | CATALOG_FORMAT_VALUE_V5
+                | CATALOG_FORMAT_VALUE_V6 => Ok(true),
                 _ => Err(NativeRuntimeError::InvalidCatalogTree),
             }
         }
@@ -25577,6 +26213,7 @@ fn catalog_requires_full_rebuild(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn catalog_root_after_mutations(
     pages: &mut PageStore,
     blobs: &BlobStore,
@@ -25590,7 +26227,10 @@ fn catalog_root_after_mutations(
         || mutations.iter().any(|mutation| {
             matches!(
                 mutation.opcode,
-                Opcode::DropSecondaryIndex | Opcode::DropTable | Opcode::RenameTable
+                Opcode::DropSecondaryIndex
+                    | Opcode::DropTable
+                    | Opcode::RenameTable
+                    | Opcode::MigrateCatalogV7
             )
         });
     let tree = if rebuild {
@@ -25629,7 +26269,7 @@ fn catalog_root_after_mutations(
         );
         entries.push((
             CATALOG_FORMAT_KEY.to_vec(),
-            CATALOG_FORMAT_VALUE_V6.to_vec(),
+            CATALOG_FORMAT_VALUE_V7.to_vec(),
         ));
         entries.push((
             CATALOG_ID_AUTHORITY_KEY.to_vec(),
@@ -25641,9 +26281,11 @@ fn catalog_root_after_mutations(
         ));
         for object in catalog.objects.values() {
             append_catalog_object_entries(&mut entries, object, blob_references)?;
+            append_catalog_ancestor_entries(&mut entries, catalog, object.header().id)?;
         }
         for object in catalog.logical_objects.values() {
             append_logical_catalog_object_entries(&mut entries, object, blob_references)?;
+            append_catalog_ancestor_entries(&mut entries, catalog, object.id())?;
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         BTree::empty()
@@ -25674,6 +26316,7 @@ fn catalog_root_after_mutations(
                 return Err(NativeRuntimeError::InvalidCatalogTree);
             }
             append_any_catalog_object_entries(&mut entries, &object, blob_references)?;
+            append_catalog_ancestor_entries(&mut entries, catalog, object.id())?;
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         existing
@@ -25783,6 +26426,26 @@ fn append_any_catalog_object_entries(
     }
 }
 
+fn append_catalog_ancestor_entries(
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    catalog: &CatalogState,
+    descendant: ObjectId,
+) -> Result<(), NativeRuntimeError> {
+    let mut ancestor = Some(descendant);
+    let mut visited = BTreeSet::new();
+    while let Some(current) = ancestor {
+        if !visited.insert(current) {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
+        entries.push((
+            catalog_ancestor_descendant_key(current, descendant),
+            Vec::new(),
+        ));
+        ancestor = catalog.parent(current);
+    }
+    Ok(())
+}
+
 fn catalog_definition_storage_value(
     definition: &[u8],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
@@ -25830,6 +26493,44 @@ fn decode_catalog_object_key(key: &[u8]) -> Result<ObjectId, NativeRuntimeError>
             .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
     ))
     .map_err(|_| NativeRuntimeError::InvalidCatalogTree)
+}
+
+fn catalog_ancestor_descendant_prefix(ancestor: ObjectId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(CATALOG_ANCESTOR_DESCENDANT_PREFIX);
+    key.extend_from_slice(&ancestor.get().to_be_bytes());
+    key
+}
+
+fn catalog_ancestor_descendant_key(ancestor: ObjectId, descendant: ObjectId) -> Vec<u8> {
+    let mut key = catalog_ancestor_descendant_prefix(ancestor);
+    key.extend_from_slice(&descendant.get().to_be_bytes());
+    key
+}
+
+fn decode_catalog_ancestor_descendant_entry(
+    key: &[u8],
+    value: &[u8],
+) -> Result<(ObjectId, ObjectId), NativeRuntimeError> {
+    if key.len() != 33
+        || key.first() != Some(&CATALOG_ANCESTOR_DESCENDANT_PREFIX)
+        || !value.is_empty()
+    {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let ancestor = ObjectId::new(u128::from_be_bytes(
+        key[1..17]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+    let descendant = ObjectId::new(u128::from_be_bytes(
+        key[17..]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?,
+    ))
+    .map_err(|_| NativeRuntimeError::InvalidCatalogTree)?;
+    Ok((ancestor, descendant))
 }
 
 fn decode_catalog_name_value(value: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
@@ -32328,7 +33029,22 @@ fn insert_secondary_index_projections(
     projections: &[SecondaryIndexProjection],
     primary_key: &[u8],
 ) -> Result<(), NativeRuntimeError> {
+    insert_secondary_index_projections_with_checkpoint(
+        relational,
+        projections,
+        primary_key,
+        &mut || true,
+    )
+}
+
+fn insert_secondary_index_projections_with_checkpoint(
+    relational: &mut RelationState,
+    projections: &[SecondaryIndexProjection],
+    primary_key: &[u8],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<(), NativeRuntimeError> {
     for projection in projections {
+        runtime_sql_checkpoint(checkpoint)?;
         relational.insert_secondary_index(
             projection.index,
             projection.key.clone(),
@@ -32344,7 +33060,22 @@ fn remove_secondary_index_projections(
     projections: &[SecondaryIndexProjection],
     primary_key: &[u8],
 ) -> Result<(), NativeRuntimeError> {
+    remove_secondary_index_projections_with_checkpoint(
+        relational,
+        projections,
+        primary_key,
+        &mut || true,
+    )
+}
+
+fn remove_secondary_index_projections_with_checkpoint(
+    relational: &mut RelationState,
+    projections: &[SecondaryIndexProjection],
+    primary_key: &[u8],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<(), NativeRuntimeError> {
     for projection in projections {
+        runtime_sql_checkpoint(checkpoint)?;
         relational.remove_secondary_index(projection.index, &projection.key, primary_key)?;
     }
     Ok(())
@@ -32550,21 +33281,25 @@ fn secondary_index_projections(
     relation: ObjectId,
     row: &[u8],
 ) -> Result<Vec<SecondaryIndexProjection>, NativeRuntimeError> {
-    catalog
-        .objects
-        .values()
-        .filter_map(|object| match object {
-            CatalogObject::SecondaryIndex(definition) if definition.relation == relation => {
-                Some(definition)
-            }
-            CatalogObject::Relation(_)
-            | CatalogObject::SecondaryIndex(_)
-            | CatalogObject::Structure(_)
-            | CatalogObject::Search(_)
-            | CatalogObject::CrossEngineLink(_) => None,
-        })
-        .map(|definition| secondary_index_projection(catalog, definition, row))
-        .collect()
+    secondary_index_projections_with_checkpoint(catalog, relation, row, &mut || true)
+}
+
+fn secondary_index_projections_with_checkpoint(
+    catalog: &CatalogState,
+    relation: ObjectId,
+    row: &[u8],
+    checkpoint: &mut dyn FnMut() -> bool,
+) -> Result<Vec<SecondaryIndexProjection>, NativeRuntimeError> {
+    let mut projections = Vec::new();
+    for object in catalog.objects.values() {
+        runtime_sql_checkpoint(checkpoint)?;
+        if let CatalogObject::SecondaryIndex(definition) = object
+            && definition.relation == relation
+        {
+            projections.push(secondary_index_projection(catalog, definition, row)?);
+        }
+    }
+    Ok(projections)
 }
 
 fn secondary_index_projection(
@@ -32612,6 +33347,14 @@ fn secondary_index_projection(
         key,
         contains_null,
     })
+}
+
+fn runtime_sql_checkpoint(checkpoint: &mut dyn FnMut() -> bool) -> Result<(), NativeRuntimeError> {
+    if checkpoint() {
+        Ok(())
+    } else {
+        Err(GovernorQueueError::Cancelled.into())
+    }
 }
 
 fn secondary_index_entry_identity(
@@ -33988,14 +34731,19 @@ fn load_catalog_state_root(
     if format_key != CATALOG_FORMAT_KEY {
         return Err(NativeRuntimeError::InvalidCatalogTree);
     }
-    let (has_relation_indexes, has_id_authority, has_logical_dependencies) =
-        match format_value.as_slice() {
-            CATALOG_FORMAT_VALUE_V3 => (false, false, false),
-            CATALOG_FORMAT_VALUE_V4 => (true, false, false),
-            CATALOG_FORMAT_VALUE_V5 => (true, true, false),
-            CATALOG_FORMAT_VALUE_V6 => (true, true, true),
-            _ => return Err(NativeRuntimeError::InvalidCatalogTree),
-        };
+    let (
+        has_relation_indexes,
+        has_id_authority,
+        has_logical_dependencies,
+        has_ancestor_descendants,
+    ) = match format_value.as_slice() {
+        CATALOG_FORMAT_VALUE_V3 => (false, false, false, false),
+        CATALOG_FORMAT_VALUE_V4 => (true, false, false, false),
+        CATALOG_FORMAT_VALUE_V5 => (true, true, false, false),
+        CATALOG_FORMAT_VALUE_V6 => (true, true, true, false),
+        CATALOG_FORMAT_VALUE_V7 => (true, true, true, true),
+        _ => return Err(NativeRuntimeError::InvalidCatalogTree),
+    };
 
     let mut objects = Vec::new();
     let mut logical_objects = Vec::new();
@@ -34004,6 +34752,7 @@ fn load_catalog_state_root(
     let mut relation_indexes = BTreeSet::new();
     let mut outgoing_dependencies = BTreeSet::new();
     let mut incoming_dependencies = BTreeSet::new();
+    let mut ancestor_descendants = BTreeSet::new();
     for (key, value) in iterator {
         match key.first().copied() {
             Some(0) if has_id_authority && key == CATALOG_ID_AUTHORITY_KEY && value.len() == 16 => {
@@ -34072,6 +34821,12 @@ fn load_catalog_state_root(
                     return Err(NativeRuntimeError::InvalidCatalogTree);
                 }
             }
+            Some(CATALOG_ANCESTOR_DESCENDANT_PREFIX) if has_ancestor_descendants => {
+                let entry = decode_catalog_ancestor_descendant_entry(&key, &value)?;
+                if !ancestor_descendants.insert(entry) {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+            }
             _ => return Err(NativeRuntimeError::InvalidCatalogTree),
         }
     }
@@ -34119,6 +34874,32 @@ fn load_catalog_state_root(
             || incoming_dependencies != expected_dependencies)
     {
         return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    if has_ancestor_descendants {
+        let mut expected = BTreeSet::new();
+        for object in &objects {
+            expected.insert((object.header().id, object.header().id));
+        }
+        let logical_by_id = logical_objects
+            .iter()
+            .map(|object| (object.id(), object))
+            .collect::<BTreeMap<_, _>>();
+        for object in &logical_objects {
+            let mut current = Some(object.id());
+            let mut visited = BTreeSet::new();
+            while let Some(ancestor) = current {
+                if !visited.insert(ancestor) {
+                    return Err(NativeRuntimeError::InvalidCatalogTree);
+                }
+                expected.insert((ancestor, object.id()));
+                current = logical_by_id
+                    .get(&ancestor)
+                    .and_then(|definition| definition.parent());
+            }
+        }
+        if ancestor_descendants != expected {
+            return Err(NativeRuntimeError::InvalidCatalogTree);
+        }
     }
     if has_id_authority && persisted_next_object_id.is_none() {
         return Err(NativeRuntimeError::InvalidCatalogTree);
@@ -35698,27 +36479,27 @@ mod tests {
         ActiveExpiryConfig, ActiveExpiryFailure, AnnRecallRisk, AnnSearchOptions,
         AnnSearchStrategy, BlobStore, CATALOG_FORMAT_KEY, CATALOG_FORMAT_VALUE_V3,
         CATALOG_FORMAT_VALUE_V4, CATALOG_FORMAT_VALUE_V5, CATALOG_FORMAT_VALUE_V6,
-        CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX, CATALOG_OBJECT_PREFIX,
-        CATALOG_RELATION_INDEX_PREFIX, CATALOG_VALUE_BLOB, CATALOG_VALUE_HEADER_SIZE,
-        CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC, CatalogDependencyRequest, CatalogListRequest,
-        CatalogName, CatalogObject, CatalogPageStop, CatalogState, CheckpointBoundary,
-        ColumnDefinition, CommitBoundary, CommitCancellationOutcome, EngineKind,
-        GovernorAdmissionError, GovernorClassLimit, GovernorMode, GovernorQueueError,
-        GovernorRequest, GroupCommitBoundary, GroupCommitConfig, GroupCommitOutcome,
-        GroupCommitSubmitError, HardwareCpu, HardwareMemory, HardwareOperatingSystem,
-        HardwareProfile, HardwareStorage, HashFieldEntry, HashPatternError, HashPatternScanPage,
-        HashPatternScanRequest, HashPatternScanStop, HashSetOutcome, HnswConfig, ManifestError,
-        Mutation, NativeCommitBatch, NativeCommitClient, NativeCommitControl,
-        NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch, NativeDirectoryError,
-        NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion, NativeHybridRequest,
-        NativePendingCommit, NativeResourceGovernor, NativeRuntimeError, NativeSchedulerClock,
-        NativeTransaction, NativeVectorBranch, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE,
-        PageStore, PromotionBoundary, QualifiedName, RelationDefinition, RelationalScanRow,
-        RootManifest, SLOT_CATALOG, SetCondition, SetOutcome, SnapshotPinBoundary,
-        SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult, SqlValue,
-        VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric, VectorRecord, WAL_FILE,
-        WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass, ZAddOutcome,
-        append_catalog_object_entries, binary_relation_definition,
+        CATALOG_FORMAT_VALUE_V7, CATALOG_INLINE_VALUE_LIMIT, CATALOG_NAME_PREFIX,
+        CATALOG_OBJECT_PREFIX, CATALOG_RELATION_INDEX_PREFIX, CATALOG_VALUE_BLOB,
+        CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC,
+        CatalogDependencyRequest, CatalogListRequest, CatalogName, CatalogObject, CatalogPageStop,
+        CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
+        CommitCancellationOutcome, EngineKind, GovernorAdmissionError, GovernorClassLimit,
+        GovernorMode, GovernorQueueError, GovernorRequest, GroupCommitBoundary, GroupCommitConfig,
+        GroupCommitOutcome, GroupCommitSubmitError, HardwareCpu, HardwareMemory,
+        HardwareOperatingSystem, HardwareProfile, HardwareStorage, HashFieldEntry,
+        HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
+        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitBatch, NativeCommitClient,
+        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch,
+        NativeDirectoryError, NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion,
+        NativeHybridRequest, NativePendingCommit, NativeResourceGovernor, NativeRuntimeError,
+        NativeSchedulerClock, NativeTransaction, NativeVectorBranch, NativeWriteBatch,
+        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
+        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
+        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
+        SqlResult, SqlValue, VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric,
+        VectorRecord, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass,
+        ZAddOutcome, append_catalog_object_entries, binary_relation_definition,
         catalog_definition_storage_value, catalog_dependency_prefix, catalog_name_identity,
         catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
@@ -36804,7 +37585,7 @@ mod tests {
             BTree::from_root(root)
                 .get(&database.pages, CATALOG_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
-            CATALOG_FORMAT_VALUE_V6
+            CATALOG_FORMAT_VALUE_V7
         );
         assert_eq!(database_object.id(), ObjectId::new(10)?);
         Ok(())
@@ -37026,6 +37807,7 @@ mod tests {
                 key.first() != Some(&CATALOG_RELATION_INDEX_PREFIX)
                     && key.first() != Some(&super::CATALOG_DEPENDENCY_OUTGOING_PREFIX)
                     && key.first() != Some(&super::CATALOG_DEPENDENCY_INCOMING_PREFIX)
+                    && key.first() != Some(&super::CATALOG_ANCESTOR_DESCENDANT_PREFIX)
                     && key.as_slice() != super::CATALOG_ID_AUTHORITY_KEY
             })
             .collect::<Vec<_>>();
@@ -37064,7 +37846,7 @@ mod tests {
             BTree::from_root(migrated_root)
                 .get(&database.pages, CATALOG_FORMAT_KEY)?
                 .ok_or(NativeRuntimeError::InvalidCatalogTree)?,
-            CATALOG_FORMAT_VALUE_V6
+            CATALOG_FORMAT_VALUE_V7
         );
         assert_eq!(
             super::load_catalog_state_root(&database.pages, &database.blobs, migrated_root)?,
@@ -37251,8 +38033,9 @@ mod tests {
                 .scan(&database.pages)?
                 .into_iter()
                 .filter(|(key, _)| {
-                    marker == CATALOG_FORMAT_VALUE_V5
-                        || key.as_slice() != super::CATALOG_ID_AUTHORITY_KEY
+                    key.first() != Some(&super::CATALOG_ANCESTOR_DESCENDANT_PREFIX)
+                        && (marker == CATALOG_FORMAT_VALUE_V5
+                            || key.as_slice() != super::CATALOG_ID_AUTHORITY_KEY)
                 })
                 .collect::<Vec<_>>();
             entries[0].1 = marker.to_vec();
@@ -49819,6 +50602,130 @@ mod tests {
     }
 
     #[test]
+    fn prepared_statement_referenced_object_ids_include_every_access_index_canonically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE events (
+                id BIGINT PRIMARY KEY,
+                tenant TEXT NOT NULL,
+                active BOOLEAN NOT NULL
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing events table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(tenant_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_tenant ON events (tenant)", &[])?
+        else {
+            return Err("missing tenant index".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(active_index),
+            ..
+        } = seed.execute_sql("CREATE INDEX events_active ON events (active)", &[])?
+        else {
+            return Err("missing active index".into());
+        };
+        seed.commit()?;
+
+        let point = database.prepare_sql_latest("SELECT id FROM events WHERE id = ?")?;
+        assert_eq!(point.referenced_object_ids(), BTreeSet::from([table]));
+
+        let indexed = database
+            .prepare_sql_latest("SELECT id FROM events WHERE tenant = ? ORDER BY id LIMIT 10")?;
+        assert_eq!(
+            indexed.referenced_object_ids(),
+            BTreeSet::from([table, tenant_index])
+        );
+
+        let intersection = database.prepare_sql_latest(
+            "SELECT id FROM events
+             WHERE tenant = ? AND active = ?
+             ORDER BY id LIMIT 10",
+        )?;
+        assert_eq!(
+            intersection.referenced_object_ids(),
+            BTreeSet::from([table, tenant_index, active_index])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_referenced_object_ids_include_both_join_sides_and_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin_sql(10, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(accounts),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE accounts (
+                id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                plan_code TEXT
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing accounts table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(plans),
+            ..
+        } = seed.execute_sql(
+            "CREATE TABLE plans (
+                id BIGINT PRIMARY KEY,
+                code TEXT NOT NULL,
+                label TEXT NOT NULL
+            )",
+            &[],
+        )?
+        else {
+            return Err("missing plans table".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(plans_code),
+            ..
+        } = seed.execute_sql("CREATE UNIQUE INDEX plans_code ON plans (code)", &[])?
+        else {
+            return Err("missing plans code index".into());
+        };
+        let SqlResult::Command {
+            object_id: Some(accounts_email),
+            ..
+        } = seed.execute_sql(
+            "CREATE UNIQUE INDEX accounts_email ON accounts (email)",
+            &[],
+        )?
+        else {
+            return Err("missing accounts email index".into());
+        };
+        seed.commit()?;
+
+        let prepared = database.prepare_sql_latest(
+            "SELECT accounts.id, plans.label
+             FROM accounts
+             INNER JOIN plans ON accounts.plan_code = plans.code
+             WHERE email = ?",
+        )?;
+        assert_eq!(
+            prepared.referenced_object_ids(),
+            BTreeSet::from([accounts, plans, plans_code, accounts_email])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn typed_sql_rows_bind_to_catalog_and_survive_recovery()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -51881,6 +52788,25 @@ mod tests {
         assert_eq!(governor.usage_snapshot().compute_threads, 0);
         assert_eq!(governor.usage_snapshot().io_slots, 0);
         assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn vectorized_sql_scan_observes_deterministic_mid_execution_cancellation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_bounded_sql_scan(&mut database)?;
+        let plan = database.prepare_sql_latest(
+            "SELECT sequence FROM events ORDER BY tenant, sequence LIMIT 400",
+        )?;
+        let mut checkpoints = 0_usize;
+        let result = database.execute_prepared_latest_profiled_with_checkpoint(&plan, &[], || {
+            checkpoints = checkpoints.saturating_add(1);
+            checkpoints < 40
+        });
+        assert!(matches!(result, Err(SqlError::ExecutionInterrupted)));
+        assert_eq!(checkpoints, 40);
         Ok(())
     }
 

@@ -19,35 +19,126 @@
     "backup-restore-product-surface",
     "cross-surface-conformance"
   ],
-  "required_predecessors": ["G0", "G1", "G2", "G3", "G4", "G5"],
-  "required_platforms": ["linux", "macos", "windows"],
-  "required_sdks": ["rust", "python", "typescript"],
-  "required_transports": ["embedded", "native-local", "http-v2"],
+  "required_predecessors": [
+    "G0",
+    "G1",
+    "G2",
+    "G3",
+    "G4",
+    "G5"
+  ],
+  "required_platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "required_sdks": [
+    "rust",
+    "python",
+    "typescript"
+  ],
+  "required_transports": [
+    "embedded",
+    "native-local",
+    "http-v2"
+  ],
   "contracts": [
-    {"reference": "docs/gates/native-local-phase-1.md", "sha256": "41a109daef529fb0983a1a62a5916ebddce650a4668b9b4989bf2e0ea94f74d2"},
-    {"reference": "docs/adr/0023-native-local-product-and-competitive-scope.md", "sha256": "c4fc93447a3bbf109668c50b86a0f8031dacccc99fc87d6d028189098c03a3a0"},
-    {"reference": "docs/roadmaps/native-g6-roadmap.md", "sha256": "67a44336d3ad70e14a57e607c6d73a909192328995df65d4cb5ee2451a8a9ea1"},
-    {"reference": "docs/native/local-product-v1.md", "sha256": "a2bcb19cd5b38d6056ff46371e3a965edd2cdc2f54eb72256629029e83f5423d"},
-    {"reference": "docs/native/product-error-v1.md", "sha256": "1b64fd58d8e8e8cc48813443dede0c1ac45ca525db0849863b483612bfd800b8"},
-    {"reference": "docs/native/catalog-api-v1.md", "sha256": "2201193d3dad3367c95bb4d9f044410c32c0363856176b44ee3a79dc7e645084"},
-    {"reference": "docs/native/explain-v1.md", "sha256": "942245c0ac08bc6b22648cc633c6eff78e17351ba497b5ea5fe866d3f261db60"},
-    {"reference": "docs/native/telemetry-v1.md", "sha256": "4b21c9185bcd9cd7f10e20f28ac864a69b772c95c5020f248420ea8efd03563d"},
-    {"reference": "docs/native/native-proof-v1.md", "sha256": "2eec789a1ac258341091013ae2eff367a50fd6347d2fd10aa30a0b5f0f0fe821"},
-    {"reference": "docs/native/native-witness-v1.md", "sha256": "57a8e46116e5f8fe014dfa36e39e0b42b290b29595deae9024cf36f5701eb750"},
-    {"reference": "docs/native/http-v2.md", "sha256": "29c8d402e0ded742aee4678b23e4514f42fd0293406f90ed79e860c58a277cb1"},
-    {"reference": "docs/native/local-protocol-v1.md", "sha256": "c22d3faeb864cde4a6820707b260f18a785d6fc36cfce00b2d0e10dcd3569b55"},
-    {"reference": "docs/native/catalog-v1.md", "sha256": "94157ebd1e63a4324f834f079153d73c64d6337a29f04cf2849b33d11f724b4a"},
-    {"reference": "docs/native/search-semantics-v1.md", "sha256": "78df63d1fbb29c23c8df607b29401a117f6fb73d73ac1b8ac0c6110c0090b634"},
-    {"reference": "docs/native/ann-semantics-v1.md", "sha256": "fed33d9d21219fb8b5c541a1ea5c5500178af5c650cf0fb93b8e59190619c90b"},
-    {"reference": "docs/native/native-backup-v1.md", "sha256": "ebe196f520cf298528399931dfb7ad0a738a3745818f9fa626ee028a74adc848"},
-    {"reference": "contracts/openapi/hyphae-v2.yaml", "sha256": "d9a77d110de72c02a4a9a50c36d794a3b1bc861e67b0e6e9e28b3fdb035f2d3e"},
-    {"reference": "contracts/json-schema/native-v2.schema.json", "sha256": "a74dc6db53518a887002f4645b0dbf29cbbded96b5197e8bfd1e2e77888d6d83"},
-    {"reference": "contracts/json-schema/product-error-v2.schema.json", "sha256": "cb1fad105fe5150dc5547d4ffc80fedda44a8ab6b3118971a5424a986d1c33a6"},
-    {"reference": "contracts/json-schema/read-stream-v2.schema.json", "sha256": "741c374d2b56fc7bc3c6c26dfb6a910a2f6f59afc208164393feeaaa7f3c9839"},
-    {"reference": "contracts/json-schema/v1-compatibility-v2.schema.json", "sha256": "c159dde418f0165010b6a897b7f4dde2cc76eb82537a8f7401a49e507caa19e9"},
-    {"reference": "compatibility/native-protocol-v1-structure-get.bin", "sha256": "112d5048f2da5c1bd3cbbd5927d999104e8f49c75a74dfdd78273e462a50b6fa"},
-    {"reference": "config/native-golden-inventory.json", "sha256": "3b6f5fc50c79014773671e12b70fb420ff0b4a381fb562e53ddc7909837f8cd7"},
-    {"reference": "config/native-golden-requirements.json", "sha256": "018ef0e7e199a9c2478c943f4fcb40f9ad39819a57a3f13ff98a9e390b2a1a5e"}
+    {
+      "reference": "docs/gates/native-local-phase-1.md",
+      "sha256": "7d873668a13415561ef8323d619c5410ab15a2e610ac7eb8a76a85914bd64dc8"
+    },
+    {
+      "reference": "docs/adr/0023-native-local-product-and-competitive-scope.md",
+      "sha256": "c4fc93447a3bbf109668c50b86a0f8031dacccc99fc87d6d028189098c03a3a0"
+    },
+    {
+      "reference": "docs/roadmaps/native-g6-roadmap.md",
+      "sha256": "67a44336d3ad70e14a57e607c6d73a909192328995df65d4cb5ee2451a8a9ea1"
+    },
+    {
+      "reference": "docs/native/local-product-v1.md",
+      "sha256": "512af08594631e37b1daf8a8f986ed02f6853f6dab2253a94927260c4ac35bf2"
+    },
+    {
+      "reference": "docs/native/product-error-v1.md",
+      "sha256": "70f3b4f8ce59ce902a915cdc17945bf7ece8a9601041ef9890074cab89c7ebd1"
+    },
+    {
+      "reference": "docs/native/catalog-api-v1.md",
+      "sha256": "6897b31c93030df7f6ca8fe65abf5f247506ca1d3c25a089c54284dc082b3ced"
+    },
+    {
+      "reference": "docs/native/explain-v1.md",
+      "sha256": "370eeccec0783588147fa8dcb18718e6f996921b5535cf9312fa3b7b5a27142d"
+    },
+    {
+      "reference": "docs/native/telemetry-v1.md",
+      "sha256": "3059614cf470267b79dcdfa09ac52515386c7f5f1bd26d85ed81dd8d6f0471fd"
+    },
+    {
+      "reference": "docs/native/native-proof-v1.md",
+      "sha256": "6ad51ce1f71b91fca40cf0a7bc61a3dbafbd61dd19030de57159e7720c9f9d87"
+    },
+    {
+      "reference": "docs/native/native-witness-v1.md",
+      "sha256": "96ce879f04a21019d682f9825b72797650ec69fedd449ee7f1f1be8c3d771862"
+    },
+    {
+      "reference": "docs/native/http-v2.md",
+      "sha256": "364445b463d2b10926c2db25d902d26ce85e0dcde5d67e6c29f5736d215c6a3f"
+    },
+    {
+      "reference": "docs/native/local-protocol-v1.md",
+      "sha256": "634a4b10926650047a04a058096881e1fd51dadc45f38406c6c718c4b6bbaddd"
+    },
+    {
+      "reference": "docs/native/catalog-v1.md",
+      "sha256": "8ec9d515a8d893f6ecce5e7ddf3e5c9aeb7e9fb45b0a1a7254595a46fb8813e0"
+    },
+    {
+      "reference": "docs/native/search-semantics-v1.md",
+      "sha256": "441ae90091b070c12dfab5540cb06516d39e9d39d2a917117f456940f9736f64"
+    },
+    {
+      "reference": "docs/native/ann-semantics-v1.md",
+      "sha256": "46e926738b599da635dbaf96243bab8bfec6862bdd3280b1419a4675e14be6b9"
+    },
+    {
+      "reference": "docs/native/native-backup-v1.md",
+      "sha256": "2284c3bda25b80ca43b904c961f09df6ea0d189d032497ad84573181ab524fb8"
+    },
+    {
+      "reference": "contracts/openapi/hyphae-v2.yaml",
+      "sha256": "76b401819bddc9bc704d7374d57f5f379ee453b9495357b8ca97270ba06a95f6"
+    },
+    {
+      "reference": "contracts/json-schema/native-v2.schema.json",
+      "sha256": "aa896774005c8d7f691bd0fecc49ac18e561c6f18350b77508952bb28a6ec711"
+    },
+    {
+      "reference": "contracts/json-schema/product-error-v2.schema.json",
+      "sha256": "be6332d57b0e1f0c79314983b1977f71b0974cb41296114f868d1cb500090073"
+    },
+    {
+      "reference": "contracts/json-schema/read-stream-v2.schema.json",
+      "sha256": "f0d2dac1668b90c758a7a4596fe7e0ff19116c0b7c6db856ac72574696854560"
+    },
+    {
+      "reference": "contracts/json-schema/v1-compatibility-v2.schema.json",
+      "sha256": "97c635b43bcf20c388b061550afc70577a513224b7eeb383bf43cdc12b502b8a"
+    },
+    {
+      "reference": "compatibility/native-protocol-v1-structure-get.bin",
+      "sha256": "112d5048f2da5c1bd3cbbd5927d999104e8f49c75a74dfdd78273e462a50b6fa"
+    },
+    {
+      "reference": "config/native-golden-inventory.json",
+      "sha256": "3b6f5fc50c79014773671e12b70fb420ff0b4a381fb562e53ddc7909837f8cd7"
+    },
+    {
+      "reference": "config/native-golden-requirements.json",
+      "sha256": "018ef0e7e199a9c2478c943f4fcb40f9ad39819a57a3f13ff98a9e390b2a1a5e"
+    }
   ],
   "claims": [],
   "closure_declared": false

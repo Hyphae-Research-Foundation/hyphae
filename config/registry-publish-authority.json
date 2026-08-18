@@ -1,0 +1,176 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-registry-publish-authority-v1",
+  "repository": "celiumsai/hyphae",
+  "branch": "main",
+  "version": "1.2.0",
+  "tag": "v1.2.0",
+  "tag_kind": "annotated",
+  "tag_signature": {
+    "required": false,
+    "policy": "annotated-tag-with-sigstore-signed-release"
+  },
+  "environment": "registry-production",
+  "required_checks": [
+    {
+      "name": "Quality",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Test (Linux stable)",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Test (Linux MSRV)",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Test (macOS stable)",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Test (Windows stable)",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Public client conformance",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Optional framework integrations",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Release readiness",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Security hard-kill aggregate",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "MCP real hosts",
+      "workflow": ".github/workflows/ci.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Dependency and license policy",
+      "workflow": ".github/workflows/security.yml",
+      "event": "push",
+      "head_branch": "main"
+    },
+    {
+      "name": "Package x86_64-unknown-linux-gnu",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Package x86_64-apple-darwin",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Package aarch64-apple-darwin",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Package x86_64-pc-windows-msvc",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Assemble and verify release candidate",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Publish GitHub release",
+      "workflow": ".github/workflows/release.yml",
+      "event": "push",
+      "head_branch": "v1.2.0"
+    },
+    {
+      "name": "Validate all exact-SHA G8 receipts",
+      "workflow": ".github/workflows/native-g8-closure.yml",
+      "event": "workflow_dispatch",
+      "head_branch": "main"
+    }
+  ],
+  "required_artifacts": [
+    {
+      "id": "release-candidate",
+      "workflow": ".github/workflows/release.yml",
+      "name": "hyphae-release-candidate"
+    },
+    {
+      "id": "signed-release-receipt",
+      "workflow": ".github/workflows/release.yml",
+      "name": "native-g8-signed-release-{commit}"
+    },
+    {
+      "id": "g8-aggregate",
+      "workflow": ".github/workflows/native-g8-closure.yml",
+      "name": "native-g8-aggregate-{commit}"
+    },
+    {
+      "id": "mcp-real-hosts",
+      "workflow": ".github/workflows/ci.yml",
+      "name": "mcp-real-hosts-{commit}"
+    },
+    {
+      "id": "security-hard-kill",
+      "workflow": ".github/workflows/ci.yml",
+      "name": "security-hard-kill-{commit}"
+    }
+  ],
+  "control_files": [
+    ".github/workflows/registry-publish.yml",
+    "config/crates-io-release.json",
+    "config/npm-release.json",
+    "config/registry-publish-authority.json",
+    "packaging/g8_release_verification.py",
+    "packaging/finalize_release.py",
+    "packaging/provenance.py",
+    "packaging/release_evidence.py",
+    "packaging/release-evidence-v1.schema.json",
+    "packaging/required_checks.py",
+    "packaging/required-checks-report-v1.schema.json",
+    "tools/check_crate_packages.py",
+    "tools/check_native_g8_receipts.py",
+    "tools/check_npm_packages.py",
+    "tools/check_registry_publish.py",
+    "tools/check_mcp_host_receipts.py",
+    "tools/check_security_crash_matrix.py",
+    "tools/check_relicensing_transition.py",
+    "tools/check_relicensing_preflight.py",
+    "tools/check_license_policy.py",
+    "tools/generate_third_party_licenses.py",
+    "tools/produce_native_g8_receipt.py",
+    "tools/verify_crate_packages.py"
+  ]
+}

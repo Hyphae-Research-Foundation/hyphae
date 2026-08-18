@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Fail-closed qualification for the dedicated AWS i7i.metal-24xl G7 host."""
 
 from __future__ import annotations

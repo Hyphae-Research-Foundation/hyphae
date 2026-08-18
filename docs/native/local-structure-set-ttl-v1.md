@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local structure SET and TTL v1
 
 Status: implemented over the serial UDS session; direct-Linux evidence

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native active-expiry scheduler v1
 
 Status: implemented; evidence recorded in

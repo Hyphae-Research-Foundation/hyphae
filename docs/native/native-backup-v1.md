@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native backup format v1
 
 `NativeDatabase` backup is an offline, local operation. It uses the native
