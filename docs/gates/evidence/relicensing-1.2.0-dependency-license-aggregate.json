@@ -250,11 +250,11 @@
         "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
       },
       {
-        "canonical_sha256": "fc2698a473128916ed940e768b1138125a6bdb7aee0f466aad7c13599a7277f9",
+        "canonical_sha256": "8a9ef1327ec234e150585dbedde1e95a448f61013466b0834caf45920818267f",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 298,
         "result": "pass",
-        "sha256": "36f2b534d09eab3d358405bbbacdd54de11801a402aaec88180f9e7a9848ca9e"
+        "sha256": "10f5b1a184bed8ddb3805ad27450a1b5168b394294e4991eed53bbba48543a01"
       },
       {
         "canonical_sha256": "f3d3675e6a0a99ea69323198b0462a887b08ffd6ca0e0d8992cb3d3da71e90d1",
@@ -279,7 +279,7 @@
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "5f492471e104ed9a69c5b18d2f37216ba5cfbc316794c78f795ad1a9a016418d"
+      "sha256": "2986eec010bd6704898e55679c038440b857f8e345a38de8a00e976450fab552"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "8eefca403f33d2c093207a69f75072e9f11cc2d4",
+      "commit": "c827edbeffa11e79e01860738c977ff2653026b9",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "1ac6b4d36aec34a913841d8e1f6a39225fb31c9b"
+      "tree": "38e699f03303244e2cdba011f0b659e13cfaba07"
     }
   },
   "target_release": "1.2.0"
