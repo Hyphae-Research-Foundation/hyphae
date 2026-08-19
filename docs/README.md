@@ -16,6 +16,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Start here
 
+- [Hyphae usage manual](usage-manual.md)
 - [Native 1.0 capabilities and limits](product/native-capabilities.md)
 - [Native quickstart](quickstart-native.md)
 - [Published 0.2.1 capabilities and limits](product/capabilities.md)
