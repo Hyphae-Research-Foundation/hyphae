@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyphae-sdk"
-version = "1.2.0"
+version = "1.2.1"
 description = "Bounded Python client for Hyphae v1 and Native v2 APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"

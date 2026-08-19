@@ -1,10 +1,10 @@
 {
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": 2,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "apache_publication_authority": {
-    "version": "1.2.0",
-    "tag": "v1.2.0",
+    "version": "1.2.1",
+    "tag": "v1.2.1",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": true
   },
