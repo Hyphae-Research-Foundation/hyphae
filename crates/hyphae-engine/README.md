@@ -12,7 +12,7 @@ existing format-2 data directories and the published `/v1` surface.
 
 ```toml
 [dependencies]
-hyphae-engine = "1.2.1"
+hyphae-engine = "1.2.2"
 ```
 
 Open one data directory, store structured records, run deterministic queries,

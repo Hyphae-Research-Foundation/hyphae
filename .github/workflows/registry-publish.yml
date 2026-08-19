@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: Existing source tag; live publication accepts only v1.2.1
+        description: Existing source tag; live publication accepts only v1.2.2
         required: true
         type: string
       ecosystem:
@@ -102,7 +102,7 @@ jobs:
           set -euo pipefail
           test "${{ github.ref }}" = refs/heads/main
           test "$WORKFLOW_REF" = 'celiumsai/hyphae/.github/workflows/registry-publish.yml@refs/heads/main'
-          test '${{ inputs.source_tag }}' = v1.2.1
+          test '${{ inputs.source_tag }}' = v1.2.2
       - name: Check out trusted main control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

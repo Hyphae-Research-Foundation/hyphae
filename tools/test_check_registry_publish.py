@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,7 +87,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         "repository": "celiumsai/hyphae",
         "ecosystem": ecosystem,
         "source": {
-            "tag": "v1.2.1",
+            "tag": "v1.2.2",
             "tag_object": TAG_OBJECT,
             "commit": COMMIT,
             "tree": TREE,
@@ -137,7 +139,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "1.2.1",
+            "version": "1.2.2",
             "config": "config/crates-io-release.json",
         },
     }
@@ -153,7 +155,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "1.2.1",
+        "version": "1.2.2",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -162,6 +164,26 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
 
 
 class RegistryPublishGateTests(unittest.TestCase):
+    def test_crate_vcs_metadata_accepts_clean_and_rejects_dirty_sources(self) -> None:
+        from tools.check_registry_publish import _crate_vcs_commit
+
+        def crate(vcs: dict) -> bytes:
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+                encoded = json.dumps(vcs).encode("utf-8")
+                member = tarfile.TarInfo("demo-1.2.2/.cargo_vcs_info.json")
+                member.size = len(encoded)
+                archive.addfile(member, io.BytesIO(encoded))
+            return payload.getvalue()
+
+        clean_without_marker = {"git": {"sha1": COMMIT}, "path_in_vcs": "crates/demo"}
+        clean_with_marker = {"git": {"sha1": COMMIT, "dirty": False}, "path_in_vcs": ""}
+        dirty = {"git": {"sha1": COMMIT, "dirty": True}, "path_in_vcs": ""}
+        self.assertEqual(_crate_vcs_commit(crate(clean_without_marker), "demo", "1.2.2"), COMMIT)
+        self.assertEqual(_crate_vcs_commit(crate(clean_with_marker), "demo", "1.2.2"), COMMIT)
+        with self.assertRaisesRegex(GateFailure, "dirty"):
+            _crate_vcs_commit(crate(dirty), "demo", "1.2.2")
+
     def materialize(self, root: Path, version: str = "1.1.0") -> None:
         (root / "config").mkdir()
         (root / "config/registry-publish-authority.json").write_bytes(
@@ -350,7 +372,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             self.assertEqual(validate_publish_authority("crates-io", root, dry_run=True), [])
             self.assertEqual(validate_publish_authority("npm", root, dry_run=True), [])
 
-    def test_live_publish_is_blocked_before_exact_1_2_1(self) -> None:
+    def test_live_publish_is_blocked_before_exact_1_2_2(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "tools.check_registry_publish._git"
         ) as git:
@@ -361,7 +383,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 1.2.1" in item for item in failures))
+        self.assertTrue(any("blocked until exact version 1.2.2" in item for item in failures))
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (

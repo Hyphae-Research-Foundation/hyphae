@@ -515,7 +515,7 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
             fail(f"credential material is forbidden in {path.relative_to(root)}")
     validate_mcp(load_object(plugin / ".mcp.json", root))
     version = validate_codex(load_object(plugin / ".codex-plugin/plugin.json", root))
-    if version != "1.2.1":
+    if version != "1.2.2":
         fail("agent plugin version must match the bounded 1.2 MCP slice")
     validate_claude(load_object(plugin / ".claude-plugin/plugin.json", root), version)
     validate_marketplaces(root, version)
