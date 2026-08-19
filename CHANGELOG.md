@@ -3,7 +3,22 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [1.2.0] - Unreleased
+## [1.2.1] - Unreleased
+
+Hyphae 1.2.1 is the Apache-2.0 registry publication of the 1.2 program,
+re-issued from the current integration tree after `v1.2.0` closed its
+exact-SHA release gates. It contains no engine changes beyond `1.2.0`.
+
+### Added
+
+- Documented the Cursor Cloud development environment in `AGENTS.md`.
+
+### Changed
+
+- Moved every workspace, SDK, packaging, and registry-publication pin to the
+  exact `1.2.1` release version.
+
+## [1.2.0] - 2026-08-19
 
 Hyphae 1.2.0 completes the coupled operator/agent-experience and relicensing
 programs: durable native access control, the operator console, agent plugins,

@@ -168,7 +168,7 @@ external immutable approval boundary. Pull requests may run only the dry-run
 path.
 
 The workflow checks out `github.workflow_sha` as the trusted control plane and
-`v1.2.0` as source in separate directories. Before executing source package
+`v1.2.1` as source in separate directories. Before executing source package
 tools, the trusted checker requires the tag to be annotated, its peeled commit
 to equal the exact fetched `origin/main` tip, and all pinned control files to be
 byte-identical between trusted main and the tag tree. It then uses the GitHub

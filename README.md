@@ -26,8 +26,8 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`v1.1.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.1.0)
-is the latest published release of the active Native architecture. G0 through
+**Stable Native release:** [`v1.2.1`](https://github.com/celiumsai/hyphae/releases/tag/v1.2.1)
+is the latest release of the active Native architecture. G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
 SBOMs, signatures, provenance, and fault matrices to the exact release
@@ -35,13 +35,15 @@ commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
 
-**Release candidate:** `v1.2.0` adds durable native access control, the
-operator console, agent plugins, the published Python client, and the
-Apache-2.0 software transition. It will distribute through crates.io, PyPI,
-npm, and signed GitHub Release archives after its exact-SHA release gates
-close. All 24 Rust crates remain available at `1.1.0` on crates.io under that
-release's original terms; the exact checksums, source identities, workflow
-runs, and consumer verification are in the
+**Published release:** the 1.2 program ships durable native access control,
+the operator console, agent plugins, the published Python client, and the
+Apache-2.0 software transition. [`v1.2.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.2.0)
+closed the exact-SHA release gates with signed GitHub Release archives;
+`v1.2.1` re-issues that program from the current integration tree as the
+Apache-2.0 registry publication for crates.io, PyPI, and npm. Until a given
+registry publication completes, the latest already-published registry version
+is `1.1.0` under that release's original terms; its exact checksums, source
+identities, workflow runs, and consumer verification are in the
 [1.1.0 publication receipt](docs/release/receipts/1.1.0.md).
 
 G8 release evidence binds publication to the exact release commit. The G7
@@ -109,20 +111,20 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`v1.1.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.1.0),
+[`v1.2.1` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.2.1),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 1.2.0 --locked
+cargo install hyphae-cli --version 1.2.1 --locked
 ```
 
-That coordinate is valid once the `v1.2.0` publication completes; the latest
+That coordinate is valid once the `v1.2.1` publication completes; the latest
 already-published version is `1.1.0`. Build and embed the exact release from
 source with:
 
 ```bash
-git checkout v1.2.0
+git checkout v1.2.1
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```
@@ -201,7 +203,7 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-Version `1.1.0` publishes the complete 24-crate graph:
+Version `1.2.1` publishes the complete 24-crate graph:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;

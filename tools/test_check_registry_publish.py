@@ -85,7 +85,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         "repository": "celiumsai/hyphae",
         "ecosystem": ecosystem,
         "source": {
-            "tag": "v1.2.0",
+            "tag": "v1.2.1",
             "tag_object": TAG_OBJECT,
             "commit": COMMIT,
             "tree": TREE,
@@ -137,7 +137,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "1.2.0",
+            "version": "1.2.1",
             "config": "config/crates-io-release.json",
         },
     }
@@ -153,7 +153,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "1.2.0",
+        "version": "1.2.1",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -350,7 +350,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             self.assertEqual(validate_publish_authority("crates-io", root, dry_run=True), [])
             self.assertEqual(validate_publish_authority("npm", root, dry_run=True), [])
 
-    def test_live_publish_is_blocked_before_exact_1_2_0(self) -> None:
+    def test_live_publish_is_blocked_before_exact_1_2_1(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "tools.check_registry_publish._git"
         ) as git:
@@ -361,11 +361,11 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 1.2.0" in item for item in failures))
+        self.assertTrue(any("blocked until exact version 1.2.1" in item for item in failures))
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (
-            ("tag", "v1.2.1"),
+            ("tag", "v1.2.0"),
             ("environment", "unprotected"),
             ("required_checks", []),
             ("required_artifacts", []),
@@ -484,7 +484,7 @@ class RegistryPublishGateTests(unittest.TestCase):
         base_authority = authority()
         mutations = (
             ("tree", lambda value: value["transition"].update(tree="f" * 40)),
-            ("version", lambda value: value["package_inventory"].update(version="1.2.1")),
+            ("version", lambda value: value["package_inventory"].update(version="1.2.0")),
             ("missing-g8", lambda value: value["release"].pop("g8_aggregate")),
             ("bad-digest", lambda value: value["release"]["g8_aggregate"].update(sha256="bad")),
             ("missing-security", lambda value: value["external_ci"].pop("security_hard_kill")),

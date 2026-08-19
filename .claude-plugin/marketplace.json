@@ -12,7 +12,7 @@
       "name": "hyphae",
       "source": "./plugins/hyphae",
       "description": "Bounded read-only Native v2 access with an Instance-scoped Auditor API key.",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "license": "Apache-2.0",
       "category": "development",
       "tags": ["database", "sql", "search", "rag", "mcp"]

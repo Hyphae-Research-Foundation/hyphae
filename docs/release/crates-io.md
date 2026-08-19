@@ -2,7 +2,7 @@
 
 The current `1.1.0` manifests remain unchanged while the Apache release is
 prepared. The first Apache-2.0 registry publication is authorized only for
-exact version `1.2.0` from annotated tag `v1.2.0`. The version, immutable
+exact version `1.2.1` from annotated tag `v1.2.1`. The version, immutable
 dependency layers, and exact source authority are defined in
 [`config/crates-io-release.json`](../../config/crates-io-release.json).
 Conformance runners and independent verifiers remain private workspace tools
@@ -16,7 +16,7 @@ the tag being published. The trusted checker and policy are loaded from the
 
 ## Preconditions
 
-1. Land version `1.2.0`, then create existing annotated tag `v1.2.0`. The
+1. Land version `1.2.1`, then create existing annotated tag `v1.2.1`. The
    registry workflow fetches the exact remote tag object and requires its peeled
    target to equal the current `origin/main` commit, not merely an ancestor.
 2. Complete the pinned exact-SHA GitHub check suite in
@@ -132,11 +132,11 @@ tag, main tip, policy file, or digest changes between gate and upload.
 Use clean temporary projects, not workspace paths:
 
 ```bash
-cargo install hyphae-cli --version 1.2.0 --locked
+cargo install hyphae-cli --version 1.2.1 --locked
 hyphae version --json
 ```
 
-Also create a minimal Rust application with exact `=1.2.0` dependencies on
+Also create a minimal Rust application with exact `=1.2.1` dependencies on
 `hyphae-engine`, `hyphae-query`, and `hyphae-native-product`; build it with
 `--locked`. Verify that docs.rs has accepted every library package, then record
 all crates.io URLs, checksums, and the Git tag in the publication receipt.
