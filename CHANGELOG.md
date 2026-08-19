@@ -3,7 +3,20 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [1.2.1] - Unreleased
+## [1.2.2] - Unreleased
+
+Hyphae 1.2.2 is the Apache-2.0 registry publication of the 1.2 program. The
+first live crates.io gate run for `v1.2.1` exposed a defect in the trusted
+publication checker, and that checker is tag-bound control code, so the fix
+ships as a new exact release version. It contains no engine changes.
+
+### Fixed
+
+- The registry publication gate now accepts the Cargo VCS metadata of a clean
+  packaging tree, which omits the dirty marker entirely, and continues to
+  fail closed on an explicit dirty marker.
+
+## [1.2.1] - 2026-08-19
 
 Hyphae 1.2.1 is the Apache-2.0 registry publication of the 1.2 program,
 re-issued from the current integration tree after `v1.2.0` closed its

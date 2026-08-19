@@ -11,7 +11,7 @@ recovery, snapshots, compaction, backups, and verified restore.
 
 ```toml
 [dependencies]
-hyphae-storage = "1.2.1"
+hyphae-storage = "1.2.2"
 ```
 
 This crate owns the format-2 compatibility disk format. New applications

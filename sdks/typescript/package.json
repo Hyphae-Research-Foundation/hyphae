@@ -1,6 +1,6 @@
 {
   "name": "@celiums/hyphae",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
   "license": "Apache-2.0",
   "type": "module",

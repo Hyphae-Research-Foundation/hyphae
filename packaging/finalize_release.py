@@ -33,7 +33,7 @@ ASSET_SUFFIXES = (
     EVIDENCE_SUFFIX,
 )
 ARCHIVE_SUFFIXES = (".tar.gz", ".zip")
-APACHE_RELEASE_VERSION = "1.2.1"
+APACHE_RELEASE_VERSION = "1.2.2"
 
 
 def require_apache_release_version(version: str) -> None:
