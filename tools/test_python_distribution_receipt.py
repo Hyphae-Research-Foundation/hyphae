@@ -771,6 +771,15 @@ class PythonDistributionReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(PythonReceiptError, "matching Trusted Publisher"):
             verify_provenance(provenance, filename, digest, "testpypi")
 
+    def test_pep740_null_environment_is_rehearsal_only(self) -> None:
+        filename = "hyphae_sdk-1.2.0.tar.gz"
+        digest = "1" * 64
+        provenance = self.provenance(filename, digest)
+        provenance["attestation_bundles"][0]["publisher"]["environment"] = None
+        verify_provenance(provenance, filename, digest, "testpypi")
+        with self.assertRaisesRegex(PythonReceiptError, "matching Trusted Publisher"):
+            verify_provenance(provenance, filename, digest, "pypi")
+
     def test_crypto_verifier_receives_only_the_exact_selected_attestation(self) -> None:
         with self.fixture() as directory, self.fixture() as repeated:
             receipt = self.build(Path(directory), Path(repeated))

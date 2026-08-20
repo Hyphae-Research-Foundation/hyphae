@@ -872,7 +872,19 @@ def _publisher_identity(publisher: object, repository: str) -> dict[str, str]:
         "workflow": PUBLISHER_WORKFLOW,
         "environment": repository,
     }
-    if any(publisher.get(key) != value for key, value in expected.items()):
+    # The 1.2.2 rehearsal files on TestPyPI carry provenance recorded before
+    # the Trusted Publisher was environment-bound, so their publisher reports
+    # a null environment permanently. Only the rehearsal registry accepts that
+    # legacy shape; the production registry requires the exact environment.
+    observed_environment = publisher.get("environment")
+    environment_matches = observed_environment == repository or (
+        repository == "testpypi" and observed_environment is None
+    )
+    if not environment_matches or any(
+        publisher.get(key) != value
+        for key, value in expected.items()
+        if key != "environment"
+    ):
         fail(
             "PyPI provenance Trusted Publisher identity differs from the release workflow"
         )

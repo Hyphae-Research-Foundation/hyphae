@@ -16,7 +16,7 @@
   },
   "transitioned_tree": {
     "digest_domain": "hyphae-relicensing-transition-tree-v1",
-    "content_sha256": "df87e4c9a693a63b1045f69db5c6322bccbf4cec6bac9473ec345080b81d4c7a",
+    "content_sha256": "825a8d9ba639150d3f98b053415016102e480f4a05693f7e33c60115dd66b829",
     "path_count": 1346,
     "excluded_paths": [
       "docs/gates/evidence/relicensing-1.2.0-transition.json"
