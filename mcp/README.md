@@ -22,7 +22,10 @@ Plaintext `http://` is accepted only for a canonical loopback host
 durable API key.
 
 Use a built-in Auditor assignment at Instance scope so both security tools
-receive `security.read` without receiving mutation authority. The key file must
+receive `security.read` without receiving mutation authority. The two search
+tools require `search.execute` instead, which the built-in Reader role
+carries; issue the key whose durable authority matches the tools the agent
+needs, and expect a typed denial on the others. The key file must
 be a restricted regular file and must contain exactly one durable `hyp1_...`
 credential. `HYPHAE_NATIVE_API_KEY_FILE` may replace the file option. The
 credential is never accepted as an argv value or ordinary environment value.
@@ -48,7 +51,7 @@ principal, role, or permission. Unknown input fields fail closed.
 - Cancellation remains live while a Native HTTP request is in flight; the
   bounded reader/control path does not wait for that request to finish.
 - `tools/list` has a fixed maximum page of one hundred definitions, so the
-  complete fixed 3-tool registry is returned in one host-compatible page;
+  complete fixed 5-tool registry is returned in one host-compatible page;
   exhausted pages omit `nextCursor` rather than serializing JSON `null`.
 - MCP tasks are forbidden.
 
@@ -62,6 +65,8 @@ The exact tool definitions live in
 | `hyphae_native_capabilities` | `Capabilities` | `discover` |
 | `hyphae_native_security_status` | `SecurityStatus` | `security.read` at Instance |
 | `hyphae_native_security_principals` | `SecurityPrincipalList` | `security.read` at Instance |
+| `hyphae_native_search_lexical` | `Search` | `search.execute` |
+| `hyphae_native_search_collection` | `SearchCollection` | `search.execute` |
 
 All three tools are read-only, non-destructive, idempotent, closed-world, and
 task-forbidden. Principal pages are bounded by `limit` (`1..=1000`) and use the

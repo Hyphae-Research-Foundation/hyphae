@@ -306,7 +306,8 @@ def structured_case(result: dict[str, Any], expected: dict[str, Any]) -> dict[st
     structured = result["structuredContent"]
     expected_outcome = expected["expect"]
     is_error = result.get("isError") is True or "error" in structured
-    outcome = "invalid_request" if is_error and structured.get("error", {}).get("code") == "invalid_request" else "success"
+    error_code = structured.get("error", {}).get("code")
+    outcome = error_code if is_error and isinstance(error_code, str) else "success"
     if outcome != expected_outcome:
         raise AdapterFailure(f"host tool outcome differs for {expected['id']}")
     return {

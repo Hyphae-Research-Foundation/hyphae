@@ -18,10 +18,15 @@ If `--base-url` is overridden for a remote service, it must be an `https://`
 origin; the MCP adapter rejects remote plaintext before sending the key.
 
 The plugin targets the versioned Native HTTP v2/RBAC MCP contract. It exposes
-only three bounded read-only tools: capabilities, redacted security status, and a
-paginated redacted principal list. The API key's durable roles remain the sole
-authority; prompt text cannot select a role or widen its permissions. Legacy
-bearers and MCP writes are not accepted.
+five bounded read-only tools: capabilities, redacted security status, a
+paginated redacted principal list, one bounded lexical query, and one
+integrated collection search with typed filters, facets, and per-branch
+recall evidence. The API key's durable roles remain the sole authority;
+prompt text cannot select a role or widen its permissions. The Auditor key
+covers the capability and security tools; the two search tools require the
+`search.execute` authority, which the built-in Reader role carries — issue
+the key whose authority matches the tools the agent needs. Legacy bearers
+and MCP writes are not accepted.
 
 The server admits one active tool call and one pending response, limits complete
 input and output messages to 4 MiB, and handles idempotent cancellation while
