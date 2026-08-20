@@ -343,6 +343,9 @@ enum Command {
         /// Read the Native API key from the first stdin line, then MCP messages.
         #[arg(long, conflicts_with = "native_api_key_file")]
         native_api_key_stdin: bool,
+        /// Explicitly expose the bounded write-scoped ingest tool.
+        #[arg(long)]
+        allow_ingest: bool,
     },
 }
 
@@ -1816,10 +1819,12 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             base_url,
             native_api_key_file,
             native_api_key_stdin,
+            allow_ingest,
         } => mcp::run(
             &base_url,
             native_api_key_file.as_deref(),
             native_api_key_stdin,
+            allow_ingest,
         )
         .await
         .map_err(Into::into),

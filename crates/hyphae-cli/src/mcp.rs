@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded read-only MCP stdio adapter over managed Native HTTP v2.
+//! Bounded MCP stdio adapter over managed Native HTTP v2: read-only by
+//! default, with one explicitly opted-in bounded ingest tool.
 
 use std::{
     io::{self, BufRead, BufReader, BufWriter, Write},
@@ -13,8 +14,9 @@ use hyphae_client::v2::{
 use hyphae_contracts::NATIVE_MCP_V2;
 use hyphae_native_product::{
     BoundedSearchQuery, MAX_API_KEY_CREDENTIAL_BYTES, ObjectId, ProductError, ProductErrorCode,
-    ProductLexicalBranch, ProductResponse, ProductSearchFilter, ProductSearchRequest,
-    ProductVector, ProductVectorBranch, SecurityCursor, SecurityPrincipalListRequest,
+    ProductLexicalBranch, ProductResponse, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchRequest, ProductVector, ProductVectorBranch, SecurityCursor,
+    SecurityPrincipalListRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,13 +32,16 @@ const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v2";
 const MCP_PROTOCOL: &str = "2025-06-18";
 const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v3";
 const TOOL_PAGE_SIZE: usize = 100;
-const TOOL_NAMES: [&str; 5] = [
+const TOOL_NAMES: [&str; 6] = [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
+    "hyphae_native_search_ingest",
 ];
+/// The one write-scoped tool, absent unless the operator opts in.
+const INGEST_TOOL_NAME: &str = "hyphae_native_search_ingest";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CURSOR_BYTES: usize = 128;
 const MAX_TOOL_CURSOR_BYTES: usize = 32;
@@ -45,22 +50,24 @@ const SERVER_BUSY: i32 = -32001;
 const RESPONSE_TOO_LARGE: i32 = -32003;
 
 #[derive(Clone, Copy)]
-enum NativeReadTool {
+enum NativeTool {
     Capabilities,
     SecurityStatus,
     SecurityPrincipals,
     SearchLexical,
     SearchCollection,
+    SearchIngest,
 }
 
-impl NativeReadTool {
-    fn parse(name: &str) -> Option<Self> {
+impl NativeTool {
+    fn parse(name: &str, allow_ingest: bool) -> Option<Self> {
         match name {
             "hyphae_native_capabilities" => Some(Self::Capabilities),
             "hyphae_native_security_status" => Some(Self::SecurityStatus),
             "hyphae_native_security_principals" => Some(Self::SecurityPrincipals),
             "hyphae_native_search_lexical" => Some(Self::SearchLexical),
             "hyphae_native_search_collection" => Some(Self::SearchCollection),
+            "hyphae_native_search_ingest" if allow_ingest => Some(Self::SearchIngest),
             _ => None,
         }
     }
@@ -74,9 +81,19 @@ struct ToolRegistry {
     tools: Vec<Value>,
 }
 
+impl ToolRegistry {
+    /// Restricts the listed registry to the read-only subset.
+    fn without_ingest(mut self) -> Self {
+        self.tools
+            .retain(|tool| tool.get("name").and_then(Value::as_str) != Some(INGEST_TOOL_NAME));
+        self
+    }
+}
+
 struct Session {
     client: HyphaeClient,
     registry: ToolRegistry,
+    allow_ingest: bool,
     initialize_seen: bool,
     initialized: bool,
 }
@@ -89,7 +106,7 @@ enum SessionAction {
 
 struct ToolCall {
     id: Value,
-    tool: NativeReadTool,
+    tool: NativeTool,
     arguments: Value,
 }
 
@@ -191,6 +208,14 @@ struct VectorBranchInput {
     weight: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchIngestInput {
+    collection: u64,
+    idempotency_id: u64,
+    documents: Vec<Value>,
+}
+
 fn default_search_limit() -> usize {
     10
 }
@@ -225,6 +250,7 @@ pub(crate) async fn run(
     base_url: &str,
     api_key_file: Option<&Path>,
     api_key_stdin: bool,
+    allow_ingest: bool,
 ) -> Result<(), CliFailure> {
     let mut input = BufReader::new(io::stdin());
     let credential = read_mcp_credential(api_key_file, api_key_stdin, &mut input)?;
@@ -235,9 +261,16 @@ pub(crate) async fn run(
         .map_err(startup_client_error)?;
     drop(credential);
 
+    let registry = ToolRegistry::load()?;
+    let registry = if allow_ingest {
+        registry
+    } else {
+        registry.without_ingest()
+    };
     let mut session = Session {
         client: HyphaeClient::new(transport),
-        registry: ToolRegistry::load()?,
+        registry,
+        allow_ingest,
         initialize_seen: false,
         initialized: false,
     };
@@ -481,7 +514,7 @@ fn valid_tool_contract(tool: &Value, expected_name: &str) -> bool {
         return false;
     };
     let expected_annotations = json!({
-        "readOnlyHint": true,
+        "readOnlyHint": expected_name != INGEST_TOOL_NAME,
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
@@ -623,7 +656,7 @@ impl Session {
                 SessionAction::Response(rpc_error(&id, -32002, "Server not initialized"))
             }
             "tools/list" => SessionAction::Response(self.list_tools(&id, &params)),
-            "tools/call" => Self::prepare_tool_call(id, &params),
+            "tools/call" => self.prepare_tool_call(id, &params),
             _ => SessionAction::Response(rpc_error(&id, -32601, "Method not found")),
         }
     }
@@ -675,14 +708,14 @@ impl Session {
         )
     }
 
-    fn prepare_tool_call(id: Value, params: &Value) -> SessionAction {
+    fn prepare_tool_call(&self, id: Value, params: &Value) -> SessionAction {
         let params = match serde_json::from_value::<ToolsCallParams>(params.clone()) {
             Ok(params) if params.arguments.is_object() => params,
             _ => {
                 return SessionAction::Response(rpc_error(&id, -32602, "Invalid params"));
             }
         };
-        let Some(tool) = NativeReadTool::parse(&params.name) else {
+        let Some(tool) = NativeTool::parse(&params.name, self.allow_ingest) else {
             return SessionAction::Response(rpc_error(&id, -32602, "Unknown tool"));
         };
         SessionAction::ToolCall(ToolCall {
@@ -719,7 +752,7 @@ fn start_tool_call(
 
 async fn execute_tool(
     client: HyphaeClient,
-    tool: NativeReadTool,
+    tool: NativeTool,
     arguments: Value,
     cancellation: CancellationToken,
 ) -> Result<Value, Box<ProductError>> {
@@ -730,15 +763,15 @@ async fn execute_tool(
     options.limits.max_request_bytes = MAX_MESSAGE_BYTES;
     options.limits.max_response_bytes = MAX_MESSAGE_BYTES;
     let response = match tool {
-        NativeReadTool::Capabilities => {
+        NativeTool::Capabilities => {
             strict_input::<EmptyInput>(arguments)?;
             client.capabilities(options).await
         }
-        NativeReadTool::SecurityStatus => {
+        NativeTool::SecurityStatus => {
             strict_input::<EmptyInput>(arguments)?;
             client.security_status(options).await
         }
-        NativeReadTool::SecurityPrincipals => {
+        NativeTool::SecurityPrincipals => {
             let input = strict_input::<PrincipalListInput>(arguments)?;
             let cursor = input
                 .cursor
@@ -749,7 +782,7 @@ async fn execute_tool(
                 .map_err(|_| invalid_request())?;
             client.security_principal_list(request, options).await
         }
-        NativeReadTool::SearchLexical => {
+        NativeTool::SearchLexical => {
             let input = strict_input::<LexicalSearchInput>(arguments)?;
             let index = ObjectId::new(u128::from(input.index)).map_err(|_| invalid_request())?;
             let query = match input.kind.as_str() {
@@ -764,12 +797,36 @@ async fn execute_tool(
             };
             client.search(index, query, input.limit, options).await
         }
-        NativeReadTool::SearchCollection => {
+        NativeTool::SearchCollection => {
             let input = strict_input::<CollectionSearchInput>(arguments)?;
             let collection =
                 ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
             let request = collection_search_request(input)?;
             client.search_collection(collection, request, options).await
+        }
+        NativeTool::SearchIngest => {
+            let input = strict_input::<SearchIngestInput>(arguments)?;
+            if input.idempotency_id == 0 {
+                return Err(invalid_request());
+            }
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let documents = input
+                .documents
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|_| invalid_request())
+                        .and_then(|document| {
+                            crate::product_document(document).map_err(|_| invalid_request())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let batch = ProductSearchIngestBatch {
+                idempotency_id: u128::from(input.idempotency_id),
+                documents,
+            };
+            client.search_ingest(collection, batch, options).await
         }
     }
     .map_err(normalize_client_error)?;
@@ -863,26 +920,24 @@ fn parse_security_cursor(value: &str) -> Result<SecurityCursor, Box<ProductError
     SecurityCursor::from_token(value).map_err(|_| invalid_request())
 }
 
-fn response_for(
-    tool: NativeReadTool,
-    response: ProductResponse,
-) -> Result<Value, Box<ProductError>> {
+fn response_for(tool: NativeTool, response: ProductResponse) -> Result<Value, Box<ProductError>> {
     let expected = matches!(
         (tool, &response),
-        (
-            NativeReadTool::Capabilities,
-            ProductResponse::Capabilities(_)
-        ) | (
-            NativeReadTool::SecurityStatus,
-            ProductResponse::SecurityStatus(_)
-        ) | (
-            NativeReadTool::SecurityPrincipals,
-            ProductResponse::SecurityPrincipalPage(_)
-        ) | (NativeReadTool::SearchLexical, ProductResponse::Search(_))
+        (NativeTool::Capabilities, ProductResponse::Capabilities(_))
             | (
-                NativeReadTool::SearchCollection,
+                NativeTool::SecurityStatus,
+                ProductResponse::SecurityStatus(_)
+            )
+            | (
+                NativeTool::SecurityPrincipals,
+                ProductResponse::SecurityPrincipalPage(_)
+            )
+            | (NativeTool::SearchLexical, ProductResponse::Search(_))
+            | (
+                NativeTool::SearchCollection,
                 ProductResponse::IntegratedSearch(_)
             )
+            | (NativeTool::SearchIngest, ProductResponse::SearchIngested(_))
     );
     if !expected {
         return Err(Box::new(ProductError::from_code(
@@ -1112,11 +1167,19 @@ mod tests {
         assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v3");
         assert_eq!(registry.schema_digest.len(), 64);
         assert_eq!(registry.page_size, 100);
-        assert_eq!(registry.tools.len(), 5);
+        assert_eq!(registry.tools.len(), 6);
         let first = registry
             .list(&serde_json::json!({}))
             .map_err(|()| "first page")?;
-        assert_eq!(first["tools"].as_array().map(Vec::len), Some(5));
+        assert_eq!(first["tools"].as_array().map(Vec::len), Some(6));
+        let read_only = ToolRegistry::load()?.without_ingest();
+        assert_eq!(read_only.tools.len(), 5);
+        assert!(
+            read_only
+                .tools
+                .iter()
+                .all(|tool| tool["name"] != super::INGEST_TOOL_NAME)
+        );
         assert!(first.get("nextCursor").is_none());
         assert!(
             registry
@@ -1244,7 +1307,8 @@ mod tests {
     {
         let mut session = Session {
             client: HyphaeClient::new(CancellationTransport),
-            registry: ToolRegistry::load()?,
+            registry: ToolRegistry::load()?.without_ingest(),
+            allow_ingest: false,
             initialize_seen: true,
             initialized: true,
         };
