@@ -4317,7 +4317,7 @@ fn proof(command: ProofCommand) -> Result<(), CliFailure> {
             if proof_out == witness_out {
                 return Err(CliFailure::invalid());
             }
-            let operation = proof_operation(serde_json::from_str(&operation_json)?)?;
+            let operation = parse_proof_operation(&operation_json)?;
             let response = open_client(&local)?.dispatch(ProductOperation::Prove {
                 operation: Box::new(operation),
                 limits: NativeProofGenerationLimits::default(),
@@ -4405,6 +4405,27 @@ fn proof_operation(input: ProofOperationInput) -> Result<ProductOperation, CliFa
                 .collect::<Result<_, _>>()?,
         },
     })
+}
+
+/// Parses one proof operation document, admitting the search-collection
+/// shape next to the tagged catalog and SQL shapes.
+fn parse_proof_operation(operation_json: &str) -> Result<ProductOperation, CliFailure> {
+    let value: Value = serde_json::from_str(operation_json)?;
+    if value.get("operation").and_then(Value::as_str) == Some("search_collection") {
+        let Value::Object(mut object) = value else {
+            return Err(CliFailure::invalid());
+        };
+        object.remove("operation");
+        let input: mcp::CollectionSearchInput =
+            serde_json::from_value(Value::Object(object)).map_err(|_| CliFailure::invalid())?;
+        let collection = object_id(u128::from(input.collection))?;
+        return Ok(ProductOperation::SearchCollection {
+            collection,
+            request: mcp::collection_search_request(input)
+                .map_err(|error| CliFailure::from(*error))?,
+        });
+    }
+    proof_operation(serde_json::from_value(value)?)
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {

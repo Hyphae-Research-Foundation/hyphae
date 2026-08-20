@@ -159,7 +159,7 @@ class McpHostConformanceTests(unittest.TestCase):
         lock = json.loads(
             (ROOT / "conformance/mcp/hosts/package-lock.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(len(corpus["tools"]), 5)
+        self.assertEqual(len(corpus["tools"]), 7)
         self.assertEqual(
             [(case["id"], case["tool"], case["arguments"], case["expect"], case["assert"]) for case in corpus["cases"]],
             [
@@ -169,9 +169,11 @@ class McpHostConformanceTests(unittest.TestCase):
                 ("prompt-authority-rejected", "hyphae_native_security_status", {"role": "owner"}, "invalid_request", {"pointer": "/error/code", "equals": "invalid_request"}),
                 ("search-lexical-requires-search-authority", "hyphae_native_search_lexical", {"index": 1, "kind": "term", "query": "rust"}, "authorization_denied", {"pointer": "/error/code", "equals": "authorization_denied"}),
                 ("search-collection-requires-search-authority", "hyphae_native_search_collection", {"collection": 1, "lexical": {"query": "rust"}}, "authorization_denied", {"pointer": "/error/code", "equals": "authorization_denied"}),
+                ("prove-search-requires-proof-authority", "hyphae_native_prove_search", {"collection": 1, "lexical": {"query": "rust"}}, "authorization_denied", {"pointer": "/error/code", "equals": "authorization_denied"}),
+                ("verify-proof-rejects-malformed-artifacts", "hyphae_native_verify_proof", {"proof_hex": "00", "witness_hex": "00", "anchor_hex": "00"}, "invalid_request", {"pointer": "/error/code", "equals": "invalid_request"}),
             ],
         )
-        self.assertEqual(len({case["id"] for case in corpus["cases"]}), 6)
+        self.assertEqual(len({case["id"] for case in corpus["cases"]}), 8)
         validate_corpus(corpus)
         drifted = json.loads(json.dumps(corpus))
         drifted["cases"][2]["arguments"] = {"limit": 2}
@@ -269,8 +271,8 @@ class McpHostConformanceTests(unittest.TestCase):
                 {
                     "status": "passed",
                     "hosts": ["claude-code", "codex"],
-                    "tools": 5,
-                    "cases": 6,
+                    "tools": 7,
+                    "cases": 8,
                     "source_mode": source_mode,
                 },
             )

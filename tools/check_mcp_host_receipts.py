@@ -33,6 +33,8 @@ EXPECTED_TOOLS = [
     "hyphae_native_security_principals",
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
+    "hyphae_native_prove_search",
+    "hyphae_native_verify_proof",
 ]
 EXPECTED_CASES = [
     {
@@ -82,6 +84,20 @@ EXPECTED_CASES = [
         "arguments": {"collection": 1, "lexical": {"query": "rust"}},
         "expect": "authorization_denied",
         "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "prove-search-requires-proof-authority",
+        "tool": "hyphae_native_prove_search",
+        "arguments": {"collection": 1, "lexical": {"query": "rust"}},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "verify-proof-rejects-malformed-artifacts",
+        "tool": "hyphae_native_verify_proof",
+        "arguments": {"proof_hex": "00", "witness_hex": "00", "anchor_hex": "00"},
+        "expect": "invalid_request",
+        "assert": {"pointer": "/error/code", "equals": "invalid_request"},
     },
 ]
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -151,7 +167,7 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
         or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
         or corpus.get("tools") != EXPECTED_TOOLS
         or corpus.get("cases") != EXPECTED_CASES
-        or len({case["id"] for case in EXPECTED_CASES}) != 6
+        or len({case["id"] for case in EXPECTED_CASES}) != 8
     ):
         fail("shared MCP corpus tools, cases, arguments, expectations, or assertions drifted")
 
