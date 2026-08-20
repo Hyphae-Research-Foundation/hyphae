@@ -822,6 +822,7 @@ jobs:
           python tools/generate_compatibility_fixture.py --binary target/debug/hyphae --check compatibility/v1/data-directory.json
           cargo test -p hyphae-engine --example generate_disk_format_2_fixture --locked
           cargo test -p hyphae-engine --example generate_retrieval_goldens --locked
+          cargo test -p hyphae-cli --example generate_valkey_rdb_fixture --locked
       - name: Verify workflow syntax
         shell: bash
         env:

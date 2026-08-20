@@ -43,3 +43,24 @@ Regenerate it only when intentionally changing the append-only native protocol:
 ```sh
 cargo run -p hyphae-native-protocol --example generate_sdk_fixture
 ```
+
+## Valkey/Redis RDB migration fixture
+
+`valkey/rdb-v11.json` is one immutable RDB version-11 source payload for the
+external migration path. It exercises every decoded encoding — raw and
+integer strings, a hashtable hash, a listpack set, an intset set, a
+quicklist2 list, a binary-double sorted set, and a stream with one consumer
+group — across two databases with one absolute expiry and a valid CRC-64
+trailer. The generator is self-contained so the fixture bytes never depend on
+the parser under test, and its embedded test proves the checked-in JSON is
+byte-exact. Reproduce it with:
+
+```sh
+cargo test -p hyphae-cli --example generate_valkey_rdb_fixture
+cargo run -q -p hyphae-cli --example generate_valkey_rdb_fixture -- \
+  /tmp/hyphae-valkey-rdb-v11.json
+```
+
+The packaged mirror `crates/hyphae-cli/tests/fixtures/valkey-rdb-v11.json`
+feeds the black-box test that runs the complete
+inspect → waive → run → verify → promote cycle against these exact bytes.
