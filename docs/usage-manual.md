@@ -654,6 +654,55 @@ hyphae migrate promote  --source ./old --target ./new --manifest plan.json
 The importer never mutates the source, verifies logical SQL/structure/
 search equivalence, and nothing activates without an explicit `promote`.
 
+### Migrating a Valkey/Redis RDB file
+
+The same pending/verify/promote machinery imports one offline RDB dump
+(versions 8-12) with `--source-kind valkey-rdb`. Inspection classifies every
+construct the file carries into four fidelity classes — `exact`,
+`equivalent`, `declared-degraded`, `rejected` — and lists the waivers a run
+would require:
+
+```bash
+hyphae migrate inspect --source ./dump.rdb --source-kind valkey-rdb
+# ... "required_waivers": ["stream-consumer-groups", "streams"], ...
+```
+
+A run fails closed while any degraded or rejected construct present in the
+file is unwaived. Each `--waive` names one construct and is recorded in the
+receipt as an explicit operator decision:
+
+```bash
+hyphae migrate run --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb --waive streams --waive stream-consumer-groups
+hyphae migrate verify  --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb
+hyphae migrate promote --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb
+```
+
+Strings, hashes, lists, sets, and sorted sets migrate exactly and are
+verified value by value. TTLs migrate as absolute instants (`equivalent`);
+keys already expired at import time are skipped and the import instant is
+pinned in the receipt so verification stays deterministic. Streams keep
+entry order and field maps but identifiers are remapped and consumer groups
+are dropped (`declared-degraded`, waiver required). Functions, modules,
+cluster metadata, and checksum-less files are `rejected` — a run only
+proceeds over them with an explicit waiver naming each one.
+
+The manifest written by `run` is a **sealed migration receipt**: the source
+digest and identity, the consistency point, the complete classification
+inventory, the operator waivers, the mapping decisions, the target keyspaces
+(`main.public.valkey_db<N>_<family>`), and a logical digest of the verified
+target content, all sealed under a domain-separated BLAKE3 content digest.
+`verify` re-parses the source, revalidates the seal, and recomputes the
+logical digest from both the source bytes and the target reads at the pinned
+import time — on a pending or an already promoted target.
+
+Be honest about what the receipt proves: the destination corresponds to
+**this RDB file** at its point-in-time capture, not to what clients last
+observed on a live server. Take the dump at a quiesced point (or accept the
+snapshot semantics of `BGSAVE`) before migrating.
+
 ## Common errors
 
 Every error is a typed `ProductError` with a stable `code`, `category`,
