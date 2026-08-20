@@ -3487,3 +3487,381 @@ fn encode_hex(bytes: &[u8]) -> String {
     }
     encoded
 }
+
+/// Builds one minimal legacy-encoded Valkey/Redis RDB v11 payload without a
+/// trailer checksum: two databases, strings with and without expiry, one
+/// hash, one intset set, one list, and one sorted set.
+fn valkey_rdb_sample() -> Vec<u8> {
+    fn string(payload: &mut Vec<u8>, bytes: &[u8]) {
+        assert!(bytes.len() < 64);
+        payload.push(u8::try_from(bytes.len()).unwrap_or(0));
+        payload.extend_from_slice(bytes);
+    }
+    let mut payload = b"REDIS0011".to_vec();
+    payload.push(0xFA);
+    string(&mut payload, b"redis-ver");
+    string(&mut payload, b"7.2.5");
+    payload.push(0xFE);
+    payload.push(0);
+    payload.push(0);
+    string(&mut payload, b"greeting");
+    string(&mut payload, b"hola");
+    payload.push(0xFC);
+    payload.extend_from_slice(&4_102_444_800_000_u64.to_le_bytes());
+    payload.push(0);
+    string(&mut payload, b"session");
+    string(&mut payload, b"active");
+    payload.push(4);
+    string(&mut payload, b"note:1");
+    payload.push(2);
+    string(&mut payload, b"author");
+    string(&mut payload, b"mario");
+    string(&mut payload, b"state");
+    string(&mut payload, b"published");
+    payload.push(11);
+    string(&mut payload, b"codes");
+    let mut intset = Vec::new();
+    intset.extend_from_slice(&4_u32.to_le_bytes());
+    intset.extend_from_slice(&2_u32.to_le_bytes());
+    intset.extend_from_slice(&7_u32.to_le_bytes());
+    intset.extend_from_slice(&11_u32.to_le_bytes());
+    string(&mut payload, &intset);
+    payload.push(1);
+    string(&mut payload, b"queue");
+    payload.push(3);
+    string(&mut payload, b"first");
+    string(&mut payload, b"second");
+    string(&mut payload, b"third");
+    payload.push(3);
+    string(&mut payload, b"ranking");
+    payload.push(1);
+    string(&mut payload, b"note:1");
+    string(&mut payload, b"9.5");
+    payload.push(0xFE);
+    payload.push(1);
+    payload.push(0);
+    string(&mut payload, b"other");
+    string(&mut payload, b"db");
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0_u8; 8]);
+    payload
+}
+
+#[test]
+fn valkey_migration_runs_verifies_promotes_and_reads_back() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let inspected = run(&[
+        "migrate",
+        "inspect",
+        "--source",
+        &path(&source),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(inspected["status"], "inspected");
+    assert_eq!(inspected["key_count"], 7);
+    assert_eq!(inspected["database_count"], 2);
+    assert_eq!(
+        inspected["unwaived_constructs"],
+        serde_json::json!(["checksum-absent"])
+    );
+
+    let imported = run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["imported_keys"], 7);
+    assert_eq!(imported["skipped_expired"], 0);
+    assert!(target.join("FORMAT.pending").exists());
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+    assert_eq!(receipt["kind"], "hyphae-external-migration-receipt");
+    assert_eq!(receipt["source"]["kind"], "valkey-rdb");
+    assert_eq!(receipt["waivers"][0]["construct"], "checksum-absent");
+
+    let verified = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["pending"], true);
+
+    let promoted = run(&[
+        "migrate",
+        "promote",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(promoted["status"], "promoted");
+    assert!(target.join("FORMAT").exists());
+    assert!(!target.join("FORMAT.pending").exists());
+
+    let reopened = run(&["status", "--data-dir", &path(&target)])?;
+    assert_eq!(reopened["status"], "ready");
+    let catalog = run(&["catalog", "--data-dir", &path(&target), "list"])?;
+    let rendered = catalog.to_string();
+    assert!(rendered.contains("valkey_db0_strings"));
+    assert!(rendered.contains("valkey_db1_strings"));
+    assert!(rendered.contains("valkey_db0_hashes"));
+
+    let verified_promoted = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified_promoted["pending"], false);
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_fails_closed_without_the_required_waiver() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let rejected = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!rejected.status.success());
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!target.exists());
+    assert!(!manifest.exists());
+
+    let unknown_waiver = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+        "--waive",
+        "nonexistent-construct",
+    ])?;
+    assert!(!unknown_waiver.status.success());
+    assert!(!target.exists());
+
+    let format2_waiver = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(!format2_waiver.status.success());
+    assert!(!target.exists());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_detects_receipt_and_target_tampering() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+
+    // A tampered receipt fails its sealed digest validation.
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+    receipt["source"]["key_count"] = serde_json::json!(99);
+    let tampered_manifest = temporary.0.join("tampered.json");
+    fs::write(&tampered_manifest, serde_json::to_vec(&receipt)?)?;
+    let tampered = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&tampered_manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!tampered.status.success());
+
+    // A receipt bound to a different target directory fails identity checks.
+    let second_target = temporary.0.join("second-target");
+    let second_manifest = temporary.0.join("second-receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&second_target),
+        "--manifest",
+        &path(&second_manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    let swapped = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&second_manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!swapped.status.success());
+
+    // A source that differs from the receipt fails identity checks.
+    let mut altered = valkey_rdb_sample();
+    let position = altered
+        .windows(4)
+        .position(|window| window == b"hola")
+        .ok_or("sample value missing")?;
+    altered[position] = b'H';
+    let altered_source = temporary.0.join("altered.rdb");
+    fs::write(&altered_source, altered)?;
+    let altered_verify = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&altered_source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!altered_verify.status.success());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_rollback_removes_only_the_pending_target() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(target.join("FORMAT.pending").exists());
+
+    let rolled_back = run(&["migrate", "rollback", "--target", &path(&target)])?;
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert!(!target.exists());
+    assert!(source.exists());
+    assert!(manifest.exists());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_rejects_path_overlap() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source_directory = temporary.0.join("sources");
+    fs::create_dir_all(&source_directory)?;
+    let source = source_directory.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let inside = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source_directory),
+        "--target",
+        &path(&source_directory.join("target")),
+        "--manifest",
+        &path(&source_directory.join("receipt.json")),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(!inside.status.success());
+    assert!(!source_directory.join("target").exists());
+    assert!(!source_directory.join("receipt.json").exists());
+    Ok(())
+}

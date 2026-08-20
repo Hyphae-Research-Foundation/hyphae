@@ -463,6 +463,11 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
+        /// Explicitly waive one degraded or rejected source construct.
+        #[arg(long = "waive")]
+        waived: Vec<String>,
     },
     /// Verify a migration manifest and its pending or promoted target.
     Verify {
@@ -472,6 +477,8 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
     },
     /// Promote a validated pending Native target.
     Promote {
@@ -481,6 +488,8 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
     },
     /// Remove a pending migration target while retaining the source.
     Rollback {
@@ -2075,8 +2084,31 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
             source,
             target,
             manifest,
+            source_kind,
+            waived,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let outcome =
+                    migrate_valkey::import::run_valkey_rdb(&source, &target, &manifest, &waived)?;
+                return print_json(&json!({
+                    "status": "imported",
+                    "source": source,
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "pending": true,
+                    "directory_id": outcome.receipt.target.directory_id,
+                    "history_epoch": outcome.receipt.target.history_epoch,
+                    "imported_keys": outcome.imported_keys,
+                    "skipped_expired": outcome.skipped_expired,
+                    "logical_digest": outcome.receipt.target.logical_digest,
+                    "content_digest": outcome.receipt.content_digest,
+                }));
+            }
+            if !waived.is_empty() {
+                return Err(CliFailure::invalid());
+            }
             let snapshot = migration_snapshot(&source)?;
             let mut product = NativeProduct::create_pending(&target)?;
             let result = match import_migration_snapshot(&mut product, &snapshot) {
@@ -2124,8 +2156,23 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
             source,
             target,
             manifest,
+            source_kind,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let outcome =
+                    migrate_valkey::import::verify_valkey_rdb(&source, &target, &manifest)?;
+                return print_json(&json!({
+                    "status": "verified",
+                    "source": source,
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "pending": outcome.pending,
+                    "logical_digest": outcome.receipt.target.logical_digest,
+                    "content_digest": outcome.receipt.content_digest,
+                }));
+            }
             let snapshot = migration_snapshot(&source)?;
             let manifest_bytes = fs::read(&manifest)?;
             let migration = hyphae_native_runtime::MigrationManifest::decode(
@@ -2146,8 +2193,20 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
             source,
             target,
             manifest,
+            source_kind,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let receipt =
+                    migrate_valkey::import::promote_valkey_rdb(&source, &target, &manifest)?;
+                return print_json(&json!({
+                    "status": "promoted",
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "content_digest": receipt.content_digest,
+                }));
+            }
             let snapshot = migration_snapshot(&source)?;
             let bytes = fs::read(&manifest)?;
             let migration = hyphae_native_runtime::MigrationManifest::decode(

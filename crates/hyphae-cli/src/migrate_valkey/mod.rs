@@ -8,6 +8,7 @@
 //! never mutates anything.
 
 pub(crate) mod crc64;
+pub(crate) mod import;
 pub(crate) mod lzf;
 pub(crate) mod rdb;
 
@@ -58,14 +59,17 @@ pub(crate) struct ValkeyInventory {
     pub file: RdbFile,
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = blake3::hash(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest.as_bytes() {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         encoded.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
         encoded.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
     }
     encoded
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    hex_encode(blake3::hash(bytes).as_bytes())
 }
 
 fn push_classification(

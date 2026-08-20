@@ -2606,7 +2606,7 @@ fn explicit_idempotency_token(
     *hasher.finalize().as_bytes()
 }
 
-fn apply_structure_mutation(
+pub(crate) fn apply_structure_mutation(
     transaction: &mut NativeWriteBatch,
     mutation: ProductStructureMutation,
 ) -> Result<ProductStructureMutationResult, ProductError> {
@@ -2746,7 +2746,7 @@ fn delete_structure(
     Ok(ProductStructureMutationResult::Boolean(deleted))
 }
 
-fn read_structure(
+pub(crate) fn read_structure(
     snapshot: &crate::ProductSnapshot,
     request: ProductStructureReadRequest,
 ) -> Result<ProductStructureReadResult, ProductError> {
