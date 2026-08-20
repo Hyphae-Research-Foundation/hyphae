@@ -6,6 +6,7 @@ mod compatibility;
 mod exit;
 mod json_value;
 mod mcp;
+mod migrate_valkey;
 mod native;
 mod native_client;
 mod native_service;
@@ -432,12 +433,27 @@ impl From<HardwareGovernorMode> for GovernorMode {
     }
 }
 
+/// Selectable migration source kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+enum MigrationSourceKind {
+    /// Existing format-2 Hyphae data directory.
+    #[default]
+    Format2,
+    /// Offline Valkey/Redis RDB file.
+    ValkeyRdb,
+}
+
 #[derive(Debug, Subcommand)]
 enum MigrationCommand {
     /// Verify and report the source logical snapshot.
     Inspect {
         #[arg(long)]
         source: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
+        /// Explicitly waive one degraded or rejected source construct.
+        #[arg(long = "waive")]
+        waived: Vec<String>,
     },
     /// Import a verified source into a separate pending Native target.
     Run {
@@ -2019,10 +2035,42 @@ fn default_hardware_cache_directory() -> Result<PathBuf, CliFailure> {
 #[allow(clippy::too_many_lines)]
 fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
     match command {
-        MigrationCommand::Inspect { source } => {
-            let snapshot = migration_snapshot(&source)?;
-            print_json(&migration_snapshot_json(&snapshot))
-        }
+        MigrationCommand::Inspect {
+            source,
+            source_kind,
+            waived,
+        } => match source_kind {
+            MigrationSourceKind::Format2 => {
+                if !waived.is_empty() {
+                    return Err(CliFailure::invalid());
+                }
+                let snapshot = migration_snapshot(&source)?;
+                print_json(&migration_snapshot_json(&snapshot))
+            }
+            MigrationSourceKind::ValkeyRdb => {
+                let inventory = migrate_valkey::inspect_valkey_rdb(
+                    &source,
+                    &migrate_valkey::rdb::RdbReadLimits::default(),
+                )
+                .map_err(|error| {
+                    eprintln!("valkey-rdb inspection failed: {error}");
+                    CliFailure::from(error)
+                })?;
+                let unwaived: Vec<&String> = inventory
+                    .required_waivers
+                    .iter()
+                    .filter(|construct| !waived.contains(construct))
+                    .collect();
+                let mut report = migrate_valkey::inventory_json(&inventory);
+                if let Some(object) = report.as_object_mut() {
+                    object.insert(
+                        "unwaived_constructs".to_owned(),
+                        serde_json::json!(unwaived),
+                    );
+                }
+                print_json(&report)
+            }
+        },
         MigrationCommand::Run {
             source,
             target,

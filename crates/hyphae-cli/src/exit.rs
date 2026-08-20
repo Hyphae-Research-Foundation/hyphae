@@ -110,6 +110,18 @@ impl From<BackupProductError> for CliFailure {
     }
 }
 
+impl From<crate::migrate_valkey::rdb::RdbError> for CliFailure {
+    fn from(error: crate::migrate_valkey::rdb::RdbError) -> Self {
+        use crate::migrate_valkey::rdb::RdbError;
+        let code = match error {
+            RdbError::Limit { .. } => ProductErrorCode::LimitExceeded,
+            RdbError::Checksum { .. } => ProductErrorCode::Corruption,
+            _ => ProductErrorCode::InvalidRequest,
+        };
+        ProductError::from_code(code).into()
+    }
+}
+
 impl From<NativeProofError> for CliFailure {
     fn from(error: NativeProofError) -> Self {
         let code = match error {
