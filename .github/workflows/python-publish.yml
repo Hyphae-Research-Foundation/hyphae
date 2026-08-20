@@ -96,6 +96,9 @@ jobs:
           test "$SOURCE_TAG" = "v$version"
           source_date_epoch="$(git -C source show -s --format=%ct "$source_commit")"
           SOURCE_DATE_EPOCH="$source_date_epoch" uv build source/sdks/python --out-dir dist
+          # uv build writes a dist/.gitignore marker; the immutable inventory
+          # must contain exactly the wheel and the sdist.
+          rm -f dist/.gitignore
           python control/tools/normalize_python_sdist.py \
             --path "dist/hyphae_sdk-$version.tar.gz" \
             --source-date-epoch "$source_date_epoch"
