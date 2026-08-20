@@ -38,8 +38,8 @@ def main() -> int:
         package = json.loads(javascript_path.read_text("utf-8"))
         peers = package.get("peerDependencies", {})
         metadata = package.get("peerDependenciesMeta", {})
-        if "@celiums/hyphae" not in peers:
-            errors.append("JavaScript integrations must peer-depend on @celiums/hyphae")
+        if "@hyphae_/hyphae" not in peers:
+            errors.append("JavaScript integrations must peer-depend on @hyphae_/hyphae")
         for host in ("astro", "next", "vite"):
             if host not in peers or metadata.get(host, {}).get("optional") is not True:
                 errors.append(f"{host} must be an optional peer dependency")
@@ -64,7 +64,7 @@ def main() -> int:
 
     forbidden_source = re.compile(
         r"hyphae-(?:core|engine|query|retrieval|server|storage)|"
-        r"@celiums/hyphae/(?:src|internal)|(?:\.\./){2,}crates/"
+        r"@hyphae_/hyphae/(?:src|internal)|(?:\.\./){2,}crates/"
     )
     for suffix in ("*.rs", "*.ts", "*.js", "*.mjs", "*.json"):
         for path in INTEGRATIONS.rglob(suffix):

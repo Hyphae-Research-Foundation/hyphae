@@ -40,8 +40,8 @@ def is_hyphae_component(name: object) -> bool:
     return isinstance(name, str) and (
         name == "hyphae"
         or name.startswith("hyphae-")
-        or name == "@celiums/hyphae"
-        or name.startswith("@celiums/hyphae-")
+        or name == "@hyphae_/hyphae"
+        or name.startswith("@hyphae_/hyphae-")
     )
 
 

@@ -103,7 +103,7 @@ remain denied.
 
 Use the `Registry publish` workflow. Pull requests and manual dry runs remain
 unprivileged and execute package audits plus exact crate tarball verification
-with local packaged dependency patches or `npm publish ./path --dry-run`. A
+with local packaged dependency patches or `npm pack ./path --dry-run`. A
 live dispatch must select `dry_run=false` from
 `main`. Before any publish command, the workflow checks out trusted main control
 code separately from the source tag, compares every target-side policy/checker

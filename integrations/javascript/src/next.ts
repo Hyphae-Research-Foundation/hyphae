@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { HyphaeClient, type HyphaeClientOptions } from "@celiums/hyphae";
+import { HyphaeClient, type HyphaeClientOptions } from "@hyphae_/hyphae";
 
 export interface HyphaeNextOptions extends HyphaeClientOptions {
   readonly baseUrl: string;

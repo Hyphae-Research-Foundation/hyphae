@@ -150,7 +150,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     inventory = (
         ["crate-a", "crate-b"]
         if ecosystem == "crates-io"
-        else ["@celiums/hyphae", "@celiums/hyphae-integrations"]
+        else ["@hyphae_/hyphae", "@hyphae_/hyphae-integrations"]
     )
     return {
         "schema": "hyphae-registry-publication-state-v1",
@@ -164,6 +164,35 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
 
 
 class RegistryPublishGateTests(unittest.TestCase):
+    def test_crate_download_requests_the_archive_not_a_url_document(self) -> None:
+        from tools.check_registry_publish import _url_bytes
+
+        captured = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def read(self):
+                return b"payload"
+
+        def opener(request, timeout):
+            captured.append(request)
+            return _Response()
+
+        with patch("tools.check_registry_publish.urllib.request.urlopen", opener):
+            _url_bytes("https://crates.io/api/v1/crates/demo/1.2.2", "metadata")
+            _url_bytes(
+                "https://crates.io/api/v1/crates/demo/1.2.2/download",
+                "crate",
+                accept=None,
+            )
+        self.assertEqual(captured[0].get_header("Accept"), "application/json")
+        self.assertIsNone(captured[1].get_header("Accept"))
+
     def test_crate_vcs_metadata_accepts_clean_and_rejects_dirty_sources(self) -> None:
         from tools.check_registry_publish import _crate_vcs_commit
 
@@ -205,8 +234,8 @@ class RegistryPublishGateTests(unittest.TestCase):
         )
         packages = []
         for path, name in (
-            ("sdks/typescript", "@celiums/hyphae"),
-            ("integrations/javascript", "@celiums/hyphae-integrations"),
+            ("sdks/typescript", "@hyphae_/hyphae"),
+            ("integrations/javascript", "@hyphae_/hyphae-integrations"),
         ):
             directory = root / path
             directory.mkdir(parents=True)
@@ -314,7 +343,7 @@ class RegistryPublishGateTests(unittest.TestCase):
         from tools.check_registry_publish import _package_intent
 
         completed = subprocess.CompletedProcess(
-            [], 0, json.dumps([{"filename": "celiums-hyphae-1.2.0.tgz"}]), ""
+            [], 0, json.dumps([{"filename": "hyphae_-hyphae-1.2.0.tgz"}]), ""
         )
         with tempfile.TemporaryDirectory() as directory, patch(
             "tools.check_registry_publish.subprocess.run", return_value=completed
