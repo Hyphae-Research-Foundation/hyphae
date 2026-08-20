@@ -17,6 +17,8 @@ EXPECTED_TOOL_NAMES = (
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
+    "hyphae_native_search_lexical",
+    "hyphae_native_search_collection",
 )
 EXPECTED_ANNOTATIONS = {
     "readOnlyHint": True,
@@ -60,6 +62,20 @@ EXPECTED_MCP_CASES = [
         "expect": "invalid_request",
         "assert": {"pointer": "/error/code", "equals": "invalid_request"},
     },
+    {
+        "id": "search-lexical-requires-search-authority",
+        "tool": "hyphae_native_search_lexical",
+        "arguments": {"index": 1, "kind": "term", "query": "rust"},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "search-collection-requires-search-authority",
+        "tool": "hyphae_native_search_collection",
+        "arguments": {"collection": 1, "lexical": {"query": "rust"}},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
 ]
 EMPTY_INPUT_SCHEMA = {
     "type": "object",
@@ -84,6 +100,117 @@ PRINCIPAL_INPUT_SCHEMA = {
         },
     },
 }
+SEARCH_LEXICAL_INPUT_SCHEMA = {'type': 'object',
+ 'additionalProperties': False,
+ 'required': ['index', 'kind', 'query'],
+ 'properties': {'index': {'type': 'integer', 'minimum': 1},
+                'kind': {'type': 'string',
+                         'enum': ['term', 'phrase', 'prefix', 'fuzzy']},
+                'query': {'type': 'string', 'minLength': 1, 'maxLength': 4096},
+                'max_distance': {'type': 'integer',
+                                 'minimum': 1,
+                                 'maximum': 2,
+                                 'default': 1},
+                'limit': {'type': 'integer',
+                          'minimum': 1,
+                          'maximum': 1024,
+                          'default': 10}}}
+SEARCH_COLLECTION_INPUT_SCHEMA = {'type': 'object',
+ 'additionalProperties': False,
+ 'required': ['collection'],
+ 'properties': {'collection': {'type': 'integer', 'minimum': 1},
+                'lexical': {'type': ['object', 'null'],
+                            'additionalProperties': False,
+                            'required': ['query'],
+                            'properties': {'query': {'type': 'string',
+                                                     'minLength': 1,
+                                                     'maxLength': 4096},
+                                           'candidate_limit': {'type': 'integer',
+                                                               'minimum': 1,
+                                                               'maximum': 10000,
+                                                               'default': 10},
+                                           'weight': {'type': 'integer',
+                                                      'minimum': 1,
+                                                      'maximum': 1000000,
+                                                      'default': 1}}},
+                'vectors': {'type': 'array',
+                            'maxItems': 16,
+                            'items': {'type': 'object',
+                                      'additionalProperties': False,
+                                      'required': ['target', 'values'],
+                                      'properties': {'target': {'type': 'string',
+                                                                'minLength': 1,
+                                                                'maxLength': 1024},
+                                                     'values': {'type': 'array',
+                                                                'minItems': 1,
+                                                                'maxItems': 65535,
+                                                                'items': {'type': 'number'}},
+                                                     'candidate_limit': {'type': 'integer',
+                                                                         'minimum': 1,
+                                                                         'maximum': 10000,
+                                                                         'default': 10},
+                                                     'weight': {'type': 'integer',
+                                                                'minimum': 1,
+                                                                'maximum': 1000000,
+                                                                'default': 1}}}},
+                'filter': {'type': ['object', 'null'],
+                           'additionalProperties': True,
+                           'required': ['operation'],
+                           'properties': {'operation': {'type': 'string',
+                                                        'enum': ['match_all',
+                                                                 'exists',
+                                                                 'compare',
+                                                                 'all',
+                                                                 'any',
+                                                                 'not']}},
+                           'description': 'Typed doc-value filter: match_all; exists '
+                                          '{field}; compare {field, operator: '
+                                          'equal|not_equal|less|less_or_equal|greater|greater_or_equal, '
+                                          'value}; all/any {filters: [...]}; not '
+                                          '{filter}. Unknown keys for the declared '
+                                          'operation fail closed.'},
+                'sort': {'type': 'array',
+                         'maxItems': 8,
+                         'items': {'type': 'object',
+                                   'additionalProperties': True,
+                                   'required': ['source', 'direction', 'missing'],
+                                   'properties': {'source': {'type': 'string',
+                                                             'enum': ['score',
+                                                                      'field']},
+                                                  'field': {'type': 'string'},
+                                                  'direction': {'type': 'string',
+                                                                'enum': ['ascending',
+                                                                         'descending']},
+                                                  'missing': {'type': 'string',
+                                                              'enum': ['first',
+                                                                       'last']}}}},
+                'facets': {'type': 'array',
+                           'maxItems': 8,
+                           'items': {'type': 'object',
+                                     'additionalProperties': False,
+                                     'required': ['field', 'limit'],
+                                     'properties': {'field': {'type': 'string',
+                                                              'minLength': 1},
+                                                    'limit': {'type': 'integer',
+                                                              'minimum': 1,
+                                                              'maximum': 10000}}}},
+                'aggregations': {'type': 'array',
+                                 'maxItems': 16,
+                                 'items': {'type': 'object',
+                                           'additionalProperties': True,
+                                           'required': ['name', 'operation'],
+                                           'properties': {'name': {'type': 'string',
+                                                                   'minLength': 1},
+                                                          'operation': {'type': 'string',
+                                                                        'enum': ['count',
+                                                                                 'sum',
+                                                                                 'min',
+                                                                                 'max']},
+                                                          'field': {'type': 'string'}}}},
+                'limit': {'type': 'integer',
+                          'minimum': 1,
+                          'maximum': 1024,
+                          'default': 10}}}
 ERROR_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -277,6 +404,88 @@ def success_schemas() -> dict[str, dict[str, Any]]:
                 "next_cursor": CURSOR_SCHEMA,
             },
         },
+        "hyphae_native_search_lexical": {'type': 'object',
+         'additionalProperties': False,
+         'required': ['hits',
+                      'documents_examined',
+                      'source_bytes',
+                      'token_visits',
+                      'token_comparisons',
+                      'fuzzy_steps'],
+         'properties': {'hits': {'type': 'array',
+                                 'maxItems': 1024,
+                                 'items': {'type': 'object',
+                                           'additionalProperties': False,
+                                           'required': ['document_id_hex', 'score'],
+                                           'properties': {'document_id_hex': {'type': 'string',
+                                                                              'pattern': '^([0-9a-f]{2})*$'},
+                                                          'score': {'type': 'number'}}}},
+                        'documents_examined': {'type': 'integer', 'minimum': 0},
+                        'source_bytes': {'type': 'integer', 'minimum': 0},
+                        'token_visits': {'type': 'integer', 'minimum': 0},
+                        'token_comparisons': {'type': 'integer', 'minimum': 0},
+                        'fuzzy_steps': {'type': 'integer', 'minimum': 0}}},
+        "hyphae_native_search_collection": {'type': 'object',
+         'additionalProperties': False,
+         'required': ['snapshot',
+                      'hits',
+                      'facets',
+                      'aggregations',
+                      'vector_branches',
+                      'approximate',
+                      'total_documents',
+                      'eligible_documents',
+                      'lexical_candidates',
+                      'retrieval_candidates',
+                      'matched_candidates'],
+         'properties': {'snapshot': {'type': 'object'},
+                        'hits': {'type': 'array',
+                                 'maxItems': 1024,
+                                 'items': {'type': 'object',
+                                           'additionalProperties': False,
+                                           'required': ['object_id', 'score', 'doc_values'],
+                                           'properties': {'object_id': {'type': 'string',
+                                                                        'pattern': '^[0-9]+$'},
+                                                          'score': {'type': 'number'},
+                                                          'doc_values': {'type': 'object',
+                                                                         'additionalProperties': {'oneOf': [{'type': 'boolean'},
+                                                                                                            {'type': 'integer'},
+                                                                                                            {'type': 'string'},
+                                                                                                            {'type': 'object',
+                                                                                                             'additionalProperties': False,
+                                                                                                             'required': ['bytes_hex'],
+                                                                                                             'properties': {'bytes_hex': {'type': 'string',
+                                                                                                                                          'pattern': '^([0-9a-f]{2})*$'}}}]}}}}},
+                        'facets': {'type': 'array'},
+                        'aggregations': {'type': 'array'},
+                        'vector_branches': {'type': 'array',
+                                            'maxItems': 16,
+                                            'items': {'type': 'object',
+                                                      'additionalProperties': False,
+                                                      'required': ['target',
+                                                                   'strategy',
+                                                                   'approximate',
+                                                                   'eligible_documents',
+                                                                   'candidate_count',
+                                                                   'visited_nodes',
+                                                                   'exact_reranked'],
+                                                      'properties': {'target': {'type': 'string'},
+                                                                     'strategy': {'type': 'string'},
+                                                                     'approximate': {'type': 'boolean'},
+                                                                     'eligible_documents': {'type': 'integer',
+                                                                                            'minimum': 0},
+                                                                     'candidate_count': {'type': 'integer',
+                                                                                         'minimum': 0},
+                                                                     'visited_nodes': {'type': 'integer',
+                                                                                       'minimum': 0},
+                                                                     'exact_reranked': {'type': 'integer',
+                                                                                        'minimum': 0}}}},
+                        'approximate': {'type': 'boolean'},
+                        'total_documents': {'type': 'integer', 'minimum': 0},
+                        'eligible_documents': {'type': 'integer', 'minimum': 0},
+                        'lexical_candidates': {'type': 'integer', 'minimum': 0},
+                        'retrieval_candidates': {'type': 'integer', 'minimum': 0},
+                        'matched_candidates': {'type': 'integer', 'minimum': 0}}},
     }
 
 
@@ -400,8 +609,8 @@ def validate_skill(plugin: Path, expected_tools: set[str]) -> None:
         fail("shared Hyphae skill advertises an unavailable MCP mutation or query")
     if "Auditor" not in text or "Instance" not in text:
         fail("shared Hyphae skill must recommend an Auditor API key")
-    if "Reader" in text:
-        fail("shared Hyphae skill must not recommend a Reader API key")
+    if "search.execute" not in text or "Reader" not in text:
+        fail("shared Hyphae skill must document the search-tool authority")
 
 
 def validate_plugin_readme(plugin: Path) -> None:
@@ -416,8 +625,8 @@ def validate_plugin_readme(plugin: Path) -> None:
         fail("plugin setup must document the managed Native v2 read-only boundary")
     if "Auditor" not in text or "Instance" not in text:
         fail("plugin setup must recommend an Instance-scoped Auditor API key")
-    if "Reader" in text:
-        fail("plugin setup must not recommend a Reader API key")
+    if "search.execute" not in text or "Reader" not in text:
+        fail("plugin setup must document the search-tool authority")
 
 
 def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
@@ -434,7 +643,7 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
     if (
         contract.get("schema") != "hyphae-native-mcp-contract-v2"
         or contract.get("mcp_protocol") != "2025-06-18"
-        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v2"
+        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
     ):
         fail("Native MCP contract versions are invalid")
     if type(contract.get("tool_page_size")) is not int or contract.get("tool_page_size") != 100:
@@ -478,11 +687,11 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
             fail("Native MCP tool annotations must be exact read-only hints")
         if tool.get("execution") != EXPECTED_EXECUTION:
             fail("Native MCP tasks must be forbidden")
-        expected_input = (
-            PRINCIPAL_INPUT_SCHEMA
-            if expected_name == "hyphae_native_security_principals"
-            else EMPTY_INPUT_SCHEMA
-        )
+        expected_input = {
+            "hyphae_native_security_principals": PRINCIPAL_INPUT_SCHEMA,
+            "hyphae_native_search_lexical": SEARCH_LEXICAL_INPUT_SCHEMA,
+            "hyphae_native_search_collection": SEARCH_COLLECTION_INPUT_SCHEMA,
+        }.get(expected_name, EMPTY_INPUT_SCHEMA)
         if tool.get("inputSchema") != expected_input:
             fail(f"Native MCP {expected_name} input schema is invalid")
         expected_output = {
@@ -528,12 +737,12 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         or
         corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
         or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
-        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v2"
+        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
         or corpus.get("tools") != list(EXPECTED_TOOL_NAMES)
         or corpus.get("cases") != EXPECTED_MCP_CASES
     ):
         fail("shared MCP host conformance corpus is invalid")
-    if len({case["id"] for case in corpus["cases"]}) != 4:
+    if len({case["id"] for case in corpus["cases"]}) != 6:
         fail("shared MCP host conformance case IDs must be unique")
     validate_skill(plugin, expected_tools)
     validate_plugin_readme(plugin)

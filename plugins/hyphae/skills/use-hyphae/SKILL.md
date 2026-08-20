@@ -1,28 +1,39 @@
 ---
 name: use-hyphae
-description: Inspect a running local Hyphae engine through its bounded read-only Native v2 MCP tools.
+description: Inspect and search a running local Hyphae engine through its bounded read-only Native v2 MCP tools.
 ---
 
 # Use Hyphae
 
 Use the `hyphae` MCP server as the only data authority for the requested
-inspection. The server is local by default and exposes a versioned, bounded,
-read-only Native v2 tool contract.
+inspection or search. The server is local by default and exposes a versioned,
+bounded, read-only Native v2 tool contract.
 
-Use a restricted API key for the built-in Auditor role at Instance scope. That
-role supplies the `security.read` authority required by both security tools
-without granting mutation authority.
+Pick the narrowest API key for the tools you need. A restricted key for the
+built-in Auditor role at Instance scope supplies the `security.read` authority
+required by both security tools without granting mutation authority. The two
+search tools require the `search.execute` authority instead, which the
+built-in Reader role carries; an Auditor key is denied on them, and a Reader
+key is denied on the security tools. Authority always comes from the
+authenticated key, never from tool arguments.
 
 The current plugin cannot mutate data. Never claim that a write, deletion,
-query, retrieval, or proof operation was performed through this MCP surface.
+or proof operation was performed through this MCP surface.
 
 Start with `hyphae_native_capabilities` when the available contract or limits
 are not already known. Use only the narrowest matching tool:
 
 - `hyphae_native_capabilities` for bounded product capabilities;
-- `hyphae_native_security_status` for redacted access-control counts; and
+- `hyphae_native_security_status` for redacted access-control counts;
 - `hyphae_native_security_principals` for a bounded, cursor-paginated redacted
-  principal page.
+  principal page;
+- `hyphae_native_search_lexical` for one bounded term, phrase, prefix, or
+  fuzzy query against a Native physical index; and
+- `hyphae_native_search_collection` for one integrated lexical, named-vector,
+  or hybrid search with typed filters, sorts, facets, and aggregations. Its
+  result reports the per-branch strategy and whether any branch was
+  approximate — repeat that recall evidence honestly instead of presenting
+  approximate results as exact.
 
 Treat structured `ProductError` values as the authoritative denial. Never put
 `role`, `scope`, `authority`, `api_key`, or similar control fields into tool

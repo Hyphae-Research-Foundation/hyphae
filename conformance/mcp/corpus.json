@@ -1,11 +1,13 @@
 {
   "schema": "hyphae-mcp-host-corpus-v1",
   "mcp_config": "plugins/hyphae/.mcp.json",
-  "tool_schema_version": "hyphae-native-mcp-tools-v2",
+  "tool_schema_version": "hyphae-native-mcp-tools-v3",
   "tools": [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
-    "hyphae_native_security_principals"
+    "hyphae_native_security_principals",
+    "hyphae_native_search_lexical",
+    "hyphae_native_search_collection"
   ],
   "cases": [
     {
@@ -13,28 +15,73 @@
       "tool": "hyphae_native_capabilities",
       "arguments": {},
       "expect": "success",
-      "assert": {"pointer": "/product_api_version", "type": "integer"}
+      "assert": {
+        "pointer": "/product_api_version",
+        "type": "integer"
+      }
     },
     {
       "id": "security-status-read",
       "tool": "hyphae_native_security_status",
       "arguments": {},
       "expect": "success",
-      "assert": {"pointer": "/schema", "equals": "hyphae-native-access-control-status-v1"}
+      "assert": {
+        "pointer": "/schema",
+        "equals": "hyphae-native-access-control-status-v1"
+      }
     },
     {
       "id": "principal-page-read",
       "tool": "hyphae_native_security_principals",
-      "arguments": {"limit": 1},
+      "arguments": {
+        "limit": 1
+      },
       "expect": "success",
-      "assert": {"pointer": "/schema", "equals": "hyphae-native-security-principals-v1"}
+      "assert": {
+        "pointer": "/schema",
+        "equals": "hyphae-native-security-principals-v1"
+      }
     },
     {
       "id": "prompt-authority-rejected",
       "tool": "hyphae_native_security_status",
-      "arguments": {"role": "owner"},
+      "arguments": {
+        "role": "owner"
+      },
       "expect": "invalid_request",
-      "assert": {"pointer": "/error/code", "equals": "invalid_request"}
+      "assert": {
+        "pointer": "/error/code",
+        "equals": "invalid_request"
+      }
+    },
+    {
+      "id": "search-lexical-requires-search-authority",
+      "tool": "hyphae_native_search_lexical",
+      "arguments": {
+        "index": 1,
+        "kind": "term",
+        "query": "rust"
+      },
+      "expect": "authorization_denied",
+      "assert": {
+        "pointer": "/error/code",
+        "equals": "authorization_denied"
+      }
+    },
+    {
+      "id": "search-collection-requires-search-authority",
+      "tool": "hyphae_native_search_collection",
+      "arguments": {
+        "collection": 1,
+        "lexical": {
+          "query": "rust"
+        }
+      },
+      "expect": "authorization_denied",
+      "assert": {
+        "pointer": "/error/code",
+        "equals": "authorization_denied"
+      }
     }
   ]
 }

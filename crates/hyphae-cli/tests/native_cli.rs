@@ -73,6 +73,25 @@ fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
         .output()?)
 }
 
+/// Runs one CLI command with ambient credential variables removed, so tests
+/// stay deterministic when the harness environment exports a key file.
+fn run_isolated(arguments: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(arguments)
+        .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+        .env_remove("HYPHAE_BASE_URL")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hyphae {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 fn security_output(data: &Path, key: &Path, operation: &[&str]) -> Result<Output, Box<dyn Error>> {
     Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
         .args(["security", "--data-dir"])
@@ -3366,11 +3385,11 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(responses.len(), 8);
     let schema_version = &responses[0]["result"]["_meta"]["hyphaeToolSchemaVersion"];
     let schema_digest = &responses[0]["result"]["_meta"]["hyphaeToolSchemaDigest"];
-    assert_eq!(schema_version, "hyphae-native-mcp-tools-v2");
+    assert_eq!(schema_version, "hyphae-native-mcp-tools-v3");
     assert_eq!(schema_digest.as_str().map(str::len), Some(64));
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(3)
+        Some(5)
     );
     assert!(responses[1]["result"].get("nextCursor").is_none());
     assert_eq!(responses[2]["error"]["code"], -32602);
@@ -3954,5 +3973,238 @@ fn valkey_fixture_runs_the_complete_cycle_with_stream_waivers() -> Result<(), Bo
     assert_eq!(promoted["status"], "promoted");
     let reopened = run(&["status", "--data-dir", &path(&target)])?;
     assert_eq!(reopened["status"], "ready");
+    Ok(())
+}
+
+/// Drives one authenticated MCP stdio session and returns one response line
+/// per request identifier.
+#[cfg(unix)]
+fn run_mcp_session(
+    address: &str,
+    key_file: &Path,
+    messages: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address}")])
+        .arg("--native-api-key-file")
+        .arg(key_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let mut output = IoBufReader::new(output);
+    let mut responses = Vec::new();
+    for message in messages {
+        serde_json::to_writer(&mut input, message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        if message.get("id").is_some() {
+            let mut line = String::new();
+            if output.read_line(&mut line)? == 0 {
+                return Err("MCP stdout closed before its response barrier".into());
+            }
+            responses.push(serde_json::from_str(&line)?);
+        }
+    }
+    drop(input);
+    assert!(mcp.wait()?.success());
+    Ok(responses)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_search_tools_execute_with_authority_and_fail_closed_without()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    // Provision the collection while the directory is still unmanaged.
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    let provisioned = run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let lexical_index = provisioned["binding"]["lexical_index"]
+        .as_str()
+        .ok_or("missing lexical index")?
+        .parse::<u64>()?;
+    let documents = serde_json::json!([
+        {"id":301,"text":"rust database engine","doc_values":{"category":"book"},"vectors":{"exact":[0.0,0.0],"ann":[0.0,0.0]}},
+        {"id":302,"text":"rust field guide","doc_values":{"category":"book"},"vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}},
+        {"id":303,"text":"database hardware","doc_values":{"category":"gear"},"vectors":{"exact":[2.0,0.0],"ann":[2.0,0.0]}}
+    ])
+    .to_string();
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        &documents,
+    ])?;
+
+    // Bootstrap security and issue one Reader key and one Auditor key.
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let mut keys = Vec::new();
+    for (name, role, token_base) in [
+        ("Search reader", "reader", 8600),
+        ("Search auditor", "auditor", 8700),
+    ] {
+        let principal = fixture.owner(&[
+            "principal",
+            "create",
+            "--name",
+            name,
+            "--idempotency-token",
+            &token_base.to_string(),
+        ])?;
+        let principal_id = principal["result_id"]
+            .as_str()
+            .ok_or("missing principal identity")?
+            .to_owned();
+        fixture.owner(&[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            &principal_id,
+            "--role",
+            role,
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            &(token_base + 1).to_string(),
+        ])?;
+        fixture.owner(&[
+            "principal",
+            "set-enabled",
+            "--principal-id",
+            &principal_id,
+            "--enabled",
+            "true",
+            "--idempotency-token",
+            &(token_base + 2).to_string(),
+        ])?;
+        let destination = fixture.temporary.0.join(format!("{role}.key"));
+        if role == "reader" {
+            fixture.issue_reader_key(&principal_id, &destination)?;
+        } else {
+            fixture.issue_auditor_key(&principal_id, &destination)?;
+        }
+        keys.push(destination);
+    }
+    let (reader_key, auditor_key) = (keys.remove(0), keys.remove(0));
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hms-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let lexical_call = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name":"hyphae_native_search_lexical",
+        "arguments":{"index":lexical_index,"kind":"term","query":"rust","limit":10}}});
+    let collection_call = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"hyphae_native_search_collection",
+        "arguments":{
+            "collection":13,
+            "lexical":{"query":"rust","candidate_limit":10},
+            "vectors":[{"target":"exact","values":[0.0,0.0],"candidate_limit":10}],
+            "filter":{"operation":"compare","field":"category","operator":"equal","value":"book"},
+            "facets":[{"field":"category","limit":4}],
+            "limit":10}}});
+
+    // The Reader authority executes both search tools.
+    let mut messages = handshake.to_vec();
+    messages.push(lexical_call.clone());
+    messages.push(collection_call.clone());
+    let reader = run_mcp_session(&address_text, &reader_key, &messages)?;
+    assert_eq!(reader[1]["result"]["isError"], false);
+    assert!(
+        !reader[1]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .ok_or("missing lexical hits")?
+            .is_empty()
+    );
+    assert_eq!(reader[2]["result"]["isError"], false);
+    let integrated = &reader[2]["result"]["structuredContent"];
+    assert_eq!(integrated["hits"].as_array().map(Vec::len), Some(2));
+    assert_eq!(integrated["facets"][0]["buckets"][0]["count"], 2);
+    assert_eq!(
+        integrated["vector_branches"][0]["strategy"],
+        "exact_filtered"
+    );
+    assert_eq!(integrated["approximate"], false);
+
+    // The Auditor authority lacks search.execute and fails closed.
+    let mut messages = handshake.to_vec();
+    messages.push(lexical_call);
+    messages.push(collection_call);
+    let auditor = run_mcp_session(&address_text, &auditor_key, &messages)?;
+    for response in &auditor[1..=2] {
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "authorization_denied"
+        );
+    }
+    let _ignored = fs::remove_file(endpoint);
     Ok(())
 }

@@ -12,8 +12,9 @@ use hyphae_client::v2::{
 };
 use hyphae_contracts::NATIVE_MCP_V2;
 use hyphae_native_product::{
-    MAX_API_KEY_CREDENTIAL_BYTES, ProductError, ProductErrorCode, ProductResponse, SecurityCursor,
-    SecurityPrincipalListRequest,
+    BoundedSearchQuery, MAX_API_KEY_CREDENTIAL_BYTES, ObjectId, ProductError, ProductErrorCode,
+    ProductLexicalBranch, ProductResponse, ProductSearchFilter, ProductSearchRequest,
+    ProductVector, ProductVectorBranch, SecurityCursor, SecurityPrincipalListRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,12 +28,14 @@ use crate::{
 const MCP_CONTRACT: &str = NATIVE_MCP_V2;
 const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v2";
 const MCP_PROTOCOL: &str = "2025-06-18";
-const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v2";
+const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v3";
 const TOOL_PAGE_SIZE: usize = 100;
-const TOOL_NAMES: [&str; 3] = [
+const TOOL_NAMES: [&str; 5] = [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
+    "hyphae_native_search_lexical",
+    "hyphae_native_search_collection",
 ];
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CURSOR_BYTES: usize = 128;
@@ -46,6 +49,8 @@ enum NativeReadTool {
     Capabilities,
     SecurityStatus,
     SecurityPrincipals,
+    SearchLexical,
+    SearchCollection,
 }
 
 impl NativeReadTool {
@@ -54,6 +59,8 @@ impl NativeReadTool {
             "hyphae_native_capabilities" => Some(Self::Capabilities),
             "hyphae_native_security_status" => Some(Self::SecurityStatus),
             "hyphae_native_security_principals" => Some(Self::SecurityPrincipals),
+            "hyphae_native_search_lexical" => Some(Self::SearchLexical),
+            "hyphae_native_search_collection" => Some(Self::SearchCollection),
             _ => None,
         }
     }
@@ -129,6 +136,71 @@ struct PrincipalListInput {
     cursor: Option<String>,
     #[serde(default = "default_security_limit")]
     limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalSearchInput {
+    index: u64,
+    kind: String,
+    query: String,
+    #[serde(default = "default_fuzzy_distance")]
+    max_distance: u8,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectionSearchInput {
+    collection: u64,
+    #[serde(default)]
+    lexical: Option<LexicalBranchInput>,
+    #[serde(default)]
+    vectors: Vec<VectorBranchInput>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    sort: Vec<Value>,
+    #[serde(default)]
+    facets: Vec<Value>,
+    #[serde(default)]
+    aggregations: Vec<Value>,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalBranchInput {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    candidate_limit: usize,
+    #[serde(default = "default_branch_weight")]
+    weight: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VectorBranchInput {
+    target: String,
+    values: Vec<f32>,
+    #[serde(default = "default_search_limit")]
+    candidate_limit: usize,
+    #[serde(default = "default_branch_weight")]
+    weight: u32,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+fn default_branch_weight() -> u32 {
+    1
+}
+
+fn default_fuzzy_distance() -> u8 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -677,9 +749,77 @@ async fn execute_tool(
                 .map_err(|_| invalid_request())?;
             client.security_principal_list(request, options).await
         }
+        NativeReadTool::SearchLexical => {
+            let input = strict_input::<LexicalSearchInput>(arguments)?;
+            let index = ObjectId::new(u128::from(input.index)).map_err(|_| invalid_request())?;
+            let query = match input.kind.as_str() {
+                "term" => BoundedSearchQuery::Term(input.query),
+                "phrase" => BoundedSearchQuery::Phrase(input.query),
+                "prefix" => BoundedSearchQuery::Prefix(input.query),
+                "fuzzy" => BoundedSearchQuery::Fuzzy {
+                    term: input.query,
+                    max_distance: input.max_distance,
+                },
+                _ => return Err(invalid_request()),
+            };
+            client.search(index, query, input.limit, options).await
+        }
+        NativeReadTool::SearchCollection => {
+            let input = strict_input::<CollectionSearchInput>(arguments)?;
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let request = collection_search_request(input)?;
+            client.search_collection(collection, request, options).await
+        }
     }
     .map_err(normalize_client_error)?;
     response_for(tool, response)
+}
+
+fn collection_search_request(
+    input: CollectionSearchInput,
+) -> Result<ProductSearchRequest, Box<ProductError>> {
+    Ok(ProductSearchRequest {
+        lexical: input.lexical.map(|branch| ProductLexicalBranch {
+            query: branch.query,
+            candidate_limit: branch.candidate_limit,
+            weight: branch.weight,
+        }),
+        vectors: input
+            .vectors
+            .into_iter()
+            .map(|branch| {
+                Ok(ProductVectorBranch {
+                    target: branch.target,
+                    query: ProductVector::new(branch.values).map_err(|_| invalid_request())?,
+                    candidate_limit: branch.candidate_limit,
+                    weight: branch.weight,
+                    execution: None,
+                })
+            })
+            .collect::<Result<_, Box<ProductError>>>()?,
+        filter: input
+            .filter
+            .map(|value| crate::product_search_filter(value).map_err(|_| invalid_request()))
+            .transpose()?
+            .unwrap_or(ProductSearchFilter::MatchAll),
+        sort: input
+            .sort
+            .into_iter()
+            .map(|value| crate::product_search_sort(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        facets: input
+            .facets
+            .into_iter()
+            .map(|value| crate::product_facet(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        aggregations: input
+            .aggregations
+            .into_iter()
+            .map(|value| crate::product_aggregation(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        limit: input.limit,
+    })
 }
 
 fn cancel_active_call(message: &Value, active: Option<&ActiveToolCall>) -> bool {
@@ -738,7 +878,11 @@ fn response_for(
         ) | (
             NativeReadTool::SecurityPrincipals,
             ProductResponse::SecurityPrincipalPage(_)
-        )
+        ) | (NativeReadTool::SearchLexical, ProductResponse::Search(_))
+            | (
+                NativeReadTool::SearchCollection,
+                ProductResponse::IntegratedSearch(_)
+            )
     );
     if !expected {
         return Err(Box::new(ProductError::from_code(
@@ -965,14 +1109,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let registry = ToolRegistry::load()?;
         assert_eq!(registry.protocol, "2025-06-18");
-        assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v2");
+        assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v3");
         assert_eq!(registry.schema_digest.len(), 64);
         assert_eq!(registry.page_size, 100);
-        assert_eq!(registry.tools.len(), 3);
+        assert_eq!(registry.tools.len(), 5);
         let first = registry
             .list(&serde_json::json!({}))
             .map_err(|()| "first page")?;
-        assert_eq!(first["tools"].as_array().map(Vec::len), Some(3));
+        assert_eq!(first["tools"].as_array().map(Vec::len), Some(5));
         assert!(first.get("nextCursor").is_none());
         assert!(
             registry
