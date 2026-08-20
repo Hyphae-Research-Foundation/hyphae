@@ -251,6 +251,7 @@ jobs:
       wheel-sha256: ${{ steps.distribution-bytes.outputs.wheel-sha256 }}
       sdist-sha256: ${{ steps.distribution-bytes.outputs.sdist-sha256 }}
       publication-artifact-id: ${{ steps.publication-artifact.outputs.artifact-id }}
+      rehearsal-published: ${{ steps.rehearsal.outputs.published }}
       publication-artifact-digest: ${{ steps.publication-artifact.outputs.artifact-digest }}
     steps:
       - name: Validate main control plane and promotion inputs
@@ -812,6 +813,54 @@ jobs:
             --workflow-run-id '${{ github.run_id }}' \
             --workflow-run-attempt '${{ github.run_attempt }}' \
             --repository "$REPOSITORY"
+      - name: Detect the already-published exact rehearsal release
+        id: rehearsal
+        if: inputs.repository == 'testpypi'
+        shell: bash
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+          WHEEL_SHA256: ${{ steps.distribution-bytes.outputs.wheel-sha256 }}
+          SDIST_SHA256: ${{ steps.distribution-bytes.outputs.sdist-sha256 }}
+        run: |
+          set -euo pipefail
+          # TestPyPI filenames are permanent, so a re-dispatch over an already
+          # published rehearsal release must reach verification instead of
+          # failing on upload. Only a complete, byte-exact match skips the
+          # publish step; a partial or differing release fails closed here.
+          python3 - <<'DETECT' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["VERSION"]
+          local = {
+              f"hyphae_sdk-{version}-py3-none-any.whl": os.environ["WHEEL_SHA256"],
+              f"hyphae_sdk-{version}.tar.gz": os.environ["SDIST_SHA256"],
+          }
+          request = urllib.request.Request(
+              f"https://test.pypi.org/pypi/hyphae-sdk/{version}/json",
+              headers={"User-Agent": "hyphae-python-publish"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  remote = {
+                      row["filename"]: row["digests"]["sha256"]
+                      for row in json.load(response)["urls"]
+                  }
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              remote = {}
+          if not remote:
+              print("published=false")
+          elif remote == local:
+              print("published=true")
+          else:
+              raise SystemExit(
+                  "rehearsal release differs from the rebuilt distributions"
+              )
+          DETECT
       - name: Upload exact distributions
         id: publication-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -844,7 +893,7 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}
           path: release
       - name: Publish distributions to TestPyPI
-        if: inputs.repository == 'testpypi'
+        if: inputs.repository == 'testpypi' && needs.build.outputs.rehearsal-published != 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: release/publish-dist/
