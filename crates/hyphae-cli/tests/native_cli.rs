@@ -4208,3 +4208,236 @@ async fn native_mcp_search_tools_execute_with_authority_and_fail_closed_without(
     let _ignored = fs::remove_file(endpoint);
     Ok(())
 }
+
+#[cfg(unix)]
+fn run_mcp_session_with_flags(
+    address: &str,
+    key_file: &Path,
+    extra: &[&str],
+    messages: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address}")])
+        .arg("--native-api-key-file")
+        .arg(key_file)
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let mut output = IoBufReader::new(output);
+    let mut responses = Vec::new();
+    for message in messages {
+        serde_json::to_writer(&mut input, message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        if message.get("id").is_some() {
+            let mut line = String::new();
+            if output.read_line(&mut line)? == 0 {
+                return Err("MCP stdout closed before its response barrier".into());
+            }
+            responses.push(serde_json::from_str(&line)?);
+        }
+    }
+    drop(input);
+    assert!(mcp.wait()?.success());
+    Ok(responses)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let mut keys = Vec::new();
+    for (name, role, token_base) in [
+        ("Ingest writer", "writer", 8800),
+        ("Ingest reader", "reader", 8900),
+    ] {
+        let principal = fixture.owner(&[
+            "principal",
+            "create",
+            "--name",
+            name,
+            "--idempotency-token",
+            &token_base.to_string(),
+        ])?;
+        let principal_id = principal["result_id"]
+            .as_str()
+            .ok_or("missing principal identity")?
+            .to_owned();
+        fixture.owner(&[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            &principal_id,
+            "--role",
+            role,
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            &(token_base + 1).to_string(),
+        ])?;
+        fixture.owner(&[
+            "principal",
+            "set-enabled",
+            "--principal-id",
+            &principal_id,
+            "--enabled",
+            "true",
+            "--idempotency-token",
+            &(token_base + 2).to_string(),
+        ])?;
+        let destination = fixture.temporary.0.join(format!("{role}.key"));
+        if role == "writer" {
+            fixture.issue_built_in_key(
+                &principal_id,
+                &destination,
+                BuiltInRole::Writer,
+                "writer-mcp",
+            )?;
+        } else {
+            fixture.issue_reader_key(&principal_id, &destination)?;
+        }
+        keys.push(destination);
+    }
+    let (writer_key, reader_key) = (keys.remove(0), keys.remove(0));
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmi-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let list = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+    let ingest_call = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"hyphae_native_search_ingest",
+        "arguments":{
+            "collection":13,
+            "idempotency_id":41,
+            "documents":[{"id":501,"text":"rust ingest via mcp","vectors":{"exact":[0.5,0.5],"ann":[0.5,0.5]}}]}}});
+    let search_call = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+        "name":"hyphae_native_search_collection",
+        "arguments":{"collection":13,"lexical":{"query":"ingest"},"limit":5}}});
+
+    // Default session: the ingest tool is not listed and not callable.
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(ingest_call.clone());
+    let default_session = run_mcp_session_with_flags(&address_text, &writer_key, &[], &messages)?;
+    assert_eq!(
+        default_session[1]["result"]["tools"]
+            .as_array()
+            .map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(default_session[2]["error"]["code"], -32602);
+
+    // Opted-in session with a Writer key: the tool is listed and the batch
+    // commits; the ingested document is immediately searchable.
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(ingest_call.clone());
+    messages.push(ingest_call.clone());
+    messages.push(search_call);
+    let writer =
+        run_mcp_session_with_flags(&address_text, &writer_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        writer[1]["result"]["tools"].as_array().map(Vec::len),
+        Some(6)
+    );
+    assert_eq!(writer[2]["result"]["isError"], false);
+    assert_eq!(
+        writer[2]["result"]["structuredContent"]["status"],
+        "committed"
+    );
+    assert_eq!(
+        writer[3]["result"]["structuredContent"]["status"],
+        "existing"
+    );
+    assert_eq!(
+        writer[3]["result"]["structuredContent"]["idempotent_replay"],
+        true
+    );
+    assert_eq!(
+        writer[4]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // Opted-in session with a Reader key: exposure is not authority.
+    let mut messages = handshake.to_vec();
+    messages.push(ingest_call);
+    let reader =
+        run_mcp_session_with_flags(&address_text, &reader_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        reader[1]["result"]["structuredContent"]["error"]["code"],
+        "authorization_denied"
+    );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}

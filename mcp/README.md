@@ -51,7 +51,9 @@ principal, role, or permission. Unknown input fields fail closed.
 - Cancellation remains live while a Native HTTP request is in flight; the
   bounded reader/control path does not wait for that request to finish.
 - `tools/list` has a fixed maximum page of one hundred definitions, so the
-  complete fixed 5-tool registry is returned in one host-compatible page;
+  complete fixed 6-tool registry (five read-only tools listed by default,
+  the ingest tool added by `--allow-ingest`) is returned in one
+  host-compatible page;
   exhausted pages omit `nextCursor` rather than serializing JSON `null`.
 - MCP tasks are forbidden.
 
@@ -67,6 +69,15 @@ The exact tool definitions live in
 | `hyphae_native_security_principals` | `SecurityPrincipalList` | `security.read` at Instance |
 | `hyphae_native_search_lexical` | `Search` | `search.execute` |
 | `hyphae_native_search_collection` | `SearchCollection` | `search.execute` |
+| `hyphae_native_search_ingest` | `SearchIngest` | `data.write` and `search.execute`; listed only with `--allow-ingest` |
+
+The adapter is read-only by default. Starting it with `--allow-ingest`
+additionally lists `hyphae_native_search_ingest`, one bounded atomic
+idempotent document-batch write (at most 256 documents and 16 MiB per batch,
+enforced fail-closed by the product). The flag only exposes the tool: the
+write still requires a key whose durable authority carries `data.write`
+(the built-in Writer role); a Reader or Auditor key receives a typed denial.
+The checked-in agent plugin never passes the flag and stays read-only.
 
 All three tools are read-only, non-destructive, idempotent, closed-world, and
 task-forbidden. Principal pages are bounded by `limit` (`1..=1000`) and use the

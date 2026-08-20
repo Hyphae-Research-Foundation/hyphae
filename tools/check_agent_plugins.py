@@ -19,13 +19,18 @@ EXPECTED_TOOL_NAMES = (
     "hyphae_native_security_principals",
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
+    "hyphae_native_search_ingest",
 )
-EXPECTED_ANNOTATIONS = {
-    "readOnlyHint": True,
-    "destructiveHint": False,
-    "idempotentHint": True,
-    "openWorldHint": False,
-}
+# The write-scoped ingest tool is absent unless the operator starts the
+# adapter with --allow-ingest; hosts and the shared corpus see this subset.
+DEFAULT_VISIBLE_TOOL_NAMES = EXPECTED_TOOL_NAMES[:5]
+def expected_annotations(tool_name: str) -> dict[str, bool]:
+    return {
+        "readOnlyHint": tool_name != "hyphae_native_search_ingest",
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
 EXPECTED_EXECUTION = {"taskSupport": "forbidden"}
 EXPECTED_MCP_CASES = [
     {
@@ -100,6 +105,36 @@ PRINCIPAL_INPUT_SCHEMA = {
         },
     },
 }
+SEARCH_INGEST_INPUT_SCHEMA = {'type': 'object',
+ 'additionalProperties': False,
+ 'required': ['collection', 'idempotency_id', 'documents'],
+ 'properties': {'collection': {'type': 'integer', 'minimum': 1},
+                'idempotency_id': {'type': 'integer', 'minimum': 1},
+                'documents': {'type': 'array',
+                              'minItems': 1,
+                              'maxItems': 256,
+                              'items': {'type': 'object',
+                                        'additionalProperties': False,
+                                        'required': ['id', 'text'],
+                                        'properties': {'id': {'oneOf': [{'type': 'integer',
+                                                                         'minimum': 1},
+                                                                        {'type': 'string',
+                                                                         'pattern': '^[0-9]+$'}]},
+                                                       'text': {'type': 'string'},
+                                                       'doc_values': {'type': 'object',
+                                                                      'additionalProperties': {'oneOf': [{'type': 'boolean'},
+                                                                                                         {'type': 'integer'},
+                                                                                                         {'type': 'string'},
+                                                                                                         {'type': 'object',
+                                                                                                          'additionalProperties': False,
+                                                                                                          'required': ['bytes_hex'],
+                                                                                                          'properties': {'bytes_hex': {'type': 'string',
+                                                                                                                                       'pattern': '^([0-9a-f]{2})*$'}}}]}},
+                                                       'vectors': {'type': 'object',
+                                                                   'additionalProperties': {'type': 'array',
+                                                                                            'minItems': 1,
+                                                                                            'maxItems': 65535,
+                                                                                            'items': {'type': 'number'}}}}}}}}
 SEARCH_LEXICAL_INPUT_SCHEMA = {'type': 'object',
  'additionalProperties': False,
  'required': ['index', 'kind', 'query'],
@@ -486,6 +521,14 @@ def success_schemas() -> dict[str, dict[str, Any]]:
                         'lexical_candidates': {'type': 'integer', 'minimum': 0},
                         'retrieval_candidates': {'type': 'integer', 'minimum': 0},
                         'matched_candidates': {'type': 'integer', 'minimum': 0}}},
+        "hyphae_native_search_ingest": {'type': 'object',
+         'additionalProperties': False,
+         'required': ['status', 'snapshot', 'commit', 'documents', 'idempotent_replay'],
+         'properties': {'status': {'type': 'string', 'enum': ['committed', 'existing']},
+                        'snapshot': {'type': 'object'},
+                        'commit': {'type': ['object', 'null']},
+                        'documents': {'type': 'integer', 'minimum': 0},
+                        'idempotent_replay': {'type': 'boolean'}}},
     }
 
 
@@ -683,7 +726,7 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
             or not 1 <= len(description) <= 256
         ):
             fail("Native MCP contract tool identities are invalid")
-        if tool.get("annotations") != EXPECTED_ANNOTATIONS:
+        if tool.get("annotations") != expected_annotations(expected_name):
             fail("Native MCP tool annotations must be exact read-only hints")
         if tool.get("execution") != EXPECTED_EXECUTION:
             fail("Native MCP tasks must be forbidden")
@@ -691,6 +734,7 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
             "hyphae_native_security_principals": PRINCIPAL_INPUT_SCHEMA,
             "hyphae_native_search_lexical": SEARCH_LEXICAL_INPUT_SCHEMA,
             "hyphae_native_search_collection": SEARCH_COLLECTION_INPUT_SCHEMA,
+            "hyphae_native_search_ingest": SEARCH_INGEST_INPUT_SCHEMA,
         }.get(expected_name, EMPTY_INPUT_SCHEMA)
         if tool.get("inputSchema") != expected_input:
             fail(f"Native MCP {expected_name} input schema is invalid")
@@ -728,9 +772,8 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         fail("agent plugin version must match the bounded 1.2 MCP slice")
     validate_claude(load_object(plugin / ".claude-plugin/plugin.json", root), version)
     validate_marketplaces(root, version)
-    expected_tools = set(
-        validate_contract(load_object(root / "contracts/native-mcp-v2.json", root))
-    )
+    validate_contract(load_object(root / "contracts/native-mcp-v2.json", root))
+    expected_tools = set(DEFAULT_VISIBLE_TOOL_NAMES)
     corpus = load_object(root / "conformance/mcp/corpus.json", root)
     if (
         set(corpus) != {"schema", "mcp_config", "tool_schema_version", "tools", "cases"}
@@ -738,7 +781,7 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
         or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
         or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
-        or corpus.get("tools") != list(EXPECTED_TOOL_NAMES)
+        or corpus.get("tools") != list(DEFAULT_VISIBLE_TOOL_NAMES)
         or corpus.get("cases") != EXPECTED_MCP_CASES
     ):
         fail("shared MCP host conformance corpus is invalid")
