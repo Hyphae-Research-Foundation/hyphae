@@ -181,7 +181,14 @@ pub use local_transaction::{
     encode_local_transaction_rollback, encode_local_transaction_rollback_receipt,
     encode_local_transaction_stage_receipt,
 };
+pub mod external_migration;
 pub mod migration;
+pub use external_migration::{
+    ConstructClassification, EXTERNAL_MIGRATION_DIGEST_DOMAIN, EXTERNAL_MIGRATION_RECEIPT_KIND,
+    EXTERNAL_MIGRATION_RECEIPT_VERSION, ExternalConsistencyPoint, ExternalMigrationReceipt,
+    ExternalMigrationReceiptError, ExternalMigrationReceiptLimits, ExternalSourceIdentity,
+    ExternalTargetState, FidelityClass, MappingDecision, OperatorWaiver, TargetKeyspace,
+};
 #[cfg(unix)]
 #[allow(deprecated)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
