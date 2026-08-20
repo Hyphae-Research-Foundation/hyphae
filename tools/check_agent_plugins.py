@@ -19,11 +19,15 @@ EXPECTED_TOOL_NAMES = (
     "hyphae_native_security_principals",
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
+    "hyphae_native_prove_search",
+    "hyphae_native_verify_proof",
     "hyphae_native_search_ingest",
 )
 # The write-scoped ingest tool is absent unless the operator starts the
 # adapter with --allow-ingest; hosts and the shared corpus see this subset.
-DEFAULT_VISIBLE_TOOL_NAMES = EXPECTED_TOOL_NAMES[:5]
+DEFAULT_VISIBLE_TOOL_NAMES = tuple(
+    name for name in EXPECTED_TOOL_NAMES if name != "hyphae_native_search_ingest"
+)
 def expected_annotations(tool_name: str) -> dict[str, bool]:
     return {
         "readOnlyHint": tool_name != "hyphae_native_search_ingest",
@@ -81,6 +85,20 @@ EXPECTED_MCP_CASES = [
         "expect": "authorization_denied",
         "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
     },
+    {
+        "id": "prove-search-requires-proof-authority",
+        "tool": "hyphae_native_prove_search",
+        "arguments": {"collection": 1, "lexical": {"query": "rust"}},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "verify-proof-rejects-malformed-artifacts",
+        "tool": "hyphae_native_verify_proof",
+        "arguments": {"proof_hex": "00", "witness_hex": "00", "anchor_hex": "00"},
+        "expect": "invalid_request",
+        "assert": {"pointer": "/error/code", "equals": "invalid_request"},
+    },
 ]
 EMPTY_INPUT_SCHEMA = {
     "type": "object",
@@ -105,6 +123,12 @@ PRINCIPAL_INPUT_SCHEMA = {
         },
     },
 }
+VERIFY_PROOF_INPUT_SCHEMA = {'type': 'object',
+ 'additionalProperties': False,
+ 'required': ['proof_hex', 'witness_hex', 'anchor_hex'],
+ 'properties': {'proof_hex': {'type': 'string', 'pattern': '^([0-9a-f]{2})*$'},
+                'witness_hex': {'type': 'string', 'pattern': '^([0-9a-f]{2})*$'},
+                'anchor_hex': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'}}}
 SEARCH_INGEST_INPUT_SCHEMA = {'type': 'object',
  'additionalProperties': False,
  'required': ['collection', 'idempotency_id', 'documents'],
@@ -529,6 +553,53 @@ def success_schemas() -> dict[str, dict[str, Any]]:
                         'commit': {'type': ['object', 'null']},
                         'documents': {'type': 'integer', 'minimum': 0},
                         'idempotent_replay': {'type': 'boolean'}}},
+        "hyphae_native_prove_search": {'type': 'object',
+         'additionalProperties': False,
+         'required': ['status',
+                      'kind',
+                      'response',
+                      'proof_hex',
+                      'witness_hex',
+                      'anchor_hex',
+                      'proof_bytes',
+                      'witness_bytes'],
+         'properties': {'status': {'const': 'generated'},
+                        'kind': {'type': 'string'},
+                        'response': {'type': 'object'},
+                        'proof_hex': {'type': 'string', 'pattern': '^([0-9a-f]{2})*$'},
+                        'witness_hex': {'type': 'string', 'pattern': '^([0-9a-f]{2})*$'},
+                        'anchor_hex': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'proof_bytes': {'type': 'integer', 'minimum': 0},
+                        'witness_bytes': {'type': 'integer', 'minimum': 0}}},
+        "hyphae_native_verify_proof": {'type': 'object',
+         'additionalProperties': False,
+         'required': ['status',
+                      'scope',
+                      'kind',
+                      'anchor_digest',
+                      'proof_digest',
+                      'witness_digest',
+                      'request_digest',
+                      'result_digest',
+                      'evidence_digest',
+                      'file_count',
+                      'directory_count',
+                      'total_file_bytes',
+                      'semantic_reexecution_performed'],
+         'properties': {'status': {'const': 'verified'},
+                        'scope': {'type': 'string',
+                                  'enum': ['semantic_reexecution', 'artifact_integrity']},
+                        'kind': {'type': 'string'},
+                        'anchor_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'proof_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'witness_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'request_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'result_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'evidence_digest': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                        'file_count': {'type': 'integer', 'minimum': 0},
+                        'directory_count': {'type': 'integer', 'minimum': 0},
+                        'total_file_bytes': {'type': 'integer', 'minimum': 0},
+                        'semantic_reexecution_performed': {'type': 'boolean'}}},
     }
 
 
@@ -734,6 +805,8 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
             "hyphae_native_security_principals": PRINCIPAL_INPUT_SCHEMA,
             "hyphae_native_search_lexical": SEARCH_LEXICAL_INPUT_SCHEMA,
             "hyphae_native_search_collection": SEARCH_COLLECTION_INPUT_SCHEMA,
+            "hyphae_native_prove_search": SEARCH_COLLECTION_INPUT_SCHEMA,
+            "hyphae_native_verify_proof": VERIFY_PROOF_INPUT_SCHEMA,
             "hyphae_native_search_ingest": SEARCH_INGEST_INPUT_SCHEMA,
         }.get(expected_name, EMPTY_INPUT_SCHEMA)
         if tool.get("inputSchema") != expected_input:
@@ -785,7 +858,7 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         or corpus.get("cases") != EXPECTED_MCP_CASES
     ):
         fail("shared MCP host conformance corpus is invalid")
-    if len({case["id"] for case in corpus["cases"]}) != 6:
+    if len({case["id"] for case in corpus["cases"]}) != 8:
         fail("shared MCP host conformance case IDs must be unique")
     validate_skill(plugin, expected_tools)
     validate_plugin_readme(plugin)

@@ -32,12 +32,14 @@ const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v2";
 const MCP_PROTOCOL: &str = "2025-06-18";
 const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v3";
 const TOOL_PAGE_SIZE: usize = 100;
-const TOOL_NAMES: [&str; 6] = [
+const TOOL_NAMES: [&str; 8] = [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
+    "hyphae_native_prove_search",
+    "hyphae_native_verify_proof",
     "hyphae_native_search_ingest",
 ];
 /// The one write-scoped tool, absent unless the operator opts in.
@@ -56,6 +58,8 @@ enum NativeTool {
     SecurityPrincipals,
     SearchLexical,
     SearchCollection,
+    ProveSearch,
+    VerifyProof,
     SearchIngest,
 }
 
@@ -67,6 +71,8 @@ impl NativeTool {
             "hyphae_native_security_principals" => Some(Self::SecurityPrincipals),
             "hyphae_native_search_lexical" => Some(Self::SearchLexical),
             "hyphae_native_search_collection" => Some(Self::SearchCollection),
+            "hyphae_native_prove_search" => Some(Self::ProveSearch),
+            "hyphae_native_verify_proof" => Some(Self::VerifyProof),
             "hyphae_native_search_ingest" if allow_ingest => Some(Self::SearchIngest),
             _ => None,
         }
@@ -167,10 +173,10 @@ struct LexicalSearchInput {
     limit: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CollectionSearchInput {
-    collection: u64,
+pub(crate) struct CollectionSearchInput {
+    pub(crate) collection: u64,
     #[serde(default)]
     lexical: Option<LexicalBranchInput>,
     #[serde(default)]
@@ -187,7 +193,7 @@ struct CollectionSearchInput {
     limit: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LexicalBranchInput {
     query: String,
@@ -197,7 +203,7 @@ struct LexicalBranchInput {
     weight: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VectorBranchInput {
     target: String,
@@ -206,6 +212,15 @@ struct VectorBranchInput {
     candidate_limit: usize,
     #[serde(default = "default_branch_weight")]
     weight: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
+struct VerifyProofInput {
+    proof_hex: String,
+    witness_hex: String,
+    anchor_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -804,6 +819,26 @@ async fn execute_tool(
             let request = collection_search_request(input)?;
             client.search_collection(collection, request, options).await
         }
+        NativeTool::ProveSearch => {
+            let input = strict_input::<CollectionSearchInput>(arguments)?;
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let request = collection_search_request(input)?;
+            client
+                .prove(
+                    hyphae_native_product::ProductOperation::SearchCollection {
+                        collection,
+                        request,
+                    },
+                    hyphae_native_product::proof::NativeProofGenerationLimits::default(),
+                    options,
+                )
+                .await
+        }
+        NativeTool::VerifyProof => {
+            let input = strict_input::<VerifyProofInput>(arguments)?;
+            return verify_proof_locally(&input);
+        }
         NativeTool::SearchIngest => {
             let input = strict_input::<SearchIngestInput>(arguments)?;
             if input.idempotency_id == 0 {
@@ -833,7 +868,7 @@ async fn execute_tool(
     response_for(tool, response)
 }
 
-fn collection_search_request(
+pub(crate) fn collection_search_request(
     input: CollectionSearchInput,
 ) -> Result<ProductSearchRequest, Box<ProductError>> {
     Ok(ProductSearchRequest {
@@ -877,6 +912,44 @@ fn collection_search_request(
             .collect::<Result<_, _>>()?,
         limit: input.limit,
     })
+}
+
+/// Verifies one sealed proof and witness completely inside the adapter
+/// process; verification is trustless and never contacts the daemon.
+fn verify_proof_locally(input: &VerifyProofInput) -> Result<Value, Box<ProductError>> {
+    use hyphae_native_product::proof::{
+        ExternalTrustedAnchor, NativeVerificationLimits, verify_native_proof_offline,
+    };
+    let proof = crate::decode_hex_bytes(&input.proof_hex).map_err(|_| invalid_request())?;
+    let witness = crate::decode_hex_bytes(&input.witness_hex).map_err(|_| invalid_request())?;
+    let anchor = crate::decode_hex::<32>(&input.anchor_hex).map_err(|_| invalid_request())?;
+    let report = verify_native_proof_offline(
+        &proof,
+        &witness,
+        ExternalTrustedAnchor::new(anchor),
+        &NativeVerificationLimits::default(),
+    )
+    .map_err(|_| invalid_request())?;
+    let scope = if report.semantic_reexecution_performed {
+        "semantic_reexecution"
+    } else {
+        "artifact_integrity"
+    };
+    Ok(json!({
+        "status": "verified",
+        "scope": scope,
+        "kind": crate::proof_kind(report.kind),
+        "anchor_digest": crate::encode_hex(&report.anchor_digest),
+        "proof_digest": crate::encode_hex(&report.proof_digest),
+        "witness_digest": crate::encode_hex(&report.witness_digest),
+        "request_digest": crate::encode_hex(&report.request_digest),
+        "result_digest": crate::encode_hex(&report.result_digest),
+        "evidence_digest": crate::encode_hex(&report.evidence_digest),
+        "file_count": report.file_count,
+        "directory_count": report.directory_count,
+        "total_file_bytes": report.total_file_bytes,
+        "semantic_reexecution_performed": report.semantic_reexecution_performed,
+    }))
 }
 
 fn cancel_active_call(message: &Value, active: Option<&ActiveToolCall>) -> bool {
@@ -938,7 +1011,22 @@ fn response_for(tool: NativeTool, response: ProductResponse) -> Result<Value, Bo
                 ProductResponse::IntegratedSearch(_)
             )
             | (NativeTool::SearchIngest, ProductResponse::SearchIngested(_))
+            | (NativeTool::ProveSearch, ProductResponse::Proven { .. })
     );
+    if let (NativeTool::ProveSearch, ProductResponse::Proven { response, artifact }) =
+        (tool, &response)
+    {
+        return Ok(json!({
+            "status": "generated",
+            "kind": crate::proof_kind(artifact.proof.content().kind),
+            "response": response_json((**response).clone()),
+            "proof_hex": crate::encode_hex(&artifact.proof_bytes),
+            "witness_hex": crate::encode_hex(&artifact.witness_bytes),
+            "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
+            "proof_bytes": artifact.proof_bytes.len(),
+            "witness_bytes": artifact.witness_bytes.len(),
+        }));
+    }
     if !expected {
         return Err(Box::new(ProductError::from_code(
             ProductErrorCode::Internal,
@@ -985,8 +1073,20 @@ fn startup_client_error(error: ClientError) -> CliFailure {
 }
 
 fn tool_success(value: &Value, metadata: &Value) -> Value {
+    // Hosts read structuredContent; the text mirror omits bulk hex payloads
+    // so one artifact-bearing result never doubles past the message budget.
+    let text_value = match value.as_object() {
+        Some(object) if object.keys().any(|key| key.ends_with("_hex")) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| !key.ends_with("_hex"))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect(),
+        ),
+        _ => value.clone(),
+    };
     json!({
-        "content": [{ "type": "text", "text": compact_json(value) }],
+        "content": [{ "type": "text", "text": compact_json(&text_value) }],
         "structuredContent": value,
         "isError": false,
         "_meta": metadata,
@@ -1167,13 +1267,13 @@ mod tests {
         assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v3");
         assert_eq!(registry.schema_digest.len(), 64);
         assert_eq!(registry.page_size, 100);
-        assert_eq!(registry.tools.len(), 6);
+        assert_eq!(registry.tools.len(), 8);
         let first = registry
             .list(&serde_json::json!({}))
             .map_err(|()| "first page")?;
-        assert_eq!(first["tools"].as_array().map(Vec::len), Some(6));
+        assert_eq!(first["tools"].as_array().map(Vec::len), Some(8));
         let read_only = ToolRegistry::load()?.without_ingest();
-        assert_eq!(read_only.tools.len(), 5);
+        assert_eq!(read_only.tools.len(), 7);
         assert!(
             read_only
                 .tools

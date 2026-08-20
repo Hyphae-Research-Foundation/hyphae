@@ -3389,7 +3389,7 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(schema_digest.as_str().map(str::len), Some(64));
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(5)
+        Some(7)
     );
     assert!(responses[1]["result"].get("nextCursor").is_none());
     assert_eq!(responses[2]["error"]["code"], -32602);
@@ -4392,7 +4392,7 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
         default_session[1]["result"]["tools"]
             .as_array()
             .map(Vec::len),
-        Some(5)
+        Some(7)
     );
     assert_eq!(default_session[2]["error"]["code"], -32602);
 
@@ -4407,7 +4407,7 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
         run_mcp_session_with_flags(&address_text, &writer_key, &["--allow-ingest"], &messages)?;
     assert_eq!(
         writer[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(6)
+        Some(8)
     );
     assert_eq!(writer[2]["result"]["isError"], false);
     assert_eq!(
@@ -4437,6 +4437,206 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
     assert_eq!(
         reader[1]["result"]["structuredContent"]["error"]["code"],
         "authorization_denied"
+    );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_proves_a_search_and_verifies_the_receipt_trustlessly()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let documents = serde_json::json!([
+        {"id":601,"text":"provable retrieval","vectors":{"exact":[0.0,1.0],"ann":[0.0,1.0]}},
+        {"id":602,"text":"plain retrieval","vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}}
+    ])
+    .to_string();
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        &documents,
+    ])?;
+
+    // The CLI generates one search proof to files while still unmanaged.
+    let proof_out = temporary.0.join("search.proof");
+    let witness_out = temporary.0.join("search.witness");
+    let generated = run_isolated(&[
+        "proof",
+        "generate",
+        "--data-dir",
+        &data_text,
+        "--operation-json",
+        r#"{"operation":"search_collection","collection":13,"lexical":{"query":"provable"},"limit":5}"#,
+        "--proof-out",
+        &path(&proof_out),
+        "--witness-out",
+        &path(&witness_out),
+    ])?;
+    assert_eq!(generated["status"], "generated");
+    assert_eq!(generated["kind"], "lexical");
+    let anchor = generated["anchor"].as_str().ok_or("missing anchor")?;
+    let verified = run_isolated(&[
+        "proof",
+        "verify",
+        "--proof",
+        &path(&proof_out),
+        "--witness",
+        &path(&witness_out),
+        "--anchor",
+        anchor,
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["scope"], "semantic_reexecution");
+
+    // Bootstrap security and drive the same flow through MCP with a Reader.
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let principal = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "Proof reader",
+        "--idempotency-token",
+        "9100",
+    ])?;
+    let principal_id = principal["result_id"]
+        .as_str()
+        .ok_or("missing principal identity")?
+        .to_owned();
+    fixture.owner(&[
+        "assignment",
+        "create-built-in",
+        "--principal-id",
+        &principal_id,
+        "--role",
+        "reader",
+        "--scope",
+        "instance",
+        "--idempotency-token",
+        "9101",
+    ])?;
+    fixture.owner(&[
+        "principal",
+        "set-enabled",
+        "--principal-id",
+        &principal_id,
+        "--enabled",
+        "true",
+        "--idempotency-token",
+        "9102",
+    ])?;
+    let reader_key = fixture.temporary.0.join("reader.key");
+    fixture.issue_reader_key(&principal_id, &reader_key)?;
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmp-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"hyphae_native_prove_search",
+            "arguments":{"collection":13,"lexical":{"query":"provable"},"limit":5}}}),
+    ];
+    let responses = run_mcp_session(&address_text, &reader_key, &messages)?;
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let proven = &responses[1]["result"]["structuredContent"];
+    assert_eq!(proven["status"], "generated");
+    assert_eq!(proven["kind"], "lexical");
+    assert_eq!(proven["response"]["hits"].as_array().map(Vec::len), Some(1));
+    let proof_hex = proven["proof_hex"].as_str().ok_or("missing proof")?;
+    let witness_hex = proven["witness_hex"].as_str().ok_or("missing witness")?;
+    let anchor_hex = proven["anchor_hex"].as_str().ok_or("missing anchor")?;
+
+    // The verify tool re-executes the proof trustlessly inside the adapter,
+    // and a tampered proof fails closed.
+    let mut tampered = proof_hex.to_owned();
+    let flipped = if tampered.ends_with('0') { '1' } else { '0' };
+    tampered.pop();
+    tampered.push(flipped);
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"hyphae_native_verify_proof",
+            "arguments":{"proof_hex":proof_hex,"witness_hex":witness_hex,"anchor_hex":anchor_hex}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"hyphae_native_verify_proof",
+            "arguments":{"proof_hex":tampered,"witness_hex":witness_hex,"anchor_hex":anchor_hex}}}),
+    ];
+    let responses = run_mcp_session(&address_text, &reader_key, &messages)?;
+    let report = &responses[1]["result"]["structuredContent"];
+    assert_eq!(report["status"], "verified");
+    assert_eq!(report["scope"], "semantic_reexecution");
+    assert_eq!(report["kind"], "lexical");
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["error"]["code"],
+        "invalid_request"
     );
     let _ignored = fs::remove_file(endpoint);
     Ok(())

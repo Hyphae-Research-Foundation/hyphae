@@ -33,7 +33,16 @@ are not already known. Use only the narrowest matching tool:
   or hybrid search with typed filters, sorts, facets, and aggregations. Its
   result reports the per-branch strategy and whether any branch was
   approximate — repeat that recall evidence honestly instead of presenting
-  approximate results as exact.
+  approximate results as exact;
+- `hyphae_native_prove_search` for the same integrated search plus a sealed
+  offline-verifiable proof and complete witness, hex-encoded within the
+  bounded message budget (it requires the `proof.generate` authority the
+  Reader role carries, and fails closed with a typed limit error when the
+  artifacts exceed the budget); and
+- `hyphae_native_verify_proof` to verify one sealed proof, witness, and
+  external trusted anchor entirely inside the adapter process — verification
+  is trustless and never contacts the service, so a receipt can be checked
+  even against an operator you do not trust.
 
 Treat structured `ProductError` values as the authoritative denial. Never put
 `role`, `scope`, `authority`, `api_key`, or similar control fields into tool

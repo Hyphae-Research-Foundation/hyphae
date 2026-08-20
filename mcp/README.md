@@ -51,7 +51,7 @@ principal, role, or permission. Unknown input fields fail closed.
 - Cancellation remains live while a Native HTTP request is in flight; the
   bounded reader/control path does not wait for that request to finish.
 - `tools/list` has a fixed maximum page of one hundred definitions, so the
-  complete fixed 6-tool registry (five read-only tools listed by default,
+  complete fixed 8-tool registry (seven read-only tools listed by default,
   the ingest tool added by `--allow-ingest`) is returned in one
   host-compatible page;
   exhausted pages omit `nextCursor` rather than serializing JSON `null`.
@@ -69,7 +69,16 @@ The exact tool definitions live in
 | `hyphae_native_security_principals` | `SecurityPrincipalList` | `security.read` at Instance |
 | `hyphae_native_search_lexical` | `Search` | `search.execute` |
 | `hyphae_native_search_collection` | `SearchCollection` | `search.execute` |
+| `hyphae_native_prove_search` | `Prove(SearchCollection)` | `proof.generate` |
+| `hyphae_native_verify_proof` | offline verification in the adapter | none (trustless) |
 | `hyphae_native_search_ingest` | `SearchIngest` | `data.write` and `search.execute`; listed only with `--allow-ingest` |
+
+`hyphae_native_prove_search` returns the proof, the complete directory
+witness, and the external trusted anchor hex-encoded; when the artifacts
+exceed the bounded message budget the call fails closed with a typed limit
+error instead of truncating. `hyphae_native_verify_proof` re-verifies those
+artifacts entirely inside the adapter process — verification is trustless
+and never contacts the service.
 
 The adapter is read-only by default. Starting it with `--allow-ingest`
 additionally lists `hyphae_native_search_ingest`, one bounded atomic
