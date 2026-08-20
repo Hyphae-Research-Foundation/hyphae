@@ -29,6 +29,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
 - [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
 - [Native acceleration and verification-asymmetry roadmap](roadmaps/native-acceleration-roadmap.md)
+- [RAG competitive roadmap](roadmaps/rag-competitive-roadmap.md)
 
 ## Build and embed
 
