@@ -44,17 +44,17 @@ def rust_artifact() -> dict:
 def linked_npm_artifact() -> dict:
     return {
         "id": "npm-link-id",
-        "name": "@celiums/hyphae",
+        "name": "@hyphae_/hyphae",
         "version": "UNKNOWN",
         "type": "npm",
         "foundBy": "javascript-lock-cataloger",
         "locations": [{"path": "/integrations/javascript/package-lock.json"}],
         "licenses": [],
-        "purl": "pkg:npm/%40celiums/hyphae",
+        "purl": "pkg:npm/%40hyphae_/hyphae",
         "metadata": {"resolved": "../../sdks/typescript"},
         "cpes": [
             {
-                "cpe": "cpe:2.3:a:\\@celiums\\/hyphae:\\@celiums\\/hyphae:*:*:*:*:*:*:*:*",
+                "cpe": "cpe:2.3:a:\\@hyphae_\\/hyphae:\\@hyphae_\\/hyphae:*:*:*:*:*:*:*:*",
                 "source": "syft-generated",
             }
         ],
@@ -117,7 +117,7 @@ version = "1.0.1"
             self.root / "sdks/typescript/package.json",
             json.dumps(
                 {
-                    "name": "@celiums/hyphae",
+                    "name": "@hyphae_/hyphae",
                     "version": "1.0.1",
                     "license": SOFTWARE_LICENSE,
                 }
@@ -132,14 +132,14 @@ version = "1.0.1"
                             "name": "fixture",
                             "version": "1.0.1",
                             "license": SOFTWARE_LICENSE,
-                            "peerDependencies": {"@celiums/hyphae": "1.0.1"},
+                            "peerDependencies": {"@hyphae_/hyphae": "1.0.1"},
                         },
-                        "node_modules/@celiums/hyphae": {
+                        "node_modules/@hyphae_/hyphae": {
                             "resolved": "../../sdks/typescript",
                             "link": True,
                         },
                         "../../sdks/typescript": {
-                            "name": "@celiums/hyphae",
+                            "name": "@hyphae_/hyphae",
                             "version": "1.0.1",
                             "license": SOFTWARE_LICENSE,
                         },
@@ -170,7 +170,7 @@ version = "1.0.1"
         self.assertEqual(document["artifacts"][1]["version"], "1.0.1")
         self.assertEqual(
             document["artifacts"][1]["purl"],
-            "pkg:npm/%40celiums/hyphae@1.0.1",
+            "pkg:npm/%40hyphae_/hyphae@1.0.1",
         )
         self.assertIn(":1.0.1:", document["artifacts"][1]["cpes"][0]["cpe"])
 
@@ -202,7 +202,7 @@ version = "1.0.1"
         artifact = linked_npm_artifact()
         lock = self.root / "integrations/javascript/package-lock.json"
         payload = json.loads(lock.read_text(encoding="utf-8"))
-        payload["packages"]["node_modules/@celiums/hyphae"][
+        payload["packages"]["node_modules/@hyphae_/hyphae"][
             "resolved"
         ] = "../../../../outside"
         lock.write_text(json.dumps(payload), encoding="utf-8")
@@ -227,7 +227,7 @@ version = "1.0.1"
             conclude_document(syft_document(artifact), self.root)
 
     def test_rejects_truncated_first_party_inventory(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "missing=.*@celiums/hyphae"):
+        with self.assertRaisesRegex(RuntimeError, "missing=.*@hyphae_/hyphae"):
             conclude_document(syft_document(rust_artifact()), self.root)
 
     def test_supplements_manifest_backed_python_package(self) -> None:
@@ -306,7 +306,7 @@ dependencies = []
         self.assertEqual(conclude_document(document, self.root), 2)
         self.assertEqual(
             [artifact["name"] for artifact in document["artifacts"]],
-            ["hyphae-core", "@celiums/hyphae"],
+            ["hyphae-core", "@hyphae_/hyphae"],
         )
         self.assertEqual(
             document["artifactRelationships"],

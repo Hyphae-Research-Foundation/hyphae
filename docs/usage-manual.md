@@ -62,7 +62,7 @@ with SHA-256 checksums, SPDX/CycloneDX SBOMs, SLSA provenance, and Sigstore
 bundles; verify before installing. To embed, depend on exact versions:
 `hyphae-native-product = "=1.2.2"` for new applications, or
 `hyphae-engine = "=1.2.2"` for existing format-2 state. Client SDKs are
-`hyphae-sdk` (Python 3.11+, standard library only) and `@celiums/hyphae`
+`hyphae-sdk` (Python 3.11+, standard library only) and `@hyphae_/hyphae`
 (Node 20+, ESM, no runtime dependencies).
 
 ## The mental model
@@ -543,7 +543,7 @@ async with AsyncHyphaeClient.local_authenticated(endpoint, api_key) as client:
 
 A transaction abandoned by its context rolls back; an uncertain commit is
 terminal `outcome_unknown` and resolves through the transaction-status
-operation. `@celiums/hyphae/v2` offers the same API for Node with
+operation. `@hyphae_/hyphae/v2` offers the same API for Node with
 deadlines, `AbortSignal`, and exact 64-bit integers (unsafe values arrive
 as `bigint`). In Rust, embed `hyphae-native-product` directly —
 engine-to-engine calls are typed Rust, not HTTP or JSON. See the

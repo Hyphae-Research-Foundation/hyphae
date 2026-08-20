@@ -34,8 +34,8 @@ EXPECTED_AUTHORITY = {
     "require_exact_clean_source": True,
 }
 EXPECTED_NPM_PACKAGES = (
-    ("sdks/typescript", "@celiums/hyphae"),
-    ("integrations/javascript", "@celiums/hyphae-integrations"),
+    ("sdks/typescript", "@hyphae_/hyphae"),
+    ("integrations/javascript", "@hyphae_/hyphae-integrations"),
 )
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -522,8 +522,8 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         "if: github.event_name == 'pull_request' || inputs.dry_run",
         "--dry-run",
         "python3 tools/verify_crate_packages.py",
-        "npm publish ./sdks/typescript --dry-run",
-        "npm publish ./integrations/javascript --dry-run",
+        "npm pack ./sdks/typescript --dry-run",
+        "npm pack ./integrations/javascript --dry-run",
     )
     failures = [
         f"{path}: required live publication control is missing: {fragment}"
@@ -884,11 +884,11 @@ def _write_outputs(path: Path, values: dict[str, str]) -> None:
             output.write(f"{name}={value}\n")
 
 
-def _url_bytes(url: str, label: str) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "hyphae-registry-reconcile"},
-    )
+def _url_bytes(url: str, label: str, *, accept: str | None = "application/json") -> bytes:
+    headers = {"User-Agent": "hyphae-registry-reconcile"}
+    if accept is not None:
+        headers["Accept"] = accept
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.read()
@@ -954,9 +954,12 @@ def _crates_io_query(intent: dict[str, Any]) -> dict[str, Any] | None:
     row = value.get("version") if isinstance(value, dict) else None
     if not isinstance(row, dict) or row.get("crate") != intent["name"] or row.get("num") != intent["version"]:
         raise GateFailure(f"{intent['name']}@{intent['version']}: crates.io metadata differs")
+    # The download endpoint answers a JSON accept with a URL document instead
+    # of the crate bytes, so this request must accept the archive itself.
     encoded = _url_bytes(
         f"https://crates.io/api/v1/crates/{name}/{version}/download",
         f"{intent['name']}@{intent['version']} crate",
+        accept=None,
     )
     checksum = hashlib.sha256(encoded).hexdigest()
     if row.get("checksum") != checksum:

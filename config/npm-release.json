@@ -5,11 +5,11 @@
   "packages": [
     {
       "path": "sdks/typescript",
-      "name": "@celiums/hyphae"
+      "name": "@hyphae_/hyphae"
     },
     {
       "path": "integrations/javascript",
-      "name": "@celiums/hyphae-integrations"
+      "name": "@hyphae_/hyphae-integrations"
     }
   ],
   "apache_publication_authority": {

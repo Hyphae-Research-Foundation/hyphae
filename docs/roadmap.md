@@ -53,6 +53,15 @@ Phase 1 is single-process and local. Clustering, hosted control planes, SaaS,
 and model integration remain separate later programs with their own accepted
 contracts and gates.
 
+## Post-1.2 program
+
+With the `1.2.2` registry publications complete, the active forward plan is
+the [Native acceleration and verification-asymmetry
+roadmap](roadmaps/native-acceleration-roadmap.md): embedded-path contention
+first, then single-stage filtering completion, SIMD, optional heterogeneous
+acceleration behind the G9 gate, attested embeddings with Proof of
+Retrieval, and distribution.
+
 ## 1.2.0 programs
 
 Hyphae `1.2.0` has two coupled execution programs. The

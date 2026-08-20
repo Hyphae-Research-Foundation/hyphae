@@ -73,8 +73,11 @@ jobs:
       - name: Dry-run npm packages
         if: (github.event_name == 'pull_request' || matrix.ecosystem == inputs.ecosystem) && matrix.ecosystem == 'npm'
         run: |
-          npm publish ./sdks/typescript --dry-run
-          npm publish ./integrations/javascript --dry-run
+          # npm publish --dry-run consults the registry and rejects the
+          # already-published workspace version between releases; pack
+          # exercises the same prepack build and tarball inventory locally.
+          npm pack ./sdks/typescript --dry-run
+          npm pack ./integrations/javascript --dry-run
 
   live:
     name: Gate and publish ${{ inputs.ecosystem }}

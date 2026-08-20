@@ -1,6 +1,6 @@
 # Optional JavaScript framework integrations
 
-`@celiums/hyphae-integrations` has independent subpath exports for Astro,
+`@hyphae_/hyphae-integrations` has independent subpath exports for Astro,
 Next, and Vite. `astro`, `next`, and `vite` are optional peer dependencies; an
 application installs only the host and integration it chooses.
 

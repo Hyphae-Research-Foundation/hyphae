@@ -374,7 +374,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(integrations_lock["version"], version)
         self.assertEqual(integrations_lock["packages"][""]["version"], version)
         self.assertEqual(
-            integrations["peerDependencies"]["@celiums/hyphae"], version
+            integrations["peerDependencies"]["@hyphae_/hyphae"], version
         )
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertRegex(

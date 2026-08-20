@@ -91,7 +91,7 @@ included. Values below are observed p50 latency in microseconds.
 | Filtered BM25 top 10 | 1.660 µs | 3.250 µs | 65.369 µs |
 | ANN top 10 | 115.995 µs | 139.118 µs | 8,397.640 µs |
 | Hybrid top 10 | 118.190 µs | 141.885 µs | 8,409.802 µs |
-| Strict group commit | 138,586.858 µs | 141,622.215 µs | 130,425.161 µs |
+| Strict group commit | 138.587 ms | 141.622 ms | 130.425 ms |
 
 The matrix completed 33/33 surface-concurrency cells: 33,000,000 measured
 observations and 3,300,000 warmups. ANN recall@10 was `1.0` in every cell.
@@ -186,7 +186,7 @@ Native data directory. See the
 | `hyphae-native-product` | Curated embedded Native product facade |
 | Native local protocol | Primary UDS/named-pipe multi-client transport |
 | HTTP `/v2` | Optional loopback-first Native edge |
-| `@celiums/hyphae` | TypeScript Native local-protocol and HTTP client |
+| `@hyphae_/hyphae` | TypeScript Native local-protocol and HTTP client |
 | `hyphae-sdk` | Python Native local-protocol and HTTP client |
 | `/v1` compatibility | Separately retained published format-2 HTTP product |
 

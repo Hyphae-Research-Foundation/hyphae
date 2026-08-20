@@ -28,6 +28,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native local ecosystem target](architecture/native-local-ecosystem.md)
 - [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
 - [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
+- [Native acceleration and verification-asymmetry roadmap](roadmaps/native-acceleration-roadmap.md)
 
 ## Build and embed
 

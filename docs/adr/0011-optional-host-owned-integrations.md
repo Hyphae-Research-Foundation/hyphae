@@ -14,7 +14,7 @@ hidden runtime dependency.
 ## Decision
 
 All framework adapters live under `integrations/`, outside the engine crates.
-They consume only `hyphae-client` or the public `@celiums/hyphae` SDK. A static
+They consume only `hyphae-client` or the public `@hyphae_/hyphae` SDK. A static
 boundary check rejects private crate dependencies, deep JavaScript imports,
 and references back into core source directories.
 

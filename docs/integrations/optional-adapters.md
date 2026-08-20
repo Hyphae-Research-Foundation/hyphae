@@ -28,7 +28,7 @@ Both variables absent means disabled. `HYPHAE_BASE_URL` enables the adapter;
 ## Astro
 
 ```typescript
-import { createHyphaeAstroMiddleware } from "@celiums/hyphae-integrations/astro";
+import { createHyphaeAstroMiddleware } from "@hyphae_/hyphae-integrations/astro";
 
 export const onRequest = createHyphaeAstroMiddleware({
   baseUrl: "http://127.0.0.1:8787",
@@ -41,7 +41,7 @@ to overwrite existing host state.
 ## Next
 
 ```typescript
-import { createHyphaeNextClientFromEnv } from "@celiums/hyphae-integrations/next";
+import { createHyphaeNextClientFromEnv } from "@hyphae_/hyphae-integrations/next";
 
 const client = createHyphaeNextClientFromEnv();
 ```
@@ -54,14 +54,14 @@ Keep `HYPHAE_BASE_URL` and `HYPHAE_BEARER_TOKEN` private; never use a
 
 ```typescript
 import { defineConfig } from "vite";
-import { hyphaeVite } from "@celiums/hyphae-integrations/vite";
+import { hyphaeVite } from "@hyphae_/hyphae-integrations/vite";
 
 export default defineConfig({
   plugins: [hyphaeVite({ target: "http://127.0.0.1:8787" })],
 });
 ```
 
-Browser code uses `@celiums/hyphae-integrations/vite/client`. It reaches `/v1`
+Browser code uses `@hyphae_/hyphae-integrations/vite/client`. It reaches `/v1`
 through the same origin and cannot accept a bearer token. Production proxying
 must be configured by the deployment host.
 
