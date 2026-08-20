@@ -3865,3 +3865,94 @@ fn valkey_migration_rejects_path_overlap() -> Result<(), Box<dyn Error>> {
     assert!(!source_directory.join("receipt.json").exists());
     Ok(())
 }
+
+#[test]
+fn valkey_fixture_runs_the_complete_cycle_with_stream_waivers() -> Result<(), Box<dyn Error>> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/valkey-rdb-v11.json"))?;
+    let rdb_hex = fixture["rdb_hex"]
+        .as_str()
+        .ok_or("fixture rdb_hex missing")?;
+    let mut bytes = Vec::with_capacity(rdb_hex.len() / 2);
+    for pair in rdb_hex.as_bytes().chunks(2) {
+        bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
+    }
+
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, &bytes)?;
+
+    let inspected = run(&[
+        "migrate",
+        "inspect",
+        "--source",
+        &path(&source),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(inspected["key_count"], fixture["expected"]["key_count"]);
+    assert_eq!(
+        inspected["database_count"],
+        fixture["expected"]["database_count"]
+    );
+    assert_eq!(
+        inspected["unwaived_constructs"],
+        fixture["expected"]["required_waivers"]
+    );
+    assert_eq!(
+        inspected["source_digest"].as_str(),
+        fixture["blake3_hex"].as_str()
+    );
+
+    let imported = run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "streams",
+        "--waive",
+        "stream-consumer-groups",
+    ])?;
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["imported_keys"], fixture["expected"]["key_count"]);
+
+    let verified = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified["status"], "verified");
+
+    let promoted = run(&[
+        "migrate",
+        "promote",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(promoted["status"], "promoted");
+    let reopened = run(&["status", "--data-dir", &path(&target)])?;
+    assert_eq!(reopened["status"], "ready");
+    Ok(())
+}

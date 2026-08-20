@@ -12,6 +12,10 @@
     {
       "source": "compatibility/v2/data-directory.json",
       "packaged": "crates/hyphae-cli/tests/fixtures/format2-data-directory.json"
+    },
+    {
+      "source": "compatibility/valkey/rdb-v11.json",
+      "packaged": "crates/hyphae-cli/tests/fixtures/valkey-rdb-v11.json"
     }
   ],
   "semver_baseline_packages": [
