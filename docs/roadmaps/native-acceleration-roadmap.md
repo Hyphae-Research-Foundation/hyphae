@@ -223,6 +223,175 @@ EULA — review before distributing any CUDA-linked binary.
 - Evaluate an in-process PyO3 binding as an addition to `hyphae-sdk`.
 - A public reproducible benchmark against the comparison set below.
 
+## Phase 6 — Compatibility and migration paths
+
+### Doctrine: external migration instantiates the mechanism that already exists
+
+The format-2 import model — offline import into a separate pending Native
+directory, equivalence verification, explicit promotion — is closed by gate.
+PostgreSQL, Valkey/Redis, and OpenSearch enter through that same door: new
+source readers over a closed mechanism, never a new model. Five rules, all
+inherited:
+
+1. **Offline, always.** Never a live proxy, dual-write, or continuous
+   replication. The source system never becomes a dependency or a source of
+   authority — which is precisely what keeps Hyphae from inheriting the
+   operational model being migrated away from.
+2. **Separate pending directory.** An import never writes over a Native
+   directory in use.
+3. **Equivalence verification before promotion.** Promotion is an explicit
+   operator act, never the automatic end of an import.
+4. **Fail-closed on the unrepresentable.** A source construct with no
+   mapping aborts the migration; nothing degrades silently. The operator may
+   explicitly waive a construct, and the waiver is recorded.
+5. **A migration receipt.** BLAKE3 over the source inventory, the
+   consistency point, the destination state, every mapping decision, and
+   every waiver — offline-verifiable like a proof. This is the
+   differentiator: everyone has migration tools; nobody delivers a
+   cryptographic proof that the destination corresponds to the declared
+   source. It is the project's thesis applied to the user's moment of
+   greatest anxiety.
+
+### Fidelity classes
+
+Every migration classifies each source construct into one of four classes,
+and the classification is part of the receipt:
+
+| Class | Meaning | Behavior |
+|---|---|---|
+| **Exact** | 1:1 mapping with verifiable value equivalence | Migrates and is verified |
+| **Equivalent** | Mapping with a declared, checkable semantic guarantee | Migrates; the guarantee is recorded |
+| **DeclaredDegraded** | Mapping with documented loss | Requires an explicit operator waiver |
+| **Rejected** | No mapping possible | Aborts the migration |
+
+A migrator with only Exact and Rejected is honest but unusable; one with
+only Exact and Degraded lies. All four together are what allows migrating
+without lying.
+
+### Valkey/Redis → Hyphae (first source)
+
+The most direct mapping and the most delicate premise. Hyphae already owns
+strings, counters, hashes, lists, sets, sorted sets, streams, TTL, scans,
+algebra, and atomic structure batches — with WAL/MVCC durability the source
+does not have.
+
+| Construct | Destination | Class |
+|---|---|---|
+| Strings, counters, hashes, lists, sets, sorted sets | Native structures | Exact |
+| Streams | Native streams | Exact-or-Equivalent per consumer-group semantics (first increment: DeclaredDegraded behind a waiver until explicit-ID stream appends land) |
+| TTL | Native active expiry, as an absolute instant | Equivalent |
+| Numbered databases (`SELECT n`) | Native namespaces (one keyspace family set per database) | Equivalent |
+| User ACLs | 1.2 principals and grants | Partial-Equivalent (ACLs do not travel in RDB files; separate design) |
+| Pub/Sub, keyspace notifications | — | **Rejected** (no delivery semantics in Hyphae) |
+| Lua scripts, functions | — | **Rejected** |
+| Blocking operations (`BLPOP`, `WAIT`) | — | **Rejected** |
+| Cluster slots, `MIGRATE`, replication | — | **Rejected** (outside the product boundary) |
+| Modules (RedisJSON, RediSearch, ...) | — | **Rejected** |
+
+The honest premise that goes in the receipt, not a footnote: Redis is not
+durable by default. Migrating from an RDB migrates a point in time that
+**may not match what clients last observed**. The equivalence Hyphae can
+prove is "the destination corresponds to this RDB", never "the destination
+corresponds to what your application saw". Preferred source path: offline
+RDB file parsing — deterministic, touches no production instance, fits the
+offline import model exactly. TTL migrates as an absolute instant (RDB
+already stores absolute milliseconds); any measured clock skew is recorded
+in the receipt.
+
+### PostgreSQL → Hyphae (second source)
+
+The highest-affinity source and the highest overpromise risk. The ideal
+case: a team running PostgreSQL + `pgvector` + `tsvector` is operating
+Hyphae's three engines in three subsystems — that migration is a
+consolidation, not a downgrade.
+
+| Construct | Destination | Class |
+|---|---|---|
+| Tables, rows, primary keys | Native relational engine | Exact |
+| B-tree secondary indexes | `hyphae-native-btree` | Exact |
+| Scalar types (int, bool, text, bytea) | Native types | Exact |
+| High-precision `numeric`/`decimal` | Per available native type | Equivalent or Rejected |
+| `timestamptz` | Native instant with declared zone | Equivalent |
+| Ordering under non-C `collation` | Hyphae's canonical collation | **DeclaredDegraded** |
+| `tsvector` / text search | BM25 lexical index | DeclaredDegraded (see OpenSearch note) |
+| `pgvector` (`vector`, HNSW/IVF indexes) | `hyphae-native-ann`, re-indexed | Equivalent |
+| `jsonb` | Native structures or blob | Equivalent or Degraded |
+| Roles and privileges | 1.2 principals, roles, grants | Partial-Equivalent |
+| Materialized views | Table resolved at import time | DeclaredDegraded |
+| Views, triggers, PL/pgSQL, extensions, shared `nextval` sequences, partitioning, logical replication, FDW | — | **Rejected** |
+
+The fidelity point that matters most is **collation**: a collation change
+alters the result order of any textual `ORDER BY`. It requires an explicit
+waiver, with the order delta measured over an operator-supplied query set.
+Source consistency: `REPEATABLE READ` with `pg_export_snapshot`, or a
+`pg_dump` bound to an LSN; the receipt records the LSN or snapshot ID —
+without a declared consistency point there is no equivalence to verify.
+
+### OpenSearch → Hyphae (third source)
+
+The highest perceived value and the most uncomfortable declaration.
+
+| Construct | Destination | Class |
+|---|---|---|
+| Documents and fields | Native documents | Exact |
+| Doc values, filters, sort | Native structures and filters | Exact |
+| BM25 inverted index | Native lexical index, **re-analyzed** | DeclaredDegraded |
+| Custom analyzers, language stemmers, synonym graphs | Hyphae's canonical analyzer | **DeclaredDegraded** |
+| `knn_vector` and its indexes | `hyphae-native-ann`, re-indexed | Equivalent |
+| Metric aggregations and bounded facets | Native facets and metric aggregations | Equivalent |
+| Mappings and multiple indexes | Native schema | Equivalent |
+| Sharding, ILM, index templates | — | **Rejected** (outside the product boundary) |
+| Ingest pipelines, Painless scripts, percolator | — | **Rejected** |
+| Nested and parent/child documents | — | Rejected or Degraded per depth |
+| Aggregations outside the bounded set | — | **Rejected** |
+
+The analyzer problem is the core of this migration: re-analyzing with
+Hyphae's canonical analyzer produces different postings, scores, and order.
+The correct statement: *lexical migration preserves documents, not scores;
+equivalence is declared over the operator's golden query set, with NDCG and
+recall@k deltas measured and recorded in the receipt.* That turns an
+inevitable degradation into an audited number — the same standard the G4
+closure demands of the search engine itself. This source therefore depends
+on the Phase 1 NDCG/recall measurement apparatus.
+
+### Declared non-goal: wire-protocol compatibility
+
+Speaking RESP or the PostgreSQL wire protocol is an enormous adoption
+vector and a contract trap: a compatible protocol creates the expectation
+of compatible **semantics** — pub/sub, scripting, blocking operations,
+server-side cursors, `LISTEN`/`NOTIFY`, nested transactions — which Hyphae
+deliberately lacks. Partial protocol compatibility is worse than none,
+because the client discovers the gap in production. **Decision: no.**
+Migration paths are one-way and offline. If reopened, it is its own program
+with its own gate, never a migrator feature.
+
+### G10 — the external-migration gate
+
+| Control | Verification |
+|---|---|
+| G10-C1 | Every source construct classifies into one of the four fidelity classes; none remains unclassified |
+| G10-C2 | Migration fails closed on any Rejected construct without an explicit operator waiver |
+| G10-C3 | The migration receipt covers the source inventory, consistency point, destination state, mapping decisions, and waivers, all BLAKE3-bound and offline-verifiable |
+| G10-C4 | Equivalence verification runs over immutable per-source-version fixtures under `compatibility/`, with the same discipline as the historical format-2 fixtures |
+| G10-C5 | The pending directory never promotes without successful verification and an explicit operator act |
+| G10-C6 | Round-trip over the Exact-class subset: the result is identical value for value |
+| G10-C7 | For lexical sources, NDCG and recall@k deltas against the operator's golden queries are measured and recorded |
+| G10-C8 | `doctor` reports the origin, source version, and migration receipt of every migrated directory *(deferred: requires wire-codec, SDK, and conformance-golden changes)* |
+
+G10 non-claims: no performance parity with the source system, no lexical
+score equivalence, and no claim that the source consistency point matches
+what client applications observed.
+
+### Build order
+
+1. **Valkey/Redis first.** Most direct mapping, smallest fidelity surface,
+   deterministic offline RDB reader. Validates the migration machinery at
+   the lowest semantic risk.
+2. **PostgreSQL second.** The PG + `pgvector` + `tsvector` consolidation is
+   the project's strongest commercial argument.
+3. **OpenSearch third.** Depends on the Phase 1 NDCG/recall apparatus,
+   because lexical equivalence is a number, not a promise.
+
 ## Accelerated-backend contract
 
 ```rust
@@ -318,6 +487,7 @@ deliberately excludes.
 | Provenance | Proof of Retrieval with model attestation |
 | Operational footprint | One binary, no orchestration, no GC |
 | Release verifiability | 24 signed crates, SBOMs, provenance, attestations, exact-SHA receipts |
+| Auditable migration | A cryptographic receipt that the destination corresponds to the declared source; nobody else delivers one |
 
 ## Risks and non-claims
 
@@ -332,6 +502,13 @@ deliberately excludes.
 - Phase 0 may reveal that embedded contention is structural rather than a
   single lock; scope then grows and everything shifts. Better discovered
   now than after building three phases on top.
+- **Migration is the project's largest reputational risk.** A user who
+  migrates and discovers an undeclared degradation in production loses
+  trust in the entire thesis, not just the migrator. That is why G10 fails
+  closed and why the four fidelity classes live in the receipt, not in the
+  documentation.
+- No migration path implies wire-protocol compatibility; see the declared
+  non-goal in Phase 6.
 - This roadmap does not include replication, clustering, hosting, or
   multitenancy.
 
@@ -346,3 +523,6 @@ deliberately excludes.
 | 5 | Write the G9 criterion before the first kernel | Phase 3 |
 | 6 | Embedding attestation format | Phase 4 |
 | 7 | CUDA license review | Phase 3 |
+| 8 | Fidelity classes and the migration-receipt format | All of Phase 6 |
+| 9 | Offline RDB reader (Valkey/Redis) as the first source | Phase 6 |
+| 10 | PostgreSQL consistency point: LSN or exported snapshot | Phase 6 PostgreSQL step |
