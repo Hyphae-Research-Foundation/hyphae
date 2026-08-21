@@ -323,6 +323,18 @@ def evaluate(
             identifier_map = ingest_corpus(client, corpus)
             ingest_seconds = _time.monotonic() - ingest_started
             ingested_bytes = directory_bytes(data_dir)
+            # Reclaim transient page and WAL generations before measuring the
+            # query phase: an unmaintained directory grows unboundedly and
+            # every query pays to materialize it.
+            client.close()
+            stop_daemon(process, endpoint)
+            maintenance_started = _time.monotonic()
+            run_binary(binary, ["checkpoint", "--data-dir", str(data_dir)])
+            run_binary(binary, ["vacuum", "--data-dir", str(data_dir)])
+            maintenance_seconds = _time.monotonic() - maintenance_started
+            maintained_bytes = directory_bytes(data_dir)
+            process, endpoint = start_daemon(binary, data_dir)
+            client = HyphaeClient.local(str(endpoint))
             ndcg_total = recall_total = mrr_total = 0.0
             evaluated = 0
             query_started = _time.monotonic()
@@ -364,8 +376,10 @@ def evaluate(
         "host": host_declaration(),
         "cost": {
             "ingest_seconds": round(ingest_seconds, 2),
+            "maintenance_seconds": round(maintenance_seconds, 2),
             "query_seconds": round(query_seconds, 2),
             "data_directory_bytes_after_ingest": ingested_bytes,
+            "data_directory_bytes_after_maintenance": maintained_bytes,
         },
         "metrics": {
             f"ndcg@{k}": round(ndcg_total / evaluated, 6),

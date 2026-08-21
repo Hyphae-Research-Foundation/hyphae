@@ -73,3 +73,33 @@ python3 tools/rag_eval.py --binary target/release/hyphae \
   per query). Both are the named R-track targets; the staged
   collection-cap raise (R5) is gated on erasing them, and every later
   run of this harness measures the fix against this baseline.
+
+
+## Follow-up — maintained directory (2026-08-21, post R2)
+
+The same evaluation rerun on the posting-index build with one
+checkpoint + vacuum cycle between ingest and the query phase. Relevance
+is byte-identical; the cost story changes materially:
+
+```json
+{
+  "data_directory_bytes_after_ingest": 29775591035,
+  "data_directory_bytes_after_maintenance": 49100675,
+  "ingest_seconds": 196.36,
+  "maintenance_seconds": 95.61,
+  "query_seconds": 2024.87
+}
+```
+
+- The 29.8 GB directory was transient page and WAL generations, not live
+  index: one maintenance cycle reclaims it to 49 MB (~13 KB per
+  document). The R-track disk finding resolves into an operations
+  policy — maintain the directory — plus the harness now measuring both
+  sides of it.
+- Query time improves from 8.6 to 6.3 seconds per query once queries
+  stop materializing a bloated store, but the remaining cost is the
+  materialized lexical execution itself: the query path re-analyzes
+  stored documents instead of reading the durable BM25 postings the
+  ingest already writes. Moving the integrated lexical branch onto the
+  pinned-root posting read path is the next R-track increment, measured
+  against this receipt.
