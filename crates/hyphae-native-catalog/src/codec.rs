@@ -7,18 +7,18 @@ use hyphae_native_types::{
 };
 
 use super::{
-    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogError,
-    CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2, ColumnCheckConstraint,
-    ColumnCheckOperator, ColumnDefinition, CompatibleCatalogObjectV2, CrossEngineLinkDefinition,
-    CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
-    DefinitionDigest, DefinitionVersion, FieldSourcePolicy, ForeignKeyDefinition,
-    IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy, KeyspaceMemoryClass,
-    KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject, MAX_CATALOG_DEFINITION_BYTES,
-    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, NamedVectorDefinition, ObjectHeader,
-    ObjectHeaderV2, QualifiedName, RelationDefinition, SearchCollectionDefinition,
-    SearchCollectionDefinitionV2, SearchFieldDefinition, SearchFieldDefinitionV2,
-    SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition, StructureKind,
-    StructureOwnership, VectorMetric, VectorSearchPolicy,
+    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, Bm25Parameters,
+    CatalogError, CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2,
+    ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition, CompatibleCatalogObjectV2,
+    CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance,
+    CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, FieldSourcePolicy,
+    ForeignKeyDefinition, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
+    KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
+    MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES,
+    NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QualifiedName, RelationDefinition,
+    SearchCollectionDefinition, SearchCollectionDefinitionV2, SearchFieldDefinition,
+    SearchFieldDefinitionV2, SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition,
+    StructureKind, StructureOwnership, VectorMetric, VectorSearchPolicy,
 };
 
 const DEFINITION_MAGIC_V1: [u8; 8] = *b"HYCOBJ01";
@@ -30,6 +30,8 @@ const OBJECT_SECONDARY_INDEX: u8 = 4;
 const OBJECT_CROSS_ENGINE_LINK: u8 = 5;
 const REPRESENTATION_COMPATIBLE: u8 = 1;
 const REPRESENTATION_V2: u8 = 2;
+/// V2 envelope carrying a V3-bodied object (tuned search collections).
+const REPRESENTATION_V3: u8 = 3;
 
 impl CatalogObject {
     /// Encodes one complete canonical catalog object definition.
@@ -130,6 +132,11 @@ impl LogicalCatalogObject {
         self.validate()?;
         let representation = match self {
             Self::Compatible(_) => REPRESENTATION_COMPATIBLE,
+            Self::V2(CatalogObjectV2::SearchCollection(definition))
+                if definition.bm25.is_some() =>
+            {
+                REPRESENTATION_V3
+            }
             Self::V2(_) => REPRESENTATION_V2,
         };
         let mut encoder = Encoder::new_v2(self.kind() as u8, representation);
@@ -147,6 +154,9 @@ impl LogicalCatalogObject {
             }
             Self::V2(CatalogObjectV2::SearchCollection(definition)) => {
                 encoder.put_search_v2(definition)?;
+                if let Some(bm25) = definition.bm25 {
+                    encoder.put_bm25(bm25)?;
+                }
             }
         }
         encoder.finish()
@@ -179,6 +189,18 @@ impl LogicalCatalogObject {
                     parent: header.parent.unwrap_or(header.id),
                     definition_version: header.definition_version,
                 })
+            }
+            REPRESENTATION_V3 => {
+                if kind != CatalogObjectKind::SearchCollection {
+                    return Err(CatalogError::InvalidDefinitionEncoding);
+                }
+                let mut definition = decoder.search_v2(header)?;
+                let bm25 = Bm25Parameters {
+                    k1_micros: u64::from_le_bytes(decoder.fixed()?),
+                    b_micros: u64::from_le_bytes(decoder.fixed()?),
+                };
+                definition.bm25 = Some(bm25);
+                Self::V2(CatalogObjectV2::SearchCollection(definition))
             }
             REPRESENTATION_V2 => Self::V2(match kind {
                 CatalogObjectKind::Database => CatalogObjectV2::Database(header),
@@ -510,6 +532,11 @@ impl Encoder {
             self.put_byte(*filter as u8)?;
         }
         Ok(())
+    }
+
+    fn put_bm25(&mut self, parameters: Bm25Parameters) -> Result<(), CatalogError> {
+        self.put_fixed(&parameters.k1_micros.to_le_bytes())?;
+        self.put_fixed(&parameters.b_micros.to_le_bytes())
     }
 
     fn put_search_v2(
@@ -978,6 +1005,7 @@ impl<'encoded> Decoder<'encoded> {
             header,
             fields,
             vectors,
+            bm25: None,
         })
     }
 
@@ -1288,11 +1316,11 @@ mod tests {
     };
 
     use super::{
-        AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogError,
-        CatalogName, CatalogObject, CatalogObjectV2, ColumnDefinition, CompatibleCatalogObjectV2,
-        CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance,
-        CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, FieldSourcePolicy,
-        IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
+        AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, Bm25Parameters,
+        CatalogError, CatalogName, CatalogObject, CatalogObjectV2, ColumnDefinition,
+        CompatibleCatalogObjectV2, CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior,
+        CrossEngineLinkMaintenance, CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion,
+        FieldSourcePolicy, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
         KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
         MAX_CATALOG_DEFINITION_BYTES, NamedVectorDefinition, ObjectHeader, ObjectHeaderV2,
         QualifiedName, RelationDefinition, SearchCollectionDefinition,
@@ -1523,6 +1551,7 @@ mod tests {
         let ann = AnnIndexDefinition::new(VectorMetric::Cosine, 16, 128, 64, 256, 7)?;
         Ok(LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
             SearchCollectionDefinitionV2 {
+                bm25: None,
                 header: header_v2(14, EngineKind::Search, "articles", Some(11))?,
                 fields: vec![
                     SearchFieldDefinitionV2 {
@@ -1925,6 +1954,65 @@ mod tests {
         assert_eq!(
             CatalogObject::CrossEngineLink(definition).encode_definition(),
             Err(CatalogError::InvalidCrossEngineLink)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tuned_bm25_round_trips_as_representation_v3_and_defaults_stay_v2()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let untuned = search_v2()?;
+        let untuned_bytes = untuned.encode_definition_v2()?;
+        // Representation byte sits after magic(8) + kind(1).
+        assert_eq!(untuned_bytes[9], 2);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&untuned_bytes)?,
+            untuned
+        );
+
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(mut definition)) = untuned
+        else {
+            return Err("search definition expected".into());
+        };
+        definition.bm25 = Some(Bm25Parameters {
+            k1_micros: 900_000,
+            b_micros: 0,
+        });
+        let tuned = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition));
+        let tuned_bytes = tuned.encode_definition_v2()?;
+        assert_eq!(tuned_bytes[9], 3);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&tuned_bytes)?,
+            tuned
+        );
+        assert_eq!(tuned_bytes.len(), untuned_bytes.len() + 16);
+        Ok(())
+    }
+
+    #[test]
+    fn bm25_parameters_out_of_bounds_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(mut definition)) =
+            search_v2()?
+        else {
+            return Err("search definition expected".into());
+        };
+        definition.bm25 = Some(Bm25Parameters {
+            k1_micros: Bm25Parameters::MAX_K1_MICROS + 1,
+            b_micros: 0,
+        });
+        assert!(
+            LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition.clone()))
+                .encode_definition_v2()
+                .is_err()
+        );
+        definition.bm25 = Some(Bm25Parameters {
+            k1_micros: 0,
+            b_micros: Bm25Parameters::MAX_B_MICROS + 1,
+        });
+        assert!(
+            LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition))
+                .encode_definition_v2()
+                .is_err()
         );
         Ok(())
     }

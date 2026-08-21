@@ -2307,6 +2307,16 @@ impl SearchState {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, f64)>, ModelError> {
+        self.search_with_parameters(index, query, limit, Bm25ScoreParameters::default())
+    }
+
+    pub(crate) fn search_with_parameters(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        parameters: Bm25ScoreParameters,
+    ) -> Result<Vec<(Vec<u8>, f64)>, ModelError> {
         let documents = self.indexes.get(&index).ok_or(ModelError::UnknownObject)?;
         let query_tokens: BTreeSet<String> = analyze(query).into_iter().collect();
         if query_tokens.is_empty() || limit == 0 || documents.is_empty() {
@@ -2344,6 +2354,7 @@ impl SearchState {
                     term_frequency,
                     count_f64(tokens.len())?,
                     average_length,
+                    parameters,
                 );
             }
             if score > 0.0 {
@@ -2424,14 +2435,37 @@ pub(crate) fn bm25_idf(document_count: f64, document_frequency: f64) -> f64 {
     (1.0 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln()
 }
 
+/// BM25 parameters in exact micros, defaulting to the canonical
+/// `k1 = 1.2`, `b = 0.75` when a collection carries no tuning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bm25ScoreParameters {
+    /// Term-frequency saturation `k1` in micros.
+    pub k1_micros: u64,
+    /// Length-normalization `b` in micros.
+    pub b_micros: u64,
+}
+
+impl Default for Bm25ScoreParameters {
+    fn default() -> Self {
+        Self {
+            k1_micros: 1_200_000,
+            b_micros: 750_000,
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn bm25_term_score(
     idf: f64,
     term_frequency: f64,
     document_length: f64,
     average_length: f64,
+    parameters: Bm25ScoreParameters,
 ) -> f64 {
-    let normalization = 1.2 * (1.0 - 0.75 + 0.75 * (document_length / average_length));
-    idf * (term_frequency * 2.2) / (term_frequency + normalization)
+    let k1 = parameters.k1_micros as f64 / 1_000_000.0;
+    let b = parameters.b_micros as f64 / 1_000_000.0;
+    let normalization = k1 * (1.0 - b + b * (document_length / average_length));
+    idf * (term_frequency * (k1 + 1.0)) / (term_frequency + normalization)
 }
 
 fn put_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), ModelError> {
