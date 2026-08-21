@@ -14896,7 +14896,8 @@ impl NativeDatabase {
             let execution = planning_permit.map(DatabaseGovernorPermit::finish);
             return Ok(direct_lexical_receipt(visible_csn, hits, execution));
         }
-        self.match_btree_text_profiled(index, query, limit, planning_permit)
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.match_btree_text_profiled(&snapshot, index, query, limit, planning_permit)
     }
 
     // Keep the ordered fail-closed validation, bounded visitor, accounting,
@@ -15504,14 +15505,57 @@ impl NativeDatabase {
         })
     }
 
+    /// Scores one analyzed free-text query from the durable BM25 postings at
+    /// the supplied retained snapshot's roots, bit-identical to the model.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the snapshot carries no visible commit, its page
+    /// generation was reclaimed by vacuum, the index is not a catalogued
+    /// search object at that root, or the physical tree is invalid. The
+    /// inline state format is answered by the retained model instead.
+    pub fn match_text_at_snapshot(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return snapshot.match_text(index, query, limit);
+        }
+        let planning_permit = self.admit_foreground_bounded()?;
+        let current = self.coordinator.snapshot(0)?;
+        if snapshot.metadata.roots().page_generation() != current.roots().page_generation() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        let catalog_root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        match self.catalog_object_at_root(catalog_root, index)? {
+            Some(CatalogObject::Search(_)) => {}
+            _ => return Err(ModelError::UnknownObject.into()),
+        }
+        let receipt = self.match_btree_text_profiled(
+            &snapshot.metadata,
+            index,
+            query,
+            limit,
+            planning_permit,
+        )?;
+        Ok(receipt.hits)
+    }
+
     fn match_btree_text_profiled(
         &self,
+        snapshot: &hyphae_native_mvcc::Snapshot,
         index: ObjectId,
         query: &str,
         limit: usize,
         planning_permit: Option<DatabaseGovernorPermit>,
     ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
-        let snapshot = self.coordinator.snapshot(0)?;
         let visible_csn = snapshot
             .visible_csn
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
@@ -39497,6 +39541,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn native_inverted_index_matches_reference_bm25_across_recovery()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -39521,6 +39566,15 @@ mod tests {
                 database.match_latest_text(index, query, 25)?,
                 historical.match_text(index, query, 25)?
             );
+            // The pinned-snapshot posting scorer must be bit-identical to
+            // the retained model at the same roots.
+            let pinned = database.match_text_at_snapshot(&historical, index, query, 25)?;
+            let model = historical.match_text(index, query, 25)?;
+            assert_eq!(pinned.len(), model.len());
+            for (durable, reference) in pinned.iter().zip(&model) {
+                assert_eq!(durable.document_id, reference.document_id);
+                assert_eq!(durable.score.to_bits(), reference.score.to_bits());
+            }
         }
 
         let serial_segmented =

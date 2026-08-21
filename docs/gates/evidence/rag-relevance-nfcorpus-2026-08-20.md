@@ -103,3 +103,29 @@ is byte-identical; the cost story changes materially:
   ingest already writes. Moving the integrated lexical branch onto the
   pinned-root posting read path is the next R-track increment, measured
   against this receipt.
+
+
+## Follow-up — pinned posting scorer (2026-08-21)
+
+The integrated lexical branch now scores from the durable BM25 postings
+at the pinned snapshot instead of re-analyzing stored documents through
+the retained model. Same corpus, same queries, same maintenance cycle:
+
+```json
+{
+  "data_directory_bytes_after_ingest": 29775591035,
+  "data_directory_bytes_after_maintenance": 49100675,
+  "ingest_seconds": 168.67,
+  "maintenance_seconds": 77.74,
+  "query_seconds": 748.33
+}
+```
+
+The measured ladder on identical inputs: 8.6 seconds per query at the
+baseline, 6.3 with directory maintenance, 2.3 with the pinned posting
+scorer — 3.7x end to end, with every relevance metric bit-identical
+(sealed search proofs encode score bits, so drift would fail proof
+re-execution, not just this harness). The remaining per-query cost is
+snapshot materialization — every query still decodes the full corpus
+into memory before reading a single posting — which is the next
+measured target on this receipt chain.
