@@ -999,6 +999,31 @@ impl StructureState {
             .map(|entry| entry.value.as_slice())
     }
 
+    /// Visits visible scalar keys inside `[start, end)` in ascending order,
+    /// stopping fail-closed once more than `limit` keys are visible.
+    pub(crate) fn visible_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        logical_time_micros: i64,
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        for (key, entry) in self.entries.range(start.to_vec()..end.to_vec()) {
+            let expired = entry
+                .expires_at_micros
+                .is_some_and(|expiry| expiry <= logical_time_micros);
+            if expired {
+                continue;
+            }
+            if keys.len() >= limit {
+                return None;
+            }
+            keys.push(key.clone());
+        }
+        Some(keys)
+    }
+
     pub(crate) fn visible_entry(
         &self,
         key: &[u8],

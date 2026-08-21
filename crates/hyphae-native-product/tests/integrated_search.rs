@@ -732,3 +732,263 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Deterministic pseudo-random sequence for the equivalence exercise.
+fn equivalence_step(seed: u64, step: u64) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"posting-equivalence-v1");
+    hasher.update(&seed.to_le_bytes());
+    hasher.update(&step.to_le_bytes());
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    )
+}
+
+/// Pure reference mirroring the runtime's linear `filter_matches`
+/// semantics; the posting path must never diverge from it.
+fn reference_eligible(
+    documents: &std::collections::BTreeMap<u128, BTreeMap<String, ProductDocValue>>,
+    filter: &ProductSearchFilter,
+) -> std::collections::BTreeSet<u128> {
+    fn matches(values: &BTreeMap<String, ProductDocValue>, filter: &ProductSearchFilter) -> bool {
+        match filter {
+            ProductSearchFilter::MatchAll => true,
+            ProductSearchFilter::Exists(field) => values.contains_key(field),
+            ProductSearchFilter::Compare {
+                field,
+                operator,
+                value,
+            } => values.get(field).is_some_and(|actual| {
+                if std::mem::discriminant(actual) != std::mem::discriminant(value) {
+                    return false;
+                }
+                match operator {
+                    ProductSearchOperator::Equal => actual == value,
+                    ProductSearchOperator::NotEqual => actual != value,
+                    ProductSearchOperator::Less => actual < value,
+                    ProductSearchOperator::LessOrEqual => actual <= value,
+                    ProductSearchOperator::Greater => actual > value,
+                    ProductSearchOperator::GreaterOrEqual => actual >= value,
+                }
+            }),
+            ProductSearchFilter::All(children) => {
+                children.iter().all(|child| matches(values, child))
+            }
+            ProductSearchFilter::Any(children) => {
+                children.iter().any(|child| matches(values, child))
+            }
+            ProductSearchFilter::Not(child) => !matches(values, child),
+        }
+    }
+    documents
+        .iter()
+        .filter(|(_, values)| matches(values, filter))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("posting-equivalence");
+    let (mut product, binding) = configure(&path)?;
+    let mut model: std::collections::BTreeMap<u128, BTreeMap<String, ProductDocValue>> =
+        std::collections::BTreeMap::new();
+    let categories = ["book", "gear", "tool", "misc"];
+    let mut idempotency = 1_u128;
+
+    for seed in 0..4_u64 {
+        for step in 0..24_u64 {
+            let roll = equivalence_step(seed, step);
+            let id = 300 + u128::from(roll % 12);
+            let category = categories[(roll >> 8) as usize % categories.len()];
+            let price = i64::try_from((roll >> 16) % 100)? - 50;
+            idempotency += 1;
+            let doc = document(
+                id,
+                "equivalence corpus text",
+                category,
+                price,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?;
+            match roll % 3 {
+                0 | 1 if !model.contains_key(&id) => {
+                    let batch = ProductSearchIngestBatch {
+                        idempotency_id: idempotency,
+                        documents: vec![doc.clone()],
+                    };
+                    product.ingest_search_batch(
+                        binding.collection,
+                        &batch,
+                        0,
+                        ProductDurability::Memory,
+                    )?;
+                    model.insert(id, doc.doc_values);
+                }
+                0 | 1 => {
+                    product.update_search_document(
+                        binding.collection,
+                        &ProductSearchDocumentUpdate {
+                            idempotency_id: idempotency,
+                            document: doc.clone(),
+                        },
+                        0,
+                        ProductDurability::Memory,
+                    )?;
+                    model.insert(id, doc.doc_values);
+                }
+                _ if model.contains_key(&id) => {
+                    product.delete_search_document(
+                        binding.collection,
+                        ProductSearchDocumentDelete {
+                            idempotency_id: idempotency,
+                            object_id: ObjectId::new(id)?,
+                        },
+                        0,
+                        ProductDurability::Memory,
+                    )?;
+                    model.remove(&id);
+                }
+                _ => {}
+            }
+
+            let probe_value = ProductDocValue::Integer(price);
+            let filters = [
+                ProductSearchFilter::MatchAll,
+                ProductSearchFilter::Exists("category".into()),
+                ProductSearchFilter::Compare {
+                    field: "category".into(),
+                    operator: ProductSearchOperator::Equal,
+                    value: ProductDocValue::String(category.into()),
+                },
+                ProductSearchFilter::Compare {
+                    field: "price".into(),
+                    operator: ProductSearchOperator::Less,
+                    value: probe_value.clone(),
+                },
+                ProductSearchFilter::Compare {
+                    field: "price".into(),
+                    operator: ProductSearchOperator::GreaterOrEqual,
+                    value: probe_value.clone(),
+                },
+                ProductSearchFilter::Compare {
+                    field: "price".into(),
+                    operator: ProductSearchOperator::NotEqual,
+                    value: probe_value.clone(),
+                },
+                ProductSearchFilter::Not(Box::new(ProductSearchFilter::Compare {
+                    field: "category".into(),
+                    operator: ProductSearchOperator::Equal,
+                    value: ProductDocValue::String("book".into()),
+                })),
+                ProductSearchFilter::Any(vec![
+                    ProductSearchFilter::Compare {
+                        field: "category".into(),
+                        operator: ProductSearchOperator::Equal,
+                        value: ProductDocValue::String("gear".into()),
+                    },
+                    ProductSearchFilter::All(vec![
+                        ProductSearchFilter::Exists("price".into()),
+                        ProductSearchFilter::Compare {
+                            field: "price".into(),
+                            operator: ProductSearchOperator::Greater,
+                            value: ProductDocValue::Integer(0),
+                        },
+                    ]),
+                ]),
+            ];
+            for filter in filters {
+                let request = ProductSearchRequest {
+                    lexical: None,
+                    vectors: Vec::new(),
+                    filter: filter.clone(),
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    aggregations: Vec::new(),
+                    limit: 64,
+                };
+                let result = product.search_collection(binding.collection, &request, 0)?;
+                let expected = reference_eligible(&model, &filter);
+                assert_eq!(
+                    result.eligible_documents,
+                    expected.len(),
+                    "eligible count diverged: seed {seed} step {step} filter {filter:?}"
+                );
+                assert_eq!(result.total_documents, model.len());
+                let observed: std::collections::BTreeSet<u128> =
+                    result.hits.iter().map(|hit| hit.object_id.get()).collect();
+                assert_eq!(
+                    observed, expected,
+                    "hit set diverged: seed {seed} step {step} filter {filter:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("posting-oversized");
+    let (mut product, binding) = configure(&path)?;
+    let mut batch = seed()?;
+    // One category value too large for a bounded posting key marks the
+    // field unindexed; filters touching it must fall back to the scan and
+    // still answer exactly.
+    let oversized = "x".repeat(4_000);
+    batch.documents.push(document(
+        205,
+        "oversized value document",
+        &oversized,
+        99,
+        [4.0, 0.0],
+        [0.0, 4.0],
+    )?);
+    product.ingest_search_batch(binding.collection, &batch, 0, ProductDurability::Strict)?;
+
+    let category_filter = ProductSearchFilter::Compare {
+        field: "category".into(),
+        operator: ProductSearchOperator::Equal,
+        value: ProductDocValue::String("book".into()),
+    };
+    let request = ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: category_filter,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 16,
+    };
+    let result = product.search_collection(binding.collection, &request, 0)?;
+    assert_eq!(result.total_documents, 5);
+    assert_eq!(result.eligible_documents, 2);
+    let observed: std::collections::BTreeSet<u128> =
+        result.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(observed, std::collections::BTreeSet::from([201, 202]));
+
+    // A filter on the untouched integer field keeps answering exactly too.
+    let price_request = ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::Compare {
+            field: "price".into(),
+            operator: ProductSearchOperator::Greater,
+            value: ProductDocValue::Integer(25),
+        },
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 16,
+    };
+    let result = product.search_collection(binding.collection, &price_request, 0)?;
+    let observed: std::collections::BTreeSet<u128> =
+        result.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(observed, std::collections::BTreeSet::from([201, 204, 205]));
+    Ok(())
+}

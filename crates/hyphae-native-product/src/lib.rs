@@ -261,6 +261,23 @@ impl ProductSnapshot {
         }
     }
 
+    /// Returns visible internal scalar keys inside `[start, end)`, ascending,
+    /// or `None` fail-closed above `limit`. Both bounds must carry the
+    /// reserved internal prefix; anything else returns no keys.
+    pub(crate) fn structure_keys_in_range_internal(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !start.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+            || !end.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+        {
+            return Some(Vec::new());
+        }
+        self.inner.structure_keys_in_range(start, end, limit)
+    }
+
     pub(crate) fn structure_get_internal(&self, key: &[u8]) -> Option<&[u8]> {
         self.inner.get(key)
     }

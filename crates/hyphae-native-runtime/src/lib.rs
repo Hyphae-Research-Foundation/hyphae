@@ -3619,6 +3619,22 @@ impl NativeSnapshot {
             .get(key, self.metadata.logical_time_micros)
     }
 
+    /// Returns the visible scalar keys inside `[start, end)` in ascending
+    /// order, or `None` fail-closed once more than `limit` keys are visible.
+    pub fn structure_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.state.structures.visible_keys_in_range(
+            start,
+            end,
+            self.metadata.logical_time_micros,
+            limit,
+        )
+    }
+
     /// Returns the key's TTL state at snapshot logical time.
     pub fn ttl(&self, key: &[u8]) -> Ttl {
         match self
