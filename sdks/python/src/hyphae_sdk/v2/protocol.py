@@ -368,12 +368,60 @@ def decode_welcome(encoded: bytes) -> dict[str, int]:
     }
 
 
+def _doc_value_required_minor(value: Any) -> int:
+    # Boolean, integer, string, and bytes doc values are minor-0 content;
+    # future typed values raise the requirement here.
+    del value
+    return 0
+
+
+def _filter_required_minor(value: Any, depth: int = 0) -> int:
+    if depth > 32 or not isinstance(value, dict):
+        return 0
+    kind = value.get("kind")
+    if kind == "compare":
+        # Every current operator is minor-0 content; future operators and
+        # typed literals raise the requirement here.
+        return _doc_value_required_minor(value.get("value"))
+    if kind in {"all", "any"}:
+        children = value.get("filters", [])
+        if not isinstance(children, list):
+            return 0
+        return max(
+            (_filter_required_minor(child, depth + 1) for child in children),
+            default=0,
+        )
+    if kind == "not":
+        return _filter_required_minor(value.get("filter"), depth + 1)
+    return 0
+
+
+def _document_required_minor(document: Any) -> int:
+    if not isinstance(document, dict):
+        return 0
+    doc_values = document.get("doc_values", {})
+    if not isinstance(doc_values, dict):
+        return 0
+    return max(
+        (_doc_value_required_minor(value) for value in doc_values.values()),
+        default=0,
+    )
+
+
 def operation_required_minor(
     operation: str, arguments: dict[str, Any] | None = None
 ) -> int:
     if operation == "proof_generate" and arguments is not None:
         nested = arguments.get("operation")
-        return operation_required_minor(nested) if isinstance(nested, str) else 0
+        nested_arguments = arguments.get("arguments")
+        return (
+            operation_required_minor(
+                nested,
+                nested_arguments if isinstance(nested_arguments, dict) else None,
+            )
+            if isinstance(nested, str)
+            else 0
+        )
     if operation in API_KEY_LIFECYCLE_OPERATIONS:
         return 3
     if operation in SECURITY_WRITE_OPERATIONS:
@@ -382,6 +430,19 @@ def operation_required_minor(
         return 3
     if operation in SECURITY_READ_OPERATIONS:
         return 1
+    if arguments is not None:
+        if operation == "search_collection":
+            return _filter_required_minor(arguments.get("filter"))
+        if operation == "search_ingest":
+            documents = arguments.get("documents", [])
+            if not isinstance(documents, list):
+                return 0
+            return max(
+                (_document_required_minor(document) for document in documents),
+                default=0,
+            )
+        if operation == "search_document_update":
+            return _document_required_minor(arguments.get("document"))
     return 0
 
 

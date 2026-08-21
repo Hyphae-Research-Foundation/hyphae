@@ -168,12 +168,18 @@ canonical request context. Local and HTTP transports return the same durable
 receipt for an exact replay and the same `idempotency_conflict` for token reuse
 with a different request.
 
-Every Native v2 request must offer exactly one `X-Hyphae-Protocol-Minor: 3`.
-The server rejects a missing, lower, malformed, different, or duplicated value
-before authentication and product
-dispatch, then emits `X-Hyphae-Protocol-Minor: 3` on every success and error.
-Clients validate that response header before accepting session state, reading a
-body, or applying one-time-secret handling.
+Every Native v2 request must offer its supported protocol minors in
+`X-Hyphae-Protocol-Minor` as bounded canonical decimal tokens: at most eight
+across every header instance, comma separation tolerated for header-coalescing
+intermediaries, no duplicates, no leading zeros, no other bytes. The server
+selects the highest offered minor it serves (this build serves exactly minor
+3) and rejects a missing, malformed, duplicated, or entirely unsupported offer
+before authentication and product dispatch. The selection gates request decode
+and response encode, and the server emits the selected minor (or its highest
+served minor on admission failure) in `X-Hyphae-Protocol-Minor` on every
+success and error. Clients validate that the echoed selection is one of their
+offered minors before accepting session state, reading a body, or applying
+one-time-secret handling, and decode the response at the selected minor.
 The explicitly contracted `/v1` incompatibility response is not converted into
 a v2 request by this admission rule.
 

@@ -158,7 +158,11 @@ proceed as adopted and are orthogonal.
   when the receipt exists.
 - **R6** Filter operators In / ContainsAny / ContainsAll / bounded Like /
   IsNull and doc-value types Float, Date (canonical epoch integer), Array —
-  product model, SQL surface, proof binding, SDKs.
+  product model, SQL surface, proof binding, SDKs. Decided ordering story:
+  Float ingest rejects non-finite values fail-closed, comparison uses IEEE-754
+  `total_cmp` over the admitted finite domain, and the memcomparable posting
+  encoding is the sign-flipped big-endian bit pattern; Array ordering is
+  lexicographic over already-ordered elements.
 - **L2** BM25F port from the legacy engine (weighted fields with the
   existing caps) into the native runtime, gated by an output-equivalence
   harness against the legacy implementation.
