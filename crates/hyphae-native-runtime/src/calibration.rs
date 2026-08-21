@@ -4224,10 +4224,12 @@ mod tests {
 
     #[test]
     fn bounded_retry_sequences_discarded_attempts_before_verdict() {
-        // A zero MAD tolerance cannot be met by real timing samples, and the
-        // operation below escalates its own cost so every sample differs.
-        // Every attempt is therefore unstable; the verdict arrives after
-        // exactly `measurement_retry_limit` attempts with discards retained.
+        // A zero MAD tolerance cannot be met by real timing samples: the
+        // operation cycles its own cost in two-millisecond steps, far above
+        // any host timer quantum, so no attempt can observe identical
+        // samples. Every attempt is therefore unstable; the verdict arrives
+        // after exactly `measurement_retry_limit` attempts with discards
+        // retained.
         let policy = CalibrationPolicy {
             maximum_relative_mad_ppm: 0,
             measurement_retry_limit: 3,
@@ -4239,7 +4241,7 @@ mod tests {
             policy,
             || {
                 let ordinal = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(std::time::Duration::from_micros(ordinal.min(500)));
+                std::thread::sleep(std::time::Duration::from_millis(1 + (ordinal % 4) * 2));
                 ordinal
             },
             u64::MAX,
@@ -4253,7 +4255,7 @@ mod tests {
             policy,
             || {
                 let ordinal = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(std::time::Duration::from_micros(ordinal.min(500)));
+                std::thread::sleep(std::time::Duration::from_millis(1 + (ordinal % 4) * 2));
                 ordinal.saturating_sub(1)
             },
             0,
