@@ -881,6 +881,7 @@ impl NativeProduct {
         )?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
+            &self.database,
             &snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
@@ -960,7 +961,7 @@ impl NativeProduct {
     /// Returns an error for an invalid binding/request, missing durable side
     /// record, exhausted bound, or native lexical/vector execution failure.
     pub fn search_collection_at_snapshot(
-        _product: &Self,
+        product: &Self,
         snapshot: &crate::ProductSnapshot,
         collection: crate::ObjectId,
         request: &ProductSearchRequest,
@@ -979,6 +980,7 @@ impl NativeProduct {
         )?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
+            &product.database,
             snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
@@ -1111,6 +1113,7 @@ impl NativeProduct {
 }
 
 fn execute_lexical_branch(
+    database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
@@ -1121,10 +1124,21 @@ fn execute_lexical_branch(
     let Some(lexical) = lexical else {
         return Ok(0);
     };
-    let hits = snapshot
-        .inner
-        .match_text(index, &lexical.query, lexical.candidate_limit)
-        .map_err(map_runtime_error)?;
+    // The durable posting scorer is bit-identical to the retained model; a
+    // reclaimed page generation or inline-format directory falls open to
+    // the model, never to a different answer.
+    let hits = match database.match_text_at_snapshot(
+        &snapshot.inner,
+        index,
+        &lexical.query,
+        lexical.candidate_limit,
+    ) {
+        Ok(hits) => hits,
+        Err(_) => snapshot
+            .inner
+            .match_text(index, &lexical.query, lexical.candidate_limit)
+            .map_err(map_runtime_error)?,
+    };
     let mut admitted = 0;
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
