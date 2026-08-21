@@ -1880,7 +1880,8 @@ fn encode_i32_ordered(value: i32) -> [u8; 4] {
     bytes
 }
 
-fn encode_i64_ordered(value: i64) -> [u8; 8] {
+/// Encodes one signed 64-bit value as 8 order-preserving big-endian bytes.
+pub fn encode_i64_ordered(value: i64) -> [u8; 8] {
     let mut bytes = value.to_be_bytes();
     bytes[0] ^= 0x80;
     bytes
@@ -1924,7 +1925,12 @@ fn unsortable_f64_bits(bits: u64) -> u64 {
     }
 }
 
-fn encode_memcomparable_bytes(value: &[u8]) -> Result<Vec<u8>, NativeTypeError> {
+/// Escapes arbitrary bytes into a self-delimiting order-preserving form.
+///
+/// # Errors
+///
+/// Returns an error when the escaped form exceeds the bounded scalar size.
+pub fn encode_memcomparable_bytes(value: &[u8]) -> Result<Vec<u8>, NativeTypeError> {
     let encoded_length = value.iter().try_fold(2_usize, |length, byte| {
         length.checked_add(if *byte == 0 { 2 } else { 1 })
     });

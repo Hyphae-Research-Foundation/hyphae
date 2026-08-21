@@ -522,6 +522,7 @@ impl NativeProduct {
             .map_err(map_runtime_error)?;
         let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
         let mut identities = decode_manifest(existing_manifest)?;
+        let collection_was_empty = identities.is_empty();
         if identities.len().saturating_add(batch.documents.len())
             > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS
         {
@@ -549,6 +550,22 @@ impl NativeProduct {
                 .set(
                     document_key(collection, document.object_id),
                     encode_document(document)?,
+                    None,
+                )
+                .map_err(map_runtime_error)?;
+        }
+        let (covered, newly_covered) =
+            posting_coverage(&transaction, collection, collection_was_empty);
+        if covered {
+            for document in &batch.documents {
+                write_document_postings(&mut transaction, collection, document)?;
+            }
+        }
+        if newly_covered {
+            transaction
+                .set(
+                    posting_coverage_key(collection),
+                    POSTING_COVERAGE_MAGIC.to_vec(),
                     None,
                 )
                 .map_err(map_runtime_error)?;
@@ -626,6 +643,19 @@ impl NativeProduct {
             return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
                 .with_object_id(update.document.object_id));
         }
+        let (postings_covered, _) = posting_coverage(&transaction, collection, false);
+        if postings_covered {
+            let previous = transaction
+                .get(&document_key(collection, update.document.object_id))
+                .ok_or_else(corruption)?
+                .to_vec();
+            delete_document_postings(
+                &mut transaction,
+                collection,
+                update.document.object_id,
+                &previous,
+            )?;
+        }
         let object_bytes = update.document.object_id.get().to_be_bytes().to_vec();
         transaction
             .replace_document(
@@ -656,6 +686,9 @@ impl NativeProduct {
                 None,
             )
             .map_err(map_runtime_error)?;
+        if postings_covered {
+            write_document_postings(&mut transaction, collection, &update.document)?;
+        }
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
@@ -717,6 +750,14 @@ impl NativeProduct {
         if !manifest.remove(&delete.object_id) {
             return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
                 .with_object_id(delete.object_id));
+        }
+        let (postings_covered, _) = posting_coverage(&transaction, collection, false);
+        if postings_covered {
+            let previous = transaction
+                .get(&document_key(collection, delete.object_id))
+                .ok_or_else(corruption)?
+                .to_vec();
+            delete_document_postings(&mut transaction, collection, delete.object_id, &previous)?;
         }
         transaction
             .delete_document(
@@ -829,15 +870,15 @@ impl NativeProduct {
         let definition = self.search_definition(collection)?;
         validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let documents = load_documents_with_checkpoint(&snapshot, collection, &mut checkpoint)?;
-        let total_documents = documents.len();
-        let eligible =
-            filter_documents_with_checkpoint(&documents, &request.filter, &mut checkpoint)?;
-        let mut eligible_ids = BTreeSet::new();
-        for candidate in &eligible {
-            checkpoint()?;
-            eligible_ids.insert(decode_object_id(&candidate.document_id)?);
-        }
+        let manifest_ids = load_manifest_ids(&snapshot, collection)?;
+        let total_documents = manifest_ids.len();
+        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
+            &snapshot,
+            collection,
+            &request.filter,
+            &manifest_ids,
+            &mut checkpoint,
+        )?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             &snapshot,
@@ -858,24 +899,18 @@ impl NativeProduct {
         )?;
 
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for candidate in &eligible {
+            for object_id in &eligible_ids {
                 checkpoint()?;
-                fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
+                fused.insert(*object_id, 0.0);
             }
-        }
-        let mut by_id = BTreeMap::new();
-        for candidate in documents {
-            checkpoint()?;
-            by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
         }
         let mut candidates = Vec::with_capacity(fused.len());
         for (object_id, score) in fused {
             checkpoint()?;
-            let source = by_id.get(&object_id).ok_or_else(corruption)?;
             candidates.push(hyphae_native_runtime::DocValueCandidate {
                 document_id: object_id.get().to_be_bytes().to_vec(),
                 score,
-                values: source.values.clone(),
+                values: source.values_of(&snapshot, collection, object_id)?,
             });
         }
         let retrieval_candidates = candidates.len();
@@ -933,13 +968,15 @@ impl NativeProduct {
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
         let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
         validate_search_request(&definition, &binding, request)?;
-        let documents = load_documents(snapshot, collection)?;
-        let total_documents = documents.len();
-        let eligible = filter_documents(&documents, &request.filter)?;
-        let eligible_ids = eligible
-            .iter()
-            .map(|candidate| decode_object_id(&candidate.document_id))
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let manifest_ids = load_manifest_ids(snapshot, collection)?;
+        let total_documents = manifest_ids.len();
+        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
+            snapshot,
+            collection,
+            &request.filter,
+            &manifest_ids,
+            &mut || Ok(()),
+        )?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             snapshot,
@@ -959,22 +996,17 @@ impl NativeProduct {
             &mut || Ok(()),
         )?;
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for candidate in &eligible {
-                fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
+            for object_id in &eligible_ids {
+                fused.insert(*object_id, 0.0);
             }
         }
-        let by_id = documents
-            .into_iter()
-            .map(|candidate| Ok((decode_object_id(&candidate.document_id)?, candidate)))
-            .collect::<Result<BTreeMap<_, _>, ProductError>>()?;
         let candidates = fused
             .into_iter()
             .map(|(object_id, score)| {
-                let source = by_id.get(&object_id).ok_or_else(corruption)?;
                 Ok(hyphae_native_runtime::DocValueCandidate {
                     document_id: object_id.get().to_be_bytes().to_vec(),
                     score,
-                    values: source.values.clone(),
+                    values: source.values_of(snapshot, collection, object_id)?,
                 })
             })
             .collect::<Result<Vec<_>, ProductError>>()?;
@@ -1500,13 +1532,6 @@ pub fn conformance_validate_integrated_request(
         .map_err(|error| map_doc_value_error(&error))
 }
 
-fn load_documents(
-    snapshot: &ProductSnapshot,
-    collection: crate::ObjectId,
-) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    load_documents_with_checkpoint(snapshot, collection, &mut || Ok(()))
-}
-
 fn load_documents_with_checkpoint(
     snapshot: &ProductSnapshot,
     collection: crate::ObjectId,
@@ -1532,13 +1557,6 @@ fn load_documents_with_checkpoint(
         });
     }
     Ok(documents)
-}
-
-fn filter_documents(
-    documents: &[hyphae_native_runtime::DocValueCandidate],
-    filter: &ProductSearchFilter,
-) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    filter_documents_with_checkpoint(documents, filter, &mut || Ok(()))
 }
 
 fn filter_documents_with_checkpoint(
@@ -1664,6 +1682,362 @@ fn storage_key(kind: u8, collection: crate::ObjectId, suffix: Option<[u8; 16]>) 
         key.extend_from_slice(&suffix);
     }
     key
+}
+
+/// Magic sealing a collection's doc-value posting coverage marker.
+const POSTING_COVERAGE_MAGIC: &[u8; 8] = b"HYPSPST1";
+/// Posting keys longer than this are not written; the field falls back.
+const MAX_POSTING_KEY_BYTES: usize = 3_900;
+
+fn posting_coverage_key(collection: crate::ObjectId) -> Vec<u8> {
+    storage_key(b'V', collection, None)
+}
+
+fn posting_field_prefix(collection: crate::ObjectId, field: &str) -> Vec<u8> {
+    let mut key = storage_key(b'P', collection, None);
+    key.extend_from_slice(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+    key.extend_from_slice(field.as_bytes());
+    key
+}
+
+fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
+    let mut key = storage_key(b'U', collection, None);
+    key.extend_from_slice(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+    key.extend_from_slice(field.as_bytes());
+    key
+}
+
+/// Pinned posting type tags in the doc-value total order.
+fn posting_component(value: &ProductDocValue) -> Result<(u8, Vec<u8>), ProductError> {
+    Ok(match value {
+        ProductDocValue::Boolean(value) => (1, vec![u8::from(*value)]),
+        ProductDocValue::Integer(value) => {
+            (2, hyphae_native_types::encode_i64_ordered(*value).to_vec())
+        }
+        ProductDocValue::String(value) => (
+            3,
+            hyphae_native_types::encode_memcomparable_bytes(value.as_bytes())
+                .map_err(|_| limit_exceeded())?,
+        ),
+        ProductDocValue::Bytes(value) => (
+            4,
+            hyphae_native_types::encode_memcomparable_bytes(value).map_err(|_| limit_exceeded())?,
+        ),
+    })
+}
+
+fn posting_value_prefix(
+    collection: crate::ObjectId,
+    field: &str,
+    value: &ProductDocValue,
+) -> Result<Vec<u8>, ProductError> {
+    let (tag, component) = posting_component(value)?;
+    let mut key = posting_field_prefix(collection, field);
+    key.push(tag);
+    key.extend_from_slice(&component);
+    Ok(key)
+}
+
+fn posting_key(
+    collection: crate::ObjectId,
+    field: &str,
+    value: &ProductDocValue,
+    object_id: crate::ObjectId,
+) -> Result<Vec<u8>, ProductError> {
+    let mut key = posting_value_prefix(collection, field, value)?;
+    key.extend_from_slice(&object_id.get().to_be_bytes());
+    Ok(key)
+}
+
+/// Returns the exclusive upper bound sharing `prefix`, or `None` when no
+/// byte string is strictly greater (all bytes are 0xFF).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.pop() {
+        if last < u8::MAX {
+            bound.push(last + 1);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+fn posting_object_id(key: &[u8]) -> Result<crate::ObjectId, ProductError> {
+    let suffix = key.len().checked_sub(16).ok_or_else(corruption)?;
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&key[suffix..]);
+    crate::ObjectId::new(u128::from_be_bytes(bytes)).map_err(|_| corruption())
+}
+
+/// Emits the posting mutations for one document: keys to set live and the
+/// fields whose encoded posting would exceed the bounded key budget.
+fn document_posting_keys(
+    collection: crate::ObjectId,
+    object_id: crate::ObjectId,
+    doc_values: &BTreeMap<String, ProductDocValue>,
+) -> Result<(Vec<Vec<u8>>, Vec<String>), ProductError> {
+    let mut keys = Vec::new();
+    let mut oversized = Vec::new();
+    for (field, value) in doc_values {
+        let key = posting_key(collection, field, value, object_id)?;
+        if key.len() > MAX_POSTING_KEY_BYTES {
+            oversized.push(field.clone());
+        } else {
+            keys.push(key);
+        }
+    }
+    Ok((keys, oversized))
+}
+
+/// Fields one filter references, or `None` when a node shape has none.
+fn filter_fields(filter: &ProductSearchFilter, fields: &mut BTreeSet<String>) {
+    match filter {
+        ProductSearchFilter::MatchAll => {}
+        ProductSearchFilter::Exists(field) | ProductSearchFilter::Compare { field, .. } => {
+            fields.insert(field.clone());
+        }
+        ProductSearchFilter::All(children) | ProductSearchFilter::Any(children) => {
+            for child in children {
+                filter_fields(child, fields);
+            }
+        }
+        ProductSearchFilter::Not(child) => filter_fields(child, fields),
+    }
+}
+
+/// Collects the visible posting document identities inside `[start, end)`.
+fn posting_scan(
+    snapshot: &crate::ProductSnapshot,
+    start: &[u8],
+    end: &[u8],
+) -> Option<BTreeSet<crate::ObjectId>> {
+    let keys = snapshot.structure_keys_in_range_internal(
+        start,
+        end,
+        MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS.saturating_mul(2),
+    )?;
+    let mut identities = BTreeSet::new();
+    for key in keys {
+        identities.insert(posting_object_id(&key).ok()?);
+    }
+    Some(identities)
+}
+
+/// Evaluates one filter against the posting index, producing exactly the
+/// eligible set the linear scan would produce, or `None` when any node
+/// cannot be answered from postings (the caller falls back fail-open to the
+/// scan, never to a wrong answer).
+fn posting_filter_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest: &BTreeSet<crate::ObjectId>,
+) -> Option<BTreeSet<crate::ObjectId>> {
+    match filter {
+        ProductSearchFilter::MatchAll => Some(manifest.clone()),
+        ProductSearchFilter::Exists(field) => {
+            let start = posting_field_prefix(collection, field);
+            let end = prefix_successor(&start)?;
+            posting_scan(snapshot, &start, &end)
+        }
+        ProductSearchFilter::Compare {
+            field,
+            operator,
+            value,
+        } => {
+            let field_start = posting_field_prefix(collection, field);
+            let (tag, component) = posting_component(value).ok()?;
+            let mut tag_start = field_start.clone();
+            tag_start.push(tag);
+            let tag_end = prefix_successor(&tag_start)?;
+            let mut value_start = tag_start.clone();
+            value_start.extend_from_slice(&component);
+            let value_end = prefix_successor(&value_start)?;
+            match operator {
+                ProductSearchOperator::Equal => posting_scan(snapshot, &value_start, &value_end),
+                ProductSearchOperator::NotEqual => {
+                    let same_type = posting_scan(snapshot, &tag_start, &tag_end)?;
+                    let equal = posting_scan(snapshot, &value_start, &value_end)?;
+                    Some(same_type.difference(&equal).copied().collect())
+                }
+                ProductSearchOperator::Less => posting_scan(snapshot, &tag_start, &value_start),
+                ProductSearchOperator::LessOrEqual => {
+                    posting_scan(snapshot, &tag_start, &value_end)
+                }
+                ProductSearchOperator::Greater => posting_scan(snapshot, &value_end, &tag_end),
+                ProductSearchOperator::GreaterOrEqual => {
+                    posting_scan(snapshot, &value_start, &tag_end)
+                }
+            }
+        }
+        ProductSearchFilter::All(children) => {
+            let mut result = manifest.clone();
+            for child in children {
+                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+                result = result.intersection(&ids).copied().collect();
+            }
+            Some(result)
+        }
+        ProductSearchFilter::Any(children) => {
+            let mut result = BTreeSet::new();
+            for child in children {
+                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+                result.extend(ids);
+            }
+            Some(result)
+        }
+        ProductSearchFilter::Not(child) => {
+            let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+            Some(manifest.difference(&ids).copied().collect())
+        }
+    }
+}
+
+/// Answers eligibility from the posting index when the collection is
+/// posting-covered and every referenced field is fully indexed.
+fn posting_eligible_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest: &BTreeSet<crate::ObjectId>,
+) -> Option<BTreeSet<crate::ObjectId>> {
+    let coverage = snapshot.structure_get_internal(&posting_coverage_key(collection))?;
+    if coverage != POSTING_COVERAGE_MAGIC {
+        return None;
+    }
+    let mut fields = BTreeSet::new();
+    filter_fields(filter, &mut fields);
+    for field in &fields {
+        if snapshot
+            .structure_get_internal(&unindexed_field_key(collection, field))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    posting_filter_ids(snapshot, collection, filter, manifest)
+}
+
+/// Writes the live postings and oversized-field markers for one document.
+fn write_document_postings(
+    transaction: &mut hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    document: &ProductDocument,
+) -> Result<(), ProductError> {
+    let (keys, oversized) =
+        document_posting_keys(collection, document.object_id, &document.doc_values)?;
+    for key in keys {
+        transaction
+            .set(key, vec![1], None)
+            .map_err(map_runtime_error)?;
+    }
+    for field in oversized {
+        transaction
+            .set(unindexed_field_key(collection, &field), vec![1], None)
+            .map_err(map_runtime_error)?;
+    }
+    Ok(())
+}
+
+/// Deletes the postings of one previously stored document encoding.
+fn delete_document_postings(
+    transaction: &mut hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    object_id: crate::ObjectId,
+    encoded: &[u8],
+) -> Result<(), ProductError> {
+    let previous = decode_document(encoded, object_id)?;
+    let (keys, _oversized) = document_posting_keys(collection, object_id, &previous)?;
+    for key in keys {
+        let _removed = transaction
+            .delete_structure(key)
+            .map_err(map_runtime_error)?;
+    }
+    Ok(())
+}
+
+/// Whether the collection maintains postings inside this transaction, and
+/// whether this transaction is the one that turns coverage on.
+fn posting_coverage(
+    transaction: &hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    collection_was_empty: bool,
+) -> (bool, bool) {
+    if transaction.get(&posting_coverage_key(collection)).is_some() {
+        return (true, false);
+    }
+    (collection_was_empty, collection_was_empty)
+}
+
+/// Where per-candidate doc-values come from after eligibility resolution.
+enum DocumentSource {
+    /// Postings answered eligibility; values load per fused candidate.
+    Postings,
+    /// The linear scan already materialized every document.
+    Scan(BTreeMap<crate::ObjectId, hyphae_native_runtime::DocValueCandidate>),
+}
+
+impl DocumentSource {
+    fn values_of(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        object_id: crate::ObjectId,
+    ) -> Result<BTreeMap<String, ProductDocValue>, ProductError> {
+        match self {
+            Self::Scan(by_id) => Ok(by_id.get(&object_id).ok_or_else(corruption)?.values.clone()),
+            Self::Postings => {
+                let encoded = snapshot
+                    .structure_get_internal(&document_key(collection, object_id))
+                    .ok_or_else(corruption)?;
+                decode_document(encoded, object_id)
+            }
+        }
+    }
+}
+
+/// Resolves eligibility from postings when possible, otherwise through the
+/// materializing linear scan, preserving byte-identical semantics.
+fn resolve_eligibility_with_checkpoint(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest_ids: &BTreeSet<crate::ObjectId>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<(BTreeSet<crate::ObjectId>, DocumentSource), ProductError> {
+    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest_ids) {
+        checkpoint()?;
+        return Ok((eligible, DocumentSource::Postings));
+    }
+    let documents = load_documents_with_checkpoint(snapshot, collection, checkpoint)?;
+    let eligible = filter_documents_with_checkpoint(&documents, filter, checkpoint)?;
+    let mut eligible_ids = BTreeSet::new();
+    for candidate in &eligible {
+        checkpoint()?;
+        eligible_ids.insert(decode_object_id(&candidate.document_id)?);
+    }
+    let mut by_id = BTreeMap::new();
+    for candidate in documents {
+        checkpoint()?;
+        by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
+    }
+    Ok((eligible_ids, DocumentSource::Scan(by_id)))
+}
+
+/// Loads the collection manifest identities under the read-side cap.
+fn load_manifest_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
+    let identities = decode_manifest(
+        snapshot
+            .structure_get_internal(&manifest_key(collection))
+            .ok_or_else(corruption)?,
+    )?;
+    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
+        return Err(corruption());
+    }
+    Ok(identities)
 }
 
 fn encode_manifest(identities: &BTreeSet<crate::ObjectId>) -> Result<Vec<u8>, ProductError> {
