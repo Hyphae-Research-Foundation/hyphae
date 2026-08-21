@@ -3507,7 +3507,7 @@ fn set_algebra_in_state(
 #[derive(Clone, Debug)]
 pub struct NativeSnapshot {
     metadata: Snapshot,
-    state: MaterializedState,
+    state: Arc<MaterializedState>,
 }
 
 impl NativeSnapshot {
@@ -5169,6 +5169,11 @@ pub struct NativeDatabase {
     database_live: Arc<AtomicBool>,
     governor_generation: u64,
     sql_plan_cache: Mutex<NativeSqlPlanCache>,
+    /// Most recent decoded snapshot state, keyed by the immutable root-set
+    /// digest. A snapshot whose roots are unchanged reuses the decoded state
+    /// instead of re-materializing the whole directory; any digest change
+    /// misses and loads fully.
+    snapshot_state_cache: Mutex<Option<([u8; 32], Arc<MaterializedState>)>>,
     directory_guard: NativeDirectoryGuard,
 }
 
@@ -5285,6 +5290,7 @@ impl NativeDatabase {
             database_live: Arc::new(AtomicBool::new(true)),
             governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
+            snapshot_state_cache: Mutex::new(None),
             directory_guard,
         })
     }
@@ -5518,6 +5524,7 @@ impl NativeDatabase {
             database_live: Arc::new(AtomicBool::new(true)),
             governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
+            snapshot_state_cache: Mutex::new(None),
             directory_guard,
         })
     }
@@ -7180,7 +7187,24 @@ impl NativeDatabase {
         logical_time_micros: i64,
     ) -> Result<NativeSnapshot, NativeRuntimeError> {
         let metadata = self.coordinator.snapshot(logical_time_micros)?;
-        let state = load_state(&self.pages, &self.blobs, metadata.roots())?;
+        let digest = metadata.roots().digest();
+        let cached = self
+            .snapshot_state_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|(key, state)| (*key == digest).then(|| Arc::clone(state)));
+        let state = if let Some(state) = cached {
+            state
+        } else {
+            let state = Arc::new(load_state(&self.pages, &self.blobs, metadata.roots())?);
+            *self
+                .snapshot_state_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((digest, Arc::clone(&state)));
+            state
+        };
         Ok(NativeSnapshot { metadata, state })
     }
 
@@ -7299,7 +7323,7 @@ impl NativeDatabase {
         .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
         validate_roots(&pages, &self.blobs, &roots, pin.visible_csn())
             .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
-        let state = load_state(&pages, &self.blobs, &roots)?;
+        let state = Arc::new(load_state(&pages, &self.blobs, &roots)?);
         let metadata = Snapshot::from_committed_root(roots, pin.logical_time_micros())?;
         Ok(NativeSnapshot { metadata, state })
     }
@@ -39585,6 +39609,45 @@ mod tests {
         let reopened = NativeDatabase::open(temporary.path())?;
         assert_eq!(reopened.recovery_report().committed_transactions, 1);
         assert_vertical(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_roots_reuse_the_decoded_snapshot_state() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let mut seed = database.begin(10, DurabilityClass::Memory)?;
+        seed.create_search_index(index, "native_search")?;
+        seed.index_document(index, b"a".to_vec(), "rust engine".to_owned())?;
+        seed.commit()?;
+
+        let first = database.snapshot(11)?;
+        // The roots have not changed: the second snapshot must reuse the
+        // decoded state without re-materializing the directory.
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        let second = database.snapshot(12)?;
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        assert_eq!(first.root_digest(), second.root_digest());
+        assert!(Arc::ptr_eq(&first.state, &second.state));
+        let pinned = first.match_text(index, "rust", 8)?;
+        let reused = second.match_text(index, "rust", 8)?;
+        assert_eq!(pinned.len(), reused.len());
+        for (left, right) in pinned.iter().zip(&reused) {
+            assert_eq!(left.document_id, right.document_id);
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+        }
+
+        // A commit changes the roots: the next snapshot misses the cache
+        // and decodes the new state fully.
+        let mut write = database.begin(13, DurabilityClass::Memory)?;
+        write.index_document(index, b"b".to_vec(), "sql engine".to_owned())?;
+        write.commit()?;
+        let third = database.snapshot(14)?;
+        assert_ne!(second.root_digest(), third.root_digest());
+        assert!(!Arc::ptr_eq(&second.state, &third.state));
+        assert_eq!(third.match_text(index, "sql", 8)?.len(), 1);
         Ok(())
     }
 

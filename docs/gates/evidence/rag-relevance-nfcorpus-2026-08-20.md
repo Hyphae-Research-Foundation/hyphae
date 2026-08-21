@@ -129,3 +129,32 @@ re-execution, not just this harness). The remaining per-query cost is
 snapshot materialization — every query still decodes the full corpus
 into memory before reading a single posting — which is the next
 measured target on this receipt chain.
+
+
+## Follow-up — cached snapshot state (2026-08-21)
+
+Snapshots whose immutable root-set digest is unchanged now reuse the
+decoded directory state instead of re-materializing the whole corpus per
+query. Same corpus, same queries, same maintenance cycle:
+
+```json
+{
+  "data_directory_bytes_after_ingest": 29775591035,
+  "data_directory_bytes_after_maintenance": 49100675,
+  "ingest_seconds": 138.82,
+  "maintenance_seconds": 69.59,
+  "query_seconds": 1.81
+}
+```
+
+The measured ladder on identical inputs: 8.6 seconds per query at the
+baseline, 6.3 with directory maintenance, 2.3 with the pinned posting
+scorer, and 2.5 milliseconds with the cached snapshot state — the full
+NFCorpus query set completes in 1.81 seconds, with every relevance
+metric bit-identical across all four rungs. The cache is one entry keyed
+by the root-set digest, so any commit, checkpoint, or vacuum misses to a
+full load; the reuse case is proven at the runtime level by a test that
+fails closed on any unexpected full-state load. Remaining per-query cost
+is now dominated by transport and per-request bookkeeping, which moves
+the R-track focus to the collection-cap ladder (R5) and richer filters
+(R6) rather than further single-query latency work.
