@@ -7,8 +7,8 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use hyphae_native_catalog::{
-    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogName,
-    CatalogObjectV2, DefinitionVersion, FieldSourcePolicy, IncrementalVectorLifecycle,
+    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, Bm25Parameters,
+    CatalogName, CatalogObjectV2, DefinitionVersion, FieldSourcePolicy, IncrementalVectorLifecycle,
     LexicalIndexPolicy, LogicalCatalogObject, NamedVectorDefinition, ObjectHeaderV2, QualifiedName,
     SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions, VectorMetric,
     VectorSearchPolicy,
@@ -59,9 +59,16 @@ fn header(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn configure(
     path: &PathBuf,
+) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
+    configure_with_bm25(path, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn configure_with_bm25(
+    path: &PathBuf,
+    bm25: Option<Bm25Parameters>,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(path);
     let mut product = NativeProduct::create(path)?;
@@ -100,6 +107,7 @@ fn configure(
     product.create_catalog_object_v2(
         LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
             SearchCollectionDefinitionV2 {
+                bm25,
                 header: header(13, EngineKind::Search, "products", Some(11))?,
                 fields: vec![
                     SearchFieldDefinitionV2 {
@@ -990,5 +998,93 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
     let observed: std::collections::BTreeSet<u128> =
         result.hits.iter().map(|hit| hit.object_id.get()).collect();
     assert_eq!(observed, std::collections::BTreeSet::from([201, 204, 205]));
+    Ok(())
+}
+
+fn bm25_probe_batch() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
+    // "rust" appears twice in a long document and once in a short one: with
+    // the default length normalization the short document ranks first, with
+    // b = 0 raw term frequency decides and the long document ranks first.
+    Ok(ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                301,
+                "rust rust alpha beta gamma delta epsilon zeta",
+                "book",
+                10,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(302, "rust", "book", 20, [1.0, 0.0], [0.0, 1.0])?,
+            document(303, "alpha beta", "gear", 30, [2.0, 0.0], [1.0, 0.0])?,
+            document(304, "alpha beta", "gear", 40, [3.0, 0.0], [1.0, 1.0])?,
+        ],
+    })
+}
+
+fn lexical_ranking(
+    product: &NativeProduct,
+    binding: &ProductSearchCollectionBinding,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    let result = product.search_collection(
+        binding.collection,
+        &ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".into(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+        },
+        11,
+    )?;
+    Ok(result.hits.iter().map(|hit| hit.object_id.get()).collect())
+}
+
+#[test]
+fn tuned_bm25_parameters_change_the_ranking_and_survive_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let default_path = temporary("bm25-default");
+    let (mut product, binding) = configure(&default_path)?;
+    product.ingest_search_batch(
+        binding.collection,
+        &bm25_probe_batch()?,
+        11,
+        ProductDurability::Strict,
+    )?;
+    assert_eq!(lexical_ranking(&product, &binding)?, vec![302, 301]);
+    drop(product);
+    fs::remove_dir_all(&default_path)?;
+
+    let tuned_path = temporary("bm25-tuned");
+    let (mut product, binding) = configure_with_bm25(
+        &tuned_path,
+        Some(Bm25Parameters {
+            k1_micros: 1_200_000,
+            b_micros: 0,
+        }),
+    )?;
+    product.ingest_search_batch(
+        binding.collection,
+        &bm25_probe_batch()?,
+        11,
+        ProductDurability::Strict,
+    )?;
+    assert_eq!(lexical_ranking(&product, &binding)?, vec![301, 302]);
+    drop(product);
+
+    // The tuned parameters live in the catalog representation and must
+    // decode identically after reopening the directory.
+    let reopened = NativeProduct::open(&tuned_path)?;
+    let binding = reopened.resolve_search_collection_binding(ObjectId::new(13)?, 0)?;
+    assert_eq!(lexical_ranking(&reopened, &binding)?, vec![301, 302]);
+    drop(reopened);
+    fs::remove_dir_all(tuned_path)?;
     Ok(())
 }

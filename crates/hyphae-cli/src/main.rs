@@ -917,6 +917,12 @@ enum CatalogCommand {
         name: String,
         #[arg(long, default_value_t = 2)]
         dimension: u16,
+        /// Tuned BM25 k1 in micros (defaults keep the canonical 1.2).
+        #[arg(long, requires = "bm25_b_micros")]
+        bm25_k1_micros: Option<u64>,
+        /// Tuned BM25 b in micros (defaults keep the canonical 0.75).
+        #[arg(long, requires = "bm25_k1_micros")]
+        bm25_b_micros: Option<u64>,
         #[arg(long, value_enum, default_value_t = Durability::Strict)]
         durability: Durability,
     },
@@ -2855,6 +2861,8 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer,
             name,
             dimension,
+            bm25_k1_micros,
+            bm25_b_micros,
             durability,
         } => {
             let mut objects = vec![
@@ -2894,6 +2902,15 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             let object = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
                 SearchCollectionDefinitionV2 {
                     header: catalog_header(collection, EngineKind::Search, &name, Some(schema))?,
+                    bm25: match (bm25_k1_micros, bm25_b_micros) {
+                        (Some(k1_micros), Some(b_micros)) => {
+                            Some(hyphae_native_catalog::Bm25Parameters {
+                                k1_micros,
+                                b_micros,
+                            })
+                        }
+                        _ => None,
+                    },
                     fields: vec![
                         SearchFieldDefinitionV2 {
                             id: field_id(1)?,

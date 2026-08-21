@@ -885,6 +885,7 @@ impl NativeProduct {
             &snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
+            collection_bm25_parameters(&definition),
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
@@ -984,6 +985,7 @@ impl NativeProduct {
             snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
+            collection_bm25_parameters(&definition),
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
@@ -1112,11 +1114,13 @@ impl NativeProduct {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_lexical_branch(
     database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
+    parameters: hyphae_native_runtime::Bm25ScoreParameters,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1132,11 +1136,12 @@ fn execute_lexical_branch(
         index,
         &lexical.query,
         lexical.candidate_limit,
+        parameters,
     ) {
         Ok(hits) => hits,
         Err(_) => snapshot
             .inner
-            .match_text(index, &lexical.query, lexical.candidate_limit)
+            .match_text_with_parameters(index, &lexical.query, lexical.candidate_limit, parameters)
             .map_err(map_runtime_error)?,
     };
     let mut admitted = 0;
@@ -2039,6 +2044,20 @@ fn resolve_eligibility_with_checkpoint(
 }
 
 /// Loads the collection manifest identities under the read-side cap.
+/// Tuned BM25 parameters from the collection definition, or the canonical
+/// defaults when the definition predates tuning.
+fn collection_bm25_parameters(
+    definition: &SearchCollectionDefinitionV2,
+) -> hyphae_native_runtime::Bm25ScoreParameters {
+    definition.bm25.map_or_else(
+        hyphae_native_runtime::Bm25ScoreParameters::default,
+        |bm25| hyphae_native_runtime::Bm25ScoreParameters {
+            k1_micros: bm25.k1_micros,
+            b_micros: bm25.b_micros,
+        },
+    )
+}
+
 fn load_manifest_ids(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,

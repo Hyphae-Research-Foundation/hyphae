@@ -143,7 +143,9 @@ V1 default ranking is versioned BM25F:
 - score ordering is descending, followed by stable object ID ascending;
 - explanations name every term, field statistic, parameter and contribution.
 
-The current scorer uses BM25 with `k1=1.2`, `b=0.75`, query-term
+The current scorer uses BM25 with per-collection `k1`/`b` taken from the
+index definition (defaults `k1=1.2`, `b=0.75`; micro-unit integers in the
+catalog so identical definitions score identically on every host), query-term
 deduplication, descending score, then bytewise document-ID ascending. The
 materialized reference scorer remains the oracle: tests require physical
 posting traversal to return exactly the same scores and order. A dedicated

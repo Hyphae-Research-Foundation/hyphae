@@ -949,6 +949,41 @@ pub struct SearchCollectionDefinitionV2 {
     pub fields: Vec<SearchFieldDefinitionV2>,
     /// Named vectors ordered by stable identity.
     pub vectors: Vec<NamedVectorDefinition>,
+    /// Tuned BM25 parameters; absent keeps the canonical defaults and the
+    /// pre-tuning definition encoding.
+    pub bm25: Option<Bm25Parameters>,
+}
+
+/// Tunable BM25 scoring parameters bound to one search collection.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Bm25Parameters {
+    /// Term-frequency saturation `k1` in micros (`k1 × 1_000_000`).
+    pub k1_micros: u64,
+    /// Length-normalization `b` in micros (`b × 1_000_000`), at most one.
+    pub b_micros: u64,
+}
+
+impl Bm25Parameters {
+    /// Canonical `k1 = 1.2` in micros.
+    pub const DEFAULT_K1_MICROS: u64 = 1_200_000;
+    /// Canonical `b = 0.75` in micros.
+    pub const DEFAULT_B_MICROS: u64 = 750_000;
+    /// Largest admitted `k1` (100.0) in micros.
+    pub const MAX_K1_MICROS: u64 = 100_000_000;
+    /// Largest admitted `b` (1.0) in micros.
+    pub const MAX_B_MICROS: u64 = 1_000_000;
+
+    /// Validates the bounded parameter ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either parameter exceeds its bound.
+    pub fn validate(self) -> Result<(), CatalogError> {
+        if self.k1_micros > Self::MAX_K1_MICROS || self.b_micros > Self::MAX_B_MICROS {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        Ok(())
+    }
 }
 
 /// Vector distance fixed by one catalog search definition.
@@ -1180,6 +1215,9 @@ impl SearchCollectionDefinitionV2 {
     /// Returns an error for wrong ownership, duplicates, noncanonical order,
     /// invalid analyzers, or invalid vector lifecycle settings.
     pub fn validate(&self) -> Result<(), CatalogError> {
+        if let Some(bm25) = self.bm25 {
+            bm25.validate()?;
+        }
         if self.header.owner != EngineKind::Search {
             return Err(CatalogError::WrongObjectOwner);
         }
@@ -2188,6 +2226,7 @@ mod tests {
         }));
         let search = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
             SearchCollectionDefinitionV2 {
+                bm25: None,
                 header: ObjectHeaderV2 {
                     id: ObjectId::new(13)?,
                     owner: EngineKind::Search,

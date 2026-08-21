@@ -151,7 +151,11 @@ Logical V2 includes:
   frequency/position policy; and
 - multiple stable-ID named vectors with fixed type/metric, exact, ANN, or
   adaptive threshold policy, and incremental delta/consolidation/generation
-  retention settings.
+  retention settings; and
+- optional per-collection BM25 `k1`/`b` scoring parameters as bounded
+  micro-unit integers. Search collections without tuned parameters keep the
+  representation-2 bytes exactly; tuned collections encode representation 3,
+  which appends the two parameters after the representation-2 body.
 
 Each complete canonical `HYCOBJ02` definition has a stable SHA-256 digest.
 Dependency derivation emits canonical directed edges from dependent to

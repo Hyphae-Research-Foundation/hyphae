@@ -60,7 +60,7 @@ fn shared_frame_and_handshake_vectors_are_stable() -> Result<(), Box<dyn std::er
     assert_eq!(decode_welcome(&encoded)?, welcome);
     assert_eq!(
         blake3::hash(&encoded).to_hex().as_str(),
-        "3ba7485426d52f643523edc48a239dc78e1b2e5f7502070059171f8777178b21"
+        "2c12fe5eb05cdf749d69e37060cd125535f069b2d0e1587bf8841cde674d7203"
     );
     Ok(())
 }
