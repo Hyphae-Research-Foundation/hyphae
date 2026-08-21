@@ -31,6 +31,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native acceleration and verification-asymmetry roadmap](roadmaps/native-acceleration-roadmap.md)
 - [RAG competitive roadmap](roadmaps/rag-competitive-roadmap.md)
 - [RAG relevance baseline — NFCorpus (2026-08-20)](gates/evidence/rag-relevance-nfcorpus-2026-08-20.md)
+- [RAG relevance at the 100k cap — FiQA (2026-08-21)](gates/evidence/rag-relevance-fiqa-2026-08-21.md)
 
 ## Build and embed
 
