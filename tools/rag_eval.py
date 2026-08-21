@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+"""Measure Hyphae retrieval relevance under the pinned evidence protocol.
+
+The harness ingests one pinned public BEIR-format dataset into a fresh
+Native directory through the shipped binary, executes every test query
+through the integrated search surface, and reports NDCG@k, Recall@k, and
+MRR@k in a receipt that pins the dataset digests, the binary version, and
+the host declaration. Every step is deterministic: dataset archives are
+verified against frozen SHA-256 digests before use, documents are ingested
+in sorted identifier order, and metrics are computed with a fixed rounding
+discipline. Nothing is downloaded unless --download is passed explicitly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "sdks" / "python" / "src"))
+
+from hyphae_sdk.v2 import HyphaeClient  # noqa: E402
+
+RECEIPT_SCHEMA = "hyphae-rag-relevance-receipt-v1"
+BEIR_BASE_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
+INGEST_BATCH_DOCUMENTS = 256
+CANDIDATE_LIMIT = 1000
+MAX_DATASET_DOCUMENTS = 10_000
+
+# Frozen dataset inventory: archives are immutable upstream artifacts and any
+# digest change fails closed. FiQA and other >10k-document corpora join this
+# table only when the collection-document cap is raised with evidence (R5).
+DATASETS = {
+    "scifact": {
+        "archive": "scifact.zip",
+        "sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
+        "documents": 5183,
+        "qrels": "qrels/test.tsv",
+    },
+    "nfcorpus": {
+        "archive": "nfcorpus.zip",
+        "sha256": "efe5be03f8c5b86a5870102d0599d227c8c6e2484328e68c6522560385671b0b",
+        "documents": 3633,
+        "qrels": "qrels/test.tsv",
+    },
+}
+
+
+class HarnessError(Exception):
+    """Fail-closed harness failure."""
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def acquire_dataset(name: str, data_root: Path, download: bool) -> Path:
+    entry = DATASETS[name]
+    archive = data_root / entry["archive"]
+    if not archive.is_file():
+        if not download:
+            raise HarnessError(
+                f"dataset archive is missing: {archive} (pass --download to fetch it)"
+            )
+        data_root.mkdir(parents=True, exist_ok=True)
+        url = f"{BEIR_BASE_URL}/{entry['archive']}"
+        with urllib.request.urlopen(url, timeout=120) as response, archive.open(
+            "wb"
+        ) as handle:
+            shutil.copyfileobj(response, handle)
+    observed = sha256_file(archive)
+    if observed != entry["sha256"]:
+        raise HarnessError(
+            f"dataset digest differs for {name}: observed {observed}, "
+            f"frozen {entry['sha256']}"
+        )
+    extracted = data_root / name
+    if not (extracted / "corpus.jsonl").is_file():
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.namelist():
+                target = (data_root / member).resolve()
+                if not str(target).startswith(str(data_root.resolve())):
+                    raise HarnessError(f"archive member escapes the root: {member}")
+            bundle.extractall(data_root)
+    return extracted
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_qrels(path: Path) -> dict[str, dict[str, int]]:
+    qrels: dict[str, dict[str, int]] = {}
+    with path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+        if not header.lower().startswith("query-id"):
+            raise HarnessError(f"unexpected qrels header in {path}: {header!r}")
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 3:
+                raise HarnessError(f"malformed qrels row: {line!r}")
+            query_id, corpus_id, score = parts
+            qrels.setdefault(query_id, {})[corpus_id] = int(score)
+    return qrels
+
+
+def run_binary(binary: Path, arguments: list[str]) -> dict:
+    completed = subprocess.run(
+        [str(binary), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HarnessError(
+            f"binary failed: {' '.join(arguments[:4])}...: {completed.stderr.strip()[:400]}"
+        )
+    return json.loads(completed.stdout)
+
+
+def provision(binary: Path, data_dir: Path) -> None:
+    run_binary(binary, ["init", "--data-dir", str(data_dir)])
+    run_binary(
+        binary,
+        [
+            "catalog",
+            "--data-dir",
+            str(data_dir),
+            "create-search-collection",
+            "--database",
+            "10",
+            "--schema",
+            "11",
+            "--collection",
+            "13",
+            "--analyzer",
+            "12",
+            "--name",
+            "main.public.rag_eval",
+        ],
+    )
+    run_binary(
+        binary,
+        ["search", "--data-dir", str(data_dir), "provision", "--collection", "13"],
+    )
+
+
+def start_daemon(binary: Path, data_dir: Path) -> tuple[subprocess.Popen, Path]:
+    endpoint = Path(tempfile.gettempdir()) / f"hyphae-rag-eval-{uuid.uuid4().hex}.sock"
+    process = subprocess.Popen(
+        [str(binary), "serve", "--data-dir", str(data_dir), "--endpoint", str(endpoint)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 30
+    while not endpoint.exists():
+        if process.poll() is not None:
+            raise HarnessError(f"serve exited early: {process.stderr.read()[:400]}")
+        if time.monotonic() > deadline:
+            process.terminate()
+            raise HarnessError("serve did not bind its endpoint")
+        time.sleep(0.05)
+    return process, endpoint
+
+
+def stop_daemon(process: subprocess.Popen, endpoint: Path) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=15)
+    endpoint.unlink(missing_ok=True)
+
+
+def ingest_corpus(
+    client: HyphaeClient, corpus: list[dict]
+) -> dict[int, str]:
+    identifier_map: dict[int, str] = {}
+    documents = []
+    for ordinal, row in enumerate(
+        sorted(corpus, key=lambda row: str(row["_id"])), start=1
+    ):
+        identifier_map[ordinal] = str(row["_id"])
+        text = f"{row.get('title', '')}\n{row.get('text', '')}".strip()
+        documents.append({"object_id": ordinal, "text": text})
+    for offset in range(0, len(documents), INGEST_BATCH_DOCUMENTS):
+        batch = documents[offset : offset + INGEST_BATCH_DOCUMENTS]
+        client.search_ingest(
+            13,
+            {
+                "idempotency_id": offset // INGEST_BATCH_DOCUMENTS + 1,
+                "documents": batch,
+            },
+        )
+    return identifier_map
+
+
+def execute_query(client: HyphaeClient, query: str, k: int) -> list[int]:
+    response = client.search_collection(
+        13,
+        {
+            "lexical": {"query": query, "candidate_limit": CANDIDATE_LIMIT, "weight": 1},
+            "vectors": [],
+            "limit": k,
+        },
+    )
+    return [int(hit["object_id"]) for hit in response.value.get("hits", [])]
+
+
+def ndcg_at_k(ranking: list[str], relevant: dict[str, int], k: int) -> float:
+    gains = [relevant.get(document, 0) for document in ranking[:k]]
+    dcg = sum(
+        gain / math.log2(position + 2) for position, gain in enumerate(gains)
+    )
+    ideal = sorted(relevant.values(), reverse=True)[:k]
+    idcg = sum(
+        gain / math.log2(position + 2) for position, gain in enumerate(ideal)
+    )
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def recall_at_k(ranking: list[str], relevant: dict[str, int], k: int) -> float:
+    judged = {document for document, score in relevant.items() if score > 0}
+    if not judged:
+        return 0.0
+    return len(judged.intersection(ranking[:k])) / len(judged)
+
+
+def mrr_at_k(ranking: list[str], relevant: dict[str, int], k: int) -> float:
+    for position, document in enumerate(ranking[:k], start=1):
+        if relevant.get(document, 0) > 0:
+            return 1.0 / position
+    return 0.0
+
+
+def host_declaration() -> dict:
+    cpu_model = ""
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    return {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "cpu_model": cpu_model,
+        "python": platform.python_version(),
+    }
+
+
+def directory_bytes(data_dir: Path) -> int:
+    return sum(f.stat().st_size for f in data_dir.rglob("*") if f.is_file())
+
+
+def evaluate(
+    binary: Path,
+    dataset: str,
+    data_root: Path,
+    k: int,
+    download: bool,
+    query_limit: int | None,
+) -> dict:
+    extracted = acquire_dataset(dataset, data_root, download)
+    corpus = load_jsonl(extracted / "corpus.jsonl")
+    if len(corpus) != DATASETS[dataset]["documents"]:
+        raise HarnessError(
+            f"corpus cardinality differs for {dataset}: {len(corpus)}"
+        )
+    if len(corpus) > MAX_DATASET_DOCUMENTS:
+        raise HarnessError(
+            f"{dataset} exceeds the collection document cap; gated on R5"
+        )
+    queries = {
+        str(row["_id"]): str(row["text"]) for row in load_jsonl(extracted / "queries.jsonl")
+    }
+    qrels = load_qrels(extracted / DATASETS[dataset]["qrels"])
+    evaluated_ids = sorted(qrels, key=str)
+    if query_limit is not None:
+        evaluated_ids = evaluated_ids[:query_limit]
+
+    version = run_binary(binary, ["version", "--json"])
+    # The working directory lives next to the dataset cache: /tmp is often a
+    # memory-backed filesystem whose quota a durable ingest exhausts.
+    with tempfile.TemporaryDirectory(
+        prefix="hyphae-rag-eval-", dir=data_root
+    ) as scratch:
+        data_dir = Path(scratch) / "data"
+        provision(binary, data_dir)
+        process, endpoint = start_daemon(binary, data_dir)
+        try:
+            client = HyphaeClient.local(str(endpoint))
+            import time as _time
+
+            ingest_started = _time.monotonic()
+            identifier_map = ingest_corpus(client, corpus)
+            ingest_seconds = _time.monotonic() - ingest_started
+            ingested_bytes = directory_bytes(data_dir)
+            ndcg_total = recall_total = mrr_total = 0.0
+            evaluated = 0
+            query_started = _time.monotonic()
+            for query_id in evaluated_ids:
+                query_text = queries.get(query_id)
+                if query_text is None:
+                    raise HarnessError(f"qrels query is missing: {query_id}")
+                ordinals = execute_query(client, query_text, k)
+                ranking = [identifier_map[ordinal] for ordinal in ordinals]
+                relevant = qrels[query_id]
+                ndcg_total += ndcg_at_k(ranking, relevant, k)
+                recall_total += recall_at_k(ranking, relevant, k)
+                mrr_total += mrr_at_k(ranking, relevant, k)
+                evaluated += 1
+            query_seconds = _time.monotonic() - query_started
+            client.close()
+        finally:
+            stop_daemon(process, endpoint)
+    if evaluated == 0:
+        raise HarnessError("no queries were evaluated")
+    return {
+        "schema": RECEIPT_SCHEMA,
+        "dataset": {
+            "name": dataset,
+            "archive_sha256": DATASETS[dataset]["sha256"],
+            "documents": len(corpus),
+            "queries_evaluated": evaluated,
+            "qrels": DATASETS[dataset]["qrels"],
+        },
+        "engine": version,
+        "protocol": {
+            "k": k,
+            "candidate_limit": CANDIDATE_LIMIT,
+            "ingest_batch_documents": INGEST_BATCH_DOCUMENTS,
+            "branches": "lexical",
+            "transport": "local-uds-daemon",
+            "ingest_order": "sorted-corpus-id",
+        },
+        "host": host_declaration(),
+        "cost": {
+            "ingest_seconds": round(ingest_seconds, 2),
+            "query_seconds": round(query_seconds, 2),
+            "data_directory_bytes_after_ingest": ingested_bytes,
+        },
+        "metrics": {
+            f"ndcg@{k}": round(ndcg_total / evaluated, 6),
+            f"recall@{k}": round(recall_total / evaluated, 6),
+            f"mrr@{k}": round(mrr_total / evaluated, 6),
+        },
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--dataset", choices=sorted(DATASETS), required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--download", action="store_true")
+    parser.add_argument("--query-limit", type=int, default=None)
+    parser.add_argument("--output", type=Path, default=None)
+    arguments = parser.parse_args()
+    if not arguments.binary.is_file():
+        print(f"error: binary is missing: {arguments.binary}", file=sys.stderr)
+        return 1
+    if arguments.k < 1 or arguments.k > 1024:
+        print("error: k must be within 1..=1024", file=sys.stderr)
+        return 1
+    try:
+        receipt = evaluate(
+            arguments.binary.resolve(),
+            arguments.dataset,
+            arguments.data_root,
+            arguments.k,
+            arguments.download,
+            arguments.query_limit,
+        )
+    except (HarnessError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    encoded = json.dumps(receipt, indent=2, sort_keys=True)
+    if arguments.output is not None:
+        arguments.output.write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -30,6 +30,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
 - [Native acceleration and verification-asymmetry roadmap](roadmaps/native-acceleration-roadmap.md)
 - [RAG competitive roadmap](roadmaps/rag-competitive-roadmap.md)
+- [RAG relevance baseline — NFCorpus (2026-08-20)](gates/evidence/rag-relevance-nfcorpus-2026-08-20.md)
 
 ## Build and embed
 
