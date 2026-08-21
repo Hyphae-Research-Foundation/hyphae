@@ -287,6 +287,62 @@ class SecurityProtocolTests(unittest.TestCase):
         }
         self.assertTrue(all(operation_required_minor(operation) == 3 for operation in lifecycle))
         self.assertEqual(operation_required_minor("security_legacy_bearer_revoke"), 3)
+        # Every currently expressible search body is minor-0 content; the
+        # content walk exists so future operators, typed doc values, and
+        # fusion methods raise the requirement without new operations.
+        self.assertEqual(
+            operation_required_minor(
+                "search_collection",
+                {
+                    "filter": {
+                        "kind": "not",
+                        "filter": {
+                            "kind": "all",
+                            "filters": [
+                                {"kind": "match_all"},
+                                {
+                                    "kind": "compare",
+                                    "field": "price",
+                                    "operator": "less_or_equal",
+                                    "value": 40,
+                                },
+                            ],
+                        },
+                    }
+                },
+            ),
+            0,
+        )
+        self.assertEqual(
+            operation_required_minor(
+                "search_ingest",
+                {
+                    "documents": [
+                        {
+                            "object_id": 1,
+                            "text": "rust",
+                            "doc_values": {
+                                "flag": True,
+                                "rank": 3,
+                                "name": "a",
+                                "blob": b"x",
+                            },
+                        }
+                    ]
+                },
+            ),
+            0,
+        )
+        self.assertEqual(
+            operation_required_minor(
+                "proof_generate",
+                {
+                    "operation": "search_collection",
+                    "arguments": {"filter": {"kind": "match_all"}},
+                },
+            ),
+            0,
+        )
         memory_revoke = bytearray(
             encode_product_request(
                 "security_legacy_bearer_revoke",

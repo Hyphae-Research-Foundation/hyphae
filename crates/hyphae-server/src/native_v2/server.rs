@@ -39,7 +39,8 @@ use super::{
 
 const SESSION_ID_HEADER: &str = hyphae_contracts::v2::SESSION_ID_HEADER_V2;
 const PROTOCOL_MINOR_HEADER: &str = hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2;
-const PROTOCOL_MINOR_VALUE: &str = hyphae_contracts::v2::PROTOCOL_MINOR_VALUE_V2;
+const SUPPORTED_PROTOCOL_MINORS: &[u16] = hyphae_contracts::v2::PROTOCOL_MINORS_SUPPORTED_V2;
+const MAX_PROTOCOL_MINOR_TOKENS: usize = 8;
 const STREAM_COMPLETION_HEADER: &str = "x-hyphae-stream-completion";
 const MAX_HTTP_SESSIONS: usize = 256;
 const MAX_HTTP_PREPARED_PER_SESSION: usize = 128;
@@ -53,6 +54,10 @@ pub(super) struct RequestMetadata {
     pub(super) request_id: u128,
     pub(super) binary_errors: bool,
 }
+
+/// Protocol minor selected from the client's offer for one request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NegotiatedProtocolMinor(pub(super) u16);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AuthenticatedPrincipal(pub(super) [u8; 32]);
@@ -508,28 +513,57 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
     response
 }
 
-async fn require_supported_protocol_minor(request: Request, next: Next) -> Response {
+/// Parses the client's offered protocol minors and selects the highest one
+/// this build serves. The offer is bounded and canonical: at most
+/// `MAX_PROTOCOL_MINOR_TOKENS` decimal tokens across every header instance
+/// (comma separation tolerated for header-coalescing intermediaries), no
+/// duplicates, no leading zeros, no other bytes. Any malformed offer or an
+/// offer without a supported member selects nothing and fails closed.
+fn select_protocol_minor(headers: &axum::http::HeaderMap) -> Option<u16> {
+    let mut offered: Vec<u16> = Vec::new();
+    for value in headers.get_all(PROTOCOL_MINOR_HEADER) {
+        for token in value.to_str().ok()?.split(',') {
+            let token = token.trim_matches(' ');
+            if offered.len() >= MAX_PROTOCOL_MINOR_TOKENS
+                || token.is_empty()
+                || token.len() > 3
+                || (token.len() > 1 && token.starts_with('0'))
+                || !token.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let minor = token.parse::<u16>().ok()?;
+            if offered.contains(&minor) {
+                return None;
+            }
+            offered.push(minor);
+        }
+    }
+    offered
+        .into_iter()
+        .filter(|minor| SUPPORTED_PROTOCOL_MINORS.contains(minor))
+        .max()
+}
+
+async fn require_supported_protocol_minor(mut request: Request, next: Next) -> Response {
     if request.uri().path() != "/v2" && !request.uri().path().starts_with("/v2/") {
         return next.run(request).await;
     }
     let metadata = request.extensions().get::<RequestMetadata>().cloned();
-    let supported = request
-        .headers()
-        .get_all(PROTOCOL_MINOR_HEADER)
-        .iter()
-        .collect::<Vec<_>>();
-    if supported.len() != 1 || supported[0].as_bytes() != PROTOCOL_MINOR_VALUE.as_bytes() {
+    let Some(selected) = select_protocol_minor(request.headers()) else {
         let metadata = metadata.unwrap_or(RequestMetadata {
             request_id: Uuid::now_v7().as_u128(),
             binary_errors: accepts_binary_errors(request.headers()),
         });
         return NativeApiError::code(ProductErrorCode::InvalidRequest, &metadata).into_response();
-    }
+    };
+    request
+        .extensions_mut()
+        .insert(NegotiatedProtocolMinor(selected));
     let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        PROTOCOL_MINOR_HEADER,
-        HeaderValue::from_static(PROTOCOL_MINOR_VALUE),
-    );
+    if let Ok(value) = HeaderValue::from_str(&selected.to_string()) {
+        response.headers_mut().insert(PROTOCOL_MINOR_HEADER, value);
+    }
     response
 }
 
@@ -727,6 +761,7 @@ async fn capabilities(
     State(state): State<Arc<NativeHttpV2State>>,
     Extension(metadata): Extension<RequestMetadata>,
     Extension(authentication): Extension<RequestAuthentication>,
+    Extension(negotiated): Extension<NegotiatedProtocolMinor>,
 ) -> Result<Response, NativeApiError> {
     execute_operation(
         state,
@@ -739,6 +774,7 @@ async fn capabilities(
             limits: hyphae_native_product::ProductLimits::default(),
             durability: hyphae_native_product::ProductDurabilityPolicy::STRICT,
         },
+        negotiated.0,
         Duration::ZERO,
         false,
         authentication,
@@ -827,6 +863,11 @@ async fn execute_request(
         .remove::<RequestBodyAdmission>()
         .ok_or_else(|| NativeApiError::code(ProductErrorCode::Internal, &metadata))?;
     let _request_admission = request_admission.0;
+    let negotiated_minor = request
+        .extensions()
+        .get::<NegotiatedProtocolMinor>()
+        .ok_or_else(|| NativeApiError::code(ProductErrorCode::Internal, &metadata))?
+        .0;
     let body = tokio::time::timeout(
         state.limits.request_body_timeout,
         body::to_bytes(request.into_body(), state.limits.request_body_bytes),
@@ -841,8 +882,9 @@ async fn execute_request(
         }
     })?;
     let decode_started = Instant::now();
-    let mut wire = hyphae_native_protocol::decode_product_request(&body)
-        .map_err(|_| rejection(ProductErrorCode::InvalidRequest))?;
+    let mut wire =
+        hyphae_native_protocol::decode_product_request_for_minor(&body, negotiated_minor)
+            .map_err(|_| rejection(ProductErrorCode::InvalidRequest))?;
     let decode_time = decode_started.elapsed();
     if deadline_header.is_some() && deadline_header != wire.deadline_micros {
         return Err(rejection(ProductErrorCode::InvalidRequest));
@@ -906,6 +948,7 @@ async fn execute_request(
         state,
         metadata,
         wire,
+        negotiated_minor,
         decode_time,
         stream_response,
         authentication,
@@ -914,11 +957,13 @@ async fn execute_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 async fn execute_operation(
     state: Arc<NativeHttpV2State>,
     metadata: RequestMetadata,
     wire: hyphae_native_protocol::WireRequest,
+    negotiated_minor: u16,
     decode_time: Duration,
     stream_response: bool,
     authentication: RequestAuthentication,
@@ -1059,8 +1104,9 @@ async fn execute_operation(
 
     completion_checkpoint(&token, wire.deadline_micros, &metadata)?;
     let encoding_started = Instant::now();
-    let encoded = hyphae_native_protocol::encode_product_response(&response)
-        .map_err(|_| NativeApiError::code(ProductErrorCode::Internal, &metadata))?;
+    let encoded =
+        hyphae_native_protocol::encode_product_response_for_minor(&response, negotiated_minor)
+            .map_err(|_| NativeApiError::code(ProductErrorCode::Internal, &metadata))?;
     client.record_timing(TimingClass::ResultEncoding, encoding_started.elapsed());
     client.record_timing(TimingClass::Transport, transport_started.elapsed());
     let maximum = state

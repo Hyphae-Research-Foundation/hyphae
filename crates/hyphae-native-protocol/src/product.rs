@@ -1075,6 +1075,63 @@ pub fn decode_product_response_for_minor(
     Ok(response)
 }
 
+/// Lowest protocol minor whose codec admits this doc value.
+fn doc_value_required_minor(value: &ProductDocValue) -> u16 {
+    match value {
+        ProductDocValue::Boolean(_)
+        | ProductDocValue::Integer(_)
+        | ProductDocValue::String(_)
+        | ProductDocValue::Bytes(_) => 0,
+    }
+}
+
+/// Lowest protocol minor whose codec admits this comparison operator.
+fn operator_required_minor(operator: ProductSearchOperator) -> u16 {
+    match operator {
+        ProductSearchOperator::Equal
+        | ProductSearchOperator::NotEqual
+        | ProductSearchOperator::Less
+        | ProductSearchOperator::LessOrEqual
+        | ProductSearchOperator::Greater
+        | ProductSearchOperator::GreaterOrEqual => 0,
+    }
+}
+
+/// Lowest protocol minor whose codec admits every node of this filter.
+/// Depth is already bounded by the strict decoder before this walk runs.
+fn filter_required_minor(filter: &ProductSearchFilter) -> u16 {
+    match filter {
+        ProductSearchFilter::MatchAll | ProductSearchFilter::Exists(_) => 0,
+        ProductSearchFilter::Compare {
+            operator, value, ..
+        } => operator_required_minor(*operator).max(doc_value_required_minor(value)),
+        ProductSearchFilter::All(children) | ProductSearchFilter::Any(children) => children
+            .iter()
+            .map(filter_required_minor)
+            .max()
+            .unwrap_or(0),
+        ProductSearchFilter::Not(child) => filter_required_minor(child),
+    }
+}
+
+/// Lowest protocol minor whose codec admits every doc value of this document.
+fn document_required_minor(document: &ProductDocument) -> u16 {
+    document
+        .doc_values
+        .values()
+        .map(doc_value_required_minor)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Lowest protocol minor whose codec admits every part of this search
+/// request. Future request content (fusion methods, new operators, new
+/// doc-value types) raises the requirement here rather than adding a new
+/// operation variant.
+fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
+    filter_required_minor(&request.filter)
+}
+
 fn ensure_operation_minor(
     operation: &ProductOperation,
     negotiated_minor: u16,
@@ -1111,6 +1168,18 @@ fn ensure_operation_minor(
         ProductOperation::Prove { operation, .. } => {
             return ensure_operation_minor(operation, negotiated_minor);
         }
+        ProductOperation::SearchCollection { request, .. } => {
+            search_request_required_minor(request)
+        }
+        ProductOperation::SearchIngest { batch, .. } => batch
+            .documents
+            .iter()
+            .map(document_required_minor)
+            .max()
+            .unwrap_or(0),
+        ProductOperation::SearchDocumentUpdate { update, .. } => {
+            document_required_minor(&update.document)
+        }
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1141,6 +1210,13 @@ fn ensure_response_minor(
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
         }
+        ProductResponse::IntegratedSearch(result) => result
+            .hits
+            .iter()
+            .flat_map(|hit| hit.doc_values.values())
+            .map(doc_value_required_minor)
+            .max()
+            .unwrap_or(0),
         _ => 0,
     };
     if negotiated_minor < required_minor {

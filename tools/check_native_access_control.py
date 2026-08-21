@@ -724,7 +724,7 @@ def validate_lifecycle_surfaces(repository: Path) -> None:
         or "no-store, private, max-age=0" not in server
         or "header::CONTENT_ENCODING" not in rust_http
         or 'endpoint.set_path(endpoint_path)' not in rust_http
-        or '"X-Hyphae-Protocol-Minor": PROTOCOL_MINOR' not in python_http
+        or '"X-Hyphae-Protocol-Minor": ",".join(' not in python_http
         or '"/v2/security/keys" if key_lifecycle else "/v2/execute"' not in python_http
         or 'operation.startsWith("security_api_key_")' not in typescript_http
         or 'keyLifecycle ? "/v2/security/keys" : "/v2/execute"' not in typescript_http

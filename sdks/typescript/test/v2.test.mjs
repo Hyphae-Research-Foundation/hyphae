@@ -21,9 +21,44 @@ import {
   SensitiveBytes,
   windowsPipePath,
 } from "../dist/v2/index.js";
-import { decodeProductRequest } from "../dist/v2/protocol.js";
+import { decodeProductRequest, operationRequiredMinor } from "../dist/v2/protocol.js";
 
 const fixtureUrl = new URL("../../../compatibility/native-protocol-v1-structure-get.bin", import.meta.url);
+
+test("v2 search content at every current shape is minor zero", () => {
+  // Every currently expressible search body is minor-0 content; the content
+  // walk exists so future operators, typed doc values, and fusion methods
+  // raise the requirement without new operations.
+  assert.equal(
+    operationRequiredMinor("search_collection", {
+      filter: {
+        kind: "not",
+        filter: {
+          kind: "all",
+          filters: [
+            { kind: "match_all" },
+            { kind: "compare", field: "price", operator: "less_or_equal", value: 40n },
+          ],
+        },
+      },
+    }),
+    0,
+  );
+  assert.equal(
+    operationRequiredMinor("search_ingest", {
+      documents: [{ object_id: 1n, text: "rust", doc_values: { flag: true, rank: 3n, name: "a" } }],
+    }),
+    0,
+  );
+  assert.equal(
+    operationRequiredMinor("proof_generate", {
+      operation: "search_collection",
+      arguments: { filter: { kind: "match_all" } },
+    }),
+    0,
+  );
+  assert.equal(operationRequiredMinor("security_status"), 1);
+});
 
 test("v2 completion BLAKE3 matches published vectors", () => {
   const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");

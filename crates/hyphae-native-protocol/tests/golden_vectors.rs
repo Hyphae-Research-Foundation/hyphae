@@ -9,17 +9,19 @@ use hyphae_native_product::{
     CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRequest, ObjectId,
     ProductAuthorization, ProductCommitReceipt, ProductDocValue, ProductDocument,
     ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCode,
-    ProductExplicitTransactionStatus, ProductLimits, ProductOperation, ProductPermission,
-    ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionVectorMutation, ProductValue, ProductVector,
-    RoleAssignmentMutationReceipt, SecurityAssignmentListRequest, SecurityAssignmentPage,
-    SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata,
-    SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget,
-    SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
-    SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
-    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityPrincipalSummary,
-    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
+    ProductExplicitTransactionStatus, ProductLexicalBranch, ProductLimits, ProductOperation,
+    ProductPermission, ProductResponse, ProductScope, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
+    ProductSearchRequest, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionVectorMutation, ProductValue, ProductVector, RoleAssignmentMutationReceipt,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAssignmentSummary,
+    SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor,
+    SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage, SecurityKeySummary,
+    SecurityKeySummaryInput, SecurityPrincipalListRequest, SecurityPrincipalMutationReceipt,
+    SecurityPrincipalPage, SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage,
+    SecurityRoleSummary, SnapshotIdentity,
 };
 use hyphae_native_protocol::{
     API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, GOLDEN_STRUCTURE_FRAME_BLAKE3,
@@ -531,6 +533,76 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
     assert!(matches!(
         decode_product_response(&zero_principal),
         Err(ProductCodecError::InvalidValue)
+    ));
+    Ok(())
+}
+
+#[test]
+fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn std::error::Error>> {
+    // Every currently expressible search request body — all filter nodes,
+    // all operators, all doc-value types — is minor-0 content. The content
+    // walk exists so future operators, typed values, and fusion methods
+    // raise the requirement without new operation variants.
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection: ObjectId::new(13)?,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 8,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::All(vec![
+                ProductSearchFilter::MatchAll,
+                ProductSearchFilter::Exists("category".to_owned()),
+                ProductSearchFilter::Not(Box::new(ProductSearchFilter::Any(vec![
+                    ProductSearchFilter::Compare {
+                        field: "price".to_owned(),
+                        operator: ProductSearchOperator::LessOrEqual,
+                        value: ProductDocValue::Integer(40),
+                    },
+                    ProductSearchFilter::Compare {
+                        field: "category".to_owned(),
+                        operator: ProductSearchOperator::Equal,
+                        value: ProductDocValue::String("book".to_owned()),
+                    },
+                ]))),
+            ]),
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+        },
+    });
+    let encoded = encode_product_request_for_minor(&request, 0)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 0)?.operation,
+        ProductOperation::SearchCollection { .. }
+    ));
+
+    let ingest = security_wire_request(ProductOperation::SearchIngest {
+        collection: ObjectId::new(13)?,
+        batch: ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents: vec![ProductDocument {
+                object_id: ObjectId::new(201)?,
+                text: "rust database".to_owned(),
+                doc_values: [
+                    ("flag".to_owned(), ProductDocValue::Boolean(true)),
+                    ("rank".to_owned(), ProductDocValue::Integer(3)),
+                    ("name".to_owned(), ProductDocValue::String("a".to_owned())),
+                    ("blob".to_owned(), ProductDocValue::Bytes(vec![7])),
+                ]
+                .into_iter()
+                .collect(),
+                vectors: std::collections::BTreeMap::new(),
+            }],
+        },
+    });
+    let encoded = encode_product_request_for_minor(&ingest, 0)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 0)?.operation,
+        ProductOperation::SearchIngest { .. }
     ));
     Ok(())
 }

@@ -230,6 +230,33 @@ export function encodeAuthenticatedHello(
   return authenticated;
 }
 
+/** Boolean, integer, string, and bytes doc values are minor-0 content;
+ * future typed values raise the requirement here. */
+function docValueRequiredMinor(_value: unknown): number {
+  return 0;
+}
+
+function filterRequiredMinor(value: unknown, depth = 0): number {
+  if (depth > 32 || typeof value !== "object" || value === null) return 0;
+  const filter = value as Readonly<Record<string, unknown>>;
+  // Every current filter kind and operator is minor-0 content; future
+  // operators and typed literals raise the requirement here.
+  if (filter.kind === "compare") return docValueRequiredMinor(filter.value);
+  if (filter.kind === "all" || filter.kind === "any") {
+    const children = Array.isArray(filter.filters) ? filter.filters : [];
+    return children.reduce((highest: number, child) => Math.max(highest, filterRequiredMinor(child, depth + 1)), 0);
+  }
+  if (filter.kind === "not") return filterRequiredMinor(filter.filter, depth + 1);
+  return 0;
+}
+
+function documentRequiredMinor(value: unknown): number {
+  if (typeof value !== "object" || value === null) return 0;
+  const docValues = (value as Readonly<Record<string, unknown>>).doc_values;
+  if (typeof docValues !== "object" || docValues === null) return 0;
+  return Object.values(docValues).reduce((highest: number, entry) => Math.max(highest, docValueRequiredMinor(entry)), 0);
+}
+
 export function operationRequiredMinor(operation: string, args: Readonly<Record<string, unknown>> = {}): number {
   if (operation === "proof_generate") {
     const nested = args.operation;
@@ -238,6 +265,12 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "search_collection") return filterRequiredMinor(args.filter);
+  if (operation === "search_ingest") {
+    const documents = Array.isArray(args.documents) ? args.documents : [];
+    return documents.reduce((highest: number, document) => Math.max(highest, documentRequiredMinor(document)), 0);
+  }
+  if (operation === "search_document_update") return documentRequiredMinor(args.document);
   return 0;
 }
 

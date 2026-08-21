@@ -3,6 +3,10 @@
 import { ClientError, ProductError, productError, type RequestOptions, type Response, type Transport } from "./models.js";
 import { decodeProductError, decodeProductResponse, encodeProductRequest, operationRequiredMinor } from "./protocol.js";
 
+/** Every protocol minor this build speaks, ascending. The request offers the
+ * whole set and the server echoes its selection, which must be a member. */
+const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3];
+
 export const PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1";
 export const ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1";
 
@@ -91,7 +95,7 @@ export class HttpTransport implements Transport {
     const headers = new Headers({
       accept: `${PRODUCT_MEDIA_TYPE}, ${ERROR_MEDIA_TYPE}`,
       "content-type": PRODUCT_MEDIA_TYPE,
-      "x-hyphae-protocol-minor": "3",
+      "x-hyphae-protocol-minor": SUPPORTED_PROTOCOL_MINORS.join(","),
       "x-hyphae-request-id": requestId.toString(),
     });
     if (options.deadlineMicros !== undefined) headers.set("x-hyphae-deadline-micros", options.deadlineMicros.toString());
@@ -111,7 +115,9 @@ export class HttpTransport implements Transport {
       }, () => {});
       response = await abortable(fetching, controller.signal);
       const minor = response.headers.get("x-hyphae-protocol-minor");
-      if (minor !== "3") throw new ClientError("HTTP v2 protocol minor is missing or unsupported");
+      if (minor === null || !/^[0-9]{1,3}$/u.test(minor) || !SUPPORTED_PROTOCOL_MINORS.includes(Number(minor))) {
+        throw new ClientError("HTTP v2 protocol minor is missing or unsupported");
+      }
       const responseRequestId = response.headers.get("x-hyphae-request-id");
       const responseSessionId = response.headers.get("x-hyphae-session-id");
       if (responseRequestId !== requestId.toString()) {
@@ -120,7 +126,7 @@ export class HttpTransport implements Transport {
       if (responseSessionId !== null && !/^(?!0{32}$)[0-9a-f]{32}$/u.test(responseSessionId)) {
         throw new ClientError("HTTP v2 response session ID is invalid");
       }
-      const negotiatedMinor = 3;
+      const negotiatedMinor = Number(minor);
       if (negotiatedMinor < operationRequiredMinor(operation, args)) {
         throw new ClientError("native operation is unavailable at the negotiated protocol minor");
       }

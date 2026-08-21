@@ -18,8 +18,12 @@ x-hyphae-provisional-streams: >-
   Every application/x-ndjson data record is provisional. Success exists only
   after a terminal completion record with status complete.
 x-hyphae-protocol-minor: >-
-  Clients offer X-Hyphae-Protocol-Minor: 3. The server rejects any other value
-  before authentication or dispatch and emits the same header on every response.
+  Clients offer their supported protocol minors in X-Hyphae-Protocol-Minor as
+  bounded canonical decimal tokens (at most eight, comma separation tolerated,
+  no duplicates, no leading zeros). The server selects the highest offered
+  minor it serves, rejects an offer without a served member before
+  authentication or dispatch, and emits the selected minor on every response.
+  This build serves exactly minor 3.
 x-hyphae-authentication-modes:
   unmanaged: >-
     Before bootstrap, new preserves the legacy adapter and an optional fixed
