@@ -93,11 +93,11 @@
     },
     {
       "reference": "docs/native/catalog-v1.md",
-      "sha256": "8ec9d515a8d893f6ecce5e7ddf3e5c9aeb7e9fb45b0a1a7254595a46fb8813e0"
+      "sha256": "4fde1fbd0991691ab9064e1ab08808a1152d73c850bd19dba1939eec32906e11"
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "441ae90091b070c12dfab5540cb06516d39e9d39d2a917117f456940f9736f64"
+      "sha256": "0fe3dfb3ef9a677aaab0922c2278fa7c4d4bff9777913f4fb20bcfcb3072e805"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",
