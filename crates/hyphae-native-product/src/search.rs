@@ -42,7 +42,10 @@ pub const MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS: usize = 256;
 /// Maximum logical input bytes accepted by one atomic integrated ingestion.
 pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
-pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 10_000;
+/// Raised from 10,000 on the R-track evidence chain (posting-index
+/// eligibility, pinned posting scorer, cached snapshot state, and the
+/// sealed `FiQA` relevance receipt); the next rung is evidence-gated.
+pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 100_000;
 /// Maximum named vector targets in one collection or request.
 pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
 /// Maximum retrieval candidates requested from one native branch.

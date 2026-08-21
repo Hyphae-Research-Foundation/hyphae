@@ -39,12 +39,18 @@ RECEIPT_SCHEMA = "hyphae-rag-relevance-receipt-v1"
 BEIR_BASE_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
 INGEST_BATCH_DOCUMENTS = 256
 CANDIDATE_LIMIT = 1000
-MAX_DATASET_DOCUMENTS = 10_000
+MAX_DATASET_DOCUMENTS = 100_000
 
 # Frozen dataset inventory: archives are immutable upstream artifacts and any
-# digest change fails closed. FiQA and other >10k-document corpora join this
-# table only when the collection-document cap is raised with evidence (R5).
+# digest change fails closed. Corpora above the collection-document cap join
+# this table only when the cap is raised with evidence (R5).
 DATASETS = {
+    "fiqa": {
+        "archive": "fiqa.zip",
+        "sha256": "32c7df99ed21252fdfb2cf3f5673502a8d245ee0c44c4a133570d92ce2b3ad02",
+        "documents": 57638,
+        "qrels": "qrels/test.tsv",
+    },
     "scifact": {
         "archive": "scifact.zip",
         "sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
@@ -128,12 +134,12 @@ def load_qrels(path: Path) -> dict[str, dict[str, int]]:
     return qrels
 
 
-def run_binary(binary: Path, arguments: list[str]) -> dict:
+def run_binary(binary: Path, arguments: list[str], timeout: int = 600) -> dict:
     completed = subprocess.run(
         [str(binary), *arguments],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=timeout,
         check=False,
     )
     if completed.returncode != 0:
@@ -178,7 +184,9 @@ def start_daemon(binary: Path, data_dir: Path) -> tuple[subprocess.Popen, Path]:
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 30
+    # Opening a directory with a large live index legitimately takes longer
+    # than the historical 30-second bound on modest hardware.
+    deadline = time.monotonic() + 600
     while not endpoint.exists():
         if process.poll() is not None:
             raise HarnessError(f"serve exited early: {process.stderr.read()[:400]}")
@@ -199,9 +207,7 @@ def stop_daemon(process: subprocess.Popen, endpoint: Path) -> None:
     endpoint.unlink(missing_ok=True)
 
 
-def ingest_corpus(
-    client: HyphaeClient, corpus: list[dict]
-) -> dict[int, str]:
+def prepare_documents(corpus: list[dict]) -> tuple[dict[int, str], list[dict]]:
     identifier_map: dict[int, str] = {}
     documents = []
     for ordinal, row in enumerate(
@@ -210,7 +216,11 @@ def ingest_corpus(
         identifier_map[ordinal] = str(row["_id"])
         text = f"{row.get('title', '')}\n{row.get('text', '')}".strip()
         documents.append({"object_id": ordinal, "text": text})
-    for offset in range(0, len(documents), INGEST_BATCH_DOCUMENTS):
+    return identifier_map, documents
+
+
+def ingest_batches(client: HyphaeClient, documents: list[dict], offsets: list[int]) -> None:
+    for offset in offsets:
         batch = documents[offset : offset + INGEST_BATCH_DOCUMENTS]
         client.search_ingest(
             13,
@@ -219,7 +229,6 @@ def ingest_corpus(
                 "documents": batch,
             },
         )
-    return identifier_map
 
 
 def execute_query(client: HyphaeClient, query: str, k: int) -> list[int]:
@@ -287,6 +296,7 @@ def evaluate(
     k: int,
     download: bool,
     query_limit: int | None,
+    maintenance_interval_batches: int,
 ) -> dict:
     extracted = acquire_dataset(dataset, data_root, download)
     corpus = load_jsonl(extracted / "corpus.jsonl")
@@ -319,19 +329,40 @@ def evaluate(
             client = HyphaeClient.local(str(endpoint))
             import time as _time
 
-            ingest_started = _time.monotonic()
-            identifier_map = ingest_corpus(client, corpus)
-            ingest_seconds = _time.monotonic() - ingest_started
-            ingested_bytes = directory_bytes(data_dir)
-            # Reclaim transient page and WAL generations before measuring the
-            # query phase: an unmaintained directory grows unboundedly and
-            # every query pays to materialize it.
-            client.close()
-            stop_daemon(process, endpoint)
-            maintenance_started = _time.monotonic()
-            run_binary(binary, ["checkpoint", "--data-dir", str(data_dir)])
-            run_binary(binary, ["vacuum", "--data-dir", str(data_dir)])
-            maintenance_seconds = _time.monotonic() - maintenance_started
+            identifier_map, documents = prepare_documents(corpus)
+            offsets = list(range(0, len(documents), INGEST_BATCH_DOCUMENTS))
+            if maintenance_interval_batches > 0:
+                windows = [
+                    offsets[start : start + maintenance_interval_batches]
+                    for start in range(0, len(offsets), maintenance_interval_batches)
+                ]
+            else:
+                windows = [offsets]
+            ingest_seconds = 0.0
+            maintenance_seconds = 0.0
+            ingested_bytes = 0
+            for ordinal, window in enumerate(windows, start=1):
+                ingest_started = _time.monotonic()
+                ingest_batches(client, documents, window)
+                ingest_seconds += _time.monotonic() - ingest_started
+                ingested_bytes = max(ingested_bytes, directory_bytes(data_dir))
+                # Reclaim transient page and WAL generations: an unmaintained
+                # directory grows unboundedly, every query pays to materialize
+                # it, and large corpora exhaust the disk before the ingest
+                # completes. The final cycle also isolates the query phase.
+                client.close()
+                stop_daemon(process, endpoint)
+                maintenance_started = _time.monotonic()
+                # Maintenance on a large transient directory legitimately
+                # exceeds the default operation timeout.
+                run_binary(
+                    binary, ["checkpoint", "--data-dir", str(data_dir)], timeout=7200
+                )
+                run_binary(binary, ["vacuum", "--data-dir", str(data_dir)], timeout=7200)
+                maintenance_seconds += _time.monotonic() - maintenance_started
+                if ordinal < len(windows):
+                    process, endpoint = start_daemon(binary, data_dir)
+                    client = HyphaeClient.local(str(endpoint))
             maintained_bytes = directory_bytes(data_dir)
             process, endpoint = start_daemon(binary, data_dir)
             client = HyphaeClient.local(str(endpoint))
@@ -369,6 +400,7 @@ def evaluate(
             "k": k,
             "candidate_limit": CANDIDATE_LIMIT,
             "ingest_batch_documents": INGEST_BATCH_DOCUMENTS,
+            "maintenance_interval_batches": maintenance_interval_batches,
             "branches": "lexical",
             "transport": "local-uds-daemon",
             "ingest_order": "sorted-corpus-id",
@@ -397,6 +429,13 @@ def main() -> int:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--query-limit", type=int, default=None)
+    parser.add_argument(
+        "--maintenance-interval-batches",
+        type=int,
+        default=0,
+        help="run a checkpoint+vacuum cycle after every N ingest batches"
+        " (0 keeps the single post-ingest cycle)",
+    )
     parser.add_argument("--output", type=Path, default=None)
     arguments = parser.parse_args()
     if not arguments.binary.is_file():
@@ -404,6 +443,9 @@ def main() -> int:
         return 1
     if arguments.k < 1 or arguments.k > 1024:
         print("error: k must be within 1..=1024", file=sys.stderr)
+        return 1
+    if arguments.maintenance_interval_batches < 0:
+        print("error: maintenance interval must be nonnegative", file=sys.stderr)
         return 1
     try:
         receipt = evaluate(
@@ -413,6 +455,7 @@ def main() -> int:
             arguments.k,
             arguments.download,
             arguments.query_limit,
+            arguments.maintenance_interval_batches,
         )
     except (HarnessError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         print(f"error: {error}", file=sys.stderr)
