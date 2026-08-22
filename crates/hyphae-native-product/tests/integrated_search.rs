@@ -1304,6 +1304,197 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
     Ok(())
 }
 
+/// A collection whose doc-value fields are the chunk provenance columns.
+fn configure_chunked(
+    path: &PathBuf,
+) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
+    let _ = fs::remove_dir_all(path);
+    let mut product = NativeProduct::create(path)?;
+    product.create_catalog_object_v2(
+        LogicalCatalogObject::V2(CatalogObjectV2::Database(header(
+            10,
+            EngineKind::Kernel,
+            "database",
+            None,
+        )?)),
+        ProductDurability::Strict,
+    )?;
+    product.create_catalog_object_v2(
+        LogicalCatalogObject::V2(CatalogObjectV2::Schema(header(
+            11,
+            EngineKind::Kernel,
+            "schema",
+            Some(10),
+        )?)),
+        ProductDurability::Strict,
+    )?;
+    product.create_catalog_object_v2(
+        LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
+            header: header(12, EngineKind::Search, "canonical", Some(11))?,
+            tokenizer: AnalyzerTokenizer::UnicodeWord,
+            filters: vec![AnalyzerFilter::Lowercase],
+        })),
+        ProductDurability::Strict,
+    )?;
+    let doc_value_field = |id: u32,
+                           field: &str,
+                           logical_type: LogicalType|
+     -> Result<SearchFieldDefinitionV2, Box<dyn std::error::Error>> {
+        Ok(SearchFieldDefinitionV2 {
+            id: FieldId::new(id)?,
+            name: name(field)?,
+            logical_type,
+            analyzer: None,
+            options: SearchFieldOptions {
+                stored: true,
+                doc_values: true,
+                source: FieldSourcePolicy::Retained,
+                lexical: LexicalIndexPolicy::None,
+            },
+        })
+    };
+    product.create_catalog_object_v2(
+        LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+            SearchCollectionDefinitionV2 {
+                bm25: None,
+                header: header(13, EngineKind::Search, "chunks", Some(11))?,
+                fields: vec![
+                    SearchFieldDefinitionV2 {
+                        id: FieldId::new(1)?,
+                        name: name("body")?,
+                        logical_type: LogicalType::Text,
+                        analyzer: Some(ObjectId::new(12)?),
+                        options: SearchFieldOptions {
+                            stored: true,
+                            doc_values: false,
+                            source: FieldSourcePolicy::Retained,
+                            lexical: LexicalIndexPolicy::Frequencies,
+                        },
+                    },
+                    doc_value_field(2, "parent", LogicalType::Binary)?,
+                    doc_value_field(3, "chunk_id", LogicalType::Binary)?,
+                    doc_value_field(4, "byte_start", LogicalType::Signed(IntegerWidth::Bits64))?,
+                    doc_value_field(5, "byte_end", LogicalType::Signed(IntegerWidth::Bits64))?,
+                    doc_value_field(
+                        6,
+                        "chunk_ordinal",
+                        LogicalType::Signed(IntegerWidth::Bits64),
+                    )?,
+                ],
+                vectors: Vec::new(),
+            },
+        )),
+        ProductDurability::Strict,
+    )?;
+    let collection = ObjectId::new(13)?;
+    product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
+    let binding = product.resolve_search_collection_binding(collection, 0)?;
+    Ok((product, binding))
+}
+
+#[test]
+fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let path = temporary("chunk-provenance");
+    let (mut product, binding) = configure_chunked(&path)?;
+    let source = "Hyphae proves its results. The chunker binds identity to bytes. \
+                  Retrieval stays deterministic across hosts. Every chunk carries \
+                  its parent and exact offsets. Proofs replay the same semantics.";
+    let config = hyphae_native_product::chunker::ChunkerConfig {
+        mode: hyphae_native_product::chunker::ChunkerMode::SentenceBounded {
+            target: 64,
+            maximum: 128,
+        },
+    };
+    let parent_id = 777_u128;
+    let documents = hyphae_native_product::chunker::chunk_documents(parent_id, source, config)
+        .map_err(|error| format!("chunking failed: {error:?}"))?;
+    assert!(documents.len() >= 3);
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: documents.clone(),
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+
+    let request = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "deterministic retrieval".into(),
+            candidate_limit: 8,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::Compare {
+            field: "parent".into(),
+            operator: ProductSearchOperator::Equal,
+            value: ProductDocValue::Bytes(parent_id.to_le_bytes().to_vec()),
+        },
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+    };
+    let result = product.search_collection(binding.collection, &request, 7)?;
+    assert!(!result.hits.is_empty());
+    let document_digest = hyphae_native_product::chunker::document_digest(source);
+    let config_digest = config.digest();
+    for hit in &result.hits {
+        let ProductDocValue::Integer(byte_start) = hit.doc_values["byte_start"] else {
+            return Err("byte_start doc value expected".into());
+        };
+        let ProductDocValue::Integer(byte_end) = hit.doc_values["byte_end"] else {
+            return Err("byte_end doc value expected".into());
+        };
+        let ProductDocValue::Bytes(chunk_id) = &hit.doc_values["chunk_id"] else {
+            return Err("chunk_id doc value expected".into());
+        };
+        let byte_start = usize::try_from(byte_start)?;
+        let byte_end = usize::try_from(byte_end)?;
+        // The retrieved chunk identity recomputes from the source digest,
+        // the configuration digest, and the exact byte range: provenance.
+        let expected = hyphae_native_product::chunker::chunk_identity(
+            &document_digest,
+            &config_digest,
+            byte_start,
+            byte_end,
+        );
+        assert_eq!(chunk_id.as_slice(), expected.as_slice());
+        let matched = documents
+            .iter()
+            .find(|document| document.object_id == hit.object_id)
+            .ok_or("hit outside the ingested chunks")?;
+        assert_eq!(
+            matched.text.as_bytes(),
+            &source.as_bytes()[byte_start..byte_end]
+        );
+    }
+
+    // The sealed proof binds the same provenance doc-values and verifies
+    // offline: every retrieved chunk is provably traceable to source bytes.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 61);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request,
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 fn bm25_probe_batch() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
     // "rust" appears twice in a long document and once in a short one: with
     // the default length normalization the short document ranks first, with
