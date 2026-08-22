@@ -1,6 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+Protocol minor 4 adds no request or response tags: it admits three new
+integrated-search filter nodes inside the existing `SearchCollection` body —
+node tag `6` (`in` bounded same-type membership, at most 256 members), node
+tag `7` (`is_null` missing-field membership), and node tag `8` (`like`
+anchored pattern over `_` and `%`, at most 256 pattern bytes). Operation
+minor requirements are content-inspecting: a client or server that
+negotiated minor 3 or lower rejects a request containing the new nodes
+before sending or before dispatch, and every filter expressible at minor 3
+keeps its exact historical bytes. Sealed search proofs whose request
+contains the new nodes carry semantics version 3; every other proof keeps
+version 2 and its exact historical bytes, and verifiers accept both.
+
 Protocol minor 3 adds request tag `54` (`CatalogVisibleList`) and response tag
 `42` (`CatalogVisiblePage`). Minor 0-2 retain the exact historical
 `CatalogList` tag `15` and `CatalogPage` tag `13` layout; minor 2 rejects the

@@ -148,7 +148,7 @@ class SecurityProtocolTests(unittest.TestCase):
 
         self.assertEqual(struct.unpack_from("<H", legacy, 18)[0], 0)
         self.assertEqual(legacy[:18], current[:18])
-        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 3)
+        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 4)
         self.assertEqual(authenticated[49], 1)
         self.assertEqual(struct.unpack_from("<H", authenticated, 50)[0], 102)
         self.assertEqual(struct.unpack_from("<Q", authenticated, 20)[0], 0xFF)
@@ -688,7 +688,7 @@ class ManagedHttpTests(unittest.TestCase):
                         RequestOptions(request_id=100 + offset, idempotency_token=100 + offset),
                     )
                 self.assertEqual(_HttpConnection.path, "/v2/security/keys")
-                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3")
+                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3,4")
 
 
 @unittest.skipIf(os.name == "nt", "AF_UNIX live parity runs on POSIX")

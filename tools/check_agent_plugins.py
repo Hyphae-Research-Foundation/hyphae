@@ -221,13 +221,19 @@ SEARCH_COLLECTION_INPUT_SCHEMA = {'type': 'object',
                                                                  'compare',
                                                                  'all',
                                                                  'any',
-                                                                 'not']}},
+                                                                 'not',
+                                                                 'in',
+                                                                 'is_null',
+                                                                 'like']}},
                            'description': 'Typed doc-value filter: match_all; exists '
                                           '{field}; compare {field, operator: '
                                           'equal|not_equal|less|less_or_equal|greater|greater_or_equal, '
                                           'value}; all/any {filters: [...]}; not '
-                                          '{filter}. Unknown keys for the declared '
-                                          'operation fail closed.'},
+                                          '{filter}; in {field, values: [...]}; '
+                                          'is_null {field}; like {field, pattern '
+                                          'with _ and % wildcards}. Unknown keys '
+                                          'for the declared operation fail '
+                                          'closed.'},
                 'sort': {'type': 'array',
                          'maxItems': 8,
                          'items': {'type': 'object',

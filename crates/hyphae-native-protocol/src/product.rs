@@ -1111,6 +1111,13 @@ fn filter_required_minor(filter: &ProductSearchFilter) -> u16 {
             .max()
             .unwrap_or(0),
         ProductSearchFilter::Not(child) => filter_required_minor(child),
+        ProductSearchFilter::In { values, .. } => values
+            .iter()
+            .map(doc_value_required_minor)
+            .max()
+            .unwrap_or(0)
+            .max(4),
+        ProductSearchFilter::IsNull(_) | ProductSearchFilter::Like { .. } => 4,
     }
 }
 
@@ -5119,6 +5126,23 @@ fn encode_search_filter(
             encoded.push(5);
             encode_search_filter(encoded, filter, depth + 1)?;
         }
+        ProductSearchFilter::In { field, values } => {
+            encoded.push(6);
+            put_text(encoded, field)?;
+            put_u32(encoded, values.len())?;
+            for value in values {
+                encode_doc_value(encoded, value)?;
+            }
+        }
+        ProductSearchFilter::IsNull(field) => {
+            encoded.push(7);
+            put_text(encoded, field)?;
+        }
+        ProductSearchFilter::Like { field, pattern } => {
+            encoded.push(8);
+            put_text(encoded, field)?;
+            put_text(encoded, pattern)?;
+        }
     }
     Ok(())
 }
@@ -5166,6 +5190,23 @@ fn decode_search_filter(
             }
         }
         5 => ProductSearchFilter::Not(Box::new(decode_search_filter(decoder, depth + 1)?)),
+        6 => {
+            let field = decoder.text()?;
+            let count = decoder.usize_u32()?;
+            if count > hyphae_native_runtime::MAX_DOC_VALUE_IN_MEMBERS {
+                return Err(ProductCodecError::LimitExceeded);
+            }
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_doc_value(decoder)?);
+            }
+            ProductSearchFilter::In { field, values }
+        }
+        7 => ProductSearchFilter::IsNull(decoder.text()?),
+        8 => ProductSearchFilter::Like {
+            field: decoder.text()?,
+            pattern: decoder.text()?,
+        },
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }

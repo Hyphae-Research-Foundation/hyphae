@@ -556,7 +556,7 @@ mod tests {
                 let mut request = vec![0; 8 * 1024];
                 let length = stream.read(&mut request).await.expect("read HTTP request");
                 let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
-                assert!(request.contains("x-hyphae-protocol-minor: 3\r\n"));
+                assert!(request.contains("x-hyphae-protocol-minor: 3,4\r\n"));
                 let minor = selected_minor.map_or_else(String::new, |minor| {
                     format!("X-Hyphae-Protocol-Minor: {minor}\r\n")
                 });

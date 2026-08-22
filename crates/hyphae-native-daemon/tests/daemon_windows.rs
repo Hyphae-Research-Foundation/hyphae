@@ -575,7 +575,7 @@ async fn security_operations_require_their_minor_on_named_pipes() -> Result<(), 
     )?;
 
     let current = Client::connect_authenticated(&test.endpoint, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 3);
+    assert_eq!(current.negotiated_minor, 4);
     current
         .send_request(1, 2, ProductOperation::SecurityStatus)
         .await?;

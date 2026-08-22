@@ -607,6 +607,50 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[test]
+fn membership_null_and_pattern_operators_require_minor_four()
+-> Result<(), Box<dyn std::error::Error>> {
+    for filter in [
+        ProductSearchFilter::In {
+            field: "category".to_owned(),
+            values: vec![
+                ProductDocValue::String("book".to_owned()),
+                ProductDocValue::String("gear".to_owned()),
+            ],
+        },
+        ProductSearchFilter::IsNull("category".to_owned()),
+        ProductSearchFilter::Like {
+            field: "category".to_owned(),
+            pattern: "bo%".to_owned(),
+        },
+    ] {
+        let request = security_wire_request(ProductOperation::SearchCollection {
+            collection: ObjectId::new(13)?,
+            request: ProductSearchRequest {
+                lexical: None,
+                vectors: Vec::new(),
+                filter,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+            },
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&request, 3),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&request, 4)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 3),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 4)?;
+        assert_eq!(encode_product_request(&decoded)?, encoded);
+    }
+    Ok(())
+}
+
 fn security_wire_request(operation: ProductOperation) -> WireRequest {
     WireRequest {
         operation,
@@ -953,7 +997,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 }
 
 #[test]
-fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
+fn protocol_minor_negotiation_preserves_1_0_through_1_3_and_selects_1_4()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1001,6 +1045,21 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
         .minor,
         1
     );
+    let minor_three = Hello {
+        maximum_minor: 3,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_three,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        3
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -1010,12 +1069,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
             1
         )?
         .minor,
-        3
+        4
     );
 
     let incompatible = Hello {
-        minimum_minor: 4,
-        maximum_minor: 4,
+        minimum_minor: 5,
+        maximum_minor: 5,
         ..Hello::default()
     };
     assert_eq!(

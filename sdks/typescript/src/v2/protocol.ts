@@ -185,7 +185,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 3) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 4) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +212,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 3,
+  maximumMinor = 4,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -239,6 +239,7 @@ function docValueRequiredMinor(_value: unknown): number {
 function filterRequiredMinor(value: unknown, depth = 0): number {
   if (depth > 32 || typeof value !== "object" || value === null) return 0;
   const filter = value as Readonly<Record<string, unknown>>;
+  if (filter.kind === "in" || filter.kind === "is_null" || filter.kind === "like") return 4;
   // Every current filter kind and operator is minor-0 content; future
   // operators and typed literals raise the requirement here.
   if (filter.kind === "compare") return docValueRequiredMinor(filter.value);
@@ -286,7 +287,7 @@ export function decodeWelcome(encoded: Uint8Array): Readonly<Record<string, numb
     throw new ClientError("native welcome is malformed");
   }
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 3 || view.getBigUint64(24, true) === 0n) {
+  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 4 || view.getBigUint64(24, true) === 0n) {
     throw new ClientError("native welcome values are invalid");
   }
   return {
@@ -1574,6 +1575,17 @@ function encodeSearchFilter(filter: Readonly<Record<string, unknown>>, depth = 0
     return join(Uint8Array.of(filter.kind === "all" ? 3 : 4), u32(filters.length), ...filters.map((value) => encodeSearchFilter(value as Readonly<Record<string, unknown>>, depth + 1)));
   }
   if (filter.kind === "not") return join(Uint8Array.of(5), encodeSearchFilter(filter.filter as Readonly<Record<string, unknown>>, depth + 1));
+  if (filter.kind === "in") {
+    const members = filter.values;
+    if (!Array.isArray(members) || members.length < 1 || members.length > 256) {
+      throw new ClientError("integrated membership set is invalid");
+    }
+    return join(Uint8Array.of(6), bytes(new TextEncoder().encode(String(filter.field))), u32(members.length), ...members.map((value) => encodeDocValue(value)));
+  }
+  if (filter.kind === "is_null") return join(Uint8Array.of(7), bytes(new TextEncoder().encode(String(filter.field))));
+  if (filter.kind === "like") {
+    return join(Uint8Array.of(8), bytes(new TextEncoder().encode(String(filter.field))), bytes(new TextEncoder().encode(String(filter.pattern))));
+  }
   throw new ClientError("integrated filter kind is invalid");
 }
 

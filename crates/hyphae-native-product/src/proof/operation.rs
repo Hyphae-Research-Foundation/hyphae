@@ -42,6 +42,9 @@ const REQUEST_MAGIC: &[u8; 8] = b"HYOPRQ02";
 const RESULT_MAGIC: &[u8; 8] = b"HYOPRS02";
 const EVIDENCE_MAGIC: &[u8; 8] = b"HYOPEV02";
 const SEMANTICS_VERSION: u16 = 2;
+/// Semantics version required by operations whose filter shapes were
+/// introduced after version 2 (membership, null, and pattern operators).
+const SEMANTICS_VERSION_OPERATORS: u16 = 3;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -235,7 +238,7 @@ fn generate_native_operation_proof_from_response(
     let proof_content = NativeProofContent {
         kind: captured.kind,
         anchor,
-        semantics_version: SEMANTICS_VERSION,
+        semantics_version: required_semantics_version(&captured.operation),
         ordering_version: ORDERING_VERSION,
         objects,
         request,
@@ -779,10 +782,39 @@ fn response_items(response: &ProductResponse) -> Result<u64, NativeProofError> {
     u64::try_from(value).map_err(|_| NativeProofError::LengthOverflow)
 }
 
+/// Whether one filter tree contains a shape introduced after semantics
+/// version 2. The version is a pure function of content so re-encoding a
+/// sealed request always reproduces its exact bytes.
+fn filter_requires_operator_semantics(filter: &DocValueFilter) -> bool {
+    match filter {
+        DocValueFilter::MatchAll | DocValueFilter::Exists(_) | DocValueFilter::Compare { .. } => {
+            false
+        }
+        DocValueFilter::All(children) | DocValueFilter::Any(children) => {
+            children.iter().any(filter_requires_operator_semantics)
+        }
+        DocValueFilter::Not(child) => filter_requires_operator_semantics(child),
+        DocValueFilter::In { .. } | DocValueFilter::IsNull(_) | DocValueFilter::Like { .. } => true,
+    }
+}
+
+/// Lowest semantics version whose contract admits this operation.
+fn required_semantics_version(operation: &SemanticOperation) -> u16 {
+    let filter = match operation {
+        SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
+        _ => None,
+    };
+    if filter.is_some_and(filter_requires_operator_semantics) {
+        SEMANTICS_VERSION_OPERATORS
+    } else {
+        SEMANTICS_VERSION
+    }
+}
+
 fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, NativeProofError> {
     let mut encoded = Encoder::default();
     encoded.extend(REQUEST_MAGIC);
-    encoded.u16(SEMANTICS_VERSION);
+    encoded.u16(required_semantics_version(operation));
     encoded.u16(ORDERING_VERSION);
     match operation {
         SemanticOperation::PointCatalog { id } => {
@@ -840,7 +872,10 @@ fn decode_semantic_operation(
 ) -> Result<SemanticOperation, NativeProofError> {
     let mut decoder = Decoder::new(encoded);
     if decoder.take(8)? != REQUEST_MAGIC
-        || decoder.u16()? != SEMANTICS_VERSION
+        || !matches!(
+            decoder.u16()?,
+            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS
+        )
         || decoder.u16()? != ORDERING_VERSION
     {
         return Err(NativeProofError::Invalid(
@@ -1789,6 +1824,23 @@ fn encode_filter(
             encoded.byte(6);
             encode_filter(encoded, child, depth + 1)?;
         }
+        DocValueFilter::In { field, values } => {
+            encoded.byte(7);
+            put_text(encoded, field)?;
+            put_count(encoded, values.len())?;
+            for value in values {
+                encode_doc_value(encoded, value)?;
+            }
+        }
+        DocValueFilter::IsNull(field) => {
+            encoded.byte(8);
+            put_text(encoded, field)?;
+        }
+        DocValueFilter::Like { field, pattern } => {
+            encoded.byte(9);
+            put_text(encoded, field)?;
+            put_text(encoded, pattern)?;
+        }
     }
     Ok(())
 }
@@ -1834,6 +1886,24 @@ fn decode_filter(
             }
         }
         6 => DocValueFilter::Not(Box::new(decode_filter(decoder, depth + 1, limits)?)),
+        7 => {
+            let field = text(decoder, limits.max_reexecution_bytes)?;
+            let count = bounded_count(
+                decoder,
+                limits.max_reexecution_candidate_items,
+                "membership members",
+            )?;
+            let mut values = Vec::new();
+            for _ in 0..count {
+                values.push(decode_doc_value(decoder, limits)?);
+            }
+            DocValueFilter::In { field, values }
+        }
+        8 => DocValueFilter::IsNull(text(decoder, limits.max_reexecution_bytes)?),
+        9 => DocValueFilter::Like {
+            field: text(decoder, limits.max_reexecution_bytes)?,
+            pattern: text(decoder, limits.max_reexecution_bytes)?,
+        },
         _ => return Err(NativeProofError::Invalid("invalid doc-value filter tag")),
     })
 }
