@@ -540,8 +540,8 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
         as owner_http,
     ):
         stale_principal_cursor = assert_security_reads(auditor_local, auditor_http)
-        if auditor_transport.negotiated_minor != 3:
-            raise AssertionError("managed Auditor local transport did not negotiate minor 3")
+        if auditor_transport.negotiated_minor != 4:
+            raise AssertionError("managed Auditor local transport did not negotiate minor 4")
         lifecycle_principal_id = assert_security_mutations(
             owner_local,
             owner_http,
@@ -555,8 +555,8 @@ def run_live_conformance(arguments: argparse.Namespace) -> dict[str, object]:
             owner_http,
             lifecycle_principal_id,
         )
-        if owner_transport.negotiated_minor != 3:
-            raise AssertionError("managed Owner local transport did not negotiate minor 3")
+        if owner_transport.negotiated_minor != 4:
+            raise AssertionError("managed Owner local transport did not negotiate minor 4")
     return {
         "schema": "hyphae-python-managed-v2-transcript-v1",
         "status": "passed",
