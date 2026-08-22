@@ -788,6 +788,25 @@ fn reference_eligible(
                 children.iter().any(|child| matches(values, child))
             }
             ProductSearchFilter::Not(child) => !matches(values, child),
+            ProductSearchFilter::In {
+                field,
+                values: members,
+            } => values.get(field).is_some_and(|actual| {
+                members.iter().any(|member| {
+                    std::mem::discriminant(actual) == std::mem::discriminant(member)
+                        && actual == member
+                })
+            }),
+            ProductSearchFilter::IsNull(field) => !values.contains_key(field),
+            ProductSearchFilter::Like { field, pattern } => {
+                values.get(field).is_some_and(|actual| {
+                    if let ProductDocValue::String(text) = actual {
+                        hyphae_native_runtime::like_matches(pattern, text)
+                    } else {
+                        false
+                    }
+                })
+            }
         }
     }
     documents
@@ -908,6 +927,30 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                         },
                     ]),
                 ]),
+                ProductSearchFilter::In {
+                    field: "category".into(),
+                    values: vec![
+                        ProductDocValue::String("book".into()),
+                        ProductDocValue::String(category.into()),
+                    ],
+                },
+                ProductSearchFilter::In {
+                    field: "price".into(),
+                    values: vec![probe_value.clone(), ProductDocValue::Integer(0)],
+                },
+                ProductSearchFilter::IsNull("category".into()),
+                ProductSearchFilter::Not(Box::new(ProductSearchFilter::In {
+                    field: "category".into(),
+                    values: vec![ProductDocValue::String("misc".into())],
+                })),
+                ProductSearchFilter::Like {
+                    field: "category".into(),
+                    pattern: "g%".into(),
+                },
+                ProductSearchFilter::Like {
+                    field: "category".into(),
+                    pattern: "_oo_".into(),
+                },
             ];
             for filter in filters {
                 let request = ProductSearchRequest {
@@ -998,6 +1041,83 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
     let observed: std::collections::BTreeSet<u128> =
         result.hits.iter().map(|hit| hit.object_id.get()).collect();
     assert_eq!(observed, std::collections::BTreeSet::from([201, 204, 205]));
+    Ok(())
+}
+
+#[test]
+fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("operator-proof");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 41);
+    let operation = ProductOperation::SearchCollection {
+        collection: binding.collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".into(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::In {
+                field: "category".into(),
+                values: vec![
+                    ProductDocValue::String("book".into()),
+                    ProductDocValue::String("gear".into()),
+                ],
+            },
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+        },
+    };
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &operation,
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+
+    // A default-shaped proof keeps semantics version 2 and its exact bytes.
+    let plain = ProductOperation::SearchCollection {
+        collection: binding.collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".into(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+        },
+    };
+    let context = proof_context(&session, 42);
+    let (_, plain) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &plain,
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(plain.proof.content().semantics_version, 2);
+    drop(product);
+    fs::remove_dir_all(path)?;
     Ok(())
 }
 

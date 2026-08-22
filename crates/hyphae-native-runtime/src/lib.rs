@@ -219,9 +219,10 @@ pub use search_doc_values::{
     DocValueSort, DocValueSortDirection, DocValueSortSource, FacetBucket, FacetRequest,
     FacetResult, MAX_DOC_VALUE_AGGREGATIONS, MAX_DOC_VALUE_BYTES, MAX_DOC_VALUE_CANDIDATES,
     MAX_DOC_VALUE_FACET_TERMS, MAX_DOC_VALUE_FACETS, MAX_DOC_VALUE_FILTER_DEPTH,
-    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
+    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_IN_MEMBERS,
+    MAX_DOC_VALUE_LIKE_PATTERN_BYTES, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
     MAX_DOC_VALUES_PER_CANDIDATE, MissingPlacement, NamedDocValueAggregation,
-    NamedDocValueAggregationValue, execute_doc_values,
+    NamedDocValueAggregationValue, execute_doc_values, like_matches,
 };
 pub use set_algebra::{
     MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,

@@ -95,6 +95,61 @@ pub enum DocValueFilter {
     Any(Vec<Self>),
     /// Two-valued negation.
     Not(Box<Self>),
+    /// Matches when the field equals any member of a bounded same-type set.
+    /// An empty set does not match. Members must share one scalar type.
+    In {
+        /// Exact field name.
+        field: String,
+        /// Bounded literal members, compared with exact equality.
+        values: Vec<DocValue>,
+    },
+    /// Matches candidates missing the exact field entirely.
+    IsNull(String),
+    /// Matches when a string field contains the literal pattern with `_`
+    /// matching exactly one character and `%` matching any run, anchored at
+    /// both ends. Patterns are bounded and contain no escape syntax.
+    Like {
+        /// Exact field name.
+        field: String,
+        /// Bounded literal pattern over `_`, `%`, and plain characters.
+        pattern: String,
+    },
+}
+
+/// Maximum members admitted by one [`DocValueFilter::In`] set.
+pub const MAX_DOC_VALUE_IN_MEMBERS: usize = 256;
+/// Maximum UTF-8 bytes admitted by one [`DocValueFilter::Like`] pattern.
+pub const MAX_DOC_VALUE_LIKE_PATTERN_BYTES: usize = 256;
+
+/// Deterministic anchored `LIKE` match over characters: `_` matches exactly
+/// one character, `%` matches any run (including empty), everything else
+/// matches itself. Iterative two-pointer algorithm — no recursion, linear
+/// backtracking bounded by the input lengths.
+#[must_use]
+pub fn like_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0_usize, 0_usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '_' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '%' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p + 1;
+            t = star_t + 1;
+            star = Some((star_p, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '%' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Sort direction for scores or doc values.
@@ -534,9 +589,12 @@ fn validate_name(name: &str, maximum: usize) -> Result<(), DocValueError> {
 
 fn filter_shape(filter: &DocValueFilter) -> (usize, usize) {
     match filter {
-        DocValueFilter::MatchAll | DocValueFilter::Exists(_) | DocValueFilter::Compare { .. } => {
-            (1, 1)
-        }
+        DocValueFilter::MatchAll
+        | DocValueFilter::Exists(_)
+        | DocValueFilter::Compare { .. }
+        | DocValueFilter::In { .. }
+        | DocValueFilter::IsNull(_)
+        | DocValueFilter::Like { .. } => (1, 1),
         DocValueFilter::Not(child) => {
             let (nodes, depth) = filter_shape(child);
             (nodes.saturating_add(1), depth.saturating_add(1))
@@ -557,7 +615,9 @@ fn filter_shape(filter: &DocValueFilter) -> (usize, usize) {
 fn validate_filter_names(filter: &DocValueFilter, maximum: usize) -> Result<(), DocValueError> {
     match filter {
         DocValueFilter::MatchAll => Ok(()),
-        DocValueFilter::Exists(field) => validate_name(field, maximum),
+        DocValueFilter::Exists(field) | DocValueFilter::IsNull(field) => {
+            validate_name(field, maximum)
+        }
         DocValueFilter::Compare { field, value, .. } => {
             validate_name(field, maximum)?;
             match value {
@@ -577,6 +637,39 @@ fn validate_filter_names(filter: &DocValueFilter, maximum: usize) -> Result<(), 
             Ok(())
         }
         DocValueFilter::Not(child) => validate_filter_names(child, maximum),
+        DocValueFilter::In { field, values } => {
+            validate_name(field, maximum)?;
+            if values.is_empty() || values.len() > MAX_DOC_VALUE_IN_MEMBERS {
+                return Err(DocValueError::ValueTooLarge {
+                    maximum: MAX_DOC_VALUE_IN_MEMBERS,
+                });
+            }
+            let first = std::mem::discriminant(&values[0]);
+            for value in values {
+                if std::mem::discriminant(value) != first {
+                    return Err(DocValueError::ValueTooLarge { maximum });
+                }
+                match value {
+                    DocValue::String(value) if value.len() > maximum => {
+                        return Err(DocValueError::ValueTooLarge { maximum });
+                    }
+                    DocValue::Bytes(value) if value.len() > maximum => {
+                        return Err(DocValueError::ValueTooLarge { maximum });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        DocValueFilter::Like { field, pattern } => {
+            validate_name(field, maximum)?;
+            if pattern.is_empty() || pattern.len() > MAX_DOC_VALUE_LIKE_PATTERN_BYTES {
+                return Err(DocValueError::ValueTooLarge {
+                    maximum: MAX_DOC_VALUE_LIKE_PATTERN_BYTES,
+                });
+            }
+            Ok(())
+        }
     }
 }
 
@@ -608,6 +701,24 @@ fn filter_matches(filter: &DocValueFilter, candidate: &DocValueCandidate) -> boo
             .iter()
             .any(|child| filter_matches(child, candidate)),
         DocValueFilter::Not(child) => !filter_matches(child, candidate),
+        DocValueFilter::In { field, values } => {
+            candidate.values.get(field).is_some_and(|candidate_value| {
+                values.iter().any(|value| {
+                    std::mem::discriminant(candidate_value) == std::mem::discriminant(value)
+                        && candidate_value == value
+                })
+            })
+        }
+        DocValueFilter::IsNull(field) => !candidate.values.contains_key(field),
+        DocValueFilter::Like { field, pattern } => {
+            candidate.values.get(field).is_some_and(|candidate_value| {
+                if let DocValue::String(text) = candidate_value {
+                    like_matches(pattern, text)
+                } else {
+                    false
+                }
+            })
+        }
     }
 }
 

@@ -14,7 +14,7 @@ from .models import ClientError, ProductErrorFields, RequestOptions, Response, S
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 3
+PROTOCOL_MINOR = 4
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -379,6 +379,8 @@ def _filter_required_minor(value: Any, depth: int = 0) -> int:
     if depth > 32 or not isinstance(value, dict):
         return 0
     kind = value.get("kind")
+    if kind in {"in", "is_null", "like"}:
+        return 4
     if kind == "compare":
         # Every current operator is minor-0 content; future operators and
         # typed literals raise the requirement here.
@@ -2289,6 +2291,20 @@ def _encode_search_filter(value: Any, depth: int = 0) -> bytes:
         )
     if kind == "not":
         return b"\x05" + _encode_search_filter(value["filter"], depth + 1)
+    if kind == "in":
+        members = value.get("values", [])
+        if not isinstance(members, list) or not 1 <= len(members) <= 256:
+            raise ClientError("integrated membership set is invalid")
+        return (
+            b"\x06"
+            + _text(value["field"])
+            + struct.pack("<I", len(members))
+            + b"".join(_encode_doc_value(member) for member in members)
+        )
+    if kind == "is_null":
+        return b"\x07" + _text(value["field"])
+    if kind == "like":
+        return b"\x08" + _text(value["field"]) + _text(value["pattern"])
     raise ClientError("integrated filter kind is invalid")
 
 

@@ -1815,7 +1815,11 @@ fn document_posting_keys(
 fn filter_fields(filter: &ProductSearchFilter, fields: &mut BTreeSet<String>) {
     match filter {
         ProductSearchFilter::MatchAll => {}
-        ProductSearchFilter::Exists(field) | ProductSearchFilter::Compare { field, .. } => {
+        ProductSearchFilter::Exists(field)
+        | ProductSearchFilter::Compare { field, .. }
+        | ProductSearchFilter::In { field, .. }
+        | ProductSearchFilter::IsNull(field)
+        | ProductSearchFilter::Like { field, .. } => {
             fields.insert(field.clone());
         }
         ProductSearchFilter::All(children) | ProductSearchFilter::Any(children) => {
@@ -1912,6 +1916,31 @@ fn posting_filter_ids(
             let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
             Some(manifest.difference(&ids).copied().collect())
         }
+        // A bounded membership set is the union of its members' point scans.
+        ProductSearchFilter::In { field, values } => {
+            let field_start = posting_field_prefix(collection, field);
+            let mut result = BTreeSet::new();
+            for value in values {
+                let (tag, component) = posting_component(value).ok()?;
+                let mut value_start = field_start.clone();
+                value_start.push(tag);
+                value_start.extend_from_slice(&component);
+                let value_end = prefix_successor(&value_start)?;
+                result.extend(posting_scan(snapshot, &value_start, &value_end)?);
+            }
+            Some(result)
+        }
+        // Missing-field membership is the manifest minus every posting for
+        // the field, mirroring the reference's negated Exists exactly.
+        ProductSearchFilter::IsNull(field) => {
+            let start = posting_field_prefix(collection, field);
+            let end = prefix_successor(&start)?;
+            let present = posting_scan(snapshot, &start, &end)?;
+            Some(manifest.difference(&present).copied().collect())
+        }
+        // Substring shapes cannot be answered from ordered postings; the
+        // caller falls back fail-open to the exact scan.
+        ProductSearchFilter::Like { .. } => None,
     }
 }
 

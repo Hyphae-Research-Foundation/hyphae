@@ -5531,6 +5531,21 @@ fn product_search_filter(value: Value) -> Result<ProductSearchFilter, CliFailure
         "not" => ProductSearchFilter::Not(Box::new(product_search_filter(
             object.remove("filter").ok_or_else(CliFailure::invalid)?,
         )?)),
+        "in" => ProductSearchFilter::In {
+            field: take_string(&mut object, "field")?,
+            values: object
+                .remove("values")
+                .and_then(|value| value.as_array().cloned())
+                .ok_or_else(CliFailure::invalid)?
+                .into_iter()
+                .map(product_doc_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        "is_null" => ProductSearchFilter::IsNull(take_string(&mut object, "field")?),
+        "like" => ProductSearchFilter::Like {
+            field: take_string(&mut object, "field")?,
+            pattern: take_string(&mut object, "pattern")?,
+        },
         _ => return Err(CliFailure::invalid()),
     };
     if object.is_empty() {

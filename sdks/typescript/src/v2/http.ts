@@ -5,7 +5,7 @@ import { decodeProductError, decodeProductResponse, encodeProductRequest, operat
 
 /** Every protocol minor this build speaks, ascending. The request offers the
  * whole set and the server echoes its selection, which must be a member. */
-const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3];
+const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3, 4];
 
 export const PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1";
 export const ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1";
@@ -27,7 +27,7 @@ export class HttpTransport implements Transport {
   readonly #maximumPending: number;
   #pending = 0;
   #closed = false;
-  #negotiatedMinor = 3;
+  #negotiatedMinor = 4;
 
   constructor(baseUrl: string, options: HttpTransportOptions = {}) {
     let origin: URL;
