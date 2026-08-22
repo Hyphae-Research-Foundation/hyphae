@@ -825,6 +825,20 @@ impl EmbeddedAdmin<'_> {
         result
     }
 
+    /// Returns one vector index's durable maintenance status, so callers can
+    /// consolidate only indexes holding deltas and stay inside the index's
+    /// own `delta_max_entries` bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable request, storage, or corruption error.
+    pub fn ann_maintenance_status(
+        &mut self,
+        index: ObjectId,
+    ) -> Result<hyphae_native_runtime::AnnMaintenanceStatus, ProductError> {
+        self.timed(|database| database.ann_maintenance_status(index))
+    }
+
     /// Captures, builds, and atomically publishes one bounded ANN consolidation.
     ///
     /// # Errors

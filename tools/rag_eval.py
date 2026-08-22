@@ -149,7 +149,7 @@ def run_binary(binary: Path, arguments: list[str], timeout: int = 600) -> dict:
     return json.loads(completed.stdout)
 
 
-def provision(binary: Path, data_dir: Path) -> None:
+def provision(binary: Path, data_dir: Path, dimension: int) -> None:
     run_binary(binary, ["init", "--data-dir", str(data_dir)])
     run_binary(
         binary,
@@ -168,6 +168,8 @@ def provision(binary: Path, data_dir: Path) -> None:
             "12",
             "--name",
             "main.public.rag_eval",
+            "--dimension",
+            str(dimension),
         ],
     )
     run_binary(
@@ -207,6 +209,28 @@ def stop_daemon(process: subprocess.Popen, endpoint: Path) -> None:
     endpoint.unlink(missing_ok=True)
 
 
+def embed_texts(
+    embed_binary: Path, model_dir: Path, texts: list[str]
+) -> tuple[list[list[float]], str]:
+    """Embeds texts through the attested local tool, returning vectors and
+    the attestation envelope hex."""
+    completed = subprocess.run(
+        [str(embed_binary), "embed", "--model-dir", str(model_dir)],
+        input=json.dumps(texts),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HarnessError(f"embedding failed: {completed.stderr.strip()[:300]}")
+    decoded = json.loads(completed.stdout)
+    vectors = decoded.get("vectors")
+    if not isinstance(vectors, list) or len(vectors) != len(texts):
+        raise HarnessError("embedding output shape differs")
+    return vectors, str(decoded.get("attestation_hex", ""))
+
+
 def prepare_documents(corpus: list[dict]) -> tuple[dict[int, str], list[dict]]:
     identifier_map: dict[int, str] = {}
     documents = []
@@ -219,27 +243,44 @@ def prepare_documents(corpus: list[dict]) -> tuple[dict[int, str], list[dict]]:
     return identifier_map, documents
 
 
-def ingest_batches(client: HyphaeClient, documents: list[dict], offsets: list[int]) -> None:
+def ingest_batches(
+    client: HyphaeClient, documents: list[dict], offsets: list[int], batch_size: int
+) -> None:
     for offset in offsets:
-        batch = documents[offset : offset + INGEST_BATCH_DOCUMENTS]
+        batch = documents[offset : offset + batch_size]
         client.search_ingest(
             13,
             {
-                "idempotency_id": offset // INGEST_BATCH_DOCUMENTS + 1,
+                "idempotency_id": offset // batch_size + 1,
                 "documents": batch,
             },
         )
 
 
-def execute_query(client: HyphaeClient, query: str, k: int) -> list[int]:
-    response = client.search_collection(
-        13,
-        {
-            "lexical": {"query": query, "candidate_limit": CANDIDATE_LIMIT, "weight": 1},
-            "vectors": [],
-            "limit": k,
-        },
-    )
+def execute_query(
+    client: HyphaeClient,
+    query: str,
+    k: int,
+    query_vector: list[float] | None,
+    fusion: str | None,
+) -> list[int]:
+    request: dict = {
+        "lexical": {"query": query, "candidate_limit": CANDIDATE_LIMIT, "weight": 1},
+        "vectors": [],
+        "limit": k,
+    }
+    if query_vector is not None:
+        request["vectors"] = [
+            {
+                "target": "exact",
+                "query": query_vector,
+                "candidate_limit": CANDIDATE_LIMIT,
+                "weight": 1,
+            }
+        ]
+    if fusion is not None:
+        request["fusion"] = fusion
+    response = client.search_collection(13, request)
     return [int(hit["object_id"]) for hit in response.value.get("hits", [])]
 
 
@@ -297,6 +338,9 @@ def evaluate(
     download: bool,
     query_limit: int | None,
     maintenance_interval_batches: int,
+    embed_binary: Path | None,
+    model_dir: Path | None,
+    fusion: str | None,
 ) -> dict:
     extracted = acquire_dataset(dataset, data_root, download)
     corpus = load_jsonl(extracted / "corpus.jsonl")
@@ -323,14 +367,39 @@ def evaluate(
         prefix="hyphae-rag-eval-", dir=data_root
     ) as scratch:
         data_dir = Path(scratch) / "data"
-        provision(binary, data_dir)
+        embed_dimension = 2
+        corpus_vectors: list[list[float]] | None = None
+        corpus_attestations: list[str] = []
+        if embed_binary is not None and model_dir is not None:
+            ordered = sorted(corpus, key=lambda row: str(row["_id"]))
+            texts = [
+                f"{row.get('title', '')}\n{row.get('text', '')}".strip() for row in ordered
+            ]
+            corpus_vectors = []
+            for offset in range(0, len(texts), INGEST_BATCH_DOCUMENTS):
+                vectors, attestation = embed_texts(
+                    embed_binary, model_dir, texts[offset : offset + INGEST_BATCH_DOCUMENTS]
+                )
+                corpus_vectors.extend(vectors)
+                corpus_attestations.append(attestation)
+            embed_dimension = len(corpus_vectors[0]) if corpus_vectors else 2
+        provision(binary, data_dir, embed_dimension)
         process, endpoint = start_daemon(binary, data_dir)
         try:
             client = HyphaeClient.local(str(endpoint))
             import time as _time
 
             identifier_map, documents = prepare_documents(corpus)
-            offsets = list(range(0, len(documents), INGEST_BATCH_DOCUMENTS))
+            # Vector payloads shrink the batch so one request stays inside
+            # the bounded local-protocol frame.
+            batch_size = INGEST_BATCH_DOCUMENTS if corpus_vectors is None else 64
+            if corpus_vectors is not None and maintenance_interval_batches == 0:
+                # Vector deltas are capped; consolidate inside the cap.
+                maintenance_interval_batches = 12
+            if corpus_vectors is not None:
+                for document, vector in zip(documents, corpus_vectors):
+                    document["vectors"] = {"exact": vector}
+            offsets = list(range(0, len(documents), batch_size))
             if maintenance_interval_batches > 0:
                 windows = [
                     offsets[start : start + maintenance_interval_batches]
@@ -343,7 +412,7 @@ def evaluate(
             ingested_bytes = 0
             for ordinal, window in enumerate(windows, start=1):
                 ingest_started = _time.monotonic()
-                ingest_batches(client, documents, window)
+                ingest_batches(client, documents, window, batch_size)
                 ingest_seconds += _time.monotonic() - ingest_started
                 ingested_bytes = max(ingested_bytes, directory_bytes(data_dir))
                 # Reclaim transient page and WAL generations: an unmaintained
@@ -355,6 +424,14 @@ def evaluate(
                 maintenance_started = _time.monotonic()
                 # Maintenance on a large transient directory legitimately
                 # exceeds the default operation timeout.
+                if corpus_vectors is not None:
+                    # Drain accumulated vector deltas into a fresh generation
+                    # before they reach the bounded delta capacity.
+                    run_binary(
+                        binary,
+                        ["search", "--data-dir", str(data_dir), "consolidate", "--collection", "13"],
+                        timeout=7200,
+                    )
                 run_binary(
                     binary, ["checkpoint", "--data-dir", str(data_dir)], timeout=7200
                 )
@@ -373,7 +450,13 @@ def evaluate(
                 query_text = queries.get(query_id)
                 if query_text is None:
                     raise HarnessError(f"qrels query is missing: {query_id}")
-                ordinals = execute_query(client, query_text, k)
+                query_vector = None
+                if embed_binary is not None and model_dir is not None:
+                    vectors, attestation = embed_texts(
+                        embed_binary, model_dir, [query_text]
+                    )
+                    query_vector = vectors[0]
+                ordinals = execute_query(client, query_text, k, query_vector, fusion)
                 ranking = [identifier_map[ordinal] for ordinal in ordinals]
                 relevant = qrels[query_id]
                 ndcg_total += ndcg_at_k(ranking, relevant, k)
@@ -401,7 +484,9 @@ def evaluate(
             "candidate_limit": CANDIDATE_LIMIT,
             "ingest_batch_documents": INGEST_BATCH_DOCUMENTS,
             "maintenance_interval_batches": maintenance_interval_batches,
-            "branches": "lexical",
+            "branches": "lexical" if embed_binary is None else "lexical+exact-vector",
+            "fusion": fusion or "weighted-reciprocal-rank",
+            "embedding_attestations": len(corpus_attestations),
             "transport": "local-uds-daemon",
             "ingest_order": "sorted-corpus-id",
         },
@@ -429,6 +514,9 @@ def main() -> int:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--query-limit", type=int, default=None)
+    parser.add_argument("--embed-binary", type=Path, default=None)
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--fusion", choices=["weighted_score"], default=None)
     parser.add_argument(
         "--maintenance-interval-batches",
         type=int,
@@ -456,6 +544,9 @@ def main() -> int:
             arguments.download,
             arguments.query_limit,
             arguments.maintenance_interval_batches,
+            arguments.embed_binary,
+            arguments.model_dir,
+            arguments.fusion,
         )
     except (HarnessError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         print(f"error: {error}", file=sys.stderr)
