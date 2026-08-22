@@ -420,7 +420,7 @@ class PackageTests(unittest.TestCase):
         self.assertIn('test -z "${{ inputs.release_commit }}"', workflow)
         self.assertIn("anchore/sbom-action/download-syft@", workflow)
         self.assertIn("syft-version: v1.46.0", workflow)
-        scan = workflow.index('scan dir:. -o "syft-json=${native_sbom}"')
+        scan = workflow.index('scan dir:. --exclude ./embed -o "syft-json=${native_sbom}"')
         conclude = workflow.index("packaging/conclude_release_sbom_licenses.py")
         spdx = workflow.index('convert "$native_sbom" -o "spdx-json=${spdx_sbom}"')
         cyclonedx = workflow.index(
