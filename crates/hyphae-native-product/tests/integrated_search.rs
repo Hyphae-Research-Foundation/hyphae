@@ -62,13 +62,21 @@ fn header(
 fn configure(
     path: &PathBuf,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
-    configure_with_bm25(path, None)
+    configure_full(path, None, vec![AnalyzerFilter::Lowercase])
 }
 
-#[allow(clippy::too_many_lines)]
 fn configure_with_bm25(
     path: &PathBuf,
     bm25: Option<Bm25Parameters>,
+) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
+    configure_full(path, bm25, vec![AnalyzerFilter::Lowercase])
+}
+
+#[allow(clippy::too_many_lines)]
+fn configure_full(
+    path: &PathBuf,
+    bm25: Option<Bm25Parameters>,
+    analyzer_filters: Vec<AnalyzerFilter>,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(path);
     let mut product = NativeProduct::create(path)?;
@@ -94,7 +102,7 @@ fn configure_with_bm25(
         LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
             header: header(12, EngineKind::Search, "canonical", Some(11))?,
             tokenizer: AnalyzerTokenizer::UnicodeWord,
-            filters: vec![AnalyzerFilter::Lowercase],
+            filters: analyzer_filters,
         })),
         ProductDurability::Strict,
     )?;
@@ -1214,6 +1222,84 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
     )?;
     assert!(report.semantic_reexecution_performed);
     drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("analyzer-pipeline");
+    let (mut product, binding) = configure_full(
+        &path,
+        None,
+        vec![
+            AnalyzerFilter::Lowercase,
+            AnalyzerFilter::AsciiFolding,
+            AnalyzerFilter::EnglishStopV1,
+            AnalyzerFilter::EnglishStemV1,
+        ],
+    )?;
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                301,
+                "The running dogs are chasing ponies",
+                "book",
+                10,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(302, "café management", "book", 20, [1.0, 0.0], [0.0, 1.0])?,
+            document(303, "quiet garden", "gear", 30, [2.0, 0.0], [1.0, 0.0])?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 11, ProductDurability::Strict)?;
+
+    let search = |product: &NativeProduct, query: &str| {
+        product
+            .search_collection(
+                binding.collection,
+                &ProductSearchRequest {
+                    lexical: Some(ProductLexicalBranch {
+                        query: query.into(),
+                        candidate_limit: 4,
+                        weight: 1,
+                    }),
+                    vectors: Vec::new(),
+                    filter: ProductSearchFilter::MatchAll,
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    aggregations: Vec::new(),
+                    limit: 4,
+                    fusion: None,
+                },
+                12,
+            )
+            .map(|result| {
+                result
+                    .hits
+                    .iter()
+                    .map(|hit| hit.object_id.get())
+                    .collect::<Vec<_>>()
+            })
+            .map_err(Box::new)
+    };
+    // Morphological variants match through the stemmer, diacritics match
+    // through the folder, and stop words carry no signal.
+    assert_eq!(search(&product, "run dog")?, vec![301]);
+    assert_eq!(search(&product, "chased pony")?, vec![301]);
+    assert_eq!(search(&product, "cafe managing")?, vec![302]);
+    assert_eq!(search(&product, "the are of")?, Vec::<u128>::new());
+    drop(product);
+
+    // The transformed terms are durable: recovery replays the raw mutation
+    // text through the canonical analyzer and lands on the same postings.
+    let reopened = NativeProduct::open(&path)?;
+    assert_eq!(search(&reopened, "chased pony")?, vec![301]);
+    assert_eq!(search(&reopened, "cafe managing")?, vec![302]);
+    drop(reopened);
     fs::remove_dir_all(path)?;
     Ok(())
 }

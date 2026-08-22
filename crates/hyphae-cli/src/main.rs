@@ -917,6 +917,15 @@ enum CatalogCommand {
         name: String,
         #[arg(long, default_value_t = 2)]
         dimension: u16,
+        /// Adds frozen Latin diacritic folding to the collection analyzer.
+        #[arg(long)]
+        analyzer_ascii_folding: bool,
+        /// Adds frozen English stop-word removal to the collection analyzer.
+        #[arg(long)]
+        analyzer_english_stop: bool,
+        /// Adds frozen English Porter stemming to the collection analyzer.
+        #[arg(long)]
+        analyzer_english_stem: bool,
         /// Tuned BM25 k1 in micros (defaults keep the canonical 1.2).
         #[arg(long, requires = "bm25_b_micros")]
         bm25_k1_micros: Option<u64>,
@@ -2870,6 +2879,9 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer,
             name,
             dimension,
+            analyzer_ascii_folding,
+            analyzer_english_stop,
+            analyzer_english_stem,
             bm25_k1_micros,
             bm25_b_micros,
             durability,
@@ -2898,7 +2910,19 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                         Some(schema),
                     )?,
                     tokenizer: AnalyzerTokenizer::UnicodeWord,
-                    filters: vec![AnalyzerFilter::Lowercase],
+                    filters: {
+                        let mut filters = vec![AnalyzerFilter::Lowercase];
+                        if analyzer_ascii_folding {
+                            filters.push(AnalyzerFilter::AsciiFolding);
+                        }
+                        if analyzer_english_stop {
+                            filters.push(AnalyzerFilter::EnglishStopV1);
+                        }
+                        if analyzer_english_stem {
+                            filters.push(AnalyzerFilter::EnglishStemV1);
+                        }
+                        filters
+                    },
                 }));
             objects.push(analyzer_object);
             let ann = AnnIndexDefinition::new(VectorMetric::SquaredL2, 8, 32, 16, 256, 7)

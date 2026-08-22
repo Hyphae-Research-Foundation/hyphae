@@ -505,6 +505,7 @@ impl NativeProduct {
     ///
     /// Returns without publication for any invalid document, exhausted bound,
     /// duplicate document, unknown target, or native commit failure.
+    #[allow(clippy::too_many_lines)]
     pub fn ingest_search_batch(
         &mut self,
         collection: crate::ObjectId,
@@ -550,10 +551,17 @@ impl NativeProduct {
             }
         }
 
+        let transform = collection_lexical_transform(&definition, |id| {
+            current.inner.logical_catalog_object(id).cloned()
+        })?;
         for document in &batch.documents {
             let object_bytes = document.object_id.get().to_be_bytes().to_vec();
+            let text = match &transform {
+                None => document.text.clone(),
+                Some(transform) => transform.apply(&document.text),
+            };
             transaction
-                .index_document(binding.lexical_index, object_bytes, document.text.clone())
+                .index_document(binding.lexical_index, object_bytes, text)
                 .map_err(map_runtime_error)?;
             for vector_binding in &binding.vectors {
                 if let Some(vector) = document.vectors.get(&vector_binding.name) {
@@ -619,6 +627,7 @@ impl NativeProduct {
     ///
     /// Returns a stable request, catalog, limit, conflict, storage, or
     /// durability error. Validation failures publish no partial mutation.
+    #[allow(clippy::too_many_lines)]
     pub fn update_search_document(
         &mut self,
         collection: crate::ObjectId,
@@ -646,6 +655,10 @@ impl NativeProduct {
         )? {
             return Ok(receipt);
         }
+        let catalog = self.catalog_snapshot()?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            self.catalog_describe(&catalog, id).ok().flatten()
+        })?;
         let mut transaction = self
             .database
             .begin(logical_time_micros, durability.into())
@@ -673,12 +686,12 @@ impl NativeProduct {
             )?;
         }
         let object_bytes = update.document.object_id.get().to_be_bytes().to_vec();
+        let text = match &transform {
+            None => update.document.text.clone(),
+            Some(transform) => transform.apply(&update.document.text),
+        };
         transaction
-            .replace_document(
-                binding.lexical_index,
-                object_bytes,
-                update.document.text.clone(),
-            )
+            .replace_document(binding.lexical_index, object_bytes, text)
             .map_err(map_runtime_error)?;
         for vector_binding in &binding.vectors {
             if let Some(vector) = update.document.vectors.get(&vector_binding.name) {
@@ -895,6 +908,9 @@ impl NativeProduct {
             &manifest_ids,
             &mut checkpoint,
         )?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            snapshot.inner.logical_catalog_object(id).cloned()
+        })?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             &self.database,
@@ -903,6 +919,7 @@ impl NativeProduct {
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
             request.fusion,
+            transform.as_ref(),
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
@@ -997,6 +1014,9 @@ impl NativeProduct {
             &manifest_ids,
             &mut || Ok(()),
         )?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            snapshot.inner.logical_catalog_object(id).cloned()
+        })?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             &product.database,
@@ -1005,6 +1025,7 @@ impl NativeProduct {
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
             request.fusion,
+            transform.as_ref(),
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
@@ -1142,6 +1163,7 @@ fn execute_lexical_branch(
     lexical: Option<&ProductLexicalBranch>,
     parameters: hyphae_native_runtime::Bm25ScoreParameters,
     fusion: Option<ProductFusionMethod>,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1149,20 +1171,25 @@ fn execute_lexical_branch(
     let Some(lexical) = lexical else {
         return Ok(0);
     };
+    let query = match transform {
+        None => lexical.query.clone(),
+        Some(transform) => transform.apply(&lexical.query),
+    };
+    let query = query.as_str();
     // The durable posting scorer is bit-identical to the retained model; a
     // reclaimed page generation or inline-format directory falls open to
     // the model, never to a different answer.
     let hits = match database.match_text_at_snapshot(
         &snapshot.inner,
         index,
-        &lexical.query,
+        query,
         lexical.candidate_limit,
         parameters,
     ) {
         Ok(hits) => hits,
         Err(_) => snapshot
             .inner
-            .match_text_with_parameters(index, &lexical.query, lexical.candidate_limit, parameters)
+            .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
             .map_err(map_runtime_error)?,
     };
     let mut admitted = 0;
@@ -2145,6 +2172,34 @@ fn resolve_eligibility_with_checkpoint(
 /// Loads the collection manifest identities under the read-side cap.
 /// Tuned BM25 parameters from the collection definition, or the canonical
 /// defaults when the definition predates tuning.
+/// Resolves the configured lexical transform for one collection, or `None`
+/// for the canonical identity pipeline. Fails closed on analyzer shapes the
+/// transform cannot honor exactly.
+fn collection_lexical_transform(
+    definition: &SearchCollectionDefinitionV2,
+    resolve: impl Fn(crate::ObjectId) -> Option<hyphae_native_catalog::LogicalCatalogObject>,
+) -> Result<Option<crate::lexical_analyzer::LexicalTransform>, ProductError> {
+    let analyzer = definition
+        .fields
+        .iter()
+        .find(|field| {
+            field.options.lexical != hyphae_native_catalog::LexicalIndexPolicy::None
+                && field.analyzer.is_some()
+        })
+        .and_then(|field| field.analyzer);
+    let Some(analyzer) = analyzer else {
+        return Ok(None);
+    };
+    let Some(hyphae_native_catalog::LogicalCatalogObject::V2(
+        hyphae_native_catalog::CatalogObjectV2::Analyzer(analyzer),
+    )) = resolve(analyzer)
+    else {
+        return Err(corruption());
+    };
+    crate::lexical_analyzer::LexicalTransform::from_definition(&analyzer)
+        .map_err(|_| invalid_request())
+}
+
 fn collection_bm25_parameters(
     definition: &SearchCollectionDefinitionV2,
 ) -> hyphae_native_runtime::Bm25ScoreParameters {
