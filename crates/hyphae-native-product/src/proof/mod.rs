@@ -2,6 +2,7 @@
 
 //! Bounded native proof and complete directory-witness artifacts.
 
+pub mod attestation;
 mod codec;
 mod crypto;
 mod model;
