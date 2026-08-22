@@ -165,7 +165,12 @@ proceed as adopted and are orthogonal.
   lexicographic over already-ordered elements.
 - **L2** BM25F port from the legacy engine (weighted fields with the
   existing caps) into the native runtime, gated by an output-equivalence
-  harness against the legacy implementation.
+  harness against the legacy implementation. Ported: the runtime hosts the
+  weighted-field scorer (canonical-analyzer tokenization, vendored msun
+  logarithm, half-up nano quantization) with a cross-engine harness proving
+  exact ranking and nano-score equality. Adoption by the integrated
+  collection surface requires the multi-field ingest model (per-field texts
+  in the document codec) and rides the chunking wave.
 - **L3** Analyzer pipeline: make the catalog's analyzer types real —
   stop-word presets and an in-tree stemmer, per-field analyzer selection;
   the analyzer configuration digest enters index identity and proofs.
