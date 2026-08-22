@@ -1140,7 +1140,14 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         None => 0,
         Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => 4,
     };
-    filter_required_minor(&request.filter).max(fusion)
+    let dedupe = if request.parent_dedupe.is_some() {
+        4
+    } else {
+        0
+    };
+    filter_required_minor(&request.filter)
+        .max(fusion)
+        .max(dedupe)
 }
 
 fn ensure_operation_minor(
@@ -4833,6 +4840,7 @@ fn decode_query(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_search_collection(
     encoded: &mut Vec<u8>,
     collection: ObjectId,
@@ -4932,11 +4940,18 @@ fn encode_search_collection(
         }
     }
     put_u64(encoded, request.limit)?;
-    // The fusion selector is content-derived: the default method keeps the
-    // exact historical bytes and a non-default method appends one byte.
-    match request.fusion {
-        None => {}
-        Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => encoded.push(1),
+    // Content-derived tagged sections in ascending tag order: an absent
+    // section is the default and keeps the exact historical bytes.
+    if let Some(fusion) = request.fusion {
+        encoded.push(1);
+        encoded.push(match fusion {
+            hyphae_native_product::ProductFusionMethod::WeightedScore => 1,
+        });
+    }
+    if let Some(dedupe) = &request.parent_dedupe {
+        encoded.push(2);
+        put_text(encoded, &dedupe.field)?;
+        put_u32(encoded, dedupe.first_k)?;
     }
     Ok(())
 }
@@ -5076,14 +5091,33 @@ fn decode_search_collection(
         aggregations.push(ProductNamedAggregation { name, aggregation });
     }
     let limit = decoder.usize()?;
-    let fusion = if decoder.has_remaining() {
-        match decoder.u8()? {
-            1 => Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
+    let mut fusion = None;
+    let mut parent_dedupe = None;
+    let mut previous = 0_u8;
+    while decoder.has_remaining() {
+        let tag = decoder.u8()?;
+        if tag <= previous {
+            return Err(ProductCodecError::InvalidValue);
+        }
+        previous = tag;
+        match tag {
+            1 => {
+                fusion = Some(match decoder.u8()? {
+                    1 => hyphae_native_product::ProductFusionMethod::WeightedScore,
+                    _ => return Err(ProductCodecError::InvalidValue),
+                });
+            }
+            2 => {
+                let field = decoder.text()?;
+                let first_k = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_PARENT_DEDUPE_FIRST_K).contains(&first_k) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                parent_dedupe = Some(hyphae_native_product::ProductParentDedupe { field, first_k });
+            }
             _ => return Err(ProductCodecError::InvalidValue),
         }
-    } else {
-        None
-    };
+    }
     Ok((
         collection,
         ProductSearchRequest {
@@ -5095,6 +5129,7 @@ fn decode_search_collection(
             aggregations,
             limit,
             fusion,
+            parent_dedupe,
         },
     ))
 }

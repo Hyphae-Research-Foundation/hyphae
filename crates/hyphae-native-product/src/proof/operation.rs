@@ -804,11 +804,12 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
     };
-    let fusion = matches!(
+    let extended = matches!(
         operation,
-        SemanticOperation::SearchCollection { request, .. } if request.fusion.is_some()
+        SemanticOperation::SearchCollection { request, .. }
+            if request.fusion.is_some() || request.parent_dedupe.is_some()
     );
-    if fusion || filter.is_some_and(filter_requires_operator_semantics) {
+    if extended || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
     } else {
         SEMANTICS_VERSION
@@ -1650,17 +1651,26 @@ fn encode_integrated_request(
         encode_aggregation(encoded, &aggregation.aggregation)?;
     }
     put_usize(encoded, request.limit)?;
-    // The version-3 layout always carries a fusion selector byte; version 2
-    // keeps the exact historical bytes and can only express the default.
+    // The version-3 layout appends content-derived tagged sections in
+    // ascending tag order; version 2 keeps the exact historical bytes and
+    // can only express the defaults. An absent section is the default.
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
-        encoded.byte(match request.fusion {
-            None => 0,
-            Some(crate::ProductFusionMethod::WeightedScore) => 1,
-        });
+        if let Some(fusion) = request.fusion {
+            encoded.byte(1);
+            encoded.byte(match fusion {
+                crate::ProductFusionMethod::WeightedScore => 1,
+            });
+        }
+        if let Some(dedupe) = &request.parent_dedupe {
+            encoded.byte(2);
+            put_text(encoded, &dedupe.field)?;
+            put_usize(encoded, dedupe.first_k)?;
+        }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_integrated_request(
     decoder: &mut Decoder<'_>,
     limits: &NativeVerificationLimits,
@@ -1743,15 +1753,33 @@ fn decode_integrated_request(
         });
     }
     let limit = usize_value(decoder)?;
-    let fusion = if semantics_version >= SEMANTICS_VERSION_OPERATORS {
-        match decoder.byte()? {
-            0 => None,
-            1 => Some(crate::ProductFusionMethod::WeightedScore),
-            _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
+    let mut fusion = None;
+    let mut parent_dedupe = None;
+    if semantics_version >= SEMANTICS_VERSION_OPERATORS {
+        let mut previous = 0_u8;
+        while decoder.has_remaining() {
+            let tag = decoder.byte()?;
+            if tag <= previous {
+                return Err(NativeProofError::Invalid("request sections out of order"));
+            }
+            previous = tag;
+            match tag {
+                1 => {
+                    fusion = Some(match decoder.byte()? {
+                        1 => crate::ProductFusionMethod::WeightedScore,
+                        _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
+                    });
+                }
+                2 => {
+                    parent_dedupe = Some(crate::ProductParentDedupe {
+                        field: text(decoder, limits.max_reexecution_bytes)?,
+                        first_k: usize_value(decoder)?,
+                    });
+                }
+                _ => return Err(NativeProofError::Invalid("unknown request section")),
+            }
         }
-    } else {
-        None
-    };
+    }
     Ok(ProductSearchRequest {
         lexical,
         vectors,
@@ -1761,6 +1789,7 @@ fn decode_integrated_request(
         aggregations,
         limit,
         fusion,
+        parent_dedupe,
     })
 }
 

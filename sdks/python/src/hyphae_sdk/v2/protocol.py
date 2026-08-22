@@ -435,7 +435,11 @@ def operation_required_minor(
     if arguments is not None:
         if operation == "search_collection":
             request = arguments.get("request", arguments)
-            fusion = 4 if isinstance(request, dict) and request.get("fusion") is not None else 0
+            extended = isinstance(request, dict) and (
+                request.get("fusion") is not None
+                or request.get("parent_dedupe") is not None
+            )
+            fusion = 4 if extended else 0
             filter_minor = _filter_required_minor(
                 request.get("filter") if isinstance(request, dict) else None
             )
@@ -2188,8 +2192,22 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
     fusion = request.get("fusion")
     if fusion == "weighted_score":
         output.append(1)
+        output.append(1)
     elif fusion is not None:
         raise ClientError("integrated fusion method is invalid")
+    dedupe = request.get("parent_dedupe")
+    if dedupe is not None:
+        if (
+            not isinstance(dedupe, dict)
+            or not isinstance(dedupe.get("field"), str)
+            or not dedupe["field"]
+            or not isinstance(dedupe.get("first_k"), int)
+            or not 1 <= dedupe["first_k"] <= 100
+        ):
+            raise ClientError("integrated parent dedupe is invalid")
+        output.append(2)
+        output.extend(_text(dedupe["field"]))
+        output.extend(struct.pack("<I", dedupe["first_k"]))
     return bytes(output)
 
 

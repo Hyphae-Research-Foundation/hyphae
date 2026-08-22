@@ -1054,6 +1054,12 @@ enum SearchCommand {
         /// Branch-combination method. Defaults to weighted reciprocal-rank.
         #[arg(long, value_enum)]
         fusion: Option<FusionMethodInput>,
+        /// Doc-value field for first-k-per-parent deduplication.
+        #[arg(long, requires = "dedupe_first_k")]
+        dedupe_field: Option<String>,
+        /// Hits retained per distinct parent value (1..=100).
+        #[arg(long, requires = "dedupe_field")]
+        dedupe_first_k: Option<usize>,
     },
     /// Deterministically chunk one document into ingest-ready JSON.
     Chunk {
@@ -3224,6 +3230,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             facets_json,
             metrics_json,
             fusion,
+            dedupe_field,
+            dedupe_first_k,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3291,6 +3299,12 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                 hyphae_native_product::ProductFusionMethod::WeightedScore
                             }
                         }),
+                        parent_dedupe: match (dedupe_field, dedupe_first_k) {
+                            (Some(field), Some(first_k)) => {
+                                Some(hyphae_native_product::ProductParentDedupe { field, first_k })
+                            }
+                            _ => None,
+                        },
                     },
                 },
             )

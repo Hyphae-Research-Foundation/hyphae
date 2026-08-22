@@ -5,10 +5,12 @@ Protocol minor 4 adds no request or response tags: it admits three new
 integrated-search filter nodes inside the existing `SearchCollection` body —
 node tag `6` (`in` bounded same-type membership, at most 256 members), node
 tag `7` (`is_null` missing-field membership), and node tag `8` (`like`
-anchored pattern over `_` and `%`, at most 256 pattern bytes) — plus one
-optional trailing fusion selector byte after the request limit (present only
-for the non-default `weighted_score` method; the default weighted
-reciprocal-rank fusion keeps the exact historical bytes). Operation
+anchored pattern over `_` and `%`, at most 256 pattern bytes) — plus
+content-derived tagged sections after the request limit, in ascending tag
+order with duplicates rejected: tag `1` is the fusion selector (one byte,
+`weighted_score`), tag `2` is first-k-per-parent deduplication (field text
+plus a bounded count). An absent section is the default, so every request
+expressible at minor 3 keeps its exact historical bytes. Operation
 minor requirements are content-inspecting: a client or server that
 negotiated minor 3 or lower rejects a request containing the new nodes
 before sending or before dispatch, and every filter expressible at minor 3

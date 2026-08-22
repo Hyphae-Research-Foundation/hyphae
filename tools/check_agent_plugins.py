@@ -283,7 +283,20 @@ SEARCH_COLLECTION_INPUT_SCHEMA = {'type': 'object',
                                           'reciprocal-rank fusion; '
                                           'weighted_score blends branch '
                                           'weights with normalized branch '
-                                          'scores.'}}}
+                                          'scores.'},
+                'parent_dedupe': {'type': ['object', 'null'],
+                                  'additionalProperties': False,
+                                  'required': ['field', 'first_k'],
+                                  'properties': {'field': {'type': 'string',
+                                                           'minLength': 1},
+                                                 'first_k': {'type': 'integer',
+                                                             'minimum': 1,
+                                                             'maximum': 100}},
+                                  'description': 'First-k-per-parent '
+                                                 'deduplication over the final '
+                                                 'ranking; hits missing the '
+                                                 'field are never '
+                                                 'deduplicated.'}}}
 ERROR_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,

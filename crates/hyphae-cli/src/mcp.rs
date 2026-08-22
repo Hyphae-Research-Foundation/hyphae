@@ -200,6 +200,16 @@ pub(crate) struct CollectionSearchInput {
     limit: usize,
     #[serde(default)]
     fusion: Option<FusionMethodInputValue>,
+    #[serde(default)]
+    parent_dedupe: Option<ParentDedupeInput>,
+}
+
+/// First-k-per-parent deduplication accepted by the search tools.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParentDedupeInput {
+    field: String,
+    first_k: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,6 +933,12 @@ pub(crate) fn collection_search_request(
         fusion: input.fusion.map(|method| match method {
             FusionMethodInputValue::WeightedScore => {
                 hyphae_native_product::ProductFusionMethod::WeightedScore
+            }
+        }),
+        parent_dedupe: input.parent_dedupe.map(|dedupe| {
+            hyphae_native_product::ProductParentDedupe {
+                field: dedupe.field,
+                first_k: dedupe.first_k,
             }
         }),
     })
