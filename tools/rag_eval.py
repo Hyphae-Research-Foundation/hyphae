@@ -231,6 +231,35 @@ def embed_texts(
     return vectors, str(decoded.get("attestation_hex", ""))
 
 
+def rerank_texts(
+    embed_binary: Path, model_dir: Path, query: str, texts: list[str]
+) -> tuple[list[float], str]:
+    """Scores texts against the query through the attested local tool,
+    returning scores and the attestation envelope hex."""
+    completed = subprocess.run(
+        [
+            str(embed_binary),
+            "rerank",
+            "--model-dir",
+            str(model_dir),
+            "--query",
+            query,
+        ],
+        input=json.dumps(texts),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HarnessError(f"rerank failed: {completed.stderr.strip()[:300]}")
+    decoded = json.loads(completed.stdout)
+    scores = decoded.get("scores")
+    if not isinstance(scores, list) or len(scores) != len(texts):
+        raise HarnessError("rerank output shape differs")
+    return scores, str(decoded.get("attestation_hex", ""))
+
+
 def prepare_documents(corpus: list[dict]) -> tuple[dict[int, str], list[dict]]:
     identifier_map: dict[int, str] = {}
     documents = []
@@ -263,6 +292,7 @@ def execute_query(
     k: int,
     query_vector: list[float] | None,
     fusion: str | None,
+    rerank: dict | None = None,
 ) -> list[int]:
     request: dict = {
         "lexical": {"query": query, "candidate_limit": CANDIDATE_LIMIT, "weight": 1},
@@ -280,6 +310,8 @@ def execute_query(
         ]
     if fusion is not None:
         request["fusion"] = fusion
+    if rerank is not None:
+        request["rerank"] = rerank
     response = client.search_collection(13, request)
     return [int(hit["object_id"]) for hit in response.value.get("hits", [])]
 
@@ -341,6 +373,8 @@ def evaluate(
     embed_binary: Path | None,
     model_dir: Path | None,
     fusion: str | None,
+    rerank_candidates: int,
+    lexical_only: bool,
 ) -> dict:
     extracted = acquire_dataset(dataset, data_root, download)
     corpus = load_jsonl(extracted / "corpus.jsonl")
@@ -370,7 +404,7 @@ def evaluate(
         embed_dimension = 2
         corpus_vectors: list[list[float]] | None = None
         corpus_attestations: list[str] = []
-        if embed_binary is not None and model_dir is not None:
+        if embed_binary is not None and model_dir is not None and not lexical_only:
             ordered = sorted(corpus, key=lambda row: str(row["_id"]))
             texts = [
                 f"{row.get('title', '')}\n{row.get('text', '')}".strip() for row in ordered
@@ -445,18 +479,44 @@ def evaluate(
             client = HyphaeClient.local(str(endpoint))
             ndcg_total = recall_total = mrr_total = 0.0
             evaluated = 0
+            rerank_attestations = 0
             query_started = _time.monotonic()
             for query_id in evaluated_ids:
                 query_text = queries.get(query_id)
                 if query_text is None:
                     raise HarnessError(f"qrels query is missing: {query_id}")
                 query_vector = None
-                if embed_binary is not None and model_dir is not None:
+                if embed_binary is not None and model_dir is not None and not lexical_only:
                     vectors, attestation = embed_texts(
                         embed_binary, model_dir, [query_text]
                     )
                     query_vector = vectors[0]
-                ordinals = execute_query(client, query_text, k, query_vector, fusion)
+                if rerank_candidates > 0:
+                    # Two passes: retrieve candidates, score them through the
+                    # attested local model, and let the engine apply the
+                    # attested rerank stage inside the search pipeline.
+                    first = execute_query(
+                        client, query_text, rerank_candidates, query_vector, fusion
+                    )
+                    stage = None
+                    if first:
+                        texts = [documents[ordinal - 1]["text"] for ordinal in first]
+                        scores, rerank_attestation = rerank_texts(
+                            embed_binary, model_dir, query_text, texts
+                        )
+                        stage = {
+                            "attestation": bytes.fromhex(rerank_attestation),
+                            "scores": [
+                                {"object_id": ordinal, "score": score}
+                                for ordinal, score in zip(first, scores)
+                            ],
+                        }
+                        rerank_attestations += 1
+                    ordinals = execute_query(
+                        client, query_text, k, query_vector, fusion, rerank=stage
+                    )
+                else:
+                    ordinals = execute_query(client, query_text, k, query_vector, fusion)
                 ranking = [identifier_map[ordinal] for ordinal in ordinals]
                 relevant = qrels[query_id]
                 ndcg_total += ndcg_at_k(ranking, relevant, k)
@@ -484,9 +544,21 @@ def evaluate(
             "candidate_limit": CANDIDATE_LIMIT,
             "ingest_batch_documents": INGEST_BATCH_DOCUMENTS,
             "maintenance_interval_batches": maintenance_interval_batches,
-            "branches": "lexical" if embed_binary is None else "lexical+exact-vector",
+            "branches": (
+                "lexical"
+                if embed_binary is None or lexical_only
+                else "lexical+exact-vector"
+            ),
             "fusion": fusion or "weighted-reciprocal-rank",
             "embedding_attestations": len(corpus_attestations),
+            "rerank": (
+                {
+                    "candidates": rerank_candidates,
+                    "attested_queries": rerank_attestations,
+                }
+                if rerank_candidates > 0
+                else None
+            ),
             "transport": "local-uds-daemon",
             "ingest_order": "sorted-corpus-id",
         },
@@ -518,6 +590,19 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, default=None)
     parser.add_argument("--fusion", choices=["weighted_score"], default=None)
     parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=0,
+        help="rerank this many first-pass candidates through the attested"
+        " local model inside the search pipeline (0 disables; max 256)",
+    )
+    parser.add_argument(
+        "--lexical-only",
+        action="store_true",
+        help="keep the vector branch off even when a model is supplied"
+        " (the model still serves --rerank-candidates)",
+    )
+    parser.add_argument(
         "--maintenance-interval-batches",
         type=int,
         default=0,
@@ -535,6 +620,14 @@ def main() -> int:
     if arguments.maintenance_interval_batches < 0:
         print("error: maintenance interval must be nonnegative", file=sys.stderr)
         return 1
+    if not 0 <= arguments.rerank_candidates <= 256:
+        print("error: rerank candidates must be within 0..=256", file=sys.stderr)
+        return 1
+    if arguments.rerank_candidates > 0 and (
+        arguments.embed_binary is None or arguments.model_dir is None
+    ):
+        print("error: rerank needs --embed-binary and --model-dir", file=sys.stderr)
+        return 1
     try:
         receipt = evaluate(
             arguments.binary.resolve(),
@@ -547,6 +640,8 @@ def main() -> int:
             arguments.embed_binary,
             arguments.model_dir,
             arguments.fusion,
+            arguments.rerank_candidates,
+            arguments.lexical_only,
         )
     except (HarnessError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         print(f"error: {error}", file=sys.stderr)
