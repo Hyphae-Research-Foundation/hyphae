@@ -144,11 +144,16 @@ proceed as adopted and are orthogonal.
 - **R2** Doc-value posting index: per-(field, value) postings persisted
   through the existing tree keyspace, WAL-covered, deterministic layout;
   equivalence-tested against the linear scan.
-- **R3** Deterministic bitmap eligibility masks (the adopted Phase 1
-  "representation gap"): in-tree container bitmap preferred to honor the
-  dependency policy; the `roaring` crate is acceptable only in the
-  acceleration crate and only if the harness shows a material gap. The mask
-  digest feeds the existing eligible-set digest — proof format unchanged.
+- **R3** Deterministic in-tree bitmap masks — CLOSED BY EVIDENCE at the
+  100k rung (2026-08-22, dedicated 28-vCPU host, 20,000 documents,
+  1,000-candidate lexical queries): match-all eligibility costs 5.04 ms per
+  query, exact-equality filtering 4.93 ms (the posting index reduces the
+  candidate set below the unfiltered cost), bounded membership 5.96 ms,
+  missing-field 5.20 ms, and the worst composite (range plus negation)
+  8.37 ms — 1.66x match-all, under the 2x threshold this item set for
+  taking on bitmap complexity. The ordered posting index answers filtered
+  eligibility in single-digit milliseconds; re-evaluate when the 1M rung's
+  write-path work lands.
 - **R4** Masks wired into ANN strategy selection; the full-collection scan
   in the product search path is deleted. Evidence: filtered recall/latency
   at 100k documents across a selectivity sweep, all recall-risk labels
