@@ -3305,6 +3305,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             }
                             _ => None,
                         },
+                        rerank: None,
                     },
                 },
             )

@@ -574,6 +574,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             limit: 4,
             fusion: None,
             parent_dedupe: None,
+            rerank: None,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -638,6 +639,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 limit: 4,
                 fusion: None,
                 parent_dedupe: None,
+                rerank: None,
             },
         });
         assert!(matches!(
@@ -656,6 +658,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
 -> Result<(), Box<dyn std::error::Error>> {
     let collection = ObjectId::new(13)?;
@@ -676,6 +679,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 limit: 4,
                 fusion,
                 parent_dedupe: None,
+                rerank: None,
             },
         })
     };
@@ -723,6 +727,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 field: "parent".to_owned(),
                 first_k: 2,
             }),
+            rerank: None,
         },
     });
     assert!(matches!(
@@ -730,6 +735,50 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
         Err(ProductCodecError::Unsupported)
     ));
     let encoded = encode_product_request_for_minor(&deduped, 4)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 4)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+
+    // The attested rerank stage is section tag three: envelope plus scores.
+    let attestation =
+        hyphae_native_product::proof::attestation::ModelAttestation::DeclaredProvider {
+            provider: "openai".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            request_digest: [3; 32],
+            response_digest: [4; 32],
+        }
+        .encode()
+        .map_err(|error| format!("attestation encode failed: {error}"))?;
+    let reranked = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: Some(hyphae_native_product::ProductRerankStage {
+                attestation,
+                scores: vec![(ObjectId::new(201)?, 0.75), (ObjectId::new(202)?, 0.25)],
+            }),
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&reranked, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&reranked, 4)?;
     assert!(matches!(
         decode_product_request_for_minor(&encoded, 3),
         Err(ProductCodecError::Unsupported)

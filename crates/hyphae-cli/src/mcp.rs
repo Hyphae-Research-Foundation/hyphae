@@ -941,6 +941,7 @@ pub(crate) fn collection_search_request(
                 first_k: dedupe.first_k,
             }
         }),
+        rerank: None,
     })
 }
 

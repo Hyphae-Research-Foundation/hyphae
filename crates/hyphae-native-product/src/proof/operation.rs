@@ -807,7 +807,9 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
     let extended = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
-            if request.fusion.is_some() || request.parent_dedupe.is_some()
+            if request.fusion.is_some()
+                || request.parent_dedupe.is_some()
+                || request.rerank.is_some()
     );
     if extended || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
@@ -1666,6 +1668,16 @@ fn encode_integrated_request(
             put_text(encoded, &dedupe.field)?;
             put_usize(encoded, dedupe.first_k)?;
         }
+        if let Some(stage) = &request.rerank {
+            encoded.byte(3);
+            put_count(encoded, stage.attestation.len())?;
+            encoded.extend(&stage.attestation);
+            put_count(encoded, stage.scores.len())?;
+            for (object_id, score) in &stage.scores {
+                encoded.u128(object_id.get());
+                encoded.extend(&score.to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -1755,6 +1767,7 @@ fn decode_integrated_request(
     let limit = usize_value(decoder)?;
     let mut fusion = None;
     let mut parent_dedupe = None;
+    let mut rerank = None;
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1776,6 +1789,27 @@ fn decode_integrated_request(
                         first_k: usize_value(decoder)?,
                     });
                 }
+                3 => {
+                    let length = bounded_count(
+                        decoder,
+                        crate::proof::attestation::MAX_ATTESTATION_BYTES,
+                        "attestation envelope",
+                    )?;
+                    let attestation = decoder.owned(length)?;
+                    crate::proof::attestation::ModelAttestation::decode(&attestation)?;
+                    let count =
+                        bounded_count(decoder, crate::MAX_RERANK_ENTRIES, "rerank entries")?;
+                    let mut scores = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let object_id = object_id(decoder.u128()?)?;
+                        let score = f64::from_le_bytes(decoder.array()?);
+                        scores.push((object_id, score));
+                    }
+                    rerank = Some(crate::ProductRerankStage {
+                        attestation,
+                        scores,
+                    });
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1790,6 +1824,7 @@ fn decode_integrated_request(
         limit,
         fusion,
         parent_dedupe,
+        rerank,
     })
 }
 

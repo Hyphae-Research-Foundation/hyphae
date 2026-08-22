@@ -922,6 +922,7 @@ impl NativeProduct {
         self.search_collection_with_checkpoint(collection, request, logical_time_micros, || Ok(()))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,
         collection: crate::ObjectId,
@@ -1635,13 +1636,12 @@ fn apply_rerank(
 }
 
 fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
-    if let Some(stage) = &request.rerank {
-        if stage.scores.is_empty()
+    if let Some(stage) = &request.rerank
+        && (stage.scores.is_empty()
             || stage.scores.len() > MAX_RERANK_ENTRIES
-            || crate::proof::attestation::ModelAttestation::decode(&stage.attestation).is_err()
-        {
-            return Err(invalid_request());
-        }
+            || crate::proof::attestation::ModelAttestation::decode(&stage.attestation).is_err())
+    {
+        return Err(invalid_request());
     }
     Ok(())
 }

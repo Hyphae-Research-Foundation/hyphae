@@ -1145,9 +1145,11 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     } else {
         0
     };
+    let rerank = if request.rerank.is_some() { 4 } else { 0 };
     filter_required_minor(&request.filter)
         .max(fusion)
         .max(dedupe)
+        .max(rerank)
 }
 
 fn ensure_operation_minor(
@@ -4953,6 +4955,15 @@ fn encode_search_collection(
         put_text(encoded, &dedupe.field)?;
         put_u32(encoded, dedupe.first_k)?;
     }
+    if let Some(stage) = &request.rerank {
+        encoded.push(3);
+        put_bytes(encoded, &stage.attestation)?;
+        put_u32(encoded, stage.scores.len())?;
+        for (object_id, score) in &stage.scores {
+            encoded.extend_from_slice(&object_id.get().to_le_bytes());
+            encoded.extend_from_slice(&score.to_le_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -5093,6 +5104,7 @@ fn decode_search_collection(
     let limit = decoder.usize()?;
     let mut fusion = None;
     let mut parent_dedupe = None;
+    let mut rerank = None;
     let mut previous = 0_u8;
     while decoder.has_remaining() {
         let tag = decoder.u8()?;
@@ -5115,6 +5127,34 @@ fn decode_search_collection(
                 }
                 parent_dedupe = Some(hyphae_native_product::ProductParentDedupe { field, first_k });
             }
+            3 => {
+                let attestation = decoder.owned_bytes()?;
+                if hyphae_native_product::proof::attestation::ModelAttestation::decode(&attestation)
+                    .is_err()
+                {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                let count = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_RERANK_ENTRIES).contains(&count) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                let mut scores = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let object_id = ObjectId::new(decoder.u128()?)
+                        .map_err(|_| ProductCodecError::InvalidValue)?;
+                    let score = f64::from_le_bytes(
+                        decoder
+                            .bytes(8)?
+                            .try_into()
+                            .map_err(|_| ProductCodecError::Malformed)?,
+                    );
+                    scores.push((object_id, score));
+                }
+                rerank = Some(hyphae_native_product::ProductRerankStage {
+                    attestation,
+                    scores,
+                });
+            }
             _ => return Err(ProductCodecError::InvalidValue),
         }
     }
@@ -5130,6 +5170,7 @@ fn decode_search_collection(
             limit,
             fusion,
             parent_dedupe,
+            rerank,
         },
     ))
 }
