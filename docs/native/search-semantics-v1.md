@@ -129,7 +129,12 @@ sets. Receipts name the snapshot CSN, build identity, metric, breadth, truthful
 strategy/risk, candidate counts, reranking flag and visited nodes.
 Bounded boolean, phrase, prefix and fuzzy execution, stable-ID vector filters,
 typed doc-value filters/sort, terms facets, metric aggregations and native RRF
-hybrid execution are implemented as embedded G4 surfaces. Wildcard,
+hybrid execution are implemented as embedded G4 surfaces. The integrated
+surface additionally accepts a per-request fusion selector: the default is
+deterministic weighted reciprocal-rank fusion (`k = 60`), and
+`weighted_score` blends each branch's weight with its normalized score — a
+lexical candidate contributes `weight × score / branch_top_score` and a
+vector candidate contributes `weight × 1 / (1 + distance)`. Wildcard,
 highlighting, persistent multi-field doc-value columns and unrestricted query
 language remain non-claims.
 

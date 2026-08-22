@@ -173,6 +173,13 @@ struct LexicalSearchInput {
     limit: usize,
 }
 
+/// Branch-combination method selector accepted by the search tools.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FusionMethodInputValue {
+    WeightedScore,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CollectionSearchInput {
@@ -191,6 +198,8 @@ pub(crate) struct CollectionSearchInput {
     aggregations: Vec<Value>,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default)]
+    fusion: Option<FusionMethodInputValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -911,6 +920,11 @@ pub(crate) fn collection_search_request(
             .map(|value| crate::product_aggregation(value).map_err(|_| invalid_request()))
             .collect::<Result<_, _>>()?,
         limit: input.limit,
+        fusion: input.fusion.map(|method| match method {
+            FusionMethodInputValue::WeightedScore => {
+                hyphae_native_product::ProductFusionMethod::WeightedScore
+            }
+        }),
     })
 }
 

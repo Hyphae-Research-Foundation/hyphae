@@ -89,7 +89,7 @@
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "7dde72ce65e052b685d31019c52dddd667b9d60bd3bea32555e7f8ac60d6d582"
+      "sha256": "1a7abc25638421505acd6a4b59c99f0b46fa3797c38b6370863eff583b1dd90a"
     },
     {
       "reference": "docs/native/catalog-v1.md",
@@ -97,7 +97,7 @@
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "0fe3dfb3ef9a677aaab0922c2278fa7c4d4bff9777913f4fb20bcfcb3072e805"
+      "sha256": "a0e35c96be393fcceff3c5d8b1e54eea02ec0208399b9d943151d63105fec94a"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",

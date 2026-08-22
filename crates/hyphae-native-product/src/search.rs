@@ -178,6 +178,16 @@ pub struct ProductVectorBranch {
     pub execution: Option<ProductVectorExecution>,
 }
 
+/// Branch-combination method for the fused relevance score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductFusionMethod {
+    /// Normalized score blend: a lexical candidate contributes its branch
+    /// weight times its score divided by the branch's top score, and a
+    /// vector candidate contributes its branch weight times the bounded
+    /// similarity `1 / (1 + distance)`.
+    WeightedScore,
+}
+
 /// Complete bounded integrated search request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductSearchRequest {
@@ -195,6 +205,9 @@ pub struct ProductSearchRequest {
     pub aggregations: Vec<ProductNamedAggregation>,
     /// Maximum final hits.
     pub limit: usize,
+    /// Branch-combination method. Absent means the deterministic
+    /// rank-based weighted reciprocal-rank fusion.
+    pub fusion: Option<ProductFusionMethod>,
 }
 
 /// Physical vector strategy that actually ran.
@@ -889,6 +902,7 @@ impl NativeProduct {
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
@@ -898,6 +912,7 @@ impl NativeProduct {
             &binding,
             &definition,
             &request.vectors,
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
@@ -989,6 +1004,7 @@ impl NativeProduct {
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
@@ -998,6 +1014,7 @@ impl NativeProduct {
             &binding,
             &definition,
             &request.vectors,
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
@@ -1124,6 +1141,7 @@ fn execute_lexical_branch(
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
     parameters: hyphae_native_runtime::Bm25ScoreParameters,
+    fusion: Option<ProductFusionMethod>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1148,22 +1166,35 @@ fn execute_lexical_branch(
             .map_err(map_runtime_error)?,
     };
     let mut admitted = 0;
+    let top_score = hits.first().map_or(0.0, |hit| hit.score);
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
         if eligible.contains(&object_id) {
-            add_rrf(fused, object_id, lexical.weight, rank)?;
+            match fusion {
+                None => add_rrf(fused, object_id, lexical.weight, rank)?,
+                Some(ProductFusionMethod::WeightedScore) => {
+                    let normalized = if top_score > 0.0 && hit.score >= 0.0 {
+                        hit.score / top_score
+                    } else {
+                        0.0
+                    };
+                    add_weighted_score(fused, object_id, lexical.weight, normalized)?;
+                }
+            }
             admitted += 1;
         }
     }
     Ok(admitted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_vector_branches(
     snapshot: &ProductSnapshot,
     binding: &ProductSearchCollectionBinding,
     definition: &SearchCollectionDefinitionV2,
     branches: &[ProductVectorBranch],
+    fusion: Option<ProductFusionMethod>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1185,7 +1216,17 @@ fn execute_vector_branches(
             execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
         for (rank, hit) in hits.into_iter().enumerate() {
             checkpoint()?;
-            add_rrf(fused, hit.object_id, branch.weight, rank)?;
+            match fusion {
+                None => add_rrf(fused, hit.object_id, branch.weight, rank)?,
+                Some(ProductFusionMethod::WeightedScore) => {
+                    let normalized = if hit.distance.is_finite() && hit.distance >= 0.0 {
+                        1.0 / (1.0 + hit.distance)
+                    } else {
+                        return Err(invalid_request());
+                    };
+                    add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
+                }
+            }
         }
         receipts.push(receipt);
     }
@@ -1632,7 +1673,33 @@ fn add_rrf(
         .ok()
         .and_then(|rank| rank.checked_add(1))
         .ok_or_else(limit_exceeded)?;
-    let contribution = f64::from(weight) / (RRF_CONSTANT + f64::from(rank));
+    add_contribution(
+        fused,
+        object_id,
+        f64::from(weight) / (RRF_CONSTANT + f64::from(rank)),
+    )
+}
+
+/// Adds one weighted normalized-score contribution. Lexical candidates
+/// normalize by the branch's top score; vector candidates map a canonical
+/// distance to the bounded similarity `1 / (1 + distance)`.
+fn add_weighted_score(
+    fused: &mut BTreeMap<crate::ObjectId, f64>,
+    object_id: crate::ObjectId,
+    weight: u32,
+    normalized: f64,
+) -> Result<(), ProductError> {
+    if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized) {
+        return Err(invalid_request());
+    }
+    add_contribution(fused, object_id, f64::from(weight) * normalized)
+}
+
+fn add_contribution(
+    fused: &mut BTreeMap<crate::ObjectId, f64>,
+    object_id: crate::ObjectId,
+    contribution: f64,
+) -> Result<(), ProductError> {
     let score = fused.entry(object_id).or_default();
     *score += contribution;
     if !score.is_finite() || *score < 0.0 {

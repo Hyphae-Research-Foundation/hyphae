@@ -434,9 +434,15 @@ def operation_required_minor(
         return 1
     if arguments is not None:
         if operation == "search_collection":
-            return _filter_required_minor(arguments.get("filter"))
+            request = arguments.get("request", arguments)
+            fusion = 4 if isinstance(request, dict) and request.get("fusion") is not None else 0
+            filter_minor = _filter_required_minor(
+                request.get("filter") if isinstance(request, dict) else None
+            )
+            return max(fusion, filter_minor)
         if operation == "search_ingest":
-            documents = arguments.get("documents", [])
+            batch = arguments.get("batch", arguments)
+            documents = batch.get("documents", []) if isinstance(batch, dict) else []
             if not isinstance(documents, list):
                 return 0
             return max(
@@ -2177,6 +2183,13 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
         else:
             raise ClientError("integrated aggregation is invalid")
     output.extend(struct.pack("<Q", request["limit"]))
+    # The default fusion keeps the exact historical bytes; the weighted-score
+    # selector appends one byte and requires protocol minor 4.
+    fusion = request.get("fusion")
+    if fusion == "weighted_score":
+        output.append(1)
+    elif fusion is not None:
+        raise ClientError("integrated fusion method is invalid")
     return bytes(output)
 
 
