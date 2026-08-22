@@ -257,11 +257,11 @@
         "sha256": "091ba77b7174f241f86264e83dcd4d0ddd8914dac3af9fc78704eb95f1919782"
       },
       {
-        "canonical_sha256": "f3d3675e6a0a99ea69323198b0462a887b08ffd6ca0e0d8992cb3d3da71e90d1",
+        "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
         "lock": "sdks/typescript/package-lock.json",
-        "package_count": 3,
+        "package_count": 4,
         "result": "pass",
-        "sha256": "37189b92a784d72e8444b15a53d02a24c02934562f755931cee23db8a8f87f2a"
+        "sha256": "67377aa0805f8e9252d6242538f1d77dcb94e491dc2dfddbb54111c0ea34a2a4"
       }
     ],
     "python": {
@@ -269,7 +269,7 @@
       "inventory": "sdks/python/build-dependencies.json",
       "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "72256f01105dc3955c838b9d6954c569d2d31056abcfd480f282b9187bfa9f12",
+      "manifest_sha256": "5776d260d0535059ccf73bd4f690033e4dca3f81f55d8e01cd66b26fb139389c",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
@@ -279,7 +279,7 @@
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "1420e02dad488705b0e8d9afb0b183f522943ed2d01ba6424d53389b45b7d836"
+      "sha256": "5aeac4b9b9aae1accd22912394c1960287b989e68aca369916d62579e811404c"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "112a33830053723ad4eeefc25d7debc44bcb20b2",
+      "commit": "f1fed9fd11e33792be3ed5fb615f89d05ba3663e",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "c57f13e69ebefc1a9fcc8ebcc9a9659ced1fceed"
+      "tree": "6409b0afeb4a95caf5f97af4ebe4a18056035bd5"
     }
   },
   "target_release": "1.2.0"

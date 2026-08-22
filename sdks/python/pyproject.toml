@@ -30,6 +30,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+providers = ["blake3>=0.4"]
+
 [project.urls]
 Homepage = "https://hyphae.dev"
 Documentation = "https://github.com/celiumsai/hyphae/tree/main/docs"

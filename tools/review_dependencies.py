@@ -50,6 +50,7 @@ CARGO_MANIFESTS = (
     "crates/hyphae-retrieval/Cargo.toml",
     "crates/hyphae-server/Cargo.toml",
     "crates/hyphae-storage/Cargo.toml",
+    "embed/Cargo.toml",
     "fuzz/Cargo.toml",
     "integrations/pliegors/Cargo.toml",
 )
@@ -57,6 +58,7 @@ CARGO_LOCKS = (
     "Cargo.lock",
     "conformance/g6/runners/rust/Cargo.lock",
     "conformance/g7/runners/rust/Cargo.lock",
+    "embed/Cargo.lock",
     "fuzz/Cargo.lock",
 )
 ISOLATED_CARGO_MANIFESTS = (
@@ -427,11 +429,15 @@ def validate_registered_dependency_files(changed: set[str]) -> None:
 def validate_manifest_lock_pairs(changed: set[str], head: str) -> None:
     validate_registered_dependency_files(changed)
     rust_manifests = {path for path in changed if path.endswith("Cargo.toml")}
-    root_manifests = rust_manifests.difference(ISOLATED_CARGO_MANIFESTS, {"fuzz/Cargo.toml"})
+    root_manifests = rust_manifests.difference(
+        ISOLATED_CARGO_MANIFESTS, {"embed/Cargo.toml", "fuzz/Cargo.toml"}
+    )
     if root_manifests and "Cargo.lock" not in changed:
         validate_cargo_lock(head)
-    if "fuzz/Cargo.toml" in changed and "fuzz/Cargo.lock" not in changed:
-        validate_cargo_lock(head, "fuzz/Cargo.toml")
+    for isolated in ("embed/Cargo.toml", "fuzz/Cargo.toml"):
+        lock = str(PurePosixPath(isolated).with_name("Cargo.lock"))
+        if isolated in changed and lock not in changed:
+            validate_cargo_lock(head, isolated)
     for runner in ISOLATED_CARGO_MANIFESTS:
         lock = str(PurePosixPath(runner).with_name("Cargo.lock"))
         if runner in changed and lock not in changed:

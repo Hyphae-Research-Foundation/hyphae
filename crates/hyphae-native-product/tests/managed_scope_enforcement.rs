@@ -458,6 +458,7 @@ fn search_request() -> ProductSearchRequest {
         limit: 8,
         fusion: None,
         parent_dedupe: None,
+        rerank: None,
     }
 }
 

@@ -201,6 +201,24 @@ pub struct ProductParentDedupe {
 /// Maximum hits retained per parent by deduplication.
 pub const MAX_PARENT_DEDUPE_FIRST_K: usize = 100;
 
+/// Maximum externally reranked entries in one request.
+pub const MAX_RERANK_ENTRIES: usize = 256;
+
+/// An attested external rerank applied over the final ranking.
+///
+/// The scores come from a model stage outside the engine — the attested
+/// local tool or a declared provider — together with the attestation
+/// envelope that binds how they were produced. The engine reorders
+/// deterministically and seals the attestation class in the proof; it never
+/// runs the model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductRerankStage {
+    /// Canonical `HYATTS01` attestation envelope for the score source.
+    pub attestation: Vec<u8>,
+    /// Externally computed scores by document identity.
+    pub scores: Vec<(crate::ObjectId, f64)>,
+}
+
 /// Complete bounded integrated search request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductSearchRequest {
@@ -223,6 +241,8 @@ pub struct ProductSearchRequest {
     pub fusion: Option<ProductFusionMethod>,
     /// Optional first-k-per-parent deduplication over the final ranking.
     pub parent_dedupe: Option<ProductParentDedupe>,
+    /// Optional attested external rerank over the final ranking.
+    pub rerank: Option<ProductRerankStage>,
 }
 
 /// Physical vector strategy that actually ran.
@@ -902,6 +922,7 @@ impl NativeProduct {
         self.search_collection_with_checkpoint(collection, request, logical_time_micros, || Ok(()))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,
         collection: crate::ObjectId,
@@ -969,19 +990,25 @@ impl NativeProduct {
         let doc_request = hyphae_native_runtime::DocValueRequest {
             filter: request.filter.clone(),
             sort: request.sort.clone(),
-            limit: match &request.parent_dedupe {
-                None => request.limit,
-                // Deduplication needs the complete bounded ranking before
-                // the final truncation.
-                Some(_) => hyphae_native_runtime::MAX_DOC_VALUE_HITS,
+            limit: if request.parent_dedupe.is_some() || request.rerank.is_some() {
+                // Deduplication and reranking need the complete bounded
+                // ranking before the final truncation.
+                hyphae_native_runtime::MAX_DOC_VALUE_HITS
+            } else {
+                request.limit
             },
             facets: request.facets.clone(),
             aggregations: request.aggregations.clone(),
         };
         let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(stage) = &request.rerank {
+            apply_rerank(&mut result.hits, stage)?;
+        }
         if let Some(dedupe) = &request.parent_dedupe {
             result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        } else if request.rerank.is_some() {
+            result.hits.truncate(request.limit);
         }
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
@@ -1083,9 +1110,10 @@ impl NativeProduct {
             &hyphae_native_runtime::DocValueRequest {
                 filter: request.filter.clone(),
                 sort: request.sort.clone(),
-                limit: match &request.parent_dedupe {
-                    None => request.limit,
-                    Some(_) => hyphae_native_runtime::MAX_DOC_VALUE_HITS,
+                limit: if request.parent_dedupe.is_some() || request.rerank.is_some() {
+                    hyphae_native_runtime::MAX_DOC_VALUE_HITS
+                } else {
+                    request.limit
                 },
                 facets: request.facets.clone(),
                 aggregations: request.aggregations.clone(),
@@ -1093,8 +1121,13 @@ impl NativeProduct {
             &doc_value_limits(),
         )
         .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(stage) = &request.rerank {
+            apply_rerank(&mut result.hits, stage)?;
+        }
         if let Some(dedupe) = &request.parent_dedupe {
             result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        } else if request.rerank.is_some() {
+            result.hits.truncate(request.limit);
         }
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
@@ -1570,6 +1603,49 @@ fn validate_documents(
     Ok(())
 }
 
+/// Reorders the final ranking by the externally attested scores: scored
+/// hits sort by score descending (ties break on the stable identity),
+/// unscored hits follow in their existing order. Deterministic and bounded.
+fn apply_rerank(
+    hits: &mut [hyphae_native_runtime::DocValueCandidate],
+    stage: &ProductRerankStage,
+) -> Result<(), ProductError> {
+    let mut scores = BTreeMap::new();
+    for (object_id, score) in &stage.scores {
+        if !score.is_finite() || scores.insert(*object_id, *score).is_some() {
+            return Err(invalid_request());
+        }
+    }
+    hits.sort_by(|left, right| {
+        let left_score = decode_object_id(&left.document_id)
+            .ok()
+            .and_then(|id| scores.get(&id).copied());
+        let right_score = decode_object_id(&right.document_id)
+            .ok()
+            .and_then(|id| scores.get(&id).copied());
+        match (left_score, right_score) {
+            (Some(left_value), Some(right_value)) => right_value
+                .total_cmp(&left_value)
+                .then_with(|| left.document_id.cmp(&right.document_id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    Ok(())
+}
+
+fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(stage) = &request.rerank
+        && (stage.scores.is_empty()
+            || stage.scores.len() > MAX_RERANK_ENTRIES
+            || crate::proof::attestation::ModelAttestation::decode(&stage.attestation).is_err())
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductError> {
     if let Some(dedupe) = &request.parent_dedupe
         && (dedupe.field.is_empty()
@@ -1587,6 +1663,7 @@ fn validate_search_request(
     request: &ProductSearchRequest,
 ) -> Result<(), ProductError> {
     validate_parent_dedupe(request)?;
+    validate_rerank(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {

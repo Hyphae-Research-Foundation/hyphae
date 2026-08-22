@@ -431,6 +431,7 @@ EXPECTED_RULES = [
             "config/",
             "conformance/",
             "crates/",
+            "embed/",
             "examples/",
             "fuzz/",
             "integrations/",

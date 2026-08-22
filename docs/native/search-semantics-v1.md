@@ -138,7 +138,14 @@ vector candidate contributes `weight × 1 / (1 + distance)`. An optional
 first-k-per-parent deduplication runs over the complete bounded ranking
 before the final limit: hits group by the exact typed value of one
 doc-value field, at most `k` (1..=100) survive per group in rank order,
-and hits missing the field are never deduplicated. Wildcard,
+and hits missing the field are never deduplicated. An optional attested
+rerank stage reorders the complete bounded ranking before deduplication and
+the final limit: externally computed scores — from the attested local tool
+or a declared provider, always accompanied by their canonical attestation
+envelope — sort their hits by score descending with stable-identity ties,
+unscored hits follow in their existing order, and the whole stage
+(envelope included) is bound into sealed proofs. The engine reorders
+deterministically; it never runs a model. Wildcard,
 highlighting, persistent multi-field doc-value columns and unrestricted query
 language remain non-claims.
 
