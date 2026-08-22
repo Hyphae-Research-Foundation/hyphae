@@ -271,6 +271,7 @@
             "config/",
             "conformance/",
             "crates/",
+            "embed/",
             "examples/",
             "fuzz/",
             "integrations/",

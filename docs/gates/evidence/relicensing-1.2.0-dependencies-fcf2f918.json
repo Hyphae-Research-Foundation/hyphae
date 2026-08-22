@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-08-20T11:46:55.129132+00:00",
+  "generated_at_utc": "2026-08-22T14:10:25.581554+00:00",
   "inventory": {
     "canonical_sha256": "52e287f2a9d1239ecec98654604579600f5b4aed842b4392637c0b38b165fa3e",
     "external_package_count": 272,
@@ -2151,14 +2151,14 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "112a33830053723ad4eeefc25d7debc44bcb20b2",
+    "commit": "8911faf5eba217c4d94f6716b56871e20957466c",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
-    "mode": "integration-tree",
+    "mode": "clean-commit",
     "repository": "https://github.com/celiumsai/hyphae.git",
-    "source_inputs_sha256": "d61b21bd20873160e24afba36ce405b9bb6542b7f071e39cae77b97613aa8669",
-    "tree": "c57f13e69ebefc1a9fcc8ebcc9a9659ced1fceed",
-    "worktree_clean": false
+    "source_inputs_sha256": "1b515e3f84f3c8ba278421589717c6d4669335abbcc10085586ab927379b6b97",
+    "tree": "87da40f3965c052e8c067819eb9cc57859679f9d",
+    "worktree_clean": true
   },
   "source_inputs": [
     {
@@ -2167,7 +2167,7 @@
     },
     {
       "path": "Cargo.toml",
-      "sha256": "4c038e6707a61614426b19f849d062bdfdc67c16bc5dbf199603e0343ec0a073"
+      "sha256": "1ebb6aabb7e09da4762c54488d25cc5112b5992084cacd26a4fd5203bd37e65c"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
@@ -2292,6 +2292,14 @@
     {
       "path": "deny.toml",
       "sha256": "73a0a72da0caac72fc2966e4a4b6c64a260d1a095fe1139ad8fe69782b1c1f17"
+    },
+    {
+      "path": "embed/Cargo.lock",
+      "sha256": "965ee0d6741c09e46de14961c3c7c5b98cd777008f57d6d9d71f0204b79322b3"
+    },
+    {
+      "path": "embed/Cargo.toml",
+      "sha256": "15242f9b1a1e9fb44211fecac853d345bf0ac33b7329a3af597f2352ccaf8365"
     },
     {
       "path": "fuzz/Cargo.lock",

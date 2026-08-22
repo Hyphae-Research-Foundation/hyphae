@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["embed", "fuzz"]
 members = [
     "conformance/g8/independent-backup-verifier",
     "conformance/rust",
