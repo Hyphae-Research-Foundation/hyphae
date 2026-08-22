@@ -261,7 +261,9 @@ jobs:
           native_sbom="${RUNNER_TEMP}/hyphae-${RELEASE_TAG}.syft.json"
           spdx_sbom="dist/hyphae-${RELEASE_TAG}.spdx.json"
           cyclonedx_sbom="dist/hyphae-${RELEASE_TAG}.cdx.json"
-          "$syft" scan dir:. -o "syft-json=${native_sbom}"
+          # The excluded embed workspace never enters a release payload; its
+          # model-stack inventory lives in its own lockfile evidence.
+          "$syft" scan dir:. --exclude ./embed -o "syft-json=${native_sbom}"
           python packaging/conclude_release_sbom_licenses.py \
             --input "$native_sbom" \
             --root .
