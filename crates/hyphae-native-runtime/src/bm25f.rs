@@ -209,6 +209,7 @@ const LG7: f64 = 1.479_819_860_511_658_6e-1;
 #[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::excessive_precision)]
 #[allow(clippy::eq_op)]
+#[allow(clippy::many_single_char_names)]
 fn log_e(mut x: f64) -> f64 {
     let x1p54 = f64::from_bits(0x4350_0000_0000_0000);
     let mut ui = x.to_bits();
