@@ -1055,6 +1055,30 @@ enum SearchCommand {
         #[arg(long, value_enum)]
         fusion: Option<FusionMethodInput>,
     },
+    /// Deterministically chunk one document into ingest-ready JSON.
+    Chunk {
+        /// Parent document identity carried by every chunk.
+        #[arg(long)]
+        parent: u128,
+        /// UTF-8 source text. Mutually exclusive with --file.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// UTF-8 source file. Mutually exclusive with --text.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Fixed window size in bytes.
+        #[arg(long, default_value_t = 1024)]
+        size: usize,
+        /// Fixed window overlap in bytes.
+        #[arg(long, default_value_t = 0)]
+        overlap: usize,
+        /// Pack whole sentences up to --size, never beyond --sentence-max.
+        #[arg(long)]
+        sentence: bool,
+        /// Hard sentence-mode window bound in bytes.
+        #[arg(long, default_value_t = 2048)]
+        sentence_max: usize,
+    },
     /// Atomically ingest integrated documents from one JSON array.
     Ingest {
         #[arg(long)]
@@ -3270,6 +3294,56 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                     },
                 },
             )
+        }
+        SearchCommand::Chunk {
+            parent,
+            text,
+            file,
+            size,
+            overlap,
+            sentence,
+            sentence_max,
+        } => {
+            let source = match (text, file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => {
+                    std::fs::read_to_string(path).map_err(|_| CliFailure::invalid())?
+                }
+                _ => return Err(CliFailure::invalid()),
+            };
+            let mode = if sentence {
+                hyphae_native_product::chunker::ChunkerMode::SentenceBounded {
+                    target: size,
+                    maximum: sentence_max,
+                }
+            } else {
+                hyphae_native_product::chunker::ChunkerMode::FixedBytes { size, overlap }
+            };
+            let documents = hyphae_native_product::chunker::chunk_documents(
+                parent,
+                &source,
+                hyphae_native_product::chunker::ChunkerConfig { mode },
+            )
+            .map_err(|_| CliFailure::invalid())?;
+            let rendered = documents
+                .into_iter()
+                .map(|document| {
+                    json!({
+                        "id": document.object_id.get().to_string(),
+                        "text": document.text,
+                        "doc_values": document
+                            .doc_values
+                            .into_iter()
+                            .map(|(name, value)| (name, doc_value_json(value)))
+                            .collect::<serde_json::Map<_, _>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_json(&json!({
+                "schema": "hyphae-chunk-documents-v1",
+                "parent": parent.to_string(),
+                "documents": rendered,
+            }))
         }
         SearchCommand::Ingest {
             collection,

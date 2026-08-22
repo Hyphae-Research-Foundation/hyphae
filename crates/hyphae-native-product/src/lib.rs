@@ -16,6 +16,7 @@ mod backup;
 mod cancellation;
 mod capabilities;
 mod catalog;
+pub mod chunker;
 mod default_scalar_keyspace;
 mod doctor;
 pub mod error;
