@@ -290,6 +290,7 @@ class DependencyReviewTests(unittest.TestCase):
             "Cargo.lock",
             "conformance/g6/runners/rust/Cargo.lock",
             "conformance/g7/runners/rust/Cargo.lock",
+            "embed/Cargo.lock",
             "fuzz/Cargo.lock",
             "sdks/typescript/package-lock.json",
             "integrations/javascript/package-lock.json",
