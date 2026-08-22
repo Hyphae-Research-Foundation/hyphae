@@ -10,6 +10,7 @@
 mod analyzer;
 mod ann_store;
 mod backup;
+pub mod bm25f;
 mod bounded_search;
 mod calibration;
 mod convergence;
