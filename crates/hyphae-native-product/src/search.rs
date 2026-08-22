@@ -188,6 +188,19 @@ pub enum ProductFusionMethod {
     WeightedScore,
 }
 
+/// Bounded first-k-per-parent deduplication over the final ranking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductParentDedupe {
+    /// Doc-value field holding the parent identity. Hits missing the field
+    /// are never deduplicated.
+    pub field: String,
+    /// Hits retained per distinct parent value, within `1..=100`.
+    pub first_k: usize,
+}
+
+/// Maximum hits retained per parent by deduplication.
+pub const MAX_PARENT_DEDUPE_FIRST_K: usize = 100;
+
 /// Complete bounded integrated search request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductSearchRequest {
@@ -208,6 +221,8 @@ pub struct ProductSearchRequest {
     /// Branch-combination method. Absent means the deterministic
     /// rank-based weighted reciprocal-rank fusion.
     pub fusion: Option<ProductFusionMethod>,
+    /// Optional first-k-per-parent deduplication over the final ranking.
+    pub parent_dedupe: Option<ProductParentDedupe>,
 }
 
 /// Physical vector strategy that actually ran.
@@ -954,12 +969,20 @@ impl NativeProduct {
         let doc_request = hyphae_native_runtime::DocValueRequest {
             filter: request.filter.clone(),
             sort: request.sort.clone(),
-            limit: request.limit,
+            limit: match &request.parent_dedupe {
+                None => request.limit,
+                // Deduplication needs the complete bounded ranking before
+                // the final truncation.
+                Some(_) => hyphae_native_runtime::MAX_DOC_VALUE_HITS,
+            },
             facets: request.facets.clone(),
             aggregations: request.aggregations.clone(),
         };
-        let result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
+        let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(dedupe) = &request.parent_dedupe {
+            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        }
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
@@ -1055,18 +1078,24 @@ impl NativeProduct {
                 })
             })
             .collect::<Result<Vec<_>, ProductError>>()?;
-        let result = execute_doc_values(
+        let mut result = execute_doc_values(
             &candidates,
             &hyphae_native_runtime::DocValueRequest {
                 filter: request.filter.clone(),
                 sort: request.sort.clone(),
-                limit: request.limit,
+                limit: match &request.parent_dedupe {
+                    None => request.limit,
+                    Some(_) => hyphae_native_runtime::MAX_DOC_VALUE_HITS,
+                },
                 facets: request.facets.clone(),
                 aggregations: request.aggregations.clone(),
             },
             &doc_value_limits(),
         )
         .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(dedupe) = &request.parent_dedupe {
+            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        }
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
             hits: result
@@ -1541,11 +1570,23 @@ fn validate_documents(
     Ok(())
 }
 
+fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(dedupe) = &request.parent_dedupe
+        && (dedupe.field.is_empty()
+            || dedupe.field.len() > 1_024
+            || !(1..=MAX_PARENT_DEDUPE_FIRST_K).contains(&dedupe.first_k))
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_search_request(
     definition: &SearchCollectionDefinitionV2,
     binding: &ProductSearchCollectionBinding,
     request: &ProductSearchRequest,
 ) -> Result<(), ProductError> {
+    validate_parent_dedupe(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
@@ -1824,6 +1865,40 @@ fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
 }
 
 /// Pinned posting type tags in the doc-value total order.
+/// Retains the first `first_k` hits per distinct parent value over the
+/// sorted ranking, then truncates to the requested limit. Hits without the
+/// parent field are never deduplicated. Grouping keys use the canonical
+/// posting component encoding so equality is exact and type-bound.
+fn apply_parent_dedupe(
+    hits: Vec<hyphae_native_runtime::DocValueCandidate>,
+    dedupe: &ProductParentDedupe,
+    limit: usize,
+) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
+    let mut counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut retained = Vec::new();
+    for hit in hits {
+        let keep = match hit.values.get(&dedupe.field) {
+            None => true,
+            Some(value) => {
+                let (tag, component) = posting_component(value)?;
+                let mut key = Vec::with_capacity(1 + component.len());
+                key.push(tag);
+                key.extend_from_slice(&component);
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= dedupe.first_k
+            }
+        };
+        if keep {
+            retained.push(hit);
+            if retained.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(retained)
+}
+
 fn posting_component(value: &ProductDocValue) -> Result<(u8, Vec<u8>), ProductError> {
     Ok(match value {
         ProductDocValue::Boolean(value) => (1, vec![u8::from(*value)]),

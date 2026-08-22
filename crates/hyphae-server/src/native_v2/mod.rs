@@ -2565,6 +2565,7 @@ mod tests {
                 aggregations: Vec::new(),
                 limit: 1,
                 fusion: None,
+                parent_dedupe: None,
             },
         };
         assert!(super::server::family_accepts(

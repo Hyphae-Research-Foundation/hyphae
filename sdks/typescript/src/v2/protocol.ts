@@ -268,7 +268,8 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
-    return Math.max(request.fusion === undefined ? 0 : 4, filterRequiredMinor(request.filter));
+    const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null);
+    return Math.max(extended ? 4 : 0, filterRequiredMinor(request.filter));
   }
   if (operation === "search_ingest") {
     const batch = (typeof args.batch === "object" && args.batch !== null ? args.batch : args) as Readonly<Record<string, unknown>>;
@@ -1510,10 +1511,22 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     encodeFacets((request.facets ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     encodeAggregations((request.aggregations ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     u64(BigInt(request.limit as number)),
-    // The default fusion keeps the exact historical bytes; the
-    // weighted-score selector appends one byte and requires minor 4.
-    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
+    // Content-derived tagged sections in ascending tag order: an absent
+    // section is the default and keeps the exact historical bytes.
+    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
+    ...encodeParentDedupe(request.parent_dedupe),
   );
+}
+
+function encodeParentDedupe(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const dedupe = value as Readonly<Record<string, unknown>>;
+  const field = dedupe.field;
+  const firstK = dedupe.first_k;
+  if (typeof field !== "string" || field.length === 0 || typeof firstK !== "number" || !Number.isInteger(firstK) || firstK < 1 || firstK > 100) {
+    throw new ClientError("integrated parent dedupe is invalid");
+  }
+  return [Uint8Array.of(2), bytes(new TextEncoder().encode(field)), u32(firstK)];
 }
 
 function encodeIntegratedVector(vector: Readonly<Record<string, unknown>>): Uint8Array {

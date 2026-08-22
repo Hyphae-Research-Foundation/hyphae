@@ -573,6 +573,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
+            parent_dedupe: None,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -636,6 +637,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
+                parent_dedupe: None,
             },
         });
         assert!(matches!(
@@ -673,6 +675,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion,
+                parent_dedupe: None,
             },
         })
     };
@@ -692,7 +695,41 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
         Err(ProductCodecError::Unsupported)
     ));
     let encoded = encode_product_request_for_minor(&weighted, 4)?;
-    assert_eq!(encoded.len(), default_encoded.len() + 1);
+    assert_eq!(encoded.len(), default_encoded.len() + 2);
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 4)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+
+    // Parent deduplication is a tagged section with the same discipline.
+    let deduped = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
+            parent_dedupe: Some(hyphae_native_product::ProductParentDedupe {
+                field: "parent".to_owned(),
+                first_k: 2,
+            }),
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&deduped, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&deduped, 4)?;
     assert!(matches!(
         decode_product_request_for_minor(&encoded, 3),
         Err(ProductCodecError::Unsupported)

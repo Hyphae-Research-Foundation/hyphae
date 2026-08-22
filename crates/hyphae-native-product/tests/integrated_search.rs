@@ -292,6 +292,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
             ],
             limit: 10,
             fusion: None,
+            parent_dedupe: None,
         },
         7,
     )?;
@@ -346,6 +347,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             aggregations: Vec::new(),
             limit: 2,
             fusion: None,
+            parent_dedupe: None,
         },
         0,
     )?;
@@ -393,6 +395,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
+            parent_dedupe: None,
         },
         0,
     )?;
@@ -433,6 +436,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
+                parent_dedupe: None,
             },
             0,
         )
@@ -462,6 +466,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
+                parent_dedupe: None,
             },
             0,
         )
@@ -499,6 +504,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         aggregations: Vec::new(),
         limit: 2,
         fusion: None,
+        parent_dedupe: None,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -515,6 +521,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         aggregations: Vec::new(),
         limit: 3,
         fusion: None,
+        parent_dedupe: None,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
@@ -535,6 +542,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
+        parent_dedupe: None,
     };
 
     let mut ann_artifact = None;
@@ -714,6 +722,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
+        parent_dedupe: None,
     };
     assert!(
         product
@@ -979,6 +988,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     aggregations: Vec::new(),
                     limit: 64,
                     fusion: None,
+                    parent_dedupe: None,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1034,6 +1044,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
+        parent_dedupe: None,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1056,6 +1067,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
+        parent_dedupe: None,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1093,6 +1105,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
+            parent_dedupe: None,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1127,6 +1140,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
+            parent_dedupe: None,
         },
     };
     let context = proof_context(&session, 42);
@@ -1172,6 +1186,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
         aggregations: Vec::new(),
         limit: 4,
         fusion,
+        parent_dedupe: None,
     };
     let rrf = product.search_collection(binding.collection, &request(None), 11)?;
     let weighted = product.search_collection(
@@ -1274,6 +1289,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                     aggregations: Vec::new(),
                     limit: 4,
                     fusion: None,
+                    parent_dedupe: None,
                 },
                 12,
             )
@@ -1433,6 +1449,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
+        parent_dedupe: None,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     assert!(!result.hits.is_empty());
@@ -1495,6 +1512,104 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[test]
+fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("parent-dedupe");
+    let (mut product, binding) = configure_chunked(&path)?;
+    let config = hyphae_native_product::chunker::ChunkerConfig {
+        mode: hyphae_native_product::chunker::ChunkerMode::FixedBytes {
+            size: 40,
+            overlap: 0,
+        },
+    };
+    let first_parent = "shared token ".repeat(12);
+    let second_parent = "shared token ".repeat(6);
+    let mut documents = Vec::new();
+    for (parent, source) in [
+        (1_u128, first_parent.as_str()),
+        (2_u128, second_parent.as_str()),
+    ] {
+        documents.extend(
+            hyphae_native_product::chunker::chunk_documents(parent, source, config)
+                .map_err(|error| format!("chunking failed: {error:?}"))?,
+        );
+    }
+    assert!(documents.len() >= 4);
+    product.ingest_search_batch(
+        binding.collection,
+        &ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents,
+        },
+        7,
+        ProductDurability::Strict,
+    )?;
+    let request = |dedupe| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "shared token".into(),
+            candidate_limit: 16,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 10,
+        fusion: None,
+        parent_dedupe: dedupe,
+    };
+    let all = product.search_collection(binding.collection, &request(None), 7)?;
+    assert!(all.hits.len() >= 4);
+    let deduped = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductParentDedupe {
+            field: "parent".into(),
+            first_k: 1,
+        })),
+        7,
+    )?;
+    assert_eq!(deduped.hits.len(), 2);
+    let mut parents = std::collections::BTreeSet::new();
+    for hit in &deduped.hits {
+        let ProductDocValue::Bytes(parent) = &hit.doc_values["parent"] else {
+            return Err("parent doc value expected".into());
+        };
+        parents.insert(parent.clone());
+    }
+    assert_eq!(parents.len(), 2);
+    // The best hit overall survives deduplication in first position.
+    assert_eq!(deduped.hits[0].object_id, all.hits[0].object_id);
+
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 71);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(hyphae_native_product::ProductParentDedupe {
+                field: "parent".into(),
+                first_k: 1,
+            })),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 fn bm25_probe_batch() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
     // "rust" appears twice in a long document and once in a short one: with
     // the default length normalization the short document ranks first, with
@@ -1536,6 +1651,7 @@ fn lexical_ranking(
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
+            parent_dedupe: None,
         },
         11,
     )?;

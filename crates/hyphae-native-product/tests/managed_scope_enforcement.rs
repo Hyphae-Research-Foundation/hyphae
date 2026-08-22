@@ -457,6 +457,7 @@ fn search_request() -> ProductSearchRequest {
         aggregations: Vec::new(),
         limit: 8,
         fusion: None,
+        parent_dedupe: None,
     }
 }
 
