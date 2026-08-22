@@ -785,6 +785,12 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
     ));
     let decoded = decode_product_request_for_minor(&encoded, 4)?;
     assert_eq!(encode_product_request(&decoded)?, encoded);
+    // Cross-language golden: the Python and TypeScript suites pin this same
+    // digest for the identically composed reranked request.
+    assert_eq!(
+        blake3::hash(&encoded).to_hex().as_str(),
+        "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
+    );
     Ok(())
 }
 

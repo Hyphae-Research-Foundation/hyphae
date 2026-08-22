@@ -268,7 +268,7 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
-    const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null);
+    const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
     return Math.max(extended ? 4 : 0, filterRequiredMinor(request.filter));
   }
   if (operation === "search_ingest") {
@@ -1515,7 +1515,35 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     // section is the default and keeps the exact historical bytes.
     ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
     ...encodeParentDedupe(request.parent_dedupe),
+    ...encodeRerank(request.rerank),
   );
+}
+
+function encodeRerank(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const rerank = value as Readonly<Record<string, unknown>>;
+  const attestation = rerank.attestation;
+  const scores = rerank.scores;
+  if (!(attestation instanceof Uint8Array) || attestation.byteLength === 0 || attestation.byteLength > 4096 || !Array.isArray(scores) || scores.length === 0 || scores.length > 256) {
+    throw new ClientError("integrated rerank stage is invalid");
+  }
+  const encodedScores = scores.map((entry) => {
+    const scored = entry as Readonly<Record<string, unknown>>;
+    if (typeof scored.object_id !== "bigint" && typeof scored.object_id !== "number") {
+      throw new ClientError("integrated rerank stage is invalid");
+    }
+    if (typeof scored.score !== "number") {
+      throw new ClientError("integrated rerank stage is invalid");
+    }
+    const encoded = new Uint8Array(24);
+    const view = new DataView(encoded.buffer);
+    const objectId = BigInt(scored.object_id as number | bigint);
+    view.setBigUint64(0, objectId & 0xffffffffffffffffn, true);
+    view.setBigUint64(8, objectId >> 64n, true);
+    view.setFloat64(16, scored.score, true);
+    return encoded;
+  });
+  return [Uint8Array.of(3), bytes(attestation), u32(scores.length), ...encodedScores];
 }
 
 function encodeParentDedupe(value: unknown): Uint8Array[] {

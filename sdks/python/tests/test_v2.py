@@ -178,6 +178,46 @@ class V2Tests(unittest.TestCase):
         )
         self.assertEqual(encoded, FIXTURE.read_bytes())
 
+    def test_attested_rerank_request_matches_the_cross_language_golden(self) -> None:
+        envelope = (
+            b"HYATTS01\x02"
+            + (6).to_bytes(2, "little")
+            + b"openai"
+            + (22).to_bytes(2, "little")
+            + b"text-embedding-3-small"
+            + bytes([3]) * 32
+            + bytes([4]) * 32
+        )
+        arguments = {
+            "collection": 13,
+            "request": {
+                "lexical": {"query": "rust", "candidate_limit": 4, "weight": 1},
+                "vectors": [],
+                "limit": 4,
+                "rerank": {
+                    "attestation": envelope,
+                    "scores": [
+                        {"object_id": 201, "score": 0.75},
+                        {"object_id": 202, "score": 0.25},
+                    ],
+                },
+            },
+        }
+        options = RequestOptions(logical_time_micros=10, durability="memory")
+        with self.assertRaises(ClientError):
+            encode_product_request(
+                "search_collection", arguments, options, negotiated_minor=3
+            )
+        encoded = encode_product_request(
+            "search_collection", arguments, options, negotiated_minor=4
+        )
+        # The same digest is pinned by the Rust protocol goldens and the
+        # TypeScript suite for this identically composed request.
+        self.assertEqual(
+            blake3(encoded).hex(),
+            "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
+        )
+
     def test_transaction_and_catalog_requests_round_trip(self) -> None:
         cases = (
             ("transaction_begin", {}),

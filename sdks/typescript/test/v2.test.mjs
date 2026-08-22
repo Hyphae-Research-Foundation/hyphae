@@ -369,6 +369,40 @@ test("v2 independent encoder matches shared fixture", async () => {
   assert.deepEqual(encodeFrame(FRAME_KIND.execute, 7, 42n, payload), fixture);
 });
 
+test("v2 attested rerank request matches the cross-language golden", () => {
+  const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const name = (value) => {
+    const encoded = new TextEncoder().encode(value);
+    return [encoded.byteLength & 0xff, encoded.byteLength >> 8, ...encoded];
+  };
+  const envelope = Uint8Array.from([
+    ...new TextEncoder().encode("HYATTS01"), 2,
+    ...name("openai"), ...name("text-embedding-3-small"),
+    ...Array(32).fill(3), ...Array(32).fill(4),
+  ]);
+  const args = {
+    collection: 13n,
+    request: {
+      lexical: { query: "rust", candidate_limit: 4, weight: 1 },
+      vectors: [],
+      limit: 4,
+      rerank: {
+        attestation: envelope,
+        scores: [
+          { object_id: 201n, score: 0.75 },
+          { object_id: 202n, score: 0.25 },
+        ],
+      },
+    },
+  };
+  const options = { logicalTimeMicros: 10n, durability: "memory" };
+  assert.throws(() => encodeProductRequest("search_collection", args, options, 3), /protocol minor/);
+  const encoded = encodeProductRequest("search_collection", args, options, 4);
+  // The same digest is pinned by the Rust protocol goldens and the Python
+  // suite for this identically composed request.
+  assert.equal(hex(blake3(encoded)), "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04");
+});
+
 test("v2 transaction and catalog requests round trip", () => {
   const cases = [
     ["transaction_begin", {}],

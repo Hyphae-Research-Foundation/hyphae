@@ -438,6 +438,7 @@ def operation_required_minor(
             extended = isinstance(request, dict) and (
                 request.get("fusion") is not None
                 or request.get("parent_dedupe") is not None
+                or request.get("rerank") is not None
             )
             fusion = 4 if extended else 0
             filter_minor = _filter_required_minor(
@@ -2208,6 +2209,28 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
         output.append(2)
         output.extend(_text(dedupe["field"]))
         output.extend(struct.pack("<I", dedupe["first_k"]))
+    rerank = request.get("rerank")
+    if rerank is not None:
+        if (
+            not isinstance(rerank, dict)
+            or not isinstance(rerank.get("attestation"), bytes)
+            or not 1 <= len(rerank["attestation"]) <= 4096
+            or not isinstance(rerank.get("scores"), list)
+            or not 1 <= len(rerank["scores"]) <= 256
+        ):
+            raise ClientError("integrated rerank stage is invalid")
+        output.append(3)
+        output.extend(_bytes(rerank["attestation"]))
+        output.extend(struct.pack("<I", len(rerank["scores"])))
+        for entry in rerank["scores"]:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("object_id"), int)
+                or not isinstance(entry.get("score"), (int, float))
+            ):
+                raise ClientError("integrated rerank stage is invalid")
+            output.extend(int(entry["object_id"]).to_bytes(16, "little"))
+            output.extend(struct.pack("<d", float(entry["score"])))
     return bytes(output)
 
 
