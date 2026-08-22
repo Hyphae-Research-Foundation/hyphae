@@ -33,6 +33,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [RAG relevance baseline — NFCorpus (2026-08-20)](gates/evidence/rag-relevance-nfcorpus-2026-08-20.md)
 - [RAG relevance at the 100k cap — FiQA (2026-08-21)](gates/evidence/rag-relevance-fiqa-2026-08-21.md)
 - [RAG filtered eligibility at the 100k cap (2026-08-22)](gates/evidence/rag-filtered-eligibility-2026-08-22.md)
+- [RAG hybrid fusion methods — NFCorpus (2026-08-22)](gates/evidence/rag-hybrid-fusion-nfcorpus-2026-08-22.md)
+- [RAG cross-host determinism — FiQA byte-identical directories (2026-08-22)](gates/evidence/rag-cross-host-determinism-2026-08-22.md)
 - [Attested local embedding replay — bge-small-en-v1.5 (2026-08-22)](gates/evidence/attested-embed-replay-2026-08-22.md)
 
 ## Build and embed
