@@ -295,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn declared_envelope_matches_the_cross_language_golden() -> Result<(), NativeProofError> {
+        // The SDK provider layers replicate this envelope byte-exactly; the
+        // same hex is asserted in the Python and TypeScript suites.
+        let encoded = declared().encode()?;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"HYATTS01\x02");
+        expected.extend_from_slice(&6_u16.to_le_bytes());
+        expected.extend_from_slice(b"openai");
+        expected.extend_from_slice(&22_u16.to_le_bytes());
+        expected.extend_from_slice(b"text-embedding-3-small");
+        expected.extend_from_slice(blake3::hash(b"request").as_bytes());
+        expected.extend_from_slice(blake3::hash(b"response").as_bytes());
+        assert_eq!(encoded, expected);
+        Ok(())
+    }
+
+    #[test]
     fn malformed_envelopes_fail_closed() -> Result<(), NativeProofError> {
         let mut encoded = local().encode()?;
         encoded.push(0);
