@@ -804,7 +804,11 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
     };
-    if filter.is_some_and(filter_requires_operator_semantics) {
+    let fusion = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. } if request.fusion.is_some()
+    );
+    if fusion || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
     } else {
         SEMANTICS_VERSION
@@ -812,9 +816,10 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
 }
 
 fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, NativeProofError> {
+    let semantics_version = required_semantics_version(operation);
     let mut encoded = Encoder::default();
     encoded.extend(REQUEST_MAGIC);
-    encoded.u16(required_semantics_version(operation));
+    encoded.u16(semantics_version);
     encoded.u16(ORDERING_VERSION);
     match operation {
         SemanticOperation::PointCatalog { id } => {
@@ -852,7 +857,7 @@ fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, N
             encoded.byte(OP_SEARCH_COLLECTION);
             encoded.extend(&logical_time_micros.to_le_bytes());
             encoded.u128(collection.get());
-            encode_integrated_request(&mut encoded, request)?;
+            encode_integrated_request(&mut encoded, request, semantics_version)?;
         }
         SemanticOperation::CatalogList(request) => {
             encoded.byte(OP_CATALOG_LIST);
@@ -871,9 +876,11 @@ fn decode_semantic_operation(
     limits: &NativeVerificationLimits,
 ) -> Result<SemanticOperation, NativeProofError> {
     let mut decoder = Decoder::new(encoded);
-    if decoder.take(8)? != REQUEST_MAGIC
+    let magic_ok = decoder.take(8)? == REQUEST_MAGIC;
+    let semantics_version = decoder.u16()?;
+    if !magic_ok
         || !matches!(
-            decoder.u16()?,
+            semantics_version,
             SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS
         )
         || decoder.u16()? != ORDERING_VERSION
@@ -914,7 +921,7 @@ fn decode_semantic_operation(
         OP_SEARCH_COLLECTION => SemanticOperation::SearchCollection {
             logical_time_micros: i64::from_le_bytes(decoder.array()?),
             collection: object_id(decoder.u128()?)?,
-            request: decode_integrated_request(&mut decoder, limits)?,
+            request: decode_integrated_request(&mut decoder, limits, semantics_version)?,
         },
         OP_CATALOG_LIST => {
             SemanticOperation::CatalogList(decode_catalog_list_request(&mut decoder)?)
@@ -1341,7 +1348,10 @@ fn hybrid_metadata(
     Ok(Some(HybridProofMetadata {
         branches,
         failure_policy: HybridFailurePolicy::FailClosed,
-        fusion_method: HybridFusionMethod::WeightedReciprocalRank,
+        fusion_method: match request.fusion {
+            None => HybridFusionMethod::WeightedReciprocalRank,
+            Some(crate::ProductFusionMethod::WeightedScore) => HybridFusionMethod::WeightedScore,
+        },
         duplicate_policy: HybridDuplicatePolicy::MergeByObjectId,
     }))
 }
@@ -1589,6 +1599,7 @@ fn decode_query(
 fn encode_integrated_request(
     encoded: &mut Encoder,
     request: &ProductSearchRequest,
+    semantics_version: u16,
 ) -> Result<(), NativeProofError> {
     encoded.byte(u8::from(request.lexical.is_some()));
     if let Some(lexical) = &request.lexical {
@@ -1638,12 +1649,22 @@ fn encode_integrated_request(
         put_text(encoded, &aggregation.name)?;
         encode_aggregation(encoded, &aggregation.aggregation)?;
     }
-    put_usize(encoded, request.limit)
+    put_usize(encoded, request.limit)?;
+    // The version-3 layout always carries a fusion selector byte; version 2
+    // keeps the exact historical bytes and can only express the default.
+    if semantics_version >= SEMANTICS_VERSION_OPERATORS {
+        encoded.byte(match request.fusion {
+            None => 0,
+            Some(crate::ProductFusionMethod::WeightedScore) => 1,
+        });
+    }
+    Ok(())
 }
 
 fn decode_integrated_request(
     decoder: &mut Decoder<'_>,
     limits: &NativeVerificationLimits,
+    semantics_version: u16,
 ) -> Result<ProductSearchRequest, NativeProofError> {
     let lexical = match decoder.byte()? {
         0 => None,
@@ -1721,6 +1742,16 @@ fn decode_integrated_request(
             aggregation: decode_aggregation(decoder, limits)?,
         });
     }
+    let limit = usize_value(decoder)?;
+    let fusion = if semantics_version >= SEMANTICS_VERSION_OPERATORS {
+        match decoder.byte()? {
+            0 => None,
+            1 => Some(crate::ProductFusionMethod::WeightedScore),
+            _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
+        }
+    } else {
+        None
+    };
     Ok(ProductSearchRequest {
         lexical,
         vectors,
@@ -1728,7 +1759,8 @@ fn decode_integrated_request(
         sort,
         facets,
         aggregations,
-        limit: usize_value(decoder)?,
+        limit,
+        fusion,
     })
 }
 

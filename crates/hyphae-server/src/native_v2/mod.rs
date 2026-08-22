@@ -2564,6 +2564,7 @@ mod tests {
                 facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 1,
+                fusion: None,
             },
         };
         assert!(super::server::family_accepts(

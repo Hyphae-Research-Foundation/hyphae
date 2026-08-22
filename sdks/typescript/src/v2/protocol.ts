@@ -266,9 +266,13 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
-  if (operation === "search_collection") return filterRequiredMinor(args.filter);
+  if (operation === "search_collection") {
+    const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
+    return Math.max(request.fusion === undefined ? 0 : 4, filterRequiredMinor(request.filter));
+  }
   if (operation === "search_ingest") {
-    const documents = Array.isArray(args.documents) ? args.documents : [];
+    const batch = (typeof args.batch === "object" && args.batch !== null ? args.batch : args) as Readonly<Record<string, unknown>>;
+    const documents = Array.isArray(batch.documents) ? batch.documents : [];
     return documents.reduce((highest: number, document) => Math.max(highest, documentRequiredMinor(document)), 0);
   }
   if (operation === "search_document_update") return documentRequiredMinor(args.document);
@@ -1506,6 +1510,9 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     encodeFacets((request.facets ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     encodeAggregations((request.aggregations ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     u64(BigInt(request.limit as number)),
+    // The default fusion keeps the exact historical bytes; the
+    // weighted-score selector appends one byte and requires minor 4.
+    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
   );
 }
 

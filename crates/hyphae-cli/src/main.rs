@@ -1042,6 +1042,9 @@ enum SearchCommand {
         /// JSON array of named metric aggregation requests.
         #[arg(long)]
         metrics_json: Option<String>,
+        /// Branch-combination method. Defaults to weighted reciprocal-rank.
+        #[arg(long, value_enum)]
+        fusion: Option<FusionMethodInput>,
     },
     /// Atomically ingest integrated documents from one JSON array.
     Ingest {
@@ -1551,6 +1554,12 @@ enum SearchQueryKind {
     Phrase,
     Prefix,
     Fuzzy,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FusionMethodInput {
+    /// Normalized weighted score blend across branches.
+    WeightedScore,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -3166,6 +3175,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             sort_json,
             facets_json,
             metrics_json,
+            fusion,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3228,6 +3238,11 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             .map(product_aggregation)
                             .collect::<Result<_, _>>()?,
                         limit,
+                        fusion: fusion.map(|method| match method {
+                            FusionMethodInput::WeightedScore => {
+                                hyphae_native_product::ProductFusionMethod::WeightedScore
+                            }
+                        }),
                     },
                 },
             )

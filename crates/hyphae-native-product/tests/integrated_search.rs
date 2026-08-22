@@ -283,6 +283,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 },
             ],
             limit: 10,
+            fusion: None,
         },
         7,
     )?;
@@ -336,6 +337,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 2,
+            fusion: None,
         },
         0,
     )?;
@@ -382,6 +384,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
+            fusion: None,
         },
         0,
     )?;
@@ -421,6 +424,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
+                fusion: None,
             },
             0,
         )
@@ -449,6 +453,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
+                fusion: None,
             },
             0,
         )
@@ -485,6 +490,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 2,
+        fusion: None,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -500,6 +506,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 3,
+        fusion: None,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
@@ -519,6 +526,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
+        fusion: None,
     };
 
     let mut ann_artifact = None;
@@ -697,6 +705,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
+        fusion: None,
     };
     assert!(
         product
@@ -961,6 +970,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     facets: Vec::new(),
                     aggregations: Vec::new(),
                     limit: 64,
+                    fusion: None,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1015,6 +1025,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
+        fusion: None,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1036,6 +1047,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
+        fusion: None,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1072,6 +1084,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
+            fusion: None,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1105,6 +1118,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
+            fusion: None,
         },
     };
     let context = proof_context(&session, 42);
@@ -1116,6 +1130,89 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
         NativeProofGenerationLimits::default(),
     )?;
     assert_eq!(plain.proof.content().semantics_version, 2);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("weighted-fusion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    // The vector query sits exactly on the lexically silent document: the
+    // rank-based fusion compresses its advantage into one reciprocal step,
+    // while the score-based blend lets the exact match dominate.
+    let image = ProductVector::new([3.0, 0.0])?;
+    let request = |fusion| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+        }),
+        vectors: vec![ProductVectorBranch {
+            target: "image".into(),
+            query: image.clone(),
+            candidate_limit: 4,
+            weight: 2,
+            execution: None,
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion,
+    };
+    let rrf = product.search_collection(binding.collection, &request(None), 11)?;
+    let weighted = product.search_collection(
+        binding.collection,
+        &request(Some(
+            hyphae_native_product::ProductFusionMethod::WeightedScore,
+        )),
+        11,
+    )?;
+    let rrf_ids: Vec<u128> = rrf.hits.iter().map(|hit| hit.object_id.get()).collect();
+    let weighted_ids: Vec<u128> = weighted
+        .hits
+        .iter()
+        .map(|hit| hit.object_id.get())
+        .collect();
+    // Both fusions admit the same candidate set; the score-based blend
+    // weights the vector branch heavily enough to change the leader.
+    assert_eq!(
+        rrf_ids.iter().collect::<std::collections::BTreeSet<_>>(),
+        weighted_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_ne!(rrf_ids, weighted_ids);
+    // The exact vector match leads under the score blend.
+    assert_eq!(weighted_ids[0], 204);
+
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 51);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(
+                hyphae_native_product::ProductFusionMethod::WeightedScore,
+            )),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())
@@ -1161,6 +1258,7 @@ fn lexical_ranking(
             facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
+            fusion: None,
         },
         11,
     )?;

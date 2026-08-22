@@ -1032,6 +1032,11 @@
             "minimum": 1,
             "maximum": 1024,
             "default": 10
+          },
+          "fusion": {
+            "type": ["string", "null"],
+            "enum": ["weighted_score", null],
+            "description": "Branch-combination method. Absent means deterministic weighted reciprocal-rank fusion; weighted_score blends branch weights with normalized branch scores."
           }
         }
       },
@@ -1509,6 +1514,11 @@
             "minimum": 1,
             "maximum": 1024,
             "default": 10
+          },
+          "fusion": {
+            "type": ["string", "null"],
+            "enum": ["weighted_score", null],
+            "description": "Branch-combination method. Absent means deterministic weighted reciprocal-rank fusion; weighted_score blends branch weights with normalized branch scores."
           }
         }
       },

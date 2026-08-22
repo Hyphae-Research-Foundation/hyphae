@@ -275,7 +275,15 @@ SEARCH_COLLECTION_INPUT_SCHEMA = {'type': 'object',
                 'limit': {'type': 'integer',
                           'minimum': 1,
                           'maximum': 1024,
-                          'default': 10}}}
+                          'default': 10},
+                'fusion': {'type': ['string', 'null'],
+                           'enum': ['weighted_score', None],
+                           'description': 'Branch-combination method. Absent '
+                                          'means deterministic weighted '
+                                          'reciprocal-rank fusion; '
+                                          'weighted_score blends branch '
+                                          'weights with normalized branch '
+                                          'scores.'}}}
 ERROR_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,

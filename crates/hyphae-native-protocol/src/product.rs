@@ -1136,7 +1136,11 @@ fn document_required_minor(document: &ProductDocument) -> u16 {
 /// doc-value types) raises the requirement here rather than adding a new
 /// operation variant.
 fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
-    filter_required_minor(&request.filter)
+    let fusion = match request.fusion {
+        None => 0,
+        Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => 4,
+    };
+    filter_required_minor(&request.filter).max(fusion)
 }
 
 fn ensure_operation_minor(
@@ -4928,6 +4932,12 @@ fn encode_search_collection(
         }
     }
     put_u64(encoded, request.limit)?;
+    // The fusion selector is content-derived: the default method keeps the
+    // exact historical bytes and a non-default method appends one byte.
+    match request.fusion {
+        None => {}
+        Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => encoded.push(1),
+    }
     Ok(())
 }
 
@@ -5066,6 +5076,14 @@ fn decode_search_collection(
         aggregations.push(ProductNamedAggregation { name, aggregation });
     }
     let limit = decoder.usize()?;
+    let fusion = if decoder.has_remaining() {
+        match decoder.u8()? {
+            1 => Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
+            _ => return Err(ProductCodecError::InvalidValue),
+        }
+    } else {
+        None
+    };
     Ok((
         collection,
         ProductSearchRequest {
@@ -5076,6 +5094,7 @@ fn decode_search_collection(
             facets,
             aggregations,
             limit,
+            fusion,
         },
     ))
 }
@@ -6700,6 +6719,10 @@ struct Decoder<'a> {
 impl<'a> Decoder<'a> {
     const fn new(remaining: &'a [u8]) -> Self {
         Self { remaining }
+    }
+
+    const fn has_remaining(&self) -> bool {
+        !self.remaining.is_empty()
     }
 
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], ProductCodecError> {
