@@ -148,6 +148,19 @@ V1 default ranking is versioned BM25F:
 - score ordering is descending, followed by stable object ID ascending;
 - explanations name every term, field statistic, parameter and contribution.
 
+The catalog analyzer types are real for integrated collections: the
+configurable pipeline runs as a deterministic text-to-text transform at the
+product boundary, at ingest and at query, in front of the canonical analyzer
+(NFKC, Unicode case fold, alphanumeric tokenization). `UnicodeWord` with
+exactly the `Lowercase` filter — or no analyzer — is the identity and keeps
+existing collections byte-identical. Frozen version-one stages compose in
+ascending filter order: Latin diacritic folding over an explicit table,
+English stop-word removal (the classic 33-word list), and English Porter
+stemming. Shapes the transform cannot honor exactly — non-word tokenizers on
+lexical fields, pipelines without `Lowercase`, out-of-order filters — fail
+closed at ingest and query. Recovery replays the transformed text through
+the canonical analyzer and lands on identical postings.
+
 The current scorer uses BM25 with per-collection `k1`/`b` taken from the
 index definition (defaults `k1=1.2`, `b=0.75`; micro-unit integers in the
 catalog so identical definitions score identically on every host), query-term

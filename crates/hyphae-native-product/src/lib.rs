@@ -20,6 +20,7 @@ mod default_scalar_keyspace;
 mod doctor;
 pub mod error;
 pub mod error_codec;
+mod lexical_analyzer;
 mod limits;
 mod operation;
 /// Canonical, bounded native proof and directory-witness artifacts.
