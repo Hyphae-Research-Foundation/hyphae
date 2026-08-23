@@ -97,7 +97,7 @@ class AgentPluginContractTests(unittest.TestCase):
             ):
                 path = root / relative
                 path.write_text(path.read_text(encoding="utf-8").replace("2.0.0", "0.2.0"), encoding="utf-8")
-            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 1.2"):
+            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 2.0"):
                 validate(root)
 
     def test_credential_material_is_rejected_everywhere(self) -> None:
