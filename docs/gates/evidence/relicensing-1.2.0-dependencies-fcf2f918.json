@@ -39,9 +39,9 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-08-23T10:28:17.813335+00:00",
+  "generated_at_utc": "2026-08-23T15:49:38.709879+00:00",
   "inventory": {
-    "canonical_sha256": "95fe65ead4d10f5cb42e4390a61d71d6ada89cf0d1a44e0a898b60bc023b3241",
+    "canonical_sha256": "1a0ec7712316c01ff20416bab06b67c59bd160de0dab061ed711c0a038f5a457",
     "external_package_count": 272,
     "package_count": 299,
     "packages": [
@@ -603,189 +603,189 @@
         "license_file": null,
         "name": "hyphae-cli",
         "source": "workspace:crates/hyphae-cli/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-client",
         "source": "workspace:crates/hyphae-client/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-conformance-rust",
         "source": "workspace:conformance/rust/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-contracts",
         "source": "workspace:crates/hyphae-contracts/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-core",
         "source": "workspace:crates/hyphae-core/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-engine",
         "source": "workspace:crates/hyphae-engine/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-independent-backup-verifier",
         "source": "workspace:conformance/g8/independent-backup-verifier/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-ann",
         "source": "workspace:crates/hyphae-native-ann/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-blobs",
         "source": "workspace:crates/hyphae-native-blobs/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-btree",
         "source": "workspace:crates/hyphae-native-btree/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-catalog",
         "source": "workspace:crates/hyphae-native-catalog/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-daemon",
         "source": "workspace:crates/hyphae-native-daemon/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-manifest",
         "source": "workspace:crates/hyphae-native-manifest/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-mvcc",
         "source": "workspace:crates/hyphae-native-mvcc/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-pages",
         "source": "workspace:crates/hyphae-native-pages/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-product",
         "source": "workspace:crates/hyphae-native-product/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-protocol",
         "source": "workspace:crates/hyphae-native-protocol/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-records",
         "source": "workspace:crates/hyphae-native-records/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-runtime",
         "source": "workspace:crates/hyphae-native-runtime/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-types",
         "source": "workspace:crates/hyphae-native-types/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-native-wal",
         "source": "workspace:crates/hyphae-native-wal/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-pliegors",
         "source": "workspace:integrations/pliegors/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-query",
         "source": "workspace:crates/hyphae-query/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-retrieval",
         "source": "workspace:crates/hyphae-retrieval/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-server",
         "source": "workspace:crates/hyphae-server/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-storage",
         "source": "workspace:crates/hyphae-storage/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Apache-2.0",
         "license_file": null,
         "name": "hyphae-v2-fixture",
         "source": "workspace:conformance/v2/fixture/Cargo.toml",
-        "version": "2.0.0"
+        "version": "2.0.1"
       },
       {
         "license": "Unicode-3.0",
@@ -2151,27 +2151,27 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "f81898d4e842b93d4316ab735272dab40c40af7c",
+    "commit": "6af6d651332662efef335112bbab1d8087ba6477",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/celiumsai/hyphae.git",
-    "source_inputs_sha256": "754343899a56bbcddd91feaab57b126ca133458f6b2ff5c6dd51120d70a79977",
-    "tree": "2ddfec164eb9ce21497d04c47028ca0eb7950d47",
+    "source_inputs_sha256": "23827b6425cb22a2fa0b9431e42cc994fe6e784a334f2bb9641232a9a582e1a9",
+    "tree": "e6a59ebf6d349163faf922c4b9873175110a4d70",
     "worktree_clean": false
   },
   "source_inputs": [
     {
       "path": "Cargo.lock",
-      "sha256": "aad83478788f4c278ee5f0500381cc05ee3e8687d243b851ac1294d97e195419"
+      "sha256": "7a7c3812e0e47390c5b4b7acd61e0e67a5ddde15ca6af9cf2905bb3145c6de47"
     },
     {
       "path": "Cargo.toml",
-      "sha256": "5eea828ca8cc4d0131200816b43d423f30ec58f7e9d691a68bf6d13e5574983e"
+      "sha256": "d6ed52f1eed3a7ec919a9fe8a7f4c5d572644840d46a3f18f2f765d3532700c3"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
-      "sha256": "a6ff440a741387af1183973a4d2841a025afdea908f76785c61e4f5094611004"
+      "sha256": "73f83f7fec3fb35228608dd3586a0f0ecebba5f9b0bb8c38450d03392f4b3271"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.toml",
@@ -2179,7 +2179,7 @@
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.lock",
-      "sha256": "11281bd3144c40dcabb8c7a0cb508b1224bac15d6ec60aa6df55790780133ee4"
+      "sha256": "b0835f57725d5e761ac1daf7ca94a4bc22fa9b8e14fa51001dc618335717ceeb"
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.toml",
@@ -2303,11 +2303,11 @@
     },
     {
       "path": "fuzz/Cargo.lock",
-      "sha256": "82dd6ffd19ede5de3b2f18ebd4d3a2513192d1302d906d09827cdd6e449441d2"
+      "sha256": "7c2b2cb261ac0536021cda1315358838004fb73895ad91b8dc25ee4a64215d2c"
     },
     {
       "path": "fuzz/Cargo.toml",
-      "sha256": "62e636f0c03f54e9c1cd979b0e8bf17fb9e525573f6953e3fe50db44dfe90b38"
+      "sha256": "179184cab4a02b14049ab8fba53dfe4f0a9e4307769e0a1d2f87dbbc096166de"
     },
     {
       "path": "integrations/pliegors/Cargo.toml",
@@ -2331,6 +2331,6 @@
       "{p} {l}"
     ],
     "normalized_unique_line_count": 623,
-    "normalized_unique_lines_sha256": "18f3c240f3dd032d9c4b47d063e5087603de4709ddf480e7cdabdc1205bbf5fe"
+    "normalized_unique_lines_sha256": "a2a4e16504618b46d9c93045b05f9705fdae78b1ff97148306b790d013381abe"
   }
 }

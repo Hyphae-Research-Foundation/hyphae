@@ -3,6 +3,26 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [2.0.1] - 2026-08-23
+
+Hyphae 2.0.1 is the registry publication of the 2.0 program. The first
+live 2.0.0 gate runs exposed two defects in tag-bound control code — the
+distribution policy rejected the new optional extras' guarded
+requirements, and an operator recovery deleted the immutable 2.0.0
+GitHub release, permanently retiring that tag name for release
+creation — so the publication ships as a new exact release version, the
+same discipline as 1.2.2. It contains no engine changes.
+
+### Fixed
+
+- The Python distribution policy admits the frozen optional extras
+  (`providers`, `langchain`, `llamaindex`): every declared requirement
+  must be one of the frozen extra-guarded strings, the base install
+  still carries zero runtime dependencies, and unguarded or unknown
+  requirements still fail closed.
+- The DCO certificate walk exempts the forge's merge commits, matching
+  reference DCO practice.
+
 ## [2.0.0] - 2026-08-23
 
 Hyphae 2.0.0 completes the RAG competitive program: hybrid retrieval,
