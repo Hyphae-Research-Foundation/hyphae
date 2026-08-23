@@ -337,9 +337,9 @@ def add_final_signature_bundles(directory: Path) -> None:
 
 class PackageTests(unittest.TestCase):
     def test_apache_publication_is_blocked_until_version_1_2_2(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "1.2.2"):
+        with self.assertRaisesRegex(RuntimeError, "2.0.0"):
             require_final_apache_release_version("1.2.1")
-        require_final_apache_release_version("1.2.2")
+        require_final_apache_release_version("2.0.0")
 
     def test_release_candidate_versions_are_aligned(self) -> None:
         cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
@@ -365,7 +365,7 @@ class PackageTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(version, "1.2.2")
+        self.assertEqual(version, "2.0.0")
         self.assertEqual(python["project"]["version"], version)
         self.assertEqual(typescript["version"], version)
         self.assertEqual(typescript_lock["version"], version)

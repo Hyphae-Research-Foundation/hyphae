@@ -87,7 +87,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         "repository": "celiumsai/hyphae",
         "ecosystem": ecosystem,
         "source": {
-            "tag": "v1.2.2",
+            "tag": "v2.0.0",
             "tag_object": TAG_OBJECT,
             "commit": COMMIT,
             "tree": TREE,
@@ -139,7 +139,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "1.2.2",
+            "version": "2.0.0",
             "config": "config/crates-io-release.json",
         },
     }
@@ -155,7 +155,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "1.2.2",
+        "version": "2.0.0",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -184,9 +184,9 @@ class RegistryPublishGateTests(unittest.TestCase):
             return _Response()
 
         with patch("tools.check_registry_publish.urllib.request.urlopen", opener):
-            _url_bytes("https://crates.io/api/v1/crates/demo/1.2.2", "metadata")
+            _url_bytes("https://crates.io/api/v1/crates/demo/2.0.0", "metadata")
             _url_bytes(
-                "https://crates.io/api/v1/crates/demo/1.2.2/download",
+                "https://crates.io/api/v1/crates/demo/2.0.0/download",
                 "crate",
                 accept=None,
             )
@@ -200,7 +200,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             payload = io.BytesIO()
             with tarfile.open(fileobj=payload, mode="w:gz") as archive:
                 encoded = json.dumps(vcs).encode("utf-8")
-                member = tarfile.TarInfo("demo-1.2.2/.cargo_vcs_info.json")
+                member = tarfile.TarInfo("demo-2.0.0/.cargo_vcs_info.json")
                 member.size = len(encoded)
                 archive.addfile(member, io.BytesIO(encoded))
             return payload.getvalue()
@@ -208,10 +208,10 @@ class RegistryPublishGateTests(unittest.TestCase):
         clean_without_marker = {"git": {"sha1": COMMIT}, "path_in_vcs": "crates/demo"}
         clean_with_marker = {"git": {"sha1": COMMIT, "dirty": False}, "path_in_vcs": ""}
         dirty = {"git": {"sha1": COMMIT, "dirty": True}, "path_in_vcs": ""}
-        self.assertEqual(_crate_vcs_commit(crate(clean_without_marker), "demo", "1.2.2"), COMMIT)
-        self.assertEqual(_crate_vcs_commit(crate(clean_with_marker), "demo", "1.2.2"), COMMIT)
+        self.assertEqual(_crate_vcs_commit(crate(clean_without_marker), "demo", "2.0.0"), COMMIT)
+        self.assertEqual(_crate_vcs_commit(crate(clean_with_marker), "demo", "2.0.0"), COMMIT)
         with self.assertRaisesRegex(GateFailure, "dirty"):
-            _crate_vcs_commit(crate(dirty), "demo", "1.2.2")
+            _crate_vcs_commit(crate(dirty), "demo", "2.0.0")
 
     def materialize(self, root: Path, version: str = "1.1.0") -> None:
         (root / "config").mkdir()
@@ -412,7 +412,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 1.2.2" in item for item in failures))
+        self.assertTrue(any("blocked until exact version 2.0.0" in item for item in failures))
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (

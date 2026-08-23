@@ -1,7 +1,7 @@
 {
   "name": "hyphae",
   "description": "Inspect a local Hyphae data engine through bounded Native v2 MCP tools with an Instance-scoped Auditor API key.",
-  "version": "1.2.2",
+  "version": "2.0.0",
   "author": {
     "name": "Celiums Solutions LLC",
     "url": "https://hyphae.dev"

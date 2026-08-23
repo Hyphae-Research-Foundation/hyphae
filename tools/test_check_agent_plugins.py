@@ -84,7 +84,7 @@ class AgentPluginContractTests(unittest.TestCase):
             json.loads(
                 (ROOT / "plugins/hyphae/.codex-plugin/plugin.json").read_text(encoding="utf-8")
             )["version"],
-            "1.2.2",
+            "2.0.0",
         )
 
     def test_plugin_version_cannot_remain_on_the_legacy_bundle(self) -> None:
@@ -96,7 +96,7 @@ class AgentPluginContractTests(unittest.TestCase):
                 ".claude-plugin/marketplace.json",
             ):
                 path = root / relative
-                path.write_text(path.read_text(encoding="utf-8").replace("1.2.2", "0.2.0"), encoding="utf-8")
+                path.write_text(path.read_text(encoding="utf-8").replace("2.0.0", "0.2.0"), encoding="utf-8")
             with self.assertRaisesRegex(AgentPluginValidationError, "bounded 1.2"):
                 validate(root)
 

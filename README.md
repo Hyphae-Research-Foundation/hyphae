@@ -26,7 +26,7 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`v1.2.2`](https://github.com/celiumsai/hyphae/releases/tag/v1.2.2)
+**Stable Native release:** [`v2.0.0`](https://github.com/celiumsai/hyphae/releases/tag/v2.0.0)
 is the latest release of the active Native architecture. G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
@@ -39,7 +39,7 @@ gate.
 the operator console, agent plugins, the published Python client, and the
 Apache-2.0 software transition. [`v1.2.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.2.0)
 closed the exact-SHA release gates with signed GitHub Release archives;
-`v1.2.2` re-issues that program from the current integration tree as the
+`v2.0.0` re-issues that program from the current integration tree as the
 Apache-2.0 registry publication for crates.io, PyPI, and npm. Until a given
 registry publication completes, the latest already-published registry version
 is `1.1.0` under that release's original terms; its exact checksums, source
@@ -111,20 +111,20 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`v1.2.2` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.2.2),
+[`v2.0.0` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v2.0.0),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 1.2.2 --locked
+cargo install hyphae-cli --version 2.0.0 --locked
 ```
 
-That coordinate is valid once the `v1.2.2` publication completes; the latest
+That coordinate is valid once the `v2.0.0` publication completes; the latest
 already-published version is `1.1.0`. Build and embed the exact release from
 source with:
 
 ```bash
-git checkout v1.2.2
+git checkout v2.0.0
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```
@@ -203,7 +203,7 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-Version `1.2.2` publishes the complete 24-crate graph:
+Version `2.0.0` publishes the complete 24-crate graph:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;

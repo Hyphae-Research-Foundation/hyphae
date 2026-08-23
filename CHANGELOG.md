@@ -3,6 +3,68 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [2.0.0] - 2026-08-23
+
+Hyphae 2.0.0 completes the RAG competitive program: hybrid retrieval,
+attested model stages, budgeted highlighting, verifiable agent memory,
+framework adapters, and the Weaviate exit ramp — every claim seated in
+the retrieval claim ledger with a receipt.
+
+### Added
+
+- Hybrid retrieval measured under the sealed protocol: +17.9% nDCG@10
+  over lexical on NFCorpus with attested local embeddings; the
+  deterministic weighted reciprocal-rank fusion default is a measured
+  choice over `weighted_score`.
+- Attested model stages end to end: the `HYATTS01` envelope and pure
+  verifier in core, `hyphae-embed` (candle, CPU-replayable) for
+  embeddings and reranking, declared-provider records in both SDKs, and
+  the sealed rerank stage the engine applies without running any model
+  (+11.5% nDCG@10 over BM25 with no vector index; the same bi-encoder
+  stacked on hybrid subtracts 2.9% — published).
+- Budgeted highlighting at protocol minor 5: deterministic
+  normalized-text fragments per hit, proof-bound budget at semantics
+  version 4, cross-language goldens in all three codecs.
+- Deterministic chunking with provenance sealed in proofs, parent
+  deduplication, and the raised 100,000-document collection cap with
+  filtered-eligibility evidence.
+- `search consolidate`: bounded ANN delta consolidation through a new
+  admin maintenance-status surface.
+- Verifiable agent memory as three MCP tools (store, recall, forget):
+  lifecycle-keyed TTL, recall that filters dead memories and can seal
+  itself, tool schema v4.
+- LangChain and LlamaIndex vector stores with provable retrieval and the
+  provable RAG cookbook.
+- The Weaviate exit ramp: a cursor-API importer with sealed fidelity
+  receipts and the "Leave Weaviate with a receipt" guide, demonstrated
+  live against the head-to-head instance (3,633/3,633 objects, exact).
+- The retrieval claim protocol: every published number maps to a
+  regenerable receipt, losses published with the wins — including the
+  head-to-head where hybrid quality, rerun stability, and cold start win
+  while strict-durable ingest and small-scale RSS lose.
+
+### Fixed
+
+- The local daemon no longer closes a connection when a flow-control
+  credit races the stream's own completion — streamed responses beyond
+  the crediting threshold (sealed proofs with megabyte witnesses) now
+  leave the connection healthy.
+- The Python SDK decodes integrated search responses again (a property
+  called as a method broke every integrated decode); Rust-encoded
+  response goldens now lock the decode path in both SDK suites.
+- The CLI dispatch runs on a worker with an explicit stack and a
+  heap-pinned future, ending Windows main-thread stack overflows.
+- Windows-hosted CI stabilized across the protocol minor-5 authority
+  sweep.
+
+### Compatibility
+
+- Native local protocol minor 5 (minor-4 exchanges keep exact
+  historical bytes); HTTP v2 serves minors 3, 4, and 5.
+- Proof semantics version 4 for requests carrying a highlight budget;
+  verifiers accept versions 2 through 4.
+- On-disk directory format unchanged from 1.2.
+
 ## [1.2.2] - 2026-08-19
 
 Hyphae 1.2.2 is the Apache-2.0 registry publication of the 1.2 program. The
