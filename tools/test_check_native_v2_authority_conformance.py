@@ -109,8 +109,8 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
                 source = (ROOT / relative).read_text(encoding="utf-8")
                 if relative.endswith("handshake.rs"):
                     source = source.replace(
-                        "pub const PROTOCOL_MINOR: u16 = 4;",
                         "pub const PROTOCOL_MINOR: u16 = 5;",
+                        "pub const PROTOCOL_MINOR: u16 = 6;",
                     )
                 target.write_text(source, encoding="utf-8")
             with self.assertRaisesRegex(

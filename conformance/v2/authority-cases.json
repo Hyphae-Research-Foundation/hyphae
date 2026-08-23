@@ -558,7 +558,7 @@
   },
   "protocol": {
     "current_major": 1,
-    "current_minor": 4,
+    "current_minor": 5,
     "rejections_before_dispatch": [
       {
         "case": "minor-0-read",

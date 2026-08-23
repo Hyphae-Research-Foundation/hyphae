@@ -23,7 +23,7 @@ x-hyphae-protocol-minor: >-
   no duplicates, no leading zeros). The server selects the highest offered
   minor it serves, rejects an offer without a served member before
   authentication or dispatch, and emits the selected minor on every response.
-  This build serves minors 3 and 4.
+  This build serves minors 3, 4, and 5.
 x-hyphae-authentication-modes:
   unmanaged: >-
     Before bootstrap, new preserves the legacy adapter and an optional fixed

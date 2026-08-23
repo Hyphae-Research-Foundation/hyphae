@@ -30,10 +30,10 @@ from .protocol import (
 
 PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1"
 ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1"
-PROTOCOL_MINOR = "4"
+PROTOCOL_MINOR = "5"
 # Every protocol minor this build speaks, ascending. The request offers the
 # whole set and the server echoes its selection, which must be a member.
-PROTOCOL_MINORS_SUPPORTED = (3, 4)
+PROTOCOL_MINORS_SUPPORTED = (3, 4, 5)
 _STANDARD_HTTP_CONNECTION = http.client.HTTPConnection
 _STANDARD_HTTPS_CONNECTION = http.client.HTTPSConnection
 _CONNECT_PENDING = {

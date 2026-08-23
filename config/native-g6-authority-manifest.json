@@ -85,7 +85,7 @@
     },
     {
       "reference": "docs/native/http-v2.md",
-      "sha256": "9d5348e30e1d000a687919df497d1806e71508f0925802347957c293cd871b5c"
+      "sha256": "56620d50bfe265f8fbd762d99b8a07889ee88ef17eba9e31d870d3736a0c7651"
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
@@ -109,7 +109,7 @@
     },
     {
       "reference": "contracts/openapi/hyphae-v2.yaml",
-      "sha256": "5b6a36823b5a10d7e7e3c126a2eaf5e51f4e18f46a5e14ee8b43133f7324fcc8"
+      "sha256": "6a1d2209cbc01b0c04a0b4f6806c4514ff75be95dd695ce7a842680e19d45036"
     },
     {
       "reference": "contracts/json-schema/native-v2.schema.json",

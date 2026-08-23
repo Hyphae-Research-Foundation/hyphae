@@ -688,7 +688,7 @@ class ManagedHttpTests(unittest.TestCase):
                         RequestOptions(request_id=100 + offset, idempotency_token=100 + offset),
                     )
                 self.assertEqual(_HttpConnection.path, "/v2/security/keys")
-                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3,4")
+                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3,4,5")
 
 
 @unittest.skipIf(os.name == "nt", "AF_UNIX live parity runs on POSIX")
