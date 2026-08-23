@@ -16,13 +16,13 @@
   },
   "transitioned_tree": {
     "digest_domain": "hyphae-relicensing-transition-tree-v1",
-    "content_sha256": "e590c148287dd2d14cdf4cc024b03527996fb514caf48856515ed07660513787",
-    "path_count": 1383,
+    "content_sha256": "beabff345359ec7f87965a1d905970bfecd70b2325ba32d123c07a9106e0e2b7",
+    "path_count": 1384,
     "excluded_paths": [
       "docs/gates/evidence/relicensing-1.2.0-transition.json"
     ],
     "category_counts": {
-      "narrative-documentation": 280,
+      "narrative-documentation": 281,
       "normative-specification": 161,
       "reserved-trademark-asset": 2,
       "software": 939,

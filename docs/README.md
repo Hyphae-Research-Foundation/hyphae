@@ -44,6 +44,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Stable API error codes](api/error-codes-v1.md)
 - [Public clients](clients/v1.md)
 - [Optional framework adapters](integrations/optional-adapters.md)
+- [Provable RAG cookbook](integrations/rag-cookbook.md)
 - [MCP adapter](../mcp/README.md)
 - [Executable examples](../examples/README.md)
 
