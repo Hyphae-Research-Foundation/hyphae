@@ -1264,6 +1264,46 @@ async fn prepared_handle_can_be_deallocated() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_window_update_for_a_completed_stream_is_benign() -> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("late-window-update")?;
+    let daemon = NativeDaemon::start(
+        NativeProduct::create(&test.data)?,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect(&test.socket, 64 * 1024).await?;
+    client
+        .send_request(7, 2, &request(ProductOperation::Capabilities))
+        .await?;
+    assert!(matches!(
+        client.response(7, 2).await?,
+        ProductResponse::Capabilities(_)
+    ));
+    // A credit for the already-completed stream races the server's own END
+    // teardown in real clients; the connection must survive it.
+    client
+        .codec
+        .send(
+            &mut &client.stream,
+            FrameKind::WindowUpdate,
+            7,
+            2,
+            &encode_window_update(4096)?,
+        )
+        .await?;
+    client
+        .send_request(9, 3, &request(ProductOperation::Capabilities))
+        .await?;
+    assert!(matches!(
+        client.response(9, 3).await?,
+        ProductResponse::Capabilities(_)
+    ));
+    drop(client);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flow_control_stalls_data_until_window_update() -> Result<(), Box<dyn Error>> {
     let test = TestDirectory::new("flow-control")?;
     let daemon = NativeDaemon::start(

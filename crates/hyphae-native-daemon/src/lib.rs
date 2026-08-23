@@ -1097,15 +1097,20 @@ async fn connection_loop(
                 validate_control_identity(frame.stream_id, frame.request_id)?;
                 let increment = decode_window_update(&frame.payload)?;
                 let mut windows = windows.lock().map_err(|_| DaemonError::Task)?;
-                let window = windows
-                    .get_mut(&frame.stream_id)
-                    .ok_or(DaemonError::ClientProtocol)?;
-                if window.request_id != frame.request_id {
-                    return Err(DaemonError::ClientProtocol);
+                // A credit can race the stream's own completion: the server
+                // tears the window down when it emits END while the client's
+                // final update is still in flight. A credit that names no
+                // live window, or a window a newer request now owns, is a
+                // benign late arrival — the bounded increment still passes
+                // validation, and nothing is credited.
+                match windows.get_mut(&frame.stream_id) {
+                    Some(window) if window.request_id == frame.request_id => {
+                        window.window.update(increment)?;
+                        drop(windows);
+                        window_notify.notify_waiters();
+                    }
+                    _ => drop(windows),
                 }
-                window.window.update(increment)?;
-                drop(windows);
-                window_notify.notify_waiters();
             }
             FrameKind::Execute | FrameKind::Prepare | FrameKind::Deallocate => {
                 validate_control_identity(frame.stream_id, frame.request_id)?;
