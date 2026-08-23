@@ -1634,7 +1634,14 @@ enum SearchQueryKind {
 #[derive(Debug, clap::Subcommand)]
 enum AgentCommand {
     /// Create every Agent Memory resource and smoke test the surface.
-    Setup,
+    Setup {
+        /// Enable and start the user service without asking.
+        #[arg(long, conflicts_with = "no_service")]
+        enable_service: bool,
+        /// Skip service installation entirely.
+        #[arg(long)]
+        no_service: bool,
+    },
     /// Redacted local status: paths, initialization, credentials.
     Status,
     /// Engine doctor over the Agent Memory directory.
@@ -1643,12 +1650,35 @@ enum AgentCommand {
     Backup,
     /// Remove generated credentials while preserving data and backups.
     Remove,
+    /// Restore one verified backup into the data directory.
+    Restore {
+        /// Backup directory produced by `hyphae agent backup`.
+        #[arg(long)]
+        backup: PathBuf,
+    },
+    /// Stop, back up, doctor, and restart the service around an upgrade.
+    Upgrade,
+    /// Generate one agent host's MCP configuration.
+    Configure {
+        #[arg(value_enum)]
+        host: AgentHost,
+        /// Write the configuration instead of printing it.
+        #[arg(long)]
+        write: bool,
+    },
     /// Permanently delete the data directory after confirmation.
     PurgeData {
         /// Skip the interactive confirmation.
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentHost {
+    Claude,
+    Codex,
+    Opencode,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1959,11 +1989,25 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             compatibility::remote(&base_url, bearer_token_file.as_deref(), operation).await,
         ),
         Command::Agent { command } => match command {
-            AgentCommand::Setup => agent::setup().map_err(Into::into),
+            AgentCommand::Setup {
+                enable_service,
+                no_service,
+            } => agent::setup(enable_service, no_service).map_err(Into::into),
             AgentCommand::Status => agent::status().map_err(Into::into),
             AgentCommand::Doctor => agent::doctor().map_err(Into::into),
             AgentCommand::Backup => agent::backup().map_err(Into::into),
             AgentCommand::Remove => agent::remove().map_err(Into::into),
+            AgentCommand::Restore { backup } => agent::restore(&backup).map_err(Into::into),
+            AgentCommand::Upgrade => agent::upgrade().map_err(Into::into),
+            AgentCommand::Configure { host, write } => agent::configure(
+                match host {
+                    AgentHost::Claude => agent::Host::Claude,
+                    AgentHost::Codex => agent::Host::Codex,
+                    AgentHost::Opencode => agent::Host::Opencode,
+                },
+                write,
+            )
+            .map_err(Into::into),
             AgentCommand::PurgeData { yes } => agent::purge_data(yes).map_err(Into::into),
         },
         Command::Mcp {

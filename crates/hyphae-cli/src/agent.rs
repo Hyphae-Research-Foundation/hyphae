@@ -110,7 +110,7 @@ const WRITER_PERMISSIONS: &[&str] = &[
 ];
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn setup() -> Result<(), CliFailure> {
+pub(crate) fn setup(enable_service: bool, no_service: bool) -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
     println!("Hyphae Agent Memory setup will create:");
     println!("  data directory     {}", paths.data.display());
@@ -294,6 +294,29 @@ pub(crate) fn setup() -> Result<(), CliFailure> {
         println!("created the {label} credential");
     }
 
+    if no_service {
+        println!("service installation skipped (--no-service)");
+    } else {
+        let unit_path = install_service_unit(&paths)?;
+        println!("installed service {}", unit_path.display());
+        let start = enable_service || {
+            print!("enable and start the service now? [y/N]: ");
+            std::io::stdout().flush().map_err(|_| CliFailure::io())?;
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(|_| CliFailure::io())?;
+            matches!(answer.trim(), "y" | "Y" | "yes")
+        };
+        if start {
+            systemctl(&["enable", "--now", SERVICE_NAME])?;
+            println!("service enabled and started");
+        } else {
+            println!("service installed but not enabled; start it with:");
+            println!("  systemctl --user enable --now {SERVICE_NAME}");
+        }
+    }
+
     println!();
     println!("Agent Memory is ready. Operate it with:");
     println!("  hyphae serve --data-dir {data_text} \\");
@@ -328,40 +351,174 @@ pub(crate) fn status() -> Result<(), CliFailure> {
         },
         "backups_directory": paths.backups.display().to_string(),
         "service": SERVICE_NAME,
+        "service_installed": service_unit_path().is_ok_and(|path| path.exists()),
+        "service_active": service_active(),
     });
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-/// Engine doctor over the Agent Memory directory.
+/// Engine doctor over the Agent Memory directory with the operator
+/// credential.
 pub(crate) fn doctor() -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
-    run_self(&["doctor", "--data-dir", &paths.data.display().to_string()])
+    let output = run_self_json(&[
+        "doctor",
+        "--data-dir",
+        &paths.data.display().to_string(),
+        "--native-api-key-file",
+        &paths.operator_key().display().to_string(),
+    ])?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
-/// One verified backup archive under the backups directory.
+/// One verified backup under the backups directory.
 pub(crate) fn backup() -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
     std::fs::create_dir_all(&paths.backups).map_err(|_| CliFailure::io())?;
     let destination = paths.backups.join(format!(
-        "agent-memory-{}.hyb",
+        "agent-memory-{}",
         crate::native::logical_time_micros()
     ));
     run_self(&[
         "backup",
+        "create",
         "--data-dir",
         &paths.data.display().to_string(),
-        "create",
-        "--destination",
+        "--native-api-key-file",
+        &paths.operator_key().display().to_string(),
+        "--out",
         &destination.display().to_string(),
     ])?;
     println!("backup written: {}", destination.display());
     Ok(())
 }
 
-/// Removes generated credentials while preserving data and backups.
+/// Restores one verified backup: the service must be stopped, the current
+/// directory is preserved aside, and the backup is verified before it
+/// replaces anything.
+pub(crate) fn restore(backup: &Path) -> Result<(), CliFailure> {
+    let paths = AgentPaths::resolve()?;
+    if service_active() {
+        eprintln!("stop the service first: systemctl --user stop {SERVICE_NAME}");
+        return Err(CliFailure::invalid());
+    }
+    run_self(&[
+        "backup",
+        "verify",
+        "--backup",
+        &backup.display().to_string(),
+    ])?;
+    let stamp = crate::native::logical_time_micros();
+    let preserved = paths
+        .data
+        .with_file_name(format!("agent-memory.pre-restore-{stamp}"));
+    if paths.data.exists() {
+        std::fs::rename(&paths.data, &preserved).map_err(|_| CliFailure::io())?;
+        println!("previous data preserved at {}", preserved.display());
+    }
+    run_self(&[
+        "restore",
+        "--backup",
+        &backup.display().to_string(),
+        "--data-dir",
+        &paths.data.display().to_string(),
+    ])?;
+    println!(
+        "restored {} from {}",
+        paths.data.display(),
+        backup.display()
+    );
+    Ok(())
+}
+
+/// The upgrade flow from the product contract: stop, backup, doctor,
+/// start, and verify a recall answers.
+pub(crate) fn upgrade() -> Result<(), CliFailure> {
+    println!("stopping the service");
+    let _ignored = systemctl(&["stop", SERVICE_NAME]);
+    backup()?;
+    doctor()?;
+    println!("starting the service");
+    systemctl(&["start", SERVICE_NAME])?;
+    println!("service restarted; verify a known memory with your agent host");
+    Ok(())
+}
+
+fn systemctl(arguments: &[&str]) -> Result<(), CliFailure> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .status()
+        .map_err(|_| CliFailure::io())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliFailure::internal())
+    }
+}
+
+fn service_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", SERVICE_NAME])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn service_unit_path() -> Result<PathBuf, CliFailure> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(CliFailure::invalid)?;
+    Ok(config_home.join(format!("systemd/user/{SERVICE_NAME}.service")))
+}
+
+/// Writes the user service: loopback-only, explicit paths, bounded
+/// resources, clean shutdown, and no secrets in arguments or logs.
+fn install_service_unit(paths: &AgentPaths) -> Result<PathBuf, CliFailure> {
+    let unit_path = service_unit_path()?;
+    std::fs::create_dir_all(unit_path.parent().ok_or_else(CliFailure::invalid)?)
+        .map_err(|_| CliFailure::io())?;
+    let binary = std::env::current_exe().map_err(|_| CliFailure::io())?;
+    let unit = format!(
+        "[Unit]\n\
+         Description=Hyphae Agent Memory (local, shared, verifiable memory for coding agents)\n\
+         Documentation=https://github.com/Hyphae-Research-Foundation/hyphae\n\n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={binary} serve --data-dir {data} --endpoint %t/{service}.sock --native-api-key-auth --http-bind 127.0.0.1:8787\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         TimeoutStopSec=30\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         MemoryHigh=384M\n\
+         MemoryMax=512M\n\
+         TasksMax=64\n\
+         LimitNOFILE=4096\n\n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        binary = binary.display(),
+        data = paths.data.display(),
+        service = SERVICE_NAME,
+    );
+    std::fs::write(&unit_path, unit).map_err(|_| CliFailure::io())?;
+    let _ignored = systemctl(&["daemon-reload"]);
+    Ok(unit_path)
+}
+
+/// Removes the service and generated credentials while preserving data
+/// and backups.
 pub(crate) fn remove() -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
+    let unit_path = service_unit_path()?;
+    if unit_path.exists() {
+        let _ignored = systemctl(&["disable", "--now", SERVICE_NAME]);
+        std::fs::remove_file(&unit_path).map_err(|_| CliFailure::io())?;
+        let _ignored = systemctl(&["daemon-reload"]);
+        println!("removed service {}", unit_path.display());
+    }
     for key in [paths.operator_key(), paths.reader_key(), paths.writer_key()] {
         if key.exists() {
             std::fs::remove_file(&key).map_err(|_| CliFailure::io())?;
@@ -374,9 +531,128 @@ pub(crate) fn remove() -> Result<(), CliFailure> {
     Ok(())
 }
 
+/// Supported agent hosts for configuration generation.
+#[derive(Clone, Copy)]
+pub(crate) enum Host {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+/// Generates one host's MCP configuration for the memory profile. The
+/// configuration carries only the credential file path — never a secret —
+/// and the same binary, profile, and endpoint on every host.
+pub(crate) fn configure(host: Host, write: bool) -> Result<(), CliFailure> {
+    let paths = AgentPaths::resolve()?;
+    let writer_key = paths.writer_key().display().to_string();
+    match host {
+        Host::Claude => {
+            let server = serde_json::json!({
+                "command": "hyphae",
+                "args": ["mcp", "--profile", "memory", "--allow-write",
+                          "--base-url", "http://127.0.0.1:8787"],
+                "env": {"HYPHAE_NATIVE_API_KEY_FILE": writer_key},
+            });
+            println!("Claude Code — register with the claude CLI (user scope):");
+            println!();
+            println!(
+                "  claude mcp add-json hyphae-memory --scope user '{}'",
+                serde_json::to_string(&server)?
+            );
+            if write {
+                println!();
+                println!("(claude owns its configuration file; the command above");
+                println!(" is the supported write path)");
+            }
+        }
+        Host::Codex => {
+            let section = format!(
+                "[mcp_servers.hyphae-memory]\ncommand = \"hyphae\"\nargs = [\"mcp\", \"--profile\", \"memory\", \"--allow-write\", \"--base-url\", \"http://127.0.0.1:8787\"]\nenv = {{ HYPHAE_NATIVE_API_KEY_FILE = \"{writer_key}\" }}\n"
+            );
+            let config = std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".codex/config.toml"))
+                .ok_or_else(CliFailure::invalid)?;
+            if write {
+                let existing = std::fs::read_to_string(&config).unwrap_or_default();
+                if existing.contains("[mcp_servers.hyphae-memory]") {
+                    println!("codex already configured at {}", config.display());
+                } else {
+                    std::fs::create_dir_all(config.parent().ok_or_else(CliFailure::invalid)?)
+                        .map_err(|_| CliFailure::io())?;
+                    let mut merged = existing;
+                    if !merged.is_empty() && !merged.ends_with('\n') {
+                        merged.push('\n');
+                    }
+                    merged.push_str(&section);
+                    std::fs::write(&config, merged).map_err(|_| CliFailure::io())?;
+                    println!("codex configured at {}", config.display());
+                }
+            } else {
+                println!("Codex — append to {}:", config.display());
+                println!();
+                println!("{section}");
+            }
+        }
+        Host::Opencode => {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .ok_or_else(CliFailure::invalid)?
+                .join("opencode/opencode.json");
+            let server = serde_json::json!({
+                "type": "local",
+                "command": ["hyphae", "mcp", "--profile", "memory", "--allow-write",
+                             "--base-url", "http://127.0.0.1:8787"],
+                "enabled": true,
+                "environment": {"HYPHAE_NATIVE_API_KEY_FILE": writer_key},
+            });
+            if write {
+                let mut root: serde_json::Value = std::fs::read_to_string(&config)
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let mcp = root
+                    .as_object_mut()
+                    .ok_or_else(CliFailure::invalid)?
+                    .entry("mcp")
+                    .or_insert_with(|| serde_json::json!({}));
+                if mcp.get("hyphae-memory").is_some() {
+                    println!("opencode already configured at {}", config.display());
+                } else {
+                    mcp.as_object_mut()
+                        .ok_or_else(CliFailure::invalid)?
+                        .insert("hyphae-memory".to_owned(), server);
+                    std::fs::create_dir_all(config.parent().ok_or_else(CliFailure::invalid)?)
+                        .map_err(|_| CliFailure::io())?;
+                    std::fs::write(&config, serde_json::to_string_pretty(&root)? + "\n")
+                        .map_err(|_| CliFailure::io())?;
+                    println!("opencode configured at {}", config.display());
+                }
+            } else {
+                println!("OpenCode — merge into {}:", config.display());
+                println!();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"mcp": {"hyphae-memory": server}})
+                    )?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Deletes the Agent Memory data directory after explicit confirmation.
 pub(crate) fn purge_data(confirmed: bool) -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
+    if service_active() {
+        eprintln!("the service owns the directory; stop it first:");
+        eprintln!("  systemctl --user stop {SERVICE_NAME}");
+        return Err(CliFailure::invalid());
+    }
     if !confirmed {
         print!(
             "This permanently deletes {} — type 'purge' to confirm: ",

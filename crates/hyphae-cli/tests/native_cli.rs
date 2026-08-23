@@ -4443,6 +4443,83 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
 }
 
 #[cfg(unix)]
+#[test]
+fn agent_lifecycle_is_idempotent_and_preserves_data() -> Result<(), Box<dyn Error>> {
+    let home = TestDirectory::new()?;
+    let home_text = path(&home.0);
+    let run_agent = |arguments: &[&str]| -> Result<std::process::Output, Box<dyn Error>> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+            .env("HOME", &home_text)
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+            .args(arguments)
+            .output()?)
+    };
+    let setup = run_agent(&["agent", "setup", "--no-service"])?;
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let text = String::from_utf8_lossy(&setup.stdout);
+    assert!(text.contains("created the memory-writer credential"));
+    // Setup is idempotent.
+    let again = run_agent(&["agent", "setup", "--no-service"])?;
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already initialized"));
+    // Status is redacted JSON with every credential present.
+    let status = run_agent(&["agent", "status"])?;
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["initialized"], true);
+    assert_eq!(status["credentials"]["memory_writer"], true);
+    assert!(status.to_string().find("hyp1_").is_none());
+    // Backup, then restore over the live directory.
+    let backup = run_agent(&["agent", "backup"])?;
+    assert!(
+        backup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    let backup_line = String::from_utf8_lossy(&backup.stdout);
+    let backup_path = backup_line
+        .lines()
+        .find_map(|line| line.strip_prefix("backup written: "))
+        .ok_or("backup path")?
+        .to_owned();
+    let restore = run_agent(&["agent", "restore", "--backup", &backup_path])?;
+    assert!(
+        restore.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let doctor = run_agent(&["agent", "doctor"])?;
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    assert_eq!(doctor["status"], "healthy");
+    // Configure writes host configurations that never contain a secret.
+    let opencode = run_agent(&["agent", "configure", "opencode", "--write"])?;
+    assert!(opencode.status.success());
+    let opencode_config = fs::read_to_string(home.0.join(".config/opencode/opencode.json"))?;
+    assert!(opencode_config.contains("hyphae-memory"));
+    assert!(!opencode_config.contains("hyp1_"));
+    // Remove preserves data; purge deletes only with the explicit flag.
+    let remove = run_agent(&["agent", "remove"])?;
+    assert!(remove.status.success());
+    let data = home.0.join(".local/share/hyphae/agent-memory");
+    assert!(data.join("FORMAT").exists());
+    assert!(
+        !home
+            .0
+            .join(".config/hyphae/credentials/memory-writer.key")
+            .exists()
+    );
+    let purge = run_agent(&["agent", "purge-data", "--yes"])?;
+    assert!(purge.status.success());
+    assert!(!data.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<dyn Error>> {
