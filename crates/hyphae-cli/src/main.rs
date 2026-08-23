@@ -1664,8 +1664,25 @@ impl From<StructureFamily> for StructureKind {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The dispatch future and the engine's open path outgrow the 1 MiB
+    // Windows main-thread stack. A dedicated worker with an explicit stack
+    // owns the runtime, and the dispatch state machine lives on the heap.
+    let Ok(worker) = std::thread::Builder::new()
+        .name("hyphae-cli".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn cli_main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
@@ -1675,7 +1692,15 @@ async fn main() {
         }
         Err(error) => error.exit(),
     };
-    if let Err(failure) = run(cli).await {
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(failure) = runtime.block_on(Box::pin(run(cli))) {
         match failure {
             RunFailure::Native(failure) => {
                 let _ignored = print_error(&failure);
