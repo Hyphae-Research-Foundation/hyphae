@@ -148,7 +148,7 @@ class SecurityProtocolTests(unittest.TestCase):
 
         self.assertEqual(struct.unpack_from("<H", legacy, 18)[0], 0)
         self.assertEqual(legacy[:18], current[:18])
-        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 4)
+        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 5)
         self.assertEqual(authenticated[49], 1)
         self.assertEqual(struct.unpack_from("<H", authenticated, 50)[0], 102)
         self.assertEqual(struct.unpack_from("<Q", authenticated, 20)[0], 0xFF)

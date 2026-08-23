@@ -2567,6 +2567,7 @@ mod tests {
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
         };
         assert!(super::server::family_accepts(

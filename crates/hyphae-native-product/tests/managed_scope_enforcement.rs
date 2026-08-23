@@ -459,6 +459,7 @@ fn search_request() -> ProductSearchRequest {
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     }
 }
 

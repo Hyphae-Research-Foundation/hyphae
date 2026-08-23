@@ -218,6 +218,31 @@ class V2Tests(unittest.TestCase):
             "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
         )
 
+    def test_highlighted_request_matches_the_cross_language_golden(self) -> None:
+        arguments = {
+            "collection": 13,
+            "request": {
+                "lexical": {"query": "rust", "candidate_limit": 4, "weight": 1},
+                "vectors": [],
+                "limit": 4,
+                "highlight": {"max_fragments": 2, "fragment_bytes": 64},
+            },
+        }
+        options = RequestOptions(logical_time_micros=10, durability="memory")
+        with self.assertRaises(ClientError):
+            encode_product_request(
+                "search_collection", arguments, options, negotiated_minor=4
+            )
+        encoded = encode_product_request(
+            "search_collection", arguments, options, negotiated_minor=5
+        )
+        # The same digest is pinned by the Rust protocol goldens and the
+        # TypeScript suite for this identically composed request.
+        self.assertEqual(
+            blake3(encoded).hex(),
+            "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443",
+        )
+
     def test_transaction_and_catalog_requests_round_trip(self) -> None:
         cases = (
             ("transaction_begin", {}),

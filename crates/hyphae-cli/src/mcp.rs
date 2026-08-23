@@ -942,6 +942,7 @@ pub(crate) fn collection_search_request(
             }
         }),
         rerank: None,
+        highlight: None,
     })
 }
 

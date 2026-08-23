@@ -403,6 +403,25 @@ test("v2 attested rerank request matches the cross-language golden", () => {
   assert.equal(hex(blake3(encoded)), "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04");
 });
 
+test("v2 highlighted request matches the cross-language golden", () => {
+  const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const args = {
+    collection: 13n,
+    request: {
+      lexical: { query: "rust", candidate_limit: 4, weight: 1 },
+      vectors: [],
+      limit: 4,
+      highlight: { max_fragments: 2, fragment_bytes: 64 },
+    },
+  };
+  const options = { logicalTimeMicros: 10n, durability: "memory" };
+  assert.throws(() => encodeProductRequest("search_collection", args, options, 4), /protocol minor/);
+  const encoded = encodeProductRequest("search_collection", args, options, 5);
+  // The same digest is pinned by the Rust protocol goldens and the Python
+  // suite for this identically composed request.
+  assert.equal(hex(blake3(encoded)), "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443");
+});
+
 test("v2 transaction and catalog requests round trip", () => {
   const cases = [
     ["transaction_begin", {}],

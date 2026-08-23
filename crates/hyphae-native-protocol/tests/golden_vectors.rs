@@ -575,6 +575,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -640,6 +641,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
         });
         assert!(matches!(
@@ -680,6 +682,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 fusion,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
         })
     };
@@ -728,6 +731,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 first_k: 2,
             }),
             rerank: None,
+            highlight: None,
         },
     });
     assert!(matches!(
@@ -772,6 +776,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 attestation,
                 scores: vec![(ObjectId::new(201)?, 0.75), (ObjectId::new(202)?, 0.25)],
             }),
+            highlight: None,
         },
     });
     assert!(matches!(
@@ -791,6 +796,111 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
         blake3::hash(&encoded).to_hex().as_str(),
         "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
     );
+    Ok(())
+}
+
+#[test]
+fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |highlight| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight,
+            },
+        })
+    };
+    // A request without highlight keeps the exact historical bytes and
+    // still decodes at minor 4.
+    let default_encoded = encode_product_request_for_minor(&request(None), 4)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 4)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.highlight.is_none()
+    ));
+    let highlighted = request(Some(hyphae_native_product::ProductHighlight {
+        max_fragments: 2,
+        fragment_bytes: 64,
+    }));
+    assert!(matches!(
+        encode_product_request_for_minor(&highlighted, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&highlighted, 5)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 5)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+    // Cross-language golden: the Python and TypeScript suites pin this same
+    // digest for the identically composed highlighted request.
+    assert_eq!(
+        blake3::hash(&encoded).to_hex().as_str(),
+        "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443",
+    );
+
+    // A result with fragments carries the content-derived response tail —
+    // admitted at minor 5, refused at minor 4 — and a fragment-free result
+    // keeps the exact historical bytes.
+    let object = ObjectId::new(201)?;
+    let catalog_version = hyphae_native_product::CatalogVersion::new(3)?;
+    let result = |fragments: Vec<String>| {
+        ProductResponse::IntegratedSearch(hyphae_native_product::ProductSearchResult {
+            snapshot: SnapshotIdentity {
+                directory_lineage: [1; 24],
+                visible_csn: None,
+                catalog_version,
+                root_digest: [4; 32],
+                logical_time_micros: 5,
+            },
+            hits: vec![hyphae_native_product::ProductIntegratedSearchHit {
+                object_id: object,
+                score: 1.5,
+                doc_values: std::collections::BTreeMap::default(),
+                fragments,
+            }],
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            vector_branches: Vec::new(),
+            approximate: false,
+            total_documents: 1,
+            eligible_documents: 1,
+            lexical_candidates: 1,
+            retrieval_candidates: 1,
+            matched_candidates: 1,
+        })
+    };
+    let plain = encode_product_response_for_minor(&result(Vec::new()), 4)?;
+    let plain_decoded = decode_product_response(&plain)?;
+    assert_eq!(encode_product_response(&plain_decoded)?, plain);
+    let fragmented = result(vec!["rust database".to_owned()]);
+    assert!(matches!(
+        encode_product_response_for_minor(&fragmented, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&fragmented, 5)?;
+    let decoded = decode_product_response(&encoded)?;
+    assert!(matches!(
+        &decoded,
+        ProductResponse::IntegratedSearch(result)
+            if result.hits[0].fragments == vec!["rust database".to_owned()]
+    ));
+    assert_eq!(encode_product_response(&decoded)?, encoded);
     Ok(())
 }
 
@@ -1140,7 +1250,8 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 }
 
 #[test]
-fn protocol_minor_negotiation_preserves_1_0_through_1_3_and_selects_1_4()
+#[allow(clippy::too_many_lines)]
+fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1203,6 +1314,21 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_3_and_selects_1_4()
         .minor,
         3
     );
+    let minor_four = Hello {
+        maximum_minor: 4,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_four,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        4
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -1212,12 +1338,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_3_and_selects_1_4()
             1
         )?
         .minor,
-        4
+        5
     );
 
     let incompatible = Hello {
-        minimum_minor: 5,
-        maximum_minor: 5,
+        minimum_minor: 6,
+        maximum_minor: 6,
         ..Hello::default()
     };
     assert_eq!(

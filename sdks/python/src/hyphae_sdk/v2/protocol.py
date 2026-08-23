@@ -14,7 +14,7 @@ from .models import ClientError, ProductErrorFields, RequestOptions, Response, S
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 4
+PROTOCOL_MINOR = 5
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -441,10 +441,15 @@ def operation_required_minor(
                 or request.get("rerank") is not None
             )
             fusion = 4 if extended else 0
+            highlight = (
+                5
+                if isinstance(request, dict) and request.get("highlight") is not None
+                else 0
+            )
             filter_minor = _filter_required_minor(
                 request.get("filter") if isinstance(request, dict) else None
             )
-            return max(fusion, filter_minor)
+            return max(fusion, highlight, filter_minor)
         if operation == "search_ingest":
             batch = arguments.get("batch", arguments)
             documents = batch.get("documents", []) if isinstance(batch, dict) else []
@@ -2231,6 +2236,18 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
                 raise ClientError("integrated rerank stage is invalid")
             output.extend(int(entry["object_id"]).to_bytes(16, "little"))
             output.extend(struct.pack("<d", float(entry["score"])))
+    highlight = request.get("highlight")
+    if highlight is not None:
+        if (
+            not isinstance(highlight, dict)
+            or not isinstance(highlight.get("max_fragments"), int)
+            or not 1 <= highlight["max_fragments"] <= 4
+            or not isinstance(highlight.get("fragment_bytes"), int)
+            or not 16 <= highlight["fragment_bytes"] <= 512
+        ):
+            raise ClientError("integrated highlight budget is invalid")
+        output.append(4)
+        output.extend(struct.pack("<II", highlight["max_fragments"], highlight["fragment_bytes"]))
     return bytes(output)
 
 
@@ -2308,6 +2325,15 @@ def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
     approximate = reader.boolean()
     reader.zeroes(7)
     counts = [reader.u64() for _ in range(5)]
+    if reader.remaining() > 0:
+        # Content-derived response tail: per-hit highlight fragments.
+        if reader.u8() != 1:
+            raise ClientError("integrated response section is invalid")
+        for hit in hits:
+            fragments = [reader.text() for _ in range(reader.u32())]
+            if len(fragments) > 4 or any(len(f.encode("utf-8")) > 512 for f in fragments):
+                raise ClientError("integrated highlight fragments are unbounded")
+            hit["fragments"] = fragments
     return {
         "snapshot": snapshot,
         "hits": hits,

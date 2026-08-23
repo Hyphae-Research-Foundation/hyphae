@@ -1060,6 +1060,12 @@ enum SearchCommand {
         /// Hits retained per distinct parent value (1..=100).
         #[arg(long, requires = "dedupe_field")]
         dedupe_first_k: Option<usize>,
+        /// Budgeted highlighted fragments per hit (1..=4).
+        #[arg(long)]
+        highlight_fragments: Option<usize>,
+        /// Normalized-text byte budget per fragment (16..=512).
+        #[arg(long, default_value_t = 128, requires = "highlight_fragments")]
+        highlight_bytes: usize,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3289,6 +3295,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             fusion,
             dedupe_field,
             dedupe_first_k,
+            highlight_fragments,
+            highlight_bytes,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3363,6 +3371,12 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             _ => None,
                         },
                         rerank: None,
+                        highlight: highlight_fragments.map(|max_fragments| {
+                            hyphae_native_product::ProductHighlight {
+                                max_fragments,
+                                fragment_bytes: highlight_bytes,
+                            }
+                        }),
                     },
                 },
             )
@@ -4829,6 +4843,7 @@ fn response_json(response: ProductResponse) -> Value {
                 "object_id": hit.object_id.get().to_string(),
                 "score": hit.score,
                 "doc_values": hit.doc_values.into_iter().map(|(name, value)| (name, doc_value_json(value))).collect::<serde_json::Map<_, _>>(),
+                "fragments": hit.fragments,
             })).collect::<Vec<_>>(),
             "facets": result.facets.into_iter().map(|facet| json!({
                 "field": facet.field,

@@ -185,7 +185,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 4) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 5) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +212,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 4,
+  maximumMinor = 5,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -269,7 +269,8 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
     const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
-    return Math.max(extended ? 4 : 0, filterRequiredMinor(request.filter));
+    const highlighted = request.highlight !== undefined && request.highlight !== null;
+    return Math.max(highlighted ? 5 : 0, extended ? 4 : 0, filterRequiredMinor(request.filter));
   }
   if (operation === "search_ingest") {
     const batch = (typeof args.batch === "object" && args.batch !== null ? args.batch : args) as Readonly<Record<string, unknown>>;
@@ -1516,7 +1517,20 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
     ...encodeParentDedupe(request.parent_dedupe),
     ...encodeRerank(request.rerank),
+    ...encodeHighlight(request.highlight),
   );
+}
+
+function encodeHighlight(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const highlight = value as Readonly<Record<string, unknown>>;
+  const maxFragments = highlight.max_fragments;
+  const fragmentBytes = highlight.fragment_bytes;
+  if (typeof maxFragments !== "number" || !Number.isInteger(maxFragments) || maxFragments < 1 || maxFragments > 4
+    || typeof fragmentBytes !== "number" || !Number.isInteger(fragmentBytes) || fragmentBytes < 16 || fragmentBytes > 512) {
+    throw new ClientError("integrated highlight budget is invalid");
+  }
+  return [Uint8Array.of(4), u32(maxFragments), u32(fragmentBytes)];
 }
 
 function encodeRerank(value: unknown): Uint8Array[] {
@@ -1902,8 +1916,26 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
   });
   const approximate = reader.boolean();
   reader.zeroes(7);
-  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments: reader.u64(), eligibleDocuments: reader.u64(),
-    lexicalCandidates: reader.u64(), retrievalCandidates: reader.u64(), matchedCandidates: reader.u64() };
+  const totalDocuments = reader.u64();
+  const eligibleDocuments = reader.u64();
+  const lexicalCandidates = reader.u64();
+  const retrievalCandidates = reader.u64();
+  const matchedCandidates = reader.u64();
+  if (reader.remaining > 0) {
+    // Content-derived response tail: per-hit highlight fragments.
+    if (reader.u8() !== 1) throw new ClientError("integrated response section is invalid");
+    for (const hit of hits) {
+      const fragmentCount = reader.u32();
+      if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
+      const fragments = Array.from({ length: fragmentCount }, () => reader.text());
+      if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
+        throw new ClientError("integrated highlight fragments are unbounded");
+      }
+      (hit as Record<string, unknown>).fragments = fragments;
+    }
+  }
+  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
+    lexicalCandidates, retrievalCandidates, matchedCandidates };
 }
 
 function encodeQualifiedName(raw: unknown): Uint8Array {
