@@ -179,6 +179,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)
 - [Porting ledger](porting/ledger.md)
+- [Leave Weaviate with a receipt](porting/leave-weaviate.md)
 - [Development guide](development.md)
 - [0.1.0 release gate](gates/0.1.0.md)
 - [0.2.0 release gate](gates/0.2.0.md)
