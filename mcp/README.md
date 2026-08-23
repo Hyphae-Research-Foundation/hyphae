@@ -51,7 +51,7 @@ principal, role, or permission. Unknown input fields fail closed.
 - Cancellation remains live while a Native HTTP request is in flight; the
   bounded reader/control path does not wait for that request to finish.
 - `tools/list` has a fixed maximum page of one hundred definitions, so the
-  complete fixed 8-tool registry (seven read-only tools listed by default,
+  complete fixed 11-tool registry (eight read-only tools listed by default,
   the ingest tool added by `--allow-ingest`) is returned in one
   host-compatible page;
   exhausted pages omit `nextCursor` rather than serializing JSON `null`.
@@ -72,6 +72,9 @@ The exact tool definitions live in
 | `hyphae_native_prove_search` | `Prove(SearchCollection)` | `proof.generate` |
 | `hyphae_native_verify_proof` | offline verification in the adapter | none (trustless) |
 | `hyphae_native_search_ingest` | `SearchIngest` | `data.write` and `search.execute`; listed only with `--allow-ingest` |
+| `hyphae_native_memory_store` | `SearchIngest` + `StructureSet` lifecycle | `data.write` and `search.execute`; listed only with `--allow-ingest` |
+| `hyphae_native_memory_recall` | `SearchCollection` (+ `Prove` with `prove`) filtered by the lifecycle key | `search.execute` (`proof.generate` with `prove`) |
+| `hyphae_native_memory_forget` | lifecycle tombstone + `SearchDocumentDelete` | `data.write` and `search.execute`; listed only with `--allow-ingest` |
 
 `hyphae_native_prove_search` returns the proof, the complete directory
 witness, and the external trusted anchor hex-encoded; when the artifacts
