@@ -331,7 +331,7 @@ class DependencyReviewTests(unittest.TestCase):
 
         def content(_revision: str, path: str) -> str:
             if path == "sdks/python/pyproject.toml":
-                return '[build-system]\nrequires = ["setuptools==80.9.0"]\n[project]\ndependencies = []\n'
+                return '[build-system]\nrequires = ["setuptools==84.0.0"]\n[project]\ndependencies = []\n'
             if path == PYTHON_BUILD_EVIDENCE:
                 return (ROOT / PYTHON_BUILD_EVIDENCE).read_text(encoding="utf-8")
             return json.dumps({"packages": packages if "mcp/hosts" in path else {}})

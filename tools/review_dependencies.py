@@ -274,22 +274,22 @@ def validate_dependency_license_boundaries(head: str) -> None:
             raise ValueError(f"{lock}: sharp/libvips LGPL license evidence differs")
 
     python = python_dependencies(read_revision(head, PYTHON_MANIFESTS[0]))
-    if python.get("build|setuptools==80.9.0") != {"group": "build"}:
+    if python.get("build|setuptools==84.0.0") != {"group": "build"}:
         raise ValueError("Python build dependency must retain exact setuptools authority")
     build_evidence = json.loads(read_revision(head, PYTHON_BUILD_EVIDENCE) or "null")
     expected_build_evidence = {
         "name": "setuptools",
-        "version": "80.9.0",
+        "version": "84.0.0",
         "license": "MIT",
         "scope": "build-only-not-bundled",
         "artifacts": [
             {
-                "filename": "setuptools-80.9.0-py3-none-any.whl",
-                "sha256": "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922",
+                "filename": "setuptools-84.0.0-py3-none-any.whl",
+                "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670",
             },
             {
-                "filename": "setuptools-80.9.0.tar.gz",
-                "sha256": "f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c",
+                "filename": "setuptools-84.0.0.tar.gz",
+                "sha256": "f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73",
             },
         ],
     }

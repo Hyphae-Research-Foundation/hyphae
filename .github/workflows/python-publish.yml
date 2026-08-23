@@ -964,7 +964,7 @@ jobs:
               --index-url https://pypi.org/simple/ \
               --no-cache \
               --no-deps \
-              'setuptools==80.9.0'
+              'setuptools==84.0.0'
             uv pip install \
               --python "$sdist_environment/bin/python" \
               --index-url "$index" \

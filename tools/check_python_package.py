@@ -81,7 +81,7 @@ def validate(
         fail("Python support floor must remain explicit")
     if project.get("dependencies") != []:
         fail("Python SDK runtime must remain standard-library only")
-    if manifest.get("build-system", {}).get("requires") != ["setuptools==80.9.0"]:
+    if manifest.get("build-system", {}).get("requires") != ["setuptools==84.0.0"]:
         fail("Python build backend dependency must remain exactly pinned")
     if project.get("license") != "Apache-2.0":
         fail("Python SDK license expression must match the repository")

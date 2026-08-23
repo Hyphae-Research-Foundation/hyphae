@@ -265,11 +265,11 @@
       }
     ],
     "python": {
-      "canonical_sha256": "1750947f0394546b79d29c52c813f7d2dbaddc16b6e833a0a5bd007738b18313",
+      "canonical_sha256": "42684c2ac92e7fb1e2ae9c3fbc90234640667980dfa0b46f8e6ddef0afebb1c5",
       "inventory": "sdks/python/build-dependencies.json",
-      "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
+      "inventory_sha256": "7108c1e86b957224038bb94be80f14fe7c0260726ee3e6b1d3cd2ef7e1ddea30",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "c3a969f2acdc29f41e1cea76c4096cd4bb6b98cf09f720ab070084e7e7aa9fc3",
+      "manifest_sha256": "89d0744d1446fcb85fe693dbd943341e6957c3d62e2c3080b0584a076ac14427",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
