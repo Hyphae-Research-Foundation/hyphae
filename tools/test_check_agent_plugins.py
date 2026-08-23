@@ -43,7 +43,7 @@ class AgentPluginContractTests(unittest.TestCase):
                 "status": "passed",
                 "hosts": ["claude-code", "codex"],
                 "mcp_servers": 1,
-                "tools": 7,
+                "tools": 8,
             },
         )
 

@@ -42,7 +42,13 @@ are not already known. Use only the narrowest matching tool:
 - `hyphae_native_verify_proof` to verify one sealed proof, witness, and
   external trusted anchor entirely inside the adapter process — verification
   is trustless and never contacts the service, so a receipt can be checked
-  even against an operator you do not trust.
+  even against an operator you do not trust; and
+- `hyphae_native_memory_recall` to recall stored agent memories from one
+  collection by bounded lexical retrieval. Expired or forgotten memories
+  never return, and with `prove` the response carries the sealed proof,
+  witness, and anchor so the recall itself is offline-verifiable. The
+  write-scoped memory store and forget tools appear only when the operator
+  starts the adapter with ingest allowed.
 
 Treat structured `ProductError` values as the authoritative denial. Never put
 `role`, `scope`, `authority`, `api_key`, or similar control fields into tool

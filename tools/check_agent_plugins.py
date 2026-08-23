@@ -22,19 +22,57 @@ EXPECTED_TOOL_NAMES = (
     "hyphae_native_prove_search",
     "hyphae_native_verify_proof",
     "hyphae_native_search_ingest",
+    "hyphae_native_memory_store",
+    "hyphae_native_memory_recall",
+    "hyphae_native_memory_forget",
 )
-# The write-scoped ingest tool is absent unless the operator starts the
-# adapter with --allow-ingest; hosts and the shared corpus see this subset.
+# Write-scoped tools are absent unless the operator starts the adapter
+# with --allow-ingest; hosts and the shared corpus see this subset.
+WRITE_TOOL_NAMES = (
+    "hyphae_native_search_ingest",
+    "hyphae_native_memory_store",
+    "hyphae_native_memory_forget",
+)
 DEFAULT_VISIBLE_TOOL_NAMES = tuple(
-    name for name in EXPECTED_TOOL_NAMES if name != "hyphae_native_search_ingest"
+    name for name in EXPECTED_TOOL_NAMES if name not in WRITE_TOOL_NAMES
 )
 def expected_annotations(tool_name: str) -> dict[str, bool]:
     return {
-        "readOnlyHint": tool_name != "hyphae_native_search_ingest",
+        "readOnlyHint": tool_name not in WRITE_TOOL_NAMES,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
+MEMORY_STORE_INPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["collection", "text"],
+    "properties": {
+        "collection": {"type": "integer", "minimum": 1},
+        "text": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 316224000},
+    },
+}
+MEMORY_RECALL_INPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["collection", "query"],
+    "properties": {
+        "collection": {"type": "integer", "minimum": 1},
+        "query": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+        "prove": {"type": "boolean"},
+    },
+}
+MEMORY_FORGET_INPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["collection", "id"],
+    "properties": {
+        "collection": {"type": "integer", "minimum": 1},
+        "id": {"type": "string", "pattern": "^[0-9]+$"},
+    },
+}
 EXPECTED_EXECUTION = {"taskSupport": "forbidden"}
 EXPECTED_MCP_CASES = [
     {
@@ -627,6 +665,57 @@ def success_schemas() -> dict[str, dict[str, Any]]:
                         'directory_count': {'type': 'integer', 'minimum': 0},
                         'total_file_bytes': {'type': 'integer', 'minimum': 0},
                         'semantic_reexecution_performed': {'type': 'boolean'}}},
+        "hyphae_native_memory_store": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status", "id", "expires_at_micros"],
+            "properties": {
+                "status": {"type": "string", "enum": ["stored"]},
+                "id": {"type": "string", "pattern": "^[0-9]+$"},
+                "expires_at_micros": {"type": ["integer", "null"]},
+            },
+        },
+        "hyphae_native_memory_recall": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["memories", "expired_filtered", "proof"],
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "score", "text"],
+                        "properties": {
+                            "id": {"type": "string", "pattern": "^[0-9]+$"},
+                            "score": {"type": "number"},
+                            "text": {"type": "string"},
+                        },
+                    },
+                },
+                "expired_filtered": {"type": "integer", "minimum": 0},
+                "proof": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "required": ["proof_hex", "witness_hex", "anchor_hex"],
+                    "properties": {
+                        "proof_hex": {"type": "string", "pattern": "^([0-9a-f]{2})*$"},
+                        "witness_hex": {"type": "string", "pattern": "^([0-9a-f]{2})*$"},
+                        "anchor_hex": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    },
+                },
+            },
+        },
+        "hyphae_native_memory_forget": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status", "id"],
+            "properties": {
+                "status": {"type": "string", "enum": ["forgotten"]},
+                "id": {"type": "string", "pattern": "^[0-9]+$"},
+            },
+        },
     }
 
 
@@ -784,7 +873,7 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
     if (
         contract.get("schema") != "hyphae-native-mcp-contract-v2"
         or contract.get("mcp_protocol") != "2025-06-18"
-        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
+        or contract.get("tool_schema_version") != "hyphae-native-mcp-tools-v4"
     ):
         fail("Native MCP contract versions are invalid")
     if type(contract.get("tool_page_size")) is not int or contract.get("tool_page_size") != 100:
@@ -835,6 +924,9 @@ def validate_contract(contract: dict[str, Any]) -> tuple[str, ...]:
             "hyphae_native_prove_search": SEARCH_COLLECTION_INPUT_SCHEMA,
             "hyphae_native_verify_proof": VERIFY_PROOF_INPUT_SCHEMA,
             "hyphae_native_search_ingest": SEARCH_INGEST_INPUT_SCHEMA,
+            "hyphae_native_memory_store": MEMORY_STORE_INPUT_SCHEMA,
+            "hyphae_native_memory_recall": MEMORY_RECALL_INPUT_SCHEMA,
+            "hyphae_native_memory_forget": MEMORY_FORGET_INPUT_SCHEMA,
         }.get(expected_name, EMPTY_INPUT_SCHEMA)
         if tool.get("inputSchema") != expected_input:
             fail(f"Native MCP {expected_name} input schema is invalid")
@@ -880,7 +972,7 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
         or
         corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
         or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
-        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
+        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v4"
         or corpus.get("tools") != list(DEFAULT_VISIBLE_TOOL_NAMES)
         or corpus.get("cases") != EXPECTED_MCP_CASES
     ):

@@ -1,7 +1,7 @@
 {
   "schema": "hyphae-mcp-host-corpus-v1",
   "mcp_config": "plugins/hyphae/.mcp.json",
-  "tool_schema_version": "hyphae-native-mcp-tools-v3",
+  "tool_schema_version": "hyphae-native-mcp-tools-v4",
   "tools": [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
@@ -9,7 +9,8 @@
     "hyphae_native_search_lexical",
     "hyphae_native_search_collection",
     "hyphae_native_prove_search",
-    "hyphae_native_verify_proof"
+    "hyphae_native_verify_proof",
+    "hyphae_native_memory_recall"
   ],
   "cases": [
     {

@@ -118,6 +118,25 @@ documents = store.similarity_search("deterministic retrieval", k=4)
 artifacts = store.last_proof  # verify with `hyphae proof verify`
 ```
 
+## Agent memory, verifiable
+
+The same composition serves agent memory through three thin MCP tools —
+no new engine features, no managed service:
+
+- `hyphae_native_memory_store` ingests one bounded memory under its
+  content-derived identity; a scalar lifecycle key carries the text and
+  the optional TTL.
+- `hyphae_native_memory_recall` retrieves by bounded lexical search and
+  returns only memories whose lifecycle key still lives — expired or
+  forgotten memories never come back. With `prove`, the recall itself is
+  sealed and offline-verifiable.
+- `hyphae_native_memory_forget` tombstones the lifecycle key and removes
+  the document permanently.
+
+Memory lives in your directory, costs nothing per month, expires on the
+engine's deterministic clock, and every recall can carry a proof — a
+managed memory service offers none of those properties to verify.
+
 ## What no alternative hands you
 
 The receipts referenced above are the point: relevance measured under a
