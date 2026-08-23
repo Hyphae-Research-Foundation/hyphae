@@ -2,6 +2,7 @@
 
 //! Command-line entry point for the single native Hyphae executable.
 
+mod agent;
 mod compatibility;
 mod exit;
 mod json_value;
@@ -330,6 +331,12 @@ enum Command {
         operation: compatibility::RemoteCommand,
     },
     /// Run the bounded read-only MCP adapter over managed Native HTTP v2.
+    /// Agent Memory lifecycle: setup, status, doctor, backup, remove,
+    /// and purge-data over the user's dedicated memory directory.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Mcp {
         #[arg(long, env = "HYPHAE_BASE_URL")]
         base_url: String,
@@ -1624,6 +1631,26 @@ enum SearchQueryKind {
     Fuzzy,
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum AgentCommand {
+    /// Create every Agent Memory resource and smoke test the surface.
+    Setup,
+    /// Redacted local status: paths, initialization, credentials.
+    Status,
+    /// Engine doctor over the Agent Memory directory.
+    Doctor,
+    /// Write one verified backup archive under the backups directory.
+    Backup,
+    /// Remove generated credentials while preserving data and backups.
+    Remove,
+    /// Permanently delete the data directory after confirmation.
+    PurgeData {
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum McpProfile {
     /// Full native tool registry.
@@ -1931,6 +1958,14 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
         } => compatibility(
             compatibility::remote(&base_url, bearer_token_file.as_deref(), operation).await,
         ),
+        Command::Agent { command } => match command {
+            AgentCommand::Setup => agent::setup().map_err(Into::into),
+            AgentCommand::Status => agent::status().map_err(Into::into),
+            AgentCommand::Doctor => agent::doctor().map_err(Into::into),
+            AgentCommand::Backup => agent::backup().map_err(Into::into),
+            AgentCommand::Remove => agent::remove().map_err(Into::into),
+            AgentCommand::PurgeData { yes } => agent::purge_data(yes).map_err(Into::into),
+        },
         Command::Mcp {
             base_url,
             native_api_key_file,

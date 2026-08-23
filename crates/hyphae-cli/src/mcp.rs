@@ -1560,11 +1560,33 @@ async fn profile_memory_recall(
                 ProductErrorCode::Internal,
             )));
         };
+        // Sealed artifacts outgrow the MCP message bound on real
+        // directories, so they land in restricted local files and the
+        // response carries their paths, digests, and anchor for offline
+        // verification with `hyphae proof verify`.
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/state"))
+            })
+            .ok_or_else(invalid_request)?
+            .join("hyphae/proofs");
+        std::fs::create_dir_all(&state_home)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+        let stamp = crate::native::logical_time_micros();
+        let proof_path = state_home.join(format!("recall-{stamp}.proof"));
+        let witness_path = state_home.join(format!("recall-{stamp}.witness"));
+        std::fs::write(&proof_path, &artifact.proof_bytes)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+        std::fs::write(&witness_path, &artifact.witness_bytes)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
         (
             result,
             Some(json!({
-                "proof_hex": crate::encode_hex(&artifact.proof_bytes),
-                "witness_hex": crate::encode_hex(&artifact.witness_bytes),
+                "proof_path": proof_path.display().to_string(),
+                "witness_path": witness_path.display().to_string(),
+                "proof_blake3": blake3::hash(&artifact.proof_bytes).to_hex().to_string(),
                 "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
             })),
         )
