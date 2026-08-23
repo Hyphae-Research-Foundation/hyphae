@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-08-23T23:16:43.478144+00:00",
+  "generated_at_utc": "2026-08-23T23:55:20.840843+00:00",
   "inventory": {
     "canonical_sha256": "3382159038ba5e5ba43bddd4d9bd3d34b5f2d0f7af2f111e6d007ad8959d8253",
     "external_package_count": 272,
@@ -2151,13 +2151,13 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "ad0b639ac013a4e797e8ab2bca459467a998f15d",
+    "commit": "27711c0efffdb57062d71fe07f59ce3f44ba2779",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
     "source_inputs_sha256": "cc372a8271fd2890ae978329d4a7d20b4bbd1481773621326a2f89993aa0e872",
-    "tree": "ba1eeaf498b941774973c0082826006f0a284f1d",
+    "tree": "27826547ca856731a1e966f1ff691f9ede84b314",
     "worktree_clean": false
   },
   "source_inputs": [
