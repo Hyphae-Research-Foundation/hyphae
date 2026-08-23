@@ -7,7 +7,7 @@
     "url": "https://hyphae.dev"
   },
   "homepage": "https://hyphae.dev",
-  "repository": "https://github.com/celiumsai/hyphae",
+  "repository": "https://github.com/Hyphae-Research-Foundation/hyphae",
   "license": "Apache-2.0",
   "keywords": ["database", "sql", "search", "rag", "mcp"]
 }

@@ -10,7 +10,7 @@ evidence. The unchecked Gate 9 items remain unchecked because the repository
 does not contain hosted closure evidence for the exact release commit. This
 document is not current release authorization. The annotated `v0.2.0` tag
 peels to `170380453a2ca6322a4c8bc50417318daee1c011`, and the matching
-[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.0) is
+[GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v0.2.0) is
 published; those observable outcomes do not replace the missing retained
 hosted receipts.
 

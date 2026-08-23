@@ -291,7 +291,7 @@ benchmark-only helper.
 ### Performance evidence
 
 Evidence runs directly on `mario@10.77.10.10` from
-`/home/mario/celiumsai/hyphae`, never through WSL.
+`/home/mario/Hyphae-Research-Foundation/hyphae`, never through WSL.
 
 The evidence must include:
 

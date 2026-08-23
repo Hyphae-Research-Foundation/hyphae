@@ -37,10 +37,10 @@ llamaindex = ["blake3>=0.4", "llama-index-core>=0.11"]
 
 [project.urls]
 Homepage = "https://hyphae.dev"
-Documentation = "https://github.com/celiumsai/hyphae/tree/main/docs"
-Repository = "https://github.com/celiumsai/hyphae"
-Issues = "https://github.com/celiumsai/hyphae/issues"
-Changelog = "https://github.com/celiumsai/hyphae/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/Hyphae-Research-Foundation/hyphae/tree/main/docs"
+Repository = "https://github.com/Hyphae-Research-Foundation/hyphae"
+Issues = "https://github.com/Hyphae-Research-Foundation/hyphae/issues"
+Changelog = "https://github.com/Hyphae-Research-Foundation/hyphae/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

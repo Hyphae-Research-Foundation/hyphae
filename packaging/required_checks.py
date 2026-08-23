@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-REPOSITORY_SLUG = "celiumsai/hyphae"
+REPOSITORY_SLUG = "Hyphae-Research-Foundation/hyphae"
 REPORT_SCHEMA = "required-checks-report-v1"
 REPORT_SCHEMA_VERSION = 1
 REPORT_SUFFIX = ".required-checks.json"

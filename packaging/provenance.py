@@ -19,7 +19,7 @@ ROOT = Path(
         Path(__file__).resolve().parents[1],
     )
 ).resolve()
-REPOSITORY = "https://github.com/celiumsai/hyphae"
+REPOSITORY = "https://github.com/Hyphae-Research-Foundation/hyphae"
 WORKFLOW_PATH = ".github/workflows/release.yml"
 BUILD_TYPE = "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1"
 BUILDER_ID = "https://github.com/actions/runner/github-hosted"

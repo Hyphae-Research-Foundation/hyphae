@@ -370,7 +370,7 @@ def _policy(root: Path) -> dict[str, Any]:
     ]
     if (
         value["schema"] != "hyphae-registry-publish-authority-v1"
-        or value["repository"] != "celiumsai/hyphae"
+        or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
         or value["version"] != "2.0.1"
         or value["tag"] != "v2.0.1"
@@ -1398,7 +1398,7 @@ def resolve_live_authority(
             "workflow_sha": workflow_sha,
             "workflow_run_id": workflow_run_id,
             "workflow_ref": (
-                "celiumsai/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
+                "Hyphae-Research-Foundation/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
             ),
             "files": _control_digests(control_root, root, workflow_sha, policy),
         },
@@ -1442,7 +1442,7 @@ def validate_authority_receipt(
         or HEX40.fullmatch(source["tree"]) is None
         or source.get("origin_main") != commit
         or control.get("workflow_ref")
-        != "celiumsai/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
+        != "Hyphae-Research-Foundation/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
         or not isinstance(control.get("workflow_sha"), str)
         or HEX40.fullmatch(control["workflow_sha"]) is None
         or not isinstance(control.get("workflow_run_id"), str)

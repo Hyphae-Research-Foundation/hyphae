@@ -2,7 +2,7 @@
 
 `0.2.1` is the retained compatibility release. Its annotated `v0.2.1` tag peels to
 `08028e8dac077846c638f067ce74fbcf6fb75501`, its
-[GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1) is
+[GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v0.2.1) is
 published, and all ten publishable Rust workspace crates are available on
 crates.io at version `0.2.1`. The exact candidate, tag, workflow, artifact,
 and registry identities are retained in the

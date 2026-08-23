@@ -1,9 +1,9 @@
 <p align="center">
   <a href="https://hyphae.dev" aria-label="Hyphae website">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup-reversed.svg">
-      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg">
-      <img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="420">
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup-reversed.svg">
+      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg">
+      <img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="420">
     </picture>
   </a>
 </p>
@@ -11,10 +11,10 @@
 <p align="center"><strong>Data that can prove itself.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/celiumsai/hyphae/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/celiumsai/hyphae/ci.yml?branch=main&amp;label=CI&amp;logo=github"></a>
+  <a href="https://github.com/Hyphae-Research-Foundation/hyphae/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Hyphae-Research-Foundation/hyphae/ci.yml?branch=main&amp;label=CI&amp;logo=github"></a>
   <a href="https://crates.io/crates/hyphae-engine"><img alt="crates.io" src="https://img.shields.io/crates/v/hyphae-engine?logo=rust"></a>
   <a href="https://docs.rs/hyphae-engine"><img alt="docs.rs" src="https://img.shields.io/docsrs/hyphae-engine?logo=docs.rs"></a>
-  <a href="https://github.com/celiumsai/hyphae/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/celiumsai/hyphae?logo=github"></a>
+  <a href="https://github.com/Hyphae-Research-Foundation/hyphae/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Hyphae-Research-Foundation/hyphae?logo=github"></a>
   <a href="https://hyphae.dev"><img alt="Website" src="https://img.shields.io/badge/website-hyphae.dev-8FCBC6"></a>
   <a href="LICENSE-POLICY.md"><img alt="License" src="https://img.shields.io/badge/code-Apache--2.0-C86F4A"></a>
   <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
@@ -26,7 +26,7 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`v2.0.1`](https://github.com/celiumsai/hyphae/releases/tag/v2.0.1)
+**Stable Native release:** [`v2.0.1`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.0.1)
 is the latest release of the active Native architecture. G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
@@ -37,7 +37,7 @@ gate.
 
 **Published release:** the 1.2 program ships durable native access control,
 the operator console, agent plugins, the published Python client, and the
-Apache-2.0 software transition. [`v1.2.0`](https://github.com/celiumsai/hyphae/releases/tag/v1.2.0)
+Apache-2.0 software transition. [`v1.2.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v1.2.0)
 closed the exact-SHA release gates with signed GitHub Release archives;
 `v2.0.1` re-issues that program from the current integration tree as the
 Apache-2.0 registry publication for crates.io, PyPI, and npm. Until a given
@@ -111,7 +111,7 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`v2.0.1` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v2.0.1),
+[`v2.0.1` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.0.1),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 

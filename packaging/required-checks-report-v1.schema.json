@@ -160,7 +160,7 @@
         },
         "check_run_url": {
           "type": "string",
-          "pattern": "^https://github\\.com/celiumsai/hyphae/actions/runs/[1-9][0-9]*/job/[1-9][0-9]*$"
+          "pattern": "^https://github\\.com/Hyphae-Research-Foundation/hyphae/actions/runs/[1-9][0-9]*/job/[1-9][0-9]*$"
         },
         "app_id": {
           "const": 15368
@@ -375,7 +375,7 @@
       "const": 1
     },
     "repository": {
-      "const": "celiumsai/hyphae"
+      "const": "Hyphae-Research-Foundation/hyphae"
     },
     "head_sha": {
       "type": "string",
