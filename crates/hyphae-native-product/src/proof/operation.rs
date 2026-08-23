@@ -45,6 +45,8 @@ const SEMANTICS_VERSION: u16 = 2;
 /// Semantics version required by operations whose filter shapes were
 /// introduced after version 2 (membership, null, and pattern operators).
 const SEMANTICS_VERSION_OPERATORS: u16 = 3;
+/// Semantics version required by requests carrying a highlight budget.
+const SEMANTICS_VERSION_HIGHLIGHT: u16 = 4;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -804,6 +806,11 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
     };
+    let highlighted = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. }
+            if request.highlight.is_some()
+    );
     let extended = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
@@ -811,7 +818,9 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
                 || request.parent_dedupe.is_some()
                 || request.rerank.is_some()
     );
-    if extended || filter.is_some_and(filter_requires_operator_semantics) {
+    if highlighted {
+        SEMANTICS_VERSION_HIGHLIGHT
+    } else if extended || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
     } else {
         SEMANTICS_VERSION
@@ -884,7 +893,7 @@ fn decode_semantic_operation(
     if !magic_ok
         || !matches!(
             semantics_version,
-            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS
+            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS | SEMANTICS_VERSION_HIGHLIGHT
         )
         || decoder.u16()? != ORDERING_VERSION
     {
@@ -1678,6 +1687,13 @@ fn encode_integrated_request(
                 encoded.extend(&score.to_le_bytes());
             }
         }
+        if semantics_version >= SEMANTICS_VERSION_HIGHLIGHT
+            && let Some(highlight) = &request.highlight
+        {
+            encoded.byte(4);
+            put_usize(encoded, highlight.max_fragments)?;
+            put_usize(encoded, highlight.fragment_bytes)?;
+        }
     }
     Ok(())
 }
@@ -1768,6 +1784,7 @@ fn decode_integrated_request(
     let mut fusion = None;
     let mut parent_dedupe = None;
     let mut rerank = None;
+    let mut highlight = None;
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1810,6 +1827,12 @@ fn decode_integrated_request(
                         scores,
                     });
                 }
+                4 if semantics_version >= SEMANTICS_VERSION_HIGHLIGHT => {
+                    highlight = Some(crate::ProductHighlight {
+                        max_fragments: usize_value(decoder)?,
+                        fragment_bytes: usize_value(decoder)?,
+                    });
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1825,6 +1848,7 @@ fn decode_integrated_request(
         fusion,
         parent_dedupe,
         rerank,
+        highlight,
     })
 }
 

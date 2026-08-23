@@ -20,14 +20,14 @@ use hyphae_native_product::proof::{
 };
 use hyphae_native_product::{
     NativeProduct, ProductAggregation, ProductAggregationValue, ProductAuthorization,
-    ProductDocValue, ProductDocument, ProductDurability, ProductFacetRequest, ProductLexicalBranch,
-    ProductMissingPlacement, ProductNamedAggregation, ProductOperation, ProductPrincipal,
-    ProductRequestContext, ProductSearchCollectionBinding, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
-    ProductSearchIngestionCoordinator, ProductSearchOperator, ProductSearchRequest,
-    ProductSearchSort, ProductSession, ProductSessionId, ProductSortDirection, ProductSortSource,
-    ProductStreamEnqueueOutcome, ProductVector, ProductVectorBranch, ProductVectorExecution,
-    ProductVectorStrategy,
+    ProductDocValue, ProductDocument, ProductDurability, ProductFacetRequest, ProductHighlight,
+    ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
+    ProductPrincipal, ProductRequestContext, ProductSearchCollectionBinding,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchIngestionCoordinator, ProductSearchOperator,
+    ProductSearchRequest, ProductSearchSort, ProductSession, ProductSessionId,
+    ProductSortDirection, ProductSortSource, ProductStreamEnqueueOutcome, ProductVector,
+    ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
 };
 use hyphae_native_types::{
     EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId, VectorElement, VectorType,
@@ -294,6 +294,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
         7,
     )?;
@@ -350,6 +351,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
         0,
     )?;
@@ -399,6 +401,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
         0,
     )?;
@@ -441,6 +444,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
             0,
         )
@@ -472,6 +476,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
             0,
         )
@@ -511,6 +516,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -529,6 +535,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
@@ -551,6 +558,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
 
     let mut ann_artifact = None;
@@ -732,6 +740,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     assert!(
         product
@@ -999,6 +1008,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     fusion: None,
                     parent_dedupe: None,
                     rerank: None,
+                    highlight: None,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1056,6 +1066,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1080,6 +1091,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1119,6 +1131,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1155,6 +1168,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
     };
     let context = proof_context(&session, 42);
@@ -1202,6 +1216,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
         fusion,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let rrf = product.search_collection(binding.collection, &request(None), 11)?;
     let weighted = product.search_collection(
@@ -1306,6 +1321,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                     fusion: None,
                     parent_dedupe: None,
                     rerank: None,
+                    highlight: None,
                 },
                 12,
             )
@@ -1467,6 +1483,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         fusion: None,
         parent_dedupe: None,
         rerank: None,
+        highlight: None,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     assert!(!result.hits.is_empty());
@@ -1577,6 +1594,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
         fusion: None,
         parent_dedupe: dedupe,
         rerank: None,
+        highlight: None,
     };
     let all = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(all.hits.len() >= 4);
@@ -1656,6 +1674,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
         fusion: None,
         parent_dedupe: None,
         rerank,
+        highlight: None,
     };
     let base = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(base.hits.len() >= 3);
@@ -1714,6 +1733,127 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
     Ok(())
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("highlighting");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |highlight| ProductSearchRequest {
+        // Mixed case exercises the canonical normalization: fragments are
+        // cut from the case-folded text the analyzer indexes.
+        lexical: Some(ProductLexicalBranch {
+            query: "Rust DATABASE".into(),
+            candidate_limit: 4,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight,
+    };
+    let plain = product.search_collection(binding.collection, &request(None), 7)?;
+    assert!(plain.hits.iter().all(|hit| hit.fragments.is_empty()));
+    let highlight = ProductHighlight {
+        max_fragments: 2,
+        fragment_bytes: 32,
+    };
+    let highlighted =
+        product.search_collection(binding.collection, &request(Some(highlight)), 7)?;
+    let order = |result: &hyphae_native_product::ProductSearchResult| {
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>()
+    };
+    // Highlighting never reorders, admits, or drops hits.
+    assert_eq!(order(&highlighted), order(&plain));
+    let first = &highlighted.hits[0];
+    assert!(!first.fragments.is_empty());
+    assert!(first.fragments.len() <= 2);
+    assert!(first.fragments.iter().all(|fragment| fragment.len() <= 32));
+    assert!(
+        first
+            .fragments
+            .iter()
+            .any(|fragment| fragment.contains("rust") || fragment.contains("database"))
+    );
+    // The snapshot twin returns byte-identical fragments.
+    let snapshot = product.snapshot_bounded(7)?;
+    let at_snapshot = NativeProduct::search_collection_at_snapshot(
+        &product,
+        &snapshot,
+        binding.collection,
+        &request(Some(highlight)),
+    )?;
+    assert_eq!(at_snapshot.hits, highlighted.hits);
+    // Unbounded budgets and a missing lexical branch fail closed.
+    assert!(
+        product
+            .search_collection(
+                binding.collection,
+                &request(Some(ProductHighlight {
+                    max_fragments: 0,
+                    fragment_bytes: 32,
+                })),
+                7,
+            )
+            .is_err()
+    );
+    assert!(
+        product
+            .search_collection(
+                binding.collection,
+                &request(Some(ProductHighlight {
+                    max_fragments: 1,
+                    fragment_bytes: 8,
+                })),
+                7,
+            )
+            .is_err()
+    );
+    let mut lexicalless = request(Some(highlight));
+    lexicalless.lexical = None;
+    assert!(
+        product
+            .search_collection(binding.collection, &lexicalless, 7)
+            .is_err()
+    );
+    // The sealed proof binds the highlight budget at semantics version
+    // four and re-executes the highlighted request offline.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 83);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(highlight)),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 4);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 fn bm25_probe_batch() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
     // "rust" appears twice in a long document and once in a short one: with
     // the default length normalization the short document ranks first, with
@@ -1757,6 +1897,7 @@ fn lexical_ranking(
             fusion: None,
             parent_dedupe: None,
             rerank: None,
+            highlight: None,
         },
         11,
     )?;

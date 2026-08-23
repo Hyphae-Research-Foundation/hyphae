@@ -1060,6 +1060,20 @@ enum SearchCommand {
         /// Hits retained per distinct parent value (1..=100).
         #[arg(long, requires = "dedupe_field")]
         dedupe_first_k: Option<usize>,
+        /// Budgeted highlighted fragments per hit (1..=4).
+        #[arg(long)]
+        highlight_fragments: Option<usize>,
+        /// Normalized-text byte budget per fragment (16..=512).
+        #[arg(long, default_value_t = 128, requires = "highlight_fragments")]
+        highlight_bytes: usize,
+    },
+    /// Consolidates every vector index of one collection into a fresh
+    /// generation, draining accumulated deltas.
+    Consolidate {
+        #[arg(long)]
+        collection: u128,
+        #[arg(long, value_enum, default_value_t = Durability::Strict)]
+        durability: Durability,
     },
     /// Deterministically chunk one document into ingest-ready JSON.
     Chunk {
@@ -1650,8 +1664,25 @@ impl From<StructureFamily> for StructureKind {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The dispatch future and the engine's open path outgrow the 1 MiB
+    // Windows main-thread stack. A dedicated worker with an explicit stack
+    // owns the runtime, and the dispatch state machine lives on the heap.
+    let Ok(worker) = std::thread::Builder::new()
+        .name("hyphae-cli".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn cli_main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
@@ -1661,7 +1692,15 @@ async fn main() {
         }
         Err(error) => error.exit(),
     };
-    if let Err(failure) = run(cli).await {
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(failure) = runtime.block_on(Box::pin(run(cli))) {
         match failure {
             RunFailure::Native(failure) => {
                 let _ignored = print_error(&failure);
@@ -3163,6 +3202,55 @@ fn structure(local: &LocalDirectory, command: StructureCommand) -> Result<(), Cl
 #[allow(clippy::too_many_lines)]
 fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailure> {
     match command {
+        SearchCommand::Consolidate {
+            collection,
+            durability,
+        } => {
+            let mut client = open_client(local)?;
+            let collection = object_id(collection)?;
+            let binding = client
+                .unmanaged_product_mut()?
+                .resolve_search_collection_binding(collection, native::logical_time_micros())?;
+            let mut receipts = Vec::new();
+            for vector in &binding.vectors {
+                let status = client
+                    .unmanaged_product_mut()?
+                    .administration()
+                    .ann_maintenance_status(vector.index)?;
+                // An index without deltas has nothing to consolidate, and the
+                // capture bound must stay inside the index's own delta limit.
+                if status.delta_records == 0 {
+                    receipts.push(json!({
+                        "target": vector.name,
+                        "consumed_delta_records": 0,
+                        "skipped": true,
+                    }));
+                    continue;
+                }
+                let max_delta_records = hyphae_native_runtime::MAX_ANN_DELTA_RECORDS
+                    .min(usize::try_from(status.lifecycle.delta_max_entries).unwrap_or(usize::MAX))
+                    .max(1);
+                let receipt = client
+                    .unmanaged_product_mut()?
+                    .administration()
+                    .consolidate_ann(hyphae_native_product::AnnConsolidationRequest {
+                        index: vector.index,
+                        max_vectors: hyphae_native_runtime::MAX_ANN_CONSOLIDATION_VECTORS,
+                        max_delta_records,
+                        durability: durability.into(),
+                    })?;
+                receipts.push(json!({
+                    "target": vector.name,
+                    "consumed_delta_records": receipt.consumed_delta_records,
+                    "effective_vector_count": receipt.effective_vector_count,
+                }));
+            }
+            print_json(&json!({
+                "schema": "hyphae-search-consolidation-v1",
+                "collection": collection.get().to_string(),
+                "consolidations": receipts,
+            }))
+        }
         SearchCommand::Provision {
             collection,
             durability,
@@ -3232,6 +3320,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             fusion,
             dedupe_field,
             dedupe_first_k,
+            highlight_fragments,
+            highlight_bytes,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3306,6 +3396,12 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             _ => None,
                         },
                         rerank: None,
+                        highlight: highlight_fragments.map(|max_fragments| {
+                            hyphae_native_product::ProductHighlight {
+                                max_fragments,
+                                fragment_bytes: highlight_bytes,
+                            }
+                        }),
                     },
                 },
             )
@@ -4772,6 +4868,7 @@ fn response_json(response: ProductResponse) -> Value {
                 "object_id": hit.object_id.get().to_string(),
                 "score": hit.score,
                 "doc_values": hit.doc_values.into_iter().map(|(name, value)| (name, doc_value_json(value))).collect::<serde_json::Map<_, _>>(),
+                "fragments": hit.fragments,
             })).collect::<Vec<_>>(),
             "facets": result.facets.into_iter().map(|facet| json!({
                 "field": facet.field,

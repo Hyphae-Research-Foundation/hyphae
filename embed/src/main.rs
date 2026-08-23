@@ -17,7 +17,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
@@ -46,7 +46,11 @@ fn main() -> Result<()> {
                 index += 2;
             }
             "--query" => {
-                query = Some(rest.get(index + 1).context("--query needs a value")?.clone());
+                query = Some(
+                    rest.get(index + 1)
+                        .context("--query needs a value")?
+                        .clone(),
+                );
                 index += 2;
             }
             other => bail!("unknown argument: {other}"),
@@ -106,6 +110,7 @@ struct AttestedModel {
     tokenizer: Tokenizer,
     model: BertModel,
     device: Device,
+    max_positions: usize,
 }
 
 impl AttestedModel {
@@ -129,9 +134,9 @@ impl AttestedModel {
         }
         // CPU execution keeps the replay-determinism claim host-independent.
         let device = Device::Cpu;
-        let builder = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)?
-        };
+        let builder =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)? };
+        let max_positions = config.max_position_embeddings;
         let model = BertModel::load(builder, &config)?;
         Ok(Self {
             target,
@@ -139,6 +144,7 @@ impl AttestedModel {
             tokenizer,
             model,
             device,
+            max_positions,
         })
     }
 
@@ -192,9 +198,10 @@ impl AttestedModel {
             .tokenizer
             .encode(text, true)
             .map_err(|error| anyhow::anyhow!("tokenization failed: {error}"))?;
-        let ids = encoding.get_ids().to_vec();
-        let type_ids = encoding.get_type_ids().to_vec();
-        let width = ids.len();
+        // Deterministic truncation to the model's positional capacity.
+        let width = encoding.get_ids().len().min(self.max_positions);
+        let ids = encoding.get_ids()[..width].to_vec();
+        let type_ids = encoding.get_type_ids()[..width].to_vec();
         let ids = Tensor::from_vec(ids, (1, width), &self.device)?;
         let type_ids = Tensor::from_vec(type_ids, (1, width), &self.device)?;
         let hidden = self.model.forward(&ids, &type_ids, None)?;
@@ -309,7 +316,7 @@ mod tests {
         );
         assert_ne!(
             base,
-            canonical_input_digest("embed", "target", None, &texts[..1].to_vec())
+            canonical_input_digest("embed", "target", None, &texts[..1])
         );
     }
 }

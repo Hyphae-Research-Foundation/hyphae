@@ -204,6 +204,27 @@ pub const MAX_PARENT_DEDUPE_FIRST_K: usize = 100;
 /// Maximum externally reranked entries in one request.
 pub const MAX_RERANK_ENTRIES: usize = 256;
 
+/// Maximum highlighted fragments per hit.
+pub const MAX_HIGHLIGHT_FRAGMENTS: usize = 4;
+/// Maximum normalized-text bytes per highlighted fragment.
+pub const MAX_HIGHLIGHT_FRAGMENT_BYTES: usize = 512;
+/// Minimum normalized-text bytes per highlighted fragment.
+pub const MIN_HIGHLIGHT_FRAGMENT_BYTES: usize = 16;
+
+/// Budgeted deterministic highlighting over the final hits.
+///
+/// Fragments are cut from the canonical analyzer's normalized text of each
+/// hit's indexed source, around tokens equal to the analyzed query terms.
+/// Extraction is a pure function of committed text, the query, and this
+/// budget — it never touches the wire encoding of proofs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductHighlight {
+    /// Fragments retained per hit, within `1..=4`.
+    pub max_fragments: usize,
+    /// Normalized-text byte budget per fragment, within `16..=512`.
+    pub fragment_bytes: usize,
+}
+
 /// An attested external rerank applied over the final ranking.
 ///
 /// The scores come from a model stage outside the engine — the attested
@@ -243,6 +264,8 @@ pub struct ProductSearchRequest {
     pub parent_dedupe: Option<ProductParentDedupe>,
     /// Optional attested external rerank over the final ranking.
     pub rerank: Option<ProductRerankStage>,
+    /// Optional budgeted highlighting over the final hits.
+    pub highlight: Option<ProductHighlight>,
 }
 
 /// Physical vector strategy that actually ran.
@@ -286,6 +309,8 @@ pub struct ProductIntegratedSearchHit {
     pub score: f64,
     /// Persisted typed values used by filtering and sorting.
     pub doc_values: BTreeMap<String, ProductDocValue>,
+    /// Budgeted normalized-text fragments, present only when requested.
+    pub fragments: Vec<String>,
 }
 
 /// Complete integrated result with snapshot, strategy, approximation, and counts.
@@ -1014,17 +1039,13 @@ impl NativeProduct {
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
-            hits: result
-                .hits
-                .into_iter()
-                .map(|hit| {
-                    Ok(ProductIntegratedSearchHit {
-                        object_id: decode_object_id(&hit.document_id)?,
-                        score: hit.score,
-                        doc_values: hit.values,
-                    })
-                })
-                .collect::<Result<_, ProductError>>()?,
+            hits: integrated_hits(
+                result.hits,
+                &snapshot,
+                binding.lexical_index,
+                request,
+                transform.as_ref(),
+            )?,
             facets: result.facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
@@ -1131,17 +1152,13 @@ impl NativeProduct {
         }
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
-            hits: result
-                .hits
-                .into_iter()
-                .map(|hit| {
-                    Ok(ProductIntegratedSearchHit {
-                        object_id: decode_object_id(&hit.document_id)?,
-                        score: hit.score,
-                        doc_values: hit.values,
-                    })
-                })
-                .collect::<Result<_, ProductError>>()?,
+            hits: integrated_hits(
+                result.hits,
+                snapshot,
+                binding.lexical_index,
+                request,
+                transform.as_ref(),
+            )?,
             facets: result.facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
@@ -1646,6 +1663,18 @@ fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
     Ok(())
 }
 
+fn validate_highlight(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(highlight) = &request.highlight
+        && (!(1..=MAX_HIGHLIGHT_FRAGMENTS).contains(&highlight.max_fragments)
+            || !(MIN_HIGHLIGHT_FRAGMENT_BYTES..=MAX_HIGHLIGHT_FRAGMENT_BYTES)
+                .contains(&highlight.fragment_bytes)
+            || request.lexical.is_none())
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductError> {
     if let Some(dedupe) = &request.parent_dedupe
         && (dedupe.field.is_empty()
@@ -1664,6 +1693,7 @@ fn validate_search_request(
 ) -> Result<(), ProductError> {
     validate_parent_dedupe(request)?;
     validate_rerank(request)?;
+    validate_highlight(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
@@ -1946,6 +1976,103 @@ fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
 /// sorted ranking, then truncates to the requested limit. Hits without the
 /// parent field are never deduplicated. Grouping keys use the canonical
 /// posting component encoding so equality is exact and type-bound.
+/// Maps final doc-value hits to integrated hits, cutting budgeted
+/// highlight fragments when the request carries a budget. Both search
+/// twins share this exact mapping.
+fn integrated_hits(
+    hits: Vec<hyphae_native_runtime::DocValueCandidate>,
+    snapshot: &ProductSnapshot,
+    lexical_index: crate::ObjectId,
+    request: &ProductSearchRequest,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
+) -> Result<Vec<ProductIntegratedSearchHit>, ProductError> {
+    let terms = highlight_terms(request, transform);
+    hits.into_iter()
+        .map(|hit| {
+            let fragments = match (&terms, &request.highlight) {
+                (Some(terms), Some(highlight)) => snapshot
+                    .inner
+                    .search_document_text(lexical_index, &hit.document_id)
+                    .map_or_else(Vec::new, |text| extract_fragments(text, terms, highlight)),
+                _ => Vec::new(),
+            };
+            Ok(ProductIntegratedSearchHit {
+                object_id: decode_object_id(&hit.document_id)?,
+                score: hit.score,
+                doc_values: hit.values,
+                fragments,
+            })
+        })
+        .collect()
+}
+
+/// Analyzed query terms for highlighting, derived from exactly the
+/// transformed query string the lexical branch scores with.
+fn highlight_terms(
+    request: &ProductSearchRequest,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
+) -> Option<BTreeSet<String>> {
+    request.highlight.as_ref()?;
+    let lexical = request.lexical.as_ref()?;
+    let query = match transform {
+        None => lexical.query.clone(),
+        Some(transform) => transform.apply(&lexical.query),
+    };
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(&query);
+    Some(
+        analysis
+            .tokens
+            .into_iter()
+            .map(|token| token.term)
+            .collect(),
+    )
+}
+
+/// Cuts budgeted fragments from the canonical analyzer's normalized text
+/// around tokens equal to the analyzed query terms.
+///
+/// Extraction is a pure deterministic function of the stored text, the
+/// term set, and the budget: fragments start one quarter of the budget
+/// before the first unconsumed matching token (clipped to a character
+/// boundary), extend to the byte budget, and never overlap.
+fn extract_fragments(
+    text: &str,
+    terms: &BTreeSet<String>,
+    highlight: &ProductHighlight,
+) -> Vec<String> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(text);
+    let normalized = analysis.normalized_text.as_str();
+    let mut fragments = Vec::new();
+    let mut cursor = 0_usize;
+    for token in &analysis.tokens {
+        if fragments.len() == highlight.max_fragments {
+            break;
+        }
+        if token.start_offset < cursor || !terms.contains(&token.term) {
+            continue;
+        }
+        let mut start = token
+            .start_offset
+            .saturating_sub(highlight.fragment_bytes / 4)
+            .max(cursor);
+        while start > 0 && !normalized.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = start
+            .saturating_add(highlight.fragment_bytes)
+            .min(normalized.len());
+        while end < normalized.len() && !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= start {
+            continue;
+        }
+        fragments.push(normalized[start..end].to_owned());
+        cursor = end;
+    }
+    fragments
+}
+
 fn apply_parent_dedupe(
     hits: Vec<hyphae_native_runtime::DocValueCandidate>,
     dedupe: &ProductParentDedupe,

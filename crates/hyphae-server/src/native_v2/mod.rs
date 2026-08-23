@@ -2002,7 +2002,7 @@ mod tests {
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             unsupported.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "4"
+            "5"
         );
 
         for (request_id, minor) in [("496", None), ("497", Some("garbage"))] {
@@ -2026,7 +2026,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "4"
+                "5"
             );
         }
 
@@ -2037,6 +2037,7 @@ mod tests {
             ("511", "1, 3", "3"),
             ("512", "4,3,2", "4"),
             ("513", "4", "4"),
+            ("508", "3,4,5", "5"),
         ] {
             let mut accepted = http_request(
                 "/v2/execute",
@@ -2073,14 +2074,14 @@ mod tests {
         assert_eq!(repeated.status(), StatusCode::OK);
         assert_eq!(
             repeated.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "3"
+            "5"
         );
         for (request_id, offer) in [
             ("514", "3,3"),
             ("515", "03"),
             ("516", "3,"),
             ("517", "1,2,5,6,7,8,9,10,3"),
-            ("518", "5"),
+            ("518", "6"),
             ("519", "3 4"),
         ] {
             let mut rejected = http_request(
@@ -2098,7 +2099,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "4"
+                "5"
             );
         }
 
@@ -2142,7 +2143,7 @@ mod tests {
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             error.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "4"
+            "5"
         );
         drop(service);
         Ok(())
@@ -2567,6 +2568,7 @@ mod tests {
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
+                highlight: None,
             },
         };
         assert!(super::server::family_accepts(

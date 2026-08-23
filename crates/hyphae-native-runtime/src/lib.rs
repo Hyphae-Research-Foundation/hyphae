@@ -3601,6 +3601,16 @@ impl NativeSnapshot {
         )
     }
 
+    /// Returns one document's exact retained source text from a physical
+    /// lexical index.
+    pub fn search_document_text(&self, index: ObjectId, document_id: &[u8]) -> Option<&str> {
+        self.state
+            .search
+            .documents(index)?
+            .get(document_id)
+            .map(String::as_str)
+    }
+
     /// Returns the exact retained source text for one physical lexical index.
     pub fn search_documents(&self, index: ObjectId) -> Option<Vec<(Vec<u8>, String)>> {
         self.state.search.documents(index).map(|documents| {
