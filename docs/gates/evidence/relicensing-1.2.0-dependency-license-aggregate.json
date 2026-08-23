@@ -269,7 +269,7 @@
       "inventory": "sdks/python/build-dependencies.json",
       "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "5776d260d0535059ccf73bd4f690033e4dca3f81f55d8e01cd66b26fb139389c",
+      "manifest_sha256": "500fecd9a7c4d346336408c69511713a378b5d601cce7ddc5002abc983e99601",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
