@@ -422,6 +422,36 @@ test("v2 highlighted request matches the cross-language golden", () => {
   assert.equal(hex(blake3(encoded)), "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443");
 });
 
+test("v2 integrated search response decodes with and without fragments", () => {
+  const fromHex = (hex) => Uint8Array.from(hex.match(/../gu), (byte) => Number.parseInt(byte, 16));
+  // Both payloads are Rust-encoded goldens for the same one-hit result; the
+  // second carries the minor-5 content-derived fragments tail.
+  const plain = fromHex(
+    "4859505253503031bc0000001600000001010101010101010101010101010101" +
+    "0101010101010101000000000000000003000000000000000404040404040404" +
+    "0404040404040404040404040404040404040404040404040500000000000000" +
+    "01000000c9000000000000000000000000000000000000000000f83f00000000" +
+    "0000000000000000000000000000000000000000010000000000000001000000" +
+    "00000000010000000000000001000000000000000100000000000000",
+  );
+  const fragmented = fromHex(
+    "4859505253503031d20000001600000001010101010101010101010101010101" +
+    "0101010101010101000000000000000003000000000000000404040404040404" +
+    "0404040404040404040404040404040404040404040404040500000000000000" +
+    "01000000c9000000000000000000000000000000000000000000f83f00000000" +
+    "0000000000000000000000000000000000000000010000000000000001000000" +
+    "0000000001000000000000000100000000000000010000000000000001010000" +
+    "000d00000072757374206461746162617365",
+  );
+  for (const [payload, fragments] of [[plain, undefined], [fragmented, ["rust database"]]]) {
+    const response = decodeProductResponse(payload, 1n, 5);
+    assert.equal(response.kind, "integrated_search");
+    const hit = response.value.hits[0];
+    assert.equal(hit.objectId, 201n);
+    assert.deepEqual(hit.fragments, fragments);
+  }
+});
+
 test("v2 transaction and catalog requests round trip", () => {
   const cases = [
     ["transaction_begin", {}],

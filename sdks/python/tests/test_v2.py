@@ -243,6 +243,33 @@ class V2Tests(unittest.TestCase):
             "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443",
         )
 
+    def test_integrated_search_response_decodes_with_and_without_fragments(self) -> None:
+        # Both payloads are Rust-encoded goldens for the same one-hit result;
+        # the second carries the minor-5 content-derived fragments tail.
+        plain = bytes.fromhex(
+            "4859505253503031bc0000001600000001010101010101010101010101010101"
+            "0101010101010101000000000000000003000000000000000404040404040404"
+            "0404040404040404040404040404040404040404040404040500000000000000"
+            "01000000c9000000000000000000000000000000000000000000f83f00000000"
+            "0000000000000000000000000000000000000000010000000000000001000000"
+            "00000000010000000000000001000000000000000100000000000000"
+        )
+        fragmented = bytes.fromhex(
+            "4859505253503031d20000001600000001010101010101010101010101010101"
+            "0101010101010101000000000000000003000000000000000404040404040404"
+            "0404040404040404040404040404040404040404040404040500000000000000"
+            "01000000c9000000000000000000000000000000000000000000f83f00000000"
+            "0000000000000000000000000000000000000000010000000000000001000000"
+            "0000000001000000000000000100000000000000010000000000000001010000"
+            "000d00000072757374206461746162617365"
+        )
+        for payload, fragments in ((plain, None), (fragmented, ["rust database"])):
+            response = decode_product_response(payload, None)
+            self.assertEqual(response.kind, "integrated_search")
+            hit = response.value["hits"][0]
+            self.assertEqual(hit["object_id"], 201)
+            self.assertEqual(hit.get("fragments"), fragments)
+
     def test_transaction_and_catalog_requests_round_trip(self) -> None:
         cases = (
             ("transaction_begin", {}),

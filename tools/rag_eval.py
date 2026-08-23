@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sdks" / "python" / "src"))
 
 from hyphae_sdk.v2 import HyphaeClient  # noqa: E402
+from hyphae_sdk.v2.protocol import operation_required_minor  # noqa: E402
 
 RECEIPT_SCHEMA = "hyphae-rag-relevance-receipt-v1"
 BEIR_BASE_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets"
@@ -394,6 +395,16 @@ def evaluate(
     if query_limit is not None:
         evaluated_ids = evaluated_ids[:query_limit]
 
+    if rerank_candidates > 0 and (
+        operation_required_minor(
+            "search_collection",
+            {"request": {"rerank": {"attestation": b"x", "scores": []}}},
+        )
+        < 4
+    ):
+        # An SDK without the rerank encoder would silently drop the stage
+        # and reproduce the baseline ranking; fail closed instead.
+        raise HarnessError("the installed SDK cannot encode the rerank stage")
     version = run_binary(binary, ["version", "--json"])
     # The working directory lives next to the dataset cache: /tmp is often a
     # memory-backed filesystem whose quota a durable ingest exhausts.
