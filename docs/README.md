@@ -46,6 +46,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [HTTP API v1](api/v1.md)
 - [Stable API error codes](api/error-codes-v1.md)
 - [Public clients](clients/v1.md)
+- [Hyphae Agent Memory on Omarchy](integrations/omarchy.md)
 - [Optional framework adapters](integrations/optional-adapters.md)
 - [Provable RAG cookbook](integrations/rag-cookbook.md)
 - [MCP adapter](../mcp/README.md)
