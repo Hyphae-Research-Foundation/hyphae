@@ -42,8 +42,24 @@ def validate_metadata(encoded: bytes, version: str) -> None:
         fail("distribution metadata lost the supported Python floor")
     if metadata.get("License-Expression") != "Apache-2.0":
         fail("distribution metadata lost the SPDX license expression")
-    if metadata.get_all("Requires-Dist", failobj=[]):
-        fail("distribution unexpectedly declares runtime dependencies")
+    # The base install carries zero runtime dependencies. Optional extras
+    # are the one admitted exception: every declared requirement must be
+    # guarded by an extra marker from the frozen inventory, with a frozen
+    # requirement body.
+    allowed_extras = {"providers", "langchain", "llamaindex"}
+    allowed_requirements = {
+        'blake3>=0.4; extra == "providers"',
+        'blake3>=0.4; extra == "langchain"',
+        'langchain-core>=0.3; extra == "langchain"',
+        'blake3>=0.4; extra == "llamaindex"',
+        'llama-index-core>=0.11; extra == "llamaindex"',
+    }
+    declared_extras = set(metadata.get_all("Provides-Extra", failobj=[]))
+    if declared_extras != allowed_extras:
+        fail("distribution extras differ from the frozen inventory")
+    for requirement in metadata.get_all("Requires-Dist", failobj=[]):
+        if requirement not in allowed_requirements:
+            fail("distribution unexpectedly declares runtime dependencies")
 
 
 def validate_wheel(path: Path, version: str) -> int:

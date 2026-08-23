@@ -1,7 +1,7 @@
 # Hyphae usage manual
 
-Status: current for the published `2.0.0` release. Every command, request
-shape, and output in this manual was executed against the released `2.0.0`
+Status: current for the published `2.0.1` release. Every command, request
+shape, and output in this manual was executed against the released `2.0.1`
 binary; outputs are literal, trimmed only where marked. The normative
 semantics remain in the versioned specifications under
 [`docs/native/`](native/local-product-v1.md) and the contracts under
@@ -41,7 +41,7 @@ or LLM.
 From crates.io:
 
 ```bash
-cargo install hyphae-cli --version 2.0.0 --locked
+cargo install hyphae-cli --version 2.0.1 --locked
 hyphae version --json
 ```
 
@@ -49,19 +49,19 @@ hyphae version --json
 {
   "api_version": "v1",
   "disk_format_version": 2,
-  "engine_version": "2.0.0",
+  "engine_version": "2.0.1",
   "native_directory_format": 1,
   "product": "hyphae",
   "product_api_version": 1
 }
 ```
 
-The [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v2.0.0)
+The [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v2.0.1)
 ships signed archives for Linux x64, macOS x64/arm64, and Windows x64, each
 with SHA-256 checksums, SPDX/CycloneDX SBOMs, SLSA provenance, and Sigstore
 bundles; verify before installing. To embed, depend on exact versions:
-`hyphae-native-product = "=2.0.0"` for new applications, or
-`hyphae-engine = "=2.0.0"` for existing format-2 state. Client SDKs are
+`hyphae-native-product = "=2.0.1"` for new applications, or
+`hyphae-engine = "=2.0.1"` for existing format-2 state. Client SDKs are
 `hyphae-sdk` (Python 3.11+, standard library only) and `@hyphae_/hyphae`
 (Node 20+, ESM, no runtime dependencies).
 
@@ -724,7 +724,7 @@ reproduced and resolved while validating this manual:
 
 ## Limits and non-capabilities
 
-Effective limits of the 2.0.0 build as reported by `capabilities` (yours
+Effective limits of the 2.0.1 build as reported by `capabilities` (yours
 are versioned in the contracts — consult them, do not assume):
 
 | Limit | Value | Limit | Value |

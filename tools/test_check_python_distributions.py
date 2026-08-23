@@ -13,10 +13,52 @@ from tools.check_python_distributions import (
     DistributionValidationError,
     safe_names,
     validate,
+    validate_metadata,
 )
 
 
+def metadata_bytes(*extra_lines: str) -> bytes:
+    lines = [
+        "Metadata-Version: 2.4",
+        "Name: hyphae-sdk",
+        "Version: 2.0.1",
+        "Requires-Python: >=3.11",
+        "License-Expression: Apache-2.0",
+        'Provides-Extra: providers',
+        'Provides-Extra: langchain',
+        'Provides-Extra: llamaindex',
+        *extra_lines,
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class PythonDistributionContractTests(unittest.TestCase):
+    def test_frozen_extras_are_the_only_admitted_requirements(self) -> None:
+        validate_metadata(
+            metadata_bytes(
+                'Requires-Dist: blake3>=0.4; extra == "providers"',
+                'Requires-Dist: langchain-core>=0.3; extra == "langchain"',
+            ),
+            "2.0.1",
+        )
+        with self.assertRaisesRegex(
+            DistributionValidationError, "runtime dependencies"
+        ):
+            validate_metadata(
+                metadata_bytes("Requires-Dist: requests>=2"), "2.0.1"
+            )
+        with self.assertRaisesRegex(
+            DistributionValidationError, "runtime dependencies"
+        ):
+            validate_metadata(
+                metadata_bytes('Requires-Dist: requests>=2; extra == "providers"'),
+                "2.0.1",
+            )
+        with self.assertRaisesRegex(DistributionValidationError, "extras differ"):
+            validate_metadata(
+                metadata_bytes('Provides-Extra: surprise'), "2.0.1"
+            )
+
     def test_path_traversal_is_rejected(self) -> None:
         with self.assertRaisesRegex(DistributionValidationError, "unsafe member"):
             safe_names(["../outside"])
