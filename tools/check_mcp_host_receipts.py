@@ -35,6 +35,7 @@ EXPECTED_TOOLS = [
     "hyphae_native_search_collection",
     "hyphae_native_prove_search",
     "hyphae_native_verify_proof",
+    "hyphae_native_memory_recall",
 ]
 EXPECTED_CASES = [
     {
@@ -164,7 +165,7 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
     if (
         corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
         or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
-        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v3"
+        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v4"
         or corpus.get("tools") != EXPECTED_TOOLS
         or corpus.get("cases") != EXPECTED_CASES
         or len({case["id"] for case in EXPECTED_CASES}) != 8

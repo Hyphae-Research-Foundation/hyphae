@@ -2325,7 +2325,7 @@ def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
     approximate = reader.boolean()
     reader.zeroes(7)
     counts = [reader.u64() for _ in range(5)]
-    if reader.remaining() > 0:
+    if reader.remaining > 0:
         # Content-derived response tail: per-hit highlight fragments.
         if reader.u8() != 1:
             raise ClientError("integrated response section is invalid")

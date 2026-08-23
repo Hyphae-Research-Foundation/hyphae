@@ -159,7 +159,7 @@ class McpHostConformanceTests(unittest.TestCase):
         lock = json.loads(
             (ROOT / "conformance/mcp/hosts/package-lock.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(len(corpus["tools"]), 7)
+        self.assertEqual(len(corpus["tools"]), 8)
         self.assertEqual(
             [(case["id"], case["tool"], case["arguments"], case["expect"], case["assert"]) for case in corpus["cases"]],
             [
@@ -271,7 +271,7 @@ class McpHostConformanceTests(unittest.TestCase):
                 {
                     "status": "passed",
                     "hosts": ["claude-code", "codex"],
-                    "tools": 7,
+                    "tools": 8,
                     "cases": 8,
                     "source_mode": source_mode,
                 },

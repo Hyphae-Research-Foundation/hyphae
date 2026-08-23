@@ -3385,11 +3385,11 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(responses.len(), 8);
     let schema_version = &responses[0]["result"]["_meta"]["hyphaeToolSchemaVersion"];
     let schema_digest = &responses[0]["result"]["_meta"]["hyphaeToolSchemaDigest"];
-    assert_eq!(schema_version, "hyphae-native-mcp-tools-v3");
+    assert_eq!(schema_version, "hyphae-native-mcp-tools-v4");
     assert_eq!(schema_digest.as_str().map(str::len), Some(64));
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(7)
+        Some(8)
     );
     assert!(responses[1]["result"].get("nextCursor").is_none());
     assert_eq!(responses[2]["error"]["code"], -32602);
@@ -4392,7 +4392,7 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
         default_session[1]["result"]["tools"]
             .as_array()
             .map(Vec::len),
-        Some(7)
+        Some(8)
     );
     assert_eq!(default_session[2]["error"]["code"], -32602);
 
@@ -4407,7 +4407,7 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
         run_mcp_session_with_flags(&address_text, &writer_key, &["--allow-ingest"], &messages)?;
     assert_eq!(
         writer[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(8)
+        Some(11)
     );
     assert_eq!(writer[2]["result"]["isError"], false);
     assert_eq!(
@@ -4438,6 +4438,137 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
         reader[1]["result"]["structuredContent"]["error"]["code"],
         "authorization_denied"
     );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_memory_tools_store_recall_and_forget_with_a_lifecycle()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.memories",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmm-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let store = |id: u64, text: &str| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_native_memory_store",
+            "arguments":{"collection":13,"text":text}}})
+    };
+    let recall = |id: u64| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_native_memory_recall",
+            "arguments":{"collection":13,"query":"deterministic retrieval"}}})
+    };
+    let mut messages = handshake.to_vec();
+    messages.push(store(2, "the user prefers deterministic retrieval"));
+    messages.push(store(3, "unrelated gardening note"));
+    messages.push(recall(4));
+    let session =
+        run_mcp_session_with_flags(&address_text, &owner_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        session[1]["result"]["structuredContent"]["status"],
+        "stored"
+    );
+    let memory_id = session[1]["result"]["structuredContent"]["id"]
+        .as_str()
+        .ok_or("memory id")?
+        .to_owned();
+    assert_eq!(
+        session[2]["result"]["structuredContent"]["status"],
+        "stored"
+    );
+    let recalled = &session[3]["result"]["structuredContent"];
+    let memories = recalled["memories"].as_array().ok_or("memories")?;
+    assert_eq!(
+        memories[0]["text"],
+        "the user prefers deterministic retrieval"
+    );
+    assert_eq!(memories[0]["id"], memory_id.as_str());
+    // Without prove the artifacts slot stays empty; the sealed path shares
+    // the prove-search plumbing covered by its own session test.
+    assert!(recalled["proof"].is_null());
+
+    // Forget removes the lifecycle and the document; recall never
+    // surfaces the memory again.
+    let forget = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+        "name":"hyphae_native_memory_forget",
+        "arguments":{"collection":13,"id":memory_id}}});
+    let mut messages = handshake.to_vec();
+    messages.push(forget);
+    messages.push(recall(6));
+    let session =
+        run_mcp_session_with_flags(&address_text, &owner_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        session[1]["result"]["structuredContent"]["status"], "forgotten",
+        "forget response: {}",
+        session[1]
+    );
+    let recalled = &session[2]["result"]["structuredContent"];
+    assert_eq!(recalled["memories"].as_array().map(Vec::len), Some(0));
     let _ignored = fs::remove_file(endpoint);
     Ok(())
 }

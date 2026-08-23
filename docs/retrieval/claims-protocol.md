@@ -42,9 +42,11 @@ promote a declared number to a replayable one.
 | Committed state is byte-identical across hosts: same metrics and same directory bytes on different distros, kernels, glibc, CPUs | [Cross-host determinism](../gates/evidence/rag-cross-host-determinism-2026-08-22.md) | x86-64 Linux; aarch64 unmeasured; excludes float pipelines outside the engine |
 | Local embeddings and rerank scores are replayable and offline-verifiable (`HYATTS01`, pure verifier in core) | [Attested embed replay](../gates/evidence/attested-embed-replay-2026-08-22.md) | CPU execution only; cross-implementation float portability not claimed |
 | Chunk provenance is sealed in the proof: parent, byte range, and ordinal ride the verified result | Offline-verified chunk test in the engine suite (`integrated_search.rs`, C1/C3) | Provenance binds doc-values, not raw parent bytes |
+| A local attested rerank lifts BM25 by +11.5% nDCG@10 with no vector index, sealed in the proof; the same bi-encoder stacked on hybrid subtracts 2.9% — published per this protocol | [Attested rerank uplift](../gates/evidence/rag-attested-rerank-nfcorpus-2026-08-23.md) | Bi-encoder rerank; a cross-encoder is the path to hybrid uplift |
+| Head-to-head on identical hardware with identical vectors: hybrid quality wins on every metric, rankings never change on rerun (theirs did, 4/323), cold start is faster — and ingest is slower, published | [Weaviate head-to-head](../gates/evidence/rag-weaviate-head-to-head-2026-08-23.md) | NFCorpus at 3.6k docs; RSS favors Weaviate at this scale; 1M×768 is the next rung |
+| Leave Weaviate with a receipt: a live instance exported through its public cursor, re-verified through the shipped binary, every construct carrying a fidelity class | [Weaviate head-to-head](../gates/evidence/rag-weaviate-head-to-head-2026-08-23.md), [migration guide](../porting/leave-weaviate.md) | Live cursor exports can miss concurrent writes; quiesce for point-in-time |
 
-Rows land here only after their receipts exist; the head-to-head (V2)
-and attested-rerank-uplift (V3) rows join with their runs.
+Rows land here only after their receipts exist.
 
 ## What we do not claim
 

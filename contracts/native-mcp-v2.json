@@ -1,7 +1,7 @@
 {
   "schema": "hyphae-native-mcp-contract-v2",
   "mcp_protocol": "2025-06-18",
-  "tool_schema_version": "hyphae-native-mcp-tools-v3",
+  "tool_schema_version": "hyphae-native-mcp-tools-v4",
   "tool_page_size": 100,
   "resource_limits": {
     "input_bytes": 4194304,
@@ -1034,14 +1034,26 @@
             "default": 10
           },
           "fusion": {
-            "type": ["string", "null"],
-            "enum": ["weighted_score", null],
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "weighted_score",
+              null
+            ],
             "description": "Branch-combination method. Absent means deterministic weighted reciprocal-rank fusion; weighted_score blends branch weights with normalized branch scores."
           },
           "parent_dedupe": {
-            "type": ["object", "null"],
+            "type": [
+              "object",
+              "null"
+            ],
             "additionalProperties": false,
-            "required": ["field", "first_k"],
+            "required": [
+              "field",
+              "first_k"
+            ],
             "properties": {
               "field": {
                 "type": "string",
@@ -1533,14 +1545,26 @@
             "default": 10
           },
           "fusion": {
-            "type": ["string", "null"],
-            "enum": ["weighted_score", null],
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "weighted_score",
+              null
+            ],
             "description": "Branch-combination method. Absent means deterministic weighted reciprocal-rank fusion; weighted_score blends branch weights with normalized branch scores."
           },
           "parent_dedupe": {
-            "type": ["object", "null"],
+            "type": [
+              "object",
+              "null"
+            ],
             "additionalProperties": false,
-            "required": ["field", "first_k"],
+            "required": [
+              "field",
+              "first_k"
+            ],
             "properties": {
               "field": {
                 "type": "string",
@@ -2072,6 +2096,563 @@
               },
               "idempotent_replay": {
                 "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema",
+              "error"
+            ],
+            "properties": {
+              "schema": {
+                "const": "hyphae-native-mcp-tool-error-v2"
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "category",
+                  "message",
+                  "retry",
+                  "transaction_state",
+                  "request_id",
+                  "trace_id",
+                  "object_id",
+                  "transaction_id"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  },
+                  "category": {
+                    "enum": [
+                      "invalid-request",
+                      "not-found",
+                      "conflict",
+                      "limit",
+                      "deadline",
+                      "cancelled",
+                      "authorization",
+                      "corruption",
+                      "unavailable",
+                      "io",
+                      "internal"
+                    ]
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "retry": {
+                    "enum": [
+                      "never",
+                      "same-request",
+                      "new-snapshot",
+                      "after-backoff",
+                      "after-recovery",
+                      "unknown-commit"
+                    ]
+                  },
+                  "transaction_state": {
+                    "enum": [
+                      "none",
+                      "active",
+                      "rolled-back",
+                      "committed",
+                      "outcome-unknown"
+                    ]
+                  },
+                  "request_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "trace_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "object_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  },
+                  "transaction_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "hyphae_native_memory_store",
+      "description": "Store one bounded memory: the text ingests under its content-derived identity and a scalar lifecycle key carries the text and optional TTL. Recallable exactly while the key lives. Listed and callable only with --allow-ingest and write authority.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collection",
+          "text"
+        ],
+        "properties": {
+          "collection": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 316224000
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "id",
+              "expires_at_micros"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "stored"
+                ]
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              },
+              "expires_at_micros": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema",
+              "error"
+            ],
+            "properties": {
+              "schema": {
+                "const": "hyphae-native-mcp-tool-error-v2"
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "category",
+                  "message",
+                  "retry",
+                  "transaction_state",
+                  "request_id",
+                  "trace_id",
+                  "object_id",
+                  "transaction_id"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  },
+                  "category": {
+                    "enum": [
+                      "invalid-request",
+                      "not-found",
+                      "conflict",
+                      "limit",
+                      "deadline",
+                      "cancelled",
+                      "authorization",
+                      "corruption",
+                      "unavailable",
+                      "io",
+                      "internal"
+                    ]
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "retry": {
+                    "enum": [
+                      "never",
+                      "same-request",
+                      "new-snapshot",
+                      "after-backoff",
+                      "after-recovery",
+                      "unknown-commit"
+                    ]
+                  },
+                  "transaction_state": {
+                    "enum": [
+                      "none",
+                      "active",
+                      "rolled-back",
+                      "committed",
+                      "outcome-unknown"
+                    ]
+                  },
+                  "request_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "trace_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "object_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  },
+                  "transaction_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "hyphae_native_memory_recall",
+      "description": "Recall memories by bounded lexical retrieval, keeping only hits whose lifecycle key still lives \u2014 expired or forgotten memories never return. With prove, the sealed proof, witness, and anchor ride the response for offline verification.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collection",
+          "query"
+        ],
+        "properties": {
+          "collection": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64
+          },
+          "prove": {
+            "type": "boolean"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "memories",
+              "expired_filtered",
+              "proof"
+            ],
+            "properties": {
+              "memories": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "score",
+                    "text"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    },
+                    "score": {
+                      "type": "number"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "expired_filtered": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "proof": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": false,
+                "required": [
+                  "proof_hex",
+                  "witness_hex",
+                  "anchor_hex"
+                ],
+                "properties": {
+                  "proof_hex": {
+                    "type": "string",
+                    "pattern": "^([0-9a-f]{2})*$"
+                  },
+                  "witness_hex": {
+                    "type": "string",
+                    "pattern": "^([0-9a-f]{2})*$"
+                  },
+                  "anchor_hex": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema",
+              "error"
+            ],
+            "properties": {
+              "schema": {
+                "const": "hyphae-native-mcp-tool-error-v2"
+              },
+              "error": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "code",
+                  "category",
+                  "message",
+                  "retry",
+                  "transaction_state",
+                  "request_id",
+                  "trace_id",
+                  "object_id",
+                  "transaction_id"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  },
+                  "category": {
+                    "enum": [
+                      "invalid-request",
+                      "not-found",
+                      "conflict",
+                      "limit",
+                      "deadline",
+                      "cancelled",
+                      "authorization",
+                      "corruption",
+                      "unavailable",
+                      "io",
+                      "internal"
+                    ]
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "retry": {
+                    "enum": [
+                      "never",
+                      "same-request",
+                      "new-snapshot",
+                      "after-backoff",
+                      "after-recovery",
+                      "unknown-commit"
+                    ]
+                  },
+                  "transaction_state": {
+                    "enum": [
+                      "none",
+                      "active",
+                      "rolled-back",
+                      "committed",
+                      "outcome-unknown"
+                    ]
+                  },
+                  "request_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "trace_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 39,
+                    "pattern": "^(0|[1-9][0-9]{0,38})$"
+                  },
+                  "object_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  },
+                  "transaction_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 20,
+                    "pattern": "^[1-9][0-9]{0,19}$"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "hyphae_native_memory_forget",
+      "description": "Forget one memory permanently: the lifecycle key tombstones and the document leaves every branch, so recall can never surface it again. Listed and callable only with --allow-ingest and write authority.",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "collection",
+          "id"
+        ],
+        "properties": {
+          "collection": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "id"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "forgotten"
+                ]
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
               }
             }
           },
