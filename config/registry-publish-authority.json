@@ -1,7 +1,7 @@
 {
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-registry-publish-authority-v1",
-  "repository": "celiumsai/hyphae",
+  "repository": "Hyphae-Research-Foundation/hyphae",
   "branch": "main",
   "version": "2.0.1",
   "tag": "v2.0.1",

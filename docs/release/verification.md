@@ -64,7 +64,7 @@ exact-tag recovery:
 cosign verify-blob \
   --bundle hyphae-VERSION-TARGET.tar.gz.sigstore.json \
   --certificate-identity \
-    'https://github.com/celiumsai/hyphae/.github/workflows/release.yml@RELEASE_WORKFLOW_REF' \
+    'https://github.com/Hyphae-Research-Foundation/hyphae/.github/workflows/release.yml@RELEASE_WORKFLOW_REF' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   hyphae-VERSION-TARGET.tar.gz
 ```
@@ -82,7 +82,7 @@ tag, commit, tree, fetched tag object, peeled tag target, full tag ref, release
 workflow, and GitHub Actions run. Its artifact inventory must contain every
 archive, provenance predicate, SPDX SBOM, CycloneDX SBOM, and the
 required-checks report exactly once. The checks
-report must identify `celiumsai/hyphae`, the tagged merge commit, and exactly
+report must identify `Hyphae-Research-Foundation/hyphae`, the tagged merge commit, and exactly
 the 20 canonical checks in fixed order. Every record must have a unique
 check-run ID, the matching workflow-run ID, canonical workflow path and
 GitHub job URL, GitHub Actions app ID/slug, the authoritative `head_sha` and head branch,
@@ -197,7 +197,7 @@ cosign verify-blob-attestation \
   --bundle hyphae-VERSION-TARGET.tar.gz.intoto.sigstore.json \
   --type slsaprovenance1 \
   --certificate-identity \
-    'https://github.com/celiumsai/hyphae/.github/workflows/release.yml@refs/tags/vVERSION' \
+    'https://github.com/Hyphae-Research-Foundation/hyphae/.github/workflows/release.yml@refs/tags/vVERSION' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   hyphae-VERSION-TARGET.tar.gz
 ```

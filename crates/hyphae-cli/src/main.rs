@@ -2,6 +2,7 @@
 
 //! Command-line entry point for the single native Hyphae executable.
 
+mod agent;
 mod compatibility;
 mod exit;
 mod json_value;
@@ -330,6 +331,12 @@ enum Command {
         operation: compatibility::RemoteCommand,
     },
     /// Run the bounded read-only MCP adapter over managed Native HTTP v2.
+    /// Agent Memory lifecycle: setup, status, doctor, backup, remove,
+    /// and purge-data over the user's dedicated memory directory.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Mcp {
         #[arg(long, env = "HYPHAE_BASE_URL")]
         base_url: String,
@@ -346,6 +353,17 @@ enum Command {
         /// Explicitly expose the bounded write-scoped ingest tool.
         #[arg(long)]
         allow_ingest: bool,
+        /// Tool profile: the full native registry, or the Agent Memory
+        /// four-tool surface.
+        #[arg(long, value_enum, default_value_t = McpProfile::Full)]
+        profile: McpProfile,
+        /// Expose the write-scoped memory tools (store and forget) on the
+        /// memory profile.
+        #[arg(long)]
+        allow_write: bool,
+        /// Agent Memory collection identity for the memory profile.
+        #[arg(long, default_value_t = 13)]
+        memory_collection: u128,
     },
 }
 
@@ -927,6 +945,10 @@ enum CatalogCommand {
         #[arg(long)]
         analyzer_english_stem: bool,
         /// Tuned BM25 k1 in micros (defaults keep the canonical 1.2).
+        /// Replace the sample doc-value fields with the Agent Memory
+        /// schema: project and kind string doc-values.
+        #[arg(long)]
+        memory_schema: bool,
         #[arg(long, requires = "bm25_b_micros")]
         bm25_k1_micros: Option<u64>,
         /// Tuned BM25 b in micros (defaults keep the canonical 0.75).
@@ -1609,6 +1631,64 @@ enum SearchQueryKind {
     Fuzzy,
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum AgentCommand {
+    /// Create every Agent Memory resource and smoke test the surface.
+    Setup {
+        /// Enable and start the user service without asking.
+        #[arg(long, conflicts_with = "no_service")]
+        enable_service: bool,
+        /// Skip service installation entirely.
+        #[arg(long)]
+        no_service: bool,
+    },
+    /// Redacted local status: paths, initialization, credentials.
+    Status,
+    /// Engine doctor over the Agent Memory directory.
+    Doctor,
+    /// Write one verified backup archive under the backups directory.
+    Backup,
+    /// Remove generated credentials while preserving data and backups.
+    Remove,
+    /// Restore one verified backup into the data directory.
+    Restore {
+        /// Backup directory produced by `hyphae agent backup`.
+        #[arg(long)]
+        backup: PathBuf,
+    },
+    /// Stop, back up, doctor, and restart the service around an upgrade.
+    Upgrade,
+    /// Generate one agent host's MCP configuration.
+    Configure {
+        #[arg(value_enum)]
+        host: AgentHost,
+        /// Write the configuration instead of printing it.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Permanently delete the data directory after confirmation.
+    PurgeData {
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentHost {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum McpProfile {
+    /// Full native tool registry.
+    Full,
+    /// Agent Memory four-tool surface.
+    Memory,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FusionMethodInput {
     /// Normalized weighted score blend across branches.
@@ -1908,16 +1988,48 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
         } => compatibility(
             compatibility::remote(&base_url, bearer_token_file.as_deref(), operation).await,
         ),
+        Command::Agent { command } => match command {
+            AgentCommand::Setup {
+                enable_service,
+                no_service,
+            } => agent::setup(enable_service, no_service).map_err(Into::into),
+            AgentCommand::Status => agent::status().map_err(Into::into),
+            AgentCommand::Doctor => agent::doctor().map_err(Into::into),
+            AgentCommand::Backup => agent::backup().map_err(Into::into),
+            AgentCommand::Remove => agent::remove().map_err(Into::into),
+            AgentCommand::Restore { backup } => agent::restore(&backup).map_err(Into::into),
+            AgentCommand::Upgrade => agent::upgrade().map_err(Into::into),
+            AgentCommand::Configure { host, write } => agent::configure(
+                match host {
+                    AgentHost::Claude => agent::Host::Claude,
+                    AgentHost::Codex => agent::Host::Codex,
+                    AgentHost::Opencode => agent::Host::Opencode,
+                },
+                write,
+            )
+            .map_err(Into::into),
+            AgentCommand::PurgeData { yes } => agent::purge_data(yes).map_err(Into::into),
+        },
         Command::Mcp {
             base_url,
             native_api_key_file,
             native_api_key_stdin,
             allow_ingest,
+            profile,
+            allow_write,
+            memory_collection,
         } => mcp::run(
             &base_url,
             native_api_key_file.as_deref(),
             native_api_key_stdin,
             allow_ingest,
+            match profile {
+                McpProfile::Full => mcp::Profile::Full,
+                McpProfile::Memory => mcp::Profile::Memory {
+                    allow_write,
+                    collection: memory_collection,
+                },
+            },
         )
         .await
         .map_err(Into::into),
@@ -2951,6 +3063,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer_ascii_folding,
             analyzer_english_stop,
             analyzer_english_stem,
+            memory_schema,
             bm25_k1_micros,
             bm25_b_micros,
             durability,
@@ -3013,8 +3126,8 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                         }
                         _ => None,
                     },
-                    fields: vec![
-                        SearchFieldDefinitionV2 {
+                    fields: {
+                        let mut fields = vec![SearchFieldDefinitionV2 {
                             id: field_id(1)?,
                             name: catalog_name("body")?,
                             logical_type: LogicalType::Text,
@@ -3025,22 +3138,40 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                                 source: FieldSourcePolicy::Retained,
                                 lexical: LexicalIndexPolicy::Frequencies,
                             },
-                        },
-                        SearchFieldDefinitionV2 {
-                            id: field_id(2)?,
-                            name: catalog_name("category")?,
-                            logical_type: LogicalType::Text,
-                            analyzer: None,
-                            options: doc_value_options(),
-                        },
-                        SearchFieldDefinitionV2 {
-                            id: field_id(3)?,
-                            name: catalog_name("price")?,
-                            logical_type: LogicalType::Signed(IntegerWidth::Bits64),
-                            analyzer: None,
-                            options: doc_value_options(),
-                        },
-                    ],
+                        }];
+                        if memory_schema {
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(2)?,
+                                name: catalog_name("project")?,
+                                logical_type: LogicalType::Text,
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(3)?,
+                                name: catalog_name("kind")?,
+                                logical_type: LogicalType::Text,
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
+                        } else {
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(2)?,
+                                name: catalog_name("category")?,
+                                logical_type: LogicalType::Text,
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(3)?,
+                                name: catalog_name("price")?,
+                                logical_type: LogicalType::Signed(IntegerWidth::Bits64),
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
+                        }
+                        fields
+                    },
                     vectors: vec![
                         NamedVectorDefinition {
                             id: field_id(4)?,

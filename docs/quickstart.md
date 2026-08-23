@@ -22,7 +22,7 @@ hyphae version --json
 ```
 
 Prebuilt native archives are available from the
-[`v0.2.1` GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v0.2.1).
+[`v0.2.1` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v0.2.1).
 Verify the matching checksum, SBOM, signature, provenance, required-checks,
 and release-evidence assets before installation; the
 [publication receipt](release/receipts/0.2.1.md) records their exact release

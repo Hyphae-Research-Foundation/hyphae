@@ -70,7 +70,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                     independent_build_receipts=receipts,
                     publication_authority=authority,
                     source_tree=TREE,
-                    workflow_repository="celiumsai/hyphae",
+                    workflow_repository="Hyphae-Research-Foundation/hyphae",
                     workflow_ref=workflow_ref,
                     workflow_sha=WORKFLOW_SHA,
                     workflow_run_id=124 if repository == "pypi" else 123,
@@ -164,7 +164,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 "head_branch": branch,
                 "head_sha": source["commit"],
                 "path": workflow,
-                "repository": "celiumsai/hyphae",
+                "repository": "Hyphae-Research-Foundation/hyphae",
             }
 
         return {
@@ -219,8 +219,8 @@ class PythonDistributionReceiptTests(unittest.TestCase):
             "head_branch": "main",
             "head_sha": WORKFLOW_SHA,
             "path": ".github/workflows/python-publish.yml",
-            "repository": {"full_name": "celiumsai/hyphae"},
-            "head_repository": {"full_name": "celiumsai/hyphae"},
+            "repository": {"full_name": "Hyphae-Research-Foundation/hyphae"},
+            "head_repository": {"full_name": "Hyphae-Research-Foundation/hyphae"},
         }
         metadata.update(overrides)
         return metadata
@@ -257,7 +257,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 {
                     "publisher": {
                         "kind": "GitHub",
-                        "repository": "celiumsai/hyphae",
+                        "repository": "Hyphae-Research-Foundation/hyphae",
                         "workflow": "python-publish.yml",
                         "environment": repository,
                         "claims": None,
@@ -377,7 +377,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                     independent_build_receipts=receipts,
                     publication_authority=authority,
                     source_tree=TREE,
-                    workflow_repository="celiumsai/hyphae",
+                    workflow_repository="Hyphae-Research-Foundation/hyphae",
                     workflow_ref=WORKFLOW_REF,
                     workflow_sha=WORKFLOW_SHA,
                     workflow_run_id=123,
@@ -430,7 +430,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                             independent_build_receipts=receipts,
                             publication_authority=authority,
                             source_tree=TREE,
-                            workflow_repository="celiumsai/hyphae",
+                            workflow_repository="Hyphae-Research-Foundation/hyphae",
                             workflow_ref=WORKFLOW_REF,
                             workflow_sha=WORKFLOW_SHA,
                             workflow_run_id=123,
@@ -827,7 +827,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 command: list[str], **kwargs: object
             ) -> subprocess.CompletedProcess[bytes]:
                 self.assertIn("pypi-attestations==0.0.30", command)
-                self.assertIn("https://github.com/celiumsai/hyphae", command)
+                self.assertIn("https://github.com/Hyphae-Research-Foundation/hyphae", command)
                 self.assertIn("--isolated", command)
                 self.assertIn("--no-config", command)
                 self.assertIn("--no-env-file", command)

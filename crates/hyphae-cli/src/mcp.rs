@@ -76,6 +76,10 @@ enum NativeTool {
     MemoryStore,
     MemoryRecall,
     MemoryForget,
+    ProfileMemoryStore(u128),
+    ProfileMemoryRecall(u128),
+    ProfileMemoryForget(u128),
+    ProfileMemoryStatus(u128),
 }
 
 impl NativeTool {
@@ -95,6 +99,161 @@ impl NativeTool {
             _ => None,
         }
     }
+}
+
+/// The Agent Memory four-tool registry: recall and status always; store
+/// and forget only when the operator allows writes. The registry never
+/// advertises a tool the profile cannot execute.
+#[allow(clippy::too_many_lines)]
+fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
+    let error_branch = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema", "error"],
+        "properties": {
+            "schema": {"const": "hyphae-native-mcp-tool-error-v2"},
+            "error": {"type": "object"},
+        },
+    });
+    let tool = |name: &str, read_only: bool, description: &str, input: Value, success: Value| {
+        json!({
+            "name": name,
+            "description": description,
+            "annotations": {
+                "readOnlyHint": read_only,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false,
+            },
+            "execution": {"taskSupport": "forbidden"},
+            "inputSchema": input,
+            "outputSchema": {"type": "object", "oneOf": [success, error_branch.clone()]},
+        })
+    };
+    let memory_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "score", "project", "scope", "kind", "agent", "text", "expires_at_micros"],
+        "properties": {
+            "id": {"type": "string", "pattern": "^[0-9]+$"},
+            "score": {"type": "number"},
+            "project": {"type": ["string", "null"]},
+            "scope": {"type": ["string", "null"]},
+            "kind": {"type": ["string", "null"]},
+            "agent": {"type": ["string", "null"]},
+            "text": {"type": ["string", "null"]},
+            "expires_at_micros": {"type": ["integer", "null"]},
+        },
+    });
+    let mut tools = vec![
+        tool(
+            "hyphae_memory_recall",
+            true,
+            "Recall stored memories for one project (global memories included) by bounded lexical retrieval. Expired or forgotten memories never return; with prove the response carries the sealed proof, witness, and anchor for offline verification.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["project", "query"],
+                "properties": {
+                    "project": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+                    "kind": {"type": "string", "enum": MEMORY_KINDS},
+                    "prove": {"type": "boolean"},
+                },
+            }),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["memories", "expired_filtered", "proof"],
+                "properties": {
+                    "memories": {"type": "array", "maxItems": 64, "items": memory_item},
+                    "expired_filtered": {"type": "integer", "minimum": 0},
+                    "proof": {"type": ["object", "null"]},
+                },
+            }),
+        ),
+        tool(
+            "hyphae_memory_status",
+            true,
+            "Redacted Agent Memory service status: collection identity, memory count, and contract versions. Never memory content, never credentials.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "profile", "collection", "memories", "product_api_version"],
+                "properties": {
+                    "status": {"const": "ok"},
+                    "profile": {"const": "memory"},
+                    "collection": {"type": "string", "pattern": "^[0-9]+$"},
+                    "memories": {},
+                    "product_api_version": {"type": "integer"},
+                },
+            }),
+        ),
+    ];
+    if allow_write {
+        tools.push(tool(
+            "hyphae_memory_store",
+            false,
+            "Store one bounded memory under its project: the identity derives from the project and text, an optional TTL bounds its life, and global scope shares it with every project. Listed and callable only when the adapter allows writes.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["project", "text"],
+                "properties": {
+                    "project": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "kind": {"type": "string", "enum": MEMORY_KINDS},
+                    "scope": {"type": "string", "enum": ["project", "global"]},
+                    "agent": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "ttl": {"type": "integer", "minimum": 1, "maximum": 316_224_000},
+                },
+            }),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "id", "scope", "expires_at_micros"],
+                "properties": {
+                    "status": {"const": "stored"},
+                    "id": {"type": "string", "pattern": "^[0-9]+$"},
+                    "scope": {"type": "string", "enum": ["project", "global"]},
+                    "expires_at_micros": {"type": ["integer", "null"]},
+                },
+            }),
+        ));
+        tools.push(tool(
+            "hyphae_memory_forget",
+            false,
+            "Forget one memory permanently by its id after proving the caller names the owning project. Forgetting is idempotent and no recall can surface the memory again. Listed and callable only when the adapter allows writes.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["project", "id"],
+                "properties": {
+                    "project": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "id": {"type": "string", "pattern": "^[0-9]+$"},
+                },
+            }),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "id"],
+                "properties": {
+                    "status": {"const": "forgotten"},
+                    "id": {"type": "string", "pattern": "^[0-9]+$"},
+                },
+            }),
+        ));
+    }
+    let serialized = serde_json::to_string(&tools)?;
+    Ok(ToolRegistry {
+        protocol: MCP_PROTOCOL.to_owned(),
+        schema_version: "hyphae-agent-memory-mcp-v1".to_owned(),
+        schema_digest: blake3::hash(serialized.as_bytes()).to_hex().to_string(),
+        page_size: TOOL_PAGE_SIZE,
+        tools,
+    })
 }
 
 struct ToolRegistry {
@@ -121,6 +280,7 @@ struct Session {
     client: HyphaeClient,
     registry: ToolRegistry,
     allow_ingest: bool,
+    profile: Profile,
     initialize_seen: bool,
     initialized: bool,
 }
@@ -332,11 +492,27 @@ struct CancelledParams {
 /// Returns a typed CLI failure for missing or invalid credentials, client
 /// construction, fatal standard-I/O, or response serialization failures.
 #[allow(clippy::too_many_lines)]
+/// Tool surface selection for one adapter process.
+#[derive(Clone, Copy)]
+pub(crate) enum Profile {
+    /// The full native tool registry.
+    Full,
+    /// The Agent Memory four-tool surface over one fixed collection.
+    Memory {
+        /// Expose the write-scoped store and forget tools.
+        allow_write: bool,
+        /// Agent Memory collection identity.
+        collection: u128,
+    },
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(
     base_url: &str,
     api_key_file: Option<&Path>,
     api_key_stdin: bool,
     allow_ingest: bool,
+    profile: Profile,
 ) -> Result<(), CliFailure> {
     let mut input = BufReader::new(io::stdin());
     let credential = read_mcp_credential(api_key_file, api_key_stdin, &mut input)?;
@@ -347,16 +523,22 @@ pub(crate) async fn run(
         .map_err(startup_client_error)?;
     drop(credential);
 
-    let registry = ToolRegistry::load()?;
-    let registry = if allow_ingest {
-        registry
-    } else {
-        registry.without_ingest()
+    let registry = match profile {
+        Profile::Full => {
+            let registry = ToolRegistry::load()?;
+            if allow_ingest {
+                registry
+            } else {
+                registry.without_ingest()
+            }
+        }
+        Profile::Memory { allow_write, .. } => memory_registry(allow_write)?,
     };
     let mut session = Session {
         client: HyphaeClient::new(transport),
         registry,
         allow_ingest,
+        profile,
         initialize_seen: false,
         initialized: false,
     };
@@ -801,7 +983,24 @@ impl Session {
                 return SessionAction::Response(rpc_error(&id, -32602, "Invalid params"));
             }
         };
-        let Some(tool) = NativeTool::parse(&params.name, self.allow_ingest) else {
+        let tool = match self.profile {
+            Profile::Full => NativeTool::parse(&params.name, self.allow_ingest),
+            Profile::Memory {
+                allow_write,
+                collection,
+            } => match params.name.as_str() {
+                "hyphae_memory_store" if allow_write => {
+                    Some(NativeTool::ProfileMemoryStore(collection))
+                }
+                "hyphae_memory_recall" => Some(NativeTool::ProfileMemoryRecall(collection)),
+                "hyphae_memory_forget" if allow_write => {
+                    Some(NativeTool::ProfileMemoryForget(collection))
+                }
+                "hyphae_memory_status" => Some(NativeTool::ProfileMemoryStatus(collection)),
+                _ => None,
+            },
+        };
+        let Some(tool) = tool else {
             return SessionAction::Response(rpc_error(&id, -32602, "Unknown tool"));
         };
         SessionAction::ToolCall(ToolCall {
@@ -946,6 +1145,22 @@ async fn execute_tool(
         NativeTool::MemoryForget => {
             let input = strict_input::<MemoryForgetInput>(arguments)?;
             return memory_forget(&client, input, options).await;
+        }
+        NativeTool::ProfileMemoryStore(collection) => {
+            let input = strict_input::<ProfileStoreInput>(arguments)?;
+            return profile_memory_store(&client, collection, input, options).await;
+        }
+        NativeTool::ProfileMemoryRecall(collection) => {
+            let input = strict_input::<ProfileRecallInput>(arguments)?;
+            return profile_memory_recall(&client, collection, input, options).await;
+        }
+        NativeTool::ProfileMemoryForget(collection) => {
+            let input = strict_input::<ProfileForgetInput>(arguments)?;
+            return profile_memory_forget(&client, collection, input, options).await;
+        }
+        NativeTool::ProfileMemoryStatus(collection) => {
+            strict_input::<EmptyInput>(arguments)?;
+            return profile_memory_status(&client, collection, options).await;
         }
     }
     .map_err(normalize_client_error)?;
@@ -1124,6 +1339,410 @@ async fn memory_recall(
         "memories": memories,
         "expired_filtered": filtered,
         "proof": proof,
+    }))
+}
+
+const MEMORY_KINDS: [&str; 5] = ["decision", "command", "constraint", "fact", "note"];
+const GLOBAL_PROJECT: &str = "_global";
+const MAX_PROJECT_BYTES: usize = 256;
+const MAX_MEMORY_TTL_SECONDS_PROFILE: u64 = 10 * 366 * 24 * 60 * 60;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileStoreInput {
+    project: String,
+    text: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileRecallInput {
+    project: String,
+    query: String,
+    #[serde(default = "default_memory_recall_limit")]
+    limit: usize,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    prove: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileForgetInput {
+    project: String,
+    id: String,
+}
+
+fn valid_project(project: &str) -> bool {
+    !project.is_empty() && project.len() <= MAX_PROJECT_BYTES
+}
+
+/// Content-derived envelope identity: project and text fix the memory.
+fn envelope_identity(project: &str, text: &str) -> u128 {
+    let digest = blake3::Hasher::new()
+        .update(b"hyphae-agent-memory")
+        .update(&[0])
+        .update(project.as_bytes())
+        .update(&[0])
+        .update(text.as_bytes())
+        .finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    match u128::from_le_bytes(bytes) {
+        0 => 1,
+        identity => identity,
+    }
+}
+
+/// Stores one bounded envelope memory under project isolation.
+async fn profile_memory_store(
+    client: &HyphaeClient,
+    collection: u128,
+    input: ProfileStoreInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    let kind = input.kind.as_deref().unwrap_or("note");
+    let scope = input.scope.as_deref().unwrap_or("project");
+    if !valid_project(&input.project)
+        || input.project == GLOBAL_PROJECT
+        || input.text.is_empty()
+        || input.text.len() > MAX_MEMORY_TEXT_BYTES
+        || !MEMORY_KINDS.contains(&kind)
+        || !matches!(scope, "project" | "global")
+        || input
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.is_empty() || agent.len() > 64)
+        || input
+            .ttl
+            .is_some_and(|ttl| ttl == 0 || ttl > MAX_MEMORY_TTL_SECONDS_PROFILE)
+    {
+        return Err(invalid_request());
+    }
+    let effective_project = if scope == "global" {
+        GLOBAL_PROJECT
+    } else {
+        input.project.as_str()
+    };
+    let identity = envelope_identity(effective_project, &input.text);
+    let collection = ObjectId::new(collection).map_err(|_| invalid_request())?;
+    let object_id = ObjectId::new(identity).map_err(|_| invalid_request())?;
+    let mut doc_values = std::collections::BTreeMap::new();
+    doc_values.insert(
+        "project".to_owned(),
+        hyphae_native_product::ProductDocValue::String(effective_project.to_owned()),
+    );
+    doc_values.insert(
+        "kind".to_owned(),
+        hyphae_native_product::ProductDocValue::String(kind.to_owned()),
+    );
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: identity,
+        documents: vec![hyphae_native_product::ProductDocument {
+            object_id,
+            text: input.text.clone(),
+            doc_values,
+            vectors: std::collections::BTreeMap::new(),
+        }],
+    };
+    client
+        .search_ingest(collection, batch, options.clone())
+        .await
+        .map_err(normalize_client_error)?;
+    let expires_at_micros = input.ttl.map(|ttl| {
+        crate::native::logical_time_micros()
+            .saturating_add(i64::try_from(ttl.saturating_mul(1_000_000)).unwrap_or(i64::MAX))
+    });
+    let envelope = json!({
+        "project": input.project,
+        "scope": scope,
+        "kind": kind,
+        "agent": input.agent,
+        "text": input.text,
+        "expires_at_micros": expires_at_micros,
+    });
+    client
+        .structure_set(
+            memory_key(collection.get(), identity),
+            serde_json::to_vec(&envelope).map_err(|_| invalid_request())?,
+            expires_at_micros,
+            options,
+        )
+        .await
+        .map_err(normalize_client_error)?;
+    Ok(json!({
+        "status": "stored",
+        "id": identity.to_string(),
+        "scope": scope,
+        "expires_at_micros": expires_at_micros,
+    }))
+}
+
+/// Recalls memories for one project (plus global memories), keeping only
+/// hits whose lifecycle envelope still lives.
+#[allow(clippy::too_many_lines)]
+async fn profile_memory_recall(
+    client: &HyphaeClient,
+    collection: u128,
+    input: ProfileRecallInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    if !valid_project(&input.project)
+        || input.query.is_empty()
+        || !(1..=MAX_MEMORY_RECALL_LIMIT).contains(&input.limit)
+        || input
+            .kind
+            .as_deref()
+            .is_some_and(|kind| !MEMORY_KINDS.contains(&kind))
+    {
+        return Err(invalid_request());
+    }
+    let collection = ObjectId::new(collection).map_err(|_| invalid_request())?;
+    let mut clauses = vec![ProductSearchFilter::In {
+        field: "project".to_owned(),
+        values: vec![
+            hyphae_native_product::ProductDocValue::String(input.project.clone()),
+            hyphae_native_product::ProductDocValue::String(GLOBAL_PROJECT.to_owned()),
+        ],
+    }];
+    if let Some(kind) = &input.kind {
+        clauses.push(ProductSearchFilter::Compare {
+            field: "kind".to_owned(),
+            operator: hyphae_native_product::ProductSearchOperator::Equal,
+            value: hyphae_native_product::ProductDocValue::String(kind.clone()),
+        });
+    }
+    let request = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: input.query,
+            candidate_limit: 1_000,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::All(clauses),
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: input.limit,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+    };
+    let (result, proof) = if input.prove {
+        let response = client
+            .prove(
+                hyphae_native_product::ProductOperation::SearchCollection {
+                    collection,
+                    request,
+                },
+                hyphae_native_product::proof::NativeProofGenerationLimits::default(),
+                options.clone(),
+            )
+            .await
+            .map_err(normalize_client_error)?;
+        let ProductResponse::Proven { response, artifact } = response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        let ProductResponse::IntegratedSearch(result) = *response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        // Sealed artifacts outgrow the MCP message bound on real
+        // directories, so they land in restricted local files and the
+        // response carries their paths, digests, and anchor for offline
+        // verification with `hyphae proof verify`.
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/state"))
+            })
+            .ok_or_else(invalid_request)?
+            .join("hyphae/proofs");
+        std::fs::create_dir_all(&state_home)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+        let stamp = crate::native::logical_time_micros();
+        let proof_path = state_home.join(format!("recall-{stamp}.proof"));
+        let witness_path = state_home.join(format!("recall-{stamp}.witness"));
+        std::fs::write(&proof_path, &artifact.proof_bytes)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+        std::fs::write(&witness_path, &artifact.witness_bytes)
+            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+        (
+            result,
+            Some(json!({
+                "proof_path": proof_path.display().to_string(),
+                "witness_path": witness_path.display().to_string(),
+                "proof_blake3": blake3::hash(&artifact.proof_bytes).to_hex().to_string(),
+                "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
+            })),
+        )
+    } else {
+        let response = client
+            .search_collection(collection, request, options.clone())
+            .await
+            .map_err(normalize_client_error)?;
+        let ProductResponse::IntegratedSearch(result) = response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        (result, None)
+    };
+    let mut memories = Vec::new();
+    let mut expired = 0_usize;
+    for hit in &result.hits {
+        let lifecycle = client
+            .structure_get(
+                memory_key(collection.get(), hit.object_id.get()),
+                options.clone(),
+            )
+            .await
+            .map_err(normalize_client_error)?;
+        match lifecycle {
+            ProductResponse::StructureValue(Some(bytes)) => {
+                let Ok(envelope) = serde_json::from_slice::<Value>(&bytes) else {
+                    expired += 1;
+                    continue;
+                };
+                memories.push(json!({
+                    "id": hit.object_id.get().to_string(),
+                    "score": hit.score,
+                    "project": envelope.get("project"),
+                    "scope": envelope.get("scope"),
+                    "kind": envelope.get("kind"),
+                    "agent": envelope.get("agent"),
+                    "text": envelope.get("text"),
+                    "expires_at_micros": envelope.get("expires_at_micros"),
+                }));
+            }
+            ProductResponse::StructureValue(None) => expired += 1,
+            _ => {
+                return Err(Box::new(ProductError::from_code(
+                    ProductErrorCode::Internal,
+                )));
+            }
+        }
+    }
+    Ok(json!({
+        "memories": memories,
+        "expired_filtered": expired,
+        "proof": proof,
+    }))
+}
+
+/// Forgets one envelope memory permanently after proving the caller names
+/// the owning project.
+async fn profile_memory_forget(
+    client: &HyphaeClient,
+    collection: u128,
+    input: ProfileForgetInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    if !valid_project(&input.project) {
+        return Err(invalid_request());
+    }
+    let identity: u128 = input.id.parse().map_err(|_| invalid_request())?;
+    let collection_id = ObjectId::new(collection).map_err(|_| invalid_request())?;
+    let lifecycle = client
+        .structure_get(memory_key(collection, identity), options.clone())
+        .await
+        .map_err(normalize_client_error)?;
+    let ProductResponse::StructureValue(Some(bytes)) = lifecycle else {
+        // Forgetting an absent memory is idempotent.
+        return Ok(json!({"status": "forgotten", "id": identity.to_string()}));
+    };
+    let Ok(envelope) = serde_json::from_slice::<Value>(&bytes) else {
+        // A tombstoned lifecycle may stay briefly visible with an empty
+        // value; forgetting it again is idempotent.
+        return Ok(json!({"status": "forgotten", "id": identity.to_string()}));
+    };
+    let owner = envelope.get("project").and_then(Value::as_str);
+    let scope = envelope.get("scope").and_then(Value::as_str);
+    if owner != Some(input.project.as_str())
+        && !(scope == Some("global") && input.project == GLOBAL_PROJECT)
+    {
+        return Err(invalid_request());
+    }
+    memory_forget(
+        client,
+        MemoryForgetInput {
+            collection: u64::try_from(collection_id.get()).map_err(|_| invalid_request())?,
+            id: identity.to_string(),
+        },
+        options,
+    )
+    .await
+}
+
+/// Redacted service and collection status: counts and identity only.
+async fn profile_memory_status(
+    client: &HyphaeClient,
+    collection: u128,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    let capabilities = client
+        .capabilities(options.clone())
+        .await
+        .map_err(normalize_client_error)?;
+    let ProductResponse::Capabilities(capabilities) = capabilities else {
+        return Err(Box::new(ProductError::from_code(
+            ProductErrorCode::Internal,
+        )));
+    };
+    let collection_id = ObjectId::new(collection).map_err(|_| invalid_request())?;
+    let request = ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "memories".to_owned(),
+            aggregation: hyphae_native_product::ProductAggregation::Count,
+        }],
+        limit: 1,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+    };
+    let response = client
+        .search_collection(collection_id, request, options)
+        .await
+        .map_err(normalize_client_error)?;
+    let ProductResponse::IntegratedSearch(result) = response else {
+        return Err(Box::new(ProductError::from_code(
+            ProductErrorCode::Internal,
+        )));
+    };
+    let memories = result
+        .aggregations
+        .iter()
+        .find(|aggregation| aggregation.name == "memories")
+        .map_or(Value::Null, |aggregation| match &aggregation.value {
+            hyphae_native_product::ProductAggregationValue::Count(count) => json!(count),
+            other => json!(format!("{other:?}")),
+        });
+    Ok(json!({
+        "status": "ok",
+        "profile": "memory",
+        "collection": collection.to_string(),
+        "memories": memories,
+        "product_api_version": capabilities.product_api_version,
     }))
 }
 
@@ -1731,6 +2350,7 @@ mod tests {
             client: HyphaeClient::new(CancellationTransport),
             registry: ToolRegistry::load()?.without_ingest(),
             allow_ingest: false,
+            profile: super::Profile::Full,
             initialize_seen: true,
             initialized: true,
         };

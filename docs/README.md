@@ -18,6 +18,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 - [Hyphae usage manual](usage-manual.md)
 - [Native 1.0 capabilities and limits](product/native-capabilities.md)
+- [Hyphae Agent Memory — product contract](product/agent-memory.md)
 - [Native quickstart](quickstart-native.md)
 - [Published 0.2.1 capabilities and limits](product/capabilities.md)
 - [Published 0.2.1 compatibility quickstart](quickstart.md)
@@ -45,6 +46,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [HTTP API v1](api/v1.md)
 - [Stable API error codes](api/error-codes-v1.md)
 - [Public clients](clients/v1.md)
+- [Hyphae Agent Memory on Omarchy](integrations/omarchy.md)
 - [Optional framework adapters](integrations/optional-adapters.md)
 - [Provable RAG cookbook](integrations/rag-cookbook.md)
 - [MCP adapter](../mcp/README.md)

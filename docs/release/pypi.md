@@ -23,7 +23,7 @@ retains that artifact ID and digest.
 
 Configure Trusted Publishers separately on TestPyPI and PyPI:
 
-- owner/repository: `celiumsai/hyphae`;
+- owner/repository: `Hyphae-Research-Foundation/hyphae`;
 - workflow: `python-publish.yml`;
 - TestPyPI environment: `testpypi`;
 - PyPI environment: `pypi`;

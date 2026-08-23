@@ -214,7 +214,7 @@ def produce(
         "target_release": "1.2.0",
         "generated_at_utc": generated_at,
         "source": {
-            "repository": "https://github.com/celiumsai/hyphae.git",
+            "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
             "commit": commit,
             "tree": tree,
             "mode": "integration-tree" if dirty else "clean-commit",

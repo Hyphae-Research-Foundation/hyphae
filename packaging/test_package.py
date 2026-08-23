@@ -240,7 +240,7 @@ def write_test_primary_payloads(
     if event_override is not None:
         event = event_override
     invocation_id = (
-        "https://github.com/celiumsai/hyphae/actions/runs/123456/attempts/1"
+        "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/123456/attempts/1"
     )
     for target in TARGET_ARCHIVES:
         archive = archive_name(identity.version, target)
@@ -546,7 +546,7 @@ class PackageTests(unittest.TestCase):
             target="x86_64-unknown-linux-gnu",
             commit=identity.commit,
             git_ref=f"refs/tags/{identity.tag}",
-            invocation_id="https://github.com/celiumsai/hyphae/actions/runs/1/attempts/1",
+            invocation_id="https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/1/attempts/1",
             runner_os="Linux",
             runner_arch="X64",
         )
@@ -564,7 +564,7 @@ class PackageTests(unittest.TestCase):
                 commit=identity.commit,
                 git_ref=f"refs/tags/{identity.tag}",
                 invocation_id=(
-                    "https://github.com/celiumsai/hyphae/"
+                    "https://github.com/Hyphae-Research-Foundation/hyphae/"
                     "actions/runs/1/attempts/1"
                 ),
                 runner_os="Linux",
@@ -628,7 +628,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(document["schema"], SCHEMA_NAME)
             self.assertEqual(
                 document["workflow"]["url"],
-                "https://github.com/celiumsai/hyphae/actions/runs/123456/attempts/1",
+                "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/123456/attempts/1",
             )
             rerun = build_release_evidence(
                 directory=root,
@@ -720,12 +720,12 @@ class PackageTests(unittest.TestCase):
 
             def wrong_invocation(predicate) -> None:
                 predicate["runDetails"]["metadata"]["invocationId"] = (
-                    "https://github.com/celiumsai/hyphae/actions/runs/1/attempts/1"
+                    "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/1/attempts/1"
                 )
 
             def future_invocation(predicate) -> None:
                 predicate["runDetails"]["metadata"]["invocationId"] = (
-                    "https://github.com/celiumsai/hyphae/"
+                    "https://github.com/Hyphae-Research-Foundation/hyphae/"
                     "actions/runs/123456/attempts/2"
                 )
 
@@ -962,7 +962,7 @@ class PackageTests(unittest.TestCase):
         )
         self.assertEqual(
             report["checks"][0]["check_run_url"],
-            "https://github.com/celiumsai/hyphae/actions/runs/30000/job/10000",
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/30000/job/10000",
         )
         self.assertEqual(report["checks"][0]["workflow_run_id"], 30_000)
         self.assertEqual(
@@ -1131,15 +1131,15 @@ class PackageTests(unittest.TestCase):
             validate_report(mixed_workflow_runs, expected_commit=commit)
         crossed_url = copy.deepcopy(report)
         crossed_url["checks"][0]["check_run_url"] = (
-            "https://github.com/celiumsai/hyphae/actions/runs/30000/job/10001"
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/30000/job/10001"
         )
         with self.assertRaisesRegex(ValueError, "invalid"):
             validate_report(crossed_url, expected_commit=commit)
         for invalid_url in (
-            "http://github.com/celiumsai/hyphae/actions/runs/30000/job/10000",
+            "http://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/30000/job/10000",
             "https://github.com/other/hyphae/actions/runs/30000/job/10000",
-            "https://github.com/celiumsai/hyphae/actions/runs/30000/jobs/10000",
-            "https://github.com/celiumsai/hyphae/actions/runs/30000/job/10001",
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/30000/jobs/10000",
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/30000/job/10001",
         ):
             invalid_source = copy.deepcopy(runs)
             invalid_source[0]["html_url"] = invalid_url
@@ -1505,7 +1505,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(
                 request.full_url,
                 (
-                    "https://api.github.com/repos/celiumsai/hyphae/actions/runs/"
+                    "https://api.github.com/repos/Hyphae-Research-Foundation/hyphae/actions/runs/"
                     f"{workflow_run_id}"
                 ),
             )
@@ -1548,7 +1548,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(
                 request.full_url,
                 (
-                    "https://api.github.com/repos/celiumsai/hyphae/actions/jobs/"
+                    "https://api.github.com/repos/Hyphae-Research-Foundation/hyphae/actions/jobs/"
                     f"{job_run_id}"
                 ),
             )
@@ -1591,7 +1591,7 @@ class PackageTests(unittest.TestCase):
         request = open_url.call_args.args[0]
         self.assertIn("state=all", request.full_url)
         self.assertIn(
-            "head=celiumsai%3Acodex%2Frelease-candidate",
+            "head=Hyphae-Research-Foundation%3Acodex%2Frelease-candidate",
             request.full_url,
         )
 
@@ -1737,7 +1737,7 @@ class PackageTests(unittest.TestCase):
                 Draft202012Validator(checks_schema).validate(wrong_order)
             legacy_check_url = copy.deepcopy(report)
             legacy_check_url["checks"][0]["check_run_url"] = (
-                "https://github.com/celiumsai/hyphae/runs/10000"
+                "https://github.com/Hyphae-Research-Foundation/hyphae/runs/10000"
             )
             with self.assertRaises(ValidationError):
                 Draft202012Validator(checks_schema).validate(legacy_check_url)
@@ -1768,7 +1768,7 @@ class PackageTests(unittest.TestCase):
             invalid = copy.deepcopy(document)
             invalid["workflow"]["run_id"] = "0123456"
             invalid["workflow"]["url"] = (
-                "https://github.com/celiumsai/hyphae/actions/runs/"
+                "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/"
                 "0123456/attempts/1"
             )
             with self.assertRaisesRegex(ValueError, "positive decimal"):

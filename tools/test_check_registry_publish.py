@@ -84,7 +84,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
     ]
     return {
         "schema": "hyphae-registry-publish-github-authority-v1",
-        "repository": "celiumsai/hyphae",
+        "repository": "Hyphae-Research-Foundation/hyphae",
         "ecosystem": ecosystem,
         "source": {
             "tag": "v2.0.1",
@@ -97,7 +97,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
             "workflow_sha": WORKFLOW_SHA,
             "workflow_run_id": "999",
             "workflow_ref": (
-                "celiumsai/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
+                "Hyphae-Research-Foundation/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
             ),
             "files": files,
         },
@@ -509,8 +509,8 @@ class RegistryPublishGateTests(unittest.TestCase):
                 "status": "completed",
                 "conclusion": "failure",
                 "completed_at": "2026-08-17T12:00:00Z",
-                "details_url": "https://github.com/celiumsai/hyphae/actions/runs/901/job/91",
-                "html_url": "https://github.com/celiumsai/hyphae/actions/runs/901/job/91",
+                "details_url": "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/901/job/91",
+                "html_url": "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/901/job/91",
                 "app": {"id": 15368, "slug": "github-actions"},
             }
             with self.subTest(check=name), patch(
@@ -524,12 +524,12 @@ class RegistryPublishGateTests(unittest.TestCase):
                     "event": "push",
                     "status": "completed",
                     "conclusion": "failure",
-                    "repository": {"full_name": "celiumsai/hyphae"},
+                    "repository": {"full_name": "Hyphae-Research-Foundation/hyphae"},
                 },
             ), self.assertRaisesRegex(GateFailure, "not a successful"):
                 from tools.check_registry_publish import _run_for_check
 
-                _run_for_check(candidate, expected, "celiumsai/hyphae", COMMIT, "token")
+                _run_for_check(candidate, expected, "Hyphae-Research-Foundation/hyphae", COMMIT, "token")
 
     def test_evidence_receipt_mutations_fail_closed(self) -> None:
         base_authority = authority()
@@ -860,7 +860,7 @@ class RegistryPublishGateTests(unittest.TestCase):
                     "head_sha": COMMIT,
                     "completed_at": f"2026-08-16T13:{index:02d}:00Z",
                     "details_url": (
-                        f"https://github.com/celiumsai/hyphae/actions/runs/{run_id}/job/{index + 1}"
+                        f"https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/{run_id}/job/{index + 1}"
                     ),
                 }
             )
@@ -873,7 +873,7 @@ class RegistryPublishGateTests(unittest.TestCase):
         stale["id"] = 999
         stale["completed_at"] = "2026-08-16T14:59:00Z"
         stale["details_url"] = (
-            "https://github.com/celiumsai/hyphae/actions/runs/9999/job/999"
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/9999/job/999"
         )
         check_runs.append(stale)
 
@@ -887,7 +887,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             "tools.check_registry_publish._run_for_check", side_effect=verified
         ):
             selected, runs = fetch_required_checks(
-                "celiumsai/hyphae", COMMIT, "token", "12345", policy()
+                "Hyphae-Research-Foundation/hyphae", COMMIT, "token", "12345", policy()
             )
         release_checks = [
             check
@@ -915,7 +915,7 @@ class RegistryPublishGateTests(unittest.TestCase):
                     "head_sha": COMMIT,
                     "completed_at": f"2026-08-16T13:{index:02d}:00Z",
                     "details_url": (
-                        f"https://github.com/celiumsai/hyphae/actions/runs/{run_id}/job/{index + 1}"
+                        f"https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/{run_id}/job/{index + 1}"
                     ),
                 }
             )
@@ -930,7 +930,7 @@ class RegistryPublishGateTests(unittest.TestCase):
         quality["id"] = 999
         quality["completed_at"] = "2026-08-16T14:59:00Z"
         quality["details_url"] = (
-            "https://github.com/celiumsai/hyphae/actions/runs/9999/job/999"
+            "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/9999/job/999"
         )
         mutations = (
             ("failed-latest", {**quality, "conclusion": "failure"}),
@@ -952,7 +952,7 @@ class RegistryPublishGateTests(unittest.TestCase):
                     "tools.check_registry_publish._run_for_check", side_effect=verified
                 ), self.assertRaises(GateFailure):
                     fetch_required_checks(
-                        "celiumsai/hyphae", COMMIT, "token", "12345", policy()
+                        "Hyphae-Research-Foundation/hyphae", COMMIT, "token", "12345", policy()
                     )
 
 

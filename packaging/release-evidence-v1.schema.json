@@ -234,7 +234,7 @@
       "const": 1
     },
     "repository": {
-      "const": "https://github.com/celiumsai/hyphae"
+      "const": "https://github.com/Hyphae-Research-Foundation/hyphae"
     },
     "release": {
       "type": "object",
@@ -321,7 +321,7 @@
         },
         "url": {
           "type": "string",
-          "pattern": "^https://github\\.com/celiumsai/hyphae/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*$"
+          "pattern": "^https://github\\.com/Hyphae-Research-Foundation/hyphae/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*$"
         }
       }
     },

@@ -270,7 +270,7 @@ jobs:
             echo 'Python publication control plane must be dispatched from main' >&2
             exit 1
           fi
-          test "$WORKFLOW_REF" = 'celiumsai/hyphae/.github/workflows/python-publish.yml@refs/heads/main'
+          test "$WORKFLOW_REF" = 'Hyphae-Research-Foundation/hyphae/.github/workflows/python-publish.yml@refs/heads/main'
           case "$REPOSITORY" in
             testpypi)
               test -z "$TESTPYPI_RUN_ID"
@@ -609,7 +609,7 @@ jobs:
               }
               if any(run.get(key) != value for key, value in expected.items()):
                   raise SystemExit(f"workflow authority differs: {workflow}")
-              if run.get("repository", {}).get("full_name") != "celiumsai/hyphae":
+              if run.get("repository", {}).get("full_name") != "Hyphae-Research-Foundation/hyphae":
                   raise SystemExit(f"workflow repository differs: {workflow}")
               return {
                   "id": expected["id"],
@@ -620,7 +620,7 @@ jobs:
                   "head_branch": expected["head_branch"],
                   "head_sha": expected["head_sha"],
                   "path": expected["path"],
-                  "repository": "celiumsai/hyphae",
+                  "repository": "Hyphae-Research-Foundation/hyphae",
               }
 
           def artifact_authority(path, name):

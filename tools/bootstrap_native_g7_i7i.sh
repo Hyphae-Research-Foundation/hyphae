@@ -106,7 +106,7 @@ chown -R ubuntu:ubuntu /opt/actions-runner
 
 sudo -u ubuntu /opt/actions-runner/config.sh \
   --unattended \
-  --url https://github.com/celiumsai/hyphae \
+  --url https://github.com/Hyphae-Research-Foundation/hyphae \
   --token __RUNNER_TOKEN__ \
   --name __RUNNER_NAME__ \
   --labels hyphae-g7,dedicated \

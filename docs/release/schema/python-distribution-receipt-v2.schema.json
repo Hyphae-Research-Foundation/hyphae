@@ -63,9 +63,9 @@
       "additionalProperties": false,
       "required": ["repository", "workflow_ref", "workflow_sha", "id", "attempt"],
       "properties": {
-        "repository": {"const": "celiumsai/hyphae"},
+        "repository": {"const": "Hyphae-Research-Foundation/hyphae"},
         "workflow_ref": {
-          "const": "celiumsai/hyphae/.github/workflows/python-publish.yml@refs/heads/main"
+          "const": "Hyphae-Research-Foundation/hyphae/.github/workflows/python-publish.yml@refs/heads/main"
         },
         "workflow_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "id": {"type": "integer", "minimum": 1},
@@ -181,7 +181,7 @@
         "head_branch": {"type": "string", "minLength": 1},
         "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "path": {"enum": [".github/workflows/release.yml", ".github/workflows/native-g8-closure.yml"]},
-        "repository": {"const": "celiumsai/hyphae"}
+        "repository": {"const": "Hyphae-Research-Foundation/hyphae"}
       }
     },
     "release_run": {
@@ -302,7 +302,7 @@
         "head_branch": {"const": "main"},
         "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "path": {"const": ".github/workflows/python-publish.yml"},
-        "repository": {"const": "celiumsai/hyphae"}
+        "repository": {"const": "Hyphae-Research-Foundation/hyphae"}
       }
     },
     "publisher": {
@@ -311,7 +311,7 @@
       "required": ["kind", "repository", "workflow", "environment"],
       "properties": {
         "kind": {"const": "GitHub"},
-        "repository": {"const": "celiumsai/hyphae"},
+        "repository": {"const": "Hyphae-Research-Foundation/hyphae"},
         "workflow": {"const": "python-publish.yml"},
         "environment": {"enum": ["testpypi", "pypi"]}
       }

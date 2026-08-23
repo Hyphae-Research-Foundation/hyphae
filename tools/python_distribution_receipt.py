@@ -23,8 +23,8 @@ from typing import Any
 
 PROJECT = "hyphae-sdk"
 SCHEMA = "hyphae-python-distribution-receipt-v2"
-WORKFLOW_REPOSITORY = "celiumsai/hyphae"
-WORKFLOW_REF = "celiumsai/hyphae/.github/workflows/python-publish.yml@refs/heads/main"
+WORKFLOW_REPOSITORY = "Hyphae-Research-Foundation/hyphae"
+WORKFLOW_REF = "Hyphae-Research-Foundation/hyphae/.github/workflows/python-publish.yml@refs/heads/main"
 PUBLISHER_WORKFLOW = "python-publish.yml"
 WORKFLOW_PATH = ".github/workflows/python-publish.yml"
 SUPPORTED_PYTHON = ("3.11", "3.14")

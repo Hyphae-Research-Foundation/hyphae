@@ -269,7 +269,7 @@
       "inventory": "sdks/python/build-dependencies.json",
       "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "158ba47adad44cc7d3d05db3642b83e0c8902100bfc2a154f1f2887f37cf0761",
+      "manifest_sha256": "53a7281d6b4f5a4706af7293a3e603399bd31993c41f1809269574af0dd8648c",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
@@ -279,7 +279,7 @@
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "b0faaa45a1f857278e9e65b84a7d023e3a102947c0183cf8ec2bab89499fc70a"
+      "sha256": "3344078f5363db09026109ee4d50677ace8aca9b92955a6ebfb566001523849a"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "6af6d651332662efef335112bbab1d8087ba6477",
+      "commit": "673f91190169ec4fbfe4c35437aa047e54b43bcc",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "e6a59ebf6d349163faf922c4b9873175110a4d70"
+      "tree": "adba7aafcdecc8fcb8dd4dbfa08595f44c323951"
     }
   },
   "target_release": "1.2.0"
