@@ -43,6 +43,28 @@ class DcoSignoffTests(unittest.TestCase):
         self.assertIn("missing", failures[0])
         self.assertTrue(calls)
 
+    def test_merge_commits_are_exempt_from_the_certificate(self) -> None:
+        rev_list_calls: list[tuple[str, ...]] = []
+
+        def fake_git(_root: Path, *arguments: str) -> str:
+            if arguments[:2] == ("rev-parse", "--verify"):
+                return f"{ADOPTION_COMMIT}\n"
+            if arguments[:1] == ("merge-base",) and "--is-ancestor" not in arguments:
+                return "base\n"
+            if arguments[:1] == ("rev-list",):
+                rev_list_calls.append(arguments)
+                return ""
+            raise AssertionError(arguments)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "tools.check_dco_signoffs.git", side_effect=fake_git
+        ):
+            self.assertEqual(validate_range("base", "head", Path(directory)), [])
+        # The certificate rides authored commits; the forge's merge commits
+        # never enter the walked range.
+        self.assertEqual(len(rev_list_calls), 1)
+        self.assertIn("--no-merges", rev_list_calls[0])
+
     def test_adoption_commit_itself_is_outside_the_required_range(self) -> None:
         def fake_git(_root: Path, *arguments: str) -> str:
             if arguments[:2] == ("rev-parse", "--verify"):
