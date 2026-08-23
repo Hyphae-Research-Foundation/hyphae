@@ -4445,6 +4445,246 @@ async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<()
 #[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.agent_memory",
+        "--memory-schema",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmp-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let list = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+
+    // The read-only profile lists exactly recall and status, and refuses
+    // the write tools even when named directly.
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"hyphae_memory_store",
+        "arguments":{"project":"acme/site","text":"read-only must refuse"}}}),
+    );
+    let reader = run_mcp_session_with_flags(
+        &address_text,
+        &owner_key,
+        &["--profile", "memory"],
+        &messages,
+    )?;
+    let names: Vec<_> = reader[1]["result"]["tools"]
+        .as_array()
+        .ok_or("tools")?
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(names, ["hyphae_memory_recall", "hyphae_memory_status"]);
+    assert_eq!(reader[2]["error"]["code"], -32602);
+
+    // The write profile stores under two projects plus one global memory.
+    let store = |id: u64, project: &str, text: &str, scope: Option<&str>| {
+        let mut arguments = serde_json::json!({"project": project, "text": text, "kind": "decision", "agent": "claude"});
+        if let Some(scope) = scope {
+            arguments["scope"] = serde_json::json!(scope);
+        }
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_memory_store","arguments":arguments}})
+    };
+    let recall = |id: u64, project: &str| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_memory_recall",
+            "arguments":{"project": project, "query":"deterministic packaging decision"}}})
+    };
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(store(
+        3,
+        "acme/site",
+        "packaging decision: use the deterministic pipeline",
+        None,
+    ));
+    messages.push(store(
+        4,
+        "acme/other",
+        "unrelated note about gardening",
+        None,
+    ));
+    messages.push(store(
+        5,
+        "acme/site",
+        "global packaging constraint for every project",
+        Some("global"),
+    ));
+    messages.push(recall(6, "acme/site"));
+    messages.push(recall(7, "acme/other"));
+    messages.push(
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
+        "name":"hyphae_memory_status","arguments":{}}}),
+    );
+    let writer = run_mcp_session_with_flags(
+        &address_text,
+        &owner_key,
+        &["--profile", "memory", "--allow-write"],
+        &messages,
+    )?;
+    let names: Vec<_> = writer[1]["result"]["tools"]
+        .as_array()
+        .ok_or("tools")?
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "hyphae_memory_recall",
+            "hyphae_memory_status",
+            "hyphae_memory_store",
+            "hyphae_memory_forget",
+        ]
+    );
+    let stored_id = writer[2]["result"]["structuredContent"]["id"]
+        .as_str()
+        .ok_or("stored id")?
+        .to_owned();
+    // Project isolation: acme/site sees its memory plus the global one and
+    // never the other project's; acme/other sees only the global memory.
+    let site: Vec<_> = writer[5]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("site memories")?
+        .iter()
+        .map(|memory| memory["text"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(site.iter().any(|text| text.contains("packaging decision")));
+    assert!(
+        site.iter()
+            .any(|text| text.contains("global packaging constraint"))
+    );
+    assert!(!site.iter().any(|text| text.contains("gardening")));
+    let other: Vec<_> = writer[6]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("other memories")?
+        .iter()
+        .map(|memory| memory["text"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        !other
+            .iter()
+            .any(|text| text.contains("packaging decision:"))
+    );
+    assert!(
+        other
+            .iter()
+            .any(|text| text.contains("global packaging constraint"))
+    );
+    assert_eq!(writer[7]["result"]["structuredContent"]["status"], "ok");
+
+    // Forgetting demands the owning project; the wrong project is refused,
+    // the right one removes permanently and idempotently.
+    let forget = |id: u64, project: &str, memory: &str| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_memory_forget",
+            "arguments":{"project": project, "id": memory}}})
+    };
+    let mut messages = handshake.to_vec();
+    messages.push(forget(3, "acme/other", &stored_id));
+    messages.push(forget(4, "acme/site", &stored_id));
+    messages.push(forget(5, "acme/site", &stored_id));
+    messages.push(recall(6, "acme/site"));
+    let cleanup = run_mcp_session_with_flags(
+        &address_text,
+        &owner_key,
+        &["--profile", "memory", "--allow-write"],
+        &messages,
+    )?;
+    assert_eq!(
+        cleanup[1]["result"]["structuredContent"]["error"]["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        cleanup[2]["result"]["structuredContent"]["status"], "forgotten",
+        "forget response: {}",
+        cleanup[2]
+    );
+    assert_eq!(
+        cleanup[3]["result"]["structuredContent"]["status"],
+        "forgotten"
+    );
+    let remaining: Vec<_> = cleanup[4]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("remaining")?
+        .iter()
+        .map(|memory| memory["text"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        !remaining
+            .iter()
+            .any(|text| text.contains("packaging decision:"))
+    );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_mcp_memory_tools_store_recall_and_forget_with_a_lifecycle()
 -> Result<(), Box<dyn Error>> {
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
