@@ -32,6 +32,7 @@ dependencies = []
 
 [project.optional-dependencies]
 providers = ["blake3>=0.4"]
+langchain = ["blake3>=0.4", "langchain-core>=0.3"]
 
 [project.urls]
 Homepage = "https://hyphae.dev"
