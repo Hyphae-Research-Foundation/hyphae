@@ -28,7 +28,7 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
-    "version": "2.0.1",
+    "version": "2.1.0",
     "tag": "v2.0.1",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
@@ -372,7 +372,7 @@ def _policy(root: Path) -> dict[str, Any]:
         value["schema"] != "hyphae-registry-publish-authority-v1"
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
-        or value["version"] != "2.0.1"
+        or value["version"] != "2.1.0"
         or value["tag"] != "v2.0.1"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
@@ -385,7 +385,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["required_artifacts"] != expected_artifacts
         or value["control_files"] != list(EXPECTED_CONTROL_FILES)
     ):
-        raise GateFailure("registry authority policy differs from the pinned 2.0.1 authority")
+        raise GateFailure("registry authority policy differs from the pinned 2.1.0 authority")
     return value
 
 
@@ -1221,7 +1221,7 @@ def _load_publication_state(
     expected = {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "2.0.1",
+        "version": "2.1.0",
         "source": authority["source"],
         "inventory": _publication_inventory(ecosystem, root),
     }
@@ -1780,7 +1780,7 @@ def validate_evidence_receipt(value: dict[str, Any], ecosystem: str, authority: 
         or value["control"] != authority["control"]
         or value.get("transition", {}).get("target_release") != "1.2.0"
         or value.get("transition", {}).get("tree") != authority["source"]["tree"]
-        or value.get("package_inventory", {}).get("version") != "2.0.1"
+        or value.get("package_inventory", {}).get("version") != "2.1.0"
     ):
         raise GateFailure("publication evidence receipt identity differs")
     release = value.get("release")

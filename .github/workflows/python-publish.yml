@@ -92,7 +92,7 @@ jobs:
           source_tree="$(git -C source rev-parse "$source_commit^{tree}")"
           test "$(git -C source rev-parse HEAD)" = "$source_commit"
           version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
-          test "$version" = "2.0.1"
+          test "$version" = "2.1.0"
           test "$SOURCE_TAG" = "v$version"
           source_date_epoch="$(git -C source show -s --format=%ct "$source_commit")"
           SOURCE_DATE_EPOCH="$source_date_epoch" uv build source/sdks/python --out-dir dist

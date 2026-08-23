@@ -3,6 +3,53 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [2.1.0] - 2026-08-23
+
+Hyphae 2.1.0 ships the Agent Memory program: local, shared, and
+verifiable memory for coding agents over one engine, operated end to
+end by `hyphae agent` and spoken by every host through the bounded
+memory MCP profile. The release also carries the project's move to the
+Hyphae Research Foundation across every active provenance and
+publication surface.
+
+### Added
+
+- `hyphae mcp --profile memory`: a four-verb MCP surface — store,
+  recall, forget, status — over a dedicated memory collection, with
+  bounded envelopes (project, scope, kind, agent, text, TTL), exact
+  project isolation with labeled `_global` memories, idempotent
+  owner-validated forget, and recall proofs written as state files for
+  offline `hyphae proof verify`. The surface never advertises a tool
+  the presented credential cannot execute: the read profile lists
+  recall and status only; `--allow-write` adds store and forget.
+- `hyphae agent`: the whole lifecycle — idempotent `setup` (directory,
+  memory-schema collection, scoped principals, role-ceilinged keys,
+  opt-in systemd user unit), `status` (redacted), `doctor`, `backup`,
+  `restore` (verified, refuses under an active service, preserves the
+  previous directory aside), `upgrade` (stop, backup, doctor, start),
+  `configure` for Claude Code, Codex, and OpenCode carrying only a
+  credential file path, `remove` (never deletes data), and
+  `purge-data` (interactive confirmation).
+- `hyphae init --create-search-collection --memory-schema` provisions
+  the Agent Memory document layout.
+- The common host conformance corpus
+  (`tools/agent_memory_conformance.py`): ten steps every host must pass
+  against one published release, ending in a credential-canary scan
+  over every byte the adapter emitted.
+- The Omarchy operating recipe (`docs/integrations/omarchy.md`) and the
+  `dl.hyphae.dev` distribution front door sources (`packaging/dl/`):
+  a verifying installer — SHA-256 against the release `SHA256SUMS`,
+  no sudo, AUR deference on Arch — behind one Cloudflare Worker that
+  hosts no binaries.
+
+### Changed
+
+- The project's canonical home is
+  `github.com/Hyphae-Research-Foundation/hyphae`; provenance,
+  publication gates, schemas, manifests, and active documentation name
+  the foundation. Historical receipts and gate evidence keep the
+  identities that were true when they were sealed.
+
 ## [2.0.1] - 2026-08-23
 
 Hyphae 2.0.1 is the registry publication of the 2.0 program. The first

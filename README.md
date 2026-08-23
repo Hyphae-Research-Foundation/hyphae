@@ -116,7 +116,7 @@ then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 2.0.1 --locked
+cargo install hyphae-cli --version 2.1.0 --locked
 ```
 
 That coordinate is valid once the `v2.0.1` publication completes; the latest
@@ -203,7 +203,7 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-Version `2.0.1` publishes the complete 24-crate graph:
+Version `2.1.0` publishes the complete 24-crate graph:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;
