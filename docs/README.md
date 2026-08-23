@@ -135,6 +135,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Durable exact retrieval semantics v2](retrieval/exact-reference-semantics-v2.md)
 - [Lexical retrieval semantics v1](retrieval/lexical-reference-semantics-v1.md)
 - [Hybrid retrieval semantics v1](retrieval/hybrid-reference-semantics-v1.md)
+- [Retrieval claim protocol](retrieval/claims-protocol.md)
 - [0.2 retrieval benchmark methodology](performance/retrieval-benchmark-0.2.md)
 - [Microsecond-first performance contract](performance/microsecond-first.md)
 - [Native performance evidence v1](performance/native-performance-evidence-v1.md)
