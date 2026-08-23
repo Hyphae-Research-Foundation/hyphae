@@ -50,6 +50,7 @@ binding or any malformed existing binding remains corruption.
 - `verify-retrieval`
 - `serve`
 - `remote`
+- `agent`
 - `mcp`
 <!-- cli-commands:end -->
 
@@ -729,11 +730,35 @@ response JSON needs a different client with a matching local policy.
 the canonical proof path, response digest header, and exact file length before
 writing a new file. Example requests live in [`examples/http`](../../examples/http/README.md).
 
+## `agent`
+
+```text
+hyphae agent setup [--enable-service | --no-service]
+hyphae agent status | doctor | backup | upgrade | remove
+hyphae agent restore --backup <ARCHIVE>
+hyphae agent configure <claude|codex|opencode> [--write]
+hyphae agent purge-data [--yes]
+```
+
+Owns the Agent Memory lifecycle described by the
+[product contract](../product/agent-memory.md): one local engine under
+`~/.local/share/hyphae/agent-memory/` that every coding agent shares
+through the `mcp --profile memory` adapter. `setup` is idempotent — it
+initializes the directory, provisions the memory collection, creates the
+scoped principals, and issues role-ceilinged keys under
+`~/.config/hyphae/credentials/` (0600), offering an opt-in systemd user
+unit. `configure` emits host registration for Claude Code, Codex, or
+OpenCode carrying only a credential file path, never a secret. `remove`
+deletes the service and credentials but never data; only `purge-data`
+deletes data, after confirmation, and both `restore` and `purge-data`
+refuse while the service owns the directory.
+
 ## `mcp`
 
 ```text
 hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-file <RESTRICTED_PATH>
 hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-stdin
+hyphae mcp --profile memory [--allow-write] [--memory-collection <ID>] ...
 ```
 
 Runs MCP revision `2025-06-18` as newline-delimited JSON-RPC 2.0 over stdio.
@@ -757,6 +782,13 @@ contract; Native failures retain structured `ProductError` fields. See the
 With a durable Native API key, `http://` is limited to canonical loopback
 hosts (`127.0.0.0/8`, `[::1]`, or exact `localhost`). Remote MCP endpoints must
 use `https://`; plaintext remote origins fail before the stdio request loop.
+
+`--profile memory` swaps the registry for the four Agent Memory verbs —
+recall and status always, store and forget only with `--allow-write` —
+scoped to the memory collection. The surface never advertises a tool the
+presented credential cannot execute, and recall proofs are written to
+`$XDG_STATE_HOME/hyphae/proofs/` for offline `proof verify` instead of
+inlining hex past the message bound.
 
 ## Environment summary
 
