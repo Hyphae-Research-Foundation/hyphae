@@ -34,7 +34,12 @@ def git(root: Path, *arguments: str) -> str:
 def validate_range(base: str, head: str, root: Path = ROOT) -> list[str]:
     git(root, "rev-parse", "--verify", f"{ADOPTION_COMMIT}^{{commit}}")
     merge_base = git(root, "merge-base", base, head).strip()
-    commits = git(root, "rev-list", "--reverse", f"{merge_base}..{head}").splitlines()
+    # Merge commits are exempt, matching the reference DCO practice: the
+    # certificate rides every authored commit, and the rev-list of an
+    # integration branch necessarily contains the forge's merge commits.
+    commits = git(
+        root, "rev-list", "--reverse", "--no-merges", f"{merge_base}..{head}"
+    ).splitlines()
     failures: list[str] = []
     for commit in commits:
         if commit == ADOPTION_COMMIT:
