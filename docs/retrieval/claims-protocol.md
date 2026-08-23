@@ -42,9 +42,10 @@ promote a declared number to a replayable one.
 | Committed state is byte-identical across hosts: same metrics and same directory bytes on different distros, kernels, glibc, CPUs | [Cross-host determinism](../gates/evidence/rag-cross-host-determinism-2026-08-22.md) | x86-64 Linux; aarch64 unmeasured; excludes float pipelines outside the engine |
 | Local embeddings and rerank scores are replayable and offline-verifiable (`HYATTS01`, pure verifier in core) | [Attested embed replay](../gates/evidence/attested-embed-replay-2026-08-22.md) | CPU execution only; cross-implementation float portability not claimed |
 | Chunk provenance is sealed in the proof: parent, byte range, and ordinal ride the verified result | Offline-verified chunk test in the engine suite (`integrated_search.rs`, C1/C3) | Provenance binds doc-values, not raw parent bytes |
+| A local attested rerank lifts BM25 by +11.5% nDCG@10 with no vector index, sealed in the proof; the same bi-encoder stacked on hybrid subtracts 2.9% — published per this protocol | [Attested rerank uplift](../gates/evidence/rag-attested-rerank-nfcorpus-2026-08-23.md) | Bi-encoder rerank; a cross-encoder is the path to hybrid uplift |
 
 Rows land here only after their receipts exist; the head-to-head (V2)
-and attested-rerank-uplift (V3) rows join with their runs.
+row joins with its run.
 
 ## What we do not claim
 

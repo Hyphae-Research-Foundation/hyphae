@@ -48,6 +48,16 @@ INGEST_BATCH_OBJECTS = 100
 EMBED_BATCH_TEXTS = 256
 
 
+def container_runtime() -> str:
+    """The available container CLI: docker, or podman as its drop-in."""
+    import shutil
+
+    for name in ("docker", "podman"):
+        if shutil.which(name):
+            return name
+    raise HarnessError("no container runtime found for the container probes")
+
+
 def http_json(
     method: str, url: str, payload: dict | None = None, timeout: float = 600.0
 ) -> dict:
@@ -167,7 +177,7 @@ def query_ranking(
 def container_rss_bytes(container: str) -> int | None:
     completed = subprocess.run(
         [
-            "docker",
+            container_runtime(),
             "stats",
             "--no-stream",
             "--format",
@@ -194,7 +204,7 @@ def container_rss_bytes(container: str) -> int | None:
 
 def cold_start_seconds(endpoint: str, container: str) -> float | None:
     completed = subprocess.run(
-        ["docker", "restart", container],
+        [container_runtime(), "restart", container],
         capture_output=True,
         text=True,
         timeout=600,
