@@ -1,6 +1,6 @@
 {
   "name": "@hyphae_/hyphae",
-  "version": "1.2.2",
+  "version": "2.0.0",
   "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
   "license": "Apache-2.0",
   "type": "module",
@@ -22,6 +22,10 @@
     "./v2": {
       "types": "./dist/v2/index.d.ts",
       "import": "./dist/v2/index.js"
+    },
+    "./providers": {
+      "types": "./dist/providers.d.ts",
+      "import": "./dist/providers.js"
     }
   },
   "scripts": {
@@ -32,7 +36,16 @@
     "conformance": "npm run build && node conformance/run.mjs"
   },
   "devDependencies": {
+    "@noble/hashes": "^2.0.1",
     "@types/node": "^24.10.1",
     "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "@noble/hashes": ">=1.5.0"
+  },
+  "peerDependenciesMeta": {
+    "@noble/hashes": {
+      "optional": true
+    }
   }
 }

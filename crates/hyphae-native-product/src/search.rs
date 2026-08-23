@@ -42,7 +42,10 @@ pub const MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS: usize = 256;
 /// Maximum logical input bytes accepted by one atomic integrated ingestion.
 pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
-pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 10_000;
+/// Raised from 10,000 on the R-track evidence chain (posting-index
+/// eligibility, pinned posting scorer, cached snapshot state, and the
+/// sealed `FiQA` relevance receipt); the next rung is evidence-gated.
+pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 100_000;
 /// Maximum named vector targets in one collection or request.
 pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
 /// Maximum retrieval candidates requested from one native branch.
@@ -175,6 +178,68 @@ pub struct ProductVectorBranch {
     pub execution: Option<ProductVectorExecution>,
 }
 
+/// Branch-combination method for the fused relevance score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductFusionMethod {
+    /// Normalized score blend: a lexical candidate contributes its branch
+    /// weight times its score divided by the branch's top score, and a
+    /// vector candidate contributes its branch weight times the bounded
+    /// similarity `1 / (1 + distance)`.
+    WeightedScore,
+}
+
+/// Bounded first-k-per-parent deduplication over the final ranking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductParentDedupe {
+    /// Doc-value field holding the parent identity. Hits missing the field
+    /// are never deduplicated.
+    pub field: String,
+    /// Hits retained per distinct parent value, within `1..=100`.
+    pub first_k: usize,
+}
+
+/// Maximum hits retained per parent by deduplication.
+pub const MAX_PARENT_DEDUPE_FIRST_K: usize = 100;
+
+/// Maximum externally reranked entries in one request.
+pub const MAX_RERANK_ENTRIES: usize = 256;
+
+/// Maximum highlighted fragments per hit.
+pub const MAX_HIGHLIGHT_FRAGMENTS: usize = 4;
+/// Maximum normalized-text bytes per highlighted fragment.
+pub const MAX_HIGHLIGHT_FRAGMENT_BYTES: usize = 512;
+/// Minimum normalized-text bytes per highlighted fragment.
+pub const MIN_HIGHLIGHT_FRAGMENT_BYTES: usize = 16;
+
+/// Budgeted deterministic highlighting over the final hits.
+///
+/// Fragments are cut from the canonical analyzer's normalized text of each
+/// hit's indexed source, around tokens equal to the analyzed query terms.
+/// Extraction is a pure function of committed text, the query, and this
+/// budget — it never touches the wire encoding of proofs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductHighlight {
+    /// Fragments retained per hit, within `1..=4`.
+    pub max_fragments: usize,
+    /// Normalized-text byte budget per fragment, within `16..=512`.
+    pub fragment_bytes: usize,
+}
+
+/// An attested external rerank applied over the final ranking.
+///
+/// The scores come from a model stage outside the engine — the attested
+/// local tool or a declared provider — together with the attestation
+/// envelope that binds how they were produced. The engine reorders
+/// deterministically and seals the attestation class in the proof; it never
+/// runs the model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductRerankStage {
+    /// Canonical `HYATTS01` attestation envelope for the score source.
+    pub attestation: Vec<u8>,
+    /// Externally computed scores by document identity.
+    pub scores: Vec<(crate::ObjectId, f64)>,
+}
+
 /// Complete bounded integrated search request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductSearchRequest {
@@ -192,6 +257,15 @@ pub struct ProductSearchRequest {
     pub aggregations: Vec<ProductNamedAggregation>,
     /// Maximum final hits.
     pub limit: usize,
+    /// Branch-combination method. Absent means the deterministic
+    /// rank-based weighted reciprocal-rank fusion.
+    pub fusion: Option<ProductFusionMethod>,
+    /// Optional first-k-per-parent deduplication over the final ranking.
+    pub parent_dedupe: Option<ProductParentDedupe>,
+    /// Optional attested external rerank over the final ranking.
+    pub rerank: Option<ProductRerankStage>,
+    /// Optional budgeted highlighting over the final hits.
+    pub highlight: Option<ProductHighlight>,
 }
 
 /// Physical vector strategy that actually ran.
@@ -235,6 +309,8 @@ pub struct ProductIntegratedSearchHit {
     pub score: f64,
     /// Persisted typed values used by filtering and sorting.
     pub doc_values: BTreeMap<String, ProductDocValue>,
+    /// Budgeted normalized-text fragments, present only when requested.
+    pub fragments: Vec<String>,
 }
 
 /// Complete integrated result with snapshot, strategy, approximation, and counts.
@@ -489,6 +565,7 @@ impl NativeProduct {
     ///
     /// Returns without publication for any invalid document, exhausted bound,
     /// duplicate document, unknown target, or native commit failure.
+    #[allow(clippy::too_many_lines)]
     pub fn ingest_search_batch(
         &mut self,
         collection: crate::ObjectId,
@@ -522,6 +599,7 @@ impl NativeProduct {
             .map_err(map_runtime_error)?;
         let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
         let mut identities = decode_manifest(existing_manifest)?;
+        let collection_was_empty = identities.is_empty();
         if identities.len().saturating_add(batch.documents.len())
             > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS
         {
@@ -533,10 +611,17 @@ impl NativeProduct {
             }
         }
 
+        let transform = collection_lexical_transform(&definition, |id| {
+            current.inner.logical_catalog_object(id).cloned()
+        })?;
         for document in &batch.documents {
             let object_bytes = document.object_id.get().to_be_bytes().to_vec();
+            let text = match &transform {
+                None => document.text.clone(),
+                Some(transform) => transform.apply(&document.text),
+            };
             transaction
-                .index_document(binding.lexical_index, object_bytes, document.text.clone())
+                .index_document(binding.lexical_index, object_bytes, text)
                 .map_err(map_runtime_error)?;
             for vector_binding in &binding.vectors {
                 if let Some(vector) = document.vectors.get(&vector_binding.name) {
@@ -549,6 +634,22 @@ impl NativeProduct {
                 .set(
                     document_key(collection, document.object_id),
                     encode_document(document)?,
+                    None,
+                )
+                .map_err(map_runtime_error)?;
+        }
+        let (covered, newly_covered) =
+            posting_coverage(&transaction, collection, collection_was_empty);
+        if covered {
+            for document in &batch.documents {
+                write_document_postings(&mut transaction, collection, document)?;
+            }
+        }
+        if newly_covered {
+            transaction
+                .set(
+                    posting_coverage_key(collection),
+                    POSTING_COVERAGE_MAGIC.to_vec(),
                     None,
                 )
                 .map_err(map_runtime_error)?;
@@ -586,6 +687,7 @@ impl NativeProduct {
     ///
     /// Returns a stable request, catalog, limit, conflict, storage, or
     /// durability error. Validation failures publish no partial mutation.
+    #[allow(clippy::too_many_lines)]
     pub fn update_search_document(
         &mut self,
         collection: crate::ObjectId,
@@ -613,6 +715,10 @@ impl NativeProduct {
         )? {
             return Ok(receipt);
         }
+        let catalog = self.catalog_snapshot()?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            self.catalog_describe(&catalog, id).ok().flatten()
+        })?;
         let mut transaction = self
             .database
             .begin(logical_time_micros, durability.into())
@@ -626,13 +732,26 @@ impl NativeProduct {
             return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
                 .with_object_id(update.document.object_id));
         }
+        let (postings_covered, _) = posting_coverage(&transaction, collection, false);
+        if postings_covered {
+            let previous = transaction
+                .get(&document_key(collection, update.document.object_id))
+                .ok_or_else(corruption)?
+                .to_vec();
+            delete_document_postings(
+                &mut transaction,
+                collection,
+                update.document.object_id,
+                &previous,
+            )?;
+        }
         let object_bytes = update.document.object_id.get().to_be_bytes().to_vec();
+        let text = match &transform {
+            None => update.document.text.clone(),
+            Some(transform) => transform.apply(&update.document.text),
+        };
         transaction
-            .replace_document(
-                binding.lexical_index,
-                object_bytes,
-                update.document.text.clone(),
-            )
+            .replace_document(binding.lexical_index, object_bytes, text)
             .map_err(map_runtime_error)?;
         for vector_binding in &binding.vectors {
             if let Some(vector) = update.document.vectors.get(&vector_binding.name) {
@@ -656,6 +775,9 @@ impl NativeProduct {
                 None,
             )
             .map_err(map_runtime_error)?;
+        if postings_covered {
+            write_document_postings(&mut transaction, collection, &update.document)?;
+        }
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
@@ -717,6 +839,14 @@ impl NativeProduct {
         if !manifest.remove(&delete.object_id) {
             return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
                 .with_object_id(delete.object_id));
+        }
+        let (postings_covered, _) = posting_coverage(&transaction, collection, false);
+        if postings_covered {
+            let previous = transaction
+                .get(&document_key(collection, delete.object_id))
+                .ok_or_else(corruption)?
+                .to_vec();
+            delete_document_postings(&mut transaction, collection, delete.object_id, &previous)?;
         }
         transaction
             .delete_document(
@@ -817,6 +947,7 @@ impl NativeProduct {
         self.search_collection_with_checkpoint(collection, request, logical_time_micros, || Ok(()))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,
         collection: crate::ObjectId,
@@ -829,20 +960,27 @@ impl NativeProduct {
         let definition = self.search_definition(collection)?;
         validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let documents = load_documents_with_checkpoint(&snapshot, collection, &mut checkpoint)?;
-        let total_documents = documents.len();
-        let eligible =
-            filter_documents_with_checkpoint(&documents, &request.filter, &mut checkpoint)?;
-        let mut eligible_ids = BTreeSet::new();
-        for candidate in &eligible {
-            checkpoint()?;
-            eligible_ids.insert(decode_object_id(&candidate.document_id)?);
-        }
+        let manifest_ids = load_manifest_ids(&snapshot, collection)?;
+        let total_documents = manifest_ids.len();
+        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
+            &snapshot,
+            collection,
+            &request.filter,
+            &manifest_ids,
+            &mut checkpoint,
+        )?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            snapshot.inner.logical_catalog_object(id).cloned()
+        })?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
+            &self.database,
             &snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
+            collection_bm25_parameters(&definition),
+            request.fusion,
+            transform.as_ref(),
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
@@ -852,57 +990,62 @@ impl NativeProduct {
             &binding,
             &definition,
             &request.vectors,
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut checkpoint,
         )?;
 
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for candidate in &eligible {
+            for object_id in &eligible_ids {
                 checkpoint()?;
-                fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
+                fused.insert(*object_id, 0.0);
             }
-        }
-        let mut by_id = BTreeMap::new();
-        for candidate in documents {
-            checkpoint()?;
-            by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
         }
         let mut candidates = Vec::with_capacity(fused.len());
         for (object_id, score) in fused {
             checkpoint()?;
-            let source = by_id.get(&object_id).ok_or_else(corruption)?;
             candidates.push(hyphae_native_runtime::DocValueCandidate {
                 document_id: object_id.get().to_be_bytes().to_vec(),
                 score,
-                values: source.values.clone(),
+                values: source.values_of(&snapshot, collection, object_id)?,
             });
         }
         let retrieval_candidates = candidates.len();
         let doc_request = hyphae_native_runtime::DocValueRequest {
             filter: request.filter.clone(),
             sort: request.sort.clone(),
-            limit: request.limit,
+            limit: if request.parent_dedupe.is_some() || request.rerank.is_some() {
+                // Deduplication and reranking need the complete bounded
+                // ranking before the final truncation.
+                hyphae_native_runtime::MAX_DOC_VALUE_HITS
+            } else {
+                request.limit
+            },
             facets: request.facets.clone(),
             aggregations: request.aggregations.clone(),
         };
-        let result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
+        let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(stage) = &request.rerank {
+            apply_rerank(&mut result.hits, stage)?;
+        }
+        if let Some(dedupe) = &request.parent_dedupe {
+            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        } else if request.rerank.is_some() {
+            result.hits.truncate(request.limit);
+        }
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
-            hits: result
-                .hits
-                .into_iter()
-                .map(|hit| {
-                    Ok(ProductIntegratedSearchHit {
-                        object_id: decode_object_id(&hit.document_id)?,
-                        score: hit.score,
-                        doc_values: hit.values,
-                    })
-                })
-                .collect::<Result<_, ProductError>>()?,
+            hits: integrated_hits(
+                result.hits,
+                &snapshot,
+                binding.lexical_index,
+                request,
+                transform.as_ref(),
+            )?,
             facets: result.facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
@@ -925,7 +1068,7 @@ impl NativeProduct {
     /// Returns an error for an invalid binding/request, missing durable side
     /// record, exhausted bound, or native lexical/vector execution failure.
     pub fn search_collection_at_snapshot(
-        _product: &Self,
+        product: &Self,
         snapshot: &crate::ProductSnapshot,
         collection: crate::ObjectId,
         request: &ProductSearchRequest,
@@ -933,18 +1076,27 @@ impl NativeProduct {
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
         let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
         validate_search_request(&definition, &binding, request)?;
-        let documents = load_documents(snapshot, collection)?;
-        let total_documents = documents.len();
-        let eligible = filter_documents(&documents, &request.filter)?;
-        let eligible_ids = eligible
-            .iter()
-            .map(|candidate| decode_object_id(&candidate.document_id))
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let manifest_ids = load_manifest_ids(snapshot, collection)?;
+        let total_documents = manifest_ids.len();
+        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
+            snapshot,
+            collection,
+            &request.filter,
+            &manifest_ids,
+            &mut || Ok(()),
+        )?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            snapshot.inner.logical_catalog_object(id).cloned()
+        })?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
+            &product.database,
             snapshot,
             binding.lexical_index,
             request.lexical.as_ref(),
+            collection_bm25_parameters(&definition),
+            request.fusion,
+            transform.as_ref(),
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
@@ -954,55 +1106,59 @@ impl NativeProduct {
             &binding,
             &definition,
             &request.vectors,
+            request.fusion,
             &eligible_ids,
             &mut fused,
             &mut || Ok(()),
         )?;
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for candidate in &eligible {
-                fused.insert(decode_object_id(&candidate.document_id)?, 0.0);
+            for object_id in &eligible_ids {
+                fused.insert(*object_id, 0.0);
             }
         }
-        let by_id = documents
-            .into_iter()
-            .map(|candidate| Ok((decode_object_id(&candidate.document_id)?, candidate)))
-            .collect::<Result<BTreeMap<_, _>, ProductError>>()?;
         let candidates = fused
             .into_iter()
             .map(|(object_id, score)| {
-                let source = by_id.get(&object_id).ok_or_else(corruption)?;
                 Ok(hyphae_native_runtime::DocValueCandidate {
                     document_id: object_id.get().to_be_bytes().to_vec(),
                     score,
-                    values: source.values.clone(),
+                    values: source.values_of(snapshot, collection, object_id)?,
                 })
             })
             .collect::<Result<Vec<_>, ProductError>>()?;
-        let result = execute_doc_values(
+        let mut result = execute_doc_values(
             &candidates,
             &hyphae_native_runtime::DocValueRequest {
                 filter: request.filter.clone(),
                 sort: request.sort.clone(),
-                limit: request.limit,
+                limit: if request.parent_dedupe.is_some() || request.rerank.is_some() {
+                    hyphae_native_runtime::MAX_DOC_VALUE_HITS
+                } else {
+                    request.limit
+                },
                 facets: request.facets.clone(),
                 aggregations: request.aggregations.clone(),
             },
             &doc_value_limits(),
         )
         .map_err(|error| map_doc_value_error(&error))?;
+        if let Some(stage) = &request.rerank {
+            apply_rerank(&mut result.hits, stage)?;
+        }
+        if let Some(dedupe) = &request.parent_dedupe {
+            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+        } else if request.rerank.is_some() {
+            result.hits.truncate(request.limit);
+        }
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
-            hits: result
-                .hits
-                .into_iter()
-                .map(|hit| {
-                    Ok(ProductIntegratedSearchHit {
-                        object_id: decode_object_id(&hit.document_id)?,
-                        score: hit.score,
-                        doc_values: hit.values,
-                    })
-                })
-                .collect::<Result<_, ProductError>>()?,
+            hits: integrated_hits(
+                result.hits,
+                snapshot,
+                binding.lexical_index,
+                request,
+                transform.as_ref(),
+            )?,
             facets: result.facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
@@ -1078,10 +1234,15 @@ impl NativeProduct {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_lexical_branch(
+    database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
+    parameters: hyphae_native_runtime::Bm25ScoreParameters,
+    fusion: Option<ProductFusionMethod>,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1089,27 +1250,57 @@ fn execute_lexical_branch(
     let Some(lexical) = lexical else {
         return Ok(0);
     };
-    let hits = snapshot
-        .inner
-        .match_text(index, &lexical.query, lexical.candidate_limit)
-        .map_err(map_runtime_error)?;
+    let query = match transform {
+        None => lexical.query.clone(),
+        Some(transform) => transform.apply(&lexical.query),
+    };
+    let query = query.as_str();
+    // The durable posting scorer is bit-identical to the retained model; a
+    // reclaimed page generation or inline-format directory falls open to
+    // the model, never to a different answer.
+    let hits = match database.match_text_at_snapshot(
+        &snapshot.inner,
+        index,
+        query,
+        lexical.candidate_limit,
+        parameters,
+    ) {
+        Ok(hits) => hits,
+        Err(_) => snapshot
+            .inner
+            .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
+            .map_err(map_runtime_error)?,
+    };
     let mut admitted = 0;
+    let top_score = hits.first().map_or(0.0, |hit| hit.score);
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
         if eligible.contains(&object_id) {
-            add_rrf(fused, object_id, lexical.weight, rank)?;
+            match fusion {
+                None => add_rrf(fused, object_id, lexical.weight, rank)?,
+                Some(ProductFusionMethod::WeightedScore) => {
+                    let normalized = if top_score > 0.0 && hit.score >= 0.0 {
+                        hit.score / top_score
+                    } else {
+                        0.0
+                    };
+                    add_weighted_score(fused, object_id, lexical.weight, normalized)?;
+                }
+            }
             admitted += 1;
         }
     }
     Ok(admitted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_vector_branches(
     snapshot: &ProductSnapshot,
     binding: &ProductSearchCollectionBinding,
     definition: &SearchCollectionDefinitionV2,
     branches: &[ProductVectorBranch],
+    fusion: Option<ProductFusionMethod>,
     eligible: &BTreeSet<crate::ObjectId>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
@@ -1131,7 +1322,17 @@ fn execute_vector_branches(
             execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
         for (rank, hit) in hits.into_iter().enumerate() {
             checkpoint()?;
-            add_rrf(fused, hit.object_id, branch.weight, rank)?;
+            match fusion {
+                None => add_rrf(fused, hit.object_id, branch.weight, rank)?,
+                Some(ProductFusionMethod::WeightedScore) => {
+                    let normalized = if hit.distance.is_finite() && hit.distance >= 0.0 {
+                        1.0 / (1.0 + hit.distance)
+                    } else {
+                        return Err(invalid_request());
+                    };
+                    add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
+                }
+            }
         }
         receipts.push(receipt);
     }
@@ -1419,11 +1620,80 @@ fn validate_documents(
     Ok(())
 }
 
+/// Reorders the final ranking by the externally attested scores: scored
+/// hits sort by score descending (ties break on the stable identity),
+/// unscored hits follow in their existing order. Deterministic and bounded.
+fn apply_rerank(
+    hits: &mut [hyphae_native_runtime::DocValueCandidate],
+    stage: &ProductRerankStage,
+) -> Result<(), ProductError> {
+    let mut scores = BTreeMap::new();
+    for (object_id, score) in &stage.scores {
+        if !score.is_finite() || scores.insert(*object_id, *score).is_some() {
+            return Err(invalid_request());
+        }
+    }
+    hits.sort_by(|left, right| {
+        let left_score = decode_object_id(&left.document_id)
+            .ok()
+            .and_then(|id| scores.get(&id).copied());
+        let right_score = decode_object_id(&right.document_id)
+            .ok()
+            .and_then(|id| scores.get(&id).copied());
+        match (left_score, right_score) {
+            (Some(left_value), Some(right_value)) => right_value
+                .total_cmp(&left_value)
+                .then_with(|| left.document_id.cmp(&right.document_id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    Ok(())
+}
+
+fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(stage) = &request.rerank
+        && (stage.scores.is_empty()
+            || stage.scores.len() > MAX_RERANK_ENTRIES
+            || crate::proof::attestation::ModelAttestation::decode(&stage.attestation).is_err())
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
+fn validate_highlight(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(highlight) = &request.highlight
+        && (!(1..=MAX_HIGHLIGHT_FRAGMENTS).contains(&highlight.max_fragments)
+            || !(MIN_HIGHLIGHT_FRAGMENT_BYTES..=MAX_HIGHLIGHT_FRAGMENT_BYTES)
+                .contains(&highlight.fragment_bytes)
+            || request.lexical.is_none())
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
+fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(dedupe) = &request.parent_dedupe
+        && (dedupe.field.is_empty()
+            || dedupe.field.len() > 1_024
+            || !(1..=MAX_PARENT_DEDUPE_FIRST_K).contains(&dedupe.first_k))
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_search_request(
     definition: &SearchCollectionDefinitionV2,
     binding: &ProductSearchCollectionBinding,
     request: &ProductSearchRequest,
 ) -> Result<(), ProductError> {
+    validate_parent_dedupe(request)?;
+    validate_rerank(request)?;
+    validate_highlight(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
@@ -1500,13 +1770,6 @@ pub fn conformance_validate_integrated_request(
         .map_err(|error| map_doc_value_error(&error))
 }
 
-fn load_documents(
-    snapshot: &ProductSnapshot,
-    collection: crate::ObjectId,
-) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    load_documents_with_checkpoint(snapshot, collection, &mut || Ok(()))
-}
-
 fn load_documents_with_checkpoint(
     snapshot: &ProductSnapshot,
     collection: crate::ObjectId,
@@ -1532,13 +1795,6 @@ fn load_documents_with_checkpoint(
         });
     }
     Ok(documents)
-}
-
-fn filter_documents(
-    documents: &[hyphae_native_runtime::DocValueCandidate],
-    filter: &ProductSearchFilter,
-) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    filter_documents_with_checkpoint(documents, filter, &mut || Ok(()))
 }
 
 fn filter_documents_with_checkpoint(
@@ -1592,7 +1848,33 @@ fn add_rrf(
         .ok()
         .and_then(|rank| rank.checked_add(1))
         .ok_or_else(limit_exceeded)?;
-    let contribution = f64::from(weight) / (RRF_CONSTANT + f64::from(rank));
+    add_contribution(
+        fused,
+        object_id,
+        f64::from(weight) / (RRF_CONSTANT + f64::from(rank)),
+    )
+}
+
+/// Adds one weighted normalized-score contribution. Lexical candidates
+/// normalize by the branch's top score; vector candidates map a canonical
+/// distance to the bounded similarity `1 / (1 + distance)`.
+fn add_weighted_score(
+    fused: &mut BTreeMap<crate::ObjectId, f64>,
+    object_id: crate::ObjectId,
+    weight: u32,
+    normalized: f64,
+) -> Result<(), ProductError> {
+    if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized) {
+        return Err(invalid_request());
+    }
+    add_contribution(fused, object_id, f64::from(weight) * normalized)
+}
+
+fn add_contribution(
+    fused: &mut BTreeMap<crate::ObjectId, f64>,
+    object_id: crate::ObjectId,
+    contribution: f64,
+) -> Result<(), ProductError> {
     let score = fused.entry(object_id).or_default();
     *score += contribution;
     if !score.is_finite() || *score < 0.0 {
@@ -1664,6 +1946,564 @@ fn storage_key(kind: u8, collection: crate::ObjectId, suffix: Option<[u8; 16]>) 
         key.extend_from_slice(&suffix);
     }
     key
+}
+
+/// Magic sealing a collection's doc-value posting coverage marker.
+const POSTING_COVERAGE_MAGIC: &[u8; 8] = b"HYPSPST1";
+/// Posting keys longer than this are not written; the field falls back.
+const MAX_POSTING_KEY_BYTES: usize = 3_900;
+
+fn posting_coverage_key(collection: crate::ObjectId) -> Vec<u8> {
+    storage_key(b'V', collection, None)
+}
+
+fn posting_field_prefix(collection: crate::ObjectId, field: &str) -> Vec<u8> {
+    let mut key = storage_key(b'P', collection, None);
+    key.extend_from_slice(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+    key.extend_from_slice(field.as_bytes());
+    key
+}
+
+fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
+    let mut key = storage_key(b'U', collection, None);
+    key.extend_from_slice(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+    key.extend_from_slice(field.as_bytes());
+    key
+}
+
+/// Pinned posting type tags in the doc-value total order.
+/// Retains the first `first_k` hits per distinct parent value over the
+/// sorted ranking, then truncates to the requested limit. Hits without the
+/// parent field are never deduplicated. Grouping keys use the canonical
+/// posting component encoding so equality is exact and type-bound.
+/// Maps final doc-value hits to integrated hits, cutting budgeted
+/// highlight fragments when the request carries a budget. Both search
+/// twins share this exact mapping.
+fn integrated_hits(
+    hits: Vec<hyphae_native_runtime::DocValueCandidate>,
+    snapshot: &ProductSnapshot,
+    lexical_index: crate::ObjectId,
+    request: &ProductSearchRequest,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
+) -> Result<Vec<ProductIntegratedSearchHit>, ProductError> {
+    let terms = highlight_terms(request, transform);
+    hits.into_iter()
+        .map(|hit| {
+            let fragments = match (&terms, &request.highlight) {
+                (Some(terms), Some(highlight)) => snapshot
+                    .inner
+                    .search_document_text(lexical_index, &hit.document_id)
+                    .map_or_else(Vec::new, |text| extract_fragments(text, terms, highlight)),
+                _ => Vec::new(),
+            };
+            Ok(ProductIntegratedSearchHit {
+                object_id: decode_object_id(&hit.document_id)?,
+                score: hit.score,
+                doc_values: hit.values,
+                fragments,
+            })
+        })
+        .collect()
+}
+
+/// Analyzed query terms for highlighting, derived from exactly the
+/// transformed query string the lexical branch scores with.
+fn highlight_terms(
+    request: &ProductSearchRequest,
+    transform: Option<&crate::lexical_analyzer::LexicalTransform>,
+) -> Option<BTreeSet<String>> {
+    request.highlight.as_ref()?;
+    let lexical = request.lexical.as_ref()?;
+    let query = match transform {
+        None => lexical.query.clone(),
+        Some(transform) => transform.apply(&lexical.query),
+    };
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(&query);
+    Some(
+        analysis
+            .tokens
+            .into_iter()
+            .map(|token| token.term)
+            .collect(),
+    )
+}
+
+/// Cuts budgeted fragments from the canonical analyzer's normalized text
+/// around tokens equal to the analyzed query terms.
+///
+/// Extraction is a pure deterministic function of the stored text, the
+/// term set, and the budget: fragments start one quarter of the budget
+/// before the first unconsumed matching token (clipped to a character
+/// boundary), extend to the byte budget, and never overlap.
+fn extract_fragments(
+    text: &str,
+    terms: &BTreeSet<String>,
+    highlight: &ProductHighlight,
+) -> Vec<String> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(text);
+    let normalized = analysis.normalized_text.as_str();
+    let mut fragments = Vec::new();
+    let mut cursor = 0_usize;
+    for token in &analysis.tokens {
+        if fragments.len() == highlight.max_fragments {
+            break;
+        }
+        if token.start_offset < cursor || !terms.contains(&token.term) {
+            continue;
+        }
+        let mut start = token
+            .start_offset
+            .saturating_sub(highlight.fragment_bytes / 4)
+            .max(cursor);
+        while start > 0 && !normalized.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = start
+            .saturating_add(highlight.fragment_bytes)
+            .min(normalized.len());
+        while end < normalized.len() && !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= start {
+            continue;
+        }
+        fragments.push(normalized[start..end].to_owned());
+        cursor = end;
+    }
+    fragments
+}
+
+fn apply_parent_dedupe(
+    hits: Vec<hyphae_native_runtime::DocValueCandidate>,
+    dedupe: &ProductParentDedupe,
+    limit: usize,
+) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
+    let mut counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut retained = Vec::new();
+    for hit in hits {
+        let keep = match hit.values.get(&dedupe.field) {
+            None => true,
+            Some(value) => {
+                let (tag, component) = posting_component(value)?;
+                let mut key = Vec::with_capacity(1 + component.len());
+                key.push(tag);
+                key.extend_from_slice(&component);
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= dedupe.first_k
+            }
+        };
+        if keep {
+            retained.push(hit);
+            if retained.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(retained)
+}
+
+fn posting_component(value: &ProductDocValue) -> Result<(u8, Vec<u8>), ProductError> {
+    Ok(match value {
+        ProductDocValue::Boolean(value) => (1, vec![u8::from(*value)]),
+        ProductDocValue::Integer(value) => {
+            (2, hyphae_native_types::encode_i64_ordered(*value).to_vec())
+        }
+        ProductDocValue::String(value) => (
+            3,
+            hyphae_native_types::encode_memcomparable_bytes(value.as_bytes())
+                .map_err(|_| limit_exceeded())?,
+        ),
+        ProductDocValue::Bytes(value) => (
+            4,
+            hyphae_native_types::encode_memcomparable_bytes(value).map_err(|_| limit_exceeded())?,
+        ),
+    })
+}
+
+fn posting_value_prefix(
+    collection: crate::ObjectId,
+    field: &str,
+    value: &ProductDocValue,
+) -> Result<Vec<u8>, ProductError> {
+    let (tag, component) = posting_component(value)?;
+    let mut key = posting_field_prefix(collection, field);
+    key.push(tag);
+    key.extend_from_slice(&component);
+    Ok(key)
+}
+
+fn posting_key(
+    collection: crate::ObjectId,
+    field: &str,
+    value: &ProductDocValue,
+    object_id: crate::ObjectId,
+) -> Result<Vec<u8>, ProductError> {
+    let mut key = posting_value_prefix(collection, field, value)?;
+    key.extend_from_slice(&object_id.get().to_be_bytes());
+    Ok(key)
+}
+
+/// Returns the exclusive upper bound sharing `prefix`, or `None` when no
+/// byte string is strictly greater (all bytes are 0xFF).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.pop() {
+        if last < u8::MAX {
+            bound.push(last + 1);
+            return Some(bound);
+        }
+    }
+    None
+}
+
+fn posting_object_id(key: &[u8]) -> Result<crate::ObjectId, ProductError> {
+    let suffix = key.len().checked_sub(16).ok_or_else(corruption)?;
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&key[suffix..]);
+    crate::ObjectId::new(u128::from_be_bytes(bytes)).map_err(|_| corruption())
+}
+
+/// Emits the posting mutations for one document: keys to set live and the
+/// fields whose encoded posting would exceed the bounded key budget.
+fn document_posting_keys(
+    collection: crate::ObjectId,
+    object_id: crate::ObjectId,
+    doc_values: &BTreeMap<String, ProductDocValue>,
+) -> Result<(Vec<Vec<u8>>, Vec<String>), ProductError> {
+    let mut keys = Vec::new();
+    let mut oversized = Vec::new();
+    for (field, value) in doc_values {
+        let key = posting_key(collection, field, value, object_id)?;
+        if key.len() > MAX_POSTING_KEY_BYTES {
+            oversized.push(field.clone());
+        } else {
+            keys.push(key);
+        }
+    }
+    Ok((keys, oversized))
+}
+
+/// Fields one filter references, or `None` when a node shape has none.
+fn filter_fields(filter: &ProductSearchFilter, fields: &mut BTreeSet<String>) {
+    match filter {
+        ProductSearchFilter::MatchAll => {}
+        ProductSearchFilter::Exists(field)
+        | ProductSearchFilter::Compare { field, .. }
+        | ProductSearchFilter::In { field, .. }
+        | ProductSearchFilter::IsNull(field)
+        | ProductSearchFilter::Like { field, .. } => {
+            fields.insert(field.clone());
+        }
+        ProductSearchFilter::All(children) | ProductSearchFilter::Any(children) => {
+            for child in children {
+                filter_fields(child, fields);
+            }
+        }
+        ProductSearchFilter::Not(child) => filter_fields(child, fields),
+    }
+}
+
+/// Collects the visible posting document identities inside `[start, end)`.
+fn posting_scan(
+    snapshot: &crate::ProductSnapshot,
+    start: &[u8],
+    end: &[u8],
+) -> Option<BTreeSet<crate::ObjectId>> {
+    let keys = snapshot.structure_keys_in_range_internal(
+        start,
+        end,
+        MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS.saturating_mul(2),
+    )?;
+    let mut identities = BTreeSet::new();
+    for key in keys {
+        identities.insert(posting_object_id(&key).ok()?);
+    }
+    Some(identities)
+}
+
+/// Evaluates one filter against the posting index, producing exactly the
+/// eligible set the linear scan would produce, or `None` when any node
+/// cannot be answered from postings (the caller falls back fail-open to the
+/// scan, never to a wrong answer).
+fn posting_filter_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest: &BTreeSet<crate::ObjectId>,
+) -> Option<BTreeSet<crate::ObjectId>> {
+    match filter {
+        ProductSearchFilter::MatchAll => Some(manifest.clone()),
+        ProductSearchFilter::Exists(field) => {
+            let start = posting_field_prefix(collection, field);
+            let end = prefix_successor(&start)?;
+            posting_scan(snapshot, &start, &end)
+        }
+        ProductSearchFilter::Compare {
+            field,
+            operator,
+            value,
+        } => {
+            let field_start = posting_field_prefix(collection, field);
+            let (tag, component) = posting_component(value).ok()?;
+            let mut tag_start = field_start.clone();
+            tag_start.push(tag);
+            let tag_end = prefix_successor(&tag_start)?;
+            let mut value_start = tag_start.clone();
+            value_start.extend_from_slice(&component);
+            let value_end = prefix_successor(&value_start)?;
+            match operator {
+                ProductSearchOperator::Equal => posting_scan(snapshot, &value_start, &value_end),
+                ProductSearchOperator::NotEqual => {
+                    let same_type = posting_scan(snapshot, &tag_start, &tag_end)?;
+                    let equal = posting_scan(snapshot, &value_start, &value_end)?;
+                    Some(same_type.difference(&equal).copied().collect())
+                }
+                ProductSearchOperator::Less => posting_scan(snapshot, &tag_start, &value_start),
+                ProductSearchOperator::LessOrEqual => {
+                    posting_scan(snapshot, &tag_start, &value_end)
+                }
+                ProductSearchOperator::Greater => posting_scan(snapshot, &value_end, &tag_end),
+                ProductSearchOperator::GreaterOrEqual => {
+                    posting_scan(snapshot, &value_start, &tag_end)
+                }
+            }
+        }
+        ProductSearchFilter::All(children) => {
+            let mut result = manifest.clone();
+            for child in children {
+                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+                result = result.intersection(&ids).copied().collect();
+            }
+            Some(result)
+        }
+        ProductSearchFilter::Any(children) => {
+            let mut result = BTreeSet::new();
+            for child in children {
+                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+                result.extend(ids);
+            }
+            Some(result)
+        }
+        ProductSearchFilter::Not(child) => {
+            let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
+            Some(manifest.difference(&ids).copied().collect())
+        }
+        // A bounded membership set is the union of its members' point scans.
+        ProductSearchFilter::In { field, values } => {
+            let field_start = posting_field_prefix(collection, field);
+            let mut result = BTreeSet::new();
+            for value in values {
+                let (tag, component) = posting_component(value).ok()?;
+                let mut value_start = field_start.clone();
+                value_start.push(tag);
+                value_start.extend_from_slice(&component);
+                let value_end = prefix_successor(&value_start)?;
+                result.extend(posting_scan(snapshot, &value_start, &value_end)?);
+            }
+            Some(result)
+        }
+        // Missing-field membership is the manifest minus every posting for
+        // the field, mirroring the reference's negated Exists exactly.
+        ProductSearchFilter::IsNull(field) => {
+            let start = posting_field_prefix(collection, field);
+            let end = prefix_successor(&start)?;
+            let present = posting_scan(snapshot, &start, &end)?;
+            Some(manifest.difference(&present).copied().collect())
+        }
+        // Substring shapes cannot be answered from ordered postings; the
+        // caller falls back fail-open to the exact scan.
+        ProductSearchFilter::Like { .. } => None,
+    }
+}
+
+/// Answers eligibility from the posting index when the collection is
+/// posting-covered and every referenced field is fully indexed.
+fn posting_eligible_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest: &BTreeSet<crate::ObjectId>,
+) -> Option<BTreeSet<crate::ObjectId>> {
+    let coverage = snapshot.structure_get_internal(&posting_coverage_key(collection))?;
+    if coverage != POSTING_COVERAGE_MAGIC {
+        return None;
+    }
+    let mut fields = BTreeSet::new();
+    filter_fields(filter, &mut fields);
+    for field in &fields {
+        if snapshot
+            .structure_get_internal(&unindexed_field_key(collection, field))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    posting_filter_ids(snapshot, collection, filter, manifest)
+}
+
+/// Writes the live postings and oversized-field markers for one document.
+fn write_document_postings(
+    transaction: &mut hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    document: &ProductDocument,
+) -> Result<(), ProductError> {
+    let (keys, oversized) =
+        document_posting_keys(collection, document.object_id, &document.doc_values)?;
+    for key in keys {
+        transaction
+            .set(key, vec![1], None)
+            .map_err(map_runtime_error)?;
+    }
+    for field in oversized {
+        transaction
+            .set(unindexed_field_key(collection, &field), vec![1], None)
+            .map_err(map_runtime_error)?;
+    }
+    Ok(())
+}
+
+/// Deletes the postings of one previously stored document encoding.
+fn delete_document_postings(
+    transaction: &mut hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    object_id: crate::ObjectId,
+    encoded: &[u8],
+) -> Result<(), ProductError> {
+    let previous = decode_document(encoded, object_id)?;
+    let (keys, _oversized) = document_posting_keys(collection, object_id, &previous)?;
+    for key in keys {
+        let _removed = transaction
+            .delete_structure(key)
+            .map_err(map_runtime_error)?;
+    }
+    Ok(())
+}
+
+/// Whether the collection maintains postings inside this transaction, and
+/// whether this transaction is the one that turns coverage on.
+fn posting_coverage(
+    transaction: &hyphae_native_runtime::NativeWriteBatch,
+    collection: crate::ObjectId,
+    collection_was_empty: bool,
+) -> (bool, bool) {
+    if transaction.get(&posting_coverage_key(collection)).is_some() {
+        return (true, false);
+    }
+    (collection_was_empty, collection_was_empty)
+}
+
+/// Where per-candidate doc-values come from after eligibility resolution.
+enum DocumentSource {
+    /// Postings answered eligibility; values load per fused candidate.
+    Postings,
+    /// The linear scan already materialized every document.
+    Scan(BTreeMap<crate::ObjectId, hyphae_native_runtime::DocValueCandidate>),
+}
+
+impl DocumentSource {
+    fn values_of(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        object_id: crate::ObjectId,
+    ) -> Result<BTreeMap<String, ProductDocValue>, ProductError> {
+        match self {
+            Self::Scan(by_id) => Ok(by_id.get(&object_id).ok_or_else(corruption)?.values.clone()),
+            Self::Postings => {
+                let encoded = snapshot
+                    .structure_get_internal(&document_key(collection, object_id))
+                    .ok_or_else(corruption)?;
+                decode_document(encoded, object_id)
+            }
+        }
+    }
+}
+
+/// Resolves eligibility from postings when possible, otherwise through the
+/// materializing linear scan, preserving byte-identical semantics.
+fn resolve_eligibility_with_checkpoint(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
+    manifest_ids: &BTreeSet<crate::ObjectId>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<(BTreeSet<crate::ObjectId>, DocumentSource), ProductError> {
+    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest_ids) {
+        checkpoint()?;
+        return Ok((eligible, DocumentSource::Postings));
+    }
+    let documents = load_documents_with_checkpoint(snapshot, collection, checkpoint)?;
+    let eligible = filter_documents_with_checkpoint(&documents, filter, checkpoint)?;
+    let mut eligible_ids = BTreeSet::new();
+    for candidate in &eligible {
+        checkpoint()?;
+        eligible_ids.insert(decode_object_id(&candidate.document_id)?);
+    }
+    let mut by_id = BTreeMap::new();
+    for candidate in documents {
+        checkpoint()?;
+        by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
+    }
+    Ok((eligible_ids, DocumentSource::Scan(by_id)))
+}
+
+/// Loads the collection manifest identities under the read-side cap.
+/// Tuned BM25 parameters from the collection definition, or the canonical
+/// defaults when the definition predates tuning.
+/// Resolves the configured lexical transform for one collection, or `None`
+/// for the canonical identity pipeline. Fails closed on analyzer shapes the
+/// transform cannot honor exactly.
+fn collection_lexical_transform(
+    definition: &SearchCollectionDefinitionV2,
+    resolve: impl Fn(crate::ObjectId) -> Option<hyphae_native_catalog::LogicalCatalogObject>,
+) -> Result<Option<crate::lexical_analyzer::LexicalTransform>, ProductError> {
+    let analyzer = definition
+        .fields
+        .iter()
+        .find(|field| {
+            field.options.lexical != hyphae_native_catalog::LexicalIndexPolicy::None
+                && field.analyzer.is_some()
+        })
+        .and_then(|field| field.analyzer);
+    let Some(analyzer) = analyzer else {
+        return Ok(None);
+    };
+    let Some(hyphae_native_catalog::LogicalCatalogObject::V2(
+        hyphae_native_catalog::CatalogObjectV2::Analyzer(analyzer),
+    )) = resolve(analyzer)
+    else {
+        return Err(corruption());
+    };
+    crate::lexical_analyzer::LexicalTransform::from_definition(&analyzer)
+        .map_err(|_| invalid_request())
+}
+
+fn collection_bm25_parameters(
+    definition: &SearchCollectionDefinitionV2,
+) -> hyphae_native_runtime::Bm25ScoreParameters {
+    definition.bm25.map_or_else(
+        hyphae_native_runtime::Bm25ScoreParameters::default,
+        |bm25| hyphae_native_runtime::Bm25ScoreParameters {
+            k1_micros: bm25.k1_micros,
+            b_micros: bm25.b_micros,
+        },
+    )
+}
+
+fn load_manifest_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
+    let identities = decode_manifest(
+        snapshot
+            .structure_get_internal(&manifest_key(collection))
+            .ok_or_else(corruption)?,
+    )?;
+    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
+        return Err(corruption());
+    }
+    Ok(identities)
 }
 
 fn encode_manifest(identities: &BTreeSet<crate::ObjectId>) -> Result<Vec<u8>, ProductError> {

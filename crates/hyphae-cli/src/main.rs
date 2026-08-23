@@ -6,6 +6,7 @@ mod compatibility;
 mod exit;
 mod json_value;
 mod mcp;
+mod migrate_valkey;
 mod native;
 mod native_client;
 mod native_service;
@@ -342,6 +343,9 @@ enum Command {
         /// Read the Native API key from the first stdin line, then MCP messages.
         #[arg(long, conflicts_with = "native_api_key_file")]
         native_api_key_stdin: bool,
+        /// Explicitly expose the bounded write-scoped ingest tool.
+        #[arg(long)]
+        allow_ingest: bool,
     },
 }
 
@@ -432,12 +436,27 @@ impl From<HardwareGovernorMode> for GovernorMode {
     }
 }
 
+/// Selectable migration source kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+enum MigrationSourceKind {
+    /// Existing format-2 Hyphae data directory.
+    #[default]
+    Format2,
+    /// Offline Valkey/Redis RDB file.
+    ValkeyRdb,
+}
+
 #[derive(Debug, Subcommand)]
 enum MigrationCommand {
     /// Verify and report the source logical snapshot.
     Inspect {
         #[arg(long)]
         source: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
+        /// Explicitly waive one degraded or rejected source construct.
+        #[arg(long = "waive")]
+        waived: Vec<String>,
     },
     /// Import a verified source into a separate pending Native target.
     Run {
@@ -447,6 +466,11 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
+        /// Explicitly waive one degraded or rejected source construct.
+        #[arg(long = "waive")]
+        waived: Vec<String>,
     },
     /// Verify a migration manifest and its pending or promoted target.
     Verify {
@@ -456,6 +480,8 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
     },
     /// Promote a validated pending Native target.
     Promote {
@@ -465,6 +491,8 @@ enum MigrationCommand {
         target: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, value_enum, default_value_t)]
+        source_kind: MigrationSourceKind,
     },
     /// Remove a pending migration target while retaining the source.
     Rollback {
@@ -889,6 +917,21 @@ enum CatalogCommand {
         name: String,
         #[arg(long, default_value_t = 2)]
         dimension: u16,
+        /// Adds frozen Latin diacritic folding to the collection analyzer.
+        #[arg(long)]
+        analyzer_ascii_folding: bool,
+        /// Adds frozen English stop-word removal to the collection analyzer.
+        #[arg(long)]
+        analyzer_english_stop: bool,
+        /// Adds frozen English Porter stemming to the collection analyzer.
+        #[arg(long)]
+        analyzer_english_stem: bool,
+        /// Tuned BM25 k1 in micros (defaults keep the canonical 1.2).
+        #[arg(long, requires = "bm25_b_micros")]
+        bm25_k1_micros: Option<u64>,
+        /// Tuned BM25 b in micros (defaults keep the canonical 0.75).
+        #[arg(long, requires = "bm25_k1_micros")]
+        bm25_b_micros: Option<u64>,
         #[arg(long, value_enum, default_value_t = Durability::Strict)]
         durability: Durability,
     },
@@ -1008,6 +1051,53 @@ enum SearchCommand {
         /// JSON array of named metric aggregation requests.
         #[arg(long)]
         metrics_json: Option<String>,
+        /// Branch-combination method. Defaults to weighted reciprocal-rank.
+        #[arg(long, value_enum)]
+        fusion: Option<FusionMethodInput>,
+        /// Doc-value field for first-k-per-parent deduplication.
+        #[arg(long, requires = "dedupe_first_k")]
+        dedupe_field: Option<String>,
+        /// Hits retained per distinct parent value (1..=100).
+        #[arg(long, requires = "dedupe_field")]
+        dedupe_first_k: Option<usize>,
+        /// Budgeted highlighted fragments per hit (1..=4).
+        #[arg(long)]
+        highlight_fragments: Option<usize>,
+        /// Normalized-text byte budget per fragment (16..=512).
+        #[arg(long, default_value_t = 128, requires = "highlight_fragments")]
+        highlight_bytes: usize,
+    },
+    /// Consolidates every vector index of one collection into a fresh
+    /// generation, draining accumulated deltas.
+    Consolidate {
+        #[arg(long)]
+        collection: u128,
+        #[arg(long, value_enum, default_value_t = Durability::Strict)]
+        durability: Durability,
+    },
+    /// Deterministically chunk one document into ingest-ready JSON.
+    Chunk {
+        /// Parent document identity carried by every chunk.
+        #[arg(long)]
+        parent: u128,
+        /// UTF-8 source text. Mutually exclusive with --file.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// UTF-8 source file. Mutually exclusive with --text.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Fixed window size in bytes.
+        #[arg(long, default_value_t = 1024)]
+        size: usize,
+        /// Fixed window overlap in bytes.
+        #[arg(long, default_value_t = 0)]
+        overlap: usize,
+        /// Pack whole sentences up to --size, never beyond --sentence-max.
+        #[arg(long)]
+        sentence: bool,
+        /// Hard sentence-mode window bound in bytes.
+        #[arg(long, default_value_t = 2048)]
+        sentence_max: usize,
     },
     /// Atomically ingest integrated documents from one JSON array.
     Ingest {
@@ -1519,6 +1609,12 @@ enum SearchQueryKind {
     Fuzzy,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FusionMethodInput {
+    /// Normalized weighted score blend across branches.
+    WeightedScore,
+}
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum IntegratedVectorStrategy {
     #[default]
@@ -1568,8 +1664,25 @@ impl From<StructureFamily> for StructureKind {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The dispatch future and the engine's open path outgrow the 1 MiB
+    // Windows main-thread stack. A dedicated worker with an explicit stack
+    // owns the runtime, and the dispatch state machine lives on the heap.
+    let Ok(worker) = std::thread::Builder::new()
+        .name("hyphae-cli".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(cli_main)
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn cli_main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
@@ -1579,7 +1692,15 @@ async fn main() {
         }
         Err(error) => error.exit(),
     };
-    if let Err(failure) = run(cli).await {
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        let failure = CliFailure::internal();
+        let _ignored = print_error(&failure);
+        std::process::exit(i32::from(failure.exit_class()));
+    };
+    if let Err(failure) = runtime.block_on(Box::pin(run(cli))) {
         match failure {
             RunFailure::Native(failure) => {
                 let _ignored = print_error(&failure);
@@ -1791,10 +1912,12 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             base_url,
             native_api_key_file,
             native_api_key_stdin,
+            allow_ingest,
         } => mcp::run(
             &base_url,
             native_api_key_file.as_deref(),
             native_api_key_stdin,
+            allow_ingest,
         )
         .await
         .map_err(Into::into),
@@ -2019,16 +2142,71 @@ fn default_hardware_cache_directory() -> Result<PathBuf, CliFailure> {
 #[allow(clippy::too_many_lines)]
 fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
     match command {
-        MigrationCommand::Inspect { source } => {
-            let snapshot = migration_snapshot(&source)?;
-            print_json(&migration_snapshot_json(&snapshot))
-        }
+        MigrationCommand::Inspect {
+            source,
+            source_kind,
+            waived,
+        } => match source_kind {
+            MigrationSourceKind::Format2 => {
+                if !waived.is_empty() {
+                    return Err(CliFailure::invalid());
+                }
+                let snapshot = migration_snapshot(&source)?;
+                print_json(&migration_snapshot_json(&snapshot))
+            }
+            MigrationSourceKind::ValkeyRdb => {
+                let inventory = migrate_valkey::inspect_valkey_rdb(
+                    &source,
+                    &migrate_valkey::rdb::RdbReadLimits::default(),
+                )
+                .map_err(|error| {
+                    eprintln!("valkey-rdb inspection failed: {error}");
+                    CliFailure::from(error)
+                })?;
+                let unwaived: Vec<&String> = inventory
+                    .required_waivers
+                    .iter()
+                    .filter(|construct| !waived.contains(construct))
+                    .collect();
+                let mut report = migrate_valkey::inventory_json(&inventory);
+                if let Some(object) = report.as_object_mut() {
+                    object.insert(
+                        "unwaived_constructs".to_owned(),
+                        serde_json::json!(unwaived),
+                    );
+                }
+                print_json(&report)
+            }
+        },
         MigrationCommand::Run {
             source,
             target,
             manifest,
+            source_kind,
+            waived,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let outcome =
+                    migrate_valkey::import::run_valkey_rdb(&source, &target, &manifest, &waived)?;
+                return print_json(&json!({
+                    "status": "imported",
+                    "source": source,
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "pending": true,
+                    "directory_id": outcome.receipt.target.directory_id,
+                    "history_epoch": outcome.receipt.target.history_epoch,
+                    "imported_keys": outcome.imported_keys,
+                    "skipped_expired": outcome.skipped_expired,
+                    "logical_digest": outcome.receipt.target.logical_digest,
+                    "content_digest": outcome.receipt.content_digest,
+                }));
+            }
+            if !waived.is_empty() {
+                return Err(CliFailure::invalid());
+            }
             let snapshot = migration_snapshot(&source)?;
             let mut product = NativeProduct::create_pending(&target)?;
             let result = match import_migration_snapshot(&mut product, &snapshot) {
@@ -2076,8 +2254,23 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
             source,
             target,
             manifest,
+            source_kind,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let outcome =
+                    migrate_valkey::import::verify_valkey_rdb(&source, &target, &manifest)?;
+                return print_json(&json!({
+                    "status": "verified",
+                    "source": source,
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "pending": outcome.pending,
+                    "logical_digest": outcome.receipt.target.logical_digest,
+                    "content_digest": outcome.receipt.content_digest,
+                }));
+            }
             let snapshot = migration_snapshot(&source)?;
             let manifest_bytes = fs::read(&manifest)?;
             let migration = hyphae_native_runtime::MigrationManifest::decode(
@@ -2098,8 +2291,20 @@ fn migration(command: MigrationCommand) -> Result<(), CliFailure> {
             source,
             target,
             manifest,
+            source_kind,
         } => {
             reject_migration_path_overlap(&source, &target, &manifest)?;
+            if source_kind == MigrationSourceKind::ValkeyRdb {
+                let receipt =
+                    migrate_valkey::import::promote_valkey_rdb(&source, &target, &manifest)?;
+                return print_json(&json!({
+                    "status": "promoted",
+                    "source_kind": "valkey-rdb",
+                    "target": target,
+                    "manifest": manifest,
+                    "content_digest": receipt.content_digest,
+                }));
+            }
             let snapshot = migration_snapshot(&source)?;
             let bytes = fs::read(&manifest)?;
             let migration = hyphae_native_runtime::MigrationManifest::decode(
@@ -2743,6 +2948,11 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer,
             name,
             dimension,
+            analyzer_ascii_folding,
+            analyzer_english_stop,
+            analyzer_english_stem,
+            bm25_k1_micros,
+            bm25_b_micros,
             durability,
         } => {
             let mut objects = vec![
@@ -2769,7 +2979,19 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                         Some(schema),
                     )?,
                     tokenizer: AnalyzerTokenizer::UnicodeWord,
-                    filters: vec![AnalyzerFilter::Lowercase],
+                    filters: {
+                        let mut filters = vec![AnalyzerFilter::Lowercase];
+                        if analyzer_ascii_folding {
+                            filters.push(AnalyzerFilter::AsciiFolding);
+                        }
+                        if analyzer_english_stop {
+                            filters.push(AnalyzerFilter::EnglishStopV1);
+                        }
+                        if analyzer_english_stem {
+                            filters.push(AnalyzerFilter::EnglishStemV1);
+                        }
+                        filters
+                    },
                 }));
             objects.push(analyzer_object);
             let ann = AnnIndexDefinition::new(VectorMetric::SquaredL2, 8, 32, 16, 256, 7)
@@ -2782,6 +3004,15 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             let object = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
                 SearchCollectionDefinitionV2 {
                     header: catalog_header(collection, EngineKind::Search, &name, Some(schema))?,
+                    bm25: match (bm25_k1_micros, bm25_b_micros) {
+                        (Some(k1_micros), Some(b_micros)) => {
+                            Some(hyphae_native_catalog::Bm25Parameters {
+                                k1_micros,
+                                b_micros,
+                            })
+                        }
+                        _ => None,
+                    },
                     fields: vec![
                         SearchFieldDefinitionV2 {
                             id: field_id(1)?,
@@ -2971,6 +3202,55 @@ fn structure(local: &LocalDirectory, command: StructureCommand) -> Result<(), Cl
 #[allow(clippy::too_many_lines)]
 fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailure> {
     match command {
+        SearchCommand::Consolidate {
+            collection,
+            durability,
+        } => {
+            let mut client = open_client(local)?;
+            let collection = object_id(collection)?;
+            let binding = client
+                .unmanaged_product_mut()?
+                .resolve_search_collection_binding(collection, native::logical_time_micros())?;
+            let mut receipts = Vec::new();
+            for vector in &binding.vectors {
+                let status = client
+                    .unmanaged_product_mut()?
+                    .administration()
+                    .ann_maintenance_status(vector.index)?;
+                // An index without deltas has nothing to consolidate, and the
+                // capture bound must stay inside the index's own delta limit.
+                if status.delta_records == 0 {
+                    receipts.push(json!({
+                        "target": vector.name,
+                        "consumed_delta_records": 0,
+                        "skipped": true,
+                    }));
+                    continue;
+                }
+                let max_delta_records = hyphae_native_runtime::MAX_ANN_DELTA_RECORDS
+                    .min(usize::try_from(status.lifecycle.delta_max_entries).unwrap_or(usize::MAX))
+                    .max(1);
+                let receipt = client
+                    .unmanaged_product_mut()?
+                    .administration()
+                    .consolidate_ann(hyphae_native_product::AnnConsolidationRequest {
+                        index: vector.index,
+                        max_vectors: hyphae_native_runtime::MAX_ANN_CONSOLIDATION_VECTORS,
+                        max_delta_records,
+                        durability: durability.into(),
+                    })?;
+                receipts.push(json!({
+                    "target": vector.name,
+                    "consumed_delta_records": receipt.consumed_delta_records,
+                    "effective_vector_count": receipt.effective_vector_count,
+                }));
+            }
+            print_json(&json!({
+                "schema": "hyphae-search-consolidation-v1",
+                "collection": collection.get().to_string(),
+                "consolidations": receipts,
+            }))
+        }
         SearchCommand::Provision {
             collection,
             durability,
@@ -3037,6 +3317,11 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             sort_json,
             facets_json,
             metrics_json,
+            fusion,
+            dedupe_field,
+            dedupe_first_k,
+            highlight_fragments,
+            highlight_bytes,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3099,9 +3384,77 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             .map(product_aggregation)
                             .collect::<Result<_, _>>()?,
                         limit,
+                        fusion: fusion.map(|method| match method {
+                            FusionMethodInput::WeightedScore => {
+                                hyphae_native_product::ProductFusionMethod::WeightedScore
+                            }
+                        }),
+                        parent_dedupe: match (dedupe_field, dedupe_first_k) {
+                            (Some(field), Some(first_k)) => {
+                                Some(hyphae_native_product::ProductParentDedupe { field, first_k })
+                            }
+                            _ => None,
+                        },
+                        rerank: None,
+                        highlight: highlight_fragments.map(|max_fragments| {
+                            hyphae_native_product::ProductHighlight {
+                                max_fragments,
+                                fragment_bytes: highlight_bytes,
+                            }
+                        }),
                     },
                 },
             )
+        }
+        SearchCommand::Chunk {
+            parent,
+            text,
+            file,
+            size,
+            overlap,
+            sentence,
+            sentence_max,
+        } => {
+            let source = match (text, file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => {
+                    std::fs::read_to_string(path).map_err(|_| CliFailure::invalid())?
+                }
+                _ => return Err(CliFailure::invalid()),
+            };
+            let mode = if sentence {
+                hyphae_native_product::chunker::ChunkerMode::SentenceBounded {
+                    target: size,
+                    maximum: sentence_max,
+                }
+            } else {
+                hyphae_native_product::chunker::ChunkerMode::FixedBytes { size, overlap }
+            };
+            let documents = hyphae_native_product::chunker::chunk_documents(
+                parent,
+                &source,
+                hyphae_native_product::chunker::ChunkerConfig { mode },
+            )
+            .map_err(|_| CliFailure::invalid())?;
+            let rendered = documents
+                .into_iter()
+                .map(|document| {
+                    json!({
+                        "id": document.object_id.get().to_string(),
+                        "text": document.text,
+                        "doc_values": document
+                            .doc_values
+                            .into_iter()
+                            .map(|(name, value)| (name, doc_value_json(value)))
+                            .collect::<serde_json::Map<_, _>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_json(&json!({
+                "schema": "hyphae-chunk-documents-v1",
+                "parent": parent.to_string(),
+                "documents": rendered,
+            }))
         }
         SearchCommand::Ingest {
             collection,
@@ -4205,7 +4558,7 @@ fn proof(command: ProofCommand) -> Result<(), CliFailure> {
             if proof_out == witness_out {
                 return Err(CliFailure::invalid());
             }
-            let operation = proof_operation(serde_json::from_str(&operation_json)?)?;
+            let operation = parse_proof_operation(&operation_json)?;
             let response = open_client(&local)?.dispatch(ProductOperation::Prove {
                 operation: Box::new(operation),
                 limits: NativeProofGenerationLimits::default(),
@@ -4293,6 +4646,27 @@ fn proof_operation(input: ProofOperationInput) -> Result<ProductOperation, CliFa
                 .collect::<Result<_, _>>()?,
         },
     })
+}
+
+/// Parses one proof operation document, admitting the search-collection
+/// shape next to the tagged catalog and SQL shapes.
+fn parse_proof_operation(operation_json: &str) -> Result<ProductOperation, CliFailure> {
+    let value: Value = serde_json::from_str(operation_json)?;
+    if value.get("operation").and_then(Value::as_str) == Some("search_collection") {
+        let Value::Object(mut object) = value else {
+            return Err(CliFailure::invalid());
+        };
+        object.remove("operation");
+        let input: mcp::CollectionSearchInput =
+            serde_json::from_value(Value::Object(object)).map_err(|_| CliFailure::invalid())?;
+        let collection = object_id(u128::from(input.collection))?;
+        return Ok(ProductOperation::SearchCollection {
+            collection,
+            request: mcp::collection_search_request(input)
+                .map_err(|error| CliFailure::from(*error))?,
+        });
+    }
+    proof_operation(serde_json::from_value(value)?)
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {
@@ -4494,6 +4868,7 @@ fn response_json(response: ProductResponse) -> Value {
                 "object_id": hit.object_id.get().to_string(),
                 "score": hit.score,
                 "doc_values": hit.doc_values.into_iter().map(|(name, value)| (name, doc_value_json(value))).collect::<serde_json::Map<_, _>>(),
+                "fragments": hit.fragments,
             })).collect::<Vec<_>>(),
             "facets": result.facets.into_iter().map(|facet| json!({
                 "field": facet.field,
@@ -5381,6 +5756,21 @@ fn product_search_filter(value: Value) -> Result<ProductSearchFilter, CliFailure
         "not" => ProductSearchFilter::Not(Box::new(product_search_filter(
             object.remove("filter").ok_or_else(CliFailure::invalid)?,
         )?)),
+        "in" => ProductSearchFilter::In {
+            field: take_string(&mut object, "field")?,
+            values: object
+                .remove("values")
+                .and_then(|value| value.as_array().cloned())
+                .ok_or_else(CliFailure::invalid)?
+                .into_iter()
+                .map(product_doc_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        "is_null" => ProductSearchFilter::IsNull(take_string(&mut object, "field")?),
+        "like" => ProductSearchFilter::Like {
+            field: take_string(&mut object, "field")?,
+            pattern: take_string(&mut object, "pattern")?,
+        },
         _ => return Err(CliFailure::invalid()),
     };
     if object.is_empty() {

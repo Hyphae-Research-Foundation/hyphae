@@ -185,7 +185,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 3) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 5) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +212,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 3,
+  maximumMinor = 5,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -230,6 +230,34 @@ export function encodeAuthenticatedHello(
   return authenticated;
 }
 
+/** Boolean, integer, string, and bytes doc values are minor-0 content;
+ * future typed values raise the requirement here. */
+function docValueRequiredMinor(_value: unknown): number {
+  return 0;
+}
+
+function filterRequiredMinor(value: unknown, depth = 0): number {
+  if (depth > 32 || typeof value !== "object" || value === null) return 0;
+  const filter = value as Readonly<Record<string, unknown>>;
+  if (filter.kind === "in" || filter.kind === "is_null" || filter.kind === "like") return 4;
+  // Every current filter kind and operator is minor-0 content; future
+  // operators and typed literals raise the requirement here.
+  if (filter.kind === "compare") return docValueRequiredMinor(filter.value);
+  if (filter.kind === "all" || filter.kind === "any") {
+    const children = Array.isArray(filter.filters) ? filter.filters : [];
+    return children.reduce((highest: number, child) => Math.max(highest, filterRequiredMinor(child, depth + 1)), 0);
+  }
+  if (filter.kind === "not") return filterRequiredMinor(filter.filter, depth + 1);
+  return 0;
+}
+
+function documentRequiredMinor(value: unknown): number {
+  if (typeof value !== "object" || value === null) return 0;
+  const docValues = (value as Readonly<Record<string, unknown>>).doc_values;
+  if (typeof docValues !== "object" || docValues === null) return 0;
+  return Object.values(docValues).reduce((highest: number, entry) => Math.max(highest, docValueRequiredMinor(entry)), 0);
+}
+
 export function operationRequiredMinor(operation: string, args: Readonly<Record<string, unknown>> = {}): number {
   if (operation === "proof_generate") {
     const nested = args.operation;
@@ -238,6 +266,18 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "search_collection") {
+    const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
+    const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
+    const highlighted = request.highlight !== undefined && request.highlight !== null;
+    return Math.max(highlighted ? 5 : 0, extended ? 4 : 0, filterRequiredMinor(request.filter));
+  }
+  if (operation === "search_ingest") {
+    const batch = (typeof args.batch === "object" && args.batch !== null ? args.batch : args) as Readonly<Record<string, unknown>>;
+    const documents = Array.isArray(batch.documents) ? batch.documents : [];
+    return documents.reduce((highest: number, document) => Math.max(highest, documentRequiredMinor(document)), 0);
+  }
+  if (operation === "search_document_update") return documentRequiredMinor(args.document);
   return 0;
 }
 
@@ -253,7 +293,7 @@ export function decodeWelcome(encoded: Uint8Array): Readonly<Record<string, numb
     throw new ClientError("native welcome is malformed");
   }
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 3 || view.getBigUint64(24, true) === 0n) {
+  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 4 || view.getBigUint64(24, true) === 0n) {
     throw new ClientError("native welcome values are invalid");
   }
   return {
@@ -1472,7 +1512,63 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     encodeFacets((request.facets ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     encodeAggregations((request.aggregations ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     u64(BigInt(request.limit as number)),
+    // Content-derived tagged sections in ascending tag order: an absent
+    // section is the default and keeps the exact historical bytes.
+    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
+    ...encodeParentDedupe(request.parent_dedupe),
+    ...encodeRerank(request.rerank),
+    ...encodeHighlight(request.highlight),
   );
+}
+
+function encodeHighlight(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const highlight = value as Readonly<Record<string, unknown>>;
+  const maxFragments = highlight.max_fragments;
+  const fragmentBytes = highlight.fragment_bytes;
+  if (typeof maxFragments !== "number" || !Number.isInteger(maxFragments) || maxFragments < 1 || maxFragments > 4
+    || typeof fragmentBytes !== "number" || !Number.isInteger(fragmentBytes) || fragmentBytes < 16 || fragmentBytes > 512) {
+    throw new ClientError("integrated highlight budget is invalid");
+  }
+  return [Uint8Array.of(4), u32(maxFragments), u32(fragmentBytes)];
+}
+
+function encodeRerank(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const rerank = value as Readonly<Record<string, unknown>>;
+  const attestation = rerank.attestation;
+  const scores = rerank.scores;
+  if (!(attestation instanceof Uint8Array) || attestation.byteLength === 0 || attestation.byteLength > 4096 || !Array.isArray(scores) || scores.length === 0 || scores.length > 256) {
+    throw new ClientError("integrated rerank stage is invalid");
+  }
+  const encodedScores = scores.map((entry) => {
+    const scored = entry as Readonly<Record<string, unknown>>;
+    if (typeof scored.object_id !== "bigint" && typeof scored.object_id !== "number") {
+      throw new ClientError("integrated rerank stage is invalid");
+    }
+    if (typeof scored.score !== "number") {
+      throw new ClientError("integrated rerank stage is invalid");
+    }
+    const encoded = new Uint8Array(24);
+    const view = new DataView(encoded.buffer);
+    const objectId = BigInt(scored.object_id as number | bigint);
+    view.setBigUint64(0, objectId & 0xffffffffffffffffn, true);
+    view.setBigUint64(8, objectId >> 64n, true);
+    view.setFloat64(16, scored.score, true);
+    return encoded;
+  });
+  return [Uint8Array.of(3), bytes(attestation), u32(scores.length), ...encodedScores];
+}
+
+function encodeParentDedupe(value: unknown): Uint8Array[] {
+  if (value === undefined || value === null) return [];
+  const dedupe = value as Readonly<Record<string, unknown>>;
+  const field = dedupe.field;
+  const firstK = dedupe.first_k;
+  if (typeof field !== "string" || field.length === 0 || typeof firstK !== "number" || !Number.isInteger(firstK) || firstK < 1 || firstK > 100) {
+    throw new ClientError("integrated parent dedupe is invalid");
+  }
+  return [Uint8Array.of(2), bytes(new TextEncoder().encode(field)), u32(firstK)];
 }
 
 function encodeIntegratedVector(vector: Readonly<Record<string, unknown>>): Uint8Array {
@@ -1541,6 +1637,17 @@ function encodeSearchFilter(filter: Readonly<Record<string, unknown>>, depth = 0
     return join(Uint8Array.of(filter.kind === "all" ? 3 : 4), u32(filters.length), ...filters.map((value) => encodeSearchFilter(value as Readonly<Record<string, unknown>>, depth + 1)));
   }
   if (filter.kind === "not") return join(Uint8Array.of(5), encodeSearchFilter(filter.filter as Readonly<Record<string, unknown>>, depth + 1));
+  if (filter.kind === "in") {
+    const members = filter.values;
+    if (!Array.isArray(members) || members.length < 1 || members.length > 256) {
+      throw new ClientError("integrated membership set is invalid");
+    }
+    return join(Uint8Array.of(6), bytes(new TextEncoder().encode(String(filter.field))), u32(members.length), ...members.map((value) => encodeDocValue(value)));
+  }
+  if (filter.kind === "is_null") return join(Uint8Array.of(7), bytes(new TextEncoder().encode(String(filter.field))));
+  if (filter.kind === "like") {
+    return join(Uint8Array.of(8), bytes(new TextEncoder().encode(String(filter.field))), bytes(new TextEncoder().encode(String(filter.pattern))));
+  }
   throw new ClientError("integrated filter kind is invalid");
 }
 
@@ -1809,8 +1916,26 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
   });
   const approximate = reader.boolean();
   reader.zeroes(7);
-  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments: reader.u64(), eligibleDocuments: reader.u64(),
-    lexicalCandidates: reader.u64(), retrievalCandidates: reader.u64(), matchedCandidates: reader.u64() };
+  const totalDocuments = reader.u64();
+  const eligibleDocuments = reader.u64();
+  const lexicalCandidates = reader.u64();
+  const retrievalCandidates = reader.u64();
+  const matchedCandidates = reader.u64();
+  if (reader.remaining > 0) {
+    // Content-derived response tail: per-hit highlight fragments.
+    if (reader.u8() !== 1) throw new ClientError("integrated response section is invalid");
+    for (const hit of hits) {
+      const fragmentCount = reader.u32();
+      if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
+      const fragments = Array.from({ length: fragmentCount }, () => reader.text());
+      if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
+        throw new ClientError("integrated highlight fragments are unbounded");
+      }
+      (hit as Record<string, unknown>).fragments = fragments;
+    }
+  }
+  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
+    lexicalCandidates, retrievalCandidates, matchedCandidates };
 }
 
 function encodeQualifiedName(raw: unknown): Uint8Array {

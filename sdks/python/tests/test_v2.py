@@ -178,6 +178,98 @@ class V2Tests(unittest.TestCase):
         )
         self.assertEqual(encoded, FIXTURE.read_bytes())
 
+    def test_attested_rerank_request_matches_the_cross_language_golden(self) -> None:
+        envelope = (
+            b"HYATTS01\x02"
+            + (6).to_bytes(2, "little")
+            + b"openai"
+            + (22).to_bytes(2, "little")
+            + b"text-embedding-3-small"
+            + bytes([3]) * 32
+            + bytes([4]) * 32
+        )
+        arguments = {
+            "collection": 13,
+            "request": {
+                "lexical": {"query": "rust", "candidate_limit": 4, "weight": 1},
+                "vectors": [],
+                "limit": 4,
+                "rerank": {
+                    "attestation": envelope,
+                    "scores": [
+                        {"object_id": 201, "score": 0.75},
+                        {"object_id": 202, "score": 0.25},
+                    ],
+                },
+            },
+        }
+        options = RequestOptions(logical_time_micros=10, durability="memory")
+        with self.assertRaises(ClientError):
+            encode_product_request(
+                "search_collection", arguments, options, negotiated_minor=3
+            )
+        encoded = encode_product_request(
+            "search_collection", arguments, options, negotiated_minor=4
+        )
+        # The same digest is pinned by the Rust protocol goldens and the
+        # TypeScript suite for this identically composed request.
+        self.assertEqual(
+            blake3(encoded).hex(),
+            "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
+        )
+
+    def test_highlighted_request_matches_the_cross_language_golden(self) -> None:
+        arguments = {
+            "collection": 13,
+            "request": {
+                "lexical": {"query": "rust", "candidate_limit": 4, "weight": 1},
+                "vectors": [],
+                "limit": 4,
+                "highlight": {"max_fragments": 2, "fragment_bytes": 64},
+            },
+        }
+        options = RequestOptions(logical_time_micros=10, durability="memory")
+        with self.assertRaises(ClientError):
+            encode_product_request(
+                "search_collection", arguments, options, negotiated_minor=4
+            )
+        encoded = encode_product_request(
+            "search_collection", arguments, options, negotiated_minor=5
+        )
+        # The same digest is pinned by the Rust protocol goldens and the
+        # TypeScript suite for this identically composed request.
+        self.assertEqual(
+            blake3(encoded).hex(),
+            "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443",
+        )
+
+    def test_integrated_search_response_decodes_with_and_without_fragments(self) -> None:
+        # Both payloads are Rust-encoded goldens for the same one-hit result;
+        # the second carries the minor-5 content-derived fragments tail.
+        plain = bytes.fromhex(
+            "4859505253503031bc0000001600000001010101010101010101010101010101"
+            "0101010101010101000000000000000003000000000000000404040404040404"
+            "0404040404040404040404040404040404040404040404040500000000000000"
+            "01000000c9000000000000000000000000000000000000000000f83f00000000"
+            "0000000000000000000000000000000000000000010000000000000001000000"
+            "00000000010000000000000001000000000000000100000000000000"
+        )
+        fragmented = bytes.fromhex(
+            "4859505253503031d20000001600000001010101010101010101010101010101"
+            "0101010101010101000000000000000003000000000000000404040404040404"
+            "0404040404040404040404040404040404040404040404040500000000000000"
+            "01000000c9000000000000000000000000000000000000000000f83f00000000"
+            "0000000000000000000000000000000000000000010000000000000001000000"
+            "0000000001000000000000000100000000000000010000000000000001010000"
+            "000d00000072757374206461746162617365"
+        )
+        for payload, fragments in ((plain, None), (fragmented, ["rust database"])):
+            response = decode_product_response(payload, None)
+            self.assertEqual(response.kind, "integrated_search")
+            hit = response.value["hits"][0]
+            self.assertEqual(hit["object_id"], 201)
+            self.assertEqual(hit.get("fragments"), fragments)
+
     def test_transaction_and_catalog_requests_round_trip(self) -> None:
         cases = (
             ("transaction_begin", {}),

@@ -1075,6 +1075,85 @@ pub fn decode_product_response_for_minor(
     Ok(response)
 }
 
+/// Lowest protocol minor whose codec admits this doc value.
+fn doc_value_required_minor(value: &ProductDocValue) -> u16 {
+    match value {
+        ProductDocValue::Boolean(_)
+        | ProductDocValue::Integer(_)
+        | ProductDocValue::String(_)
+        | ProductDocValue::Bytes(_) => 0,
+    }
+}
+
+/// Lowest protocol minor whose codec admits this comparison operator.
+fn operator_required_minor(operator: ProductSearchOperator) -> u16 {
+    match operator {
+        ProductSearchOperator::Equal
+        | ProductSearchOperator::NotEqual
+        | ProductSearchOperator::Less
+        | ProductSearchOperator::LessOrEqual
+        | ProductSearchOperator::Greater
+        | ProductSearchOperator::GreaterOrEqual => 0,
+    }
+}
+
+/// Lowest protocol minor whose codec admits every node of this filter.
+/// Depth is already bounded by the strict decoder before this walk runs.
+fn filter_required_minor(filter: &ProductSearchFilter) -> u16 {
+    match filter {
+        ProductSearchFilter::MatchAll | ProductSearchFilter::Exists(_) => 0,
+        ProductSearchFilter::Compare {
+            operator, value, ..
+        } => operator_required_minor(*operator).max(doc_value_required_minor(value)),
+        ProductSearchFilter::All(children) | ProductSearchFilter::Any(children) => children
+            .iter()
+            .map(filter_required_minor)
+            .max()
+            .unwrap_or(0),
+        ProductSearchFilter::Not(child) => filter_required_minor(child),
+        ProductSearchFilter::In { values, .. } => values
+            .iter()
+            .map(doc_value_required_minor)
+            .max()
+            .unwrap_or(0)
+            .max(4),
+        ProductSearchFilter::IsNull(_) | ProductSearchFilter::Like { .. } => 4,
+    }
+}
+
+/// Lowest protocol minor whose codec admits every doc value of this document.
+fn document_required_minor(document: &ProductDocument) -> u16 {
+    document
+        .doc_values
+        .values()
+        .map(doc_value_required_minor)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Lowest protocol minor whose codec admits every part of this search
+/// request. Future request content (fusion methods, new operators, new
+/// doc-value types) raises the requirement here rather than adding a new
+/// operation variant.
+fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
+    let fusion = match request.fusion {
+        None => 0,
+        Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => 4,
+    };
+    let dedupe = if request.parent_dedupe.is_some() {
+        4
+    } else {
+        0
+    };
+    let rerank = if request.rerank.is_some() { 4 } else { 0 };
+    let highlight = if request.highlight.is_some() { 5 } else { 0 };
+    filter_required_minor(&request.filter)
+        .max(fusion)
+        .max(dedupe)
+        .max(rerank)
+        .max(highlight)
+}
+
 fn ensure_operation_minor(
     operation: &ProductOperation,
     negotiated_minor: u16,
@@ -1111,6 +1190,18 @@ fn ensure_operation_minor(
         ProductOperation::Prove { operation, .. } => {
             return ensure_operation_minor(operation, negotiated_minor);
         }
+        ProductOperation::SearchCollection { request, .. } => {
+            search_request_required_minor(request)
+        }
+        ProductOperation::SearchIngest { batch, .. } => batch
+            .documents
+            .iter()
+            .map(document_required_minor)
+            .max()
+            .unwrap_or(0),
+        ProductOperation::SearchDocumentUpdate { update, .. } => {
+            document_required_minor(&update.document)
+        }
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1140,6 +1231,21 @@ fn ensure_response_minor(
         | ProductResponse::SecurityApiKeyActivated(_) => 3,
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
+        }
+        ProductResponse::IntegratedSearch(result) => {
+            let values = result
+                .hits
+                .iter()
+                .flat_map(|hit| hit.doc_values.values())
+                .map(doc_value_required_minor)
+                .max()
+                .unwrap_or(0);
+            let fragments = if result.hits.iter().any(|hit| !hit.fragments.is_empty()) {
+                5
+            } else {
+                0
+            };
+            values.max(fragments)
         }
         _ => 0,
     };
@@ -4746,6 +4852,7 @@ fn decode_query(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_search_collection(
     encoded: &mut Vec<u8>,
     collection: ObjectId,
@@ -4845,6 +4952,33 @@ fn encode_search_collection(
         }
     }
     put_u64(encoded, request.limit)?;
+    // Content-derived tagged sections in ascending tag order: an absent
+    // section is the default and keeps the exact historical bytes.
+    if let Some(fusion) = request.fusion {
+        encoded.push(1);
+        encoded.push(match fusion {
+            hyphae_native_product::ProductFusionMethod::WeightedScore => 1,
+        });
+    }
+    if let Some(dedupe) = &request.parent_dedupe {
+        encoded.push(2);
+        put_text(encoded, &dedupe.field)?;
+        put_u32(encoded, dedupe.first_k)?;
+    }
+    if let Some(stage) = &request.rerank {
+        encoded.push(3);
+        put_bytes(encoded, &stage.attestation)?;
+        put_u32(encoded, stage.scores.len())?;
+        for (object_id, score) in &stage.scores {
+            encoded.extend_from_slice(&object_id.get().to_le_bytes());
+            encoded.extend_from_slice(&score.to_le_bytes());
+        }
+    }
+    if let Some(highlight) = &request.highlight {
+        encoded.push(4);
+        put_u32(encoded, highlight.max_fragments)?;
+        put_u32(encoded, highlight.fragment_bytes)?;
+    }
     Ok(())
 }
 
@@ -4983,6 +5117,78 @@ fn decode_search_collection(
         aggregations.push(ProductNamedAggregation { name, aggregation });
     }
     let limit = decoder.usize()?;
+    let mut fusion = None;
+    let mut parent_dedupe = None;
+    let mut rerank = None;
+    let mut highlight = None;
+    let mut previous = 0_u8;
+    while decoder.has_remaining() {
+        let tag = decoder.u8()?;
+        if tag <= previous {
+            return Err(ProductCodecError::InvalidValue);
+        }
+        previous = tag;
+        match tag {
+            1 => {
+                fusion = Some(match decoder.u8()? {
+                    1 => hyphae_native_product::ProductFusionMethod::WeightedScore,
+                    _ => return Err(ProductCodecError::InvalidValue),
+                });
+            }
+            2 => {
+                let field = decoder.text()?;
+                let first_k = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_PARENT_DEDUPE_FIRST_K).contains(&first_k) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                parent_dedupe = Some(hyphae_native_product::ProductParentDedupe { field, first_k });
+            }
+            3 => {
+                let attestation = decoder.owned_bytes()?;
+                if hyphae_native_product::proof::attestation::ModelAttestation::decode(&attestation)
+                    .is_err()
+                {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                let count = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_RERANK_ENTRIES).contains(&count) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                let mut scores = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let object_id = ObjectId::new(decoder.u128()?)
+                        .map_err(|_| ProductCodecError::InvalidValue)?;
+                    let score = f64::from_le_bytes(
+                        decoder
+                            .bytes(8)?
+                            .try_into()
+                            .map_err(|_| ProductCodecError::Malformed)?,
+                    );
+                    scores.push((object_id, score));
+                }
+                rerank = Some(hyphae_native_product::ProductRerankStage {
+                    attestation,
+                    scores,
+                });
+            }
+            4 => {
+                let max_fragments = decoder.usize_u32()?;
+                let fragment_bytes = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS).contains(&max_fragments)
+                    || !(hyphae_native_product::MIN_HIGHLIGHT_FRAGMENT_BYTES
+                        ..=hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES)
+                        .contains(&fragment_bytes)
+                {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                highlight = Some(hyphae_native_product::ProductHighlight {
+                    max_fragments,
+                    fragment_bytes,
+                });
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
+        }
+    }
     Ok((
         collection,
         ProductSearchRequest {
@@ -4993,6 +5199,10 @@ fn decode_search_collection(
             facets,
             aggregations,
             limit,
+            fusion,
+            parent_dedupe,
+            rerank,
+            highlight,
         },
     ))
 }
@@ -5043,6 +5253,23 @@ fn encode_search_filter(
             encoded.push(5);
             encode_search_filter(encoded, filter, depth + 1)?;
         }
+        ProductSearchFilter::In { field, values } => {
+            encoded.push(6);
+            put_text(encoded, field)?;
+            put_u32(encoded, values.len())?;
+            for value in values {
+                encode_doc_value(encoded, value)?;
+            }
+        }
+        ProductSearchFilter::IsNull(field) => {
+            encoded.push(7);
+            put_text(encoded, field)?;
+        }
+        ProductSearchFilter::Like { field, pattern } => {
+            encoded.push(8);
+            put_text(encoded, field)?;
+            put_text(encoded, pattern)?;
+        }
     }
     Ok(())
 }
@@ -5090,6 +5317,23 @@ fn decode_search_filter(
             }
         }
         5 => ProductSearchFilter::Not(Box::new(decode_search_filter(decoder, depth + 1)?)),
+        6 => {
+            let field = decoder.text()?;
+            let count = decoder.usize_u32()?;
+            if count > hyphae_native_runtime::MAX_DOC_VALUE_IN_MEMBERS {
+                return Err(ProductCodecError::LimitExceeded);
+            }
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_doc_value(decoder)?);
+            }
+            ProductSearchFilter::In { field, values }
+        }
+        7 => ProductSearchFilter::IsNull(decoder.text()?),
+        8 => ProductSearchFilter::Like {
+            field: decoder.text()?,
+            pattern: decoder.text()?,
+        },
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -5332,6 +5576,18 @@ fn encode_integrated_search(
     ] {
         put_u64(encoded, count)?;
     }
+    // Content-derived tagged tail: a result without fragments keeps the
+    // exact historical bytes, and fragments only exist when the request
+    // carried a highlight budget — which minor gating already bounds.
+    if result.hits.iter().any(|hit| !hit.fragments.is_empty()) {
+        encoded.push(1);
+        for hit in &result.hits {
+            put_u32(encoded, hit.fragments.len())?;
+            for fragment in &hit.fragments {
+                put_text(encoded, fragment)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5370,6 +5626,7 @@ fn decode_integrated_search(
             object_id,
             score,
             doc_values,
+            fragments: Vec::new(),
         });
     }
     let facet_count = decoder.usize_u32()?;
@@ -5436,6 +5693,36 @@ fn decode_integrated_search(
     if decoder.bytes(7)? != [0; 7] {
         return Err(ProductCodecError::Malformed);
     }
+    let total_documents = decoder.usize()?;
+    let eligible_documents = decoder.usize()?;
+    let lexical_candidates = decoder.usize()?;
+    let retrieval_candidates = decoder.usize()?;
+    let matched_candidates = decoder.usize()?;
+    if decoder.has_remaining() {
+        if decoder.u8()? != 1 {
+            return Err(ProductCodecError::InvalidValue);
+        }
+        let mut any = false;
+        for hit in &mut hits {
+            let fragment_count = decoder.usize_u32()?;
+            if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
+                return Err(ProductCodecError::LimitExceeded);
+            }
+            let mut fragments = Vec::with_capacity(fragment_count);
+            for _ in 0..fragment_count {
+                let fragment = decoder.text()?;
+                if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
+                    return Err(ProductCodecError::LimitExceeded);
+                }
+                fragments.push(fragment);
+            }
+            any |= !fragments.is_empty();
+            hit.fragments = fragments;
+        }
+        if !any {
+            return Err(ProductCodecError::InvalidValue);
+        }
+    }
     Ok(ProductSearchResult {
         snapshot,
         hits,
@@ -5443,11 +5730,11 @@ fn decode_integrated_search(
         aggregations,
         vector_branches,
         approximate,
-        total_documents: decoder.usize()?,
-        eligible_documents: decoder.usize()?,
-        lexical_candidates: decoder.usize()?,
-        retrieval_candidates: decoder.usize()?,
-        matched_candidates: decoder.usize()?,
+        total_documents,
+        eligible_documents,
+        lexical_candidates,
+        retrieval_candidates,
+        matched_candidates,
     })
 }
 
@@ -6583,6 +6870,10 @@ struct Decoder<'a> {
 impl<'a> Decoder<'a> {
     const fn new(remaining: &'a [u8]) -> Self {
         Self { remaining }
+    }
+
+    const fn has_remaining(&self) -> bool {
+        !self.remaining.is_empty()
     }
 
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], ProductCodecError> {

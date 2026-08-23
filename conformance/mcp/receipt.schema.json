@@ -47,8 +47,8 @@
     "mcp_config_sha256": {"$ref": "#/$defs/sha256"},
     "installed_mcp_config_sha256": {"$ref": "#/$defs/sha256"},
     "corpus_sha256": {"$ref": "#/$defs/sha256"},
-    "tool_schema_version": {"const": "hyphae-native-mcp-tools-v2"},
-    "tools": {"const": ["hyphae_native_capabilities", "hyphae_native_security_status", "hyphae_native_security_principals"]},
+    "tool_schema_version": {"const": "hyphae-native-mcp-tools-v4"},
+    "tools": {"const": ["hyphae_native_capabilities", "hyphae_native_security_status", "hyphae_native_security_principals", "hyphae_native_search_lexical", "hyphae_native_search_collection", "hyphae_native_prove_search", "hyphae_native_verify_proof"]},
     "cases": {"const": ["capabilities-read", "security-status-read", "principal-page-read", "prompt-authority-rejected"]},
     "transcript_sha256": {"$ref": "#/$defs/sha256"}
   },

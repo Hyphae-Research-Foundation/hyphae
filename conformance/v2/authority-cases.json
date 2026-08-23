@@ -243,7 +243,7 @@
         "assert_security_reads",
         "run_live_conformance"
       ],
-      "command": "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae --fixture-binary target/debug/hyphae-v2-fixture --wheel dist/hyphae_sdk-1.2.2-py3-none-any.whl --output python-managed-v2-conformance.json",
+      "command": "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae --fixture-binary target/debug/hyphae-v2-fixture --wheel dist/hyphae_sdk-2.0.0-py3-none-any.whl --output python-managed-v2-conformance.json",
       "covers": [
         "digests.request",
         "pagination.audit",
@@ -558,7 +558,7 @@
   },
   "protocol": {
     "current_major": 1,
-    "current_minor": 3,
+    "current_minor": 5,
     "rejections_before_dispatch": [
       {
         "case": "minor-0-read",

@@ -32,7 +32,7 @@ pub const fn capabilities() -> ProductCapabilities {
     ProductCapabilities {
         product_api_version: 1,
         native_directory_format: 1,
-        logical_catalog_codec_version: 2,
+        logical_catalog_codec_version: 3,
         catalog_tree_format_version: 7,
         max_catalog_items: hyphae_native_runtime::MAX_CATALOG_READ_ITEMS,
         max_catalog_visits: hyphae_native_runtime::MAX_CATALOG_READ_VISITS,

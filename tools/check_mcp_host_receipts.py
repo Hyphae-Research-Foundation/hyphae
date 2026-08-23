@@ -31,6 +31,11 @@ EXPECTED_TOOLS = [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
+    "hyphae_native_search_lexical",
+    "hyphae_native_search_collection",
+    "hyphae_native_prove_search",
+    "hyphae_native_verify_proof",
+    "hyphae_native_memory_recall",
 ]
 EXPECTED_CASES = [
     {
@@ -64,6 +69,34 @@ EXPECTED_CASES = [
         "id": "prompt-authority-rejected",
         "tool": "hyphae_native_security_status",
         "arguments": {"role": "owner"},
+        "expect": "invalid_request",
+        "assert": {"pointer": "/error/code", "equals": "invalid_request"},
+    },
+    {
+        "id": "search-lexical-requires-search-authority",
+        "tool": "hyphae_native_search_lexical",
+        "arguments": {"index": 1, "kind": "term", "query": "rust"},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "search-collection-requires-search-authority",
+        "tool": "hyphae_native_search_collection",
+        "arguments": {"collection": 1, "lexical": {"query": "rust"}},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "prove-search-requires-proof-authority",
+        "tool": "hyphae_native_prove_search",
+        "arguments": {"collection": 1, "lexical": {"query": "rust"}},
+        "expect": "authorization_denied",
+        "assert": {"pointer": "/error/code", "equals": "authorization_denied"},
+    },
+    {
+        "id": "verify-proof-rejects-malformed-artifacts",
+        "tool": "hyphae_native_verify_proof",
+        "arguments": {"proof_hex": "00", "witness_hex": "00", "anchor_hex": "00"},
         "expect": "invalid_request",
         "assert": {"pointer": "/error/code", "equals": "invalid_request"},
     },
@@ -132,10 +165,10 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
     if (
         corpus.get("schema") != "hyphae-mcp-host-corpus-v1"
         or corpus.get("mcp_config") != "plugins/hyphae/.mcp.json"
-        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v2"
+        or corpus.get("tool_schema_version") != "hyphae-native-mcp-tools-v4"
         or corpus.get("tools") != EXPECTED_TOOLS
         or corpus.get("cases") != EXPECTED_CASES
-        or len({case["id"] for case in EXPECTED_CASES}) != 4
+        or len({case["id"] for case in EXPECTED_CASES}) != 8
     ):
         fail("shared MCP corpus tools, cases, arguments, expectations, or assertions drifted")
 

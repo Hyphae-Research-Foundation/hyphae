@@ -16,10 +16,12 @@ mod backup;
 mod cancellation;
 mod capabilities;
 mod catalog;
+pub mod chunker;
 mod default_scalar_keyspace;
 mod doctor;
 pub mod error;
 pub mod error_codec;
+mod lexical_analyzer;
 mod limits;
 mod operation;
 /// Canonical, bounded native proof and directory-witness artifacts.
@@ -259,6 +261,23 @@ impl ProductSnapshot {
         } else {
             self.inner.ttl(key).into()
         }
+    }
+
+    /// Returns visible internal scalar keys inside `[start, end)`, ascending,
+    /// or `None` fail-closed above `limit`. Both bounds must carry the
+    /// reserved internal prefix; anything else returns no keys.
+    pub(crate) fn structure_keys_in_range_internal(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !start.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+            || !end.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+        {
+            return Some(Vec::new());
+        }
+        self.inner.structure_keys_in_range(start, end, limit)
     }
 
     pub(crate) fn structure_get_internal(&self, key: &[u8]) -> Option<&[u8]> {
@@ -695,6 +714,132 @@ impl NativeProduct {
             }
         }
         Ok(true)
+    }
+
+    /// Creates catalogued binary structure keyspaces for an external
+    /// migration import, allocating stable identities inside one strict
+    /// atomic commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a product, catalog, or durability error when the keyspaces
+    /// cannot be created.
+    pub fn migration_create_structure_keyspaces(
+        &mut self,
+        keyspaces: &[(String, StructureKind)],
+    ) -> Result<Vec<(String, ObjectId)>, ProductError> {
+        use hyphae_native_catalog::{
+            CatalogObjectV2, DefinitionVersion, KeyspaceDefinition, KeyspaceEvictionPolicy,
+            KeyspaceMemoryClass, KeyspaceTtlPolicy, ObjectHeaderV2, StructureOwnership,
+        };
+        use hyphae_native_types::{EngineKind, LogicalType};
+        if keyspaces.is_empty() || keyspaces.len() > MAX_PRODUCT_TRANSACTION_OPERATIONS {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let invalid = || ProductError::from_code(ProductErrorCode::InvalidRequest);
+        let qualified = |object: &str| -> Result<QualifiedName, ProductError> {
+            Ok(QualifiedName::new(
+                CatalogName::unquoted("main").map_err(|_| invalid())?,
+                CatalogName::unquoted("public").map_err(|_| invalid())?,
+                CatalogName::unquoted(object).map_err(|_| invalid())?,
+            ))
+        };
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        let database = transaction.next_catalog_object_id()?;
+        transaction.create_catalog_object_v2(LogicalCatalogObject::V2(
+            CatalogObjectV2::Database(ObjectHeaderV2 {
+                id: database,
+                owner: EngineKind::Kernel,
+                name: qualified("database")?,
+                parent: None,
+                definition_version: DefinitionVersion::FIRST,
+            }),
+        ))?;
+        let schema = transaction.next_catalog_object_id()?;
+        transaction.create_catalog_object_v2(LogicalCatalogObject::V2(CatalogObjectV2::Schema(
+            ObjectHeaderV2 {
+                id: schema,
+                owner: EngineKind::Kernel,
+                name: qualified("schema")?,
+                parent: Some(database),
+                definition_version: DefinitionVersion::FIRST,
+            },
+        )))?;
+        let mut created = Vec::with_capacity(keyspaces.len());
+        for (name, kind) in keyspaces {
+            let id = transaction.next_catalog_object_id()?;
+            transaction.create_catalog_object_v2(LogicalCatalogObject::V2(
+                CatalogObjectV2::Keyspace(KeyspaceDefinition {
+                    header: ObjectHeaderV2 {
+                        id,
+                        owner: EngineKind::Structure,
+                        name: qualified(name)?,
+                        parent: Some(schema),
+                        definition_version: DefinitionVersion::FIRST,
+                    },
+                    kind: *kind,
+                    key_type: LogicalType::Binary,
+                    value_type: LogicalType::Binary,
+                    ownership: StructureOwnership::Canonical,
+                    ttl_policy: KeyspaceTtlPolicy::PerValue,
+                    default_ttl_millis: None,
+                    memory_class: KeyspaceMemoryClass::Durable,
+                    eviction: KeyspaceEvictionPolicy::None,
+                    relation_schema: None,
+                }),
+            ))?;
+            created.push((name.clone(), id));
+        }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(created)
+    }
+
+    /// Applies one bounded ordered batch of structure mutations under one
+    /// strict native commit for an external migration import.
+    ///
+    /// # Errors
+    ///
+    /// Returns a product, validation, or durability error when the batch
+    /// cannot be applied.
+    pub fn migration_store_structures(
+        &mut self,
+        mutations: Vec<ProductStructureMutation>,
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if mutations.is_empty() {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        if mutations.len() > MAX_PRODUCT_TRANSACTION_OPERATIONS {
+            return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        for mutation in mutations {
+            operation::apply_structure_mutation(&mut transaction, mutation)?;
+        }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Evaluates one bounded ordered batch of structure reads at one
+    /// immutable snapshot pinned to the supplied logical time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a product or snapshot error when any read cannot run.
+    pub fn migration_read_structures(
+        &self,
+        logical_time_micros: i64,
+        requests: Vec<ProductStructureReadRequest>,
+    ) -> Result<Vec<ProductStructureReadResult>, ProductError> {
+        if requests.is_empty() || requests.len() > MAX_PRODUCT_TRANSACTION_OPERATIONS {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let snapshot = self.snapshot_bounded(logical_time_micros)?;
+        requests
+            .into_iter()
+            .map(|request| operation::read_structure(&snapshot, request))
+            .collect()
     }
 
     /// Returns admitted product, catalog-format, and hard-limit capabilities.

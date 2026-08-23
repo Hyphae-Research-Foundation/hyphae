@@ -30,7 +30,10 @@ from .protocol import (
 
 PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1"
 ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1"
-PROTOCOL_MINOR = "3"
+PROTOCOL_MINOR = "5"
+# Every protocol minor this build speaks, ascending. The request offers the
+# whole set and the server echoes its selection, which must be a member.
+PROTOCOL_MINORS_SUPPORTED = (3, 4, 5)
 _STANDARD_HTTP_CONNECTION = http.client.HTTPConnection
 _STANDARD_HTTPS_CONNECTION = http.client.HTTPSConnection
 _CONNECT_PENDING = {
@@ -201,7 +204,9 @@ class HttpTransport:
             "Accept": f"{PRODUCT_MEDIA_TYPE}, {ERROR_MEDIA_TYPE}",
             "Content-Type": PRODUCT_MEDIA_TYPE,
             "Content-Length": str(len(body)),
-            "X-Hyphae-Protocol-Minor": PROTOCOL_MINOR,
+            "X-Hyphae-Protocol-Minor": ",".join(
+                str(minor) for minor in PROTOCOL_MINORS_SUPPORTED
+            ),
             "X-Hyphae-Request-Id": str(request_id),
         }
         if options.deadline_micros is not None:
@@ -282,8 +287,15 @@ class HttpTransport:
             selected_minor = response.getheader("X-Hyphae-Protocol-Minor")
             response_request_id = response.getheader("X-Hyphae-Request-Id")
             session_id = response.getheader("X-Hyphae-Session-Id")
-            if selected_minor != PROTOCOL_MINOR:
+            if (
+                selected_minor is None
+                or not selected_minor.isascii()
+                or not selected_minor.isdigit()
+                or len(selected_minor) > 3
+                or int(selected_minor) not in PROTOCOL_MINORS_SUPPORTED
+            ):
                 raise ClientError("HTTP v2 protocol minor is missing or unsupported")
+            negotiated_minor = int(selected_minor)
             if response_request_id != str(request_id):
                 raise ClientError("HTTP v2 response request ID mismatch")
             if session_id is not None and (
@@ -341,7 +353,7 @@ class HttpTransport:
                         "HTTP v2 returned an unexpected status or media type"
                     )
                 return decode_product_response(
-                    encoded, request_id, negotiated_minor=int(PROTOCOL_MINOR)
+                    encoded, request_id, negotiated_minor=negotiated_minor
                 )
             if media_type == ERROR_MEDIA_TYPE:
                 raise ProductError(

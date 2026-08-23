@@ -5,6 +5,46 @@ host application behaves exactly as before. The Rust adapter is published as
 `hyphae-pliegors`; the JavaScript adapters remain source packages in this
 repository until they receive an independent registry release.
 
+## LangChain
+
+```python
+from hyphae_sdk.v2 import HyphaeClient
+from hyphae_sdk.langchain import HyphaeVectorStore
+
+with HyphaeClient.local("/run/hyphae.sock") as client:
+    store = HyphaeVectorStore(client, 13, embeddings, prove=True)
+    store.add_texts(["deterministic retrieval"], metadatas=[{"kind": "engine"}])
+    documents = store.similarity_search("retrieval", k=4)
+```
+
+The store needs the `langchain` extra (`pip install 'hyphae-sdk[langchain]'`).
+Documents ingest under content-derived BLAKE3 identities, queries run as
+hybrid retrieval by default, and with `prove=True` every returned document
+carries the sealed proof's digest in its metadata while `store.last_proof`
+holds the artifacts for offline verification with `hyphae proof verify`.
+Metadata keys listed in `metadata_fields` are persisted as typed doc-values
+(the collection schema must declare them); everything else stays
+adapter-side.
+
+## LlamaIndex
+
+```python
+from hyphae_sdk.v2 import HyphaeClient
+from hyphae_sdk.llamaindex import HyphaeLlamaVectorStore
+
+with HyphaeClient.local("/run/hyphae.sock") as client:
+    store = HyphaeLlamaVectorStore(client, 13, prove=True)
+    store.add(embedded_nodes)
+    result = store.query(vector_store_query)
+```
+
+The store needs the `llamaindex` extra (`pip install 'hyphae-sdk[llamaindex]'`)
+and mirrors the LangChain adapter: content-derived identities, hybrid
+retrieval whenever the query carries text, opted-in `metadata_fields` as
+typed doc-values, and `prove=True` sealing the proof digest into node
+metadata with `store.last_proof` retaining the artifacts for
+`hyphae proof verify`.
+
 ## PliegoRS boundary
 
 Add `hyphae-pliegors` only in an application that wants remote Hyphae access.

@@ -148,7 +148,7 @@ class SecurityProtocolTests(unittest.TestCase):
 
         self.assertEqual(struct.unpack_from("<H", legacy, 18)[0], 0)
         self.assertEqual(legacy[:18], current[:18])
-        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 3)
+        self.assertEqual(struct.unpack_from("<H", current, 18)[0], 5)
         self.assertEqual(authenticated[49], 1)
         self.assertEqual(struct.unpack_from("<H", authenticated, 50)[0], 102)
         self.assertEqual(struct.unpack_from("<Q", authenticated, 20)[0], 0xFF)
@@ -287,6 +287,62 @@ class SecurityProtocolTests(unittest.TestCase):
         }
         self.assertTrue(all(operation_required_minor(operation) == 3 for operation in lifecycle))
         self.assertEqual(operation_required_minor("security_legacy_bearer_revoke"), 3)
+        # Every currently expressible search body is minor-0 content; the
+        # content walk exists so future operators, typed doc values, and
+        # fusion methods raise the requirement without new operations.
+        self.assertEqual(
+            operation_required_minor(
+                "search_collection",
+                {
+                    "filter": {
+                        "kind": "not",
+                        "filter": {
+                            "kind": "all",
+                            "filters": [
+                                {"kind": "match_all"},
+                                {
+                                    "kind": "compare",
+                                    "field": "price",
+                                    "operator": "less_or_equal",
+                                    "value": 40,
+                                },
+                            ],
+                        },
+                    }
+                },
+            ),
+            0,
+        )
+        self.assertEqual(
+            operation_required_minor(
+                "search_ingest",
+                {
+                    "documents": [
+                        {
+                            "object_id": 1,
+                            "text": "rust",
+                            "doc_values": {
+                                "flag": True,
+                                "rank": 3,
+                                "name": "a",
+                                "blob": b"x",
+                            },
+                        }
+                    ]
+                },
+            ),
+            0,
+        )
+        self.assertEqual(
+            operation_required_minor(
+                "proof_generate",
+                {
+                    "operation": "search_collection",
+                    "arguments": {"filter": {"kind": "match_all"}},
+                },
+            ),
+            0,
+        )
         memory_revoke = bytearray(
             encode_product_request(
                 "security_legacy_bearer_revoke",
@@ -632,7 +688,7 @@ class ManagedHttpTests(unittest.TestCase):
                         RequestOptions(request_id=100 + offset, idempotency_token=100 + offset),
                     )
                 self.assertEqual(_HttpConnection.path, "/v2/security/keys")
-                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3")
+                self.assertEqual(_HttpConnection.headers["X-Hyphae-Protocol-Minor"], "3,4,5")
 
 
 @unittest.skipIf(os.name == "nt", "AF_UNIX live parity runs on POSIX")

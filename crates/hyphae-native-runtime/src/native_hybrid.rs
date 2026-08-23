@@ -448,6 +448,7 @@ impl NativeLexicalReadView {
                     f64::from(term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
+                    crate::model::Bm25ScoreParameters::default(),
                 );
                 live = live
                     .checked_add(1)
@@ -612,6 +613,7 @@ impl NativeFilteredLexicalReadView {
                     f64::from(term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
+                    crate::model::Bm25ScoreParameters::default(),
                 );
             }
         }

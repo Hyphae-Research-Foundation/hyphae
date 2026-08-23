@@ -11,7 +11,15 @@ const DEFAULT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const PRODUCT_MEDIA_TYPE: &str = hyphae_contracts::v2::PRODUCT_MEDIA_TYPE_V2;
 const ERROR_MEDIA_TYPE: &str = hyphae_contracts::v2::PRODUCT_ERROR_MEDIA_TYPE_V2;
-const PROTOCOL_MINOR_VALUE: &str = hyphae_contracts::v2::PROTOCOL_MINOR_VALUE_V2;
+
+/// Comma-joined ascending offer of every protocol minor this build speaks.
+fn offered_protocol_minors() -> String {
+    hyphae_contracts::v2::PROTOCOL_MINORS_SUPPORTED_V2
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Binary product-envelope HTTP `/v2` transport.
 #[derive(Clone, Debug)]
@@ -134,7 +142,7 @@ impl HttpTransport {
             )
             .header(
                 hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
-                PROTOCOL_MINOR_VALUE,
+                offered_protocol_minors(),
             )
             .body(encoded);
         if let Some(session_id) = self.session_id.lock().await.clone() {
@@ -177,18 +185,25 @@ impl HttpTransport {
                 return Err(product_error(ProductErrorCode::Cancelled, request_id));
             }
         };
-        let selected_minor = response
+        let selected_headers = response
             .headers()
             .get_all(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2)
             .iter()
             .collect::<Vec<_>>();
-        if selected_minor.len() != 1
-            || selected_minor[0].as_bytes() != PROTOCOL_MINOR_VALUE.as_bytes()
-        {
+        let selected_minor = if selected_headers.len() == 1 {
+            selected_headers[0]
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|minor| hyphae_contracts::v2::PROTOCOL_MINORS_SUPPORTED_V2.contains(minor))
+        } else {
+            None
+        };
+        let Some(selected_minor) = selected_minor else {
             return Err(ClientError::Http(
                 "HTTP v2 protocol minor is missing or unsupported".to_owned(),
             ));
-        }
+        };
         let status = response.status();
         if one_time_secret && status.is_success() {
             let cache_control = response
@@ -273,11 +288,8 @@ impl HttpTransport {
                 "HTTP v2 returned an unexpected status or media type".to_owned(),
             ));
         }
-        hyphae_native_protocol::decode_product_response_for_minor(
-            &encoded,
-            hyphae_native_protocol::PROTOCOL_MINOR,
-        )
-        .map_err(|error| ClientError::Protocol(error.to_string()))
+        hyphae_native_protocol::decode_product_response_for_minor(&encoded, selected_minor)
+            .map_err(|error| ClientError::Protocol(error.to_string()))
     }
 }
 
@@ -544,7 +556,7 @@ mod tests {
                 let mut request = vec![0; 8 * 1024];
                 let length = stream.read(&mut request).await.expect("read HTTP request");
                 let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
-                assert!(request.contains("x-hyphae-protocol-minor: 3\r\n"));
+                assert!(request.contains("x-hyphae-protocol-minor: 3,4,5\r\n"));
                 let minor = selected_minor.map_or_else(String::new, |minor| {
                     format!("X-Hyphae-Protocol-Minor: {minor}\r\n")
                 });

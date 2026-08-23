@@ -14,7 +14,7 @@ from .models import ClientError, ProductErrorFields, RequestOptions, Response, S
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 3
+PROTOCOL_MINOR = 5
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -368,12 +368,62 @@ def decode_welcome(encoded: bytes) -> dict[str, int]:
     }
 
 
+def _doc_value_required_minor(value: Any) -> int:
+    # Boolean, integer, string, and bytes doc values are minor-0 content;
+    # future typed values raise the requirement here.
+    del value
+    return 0
+
+
+def _filter_required_minor(value: Any, depth: int = 0) -> int:
+    if depth > 32 or not isinstance(value, dict):
+        return 0
+    kind = value.get("kind")
+    if kind in {"in", "is_null", "like"}:
+        return 4
+    if kind == "compare":
+        # Every current operator is minor-0 content; future operators and
+        # typed literals raise the requirement here.
+        return _doc_value_required_minor(value.get("value"))
+    if kind in {"all", "any"}:
+        children = value.get("filters", [])
+        if not isinstance(children, list):
+            return 0
+        return max(
+            (_filter_required_minor(child, depth + 1) for child in children),
+            default=0,
+        )
+    if kind == "not":
+        return _filter_required_minor(value.get("filter"), depth + 1)
+    return 0
+
+
+def _document_required_minor(document: Any) -> int:
+    if not isinstance(document, dict):
+        return 0
+    doc_values = document.get("doc_values", {})
+    if not isinstance(doc_values, dict):
+        return 0
+    return max(
+        (_doc_value_required_minor(value) for value in doc_values.values()),
+        default=0,
+    )
+
+
 def operation_required_minor(
     operation: str, arguments: dict[str, Any] | None = None
 ) -> int:
     if operation == "proof_generate" and arguments is not None:
         nested = arguments.get("operation")
-        return operation_required_minor(nested) if isinstance(nested, str) else 0
+        nested_arguments = arguments.get("arguments")
+        return (
+            operation_required_minor(
+                nested,
+                nested_arguments if isinstance(nested_arguments, dict) else None,
+            )
+            if isinstance(nested, str)
+            else 0
+        )
     if operation in API_KEY_LIFECYCLE_OPERATIONS:
         return 3
     if operation in SECURITY_WRITE_OPERATIONS:
@@ -382,6 +432,35 @@ def operation_required_minor(
         return 3
     if operation in SECURITY_READ_OPERATIONS:
         return 1
+    if arguments is not None:
+        if operation == "search_collection":
+            request = arguments.get("request", arguments)
+            extended = isinstance(request, dict) and (
+                request.get("fusion") is not None
+                or request.get("parent_dedupe") is not None
+                or request.get("rerank") is not None
+            )
+            fusion = 4 if extended else 0
+            highlight = (
+                5
+                if isinstance(request, dict) and request.get("highlight") is not None
+                else 0
+            )
+            filter_minor = _filter_required_minor(
+                request.get("filter") if isinstance(request, dict) else None
+            )
+            return max(fusion, highlight, filter_minor)
+        if operation == "search_ingest":
+            batch = arguments.get("batch", arguments)
+            documents = batch.get("documents", []) if isinstance(batch, dict) else []
+            if not isinstance(documents, list):
+                return 0
+            return max(
+                (_document_required_minor(document) for document in documents),
+                default=0,
+            )
+        if operation == "search_document_update":
+            return _document_required_minor(arguments.get("document"))
     return 0
 
 
@@ -2114,6 +2193,61 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
         else:
             raise ClientError("integrated aggregation is invalid")
     output.extend(struct.pack("<Q", request["limit"]))
+    # The default fusion keeps the exact historical bytes; the weighted-score
+    # selector appends one byte and requires protocol minor 4.
+    fusion = request.get("fusion")
+    if fusion == "weighted_score":
+        output.append(1)
+        output.append(1)
+    elif fusion is not None:
+        raise ClientError("integrated fusion method is invalid")
+    dedupe = request.get("parent_dedupe")
+    if dedupe is not None:
+        if (
+            not isinstance(dedupe, dict)
+            or not isinstance(dedupe.get("field"), str)
+            or not dedupe["field"]
+            or not isinstance(dedupe.get("first_k"), int)
+            or not 1 <= dedupe["first_k"] <= 100
+        ):
+            raise ClientError("integrated parent dedupe is invalid")
+        output.append(2)
+        output.extend(_text(dedupe["field"]))
+        output.extend(struct.pack("<I", dedupe["first_k"]))
+    rerank = request.get("rerank")
+    if rerank is not None:
+        if (
+            not isinstance(rerank, dict)
+            or not isinstance(rerank.get("attestation"), bytes)
+            or not 1 <= len(rerank["attestation"]) <= 4096
+            or not isinstance(rerank.get("scores"), list)
+            or not 1 <= len(rerank["scores"]) <= 256
+        ):
+            raise ClientError("integrated rerank stage is invalid")
+        output.append(3)
+        output.extend(_bytes(rerank["attestation"]))
+        output.extend(struct.pack("<I", len(rerank["scores"])))
+        for entry in rerank["scores"]:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("object_id"), int)
+                or not isinstance(entry.get("score"), (int, float))
+            ):
+                raise ClientError("integrated rerank stage is invalid")
+            output.extend(int(entry["object_id"]).to_bytes(16, "little"))
+            output.extend(struct.pack("<d", float(entry["score"])))
+    highlight = request.get("highlight")
+    if highlight is not None:
+        if (
+            not isinstance(highlight, dict)
+            or not isinstance(highlight.get("max_fragments"), int)
+            or not 1 <= highlight["max_fragments"] <= 4
+            or not isinstance(highlight.get("fragment_bytes"), int)
+            or not 16 <= highlight["fragment_bytes"] <= 512
+        ):
+            raise ClientError("integrated highlight budget is invalid")
+        output.append(4)
+        output.extend(struct.pack("<II", highlight["max_fragments"], highlight["fragment_bytes"]))
     return bytes(output)
 
 
@@ -2191,6 +2325,15 @@ def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
     approximate = reader.boolean()
     reader.zeroes(7)
     counts = [reader.u64() for _ in range(5)]
+    if reader.remaining > 0:
+        # Content-derived response tail: per-hit highlight fragments.
+        if reader.u8() != 1:
+            raise ClientError("integrated response section is invalid")
+        for hit in hits:
+            fragments = [reader.text() for _ in range(reader.u32())]
+            if len(fragments) > 4 or any(len(f.encode("utf-8")) > 512 for f in fragments):
+                raise ClientError("integrated highlight fragments are unbounded")
+            hit["fragments"] = fragments
     return {
         "snapshot": snapshot,
         "hits": hits,
@@ -2228,6 +2371,20 @@ def _encode_search_filter(value: Any, depth: int = 0) -> bytes:
         )
     if kind == "not":
         return b"\x05" + _encode_search_filter(value["filter"], depth + 1)
+    if kind == "in":
+        members = value.get("values", [])
+        if not isinstance(members, list) or not 1 <= len(members) <= 256:
+            raise ClientError("integrated membership set is invalid")
+        return (
+            b"\x06"
+            + _text(value["field"])
+            + struct.pack("<I", len(members))
+            + b"".join(_encode_doc_value(member) for member in members)
+        )
+    if kind == "is_null":
+        return b"\x07" + _text(value["field"])
+    if kind == "like":
+        return b"\x08" + _text(value["field"]) + _text(value["pattern"])
     raise ClientError("integrated filter kind is invalid")
 
 

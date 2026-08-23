@@ -1,7 +1,7 @@
 # Hyphae usage manual
 
-Status: current for the published `1.2.2` release. Every command, request
-shape, and output in this manual was executed against the released `1.2.2`
+Status: current for the published `2.0.0` release. Every command, request
+shape, and output in this manual was executed against the released `2.0.0`
 binary; outputs are literal, trimmed only where marked. The normative
 semantics remain in the versioned specifications under
 [`docs/native/`](native/local-product-v1.md) and the contracts under
@@ -41,7 +41,7 @@ or LLM.
 From crates.io:
 
 ```bash
-cargo install hyphae-cli --version 1.2.2 --locked
+cargo install hyphae-cli --version 2.0.0 --locked
 hyphae version --json
 ```
 
@@ -49,19 +49,19 @@ hyphae version --json
 {
   "api_version": "v1",
   "disk_format_version": 2,
-  "engine_version": "1.2.2",
+  "engine_version": "2.0.0",
   "native_directory_format": 1,
   "product": "hyphae",
   "product_api_version": 1
 }
 ```
 
-The [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v1.2.2)
+The [GitHub release](https://github.com/celiumsai/hyphae/releases/tag/v2.0.0)
 ships signed archives for Linux x64, macOS x64/arm64, and Windows x64, each
 with SHA-256 checksums, SPDX/CycloneDX SBOMs, SLSA provenance, and Sigstore
 bundles; verify before installing. To embed, depend on exact versions:
-`hyphae-native-product = "=1.2.2"` for new applications, or
-`hyphae-engine = "=1.2.2"` for existing format-2 state. Client SDKs are
+`hyphae-native-product = "=2.0.0"` for new applications, or
+`hyphae-engine = "=2.0.0"` for existing format-2 state. Client SDKs are
 `hyphae-sdk` (Python 3.11+, standard library only) and `@hyphae_/hyphae`
 (Node 20+, ESM, no runtime dependencies).
 
@@ -654,6 +654,55 @@ hyphae migrate promote  --source ./old --target ./new --manifest plan.json
 The importer never mutates the source, verifies logical SQL/structure/
 search equivalence, and nothing activates without an explicit `promote`.
 
+### Migrating a Valkey/Redis RDB file
+
+The same pending/verify/promote machinery imports one offline RDB dump
+(versions 8-12) with `--source-kind valkey-rdb`. Inspection classifies every
+construct the file carries into four fidelity classes — `exact`,
+`equivalent`, `declared-degraded`, `rejected` — and lists the waivers a run
+would require:
+
+```bash
+hyphae migrate inspect --source ./dump.rdb --source-kind valkey-rdb
+# ... "required_waivers": ["stream-consumer-groups", "streams"], ...
+```
+
+A run fails closed while any degraded or rejected construct present in the
+file is unwaived. Each `--waive` names one construct and is recorded in the
+receipt as an explicit operator decision:
+
+```bash
+hyphae migrate run --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb --waive streams --waive stream-consumer-groups
+hyphae migrate verify  --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb
+hyphae migrate promote --source ./dump.rdb --target ./new --manifest receipt.json \
+  --source-kind valkey-rdb
+```
+
+Strings, hashes, lists, sets, and sorted sets migrate exactly and are
+verified value by value. TTLs migrate as absolute instants (`equivalent`);
+keys already expired at import time are skipped and the import instant is
+pinned in the receipt so verification stays deterministic. Streams keep
+entry order and field maps but identifiers are remapped and consumer groups
+are dropped (`declared-degraded`, waiver required). Functions, modules,
+cluster metadata, and checksum-less files are `rejected` — a run only
+proceeds over them with an explicit waiver naming each one.
+
+The manifest written by `run` is a **sealed migration receipt**: the source
+digest and identity, the consistency point, the complete classification
+inventory, the operator waivers, the mapping decisions, the target keyspaces
+(`main.public.valkey_db<N>_<family>`), and a logical digest of the verified
+target content, all sealed under a domain-separated BLAKE3 content digest.
+`verify` re-parses the source, revalidates the seal, and recomputes the
+logical digest from both the source bytes and the target reads at the pinned
+import time — on a pending or an already promoted target.
+
+Be honest about what the receipt proves: the destination corresponds to
+**this RDB file** at its point-in-time capture, not to what clients last
+observed on a live server. Take the dump at a quiesced point (or accept the
+snapshot semantics of `BGSAVE`) before migrating.
+
 ## Common errors
 
 Every error is a typed `ProductError` with a stable `code`, `category`,
@@ -675,7 +724,7 @@ reproduced and resolved while validating this manual:
 
 ## Limits and non-capabilities
 
-Effective limits of the 1.2.2 build as reported by `capabilities` (yours
+Effective limits of the 2.0.0 build as reported by `capabilities` (yours
 are versioned in the contracts — consult them, do not assume):
 
 | Limit | Value | Limit | Value |

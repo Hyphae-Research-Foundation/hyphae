@@ -1,6 +1,40 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+Protocol minor 5 admits one new content-derived request section and one
+content-derived response tail inside the existing `SearchCollection`
+exchange. Request tag `4` is the highlight budget: fragments per hit
+(`u32`, `1..=4`) and normalized-text bytes per fragment (`u32`,
+`16..=512`). A result whose request carried the budget appends response
+section tag `1` after the five trailing counts: for every hit in order, a
+`u32` fragment count followed by length-framed UTF-8 fragments cut from
+the canonical analyzer's normalized document text. A request without the
+budget and a result without fragments keep their exact historical bytes,
+so every exchange expressible at minor 4 is unchanged. Sealed search
+proofs whose request carries the budget seal at semantics version 4 with
+the same tagged section; fragments are derived presentation data
+re-derivable from the bound hits and are not bound by the claim.
+
+Protocol minor 4 adds no request or response tags: it admits three new
+integrated-search filter nodes inside the existing `SearchCollection` body —
+node tag `6` (`in` bounded same-type membership, at most 256 members), node
+tag `7` (`is_null` missing-field membership), and node tag `8` (`like`
+anchored pattern over `_` and `%`, at most 256 pattern bytes) — plus
+content-derived tagged sections after the request limit, in ascending tag
+order with duplicates rejected: tag `1` is the fusion selector (one byte,
+`weighted_score`), tag `2` is first-k-per-parent deduplication (field text
+plus a bounded count), and tag `3` is the attested external rerank stage
+(a length-framed canonical `HYATTS01` attestation envelope, a bounded
+`u32` score count, then little-endian object-id/score pairs). An absent
+section is the default, so every request
+expressible at minor 3 keeps its exact historical bytes. Operation
+minor requirements are content-inspecting: a client or server that
+negotiated minor 3 or lower rejects a request containing the new nodes
+before sending or before dispatch, and every filter expressible at minor 3
+keeps its exact historical bytes. Sealed search proofs whose request
+contains the new nodes carry semantics version 3; every other proof keeps
+version 2 and its exact historical bytes, and verifiers accept both.
+
 Protocol minor 3 adds request tag `54` (`CatalogVisibleList`) and response tag
 `42` (`CatalogVisiblePage`). Minor 0-2 retain the exact historical
 `CatalogList` tag `15` and `CatalogPage` tag `13` layout; minor 2 rejects the

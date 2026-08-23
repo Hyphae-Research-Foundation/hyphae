@@ -9,17 +9,19 @@ use hyphae_native_product::{
     CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt, DoctorRequest, ObjectId,
     ProductAuthorization, ProductCommitReceipt, ProductDocValue, ProductDocument,
     ProductDurability, ProductDurabilityPolicy, ProductError, ProductErrorCode,
-    ProductExplicitTransactionStatus, ProductLimits, ProductOperation, ProductPermission,
-    ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionVectorMutation, ProductValue, ProductVector,
-    RoleAssignmentMutationReceipt, SecurityAssignmentListRequest, SecurityAssignmentPage,
-    SecurityAssignmentSummary, SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata,
-    SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget,
-    SecurityCursor, SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
-    SecurityKeySummary, SecurityKeySummaryInput, SecurityPrincipalListRequest,
-    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityPrincipalSummary,
-    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
+    ProductExplicitTransactionStatus, ProductLexicalBranch, ProductLimits, ProductOperation,
+    ProductPermission, ProductResponse, ProductScope, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
+    ProductSearchRequest, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionVectorMutation, ProductValue, ProductVector, RoleAssignmentMutationReceipt,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAssignmentSummary,
+    SecurityAuditAction, SecurityAuditEvent, SecurityAuditMetadata, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor,
+    SecurityCursorId, SecurityId, SecurityKeyListRequest, SecurityKeyPage, SecurityKeySummary,
+    SecurityKeySummaryInput, SecurityPrincipalListRequest, SecurityPrincipalMutationReceipt,
+    SecurityPrincipalPage, SecurityPrincipalSummary, SecurityRoleListRequest, SecurityRolePage,
+    SecurityRoleSummary, SnapshotIdentity,
 };
 use hyphae_native_protocol::{
     API_KEY_AUTH_TRAILER_BYTES, AsyncFrameIo, FrameKind, GOLDEN_STRUCTURE_FRAME_BLAKE3,
@@ -60,7 +62,7 @@ fn shared_frame_and_handshake_vectors_are_stable() -> Result<(), Box<dyn std::er
     assert_eq!(decode_welcome(&encoded)?, welcome);
     assert_eq!(
         blake3::hash(&encoded).to_hex().as_str(),
-        "3ba7485426d52f643523edc48a239dc78e1b2e5f7502070059171f8777178b21"
+        "2c12fe5eb05cdf749d69e37060cd125535f069b2d0e1587bf8841cde674d7203"
     );
     Ok(())
 }
@@ -535,6 +537,373 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[test]
+fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn std::error::Error>> {
+    // Every currently expressible search request body — all filter nodes,
+    // all operators, all doc-value types — is minor-0 content. The content
+    // walk exists so future operators, typed values, and fusion methods
+    // raise the requirement without new operation variants.
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection: ObjectId::new(13)?,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 8,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::All(vec![
+                ProductSearchFilter::MatchAll,
+                ProductSearchFilter::Exists("category".to_owned()),
+                ProductSearchFilter::Not(Box::new(ProductSearchFilter::Any(vec![
+                    ProductSearchFilter::Compare {
+                        field: "price".to_owned(),
+                        operator: ProductSearchOperator::LessOrEqual,
+                        value: ProductDocValue::Integer(40),
+                    },
+                    ProductSearchFilter::Compare {
+                        field: "category".to_owned(),
+                        operator: ProductSearchOperator::Equal,
+                        value: ProductDocValue::String("book".to_owned()),
+                    },
+                ]))),
+            ]),
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+        },
+    });
+    let encoded = encode_product_request_for_minor(&request, 0)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 0)?.operation,
+        ProductOperation::SearchCollection { .. }
+    ));
+
+    let ingest = security_wire_request(ProductOperation::SearchIngest {
+        collection: ObjectId::new(13)?,
+        batch: ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents: vec![ProductDocument {
+                object_id: ObjectId::new(201)?,
+                text: "rust database".to_owned(),
+                doc_values: [
+                    ("flag".to_owned(), ProductDocValue::Boolean(true)),
+                    ("rank".to_owned(), ProductDocValue::Integer(3)),
+                    ("name".to_owned(), ProductDocValue::String("a".to_owned())),
+                    ("blob".to_owned(), ProductDocValue::Bytes(vec![7])),
+                ]
+                .into_iter()
+                .collect(),
+                vectors: std::collections::BTreeMap::new(),
+            }],
+        },
+    });
+    let encoded = encode_product_request_for_minor(&ingest, 0)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 0)?.operation,
+        ProductOperation::SearchIngest { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn membership_null_and_pattern_operators_require_minor_four()
+-> Result<(), Box<dyn std::error::Error>> {
+    for filter in [
+        ProductSearchFilter::In {
+            field: "category".to_owned(),
+            values: vec![
+                ProductDocValue::String("book".to_owned()),
+                ProductDocValue::String("gear".to_owned()),
+            ],
+        },
+        ProductSearchFilter::IsNull("category".to_owned()),
+        ProductSearchFilter::Like {
+            field: "category".to_owned(),
+            pattern: "bo%".to_owned(),
+        },
+    ] {
+        let request = security_wire_request(ProductOperation::SearchCollection {
+            collection: ObjectId::new(13)?,
+            request: ProductSearchRequest {
+                lexical: None,
+                vectors: Vec::new(),
+                filter,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+            },
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&request, 3),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&request, 4)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 3),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 4)?;
+        assert_eq!(encode_product_request(&decoded)?, encoded);
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |fusion| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+            },
+        })
+    };
+    // The default fusion keeps the exact historical bytes: no trailing
+    // selector, decodable at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.fusion.is_none()
+    ));
+
+    let weighted = request(Some(
+        hyphae_native_product::ProductFusionMethod::WeightedScore,
+    ));
+    assert!(matches!(
+        encode_product_request_for_minor(&weighted, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&weighted, 4)?;
+    assert_eq!(encoded.len(), default_encoded.len() + 2);
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 4)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+
+    // Parent deduplication is a tagged section with the same discipline.
+    let deduped = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
+            parent_dedupe: Some(hyphae_native_product::ProductParentDedupe {
+                field: "parent".to_owned(),
+                first_k: 2,
+            }),
+            rerank: None,
+            highlight: None,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&deduped, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&deduped, 4)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 4)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+
+    // The attested rerank stage is section tag three: envelope plus scores.
+    let attestation =
+        hyphae_native_product::proof::attestation::ModelAttestation::DeclaredProvider {
+            provider: "openai".to_owned(),
+            model: "text-embedding-3-small".to_owned(),
+            request_digest: [3; 32],
+            response_digest: [4; 32],
+        }
+        .encode()
+        .map_err(|error| format!("attestation encode failed: {error}"))?;
+    let reranked = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: Some(hyphae_native_product::ProductRerankStage {
+                attestation,
+                scores: vec![(ObjectId::new(201)?, 0.75), (ObjectId::new(202)?, 0.25)],
+            }),
+            highlight: None,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&reranked, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&reranked, 4)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 3),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 4)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+    // Cross-language golden: the Python and TypeScript suites pin this same
+    // digest for the identically composed reranked request.
+    assert_eq!(
+        blake3::hash(&encoded).to_hex().as_str(),
+        "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04",
+    );
+    Ok(())
+}
+
+#[test]
+fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |highlight| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight,
+            },
+        })
+    };
+    // A request without highlight keeps the exact historical bytes and
+    // still decodes at minor 4.
+    let default_encoded = encode_product_request_for_minor(&request(None), 4)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 4)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.highlight.is_none()
+    ));
+    let highlighted = request(Some(hyphae_native_product::ProductHighlight {
+        max_fragments: 2,
+        fragment_bytes: 64,
+    }));
+    assert!(matches!(
+        encode_product_request_for_minor(&highlighted, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&highlighted, 5)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 5)?;
+    assert_eq!(encode_product_request(&decoded)?, encoded);
+    // Cross-language golden: the Python and TypeScript suites pin this same
+    // digest for the identically composed highlighted request.
+    assert_eq!(
+        blake3::hash(&encoded).to_hex().as_str(),
+        "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443",
+    );
+
+    // A result with fragments carries the content-derived response tail —
+    // admitted at minor 5, refused at minor 4 — and a fragment-free result
+    // keeps the exact historical bytes.
+    let object = ObjectId::new(201)?;
+    let catalog_version = hyphae_native_product::CatalogVersion::new(3)?;
+    let result = |fragments: Vec<String>| {
+        ProductResponse::IntegratedSearch(hyphae_native_product::ProductSearchResult {
+            snapshot: SnapshotIdentity {
+                directory_lineage: [1; 24],
+                visible_csn: None,
+                catalog_version,
+                root_digest: [4; 32],
+                logical_time_micros: 5,
+            },
+            hits: vec![hyphae_native_product::ProductIntegratedSearchHit {
+                object_id: object,
+                score: 1.5,
+                doc_values: std::collections::BTreeMap::default(),
+                fragments,
+            }],
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            vector_branches: Vec::new(),
+            approximate: false,
+            total_documents: 1,
+            eligible_documents: 1,
+            lexical_candidates: 1,
+            retrieval_candidates: 1,
+            matched_candidates: 1,
+        })
+    };
+    let plain = encode_product_response_for_minor(&result(Vec::new()), 4)?;
+    let plain_decoded = decode_product_response(&plain)?;
+    assert_eq!(encode_product_response(&plain_decoded)?, plain);
+    let fragmented = result(vec!["rust database".to_owned()]);
+    assert!(matches!(
+        encode_product_response_for_minor(&fragmented, 4),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&fragmented, 5)?;
+    let decoded = decode_product_response(&encoded)?;
+    assert!(matches!(
+        &decoded,
+        ProductResponse::IntegratedSearch(result)
+            if result.hits[0].fragments == vec!["rust database".to_owned()]
+    ));
+    assert_eq!(encode_product_response(&decoded)?, encoded);
+    Ok(())
+}
+
 fn security_wire_request(operation: ProductOperation) -> WireRequest {
     WireRequest {
         operation,
@@ -881,7 +1250,8 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 }
 
 #[test]
-fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
+#[allow(clippy::too_many_lines)]
+fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -929,6 +1299,36 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
         .minor,
         1
     );
+    let minor_three = Hello {
+        maximum_minor: 3,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_three,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        3
+    );
+    let minor_four = Hello {
+        maximum_minor: 4,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_four,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        4
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -938,12 +1338,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_2_and_selects_1_3()
             1
         )?
         .minor,
-        3
+        5
     );
 
     let incompatible = Hello {
-        minimum_minor: 4,
-        maximum_minor: 4,
+        minimum_minor: 6,
+        maximum_minor: 6,
         ..Hello::default()
     };
     assert_eq!(

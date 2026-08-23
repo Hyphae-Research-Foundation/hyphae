@@ -129,7 +129,23 @@ sets. Receipts name the snapshot CSN, build identity, metric, breadth, truthful
 strategy/risk, candidate counts, reranking flag and visited nodes.
 Bounded boolean, phrase, prefix and fuzzy execution, stable-ID vector filters,
 typed doc-value filters/sort, terms facets, metric aggregations and native RRF
-hybrid execution are implemented as embedded G4 surfaces. Wildcard,
+hybrid execution are implemented as embedded G4 surfaces. The integrated
+surface additionally accepts a per-request fusion selector: the default is
+deterministic weighted reciprocal-rank fusion (`k = 60`), and
+`weighted_score` blends each branch's weight with its normalized score — a
+lexical candidate contributes `weight × score / branch_top_score` and a
+vector candidate contributes `weight × 1 / (1 + distance)`. An optional
+first-k-per-parent deduplication runs over the complete bounded ranking
+before the final limit: hits group by the exact typed value of one
+doc-value field, at most `k` (1..=100) survive per group in rank order,
+and hits missing the field are never deduplicated. An optional attested
+rerank stage reorders the complete bounded ranking before deduplication and
+the final limit: externally computed scores — from the attested local tool
+or a declared provider, always accompanied by their canonical attestation
+envelope — sort their hits by score descending with stable-identity ties,
+unscored hits follow in their existing order, and the whole stage
+(envelope included) is bound into sealed proofs. The engine reorders
+deterministically; it never runs a model. Wildcard,
 highlighting, persistent multi-field doc-value columns and unrestricted query
 language remain non-claims.
 
@@ -143,7 +159,22 @@ V1 default ranking is versioned BM25F:
 - score ordering is descending, followed by stable object ID ascending;
 - explanations name every term, field statistic, parameter and contribution.
 
-The current scorer uses BM25 with `k1=1.2`, `b=0.75`, query-term
+The catalog analyzer types are real for integrated collections: the
+configurable pipeline runs as a deterministic text-to-text transform at the
+product boundary, at ingest and at query, in front of the canonical analyzer
+(NFKC, Unicode case fold, alphanumeric tokenization). `UnicodeWord` with
+exactly the `Lowercase` filter — or no analyzer — is the identity and keeps
+existing collections byte-identical. Frozen version-one stages compose in
+ascending filter order: Latin diacritic folding over an explicit table,
+English stop-word removal (the classic 33-word list), and English Porter
+stemming. Shapes the transform cannot honor exactly — non-word tokenizers on
+lexical fields, pipelines without `Lowercase`, out-of-order filters — fail
+closed at ingest and query. Recovery replays the transformed text through
+the canonical analyzer and lands on identical postings.
+
+The current scorer uses BM25 with per-collection `k1`/`b` taken from the
+index definition (defaults `k1=1.2`, `b=0.75`; micro-unit integers in the
+catalog so identical definitions score identically on every host), query-term
 deduplication, descending score, then bytewise document-ID ascending. The
 materialized reference scorer remains the oracle: tests require physical
 posting traversal to return exactly the same scores and order. A dedicated

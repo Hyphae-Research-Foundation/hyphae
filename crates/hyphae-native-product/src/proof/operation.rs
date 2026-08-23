@@ -42,6 +42,11 @@ const REQUEST_MAGIC: &[u8; 8] = b"HYOPRQ02";
 const RESULT_MAGIC: &[u8; 8] = b"HYOPRS02";
 const EVIDENCE_MAGIC: &[u8; 8] = b"HYOPEV02";
 const SEMANTICS_VERSION: u16 = 2;
+/// Semantics version required by operations whose filter shapes were
+/// introduced after version 2 (membership, null, and pattern operators).
+const SEMANTICS_VERSION_OPERATORS: u16 = 3;
+/// Semantics version required by requests carrying a highlight budget.
+const SEMANTICS_VERSION_HIGHLIGHT: u16 = 4;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -235,7 +240,7 @@ fn generate_native_operation_proof_from_response(
     let proof_content = NativeProofContent {
         kind: captured.kind,
         anchor,
-        semantics_version: SEMANTICS_VERSION,
+        semantics_version: required_semantics_version(&captured.operation),
         ordering_version: ORDERING_VERSION,
         objects,
         request,
@@ -779,10 +784,54 @@ fn response_items(response: &ProductResponse) -> Result<u64, NativeProofError> {
     u64::try_from(value).map_err(|_| NativeProofError::LengthOverflow)
 }
 
+/// Whether one filter tree contains a shape introduced after semantics
+/// version 2. The version is a pure function of content so re-encoding a
+/// sealed request always reproduces its exact bytes.
+fn filter_requires_operator_semantics(filter: &DocValueFilter) -> bool {
+    match filter {
+        DocValueFilter::MatchAll | DocValueFilter::Exists(_) | DocValueFilter::Compare { .. } => {
+            false
+        }
+        DocValueFilter::All(children) | DocValueFilter::Any(children) => {
+            children.iter().any(filter_requires_operator_semantics)
+        }
+        DocValueFilter::Not(child) => filter_requires_operator_semantics(child),
+        DocValueFilter::In { .. } | DocValueFilter::IsNull(_) | DocValueFilter::Like { .. } => true,
+    }
+}
+
+/// Lowest semantics version whose contract admits this operation.
+fn required_semantics_version(operation: &SemanticOperation) -> u16 {
+    let filter = match operation {
+        SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
+        _ => None,
+    };
+    let highlighted = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. }
+            if request.highlight.is_some()
+    );
+    let extended = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. }
+            if request.fusion.is_some()
+                || request.parent_dedupe.is_some()
+                || request.rerank.is_some()
+    );
+    if highlighted {
+        SEMANTICS_VERSION_HIGHLIGHT
+    } else if extended || filter.is_some_and(filter_requires_operator_semantics) {
+        SEMANTICS_VERSION_OPERATORS
+    } else {
+        SEMANTICS_VERSION
+    }
+}
+
 fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, NativeProofError> {
+    let semantics_version = required_semantics_version(operation);
     let mut encoded = Encoder::default();
     encoded.extend(REQUEST_MAGIC);
-    encoded.u16(SEMANTICS_VERSION);
+    encoded.u16(semantics_version);
     encoded.u16(ORDERING_VERSION);
     match operation {
         SemanticOperation::PointCatalog { id } => {
@@ -820,7 +869,7 @@ fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, N
             encoded.byte(OP_SEARCH_COLLECTION);
             encoded.extend(&logical_time_micros.to_le_bytes());
             encoded.u128(collection.get());
-            encode_integrated_request(&mut encoded, request)?;
+            encode_integrated_request(&mut encoded, request, semantics_version)?;
         }
         SemanticOperation::CatalogList(request) => {
             encoded.byte(OP_CATALOG_LIST);
@@ -839,8 +888,13 @@ fn decode_semantic_operation(
     limits: &NativeVerificationLimits,
 ) -> Result<SemanticOperation, NativeProofError> {
     let mut decoder = Decoder::new(encoded);
-    if decoder.take(8)? != REQUEST_MAGIC
-        || decoder.u16()? != SEMANTICS_VERSION
+    let magic_ok = decoder.take(8)? == REQUEST_MAGIC;
+    let semantics_version = decoder.u16()?;
+    if !magic_ok
+        || !matches!(
+            semantics_version,
+            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS | SEMANTICS_VERSION_HIGHLIGHT
+        )
         || decoder.u16()? != ORDERING_VERSION
     {
         return Err(NativeProofError::Invalid(
@@ -879,7 +933,7 @@ fn decode_semantic_operation(
         OP_SEARCH_COLLECTION => SemanticOperation::SearchCollection {
             logical_time_micros: i64::from_le_bytes(decoder.array()?),
             collection: object_id(decoder.u128()?)?,
-            request: decode_integrated_request(&mut decoder, limits)?,
+            request: decode_integrated_request(&mut decoder, limits, semantics_version)?,
         },
         OP_CATALOG_LIST => {
             SemanticOperation::CatalogList(decode_catalog_list_request(&mut decoder)?)
@@ -1306,7 +1360,10 @@ fn hybrid_metadata(
     Ok(Some(HybridProofMetadata {
         branches,
         failure_policy: HybridFailurePolicy::FailClosed,
-        fusion_method: HybridFusionMethod::WeightedReciprocalRank,
+        fusion_method: match request.fusion {
+            None => HybridFusionMethod::WeightedReciprocalRank,
+            Some(crate::ProductFusionMethod::WeightedScore) => HybridFusionMethod::WeightedScore,
+        },
         duplicate_policy: HybridDuplicatePolicy::MergeByObjectId,
     }))
 }
@@ -1554,6 +1611,7 @@ fn decode_query(
 fn encode_integrated_request(
     encoded: &mut Encoder,
     request: &ProductSearchRequest,
+    semantics_version: u16,
 ) -> Result<(), NativeProofError> {
     encoded.byte(u8::from(request.lexical.is_some()));
     if let Some(lexical) = &request.lexical {
@@ -1603,12 +1661,48 @@ fn encode_integrated_request(
         put_text(encoded, &aggregation.name)?;
         encode_aggregation(encoded, &aggregation.aggregation)?;
     }
-    put_usize(encoded, request.limit)
+    put_usize(encoded, request.limit)?;
+    // The version-3 layout appends content-derived tagged sections in
+    // ascending tag order; version 2 keeps the exact historical bytes and
+    // can only express the defaults. An absent section is the default.
+    if semantics_version >= SEMANTICS_VERSION_OPERATORS {
+        if let Some(fusion) = request.fusion {
+            encoded.byte(1);
+            encoded.byte(match fusion {
+                crate::ProductFusionMethod::WeightedScore => 1,
+            });
+        }
+        if let Some(dedupe) = &request.parent_dedupe {
+            encoded.byte(2);
+            put_text(encoded, &dedupe.field)?;
+            put_usize(encoded, dedupe.first_k)?;
+        }
+        if let Some(stage) = &request.rerank {
+            encoded.byte(3);
+            put_count(encoded, stage.attestation.len())?;
+            encoded.extend(&stage.attestation);
+            put_count(encoded, stage.scores.len())?;
+            for (object_id, score) in &stage.scores {
+                encoded.u128(object_id.get());
+                encoded.extend(&score.to_le_bytes());
+            }
+        }
+        if semantics_version >= SEMANTICS_VERSION_HIGHLIGHT
+            && let Some(highlight) = &request.highlight
+        {
+            encoded.byte(4);
+            put_usize(encoded, highlight.max_fragments)?;
+            put_usize(encoded, highlight.fragment_bytes)?;
+        }
+    }
+    Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_integrated_request(
     decoder: &mut Decoder<'_>,
     limits: &NativeVerificationLimits,
+    semantics_version: u16,
 ) -> Result<ProductSearchRequest, NativeProofError> {
     let lexical = match decoder.byte()? {
         0 => None,
@@ -1686,6 +1780,63 @@ fn decode_integrated_request(
             aggregation: decode_aggregation(decoder, limits)?,
         });
     }
+    let limit = usize_value(decoder)?;
+    let mut fusion = None;
+    let mut parent_dedupe = None;
+    let mut rerank = None;
+    let mut highlight = None;
+    if semantics_version >= SEMANTICS_VERSION_OPERATORS {
+        let mut previous = 0_u8;
+        while decoder.has_remaining() {
+            let tag = decoder.byte()?;
+            if tag <= previous {
+                return Err(NativeProofError::Invalid("request sections out of order"));
+            }
+            previous = tag;
+            match tag {
+                1 => {
+                    fusion = Some(match decoder.byte()? {
+                        1 => crate::ProductFusionMethod::WeightedScore,
+                        _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
+                    });
+                }
+                2 => {
+                    parent_dedupe = Some(crate::ProductParentDedupe {
+                        field: text(decoder, limits.max_reexecution_bytes)?,
+                        first_k: usize_value(decoder)?,
+                    });
+                }
+                3 => {
+                    let length = bounded_count(
+                        decoder,
+                        crate::proof::attestation::MAX_ATTESTATION_BYTES,
+                        "attestation envelope",
+                    )?;
+                    let attestation = decoder.owned(length)?;
+                    crate::proof::attestation::ModelAttestation::decode(&attestation)?;
+                    let count =
+                        bounded_count(decoder, crate::MAX_RERANK_ENTRIES, "rerank entries")?;
+                    let mut scores = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let object_id = object_id(decoder.u128()?)?;
+                        let score = f64::from_le_bytes(decoder.array()?);
+                        scores.push((object_id, score));
+                    }
+                    rerank = Some(crate::ProductRerankStage {
+                        attestation,
+                        scores,
+                    });
+                }
+                4 if semantics_version >= SEMANTICS_VERSION_HIGHLIGHT => {
+                    highlight = Some(crate::ProductHighlight {
+                        max_fragments: usize_value(decoder)?,
+                        fragment_bytes: usize_value(decoder)?,
+                    });
+                }
+                _ => return Err(NativeProofError::Invalid("unknown request section")),
+            }
+        }
+    }
     Ok(ProductSearchRequest {
         lexical,
         vectors,
@@ -1693,7 +1844,11 @@ fn decode_integrated_request(
         sort,
         facets,
         aggregations,
-        limit: usize_value(decoder)?,
+        limit,
+        fusion,
+        parent_dedupe,
+        rerank,
+        highlight,
     })
 }
 
@@ -1789,6 +1944,23 @@ fn encode_filter(
             encoded.byte(6);
             encode_filter(encoded, child, depth + 1)?;
         }
+        DocValueFilter::In { field, values } => {
+            encoded.byte(7);
+            put_text(encoded, field)?;
+            put_count(encoded, values.len())?;
+            for value in values {
+                encode_doc_value(encoded, value)?;
+            }
+        }
+        DocValueFilter::IsNull(field) => {
+            encoded.byte(8);
+            put_text(encoded, field)?;
+        }
+        DocValueFilter::Like { field, pattern } => {
+            encoded.byte(9);
+            put_text(encoded, field)?;
+            put_text(encoded, pattern)?;
+        }
     }
     Ok(())
 }
@@ -1834,6 +2006,24 @@ fn decode_filter(
             }
         }
         6 => DocValueFilter::Not(Box::new(decode_filter(decoder, depth + 1, limits)?)),
+        7 => {
+            let field = text(decoder, limits.max_reexecution_bytes)?;
+            let count = bounded_count(
+                decoder,
+                limits.max_reexecution_candidate_items,
+                "membership members",
+            )?;
+            let mut values = Vec::new();
+            for _ in 0..count {
+                values.push(decode_doc_value(decoder, limits)?);
+            }
+            DocValueFilter::In { field, values }
+        }
+        8 => DocValueFilter::IsNull(text(decoder, limits.max_reexecution_bytes)?),
+        9 => DocValueFilter::Like {
+            field: text(decoder, limits.max_reexecution_bytes)?,
+            pattern: text(decoder, limits.max_reexecution_bytes)?,
+        },
         _ => return Err(NativeProofError::Invalid("invalid doc-value filter tag")),
     })
 }

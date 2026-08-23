@@ -26,7 +26,10 @@ ROOT = Path(
 ).resolve()
 SOFTWARE_LICENSE = "Apache-2.0"
 SYFT_VERSION = "1.46.0"
-IGNORED_DIRECTORIES = frozenset({"build", "dist", "node_modules", "target"})
+# The excluded `embed` workspace hosts the attested local-model tool: it is
+# publish = false, carries its own lockfile, and never enters a release
+# payload, so it stays outside the release package authorities.
+IGNORED_DIRECTORIES = frozenset({"build", "dist", "embed", "node_modules", "target"})
 
 
 @dataclass(frozen=True)

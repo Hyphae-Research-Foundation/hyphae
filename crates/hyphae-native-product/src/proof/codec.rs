@@ -678,6 +678,10 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
+    pub(crate) const fn has_remaining(&self) -> bool {
+        self.offset < self.bytes.len()
+    }
+
     pub(crate) fn u16(&mut self) -> Result<u16, NativeProofError> {
         Ok(read_u16(self.take(2)?))
     }

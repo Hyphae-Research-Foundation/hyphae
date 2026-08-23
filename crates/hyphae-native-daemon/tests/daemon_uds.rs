@@ -722,7 +722,7 @@ async fn security_operations_require_their_minor_and_reject_retired_shapes_befor
     )?;
 
     let current = Client::connect_authenticated(&test.socket, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 3);
+    assert_eq!(current.negotiated_minor, 5);
     current
         .send_request(1, 2, &request(ProductOperation::SecurityStatus))
         .await?;
@@ -1258,6 +1258,46 @@ async fn prepared_handle_can_be_deallocated() -> Result<(), Box<dyn Error>> {
         .await?;
     assert!(missing.response(1, 5).await.is_err());
     drop(missing);
+    drop(client);
+    daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_window_update_for_a_completed_stream_is_benign() -> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("late-window-update")?;
+    let daemon = NativeDaemon::start(
+        NativeProduct::create(&test.data)?,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect(&test.socket, 64 * 1024).await?;
+    client
+        .send_request(7, 2, &request(ProductOperation::Capabilities))
+        .await?;
+    assert!(matches!(
+        client.response(7, 2).await?,
+        ProductResponse::Capabilities(_)
+    ));
+    // A credit for the already-completed stream races the server's own END
+    // teardown in real clients; the connection must survive it.
+    client
+        .codec
+        .send(
+            &mut &client.stream,
+            FrameKind::WindowUpdate,
+            7,
+            2,
+            &encode_window_update(4096)?,
+        )
+        .await?;
+    client
+        .send_request(9, 3, &request(ProductOperation::Capabilities))
+        .await?;
+    assert!(matches!(
+        client.response(9, 3).await?,
+        ProductResponse::Capabilities(_)
+    ));
     drop(client);
     daemon.shutdown().await?;
     Ok(())

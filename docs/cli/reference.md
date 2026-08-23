@@ -404,17 +404,32 @@ counts, and file length.
 ## `migrate`
 
 ```text
-hyphae migrate inspect --source <FORMAT2_DIRECTORY>
-hyphae migrate run --source <FORMAT2_DIRECTORY> --target <NEW_NATIVE_DIRECTORY> --manifest <NEW_FILE>
-hyphae migrate verify --source <FORMAT2_DIRECTORY> --target <NATIVE_DIRECTORY> --manifest <FILE>
-hyphae migrate promote --source <FORMAT2_DIRECTORY> --target <PENDING_NATIVE_DIRECTORY> --manifest <FILE>
+hyphae migrate inspect --source <SOURCE> [--source-kind <KIND>] [--waive <CONSTRUCT>]...
+hyphae migrate run --source <SOURCE> --target <NEW_NATIVE_DIRECTORY> --manifest <NEW_FILE> [--source-kind <KIND>] [--waive <CONSTRUCT>]...
+hyphae migrate verify --source <SOURCE> --target <NATIVE_DIRECTORY> --manifest <FILE> [--source-kind <KIND>]
+hyphae migrate promote --source <SOURCE> --target <PENDING_NATIVE_DIRECTORY> --manifest <FILE> [--source-kind <KIND>]
 hyphae migrate rollback --target <PENDING_NATIVE_DIRECTORY> [--manifest <FILE>]
 ```
 
-The importer reads the format-2 source without mutating it, creates a separate
-pending Native directory, verifies identity and logical SQL/structure/search
-equivalence, and requires explicit promotion. Rollback only removes an
-unpromoted target owned by the migration manifest.
+The importer reads the source without mutating it, creates a separate
+pending Native directory, verifies logical equivalence, and requires
+explicit promotion. Rollback only removes an unpromoted target owned by the
+migration manifest.
+
+`--source-kind format2` (the default) migrates an existing format-2 Hyphae
+data directory, keeps its byte-compatible behavior, and rejects `--waive`.
+
+`--source-kind valkey-rdb` migrates one offline Valkey/Redis RDB file
+(versions 8-12). `inspect` prints a classified inventory: every construct is
+`exact`, `equivalent`, `declared-degraded`, or `rejected`, and each degraded
+or rejected construct present in the file must be explicitly waived with a
+repeated `--waive <construct>` before `run` proceeds. The manifest written by
+`run` is a sealed migration receipt — source identity and digest, consistency
+point, the complete classification inventory, operator waivers, mapping
+decisions, target keyspaces, and a domain-separated BLAKE3 content digest.
+`verify` re-parses the source, revalidates the receipt seal, and recomputes
+the logical digest from both the source and the target at the pinned import
+time; `promote` verifies first and activates the pending directory.
 
 ## `init` and `capabilities`
 

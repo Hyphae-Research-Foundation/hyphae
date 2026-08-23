@@ -147,6 +147,22 @@ opaque sections remains scope `ArtifactIntegrity` and cannot satisfy an
 operation-proof requirement. A recognized semantic request that cannot be
 opened, executed, or matched is an error, never an artifact-only success.
 
+## Model attestation envelopes
+
+`HYATTS01` records how a model output entered a search pipeline, in one of
+two never-interchangeable classes. `AttestedLocal` binds a locally executed
+model's weights digest, canonical input digest, and output digest (all
+BLAKE3); the claim is replayable — rerunning the same weights over the same
+input must reproduce the output digest. `DeclaredProvider` binds a provider
+identifier, a model identifier, and request/response digests; the envelope
+proves what was sent and received, never that the provider computed it
+deterministically. Envelopes are bounded (names ≤ 256 bytes, envelope
+≤ 4 KiB), canonical (decode re-encodes byte-identically), and fail closed on
+unknown classes, truncation, or trailing bytes. The pure offline verifier
+additionally checks caller-supplied input or output bytes against the
+recorded digests. Attestation classes are recorded in proofs by the stages
+that consume model outputs.
+
 ## Bounds and non-claims
 
 Proof, witness, section, object, branch, decoded-byte, result-item, candidate,

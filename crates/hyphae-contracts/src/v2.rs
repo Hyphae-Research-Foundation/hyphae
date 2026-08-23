@@ -15,10 +15,15 @@ pub const REQUEST_ID_HEADER_V2: &str = "x-hyphae-request-id";
 pub const DEADLINE_HEADER_V2: &str = "x-hyphae-deadline-micros";
 /// Opaque lowercase hexadecimal identity for retained HTTP session state.
 pub const SESSION_ID_HEADER_V2: &str = "x-hyphae-session-id";
-/// Exact Native product protocol minor offered by clients and selected by servers.
+/// Native product protocol minors offered by clients and the selection
+/// echoed by servers.
 pub const PROTOCOL_MINOR_HEADER_V2: &str = "x-hyphae-protocol-minor";
-/// Current exact Native HTTP v2 protocol minor value.
-pub const PROTOCOL_MINOR_VALUE_V2: &str = "3";
+/// Highest Native HTTP v2 protocol minor this build serves.
+pub const PROTOCOL_MINOR_VALUE_V2: &str = "5";
+/// Every Native HTTP v2 protocol minor this build serves, ascending. The
+/// server selects the highest member the client also offers and echoes the
+/// selection; an offer with no supported member fails closed.
+pub const PROTOCOL_MINORS_SUPPORTED_V2: &[u16] = &[3, 4, 5];
 
 /// Typed configured-limit evidence in a Native product error.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

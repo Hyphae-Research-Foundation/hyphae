@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded read-only MCP stdio adapter over managed Native HTTP v2.
+//! Bounded MCP stdio adapter over managed Native HTTP v2: read-only by
+//! default, with one explicitly opted-in bounded ingest tool.
 
 use std::{
     io::{self, BufRead, BufReader, BufWriter, Write},
@@ -12,7 +13,9 @@ use hyphae_client::v2::{
 };
 use hyphae_contracts::NATIVE_MCP_V2;
 use hyphae_native_product::{
-    MAX_API_KEY_CREDENTIAL_BYTES, ProductError, ProductErrorCode, ProductResponse, SecurityCursor,
+    BoundedSearchQuery, MAX_API_KEY_CREDENTIAL_BYTES, ObjectId, ProductError, ProductErrorCode,
+    ProductLexicalBranch, ProductResponse, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchRequest, ProductVector, ProductVectorBranch, SecurityCursor,
     SecurityPrincipalListRequest,
 };
 use serde::Deserialize;
@@ -27,13 +30,32 @@ use crate::{
 const MCP_CONTRACT: &str = NATIVE_MCP_V2;
 const MCP_CONTRACT_SCHEMA: &str = "hyphae-native-mcp-contract-v2";
 const MCP_PROTOCOL: &str = "2025-06-18";
-const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v2";
+const TOOL_SCHEMA_VERSION: &str = "hyphae-native-mcp-tools-v4";
 const TOOL_PAGE_SIZE: usize = 100;
-const TOOL_NAMES: [&str; 3] = [
+const TOOL_NAMES: [&str; 11] = [
     "hyphae_native_capabilities",
     "hyphae_native_security_status",
     "hyphae_native_security_principals",
+    "hyphae_native_search_lexical",
+    "hyphae_native_search_collection",
+    "hyphae_native_prove_search",
+    "hyphae_native_verify_proof",
+    "hyphae_native_search_ingest",
+    "hyphae_native_memory_store",
+    "hyphae_native_memory_recall",
+    "hyphae_native_memory_forget",
 ];
+/// Write-scoped tools, absent unless the operator opts in.
+const WRITE_TOOL_NAMES: [&str; 3] = [
+    "hyphae_native_search_ingest",
+    "hyphae_native_memory_store",
+    "hyphae_native_memory_forget",
+];
+/// Memory texts are bounded so one recall stays inside the message bound.
+const MAX_MEMORY_TEXT_BYTES: usize = 4 * 1024;
+/// Memory TTLs are bounded to ten years.
+const MAX_MEMORY_TTL_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
+const MAX_MEMORY_RECALL_LIMIT: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CURSOR_BYTES: usize = 128;
 const MAX_TOOL_CURSOR_BYTES: usize = 32;
@@ -42,18 +64,34 @@ const SERVER_BUSY: i32 = -32001;
 const RESPONSE_TOO_LARGE: i32 = -32003;
 
 #[derive(Clone, Copy)]
-enum NativeReadTool {
+enum NativeTool {
     Capabilities,
     SecurityStatus,
     SecurityPrincipals,
+    SearchLexical,
+    SearchCollection,
+    ProveSearch,
+    VerifyProof,
+    SearchIngest,
+    MemoryStore,
+    MemoryRecall,
+    MemoryForget,
 }
 
-impl NativeReadTool {
-    fn parse(name: &str) -> Option<Self> {
+impl NativeTool {
+    fn parse(name: &str, allow_ingest: bool) -> Option<Self> {
         match name {
             "hyphae_native_capabilities" => Some(Self::Capabilities),
             "hyphae_native_security_status" => Some(Self::SecurityStatus),
             "hyphae_native_security_principals" => Some(Self::SecurityPrincipals),
+            "hyphae_native_search_lexical" => Some(Self::SearchLexical),
+            "hyphae_native_search_collection" => Some(Self::SearchCollection),
+            "hyphae_native_prove_search" => Some(Self::ProveSearch),
+            "hyphae_native_verify_proof" => Some(Self::VerifyProof),
+            "hyphae_native_search_ingest" if allow_ingest => Some(Self::SearchIngest),
+            "hyphae_native_memory_store" if allow_ingest => Some(Self::MemoryStore),
+            "hyphae_native_memory_recall" => Some(Self::MemoryRecall),
+            "hyphae_native_memory_forget" if allow_ingest => Some(Self::MemoryForget),
             _ => None,
         }
     }
@@ -67,9 +105,22 @@ struct ToolRegistry {
     tools: Vec<Value>,
 }
 
+impl ToolRegistry {
+    /// Restricts the listed registry to the read-only subset.
+    fn without_ingest(mut self) -> Self {
+        self.tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !WRITE_TOOL_NAMES.contains(&name))
+        });
+        self
+    }
+}
+
 struct Session {
     client: HyphaeClient,
     registry: ToolRegistry,
+    allow_ingest: bool,
     initialize_seen: bool,
     initialized: bool,
 }
@@ -82,7 +133,7 @@ enum SessionAction {
 
 struct ToolCall {
     id: Value,
-    tool: NativeReadTool,
+    tool: NativeTool,
     arguments: Value,
 }
 
@@ -132,6 +183,138 @@ struct PrincipalListInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalSearchInput {
+    index: u64,
+    kind: String,
+    query: String,
+    #[serde(default = "default_fuzzy_distance")]
+    max_distance: u8,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+/// Branch-combination method selector accepted by the search tools.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FusionMethodInputValue {
+    WeightedScore,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CollectionSearchInput {
+    pub(crate) collection: u64,
+    #[serde(default)]
+    lexical: Option<LexicalBranchInput>,
+    #[serde(default)]
+    vectors: Vec<VectorBranchInput>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    sort: Vec<Value>,
+    #[serde(default)]
+    facets: Vec<Value>,
+    #[serde(default)]
+    aggregations: Vec<Value>,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    fusion: Option<FusionMethodInputValue>,
+    #[serde(default)]
+    parent_dedupe: Option<ParentDedupeInput>,
+}
+
+/// First-k-per-parent deduplication accepted by the search tools.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParentDedupeInput {
+    field: String,
+    first_k: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LexicalBranchInput {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    candidate_limit: usize,
+    #[serde(default = "default_branch_weight")]
+    weight: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VectorBranchInput {
+    target: String,
+    values: Vec<f32>,
+    #[serde(default = "default_search_limit")]
+    candidate_limit: usize,
+    #[serde(default = "default_branch_weight")]
+    weight: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
+struct VerifyProofInput {
+    proof_hex: String,
+    witness_hex: String,
+    anchor_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchIngestInput {
+    collection: u64,
+    idempotency_id: u64,
+    documents: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryStoreInput {
+    collection: u64,
+    text: String,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRecallInput {
+    collection: u64,
+    query: String,
+    #[serde(default = "default_memory_recall_limit")]
+    limit: usize,
+    #[serde(default)]
+    prove: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryForgetInput {
+    collection: u64,
+    id: String,
+}
+
+fn default_memory_recall_limit() -> usize {
+    8
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+fn default_branch_weight() -> u32 {
+    1
+}
+
+fn default_fuzzy_distance() -> u8 {
+    1
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CancelledParams {
     request_id: Value,
@@ -153,6 +336,7 @@ pub(crate) async fn run(
     base_url: &str,
     api_key_file: Option<&Path>,
     api_key_stdin: bool,
+    allow_ingest: bool,
 ) -> Result<(), CliFailure> {
     let mut input = BufReader::new(io::stdin());
     let credential = read_mcp_credential(api_key_file, api_key_stdin, &mut input)?;
@@ -163,9 +347,16 @@ pub(crate) async fn run(
         .map_err(startup_client_error)?;
     drop(credential);
 
+    let registry = ToolRegistry::load()?;
+    let registry = if allow_ingest {
+        registry
+    } else {
+        registry.without_ingest()
+    };
     let mut session = Session {
         client: HyphaeClient::new(transport),
-        registry: ToolRegistry::load()?,
+        registry,
+        allow_ingest,
         initialize_seen: false,
         initialized: false,
     };
@@ -409,7 +600,7 @@ fn valid_tool_contract(tool: &Value, expected_name: &str) -> bool {
         return false;
     };
     let expected_annotations = json!({
-        "readOnlyHint": true,
+        "readOnlyHint": !WRITE_TOOL_NAMES.contains(&expected_name),
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
@@ -551,7 +742,7 @@ impl Session {
                 SessionAction::Response(rpc_error(&id, -32002, "Server not initialized"))
             }
             "tools/list" => SessionAction::Response(self.list_tools(&id, &params)),
-            "tools/call" => Self::prepare_tool_call(id, &params),
+            "tools/call" => self.prepare_tool_call(id, &params),
             _ => SessionAction::Response(rpc_error(&id, -32601, "Method not found")),
         }
     }
@@ -603,14 +794,14 @@ impl Session {
         )
     }
 
-    fn prepare_tool_call(id: Value, params: &Value) -> SessionAction {
+    fn prepare_tool_call(&self, id: Value, params: &Value) -> SessionAction {
         let params = match serde_json::from_value::<ToolsCallParams>(params.clone()) {
             Ok(params) if params.arguments.is_object() => params,
             _ => {
                 return SessionAction::Response(rpc_error(&id, -32602, "Invalid params"));
             }
         };
-        let Some(tool) = NativeReadTool::parse(&params.name) else {
+        let Some(tool) = NativeTool::parse(&params.name, self.allow_ingest) else {
             return SessionAction::Response(rpc_error(&id, -32602, "Unknown tool"));
         };
         SessionAction::ToolCall(ToolCall {
@@ -645,9 +836,10 @@ fn start_tool_call(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_tool(
     client: HyphaeClient,
-    tool: NativeReadTool,
+    tool: NativeTool,
     arguments: Value,
     cancellation: CancellationToken,
 ) -> Result<Value, Box<ProductError>> {
@@ -658,15 +850,15 @@ async fn execute_tool(
     options.limits.max_request_bytes = MAX_MESSAGE_BYTES;
     options.limits.max_response_bytes = MAX_MESSAGE_BYTES;
     let response = match tool {
-        NativeReadTool::Capabilities => {
+        NativeTool::Capabilities => {
             strict_input::<EmptyInput>(arguments)?;
             client.capabilities(options).await
         }
-        NativeReadTool::SecurityStatus => {
+        NativeTool::SecurityStatus => {
             strict_input::<EmptyInput>(arguments)?;
             client.security_status(options).await
         }
-        NativeReadTool::SecurityPrincipals => {
+        NativeTool::SecurityPrincipals => {
             let input = strict_input::<PrincipalListInput>(arguments)?;
             let cursor = input
                 .cursor
@@ -677,9 +869,410 @@ async fn execute_tool(
                 .map_err(|_| invalid_request())?;
             client.security_principal_list(request, options).await
         }
+        NativeTool::SearchLexical => {
+            let input = strict_input::<LexicalSearchInput>(arguments)?;
+            let index = ObjectId::new(u128::from(input.index)).map_err(|_| invalid_request())?;
+            let query = match input.kind.as_str() {
+                "term" => BoundedSearchQuery::Term(input.query),
+                "phrase" => BoundedSearchQuery::Phrase(input.query),
+                "prefix" => BoundedSearchQuery::Prefix(input.query),
+                "fuzzy" => BoundedSearchQuery::Fuzzy {
+                    term: input.query,
+                    max_distance: input.max_distance,
+                },
+                _ => return Err(invalid_request()),
+            };
+            client.search(index, query, input.limit, options).await
+        }
+        NativeTool::SearchCollection => {
+            let input = strict_input::<CollectionSearchInput>(arguments)?;
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let request = collection_search_request(input)?;
+            client.search_collection(collection, request, options).await
+        }
+        NativeTool::ProveSearch => {
+            let input = strict_input::<CollectionSearchInput>(arguments)?;
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let request = collection_search_request(input)?;
+            client
+                .prove(
+                    hyphae_native_product::ProductOperation::SearchCollection {
+                        collection,
+                        request,
+                    },
+                    hyphae_native_product::proof::NativeProofGenerationLimits::default(),
+                    options,
+                )
+                .await
+        }
+        NativeTool::VerifyProof => {
+            let input = strict_input::<VerifyProofInput>(arguments)?;
+            return verify_proof_locally(&input);
+        }
+        NativeTool::SearchIngest => {
+            let input = strict_input::<SearchIngestInput>(arguments)?;
+            if input.idempotency_id == 0 {
+                return Err(invalid_request());
+            }
+            let collection =
+                ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+            let documents = input
+                .documents
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|_| invalid_request())
+                        .and_then(|document| {
+                            crate::product_document(document).map_err(|_| invalid_request())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let batch = ProductSearchIngestBatch {
+                idempotency_id: u128::from(input.idempotency_id),
+                documents,
+            };
+            client.search_ingest(collection, batch, options).await
+        }
+        NativeTool::MemoryStore => {
+            let input = strict_input::<MemoryStoreInput>(arguments)?;
+            return memory_store(&client, input, options).await;
+        }
+        NativeTool::MemoryRecall => {
+            let input = strict_input::<MemoryRecallInput>(arguments)?;
+            return memory_recall(&client, input, options).await;
+        }
+        NativeTool::MemoryForget => {
+            let input = strict_input::<MemoryForgetInput>(arguments)?;
+            return memory_forget(&client, input, options).await;
+        }
     }
     .map_err(normalize_client_error)?;
     response_for(tool, response)
+}
+
+/// Content-derived memory identity: the first sixteen digest bytes.
+fn memory_identity(text: &str) -> u128 {
+    let digest = blake3::hash(text.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    let identity = u128::from_le_bytes(bytes);
+    if identity == 0 { 1 } else { identity }
+}
+
+/// Lifecycle key owning one memory's recallability and TTL.
+fn memory_key(collection: u128, identity: u128) -> Vec<u8> {
+    let mut key = b"hyphae-memory/".to_vec();
+    key.extend_from_slice(&collection.to_le_bytes());
+    key.extend_from_slice(&identity.to_le_bytes());
+    key
+}
+
+/// Stores one bounded memory: the text ingests into the collection under
+/// its content-derived identity, and a scalar lifecycle key carries the
+/// text and the optional TTL. A memory is recallable exactly while its
+/// lifecycle key lives.
+async fn memory_store(
+    client: &HyphaeClient,
+    input: MemoryStoreInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    if input.text.is_empty()
+        || input.text.len() > MAX_MEMORY_TEXT_BYTES
+        || input
+            .ttl_seconds
+            .is_some_and(|ttl| ttl == 0 || ttl > MAX_MEMORY_TTL_SECONDS)
+    {
+        return Err(invalid_request());
+    }
+    let identity = memory_identity(&input.text);
+    let collection = ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+    let object_id = ObjectId::new(identity).map_err(|_| invalid_request())?;
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: identity,
+        documents: vec![hyphae_native_product::ProductDocument {
+            object_id,
+            text: input.text.clone(),
+            doc_values: std::collections::BTreeMap::new(),
+            vectors: std::collections::BTreeMap::new(),
+        }],
+    };
+    client
+        .search_ingest(collection, batch, options.clone())
+        .await
+        .map_err(normalize_client_error)?;
+    let expires_at_micros = input.ttl_seconds.map(|ttl| {
+        crate::native::logical_time_micros()
+            .saturating_add(i64::try_from(ttl.saturating_mul(1_000_000)).unwrap_or(i64::MAX))
+    });
+    client
+        .structure_set(
+            memory_key(collection.get(), identity),
+            input.text.into_bytes(),
+            expires_at_micros,
+            options,
+        )
+        .await
+        .map_err(normalize_client_error)?;
+    Ok(json!({
+        "status": "stored",
+        "id": identity.to_string(),
+        "expires_at_micros": expires_at_micros,
+    }))
+}
+
+/// Recalls memories by bounded lexical retrieval, keeping only hits whose
+/// lifecycle key still lives — expired or forgotten memories never return.
+/// With `prove`, the retrieval itself is sealed and the artifacts ride the
+/// response; the lifecycle filter is applied after the proved search.
+async fn memory_recall(
+    client: &HyphaeClient,
+    input: MemoryRecallInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    if input.query.is_empty() || !(1..=MAX_MEMORY_RECALL_LIMIT).contains(&input.limit) {
+        return Err(invalid_request());
+    }
+    let collection = ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+    let request = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: input.query,
+            candidate_limit: 1_000,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: input.limit,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+    };
+    let (result, proof) = if input.prove {
+        let response = client
+            .prove(
+                hyphae_native_product::ProductOperation::SearchCollection {
+                    collection,
+                    request,
+                },
+                hyphae_native_product::proof::NativeProofGenerationLimits::default(),
+                options.clone(),
+            )
+            .await
+            .map_err(normalize_client_error)?;
+        let ProductResponse::Proven { response, artifact } = response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        let ProductResponse::IntegratedSearch(result) = *response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        (
+            result,
+            Some(json!({
+                "proof_hex": crate::encode_hex(&artifact.proof_bytes),
+                "witness_hex": crate::encode_hex(&artifact.witness_bytes),
+                "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
+            })),
+        )
+    } else {
+        let response = client
+            .search_collection(collection, request, options.clone())
+            .await
+            .map_err(normalize_client_error)?;
+        let ProductResponse::IntegratedSearch(result) = response else {
+            return Err(Box::new(ProductError::from_code(
+                ProductErrorCode::Internal,
+            )));
+        };
+        (result, None)
+    };
+    let mut memories = Vec::new();
+    let mut filtered = 0_usize;
+    for hit in &result.hits {
+        let lifecycle = client
+            .structure_get(
+                memory_key(collection.get(), hit.object_id.get()),
+                options.clone(),
+            )
+            .await
+            .map_err(normalize_client_error)?;
+        match lifecycle {
+            ProductResponse::StructureValue(Some(bytes)) => {
+                memories.push(json!({
+                    "id": hit.object_id.get().to_string(),
+                    "score": hit.score,
+                    "text": String::from_utf8_lossy(&bytes),
+                }));
+            }
+            ProductResponse::StructureValue(None) => filtered += 1,
+            _ => {
+                return Err(Box::new(ProductError::from_code(
+                    ProductErrorCode::Internal,
+                )));
+            }
+        }
+    }
+    Ok(json!({
+        "memories": memories,
+        "expired_filtered": filtered,
+        "proof": proof,
+    }))
+}
+
+/// Forgets one memory permanently: the lifecycle key and the document
+/// leave together, and recall can never surface it again.
+async fn memory_forget(
+    client: &HyphaeClient,
+    input: MemoryForgetInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    let identity: u128 = input.id.parse().map_err(|_| invalid_request())?;
+    let collection = ObjectId::new(u128::from(input.collection)).map_err(|_| invalid_request())?;
+    let object_id = ObjectId::new(identity).map_err(|_| invalid_request())?;
+    // The lifecycle key tombstones through the public scalar surface: an
+    // immediately expired set makes it invisible to every recall, and the
+    // active-expiry scheduler reclaims it.
+    client
+        .structure_set(
+            memory_key(collection.get(), identity),
+            Vec::new(),
+            Some(crate::native::logical_time_micros()),
+            options.clone(),
+        )
+        .await
+        .map_err(normalize_client_error)?;
+    // The forget retry identity is derived from the memory identity but
+    // distinct from the store's ingest identity, so an exact forget retry
+    // replays while never colliding with the original ingest.
+    let mut forget_identity = [0_u8; 16];
+    forget_identity.copy_from_slice(
+        &blake3::Hasher::new()
+            .update(b"hyphae-memory-forget")
+            .update(&identity.to_le_bytes())
+            .finalize()
+            .as_bytes()[..16],
+    );
+    let forget_identity = match u128::from_le_bytes(forget_identity) {
+        0 => 1,
+        value => value,
+    };
+    client
+        .search_document_delete(
+            collection,
+            hyphae_native_product::ProductSearchDocumentDelete {
+                idempotency_id: forget_identity,
+                object_id,
+            },
+            options,
+        )
+        .await
+        .map_err(normalize_client_error)?;
+    Ok(json!({"status": "forgotten", "id": identity.to_string()}))
+}
+
+pub(crate) fn collection_search_request(
+    input: CollectionSearchInput,
+) -> Result<ProductSearchRequest, Box<ProductError>> {
+    Ok(ProductSearchRequest {
+        lexical: input.lexical.map(|branch| ProductLexicalBranch {
+            query: branch.query,
+            candidate_limit: branch.candidate_limit,
+            weight: branch.weight,
+        }),
+        vectors: input
+            .vectors
+            .into_iter()
+            .map(|branch| {
+                Ok(ProductVectorBranch {
+                    target: branch.target,
+                    query: ProductVector::new(branch.values).map_err(|_| invalid_request())?,
+                    candidate_limit: branch.candidate_limit,
+                    weight: branch.weight,
+                    execution: None,
+                })
+            })
+            .collect::<Result<_, Box<ProductError>>>()?,
+        filter: input
+            .filter
+            .map(|value| crate::product_search_filter(value).map_err(|_| invalid_request()))
+            .transpose()?
+            .unwrap_or(ProductSearchFilter::MatchAll),
+        sort: input
+            .sort
+            .into_iter()
+            .map(|value| crate::product_search_sort(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        facets: input
+            .facets
+            .into_iter()
+            .map(|value| crate::product_facet(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        aggregations: input
+            .aggregations
+            .into_iter()
+            .map(|value| crate::product_aggregation(value).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        limit: input.limit,
+        fusion: input.fusion.map(|method| match method {
+            FusionMethodInputValue::WeightedScore => {
+                hyphae_native_product::ProductFusionMethod::WeightedScore
+            }
+        }),
+        parent_dedupe: input.parent_dedupe.map(|dedupe| {
+            hyphae_native_product::ProductParentDedupe {
+                field: dedupe.field,
+                first_k: dedupe.first_k,
+            }
+        }),
+        rerank: None,
+        highlight: None,
+    })
+}
+
+/// Verifies one sealed proof and witness completely inside the adapter
+/// process; verification is trustless and never contacts the daemon.
+fn verify_proof_locally(input: &VerifyProofInput) -> Result<Value, Box<ProductError>> {
+    use hyphae_native_product::proof::{
+        ExternalTrustedAnchor, NativeVerificationLimits, verify_native_proof_offline,
+    };
+    let proof = crate::decode_hex_bytes(&input.proof_hex).map_err(|_| invalid_request())?;
+    let witness = crate::decode_hex_bytes(&input.witness_hex).map_err(|_| invalid_request())?;
+    let anchor = crate::decode_hex::<32>(&input.anchor_hex).map_err(|_| invalid_request())?;
+    let report = verify_native_proof_offline(
+        &proof,
+        &witness,
+        ExternalTrustedAnchor::new(anchor),
+        &NativeVerificationLimits::default(),
+    )
+    .map_err(|_| invalid_request())?;
+    let scope = if report.semantic_reexecution_performed {
+        "semantic_reexecution"
+    } else {
+        "artifact_integrity"
+    };
+    Ok(json!({
+        "status": "verified",
+        "scope": scope,
+        "kind": crate::proof_kind(report.kind),
+        "anchor_digest": crate::encode_hex(&report.anchor_digest),
+        "proof_digest": crate::encode_hex(&report.proof_digest),
+        "witness_digest": crate::encode_hex(&report.witness_digest),
+        "request_digest": crate::encode_hex(&report.request_digest),
+        "result_digest": crate::encode_hex(&report.result_digest),
+        "evidence_digest": crate::encode_hex(&report.evidence_digest),
+        "file_count": report.file_count,
+        "directory_count": report.directory_count,
+        "total_file_bytes": report.total_file_bytes,
+        "semantic_reexecution_performed": report.semantic_reexecution_performed,
+    }))
 }
 
 fn cancel_active_call(message: &Value, active: Option<&ActiveToolCall>) -> bool {
@@ -723,23 +1316,40 @@ fn parse_security_cursor(value: &str) -> Result<SecurityCursor, Box<ProductError
     SecurityCursor::from_token(value).map_err(|_| invalid_request())
 }
 
-fn response_for(
-    tool: NativeReadTool,
-    response: ProductResponse,
-) -> Result<Value, Box<ProductError>> {
+fn response_for(tool: NativeTool, response: ProductResponse) -> Result<Value, Box<ProductError>> {
     let expected = matches!(
         (tool, &response),
-        (
-            NativeReadTool::Capabilities,
-            ProductResponse::Capabilities(_)
-        ) | (
-            NativeReadTool::SecurityStatus,
-            ProductResponse::SecurityStatus(_)
-        ) | (
-            NativeReadTool::SecurityPrincipals,
-            ProductResponse::SecurityPrincipalPage(_)
-        )
+        (NativeTool::Capabilities, ProductResponse::Capabilities(_))
+            | (
+                NativeTool::SecurityStatus,
+                ProductResponse::SecurityStatus(_)
+            )
+            | (
+                NativeTool::SecurityPrincipals,
+                ProductResponse::SecurityPrincipalPage(_)
+            )
+            | (NativeTool::SearchLexical, ProductResponse::Search(_))
+            | (
+                NativeTool::SearchCollection,
+                ProductResponse::IntegratedSearch(_)
+            )
+            | (NativeTool::SearchIngest, ProductResponse::SearchIngested(_))
+            | (NativeTool::ProveSearch, ProductResponse::Proven { .. })
     );
+    if let (NativeTool::ProveSearch, ProductResponse::Proven { response, artifact }) =
+        (tool, &response)
+    {
+        return Ok(json!({
+            "status": "generated",
+            "kind": crate::proof_kind(artifact.proof.content().kind),
+            "response": response_json((**response).clone()),
+            "proof_hex": crate::encode_hex(&artifact.proof_bytes),
+            "witness_hex": crate::encode_hex(&artifact.witness_bytes),
+            "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
+            "proof_bytes": artifact.proof_bytes.len(),
+            "witness_bytes": artifact.witness_bytes.len(),
+        }));
+    }
     if !expected {
         return Err(Box::new(ProductError::from_code(
             ProductErrorCode::Internal,
@@ -786,8 +1396,20 @@ fn startup_client_error(error: ClientError) -> CliFailure {
 }
 
 fn tool_success(value: &Value, metadata: &Value) -> Value {
+    // Hosts read structuredContent; the text mirror omits bulk hex payloads
+    // so one artifact-bearing result never doubles past the message budget.
+    let text_value = match value.as_object() {
+        Some(object) if object.keys().any(|key| key.ends_with("_hex")) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| !key.ends_with("_hex"))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect(),
+        ),
+        _ => value.clone(),
+    };
     json!({
-        "content": [{ "type": "text", "text": compact_json(value) }],
+        "content": [{ "type": "text", "text": compact_json(&text_value) }],
         "structuredContent": value,
         "isError": false,
         "_meta": metadata,
@@ -965,14 +1587,21 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let registry = ToolRegistry::load()?;
         assert_eq!(registry.protocol, "2025-06-18");
-        assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v2");
+        assert_eq!(registry.schema_version, "hyphae-native-mcp-tools-v4");
         assert_eq!(registry.schema_digest.len(), 64);
         assert_eq!(registry.page_size, 100);
-        assert_eq!(registry.tools.len(), 3);
+        assert_eq!(registry.tools.len(), 11);
         let first = registry
             .list(&serde_json::json!({}))
             .map_err(|()| "first page")?;
-        assert_eq!(first["tools"].as_array().map(Vec::len), Some(3));
+        assert_eq!(first["tools"].as_array().map(Vec::len), Some(11));
+        let read_only = ToolRegistry::load()?.without_ingest();
+        assert_eq!(read_only.tools.len(), 8);
+        assert!(read_only.tools.iter().all(|tool| {
+            tool["name"]
+                .as_str()
+                .is_none_or(|name| !super::WRITE_TOOL_NAMES.contains(&name))
+        }));
         assert!(first.get("nextCursor").is_none());
         assert!(
             registry
@@ -1100,7 +1729,8 @@ mod tests {
     {
         let mut session = Session {
             client: HyphaeClient::new(CancellationTransport),
-            registry: ToolRegistry::load()?,
+            registry: ToolRegistry::load()?.without_ingest(),
+            allow_ingest: false,
             initialize_seen: true,
             initialized: true,
         };

@@ -21,9 +21,44 @@ import {
   SensitiveBytes,
   windowsPipePath,
 } from "../dist/v2/index.js";
-import { decodeProductRequest } from "../dist/v2/protocol.js";
+import { decodeProductRequest, operationRequiredMinor } from "../dist/v2/protocol.js";
 
 const fixtureUrl = new URL("../../../compatibility/native-protocol-v1-structure-get.bin", import.meta.url);
+
+test("v2 search content at every current shape is minor zero", () => {
+  // Every currently expressible search body is minor-0 content; the content
+  // walk exists so future operators, typed doc values, and fusion methods
+  // raise the requirement without new operations.
+  assert.equal(
+    operationRequiredMinor("search_collection", {
+      filter: {
+        kind: "not",
+        filter: {
+          kind: "all",
+          filters: [
+            { kind: "match_all" },
+            { kind: "compare", field: "price", operator: "less_or_equal", value: 40n },
+          ],
+        },
+      },
+    }),
+    0,
+  );
+  assert.equal(
+    operationRequiredMinor("search_ingest", {
+      documents: [{ object_id: 1n, text: "rust", doc_values: { flag: true, rank: 3n, name: "a" } }],
+    }),
+    0,
+  );
+  assert.equal(
+    operationRequiredMinor("proof_generate", {
+      operation: "search_collection",
+      arguments: { filter: { kind: "match_all" } },
+    }),
+    0,
+  );
+  assert.equal(operationRequiredMinor("security_status"), 1);
+});
 
 test("v2 completion BLAKE3 matches published vectors", () => {
   const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -334,6 +369,89 @@ test("v2 independent encoder matches shared fixture", async () => {
   assert.deepEqual(encodeFrame(FRAME_KIND.execute, 7, 42n, payload), fixture);
 });
 
+test("v2 attested rerank request matches the cross-language golden", () => {
+  const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const name = (value) => {
+    const encoded = new TextEncoder().encode(value);
+    return [encoded.byteLength & 0xff, encoded.byteLength >> 8, ...encoded];
+  };
+  const envelope = Uint8Array.from([
+    ...new TextEncoder().encode("HYATTS01"), 2,
+    ...name("openai"), ...name("text-embedding-3-small"),
+    ...Array(32).fill(3), ...Array(32).fill(4),
+  ]);
+  const args = {
+    collection: 13n,
+    request: {
+      lexical: { query: "rust", candidate_limit: 4, weight: 1 },
+      vectors: [],
+      limit: 4,
+      rerank: {
+        attestation: envelope,
+        scores: [
+          { object_id: 201n, score: 0.75 },
+          { object_id: 202n, score: 0.25 },
+        ],
+      },
+    },
+  };
+  const options = { logicalTimeMicros: 10n, durability: "memory" };
+  assert.throws(() => encodeProductRequest("search_collection", args, options, 3), /protocol minor/);
+  const encoded = encodeProductRequest("search_collection", args, options, 4);
+  // The same digest is pinned by the Rust protocol goldens and the Python
+  // suite for this identically composed request.
+  assert.equal(hex(blake3(encoded)), "f61fd68c170b8cf0841678aeda0819f7ff98869486b51ea10c104e8e2d4cee04");
+});
+
+test("v2 highlighted request matches the cross-language golden", () => {
+  const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const args = {
+    collection: 13n,
+    request: {
+      lexical: { query: "rust", candidate_limit: 4, weight: 1 },
+      vectors: [],
+      limit: 4,
+      highlight: { max_fragments: 2, fragment_bytes: 64 },
+    },
+  };
+  const options = { logicalTimeMicros: 10n, durability: "memory" };
+  assert.throws(() => encodeProductRequest("search_collection", args, options, 4), /protocol minor/);
+  const encoded = encodeProductRequest("search_collection", args, options, 5);
+  // The same digest is pinned by the Rust protocol goldens and the Python
+  // suite for this identically composed request.
+  assert.equal(hex(blake3(encoded)), "1438488e4d12a342a71d1cab17bad2fecf6ddc46ecb8e73970fc6f037e5e1443");
+});
+
+test("v2 integrated search response decodes with and without fragments", () => {
+  const fromHex = (hex) => Uint8Array.from(hex.match(/../gu), (byte) => Number.parseInt(byte, 16));
+  // Both payloads are Rust-encoded goldens for the same one-hit result; the
+  // second carries the minor-5 content-derived fragments tail.
+  const plain = fromHex(
+    "4859505253503031bc0000001600000001010101010101010101010101010101" +
+    "0101010101010101000000000000000003000000000000000404040404040404" +
+    "0404040404040404040404040404040404040404040404040500000000000000" +
+    "01000000c9000000000000000000000000000000000000000000f83f00000000" +
+    "0000000000000000000000000000000000000000010000000000000001000000" +
+    "00000000010000000000000001000000000000000100000000000000",
+  );
+  const fragmented = fromHex(
+    "4859505253503031d20000001600000001010101010101010101010101010101" +
+    "0101010101010101000000000000000003000000000000000404040404040404" +
+    "0404040404040404040404040404040404040404040404040500000000000000" +
+    "01000000c9000000000000000000000000000000000000000000f83f00000000" +
+    "0000000000000000000000000000000000000000010000000000000001000000" +
+    "0000000001000000000000000100000000000000010000000000000001010000" +
+    "000d00000072757374206461746162617365",
+  );
+  for (const [payload, fragments] of [[plain, undefined], [fragmented, ["rust database"]]]) {
+    const response = decodeProductResponse(payload, 1n, 5);
+    assert.equal(response.kind, "integrated_search");
+    const hit = response.value.hits[0];
+    assert.equal(hit.objectId, 201n);
+    assert.deepEqual(hit.fragments, fragments);
+  }
+});
+
 test("v2 transaction and catalog requests round trip", () => {
   const cases = [
     ["transaction_begin", {}],
@@ -531,7 +649,7 @@ test("v2 HTTP client uses /v2 and validates correlation", async () => {
   });
   const response = await client.capabilities({ requestId: 17n });
   assert.equal(response.kind, "capabilities");
-  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3" });
+  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5" });
   assert.equal(ERROR_MEDIA_TYPE, "application/vnd.hyphae.error-v1");
 });
 
@@ -658,6 +776,6 @@ test("v2 HTTP routes all API-key lifecycle phases through the dedicated family",
   }
   assert.deepEqual(seen, operations.map(() => ({
     url: "https://example.test/v2/security/keys",
-    minor: "3",
+    minor: "3,4,5",
   })));
 });

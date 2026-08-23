@@ -77,7 +77,7 @@
     },
     {
       "reference": "docs/native/native-proof-v1.md",
-      "sha256": "6ad51ce1f71b91fca40cf0a7bc61a3dbafbd61dd19030de57159e7720c9f9d87"
+      "sha256": "2cf7dd4d39b2069c78fe6aa9f8bb741d178f05663b5c2d299fc324d9a355063e"
     },
     {
       "reference": "docs/native/native-witness-v1.md",
@@ -85,19 +85,19 @@
     },
     {
       "reference": "docs/native/http-v2.md",
-      "sha256": "364445b463d2b10926c2db25d902d26ce85e0dcde5d67e6c29f5736d215c6a3f"
+      "sha256": "56620d50bfe265f8fbd762d99b8a07889ee88ef17eba9e31d870d3736a0c7651"
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "6a8242aeb2030fb4dbf943355ad2571cd5791d87d3c15f3baff0d78c1acb431a"
+      "sha256": "3d1796c90e3fd1228172e1c5c3069bffbc813f27fb87b5715074db7cee98573b"
     },
     {
       "reference": "docs/native/catalog-v1.md",
-      "sha256": "8ec9d515a8d893f6ecce5e7ddf3e5c9aeb7e9fb45b0a1a7254595a46fb8813e0"
+      "sha256": "4fde1fbd0991691ab9064e1ab08808a1152d73c850bd19dba1939eec32906e11"
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "441ae90091b070c12dfab5540cb06516d39e9d39d2a917117f456940f9736f64"
+      "sha256": "0b018082fd5e78a4517d561cbfcac1317ff7c4e164f1607218e0793323703240"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",
@@ -109,7 +109,7 @@
     },
     {
       "reference": "contracts/openapi/hyphae-v2.yaml",
-      "sha256": "76b401819bddc9bc704d7374d57f5f379ee453b9495357b8ca97270ba06a95f6"
+      "sha256": "6a1d2209cbc01b0c04a0b4f6806c4514ff75be95dd695ce7a842680e19d45036"
     },
     {
       "reference": "contracts/json-schema/native-v2.schema.json",

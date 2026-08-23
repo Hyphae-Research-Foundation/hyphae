@@ -29,6 +29,15 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native G6 local-product roadmap](roadmaps/native-g6-roadmap.md)
 - [Native hardware-aware performance roadmap](roadmaps/native-performance-architecture-roadmap.md)
 - [Native acceleration and verification-asymmetry roadmap](roadmaps/native-acceleration-roadmap.md)
+- [RAG competitive roadmap](roadmaps/rag-competitive-roadmap.md)
+- [RAG relevance baseline — NFCorpus (2026-08-20)](gates/evidence/rag-relevance-nfcorpus-2026-08-20.md)
+- [RAG relevance at the 100k cap — FiQA (2026-08-21)](gates/evidence/rag-relevance-fiqa-2026-08-21.md)
+- [RAG filtered eligibility at the 100k cap (2026-08-22)](gates/evidence/rag-filtered-eligibility-2026-08-22.md)
+- [RAG hybrid fusion methods — NFCorpus (2026-08-22)](gates/evidence/rag-hybrid-fusion-nfcorpus-2026-08-22.md)
+- [RAG cross-host determinism — FiQA byte-identical directories (2026-08-22)](gates/evidence/rag-cross-host-determinism-2026-08-22.md)
+- [RAG attested rerank uplift — NFCorpus (2026-08-23)](gates/evidence/rag-attested-rerank-nfcorpus-2026-08-23.md)
+- [RAG head-to-head vs Weaviate OSS (2026-08-23)](gates/evidence/rag-weaviate-head-to-head-2026-08-23.md)
+- [Attested local embedding replay — bge-small-en-v1.5 (2026-08-22)](gates/evidence/attested-embed-replay-2026-08-22.md)
 
 ## Build and embed
 
@@ -37,6 +46,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Stable API error codes](api/error-codes-v1.md)
 - [Public clients](clients/v1.md)
 - [Optional framework adapters](integrations/optional-adapters.md)
+- [Provable RAG cookbook](integrations/rag-cookbook.md)
 - [MCP adapter](../mcp/README.md)
 - [Executable examples](../examples/README.md)
 
@@ -128,6 +138,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Durable exact retrieval semantics v2](retrieval/exact-reference-semantics-v2.md)
 - [Lexical retrieval semantics v1](retrieval/lexical-reference-semantics-v1.md)
 - [Hybrid retrieval semantics v1](retrieval/hybrid-reference-semantics-v1.md)
+- [Retrieval claim protocol](retrieval/claims-protocol.md)
 - [0.2 retrieval benchmark methodology](performance/retrieval-benchmark-0.2.md)
 - [Microsecond-first performance contract](performance/microsecond-first.md)
 - [Native performance evidence v1](performance/native-performance-evidence-v1.md)
@@ -170,6 +181,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)
 - [Porting ledger](porting/ledger.md)
+- [Leave Weaviate with a receipt](porting/leave-weaviate.md)
 - [Development guide](development.md)
 - [0.1.0 release gate](gates/0.1.0.md)
 - [0.2.0 release gate](gates/0.2.0.md)

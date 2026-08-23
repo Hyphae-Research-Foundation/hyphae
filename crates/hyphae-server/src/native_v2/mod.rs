@@ -2002,7 +2002,7 @@ mod tests {
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             unsupported.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "3"
+            "5"
         );
 
         for (request_id, minor) in [("496", None), ("497", Some("garbage"))] {
@@ -2026,7 +2026,80 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "3"
+                "5"
+            );
+        }
+
+        // A bounded multi-minor offer selects the highest served member and
+        // echoes the selection; malformed or unserved offers fail closed.
+        for (request_id, offer, selected) in [
+            ("510", "3,4", "4"),
+            ("511", "1, 3", "3"),
+            ("512", "4,3,2", "4"),
+            ("513", "4", "4"),
+            ("508", "3,4,5", "5"),
+        ] {
+            let mut accepted = http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some(request_id),
+                None,
+                None,
+            )?;
+            accepted.headers_mut().insert(
+                hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                offer.parse()?,
+            );
+            let accepted = app.clone().oneshot(accepted).await?;
+            assert_eq!(accepted.status(), StatusCode::OK);
+            assert_eq!(
+                accepted.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+                selected
+            );
+        }
+        let mut repeated = http_request(
+            "/v2/execute",
+            request(ProductOperation::Capabilities)?,
+            Some("520"),
+            None,
+            None,
+        )?;
+        repeated
+            .headers_mut()
+            .insert(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "5".parse()?);
+        repeated
+            .headers_mut()
+            .append(hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2, "3".parse()?);
+        let repeated = app.clone().oneshot(repeated).await?;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(
+            repeated.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+            "5"
+        );
+        for (request_id, offer) in [
+            ("514", "3,3"),
+            ("515", "03"),
+            ("516", "3,"),
+            ("517", "1,2,5,6,7,8,9,10,3"),
+            ("518", "6"),
+            ("519", "3 4"),
+        ] {
+            let mut rejected = http_request(
+                "/v2/execute",
+                request(ProductOperation::Capabilities)?,
+                Some(request_id),
+                None,
+                Some(ERROR_MEDIA_TYPE),
+            )?;
+            rejected.headers_mut().insert(
+                hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2,
+                offer.parse()?,
+            );
+            let rejected = app.clone().oneshot(rejected).await?;
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
+                "5"
             );
         }
 
@@ -2070,7 +2143,7 @@ mod tests {
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             error.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "3"
+            "5"
         );
         drop(service);
         Ok(())
@@ -2492,6 +2565,10 @@ mod tests {
                 facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 1,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
             },
         };
         assert!(super::server::family_accepts(

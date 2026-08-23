@@ -10,6 +10,7 @@
 mod analyzer;
 mod ann_store;
 mod backup;
+pub mod bm25f;
 mod bounded_search;
 mod calibration;
 mod convergence;
@@ -181,7 +182,15 @@ pub use local_transaction::{
     encode_local_transaction_rollback, encode_local_transaction_rollback_receipt,
     encode_local_transaction_stage_receipt,
 };
+pub use model::Bm25ScoreParameters;
+pub mod external_migration;
 pub mod migration;
+pub use external_migration::{
+    ConstructClassification, EXTERNAL_MIGRATION_DIGEST_DOMAIN, EXTERNAL_MIGRATION_RECEIPT_KIND,
+    EXTERNAL_MIGRATION_RECEIPT_VERSION, ExternalConsistencyPoint, ExternalMigrationReceipt,
+    ExternalMigrationReceiptError, ExternalMigrationReceiptLimits, ExternalSourceIdentity,
+    ExternalTargetState, FidelityClass, MappingDecision, OperatorWaiver, TargetKeyspace,
+};
 #[cfg(unix)]
 #[allow(deprecated)]
 pub use local_uds::{UdsFrameConnection, UdsFrameListener};
@@ -211,9 +220,10 @@ pub use search_doc_values::{
     DocValueSort, DocValueSortDirection, DocValueSortSource, FacetBucket, FacetRequest,
     FacetResult, MAX_DOC_VALUE_AGGREGATIONS, MAX_DOC_VALUE_BYTES, MAX_DOC_VALUE_CANDIDATES,
     MAX_DOC_VALUE_FACET_TERMS, MAX_DOC_VALUE_FACETS, MAX_DOC_VALUE_FILTER_DEPTH,
-    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
+    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_IN_MEMBERS,
+    MAX_DOC_VALUE_LIKE_PATTERN_BYTES, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
     MAX_DOC_VALUES_PER_CANDIDATE, MissingPlacement, NamedDocValueAggregation,
-    NamedDocValueAggregationValue, execute_doc_values,
+    NamedDocValueAggregationValue, execute_doc_values, like_matches,
 };
 pub use set_algebra::{
     MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,
@@ -3260,6 +3270,7 @@ struct LexicalExecutionPlan {
     format: PhysicalSearchFormat,
     index: ObjectId,
     average_length: f64,
+    parameters: model::Bm25ScoreParameters,
     planned_terms: usize,
     planned_segments: usize,
     planned_physical_entries: usize,
@@ -3498,7 +3509,7 @@ fn set_algebra_in_state(
 #[derive(Clone, Debug)]
 pub struct NativeSnapshot {
     metadata: Snapshot,
-    state: MaterializedState,
+    state: Arc<MaterializedState>,
 }
 
 impl NativeSnapshot {
@@ -3590,6 +3601,16 @@ impl NativeSnapshot {
         )
     }
 
+    /// Returns one document's exact retained source text from a physical
+    /// lexical index.
+    pub fn search_document_text(&self, index: ObjectId, document_id: &[u8]) -> Option<&str> {
+        self.state
+            .search
+            .documents(index)?
+            .get(document_id)
+            .map(String::as_str)
+    }
+
     /// Returns the exact retained source text for one physical lexical index.
     pub fn search_documents(&self, index: ObjectId) -> Option<Vec<(Vec<u8>, String)>> {
         self.state.search.documents(index).map(|documents| {
@@ -3605,11 +3626,49 @@ impl NativeSnapshot {
         self.state.relational.select(table, primary_key)
     }
 
+    /// Scores one free-text query through the retained model with tuned
+    /// BM25 parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index or an overflowing corpus.
+    pub fn match_text_with_parameters(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        parameters: model::Bm25ScoreParameters,
+    ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
+        Ok(self
+            .state
+            .search
+            .search_with_parameters(index, query, limit, parameters)?
+            .into_iter()
+            .map(|(document_id, score)| MatchHit { document_id, score })
+            .collect())
+    }
+
     /// Returns a structure value unless it is expired at snapshot logical time.
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         self.state
             .structures
             .get(key, self.metadata.logical_time_micros)
+    }
+
+    /// Returns the visible scalar keys inside `[start, end)` in ascending
+    /// order, or `None` fail-closed once more than `limit` keys are visible.
+    pub fn structure_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.state.structures.visible_keys_in_range(
+            start,
+            end,
+            self.metadata.logical_time_micros,
+            limit,
+        )
     }
 
     /// Returns the key's TTL state at snapshot logical time.
@@ -5122,6 +5181,11 @@ pub struct NativeDatabase {
     database_live: Arc<AtomicBool>,
     governor_generation: u64,
     sql_plan_cache: Mutex<NativeSqlPlanCache>,
+    /// Most recent decoded snapshot state, keyed by the immutable root-set
+    /// digest. A snapshot whose roots are unchanged reuses the decoded state
+    /// instead of re-materializing the whole directory; any digest change
+    /// misses and loads fully.
+    snapshot_state_cache: Mutex<Option<([u8; 32], Arc<MaterializedState>)>>,
     directory_guard: NativeDirectoryGuard,
 }
 
@@ -5238,6 +5302,7 @@ impl NativeDatabase {
             database_live: Arc::new(AtomicBool::new(true)),
             governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
+            snapshot_state_cache: Mutex::new(None),
             directory_guard,
         })
     }
@@ -5471,6 +5536,7 @@ impl NativeDatabase {
             database_live: Arc::new(AtomicBool::new(true)),
             governor_generation: 0,
             sql_plan_cache: Mutex::new(NativeSqlPlanCache::default()),
+            snapshot_state_cache: Mutex::new(None),
             directory_guard,
         })
     }
@@ -7133,7 +7199,24 @@ impl NativeDatabase {
         logical_time_micros: i64,
     ) -> Result<NativeSnapshot, NativeRuntimeError> {
         let metadata = self.coordinator.snapshot(logical_time_micros)?;
-        let state = load_state(&self.pages, &self.blobs, metadata.roots())?;
+        let digest = metadata.roots().digest();
+        let cached = self
+            .snapshot_state_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|(key, state)| (*key == digest).then(|| Arc::clone(state)));
+        let state = if let Some(state) = cached {
+            state
+        } else {
+            let state = Arc::new(load_state(&self.pages, &self.blobs, metadata.roots())?);
+            *self
+                .snapshot_state_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((digest, Arc::clone(&state)));
+            state
+        };
         Ok(NativeSnapshot { metadata, state })
     }
 
@@ -7252,7 +7335,7 @@ impl NativeDatabase {
         .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
         validate_roots(&pages, &self.blobs, &roots, pin.visible_csn())
             .map_err(|_| NativeRuntimeError::InvalidSnapshotPinAuthority)?;
-        let state = load_state(&pages, &self.blobs, &roots)?;
+        let state = Arc::new(load_state(&pages, &self.blobs, &roots)?);
         let metadata = Snapshot::from_committed_root(roots, pin.logical_time_micros())?;
         Ok(NativeSnapshot { metadata, state })
     }
@@ -14873,7 +14956,15 @@ impl NativeDatabase {
             let execution = planning_permit.map(DatabaseGovernorPermit::finish);
             return Ok(direct_lexical_receipt(visible_csn, hits, execution));
         }
-        self.match_btree_text_profiled(index, query, limit, planning_permit)
+        let snapshot = self.coordinator.snapshot(0)?;
+        self.match_btree_text_profiled(
+            &snapshot,
+            index,
+            query,
+            limit,
+            model::Bm25ScoreParameters::default(),
+            planning_permit,
+        )
     }
 
     // Keep the ordered fail-closed validation, bounded visitor, accounting,
@@ -15481,14 +15572,60 @@ impl NativeDatabase {
         })
     }
 
-    fn match_btree_text_profiled(
+    /// Scores one analyzed free-text query from the durable BM25 postings at
+    /// the supplied retained snapshot's roots, bit-identical to the model.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the snapshot carries no visible commit, its page
+    /// generation was reclaimed by vacuum, the index is not a catalogued
+    /// search object at that root, or the physical tree is invalid. The
+    /// inline state format is answered by the retained model instead.
+    pub fn match_text_at_snapshot(
         &self,
+        snapshot: &NativeSnapshot,
         index: ObjectId,
         query: &str,
         limit: usize,
+        parameters: model::Bm25ScoreParameters,
+    ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return snapshot.match_text_with_parameters(index, query, limit, parameters);
+        }
+        let planning_permit = self.admit_foreground_bounded()?;
+        let current = self.coordinator.snapshot(0)?;
+        if snapshot.metadata.roots().page_generation() != current.roots().page_generation() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        let catalog_root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        match self.catalog_object_at_root(catalog_root, index)? {
+            Some(CatalogObject::Search(_)) => {}
+            _ => return Err(ModelError::UnknownObject.into()),
+        }
+        let receipt = self.match_btree_text_profiled(
+            &snapshot.metadata,
+            index,
+            query,
+            limit,
+            parameters,
+            planning_permit,
+        )?;
+        Ok(receipt.hits)
+    }
+
+    fn match_btree_text_profiled(
+        &self,
+        snapshot: &hyphae_native_mvcc::Snapshot,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        parameters: model::Bm25ScoreParameters,
         planning_permit: Option<DatabaseGovernorPermit>,
     ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
-        let snapshot = self.coordinator.snapshot(0)?;
         let visible_csn = snapshot
             .visible_csn
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
@@ -15523,6 +15660,7 @@ impl NativeDatabase {
                 document_count,
                 document_count_f64,
                 average_length,
+                parameters,
                 limit,
             )?;
             let execution = planning_permit.map(DatabaseGovernorPermit::finish);
@@ -15555,6 +15693,7 @@ impl NativeDatabase {
         let planning = planning_permit.map(DatabaseGovernorPermit::finish);
         self.execute_lexical_plan(
             LexicalExecutionPlan {
+                parameters,
                 snapshot_csn: visible_csn,
                 tree,
                 format,
@@ -15592,6 +15731,7 @@ impl NativeDatabase {
                     plan.format,
                     plan.index,
                     plan.average_length,
+                    plan.parameters,
                     plan.work,
                     execution_pool,
                     permit.permit(),
@@ -15602,6 +15742,7 @@ impl NativeDatabase {
                     plan.format,
                     plan.index,
                     plan.average_length,
+                    plan.parameters,
                     &plan.work,
                 )?,
                 0,
@@ -15623,6 +15764,7 @@ impl NativeDatabase {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn match_text_in_tree_direct(
         &self,
         tree: BTree,
@@ -15632,6 +15774,7 @@ impl NativeDatabase {
         document_count: u64,
         document_count_f64: f64,
         average_length: f64,
+        parameters: model::Bm25ScoreParameters,
         limit: usize,
     ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
         let mut scores = BTreeMap::<Vec<u8>, f64>::new();
@@ -15690,6 +15833,7 @@ impl NativeDatabase {
                     f64::from(term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
+                    parameters,
                 );
             }
             if live_postings != document_frequency {
@@ -15752,6 +15896,7 @@ impl NativeDatabase {
         format: PhysicalSearchFormat,
         index: ObjectId,
         average_length: f64,
+        parameters: model::Bm25ScoreParameters,
         work: &[LexicalSegmentWork],
     ) -> Result<Vec<LexicalPostingBatch>, NativeRuntimeError> {
         work.iter()
@@ -15763,6 +15908,7 @@ impl NativeDatabase {
                     format,
                     index,
                     average_length,
+                    parameters,
                     work,
                 )
             })
@@ -15770,12 +15916,14 @@ impl NativeDatabase {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn scan_lexical_segments_parallel(
         &self,
         tree: BTree,
         format: PhysicalSearchFormat,
         index: ObjectId,
         average_length: f64,
+        parameters: model::Bm25ScoreParameters,
         work: Vec<LexicalSegmentWork>,
         execution_pool: &NativeExecutionPool,
         permit: &OwnedGovernorPermit,
@@ -15799,6 +15947,7 @@ impl NativeDatabase {
                         format,
                         index,
                         average_length,
+                        parameters,
                         &work,
                     )
                 },
@@ -29910,6 +30059,7 @@ fn decode_lexical_segment(
     format: PhysicalSearchFormat,
     index: ObjectId,
     average_length: f64,
+    parameters: model::Bm25ScoreParameters,
     work: &LexicalSegmentWork,
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
     let mut live_postings = 0_u64;
@@ -29939,6 +30089,7 @@ fn decode_lexical_segment(
                 f64::from(term_frequency),
                 search_count_f64(document_length)?,
                 average_length,
+                parameters,
             ),
         ));
     }
@@ -39474,6 +39625,46 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_roots_reuse_the_decoded_snapshot_state() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let index = ObjectId::new(10)?;
+        let mut seed = database.begin(10, DurabilityClass::Memory)?;
+        seed.create_search_index(index, "native_search")?;
+        seed.index_document(index, b"a".to_vec(), "rust engine".to_owned())?;
+        seed.commit()?;
+
+        let first = database.snapshot(11)?;
+        // The roots have not changed: the second snapshot must reuse the
+        // decoded state without re-materializing the directory.
+        super::FAIL_FULL_STATE_LOAD.set(true);
+        let second = database.snapshot(12)?;
+        super::FAIL_FULL_STATE_LOAD.set(false);
+        assert_eq!(first.root_digest(), second.root_digest());
+        assert!(Arc::ptr_eq(&first.state, &second.state));
+        let pinned = first.match_text(index, "rust", 8)?;
+        let reused = second.match_text(index, "rust", 8)?;
+        assert_eq!(pinned.len(), reused.len());
+        for (left, right) in pinned.iter().zip(&reused) {
+            assert_eq!(left.document_id, right.document_id);
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+        }
+
+        // A commit changes the roots: the next snapshot misses the cache
+        // and decodes the new state fully.
+        let mut write = database.begin(13, DurabilityClass::Memory)?;
+        write.index_document(index, b"b".to_vec(), "sql engine".to_owned())?;
+        write.commit()?;
+        let third = database.snapshot(14)?;
+        assert_ne!(second.root_digest(), third.root_digest());
+        assert!(!Arc::ptr_eq(&second.state, &third.state));
+        assert_eq!(third.match_text(index, "sql", 8)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn native_inverted_index_matches_reference_bm25_across_recovery()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -39498,6 +39689,35 @@ mod tests {
                 database.match_latest_text(index, query, 25)?,
                 historical.match_text(index, query, 25)?
             );
+            // The pinned-snapshot posting scorer must be bit-identical to
+            // the retained model at the same roots.
+            let pinned = database.match_text_at_snapshot(
+                &historical,
+                index,
+                query,
+                25,
+                super::Bm25ScoreParameters::default(),
+            )?;
+            let model = historical.match_text(index, query, 25)?;
+            assert_eq!(pinned.len(), model.len());
+            for (durable, reference) in pinned.iter().zip(&model) {
+                assert_eq!(durable.document_id, reference.document_id);
+                assert_eq!(durable.score.to_bits(), reference.score.to_bits());
+            }
+            // Tuned parameters must stay bit-identical between the pinned
+            // posting scorer and the retained model as well.
+            let tuned = super::Bm25ScoreParameters {
+                k1_micros: 900_000,
+                b_micros: 0,
+            };
+            let pinned_tuned =
+                database.match_text_at_snapshot(&historical, index, query, 25, tuned)?;
+            let model_tuned = historical.match_text_with_parameters(index, query, 25, tuned)?;
+            assert_eq!(pinned_tuned.len(), model_tuned.len());
+            for (durable, reference) in pinned_tuned.iter().zip(&model_tuned) {
+                assert_eq!(durable.document_id, reference.document_id);
+                assert_eq!(durable.score.to_bits(), reference.score.to_bits());
+            }
         }
 
         let serial_segmented =

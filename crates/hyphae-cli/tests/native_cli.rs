@@ -73,6 +73,25 @@ fn output(arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
         .output()?)
 }
 
+/// Runs one CLI command with ambient credential variables removed, so tests
+/// stay deterministic when the harness environment exports a key file.
+fn run_isolated(arguments: &[&str]) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(arguments)
+        .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+        .env_remove("HYPHAE_BASE_URL")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hyphae {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 fn security_output(data: &Path, key: &Path, operation: &[&str]) -> Result<Output, Box<dyn Error>> {
     Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
         .args(["security", "--data-dir"])
@@ -3366,11 +3385,11 @@ fn assert_mcp_read_only_session(stdout: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(responses.len(), 8);
     let schema_version = &responses[0]["result"]["_meta"]["hyphaeToolSchemaVersion"];
     let schema_digest = &responses[0]["result"]["_meta"]["hyphaeToolSchemaDigest"];
-    assert_eq!(schema_version, "hyphae-native-mcp-tools-v2");
+    assert_eq!(schema_version, "hyphae-native-mcp-tools-v4");
     assert_eq!(schema_digest.as_str().map(str::len), Some(64));
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
-        Some(3)
+        Some(8)
     );
     assert!(responses[1]["result"].get("nextCursor").is_none());
     assert_eq!(responses[2]["error"]["code"], -32602);
@@ -3486,4 +3505,1270 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+/// Builds one minimal legacy-encoded Valkey/Redis RDB v11 payload without a
+/// trailer checksum: two databases, strings with and without expiry, one
+/// hash, one intset set, one list, and one sorted set.
+fn valkey_rdb_sample() -> Vec<u8> {
+    fn string(payload: &mut Vec<u8>, bytes: &[u8]) {
+        assert!(bytes.len() < 64);
+        payload.push(u8::try_from(bytes.len()).unwrap_or(0));
+        payload.extend_from_slice(bytes);
+    }
+    let mut payload = b"REDIS0011".to_vec();
+    payload.push(0xFA);
+    string(&mut payload, b"redis-ver");
+    string(&mut payload, b"7.2.5");
+    payload.push(0xFE);
+    payload.push(0);
+    payload.push(0);
+    string(&mut payload, b"greeting");
+    string(&mut payload, b"hola");
+    payload.push(0xFC);
+    payload.extend_from_slice(&4_102_444_800_000_u64.to_le_bytes());
+    payload.push(0);
+    string(&mut payload, b"session");
+    string(&mut payload, b"active");
+    payload.push(4);
+    string(&mut payload, b"note:1");
+    payload.push(2);
+    string(&mut payload, b"author");
+    string(&mut payload, b"mario");
+    string(&mut payload, b"state");
+    string(&mut payload, b"published");
+    payload.push(11);
+    string(&mut payload, b"codes");
+    let mut intset = Vec::new();
+    intset.extend_from_slice(&4_u32.to_le_bytes());
+    intset.extend_from_slice(&2_u32.to_le_bytes());
+    intset.extend_from_slice(&7_u32.to_le_bytes());
+    intset.extend_from_slice(&11_u32.to_le_bytes());
+    string(&mut payload, &intset);
+    payload.push(1);
+    string(&mut payload, b"queue");
+    payload.push(3);
+    string(&mut payload, b"first");
+    string(&mut payload, b"second");
+    string(&mut payload, b"third");
+    payload.push(3);
+    string(&mut payload, b"ranking");
+    payload.push(1);
+    string(&mut payload, b"note:1");
+    string(&mut payload, b"9.5");
+    payload.push(0xFE);
+    payload.push(1);
+    payload.push(0);
+    string(&mut payload, b"other");
+    string(&mut payload, b"db");
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0_u8; 8]);
+    payload
+}
+
+#[test]
+fn valkey_migration_runs_verifies_promotes_and_reads_back() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let inspected = run(&[
+        "migrate",
+        "inspect",
+        "--source",
+        &path(&source),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(inspected["status"], "inspected");
+    assert_eq!(inspected["key_count"], 7);
+    assert_eq!(inspected["database_count"], 2);
+    assert_eq!(
+        inspected["unwaived_constructs"],
+        serde_json::json!(["checksum-absent"])
+    );
+
+    let imported = run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["imported_keys"], 7);
+    assert_eq!(imported["skipped_expired"], 0);
+    assert!(target.join("FORMAT.pending").exists());
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+    assert_eq!(receipt["kind"], "hyphae-external-migration-receipt");
+    assert_eq!(receipt["source"]["kind"], "valkey-rdb");
+    assert_eq!(receipt["waivers"][0]["construct"], "checksum-absent");
+
+    let verified = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["pending"], true);
+
+    let promoted = run(&[
+        "migrate",
+        "promote",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(promoted["status"], "promoted");
+    assert!(target.join("FORMAT").exists());
+    assert!(!target.join("FORMAT.pending").exists());
+
+    let reopened = run(&["status", "--data-dir", &path(&target)])?;
+    assert_eq!(reopened["status"], "ready");
+    let catalog = run(&["catalog", "--data-dir", &path(&target), "list"])?;
+    let rendered = catalog.to_string();
+    assert!(rendered.contains("valkey_db0_strings"));
+    assert!(rendered.contains("valkey_db1_strings"));
+    assert!(rendered.contains("valkey_db0_hashes"));
+
+    let verified_promoted = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified_promoted["pending"], false);
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_fails_closed_without_the_required_waiver() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let rejected = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!rejected.status.success());
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!target.exists());
+    assert!(!manifest.exists());
+
+    let unknown_waiver = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+        "--waive",
+        "nonexistent-construct",
+    ])?;
+    assert!(!unknown_waiver.status.success());
+    assert!(!target.exists());
+
+    let format2_waiver = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(!format2_waiver.status.success());
+    assert!(!target.exists());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_detects_receipt_and_target_tampering() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+
+    // A tampered receipt fails its sealed digest validation.
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+    receipt["source"]["key_count"] = serde_json::json!(99);
+    let tampered_manifest = temporary.0.join("tampered.json");
+    fs::write(&tampered_manifest, serde_json::to_vec(&receipt)?)?;
+    let tampered = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&tampered_manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!tampered.status.success());
+
+    // A receipt bound to a different target directory fails identity checks.
+    let second_target = temporary.0.join("second-target");
+    let second_manifest = temporary.0.join("second-receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&second_target),
+        "--manifest",
+        &path(&second_manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    let swapped = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&second_manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!swapped.status.success());
+
+    // A source that differs from the receipt fails identity checks.
+    let mut altered = valkey_rdb_sample();
+    let position = altered
+        .windows(4)
+        .position(|window| window == b"hola")
+        .ok_or("sample value missing")?;
+    altered[position] = b'H';
+    let altered_source = temporary.0.join("altered.rdb");
+    fs::write(&altered_source, altered)?;
+    let altered_verify = output(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&altered_source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert!(!altered_verify.status.success());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_rollback_removes_only_the_pending_target() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(target.join("FORMAT.pending").exists());
+
+    let rolled_back = run(&["migrate", "rollback", "--target", &path(&target)])?;
+    assert_eq!(rolled_back["status"], "rolled_back");
+    assert!(!target.exists());
+    assert!(source.exists());
+    assert!(manifest.exists());
+    Ok(())
+}
+
+#[test]
+fn valkey_migration_rejects_path_overlap() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let source_directory = temporary.0.join("sources");
+    fs::create_dir_all(&source_directory)?;
+    let source = source_directory.join("dump.rdb");
+    fs::write(&source, valkey_rdb_sample())?;
+
+    let inside = output(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source_directory),
+        "--target",
+        &path(&source_directory.join("target")),
+        "--manifest",
+        &path(&source_directory.join("receipt.json")),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "checksum-absent",
+    ])?;
+    assert!(!inside.status.success());
+    assert!(!source_directory.join("target").exists());
+    assert!(!source_directory.join("receipt.json").exists());
+    Ok(())
+}
+
+#[test]
+fn valkey_fixture_runs_the_complete_cycle_with_stream_waivers() -> Result<(), Box<dyn Error>> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/valkey-rdb-v11.json"))?;
+    let rdb_hex = fixture["rdb_hex"]
+        .as_str()
+        .ok_or("fixture rdb_hex missing")?;
+    let mut bytes = Vec::with_capacity(rdb_hex.len() / 2);
+    for pair in rdb_hex.as_bytes().chunks(2) {
+        bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
+    }
+
+    let temporary = TestDirectory::new()?;
+    let source = temporary.0.join("dump.rdb");
+    let target = temporary.0.join("target");
+    let manifest = temporary.0.join("receipt.json");
+    fs::write(&source, &bytes)?;
+
+    let inspected = run(&[
+        "migrate",
+        "inspect",
+        "--source",
+        &path(&source),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(inspected["key_count"], fixture["expected"]["key_count"]);
+    assert_eq!(
+        inspected["database_count"],
+        fixture["expected"]["database_count"]
+    );
+    assert_eq!(
+        inspected["unwaived_constructs"],
+        fixture["expected"]["required_waivers"]
+    );
+    assert_eq!(
+        inspected["source_digest"].as_str(),
+        fixture["blake3_hex"].as_str()
+    );
+
+    let imported = run(&[
+        "migrate",
+        "run",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+        "--waive",
+        "streams",
+        "--waive",
+        "stream-consumer-groups",
+    ])?;
+    assert_eq!(imported["status"], "imported");
+    assert_eq!(imported["imported_keys"], fixture["expected"]["key_count"]);
+
+    let verified = run(&[
+        "migrate",
+        "verify",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(verified["status"], "verified");
+
+    let promoted = run(&[
+        "migrate",
+        "promote",
+        "--source",
+        &path(&source),
+        "--target",
+        &path(&target),
+        "--manifest",
+        &path(&manifest),
+        "--source-kind",
+        "valkey-rdb",
+    ])?;
+    assert_eq!(promoted["status"], "promoted");
+    let reopened = run(&["status", "--data-dir", &path(&target)])?;
+    assert_eq!(reopened["status"], "ready");
+    Ok(())
+}
+
+/// Drives one authenticated MCP stdio session and returns one response line
+/// per request identifier.
+#[cfg(unix)]
+fn run_mcp_session(
+    address: &str,
+    key_file: &Path,
+    messages: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address}")])
+        .arg("--native-api-key-file")
+        .arg(key_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let mut output = IoBufReader::new(output);
+    let mut responses = Vec::new();
+    for message in messages {
+        serde_json::to_writer(&mut input, message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        if message.get("id").is_some() {
+            let mut line = String::new();
+            if output.read_line(&mut line)? == 0 {
+                return Err("MCP stdout closed before its response barrier".into());
+            }
+            responses.push(serde_json::from_str(&line)?);
+        }
+    }
+    drop(input);
+    assert!(mcp.wait()?.success());
+    Ok(responses)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_search_tools_execute_with_authority_and_fail_closed_without()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    // Provision the collection while the directory is still unmanaged.
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    let provisioned = run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let lexical_index = provisioned["binding"]["lexical_index"]
+        .as_str()
+        .ok_or("missing lexical index")?
+        .parse::<u64>()?;
+    let documents = serde_json::json!([
+        {"id":301,"text":"rust database engine","doc_values":{"category":"book"},"vectors":{"exact":[0.0,0.0],"ann":[0.0,0.0]}},
+        {"id":302,"text":"rust field guide","doc_values":{"category":"book"},"vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}},
+        {"id":303,"text":"database hardware","doc_values":{"category":"gear"},"vectors":{"exact":[2.0,0.0],"ann":[2.0,0.0]}}
+    ])
+    .to_string();
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        &documents,
+    ])?;
+
+    // Bootstrap security and issue one Reader key and one Auditor key.
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let mut keys = Vec::new();
+    for (name, role, token_base) in [
+        ("Search reader", "reader", 8600),
+        ("Search auditor", "auditor", 8700),
+    ] {
+        let principal = fixture.owner(&[
+            "principal",
+            "create",
+            "--name",
+            name,
+            "--idempotency-token",
+            &token_base.to_string(),
+        ])?;
+        let principal_id = principal["result_id"]
+            .as_str()
+            .ok_or("missing principal identity")?
+            .to_owned();
+        fixture.owner(&[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            &principal_id,
+            "--role",
+            role,
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            &(token_base + 1).to_string(),
+        ])?;
+        fixture.owner(&[
+            "principal",
+            "set-enabled",
+            "--principal-id",
+            &principal_id,
+            "--enabled",
+            "true",
+            "--idempotency-token",
+            &(token_base + 2).to_string(),
+        ])?;
+        let destination = fixture.temporary.0.join(format!("{role}.key"));
+        if role == "reader" {
+            fixture.issue_reader_key(&principal_id, &destination)?;
+        } else {
+            fixture.issue_auditor_key(&principal_id, &destination)?;
+        }
+        keys.push(destination);
+    }
+    let (reader_key, auditor_key) = (keys.remove(0), keys.remove(0));
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hms-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let lexical_call = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name":"hyphae_native_search_lexical",
+        "arguments":{"index":lexical_index,"kind":"term","query":"rust","limit":10}}});
+    let collection_call = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"hyphae_native_search_collection",
+        "arguments":{
+            "collection":13,
+            "lexical":{"query":"rust","candidate_limit":10},
+            "vectors":[{"target":"exact","values":[0.0,0.0],"candidate_limit":10}],
+            "filter":{"operation":"compare","field":"category","operator":"equal","value":"book"},
+            "facets":[{"field":"category","limit":4}],
+            "limit":10}}});
+
+    // The Reader authority executes both search tools.
+    let mut messages = handshake.to_vec();
+    messages.push(lexical_call.clone());
+    messages.push(collection_call.clone());
+    let reader = run_mcp_session(&address_text, &reader_key, &messages)?;
+    assert_eq!(reader[1]["result"]["isError"], false);
+    assert!(
+        !reader[1]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .ok_or("missing lexical hits")?
+            .is_empty()
+    );
+    assert_eq!(reader[2]["result"]["isError"], false);
+    let integrated = &reader[2]["result"]["structuredContent"];
+    assert_eq!(integrated["hits"].as_array().map(Vec::len), Some(2));
+    assert_eq!(integrated["facets"][0]["buckets"][0]["count"], 2);
+    assert_eq!(
+        integrated["vector_branches"][0]["strategy"],
+        "exact_filtered"
+    );
+    assert_eq!(integrated["approximate"], false);
+
+    // The Auditor authority lacks search.execute and fails closed.
+    let mut messages = handshake.to_vec();
+    messages.push(lexical_call);
+    messages.push(collection_call);
+    let auditor = run_mcp_session(&address_text, &auditor_key, &messages)?;
+    for response in &auditor[1..=2] {
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "authorization_denied"
+        );
+    }
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_mcp_session_with_flags(
+    address: &str,
+    key_file: &Path,
+    extra: &[&str],
+    messages: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args(["mcp", "--base-url", &format!("http://{address}")])
+        .arg("--native-api-key-file")
+        .arg(key_file)
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = mcp.stdin.take().ok_or("missing MCP stdin")?;
+    let output = mcp.stdout.take().ok_or("missing MCP stdout")?;
+    let mut output = IoBufReader::new(output);
+    let mut responses = Vec::new();
+    for message in messages {
+        serde_json::to_writer(&mut input, message)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        if message.get("id").is_some() {
+            let mut line = String::new();
+            if output.read_line(&mut line)? == 0 {
+                return Err("MCP stdout closed before its response barrier".into());
+            }
+            responses.push(serde_json::from_str(&line)?);
+        }
+    }
+    drop(input);
+    assert!(mcp.wait()?.success());
+    Ok(responses)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_ingest_is_opt_in_write_scoped_and_fail_closed() -> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let mut keys = Vec::new();
+    for (name, role, token_base) in [
+        ("Ingest writer", "writer", 8800),
+        ("Ingest reader", "reader", 8900),
+    ] {
+        let principal = fixture.owner(&[
+            "principal",
+            "create",
+            "--name",
+            name,
+            "--idempotency-token",
+            &token_base.to_string(),
+        ])?;
+        let principal_id = principal["result_id"]
+            .as_str()
+            .ok_or("missing principal identity")?
+            .to_owned();
+        fixture.owner(&[
+            "assignment",
+            "create-built-in",
+            "--principal-id",
+            &principal_id,
+            "--role",
+            role,
+            "--scope",
+            "instance",
+            "--idempotency-token",
+            &(token_base + 1).to_string(),
+        ])?;
+        fixture.owner(&[
+            "principal",
+            "set-enabled",
+            "--principal-id",
+            &principal_id,
+            "--enabled",
+            "true",
+            "--idempotency-token",
+            &(token_base + 2).to_string(),
+        ])?;
+        let destination = fixture.temporary.0.join(format!("{role}.key"));
+        if role == "writer" {
+            fixture.issue_built_in_key(
+                &principal_id,
+                &destination,
+                BuiltInRole::Writer,
+                "writer-mcp",
+            )?;
+        } else {
+            fixture.issue_reader_key(&principal_id, &destination)?;
+        }
+        keys.push(destination);
+    }
+    let (writer_key, reader_key) = (keys.remove(0), keys.remove(0));
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmi-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let list = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+    let ingest_call = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"hyphae_native_search_ingest",
+        "arguments":{
+            "collection":13,
+            "idempotency_id":41,
+            "documents":[{"id":501,"text":"rust ingest via mcp","vectors":{"exact":[0.5,0.5],"ann":[0.5,0.5]}}]}}});
+    let search_call = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+        "name":"hyphae_native_search_collection",
+        "arguments":{"collection":13,"lexical":{"query":"ingest"},"limit":5}}});
+
+    // Default session: the ingest tool is not listed and not callable.
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(ingest_call.clone());
+    let default_session = run_mcp_session_with_flags(&address_text, &writer_key, &[], &messages)?;
+    assert_eq!(
+        default_session[1]["result"]["tools"]
+            .as_array()
+            .map(Vec::len),
+        Some(8)
+    );
+    assert_eq!(default_session[2]["error"]["code"], -32602);
+
+    // Opted-in session with a Writer key: the tool is listed and the batch
+    // commits; the ingested document is immediately searchable.
+    let mut messages = handshake.to_vec();
+    messages.push(list.clone());
+    messages.push(ingest_call.clone());
+    messages.push(ingest_call.clone());
+    messages.push(search_call);
+    let writer =
+        run_mcp_session_with_flags(&address_text, &writer_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        writer[1]["result"]["tools"].as_array().map(Vec::len),
+        Some(11)
+    );
+    assert_eq!(writer[2]["result"]["isError"], false);
+    assert_eq!(
+        writer[2]["result"]["structuredContent"]["status"],
+        "committed"
+    );
+    assert_eq!(
+        writer[3]["result"]["structuredContent"]["status"],
+        "existing"
+    );
+    assert_eq!(
+        writer[3]["result"]["structuredContent"]["idempotent_replay"],
+        true
+    );
+    assert_eq!(
+        writer[4]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // Opted-in session with a Reader key: exposure is not authority.
+    let mut messages = handshake.to_vec();
+    messages.push(ingest_call);
+    let reader =
+        run_mcp_session_with_flags(&address_text, &reader_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        reader[1]["result"]["structuredContent"]["error"]["code"],
+        "authorization_denied"
+    );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_memory_tools_store_recall_and_forget_with_a_lifecycle()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.memories",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmm-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let handshake = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    ];
+    let store = |id: u64, text: &str| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_native_memory_store",
+            "arguments":{"collection":13,"text":text}}})
+    };
+    let recall = |id: u64| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":"hyphae_native_memory_recall",
+            "arguments":{"collection":13,"query":"deterministic retrieval"}}})
+    };
+    let mut messages = handshake.to_vec();
+    messages.push(store(2, "the user prefers deterministic retrieval"));
+    messages.push(store(3, "unrelated gardening note"));
+    messages.push(recall(4));
+    let session =
+        run_mcp_session_with_flags(&address_text, &owner_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        session[1]["result"]["structuredContent"]["status"],
+        "stored"
+    );
+    let memory_id = session[1]["result"]["structuredContent"]["id"]
+        .as_str()
+        .ok_or("memory id")?
+        .to_owned();
+    assert_eq!(
+        session[2]["result"]["structuredContent"]["status"],
+        "stored"
+    );
+    let recalled = &session[3]["result"]["structuredContent"];
+    let memories = recalled["memories"].as_array().ok_or("memories")?;
+    assert_eq!(
+        memories[0]["text"],
+        "the user prefers deterministic retrieval"
+    );
+    assert_eq!(memories[0]["id"], memory_id.as_str());
+    // Without prove the artifacts slot stays empty; the sealed path shares
+    // the prove-search plumbing covered by its own session test.
+    assert!(recalled["proof"].is_null());
+
+    // Forget removes the lifecycle and the document; recall never
+    // surfaces the memory again.
+    let forget = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+        "name":"hyphae_native_memory_forget",
+        "arguments":{"collection":13,"id":memory_id}}});
+    let mut messages = handshake.to_vec();
+    messages.push(forget);
+    messages.push(recall(6));
+    let session =
+        run_mcp_session_with_flags(&address_text, &owner_key, &["--allow-ingest"], &messages)?;
+    assert_eq!(
+        session[1]["result"]["structuredContent"]["status"], "forgotten",
+        "forget response: {}",
+        session[1]
+    );
+    let recalled = &session[2]["result"]["structuredContent"];
+    assert_eq!(recalled["memories"].as_array().map(Vec::len), Some(0));
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_mcp_proves_a_search_and_verifies_the_receipt_trustlessly()
+-> Result<(), Box<dyn Error>> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run_isolated(&["init", "--data-dir", &data_text])?;
+    run_isolated(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.notes",
+    ])?;
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let documents = serde_json::json!([
+        {"id":601,"text":"provable retrieval","vectors":{"exact":[0.0,1.0],"ann":[0.0,1.0]}},
+        {"id":602,"text":"plain retrieval","vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}}
+    ])
+    .to_string();
+    run_isolated(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        &documents,
+    ])?;
+
+    // The CLI generates one search proof to files while still unmanaged.
+    let proof_out = temporary.0.join("search.proof");
+    let witness_out = temporary.0.join("search.witness");
+    let generated = run_isolated(&[
+        "proof",
+        "generate",
+        "--data-dir",
+        &data_text,
+        "--operation-json",
+        r#"{"operation":"search_collection","collection":13,"lexical":{"query":"provable"},"limit":5}"#,
+        "--proof-out",
+        &path(&proof_out),
+        "--witness-out",
+        &path(&witness_out),
+    ])?;
+    assert_eq!(generated["status"], "generated");
+    assert_eq!(generated["kind"], "lexical");
+    let anchor = generated["anchor"].as_str().ok_or("missing anchor")?;
+    let verified = run_isolated(&[
+        "proof",
+        "verify",
+        "--proof",
+        &path(&proof_out),
+        "--witness",
+        &path(&witness_out),
+        "--anchor",
+        anchor,
+    ])?;
+    assert_eq!(verified["status"], "verified");
+    assert_eq!(verified["scope"], "semantic_reexecution");
+
+    // Bootstrap security and drive the same flow through MCP with a Reader.
+    let owner_key = temporary.0.join("owner.key");
+    run_isolated(&[
+        "security",
+        "--data-dir",
+        &data_text,
+        "bootstrap",
+        "--name",
+        "Owner",
+        "--key-out",
+        &path(&owner_key),
+    ])?;
+    let fixture = SecurityWriteFixture {
+        temporary,
+        data: data.clone(),
+        owner_key: owner_key.clone(),
+        owner_secret: fs::read_to_string(&owner_key)?,
+    };
+    let principal = fixture.owner(&[
+        "principal",
+        "create",
+        "--name",
+        "Proof reader",
+        "--idempotency-token",
+        "9100",
+    ])?;
+    let principal_id = principal["result_id"]
+        .as_str()
+        .ok_or("missing principal identity")?
+        .to_owned();
+    fixture.owner(&[
+        "assignment",
+        "create-built-in",
+        "--principal-id",
+        &principal_id,
+        "--role",
+        "reader",
+        "--scope",
+        "instance",
+        "--idempotency-token",
+        "9101",
+    ])?;
+    fixture.owner(&[
+        "principal",
+        "set-enabled",
+        "--principal-id",
+        &principal_id,
+        "--enabled",
+        "true",
+        "--idempotency-token",
+        "9102",
+    ])?;
+    let reader_key = fixture.temporary.0.join("reader.key");
+    fixture.issue_reader_key(&principal_id, &reader_key)?;
+
+    let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let address = probe.local_addr()?;
+    drop(probe);
+    let endpoint = std::env::temp_dir().join(format!("hmp-{}.sock", Uuid::now_v7()));
+    let address_text = address.to_string();
+    let mut server = spawn_native_serve(
+        &data,
+        &endpoint,
+        &["--native-api-key-auth", "--http-bind", &address_text],
+    )?;
+    wait_for_authenticated_http_ready(&mut server, &address_text, &fixture.owner_secret)
+        .await
+        .map_err(|error| std::io::Error::other(format!("HTTP readiness: {error}")))?;
+    let _server_guard = ChildGuard(&mut server);
+
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"hyphae_native_prove_search",
+            "arguments":{"collection":13,"lexical":{"query":"provable"},"limit":5}}}),
+    ];
+    let responses = run_mcp_session(&address_text, &reader_key, &messages)?;
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let proven = &responses[1]["result"]["structuredContent"];
+    assert_eq!(proven["status"], "generated");
+    assert_eq!(proven["kind"], "lexical");
+    assert_eq!(proven["response"]["hits"].as_array().map(Vec::len), Some(1));
+    let proof_hex = proven["proof_hex"].as_str().ok_or("missing proof")?;
+    let witness_hex = proven["witness_hex"].as_str().ok_or("missing witness")?;
+    let anchor_hex = proven["anchor_hex"].as_str().ok_or("missing anchor")?;
+
+    // The verify tool re-executes the proof trustlessly inside the adapter,
+    // and a tampered proof fails closed.
+    let mut tampered = proof_hex.to_owned();
+    let flipped = if tampered.ends_with('0') { '1' } else { '0' };
+    tampered.pop();
+    tampered.push(flipped);
+    let messages = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"hyphae_native_verify_proof",
+            "arguments":{"proof_hex":proof_hex,"witness_hex":witness_hex,"anchor_hex":anchor_hex}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"hyphae_native_verify_proof",
+            "arguments":{"proof_hex":tampered,"witness_hex":witness_hex,"anchor_hex":anchor_hex}}}),
+    ];
+    let responses = run_mcp_session(&address_text, &reader_key, &messages)?;
+    let report = &responses[1]["result"]["structuredContent"];
+    assert_eq!(report["status"], "verified");
+    assert_eq!(report["scope"], "semantic_reexecution");
+    assert_eq!(report["kind"], "lexical");
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["error"]["code"],
+        "invalid_request"
+    );
+    let _ignored = fs::remove_file(endpoint);
+    Ok(())
 }

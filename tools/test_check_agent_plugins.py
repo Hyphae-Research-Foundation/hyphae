@@ -43,7 +43,7 @@ class AgentPluginContractTests(unittest.TestCase):
                 "status": "passed",
                 "hosts": ["claude-code", "codex"],
                 "mcp_servers": 1,
-                "tools": 3,
+                "tools": 8,
             },
         )
 
@@ -84,7 +84,7 @@ class AgentPluginContractTests(unittest.TestCase):
             json.loads(
                 (ROOT / "plugins/hyphae/.codex-plugin/plugin.json").read_text(encoding="utf-8")
             )["version"],
-            "1.2.2",
+            "2.0.0",
         )
 
     def test_plugin_version_cannot_remain_on_the_legacy_bundle(self) -> None:
@@ -96,8 +96,8 @@ class AgentPluginContractTests(unittest.TestCase):
                 ".claude-plugin/marketplace.json",
             ):
                 path = root / relative
-                path.write_text(path.read_text(encoding="utf-8").replace("1.2.2", "0.2.0"), encoding="utf-8")
-            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 1.2"):
+                path.write_text(path.read_text(encoding="utf-8").replace("2.0.0", "0.2.0"), encoding="utf-8")
+            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 2.0"):
                 validate(root)
 
     def test_credential_material_is_rejected_everywhere(self) -> None:
@@ -256,8 +256,6 @@ class AgentPluginContractTests(unittest.TestCase):
 
     def test_plugin_cannot_recommend_reader_alongside_auditor(self) -> None:
         for relative, field_path in (
-            ("plugins/hyphae/README.md", None),
-            ("plugins/hyphae/skills/use-hyphae/SKILL.md", None),
             ("plugins/hyphae/.codex-plugin/plugin.json", ("interface", "longDescription")),
             ("plugins/hyphae/.claude-plugin/plugin.json", ("description",)),
             (".claude-plugin/marketplace.json", ("plugins", 0, "description")),
@@ -278,6 +276,21 @@ class AgentPluginContractTests(unittest.TestCase):
                     target[field_path[-1]] += " Reader"
                     path.write_text(json.dumps(value), encoding="utf-8")
                 with self.assertRaisesRegex(AgentPluginValidationError, "Reader"):
+                    validate(root)
+
+    def test_skill_and_setup_must_document_the_search_authority(self) -> None:
+        for relative in (
+            "plugins/hyphae/README.md",
+            "plugins/hyphae/skills/use-hyphae/SKILL.md",
+        ):
+            with self.subTest(relative=relative), self.fixture() as directory:
+                root = Path(directory)
+                path = root / relative
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace("search.execute", "search"),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(AgentPluginValidationError, "search-tool authority"):
                     validate(root)
 
 

@@ -109,7 +109,7 @@ class LicensePolicyTests(unittest.TestCase):
             JSON_EXCEPTION_PATHS_SHA256,
         )
 
-        self.assertEqual(JSON_EXCEPTION_PATH_COUNT, 89)
+        self.assertEqual(JSON_EXCEPTION_PATH_COUNT, 91)
         self.assertRegex(JSON_EXCEPTION_PATHS_SHA256, r"^[0-9a-f]{64}$")
 
     def test_schema_validation_requires_the_apache_marker(self) -> None:

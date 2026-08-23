@@ -456,6 +456,10 @@ fn search_request() -> ProductSearchRequest {
         facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
     }
 }
 
