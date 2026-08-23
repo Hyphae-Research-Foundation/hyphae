@@ -26,6 +26,25 @@ Metadata keys listed in `metadata_fields` are persisted as typed doc-values
 (the collection schema must declare them); everything else stays
 adapter-side.
 
+## LlamaIndex
+
+```python
+from hyphae_sdk.v2 import HyphaeClient
+from hyphae_sdk.llamaindex import HyphaeLlamaVectorStore
+
+with HyphaeClient.local("/run/hyphae.sock") as client:
+    store = HyphaeLlamaVectorStore(client, 13, prove=True)
+    store.add(embedded_nodes)
+    result = store.query(vector_store_query)
+```
+
+The store needs the `llamaindex` extra (`pip install 'hyphae-sdk[llamaindex]'`)
+and mirrors the LangChain adapter: content-derived identities, hybrid
+retrieval whenever the query carries text, opted-in `metadata_fields` as
+typed doc-values, and `prove=True` sealing the proof digest into node
+metadata with `store.last_proof` retaining the artifacts for
+`hyphae proof verify`.
+
 ## PliegoRS boundary
 
 Add `hyphae-pliegors` only in an application that wants remote Hyphae access.
