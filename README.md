@@ -26,7 +26,7 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`v2.0.1`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.0.1)
+**Stable Native release:** [`v2.1.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0)
 is the latest release of the active Native architecture. G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
@@ -39,7 +39,7 @@ gate.
 the operator console, agent plugins, the published Python client, and the
 Apache-2.0 software transition. [`v1.2.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v1.2.0)
 closed the exact-SHA release gates with signed GitHub Release archives;
-`v2.0.1` re-issues that program from the current integration tree as the
+`v2.1.0` re-issues that program from the current integration tree as the
 Apache-2.0 registry publication for crates.io, PyPI, and npm. Until a given
 registry publication completes, the latest already-published registry version
 is `1.1.0` under that release's original terms; its exact checksums, source
@@ -111,7 +111,7 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`v2.0.1` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.0.1),
+[`v2.1.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
@@ -119,12 +119,12 @@ binary. To install from crates.io, run:
 cargo install hyphae-cli --version 2.1.0 --locked
 ```
 
-That coordinate is valid once the `v2.0.1` publication completes; the latest
+That coordinate is valid once the `v2.1.0` publication completes; the latest
 already-published version is `1.1.0`. Build and embed the exact release from
 source with:
 
 ```bash
-git checkout v2.0.1
+git checkout v2.1.0
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```

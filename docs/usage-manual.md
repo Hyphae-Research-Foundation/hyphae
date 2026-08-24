@@ -56,7 +56,7 @@ hyphae version --json
 }
 ```
 
-The [GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.0.1)
+The [GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0)
 ships signed archives for Linux x64, macOS x64/arm64, and Windows x64, each
 with SHA-256 checksums, SPDX/CycloneDX SBOMs, SLSA provenance, and Sigstore
 bundles; verify before installing. To embed, depend on exact versions:
