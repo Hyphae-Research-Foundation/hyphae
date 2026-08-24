@@ -10,11 +10,11 @@ license = "Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
-hyphae-engine = { path = "../crates/hyphae-engine", version = "=2.0.1" }
-hyphae-core = { path = "../crates/hyphae-core", version = "=2.0.1" }
-hyphae-query = { path = "../crates/hyphae-query", version = "=2.0.1" }
-hyphae-retrieval = { path = "../crates/hyphae-retrieval", version = "=2.0.1" }
-hyphae-storage = { path = "../crates/hyphae-storage", version = "=2.0.1" }
+hyphae-engine = { path = "../crates/hyphae-engine", version = "=2.1.0" }
+hyphae-core = { path = "../crates/hyphae-core", version = "=2.1.0" }
+hyphae-query = { path = "../crates/hyphae-query", version = "=2.1.0" }
+hyphae-retrieval = { path = "../crates/hyphae-retrieval", version = "=2.1.0" }
+hyphae-storage = { path = "../crates/hyphae-storage", version = "=2.1.0" }
 libfuzzer-sys = "0.4.13"
 serde_json = "1.0.151"
 

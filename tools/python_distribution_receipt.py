@@ -872,7 +872,7 @@ def _publisher_identity(publisher: object, repository: str) -> dict[str, str]:
         "workflow": PUBLISHER_WORKFLOW,
         "environment": repository,
     }
-    # The 2.0.1 rehearsal files on TestPyPI carry provenance recorded before
+    # The 2.1.0 rehearsal files on TestPyPI carry provenance recorded before
     # the Trusted Publisher was environment-bound, so their publisher reports
     # a null environment permanently. Only the rehearsal registry accepts that
     # legacy shape; the production registry requires the exact environment.

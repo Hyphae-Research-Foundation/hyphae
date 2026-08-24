@@ -19,7 +19,7 @@ WORKFLOW = Path(".github/workflows/python-publish.yml")
 EXPECTED_NAME = "hyphae-sdk"
 REQUIRED_URLS = {"Homepage", "Documentation", "Repository", "Issues", "Changelog"}
 PYPI_ACTION = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
-APACHE_RELEASE_VERSION = "2.0.1"
+APACHE_RELEASE_VERSION = "2.1.0"
 
 
 class PythonPackageValidationError(ValueError):
@@ -81,7 +81,7 @@ def validate(
         fail("Python support floor must remain explicit")
     if project.get("dependencies") != []:
         fail("Python SDK runtime must remain standard-library only")
-    if manifest.get("build-system", {}).get("requires") != ["setuptools==80.9.0"]:
+    if manifest.get("build-system", {}).get("requires") != ["setuptools==84.0.0"]:
         fail("Python build backend dependency must remain exactly pinned")
     if project.get("license") != "Apache-2.0":
         fail("Python SDK license expression must match the repository")
@@ -173,7 +173,7 @@ def validate(
         "actions/runs/${{ github.run_id }}/artifacts?per_page=100",
         "--independent-build-receipt independent-a/builder-receipt.json",
         "--independent-build-receipt independent-b/builder-receipt.json",
-        'test "$version" = "2.0.1"',
+        'test "$version" = "2.1.0"',
     }
     if any(fragment not in workflow for fragment in required_workflow):
         fail("Python Trusted Publishing workflow is incomplete")
@@ -257,7 +257,7 @@ def validate(
     # The checked-in source remains 1.1.0 until release preparation, but every
     # workflow path that can reach OIDC must reject it first.
     if f'test "$version" = "{APACHE_RELEASE_VERSION}"' not in workflow:
-        fail("Apache Python publication must be gated on version 2.0.1")
+        fail("Apache Python publication must be gated on version 2.1.0")
     contract_root = workflow_root or root
     if not (
         contract_root / "docs/release/schema/python-distribution-receipt-v2.schema.json"

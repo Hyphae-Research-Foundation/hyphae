@@ -250,36 +250,36 @@
         "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
       },
       {
-        "canonical_sha256": "7bcfbfb8d33466d30afee8064dbbf2abceb5203a24cbb5647099110d8b6d250d",
+        "canonical_sha256": "9d3b4698bfd1a2b994eb4e915af5f5ee06b30c4653383183beb26fe453e8f1c4",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 298,
         "result": "pass",
-        "sha256": "c43832b700b9190a8bc84be4c8ef8617ea66f144f681974c697a08d0b218c5cf"
+        "sha256": "ad794b668a778d5aaa15a9de4914e00322a3313e03a091cdc0db992a3be93cc7"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
         "lock": "sdks/typescript/package-lock.json",
         "package_count": 4,
         "result": "pass",
-        "sha256": "75b3f41945e1029793a607f9dfac85f6a2bdd2cd3e41992161fb48ebf713aa96"
+        "sha256": "739baec1efa099c42f8d545d4d587dc3827f964efdd0b8db7aec629b08271f6b"
       }
     ],
     "python": {
-      "canonical_sha256": "1750947f0394546b79d29c52c813f7d2dbaddc16b6e833a0a5bd007738b18313",
+      "canonical_sha256": "42684c2ac92e7fb1e2ae9c3fbc90234640667980dfa0b46f8e6ddef0afebb1c5",
       "inventory": "sdks/python/build-dependencies.json",
-      "inventory_sha256": "febb73d876a9ad66ac83aa1c3a78817bdacf952792e8ed8d3633efea2cb3dfd2",
+      "inventory_sha256": "7108c1e86b957224038bb94be80f14fe7c0260726ee3e6b1d3cd2ef7e1ddea30",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "53a7281d6b4f5a4706af7293a3e603399bd31993c41f1809269574af0dd8648c",
+      "manifest_sha256": "89d0744d1446fcb85fe693dbd943341e6957c3d62e2c3080b0584a076ac14427",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
     },
     "rust": {
-      "canonical_sha256": "1a0ec7712316c01ff20416bab06b67c59bd160de0dab061ed711c0a038f5a457",
+      "canonical_sha256": "3382159038ba5e5ba43bddd4d9bd3d34b5f2d0f7af2f111e6d007ad8959d8253",
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "3344078f5363db09026109ee4d50677ace8aca9b92955a6ebfb566001523849a"
+      "sha256": "e1edf0ccea25753b66eb5ac684bdafdbde825418716b57c628d918f9193086ef"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "673f91190169ec4fbfe4c35437aa047e54b43bcc",
+      "commit": "27711c0efffdb57062d71fe07f59ce3f44ba2779",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "adba7aafcdecc8fcb8dd4dbfa08595f44c323951"
+      "tree": "27826547ca856731a1e966f1ff691f9ede84b314"
     }
   },
   "target_release": "1.2.0"

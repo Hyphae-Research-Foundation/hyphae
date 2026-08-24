@@ -483,7 +483,7 @@ def validate_repository(root: Path = ROOT) -> list[str]:
         "@img/sharp-libvips-*",
         "@anthropic-ai/claude-code",
         "must never be included in Hyphae",
-        "setuptools==80.9.0",
+        "setuptools==84.0.0",
     ):
         if required not in notice:
             failures.append(f"THIRD_PARTY_NOTICES.md: missing boundary {required}")

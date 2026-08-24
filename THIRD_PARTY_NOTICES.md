@@ -53,6 +53,6 @@ redistribution remain subject to Anthropic's terms.
 ## Python build boundary
 
 The Python SDK has no runtime dependency. Its exact build dependency is
-`setuptools==80.9.0`, licensed MIT. Build dependency identity is recorded in
+`setuptools==84.0.0`, licensed MIT. Build dependency identity is recorded in
 `sdks/python/pyproject.toml`; release wheels and sdists contain Hyphae's own
 license documents and do not bundle setuptools.

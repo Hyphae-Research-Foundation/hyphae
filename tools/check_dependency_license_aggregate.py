@@ -204,17 +204,17 @@ def build_aggregate(root: Path = ROOT) -> tuple[dict[str, Any], list[str]]:
     expected_python_packages = [
         {
             "name": "setuptools",
-            "version": "80.9.0",
+            "version": "84.0.0",
             "license": "MIT",
             "scope": "build-only-not-bundled",
             "artifacts": [
                 {
-                    "filename": "setuptools-80.9.0-py3-none-any.whl",
-                    "sha256": "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922",
+                    "filename": "setuptools-84.0.0-py3-none-any.whl",
+                    "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670",
                 },
                 {
-                    "filename": "setuptools-80.9.0.tar.gz",
-                    "sha256": "f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c",
+                    "filename": "setuptools-84.0.0.tar.gz",
+                    "sha256": "f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73",
                 },
             ],
         }
@@ -224,7 +224,7 @@ def build_aggregate(root: Path = ROOT) -> tuple[dict[str, Any], list[str]]:
         python_inventory.get("schema") != "hyphae-python-build-dependencies-v1"
         or python_packages != expected_python_packages
         or runtime_dependencies != []
-        or python_manifest.get("build-system", {}).get("requires") != ["setuptools==80.9.0"]
+        or python_manifest.get("build-system", {}).get("requires") != ["setuptools==84.0.0"]
         or python_manifest.get("project", {}).get("dependencies") != []
     ):
         python_result = "fail"

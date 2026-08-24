@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 [build-system]
-requires = ["setuptools==80.9.0"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyphae-sdk"
-version = "2.0.1"
+version = "2.1.0"
 description = "Bounded Python client for Hyphae v1 and Native v2 APIs"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"

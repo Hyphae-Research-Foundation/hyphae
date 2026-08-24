@@ -1,6 +1,6 @@
 {
   "name": "hyphae",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Inspect a local Hyphae data engine through bounded Native v2 MCP tools.",
   "author": {
     "name": "Celiums Solutions LLC",
