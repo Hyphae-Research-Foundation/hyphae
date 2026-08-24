@@ -4,7 +4,7 @@
   "version": "2.1.0",
   "apache_publication_authority": {
     "version": "2.1.0",
-    "tag": "v2.0.1",
+    "tag": "v2.1.0",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": true
   },

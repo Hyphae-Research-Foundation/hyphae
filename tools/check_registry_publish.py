@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
     "version": "2.1.0",
-    "tag": "v2.0.1",
+    "tag": "v2.1.0",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
 }
@@ -67,12 +67,12 @@ EXPECTED_CHECKS = (
     ("Security hard-kill aggregate", ".github/workflows/ci.yml", "push", "main"),
     ("MCP real hosts", ".github/workflows/ci.yml", "push", "main"),
     ("Dependency and license policy", ".github/workflows/security.yml", "push", "main"),
-    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "push", "v2.0.1"),
-    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "push", "v2.0.1"),
-    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "push", "v2.0.1"),
-    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "push", "v2.0.1"),
-    ("Assemble and verify release candidate", ".github/workflows/release.yml", "push", "v2.0.1"),
-    ("Publish GitHub release", ".github/workflows/release.yml", "push", "v2.0.1"),
+    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "push", "v2.1.0"),
+    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "push", "v2.1.0"),
+    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "push", "v2.1.0"),
+    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "push", "v2.1.0"),
+    ("Assemble and verify release candidate", ".github/workflows/release.yml", "push", "v2.1.0"),
+    ("Publish GitHub release", ".github/workflows/release.yml", "push", "v2.1.0"),
     ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "main"),
 )
 EXPECTED_ARTIFACTS = (
@@ -373,7 +373,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
         or value["version"] != "2.1.0"
-        or value["tag"] != "v2.0.1"
+        or value["tag"] != "v2.1.0"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
         != {
@@ -1376,7 +1376,7 @@ def resolve_live_authority(
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
     if source_commit != origin_main:
-        raise GateFailure("v2.0.1 target is not the exact origin/main commit")
+        raise GateFailure("v2.1.0 target is not the exact origin/main commit")
     checks, runs_by_path = fetch_required_checks(
         repository, source_commit, token, workflow_run_id, policy
     )
