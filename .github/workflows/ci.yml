@@ -839,7 +839,10 @@ jobs:
       - name: Test deterministic packaging and checksums
         run: |
           python -m compileall -q packaging tools
-          PYTHONPATH=. python -m unittest tools.test_rag_eval -v
+          PYTHONPATH=. python -m unittest \
+            tools.test_rag_eval \
+            tools.test_agent_memory_retrieval_eval \
+            tools.test_long_term_memory_benchmarks -v
           python packaging/test_package.py
       - name: Install from a generated Linux archive
         shell: bash

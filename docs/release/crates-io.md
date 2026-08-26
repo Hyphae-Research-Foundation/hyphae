@@ -16,7 +16,7 @@ the tag being published. The trusted checker and policy are loaded from the
 
 ## Preconditions
 
-1. Land version `2.1.0`, then create existing annotated tag `v2.1.0`. The
+1. Land version `2.1.0`, then create the annotated tag `v2.1.0`. The
    registry workflow fetches the exact remote tag object and requires its peeled
    target to equal the current `origin/main` commit, not merely an ancestor.
 2. Complete the pinned exact-SHA GitHub check suite in
