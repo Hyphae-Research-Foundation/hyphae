@@ -250,18 +250,18 @@
         "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
       },
       {
-        "canonical_sha256": "9d3b4698bfd1a2b994eb4e915af5f5ee06b30c4653383183beb26fe453e8f1c4",
+        "canonical_sha256": "6aa0b55f2c4353a0085828dfde3b65da3ef49800da20389a685710ccfbd98ff9",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 298,
         "result": "pass",
-        "sha256": "ad794b668a778d5aaa15a9de4914e00322a3313e03a091cdc0db992a3be93cc7"
+        "sha256": "c76e1683211426efbe71121e1dc56ec90e65f8fd364bd4324777083e8bd03372"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
         "lock": "sdks/typescript/package-lock.json",
         "package_count": 4,
         "result": "pass",
-        "sha256": "739baec1efa099c42f8d545d4d587dc3827f964efdd0b8db7aec629b08271f6b"
+        "sha256": "235ae02b43f11d93c4725739551264e8352b4ef23cf3abe30d8fbce58c5507f3"
       }
     ],
     "python": {
