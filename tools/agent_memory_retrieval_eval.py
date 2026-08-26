@@ -79,6 +79,9 @@ def load_fixture(path: Path) -> dict[str, Any]:
         raise EvalError(f"fixture is invalid: {path}") from error
     if not isinstance(fixture, dict):
         raise EvalError("fixture must be one JSON object")
+    fixture = {
+        key: value for key, value in fixture.items() if key != "$comment"
+    }
     require_keys(
         fixture,
         {"schema", "project", "collections", "protocol", "documents", "queries"},
