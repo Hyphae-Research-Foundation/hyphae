@@ -40,7 +40,7 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "peerDependencies": {
-    "@hyphae_/hyphae": "2.1.0",
+    "@hyphae_/hyphae": "2.2.0",
     "astro": ">=5 <8",
     "next": ">=15 <17",
     "vite": ">=6 <9"
