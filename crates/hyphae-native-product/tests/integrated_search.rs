@@ -227,6 +227,44 @@ fn seed() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
     })
 }
 
+#[test]
+fn complete_document_scan_is_stable_bounded_and_snapshot_pinned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("complete-document-scan");
+    let (mut product, binding) = configure(&path)?;
+    let batch = seed()?;
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let snapshot = product.snapshot_bounded(7)?;
+
+    let first =
+        NativeProduct::search_documents_at_snapshot(&snapshot, binding.collection, None, 2)?;
+    assert_eq!(first.snapshot, snapshot.identity());
+    assert_eq!(first.documents, batch.documents[..2]);
+    assert_eq!(first.continuation, Some(batch.documents[1].object_id));
+
+    let second = NativeProduct::search_documents_at_snapshot(
+        &snapshot,
+        binding.collection,
+        first.continuation,
+        2,
+    )?;
+    assert_eq!(second.documents, batch.documents[2..]);
+    assert_eq!(second.continuation, None);
+    assert!(matches!(
+        NativeProduct::search_documents_at_snapshot(
+            &snapshot,
+            binding.collection,
+            None,
+            0,
+        ),
+        Err(error) if error.code() == hyphae_native_product::ProductErrorCode::LimitExceeded
+    ));
+
+    drop(product);
+    let _ignored = fs::remove_dir_all(path);
+    Ok(())
+}
+
 fn proof_session() -> Result<ProductSession, Box<dyn std::error::Error>> {
     let principal = ProductPrincipal::new("integrated-proof").ok_or("invalid principal")?;
     Ok(ProductSession::new(
@@ -1943,5 +1981,176 @@ fn tuned_bm25_parameters_change_the_ranking_and_survive_reopen()
     assert_eq!(lexical_ranking(&reopened, &binding)?, vec![301, 302]);
     drop(reopened);
     fs::remove_dir_all(tuned_path)?;
+    Ok(())
+}
+
+#[test]
+fn explicit_transaction_stages_a_complete_document_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("atomic-document");
+    let (mut product, binding) = configure(&path)?;
+    let mut session = proof_session()?;
+    let c1 = proof_context(&session, 1);
+    let begin = product.dispatch(&mut session, &c1, ProductOperation::TransactionBegin)?;
+    let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
+        hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+    ) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+    let document = ProductDocument {
+        object_id: ObjectId::new(900)?,
+        text: "atomic staged document".to_owned(),
+        doc_values: BTreeMap::new(),
+        vectors: BTreeMap::new(),
+    };
+    let c2 = proof_context(&session, 2);
+    product.dispatch(
+        &mut session,
+        &c2,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
+                collection: binding.collection,
+                document: document.clone(),
+            },
+        },
+    )?;
+    let c3 = proof_context(&session, 3);
+    let committed = product.dispatch(
+        &mut session,
+        &c3,
+        ProductOperation::TransactionCommit { handle },
+    )?;
+    let hyphae_native_product::ProductResponse::TransactionCommitted(receipt) = committed else {
+        return Err("transaction did not commit".into());
+    };
+    assert_eq!(receipt.staged_operations, 1);
+    let result = product.search_collection(
+        binding.collection,
+        &ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "atomic staged".to_owned(),
+                candidate_limit: 10,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 5,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+        },
+        0,
+    )?;
+    assert_eq!(
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![900]
+    );
+    let c4 = proof_context(&session, 4);
+    let begin = product.dispatch(&mut session, &c4, ProductOperation::TransactionBegin)?;
+    let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
+        hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+    ) = begin
+    else {
+        return Err("replacement transaction did not begin".into());
+    };
+    let c5 = proof_context(&session, 5);
+    product.dispatch(
+        &mut session,
+        &c5,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
+                collection: binding.collection,
+                document,
+            },
+        },
+    )?;
+    let c6 = proof_context(&session, 6);
+    product.dispatch(
+        &mut session,
+        &c6,
+        ProductOperation::TransactionCommit { handle },
+    )?;
+    drop(product);
+    let reopened = NativeProduct::open(&path)?;
+    reopened.resolve_search_collection_binding(binding.collection, 0)?;
+    drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn explicit_transaction_document_stage_rejects_unknown_collection_and_bad_doc_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("atomic-document-invalid");
+    let (mut product, binding) = configure(&path)?;
+    let mut session = proof_session()?;
+    let c1 = proof_context(&session, 1);
+    let begin = product.dispatch(&mut session, &c1, ProductOperation::TransactionBegin)?;
+    let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
+        hyphae_native_product::ProductExplicitTransactionStatus::Active { handle, .. },
+    ) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+    let c2 = proof_context(&session, 2);
+    let unknown = product.dispatch(
+        &mut session,
+        &c2,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
+                collection: ObjectId::new(999)?,
+                document: ProductDocument {
+                    object_id: ObjectId::new(1)?,
+                    text: "x".to_owned(),
+                    doc_values: BTreeMap::new(),
+                    vectors: BTreeMap::new(),
+                },
+            },
+        },
+    );
+    assert!(unknown.is_err());
+    let mut invalid = BTreeMap::new();
+    invalid.insert(
+        "missing_field".to_owned(),
+        ProductDocValue::String("nope".to_owned()),
+    );
+    let c3 = proof_context(&session, 3);
+    let bad_doc = product.dispatch(
+        &mut session,
+        &c3,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
+                collection: binding.collection,
+                document: ProductDocument {
+                    object_id: ObjectId::new(2)?,
+                    text: "y".to_owned(),
+                    doc_values: invalid,
+                    vectors: BTreeMap::new(),
+                },
+            },
+        },
+    );
+    assert!(bad_doc.is_err());
+    let c4 = proof_context(&session, 4);
+    product.dispatch(
+        &mut session,
+        &c4,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    drop(product);
+    fs::remove_dir_all(path)?;
     Ok(())
 }

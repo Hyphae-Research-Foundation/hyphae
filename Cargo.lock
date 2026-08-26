@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-cli"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "clap",
@@ -785,13 +785,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "unicode-normalization",
  "uuid",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "hyphae-client"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-contracts",
  "hyphae-native-daemon",
@@ -808,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-conformance-rust"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-client",
  "hyphae-contracts",
@@ -819,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-contracts"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-query",
  "schemars",
@@ -832,11 +833,11 @@ dependencies = [
 
 [[package]]
 name = "hyphae-core"
-version = "2.1.0"
+version = "2.2.0"
 
 [[package]]
 name = "hyphae-engine"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -851,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-independent-backup-verifier"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "serde",
@@ -860,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-ann"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -869,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -880,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "hyphae-native-pages",
@@ -890,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -898,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-daemon"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-native-product",
  "hyphae-native-protocol",
@@ -910,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-manifest"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -921,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -930,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -940,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-product"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "futures-channel",
@@ -963,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-protocol"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "hyphae-native-catalog",
@@ -975,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-records"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -984,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1014,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-types"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -1022,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-wal"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1032,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-pliegors"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-client",
  "thiserror",
@@ -1040,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-query"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1051,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-retrieval"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-core",
  "hyphae-query",
@@ -1064,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-server"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "axum",
  "base64 0.23.0",
@@ -1094,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-storage"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1111,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-v2-fixture"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "hyphae-native-product",
  "serde_json",

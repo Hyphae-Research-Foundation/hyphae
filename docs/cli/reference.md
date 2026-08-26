@@ -734,9 +734,10 @@ writing a new file. Example requests live in [`examples/http`](../../examples/ht
 
 ```text
 hyphae agent setup [--enable-service | --no-service]
-hyphae agent status | doctor | backup | upgrade | remove
+hyphae agent status | doctor | backup | upgrade | migrate-domains | remove
 hyphae agent restore --backup <ARCHIVE>
-hyphae agent configure <claude|codex|opencode> [--write]
+hyphae agent configure <claude|codex|opencode|pi> [--access <read|write>] [--apply]
+hyphae agent hook --host <claude|codex|opencode|pi>  # bounded JSON on stdin
 hyphae agent purge-data [--yes]
 ```
 
@@ -744,25 +745,43 @@ Owns the Agent Memory lifecycle described by the
 [product contract](../product/agent-memory.md): one local engine under
 `~/.local/share/hyphae/agent-memory/` that every coding agent shares
 through the `mcp --profile memory` adapter. `setup` is idempotent — it
-initializes the directory, provisions the memory collection, creates the
+initializes the directory, provisions physically separate personal, work,
+and journal collections, creates the
 scoped principals, and issues role-ceilinged keys under
 `~/.config/hyphae/credentials/` (0600), offering an opt-in systemd user
-unit. `configure` emits host registration for Claude Code, Codex, or
-OpenCode carrying only a credential file path, never a secret. `remove`
+unit. `configure` emits read-only host registration by default for Claude
+Code, Codex, OpenCode, or Pi; `--access write` explicitly adds store and
+forget. `--apply` installs the registration through the host's supported
+interface. Configuration carries only a credential file path, never a secret. `remove`
 deletes the service and credentials but never data; only `purge-data`
 deletes data, after confirmation, and both `restore` and `purge-data`
 refuse while the service owns the directory.
 
+`migrate-domains` is an explicit offline migration for legacy mixed
+collection `13`. It refuses while the service or local endpoint is active,
+seals a content-free durable plan, copies and verifies each complete document
+and lifecycle record with its original absolute expiry, writes a copy-complete
+barrier, and only then removes legacy source state. Exact retries resume from
+the durable plan and operation idempotency records.
+
+`hook` is the non-interactive proactive bridge installed by `configure
+--apply`. It resolves one stable project identity, performs bounded local
+recall before a prompt, and conservatively captures explicit durable facts
+after successful lifecycle events. It rejects oversized input and detected
+secrets, never persists complete prompts or responses, and uses no model.
+
 ## `mcp`
 
 ```text
-hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-file <RESTRICTED_PATH>
-hyphae mcp --base-url <ROOT_ORIGIN> --native-api-key-stdin
+hyphae mcp (--endpoint <LOCAL_ENDPOINT> | --base-url <ROOT_ORIGIN>) --native-api-key-file <RESTRICTED_PATH>
+hyphae mcp (--endpoint <LOCAL_ENDPOINT> | --base-url <ROOT_ORIGIN>) --native-api-key-stdin
 hyphae mcp --profile memory [--allow-write] [--memory-collection <ID>] ...
 ```
 
 Runs MCP revision `2025-06-18` as newline-delimited JSON-RPC 2.0 over stdio.
-It opens no listener or data directory. The adapter enforces a 4 MiB message
+It opens no listener or data directory. `--endpoint` uses the native local
+UDS/named-pipe transport and is the preferred same-machine path; `--base-url`
+uses HTTP v2. The adapter enforces a 4 MiB message
 bound and exposes only three Native v2 read tools: capabilities, redacted
 security status, and bounded redacted principal pages. `tools/list` returns at
 most two definitions and uses its own opaque cursor.
@@ -783,8 +802,8 @@ With a durable Native API key, `http://` is limited to canonical loopback
 hosts (`127.0.0.0/8`, `[::1]`, or exact `localhost`). Remote MCP endpoints must
 use `https://`; plaintext remote origins fail before the stdio request loop.
 
-`--profile memory` swaps the registry for the four Agent Memory verbs —
-recall and status always, store and forget only with `--allow-write` —
+`--profile memory` swaps the registry for Agent Memory — recall and status
+always; store, first-person journal, and forget only with `--allow-write` —
 scoped to the memory collection. The surface never advertises a tool the
 presented credential cannot execute, and recall proofs are written to
 `$XDG_STATE_HOME/hyphae/proofs/` for offline `proof verify` instead of
@@ -796,6 +815,7 @@ inlining hex past the message bound.
 |---|---|
 | `HYPHAE_DATA_DIR` | `--data-dir` |
 | `HYPHAE_BASE_URL` | `--base-url` |
+| `HYPHAE_NATIVE_ENDPOINT` | `--endpoint` for MCP local transport |
 | `HYPHAE_BEARER_TOKEN_FILE` | `--bearer-token-file` |
 | `HYPHAE_BEARER_TOKEN` | Token fallback when no file is selected |
 | `HYPHAE_NATIVE_API_KEY_FILE` | `--native-api-key-file` for Native local commands and MCP |

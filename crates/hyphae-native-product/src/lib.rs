@@ -263,6 +263,22 @@ impl ProductSnapshot {
         }
     }
 
+    /// Returns visible public scalar keys inside `[start, end)`, ascending, or
+    /// `None` fail-closed above `limit`.
+    pub fn structure_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        if start.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+            || end.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
+        {
+            return Some(Vec::new());
+        }
+        self.inner.structure_keys_in_range(start, end, limit)
+    }
+
     /// Returns visible internal scalar keys inside `[start, end)`, ascending,
     /// or `None` fail-closed above `limit`. Both bounds must carry the
     /// reserved internal prefix; anything else returns no keys.
@@ -528,6 +544,49 @@ impl NativeProduct {
         for (key, value) in entries {
             transaction.set(key.clone(), value.clone(), None)?;
         }
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Stores one exact public scalar value with its original absolute expiry
+    /// under a strict native commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a request, product, or durability error when the value cannot
+    /// be stored.
+    pub fn migration_store_public_entry(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if is_internal_structure_key(&key) {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        transaction.set(key, value, expires_at_micros)?;
+        let receipt = transaction.commit()?;
+        self.observe_commit(&receipt);
+        Ok(receipt.into())
+    }
+
+    /// Deletes one public scalar value under a strict native commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a request, product, or durability error when the value cannot
+    /// be deleted.
+    pub fn migration_delete_public_entry(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<ProductCommitReceipt, ProductError> {
+        if is_internal_structure_key(&key) {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
+        let mut transaction = self.database.begin(0, ProductDurability::Strict.into())?;
+        transaction.delete_structure(key)?;
         let receipt = transaction.commit()?;
         self.observe_commit(&receipt);
         Ok(receipt.into())

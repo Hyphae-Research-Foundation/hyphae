@@ -113,18 +113,21 @@ def run(binary: Path, base_url: str, writer_key: Path, reader_key: Path) -> dict
     other = f"{project}-other"
 
     writer = Adapter(binary, base_url, writer_key, write=True)
-    # 1. Discovery: the write profile lists exactly the four tools.
+    # 1. Discovery: the write profile lists exactly the five bounded tools.
     tools = writer.tools()
     expect(
         tools == ["hyphae_memory_recall", "hyphae_memory_status",
-                   "hyphae_memory_store", "hyphae_memory_forget"],
+                   "hyphae_memory_store", "hyphae_memory_journal",
+                   "hyphae_memory_forget"],
         f"discovery listed {tools}",
     )
     steps.append("discovery")
     # 2. Store one memory.
     stored = content(writer.call("hyphae_memory_store", {
         "project": project, "text": "the conformance decision to recall",
-        "kind": "decision", "agent": "conformance"}))
+        "kind": "decision", "agent": "conformance",
+        "harness": "conformance-cli", "model": "conformance-model",
+        "layer": "work"}))
     expect(stored.get("status") == "stored", f"store answered {stored}")
     memory_id = stored["id"]
     steps.append("store")

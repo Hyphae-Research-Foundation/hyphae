@@ -86,6 +86,17 @@ pub struct ProductDocument {
     pub vectors: BTreeMap<String, ProductVector>,
 }
 
+/// One stable-ID ordered page of complete integrated search documents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductDocumentPage {
+    /// Immutable snapshot shared by every returned document.
+    pub snapshot: SnapshotIdentity,
+    /// Complete documents in ascending object-ID order.
+    pub documents: Vec<ProductDocument>,
+    /// Last returned object ID when another page remains.
+    pub continuation: Option<crate::ObjectId>,
+}
+
 /// One bounded, idempotent atomic ingestion request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductSearchIngestBatch {
@@ -680,6 +691,83 @@ impl NativeProduct {
         })
     }
 
+    /// Validates and applies one complete product document inside a
+    /// caller-owned write batch, so the lexical text, doc-values, vectors,
+    /// manifest, and postings commit under the batch's single CSN alongside
+    /// SQL and structure stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns without mutation for any invalid document, unknown target,
+    /// duplicate identity, or exhausted bound.
+    pub fn stage_document_in_batch(
+        &self,
+        batch: &mut hyphae_native_runtime::NativeWriteBatch,
+        collection: crate::ObjectId,
+        document: &crate::ProductDocument,
+        logical_time_micros: i64,
+    ) -> Result<(), ProductError> {
+        let binding = self.resolve_search_collection_binding(collection, logical_time_micros)?;
+        let definition = self.search_definition(collection)?;
+        let batch_shape = ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents: vec![document.clone()],
+        };
+        validate_documents(&definition, &binding, &batch_shape)?;
+        let manifest_key = manifest_key(collection);
+        let existing = batch.get(&manifest_key).ok_or_else(corruption)?;
+        let mut identities = decode_manifest(existing)?;
+        if identities.len().saturating_add(1) > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
+            return Err(limit_exceeded());
+        }
+        let replace = identities.contains(&document.object_id);
+        if !replace && !identities.insert(document.object_id) {
+            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
+        }
+        let object_bytes = document.object_id.get().to_be_bytes().to_vec();
+        let transform = collection_lexical_transform(&definition, |id| {
+            batch.logical_catalog_object(id).cloned()
+        })?;
+        let text = match &transform {
+            None => document.text.clone(),
+            Some(transform) => transform.apply(&document.text),
+        };
+        let lexical = binding.lexical_index;
+        if replace {
+            batch
+                .replace_document(lexical, object_bytes.clone(), text)
+                .map_err(map_runtime_error)?;
+            let encoded_previous = batch
+                .get(&document_key(collection, document.object_id))
+                .ok_or_else(corruption)?
+                .to_vec();
+            delete_document_postings(batch, collection, document.object_id, &encoded_previous)?;
+        } else {
+            batch
+                .index_document(lexical, object_bytes.clone(), text)
+                .map_err(map_runtime_error)?;
+        }
+        for vector_binding in &binding.vectors {
+            if let Some(vector) = document.vectors.get(&vector_binding.name) {
+                batch
+                    .upsert_vector(vector_binding.index, document.object_id, vector.clone())
+                    .map_err(map_runtime_error)?;
+            }
+        }
+        batch
+            .set(
+                document_key(collection, document.object_id),
+                encode_document(document)?,
+                None,
+            )
+            .map_err(map_runtime_error)?;
+        write_document_postings(batch, collection, document)?;
+        batch
+            .set(manifest_key, encode_manifest(&identities)?, None)
+            .map_err(map_runtime_error)?;
+        Ok(())
+    }
+
     /// Atomically replaces one existing integrated document across lexical,
     /// named-vector, and doc-value state.
     ///
@@ -945,6 +1033,87 @@ impl NativeProduct {
         logical_time_micros: i64,
     ) -> Result<ProductSearchResult, ProductError> {
         self.search_collection_with_checkpoint(collection, request, logical_time_micros, || Ok(()))
+    }
+
+    /// Reads one bounded, stable-ID ordered page of complete integrated
+    /// documents from a caller-owned immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing binding, an invalid limit, corrupt side
+    /// records, or inconsistent lexical/vector state.
+    pub fn search_documents_at_snapshot(
+        snapshot: &ProductSnapshot,
+        collection: crate::ObjectId,
+        start_after: Option<crate::ObjectId>,
+        limit: usize,
+    ) -> Result<ProductDocumentPage, ProductError> {
+        if limit == 0 || limit > MAX_PRODUCT_SEARCH_HITS {
+            return Err(limit_exceeded());
+        }
+        let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
+        let manifest = load_manifest_ids(snapshot, collection)?;
+        let mut selected = manifest
+            .iter()
+            .copied()
+            .filter(|object_id| start_after.is_none_or(|start| *object_id > start))
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let continuation = (selected.len() > limit)
+            .then(|| selected.get(limit.saturating_sub(1)).copied())
+            .flatten();
+        selected.truncate(limit);
+
+        let mut vector_values = BTreeMap::new();
+        for vector in &binding.vectors {
+            let records = snapshot
+                .inner
+                .vector_records(vector.index)
+                .map_err(map_runtime_error)?;
+            vector_values.insert(
+                vector.name.clone(),
+                records
+                    .into_iter()
+                    .map(|record| (record.object_id, record.vector))
+                    .collect::<BTreeMap<_, _>>(),
+            );
+        }
+
+        let documents = selected
+            .into_iter()
+            .map(|object_id| {
+                let text = snapshot
+                    .inner
+                    .search_document_text(binding.lexical_index, &object_id.get().to_be_bytes())
+                    .ok_or_else(corruption)?
+                    .to_owned();
+                let encoded = snapshot
+                    .structure_get_internal(&document_key(collection, object_id))
+                    .ok_or_else(corruption)?;
+                let doc_values = decode_document(encoded, object_id)?;
+                let vectors = vector_values
+                    .iter()
+                    .filter_map(|(name, records)| {
+                        records
+                            .get(&object_id)
+                            .cloned()
+                            .map(|vector| (name.clone(), vector))
+                    })
+                    .collect();
+                Ok(ProductDocument {
+                    object_id,
+                    text,
+                    doc_values,
+                    vectors,
+                })
+            })
+            .collect::<Result<Vec<_>, ProductError>>()?;
+
+        Ok(ProductDocumentPage {
+            snapshot: snapshot.identity(),
+            documents,
+            continuation,
+        })
     }
 
     #[allow(clippy::too_many_lines)]

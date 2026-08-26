@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
 
 from hyphae_sdk.providers import (
     DeclaredProviderRecord,
+    DigitalOceanProvider,
     OllamaProvider,
     ProviderError,
 )
@@ -86,6 +87,27 @@ class DeclaredProviderRecordTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse()):
             with self.assertRaises(ProviderError):
                 OllamaProvider().embed("all-minilm", ["hello"])
+
+    def test_digitalocean_embed_declares_the_actual_provider(self) -> None:
+        response = json.dumps({"data": [{"embedding": [0.5, 0.25]}]}).encode("utf-8")
+
+        class FakeResponse:
+            def read(self) -> bytes:
+                return response
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResponse()):
+            vectors, record = DigitalOceanProvider(api_key="secret").embed(
+                "qwen3-embedding-0.6b", ["hello"]
+            )
+        self.assertEqual(vectors, [[0.5, 0.25]])
+        self.assertEqual(record.provider, "digitalocean-inference")
+        self.assertEqual(record.model, "qwen3-embedding-0.6b")
 
 
 if __name__ == "__main__":

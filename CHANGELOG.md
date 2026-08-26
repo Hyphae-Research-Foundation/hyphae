@@ -3,6 +3,77 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [2.2.0] - 2026-08-26
+
+Hyphae 2.2.0 makes Agent Memory transactional and the memory surface a
+first-class multipurpose citizen of the engine: one memory now commits
+across the lexical, vector, and structure planes under a single CSN, and
+retrieval can reason over temporal and session structure through the
+engine's doc-value plane instead of baked-in text. The release also lands
+the proactive host bridge, domain separation tooling, and the external
+retrieval/QA evaluation harness with its declarative reader and declared
+judge, all measured on pinned LoCoMo and LongMemEval releases.
+
+### Added
+
+- Atomic memory commits: `hyphae_memory_store` and the profile store stage
+  the search document (text, doc-values, vector branches) and the lifecycle
+  envelope with its TTL in one explicit all-engine transaction, so a crash
+  or abort can never leave a searchable document without its lifecycle
+  record. Transports that cannot serve explicit transactions fall back,
+  bounded per step, to the historical ingest-then-set sequence. A new
+  `ProductTransactionSearchMutation::Document` stage and
+  `NativeProduct::stage_document_in_batch` validate and apply complete
+  product documents inside a caller-owned write batch, with failure-path
+  coverage for unknown collections, invalid doc-values, and idempotent
+  replacement.
+- Temporal and session doc-values on memory collections: `session`,
+  `actor`, `date_anchor`, `session_ts`, and `turn_ord` join the memory
+  schema, letting filters, faceted eligibility, and per-parent
+  deduplication operate on time and session as data.
+- Proactive Agent Memory bridge (`hyphae agent hook`): lifecycle hooks for
+  Claude Code, Codex, OpenCode, and Pi inject bounded historical context
+  before a host processes a prompt, with fail-closed PII/secret filtering,
+  content-identified durable spool under `XDG_STATE_HOME`, and
+  acknowledgement-only drain through the owner-only local socket.
+- `hyphae agent migrate-domains`: offline, retry-safe migration of legacy
+  mixed collection data into the physically separated personal, work, and
+  journal domains, with plan/copy/done markers and unpaired-record
+  detection.
+- External retrieval and QA evaluation harness
+  (`tools/long_term_memory_benchmarks.py`): pinned-digest LoCoMo and
+  LongMemEval-S-cleaned protocols over disposable native directories,
+  versioned per-query traces, chunked parallel execution with audited
+  aggregation, audited-v2 qrel deduplication, offline statistical
+  selection (`tools/locomo_slice_a_statistics.py`: nested
+  leave-one-conversation-out, one-standard-error rule, conversation
+  bootstrap, exact sign-flip), and a declarative end-to-end QA phase
+  (`tools/reader_extractive.py`) whose extractive reader, official
+  F1/BLEU-1 metrics, and declared LLM judge (DigitalOcean Inference,
+  429-backoff, HYATTS01-compatible audit records) keep every compared
+  system on one reader axis. All receipts remain `local-diagnostic` and
+  never authorize publication.
+- `DigitalOceanProvider` in the Python SDK provider layer, returning
+  declared-provider attestation records for embeddings and reranks.
+
+### Changed
+
+- Memory recall keeps gating every hit on the live lifecycle envelope and
+  now resolves the collection's physical bindings through the public
+  catalog only.
+- Evaluation and conformance tooling gained session-cover and slice
+  candidates (temporal window, per-session quota) as deterministic fusion
+  options, each declared in the receipt protocol.
+
+### Measured
+
+- LoCoMo evidence recall at 10 for the selected deterministic
+  configuration: 0.7012 OOF (baseline 0.5424), conversation-bootstrap 95%
+  interval [0.1432, 0.1831], exact sign-flip p = 0.00195.
+- LongMemEval user-only retrieval across all 419 eligible questions:
+  recall_all@10 0.8926, ndcg_any@10 0.8775, with zero changed rankings on
+  repeat.
+
 ## [2.1.0] - 2026-08-23
 
 Hyphae 2.1.0 ships the Agent Memory program: local, shared, and
@@ -14,14 +85,14 @@ publication surface.
 
 ### Added
 
-- `hyphae mcp --profile memory`: a four-verb MCP surface — store,
-  recall, forget, status — over a dedicated memory collection, with
+- `hyphae mcp --profile memory`: a five-verb MCP surface — store,
+  journal, recall, forget, status — over physically separated memory domains, with
   bounded envelopes (project, scope, kind, agent, text, TTL), exact
   project isolation with labeled `_global` memories, idempotent
   owner-validated forget, and recall proofs written as state files for
   offline `hyphae proof verify`. The surface never advertises a tool
   the presented credential cannot execute: the read profile lists
-  recall and status only; `--allow-write` adds store and forget.
+  recall and status only; `--allow-write` adds store, journal, and forget.
 - `hyphae agent`: the whole lifecycle — idempotent `setup` (directory,
   memory-schema collection, scoped principals, role-ceilinged keys,
   opt-in systemd user unit), `status` (redacted), `doctor`, `backup`,

@@ -23,13 +23,38 @@ the user service, and prints exact backup and removal instructions.
 Then register the memory server with your agents:
 
 ```bash
-hyphae agent configure claude     # prints the claude CLI command
-hyphae agent configure codex --write
-hyphae agent configure opencode --write
+hyphae agent configure claude --apply
+hyphae agent configure codex --apply
+hyphae agent configure opencode --apply
+hyphae agent configure pi --apply
 ```
 
-Every host runs the same binary and profile; configuration carries only
-a credential file path, never a secret.
+Hosts receive recall and status access by default. Grant store, journal, and
+forget to one host only when needed with `--access write`. Every host uses the same
+local socket and profile; configuration carries only a credential file path,
+never a secret.
+
+`--apply` also installs proactive lifecycle integration. Claude Code and Codex
+receive command hooks, OpenCode receives a local plugin, and Pi receives a
+local extension. Before each prompt they recall relevant project memory and
+inject it as delimited, untrusted historical context. After a turn, only
+explicit decision/constraint/fact lines and safe successful build/test
+commands are considered for capture; prompts and responses are not stored in
+full.
+
+Each memory records two additional provenance columns: the harness that
+produced it and the model identity reported by that harness. A separate
+first-person `journal` layer lets one model record its own reflection for later
+models to inspect without mixing that reflection with user/project work memory.
+Journal entries are labeled as model-authored historical context and never
+override current user instructions.
+
+Automatic capture and injection both pass through fail-closed secret and PII
+screening. Email, phone, address, government-ID, payment-card, network-address,
+UUID, home-path, and likely credential patterns are discarded. Repository
+names and local paths are represented by a private local project digest.
+Sanitized capture survives a temporary service outage in the private XDG state
+spool and is committed exactly once on the next successful hook invocation.
 
 ## Operate
 
@@ -44,7 +69,7 @@ journalctl --user -u hyphae-agent-memory
 ## Upgrade
 
 ```bash
-omarchy pkg update                # or your AUR helper
+omarchy update                    # updates system and installed AUR packages
 hyphae agent upgrade              # stop, backup, doctor, start
 ```
 

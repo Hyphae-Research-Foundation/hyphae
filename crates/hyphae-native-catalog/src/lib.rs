@@ -1262,14 +1262,16 @@ impl SearchCollectionDefinitionV2 {
 
         previous_id = None;
         for vector in &self.vectors {
-            if previous_id == Some(vector.id) || ids.contains(&vector.id) {
+            if previous_id == Some(vector.id) {
                 return Err(CatalogError::DuplicateVectorId(vector.id));
             }
             if previous_id.is_some_and(|previous| previous > vector.id) {
                 return Err(CatalogError::NoncanonicalFieldOrder);
             }
             previous_id = Some(vector.id);
-            ids.insert(vector.id);
+            if !ids.insert(vector.id) {
+                return Err(CatalogError::DuplicateVectorId(vector.id));
+            }
             if !names.insert(vector.name.lookup()) {
                 return Err(CatalogError::DuplicateVectorName(Box::new(
                     vector.name.clone(),
@@ -2041,15 +2043,17 @@ mod tests {
 
     use hyphae_native_types::{
         CatalogVersion, ColumnId, EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId,
+        VectorElement, VectorType,
     };
 
     use super::{
         AnalyzerDefinition, AnalyzerTokenizer, CatalogError, CatalogName, CatalogObject,
         CatalogObjectV2, CatalogSnapshot, CatalogTransaction, ColumnDefinition,
         CompatibleCatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind,
-        FieldSourcePolicy, LexicalIndexPolicy, LogicalCatalogObject, ObjectHeader, ObjectHeaderV2,
-        QualifiedName, RelationDefinition, SearchCollectionDefinitionV2, SearchFieldDefinitionV2,
-        SearchFieldOptions, SecondaryIndexDefinition, dependency_edges_for,
+        FieldSourcePolicy, IncrementalVectorLifecycle, LexicalIndexPolicy, LogicalCatalogObject,
+        NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QualifiedName, RelationDefinition,
+        SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions,
+        SecondaryIndexDefinition, VectorMetric, VectorSearchPolicy, dependency_edges_for,
         derive_logical_dependency_edges,
     };
 
@@ -2158,6 +2162,57 @@ mod tests {
         assert_eq!(
             invalid.validate(),
             Err(CatalogError::MissingPrimaryKeyColumn(ColumnId::new(2)?))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_vectors_accept_new_ids_and_reject_field_id_collisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut definition = SearchCollectionDefinitionV2 {
+            header: ObjectHeaderV2 {
+                id: ObjectId::new(13)?,
+                owner: EngineKind::Search,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted("documents")?,
+                ),
+                parent: Some(ObjectId::new(11)?),
+                definition_version: DefinitionVersion::FIRST,
+            },
+            fields: vec![SearchFieldDefinitionV2 {
+                id: FieldId::new(1)?,
+                name: CatalogName::unquoted("body")?,
+                logical_type: LogicalType::Text,
+                analyzer: None,
+                options: SearchFieldOptions {
+                    stored: true,
+                    doc_values: false,
+                    source: FieldSourcePolicy::Retained,
+                    lexical: LexicalIndexPolicy::None,
+                },
+            }],
+            vectors: vec![NamedVectorDefinition {
+                id: FieldId::new(2)?,
+                name: CatalogName::unquoted("embedding")?,
+                vector_type: VectorType::new(VectorElement::Float32, 3)?,
+                metric: VectorMetric::SquaredL2,
+                policy: VectorSearchPolicy::Exact,
+                lifecycle: IncrementalVectorLifecycle {
+                    delta_max_entries: 100,
+                    consolidate_after_deltas: 4,
+                    retain_generations: 2,
+                },
+            }],
+            bm25: None,
+        };
+        definition.validate()?;
+
+        definition.vectors[0].id = FieldId::new(1)?;
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::DuplicateVectorId(FieldId::new(1)?))
         );
         Ok(())
     }

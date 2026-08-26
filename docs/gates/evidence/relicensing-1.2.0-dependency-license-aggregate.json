@@ -250,18 +250,18 @@
         "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
       },
       {
-        "canonical_sha256": "9d3b4698bfd1a2b994eb4e915af5f5ee06b30c4653383183beb26fe453e8f1c4",
+        "canonical_sha256": "6aa0b55f2c4353a0085828dfde3b65da3ef49800da20389a685710ccfbd98ff9",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 298,
         "result": "pass",
-        "sha256": "ad794b668a778d5aaa15a9de4914e00322a3313e03a091cdc0db992a3be93cc7"
+        "sha256": "c76e1683211426efbe71121e1dc56ec90e65f8fd364bd4324777083e8bd03372"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
         "lock": "sdks/typescript/package-lock.json",
         "package_count": 4,
         "result": "pass",
-        "sha256": "739baec1efa099c42f8d545d4d587dc3827f964efdd0b8db7aec629b08271f6b"
+        "sha256": "235ae02b43f11d93c4725739551264e8352b4ef23cf3abe30d8fbce58c5507f3"
       }
     ],
     "python": {
@@ -269,17 +269,17 @@
       "inventory": "sdks/python/build-dependencies.json",
       "inventory_sha256": "7108c1e86b957224038bb94be80f14fe7c0260726ee3e6b1d3cd2ef7e1ddea30",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "89d0744d1446fcb85fe693dbd943341e6957c3d62e2c3080b0584a076ac14427",
+      "manifest_sha256": "055affdbe5492155f033639fdfb3a1a98579c4593da1bb70b2a0eec2557411d1",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
     },
     "rust": {
-      "canonical_sha256": "3382159038ba5e5ba43bddd4d9bd3d34b5f2d0f7af2f111e6d007ad8959d8253",
+      "canonical_sha256": "352ab7d575bca7e09029ceb2aa16d8fe1f476d3a74dfc125ca51b8e72c8944ea",
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "e1edf0ccea25753b66eb5ac684bdafdbde825418716b57c628d918f9193086ef"
+      "sha256": "e0ea3411f095576cea3d8a21643005951796c97df4b023e3c41c44579a635b87"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "27711c0efffdb57062d71fe07f59ce3f44ba2779",
+      "commit": "748a046aa35e50156860bcc62de552a8328eb16c",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "27826547ca856731a1e966f1ff691f9ede84b314"
+      "tree": "31fc36a62c4996d9d615f41dfdb721eb4285a08b"
     }
   },
   "target_release": "1.2.0"

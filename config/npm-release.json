@@ -1,7 +1,7 @@
 {
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-npm-release-v1",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "packages": [
     {
       "path": "sdks/typescript",
@@ -13,7 +13,7 @@
     }
   ],
   "apache_publication_authority": {
-    "version": "2.1.0",
+    "version": "2.2.0",
     "tag": "v2.1.0",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": true
