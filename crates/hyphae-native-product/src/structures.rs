@@ -406,6 +406,14 @@ pub enum ProductTransactionSearchMutation {
         index: ObjectId,
         document_id: Vec<u8>,
     },
+    /// Replace or insert one complete product document — source text,
+    /// doc-values, and named vectors — under the transaction's CSN.
+    Document {
+        /// Search collection receiving the document.
+        collection: ObjectId,
+        /// Complete validated cross-engine document.
+        document: crate::ProductDocument,
+    },
 }
 
 /// One transaction-bound native vector mutation.

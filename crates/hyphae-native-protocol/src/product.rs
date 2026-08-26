@@ -3823,6 +3823,14 @@ fn encode_transaction_search_mutation(
             encoded.extend_from_slice(&index.get().to_le_bytes());
             put_bytes(encoded, document_id)?;
         }
+        ProductTransactionSearchMutation::Document {
+            collection,
+            document,
+        } => {
+            encoded.push(3);
+            encoded.extend_from_slice(&collection.get().to_le_bytes());
+            encode_product_document(encoded, document)?;
+        }
     }
     Ok(())
 }
@@ -3831,6 +3839,14 @@ fn decode_transaction_search_mutation(
     decoder: &mut Decoder<'_>,
 ) -> Result<ProductTransactionSearchMutation, ProductCodecError> {
     let tag = decoder.u8()?;
+    if tag == 3 {
+        let collection =
+            ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        return Ok(ProductTransactionSearchMutation::Document {
+            collection,
+            document: decode_product_document(decoder)?,
+        });
+    }
     let index = ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
     let document_id = decoder.owned_bytes()?;
     match tag {

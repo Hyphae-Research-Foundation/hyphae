@@ -18,6 +18,9 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
 use crate::{
     ADMINISTRATIVE_MEMORY_BYTES, CheckpointReceipt, GovernorRequest, NativeDatabase,
     NativeResourceGovernor, NativeRuntimeError, WorkloadClass, admit_governor_work,
@@ -181,7 +184,7 @@ impl NativeDatabase {
         reject_nested_destination(&self.data_directory, &parent, destination)?;
         let checkpoint = self.checkpoint_at(None)?;
         let staging = staging_path(destination, "backup")?;
-        fs::create_dir(&staging).map_err(|source| io_error(&staging, source))?;
+        create_private_directory(&staging)?;
         let result = create_staging(self.data_directory(), &staging, checkpoint, limits)
             .and_then(|()| verify_native_backup_bounded(&staging, limits))
             .and_then(|mut info| {
@@ -284,7 +287,7 @@ pub fn restore_native_backup_with_limits(
     reject_nested_destination(backup, &parent, destination)?;
     let manifest = read_manifest(&backup.join(MANIFEST_FILE), limits)?;
     let staging = staging_path(destination, "restore")?;
-    fs::create_dir(&staging).map_err(|source| io_error(&staging, source))?;
+    create_private_directory(&staging)?;
     let result = copy_manifest_files(
         &backup.join(DATA_DIRECTORY),
         &staging,
@@ -702,7 +705,7 @@ fn copy_manifest_files(
 ) -> Result<(), NativeBackupError> {
     for directory in directories {
         let target = destination.join(directory);
-        fs::create_dir(&target).map_err(|source| io_error(&target, source))?;
+        create_private_directory(&target)?;
     }
     for file in files {
         let relative = Path::new(&file.path);
@@ -738,6 +741,7 @@ fn copy_and_hash(source: &Path, destination: &Path) -> Result<(u64, [u8; 32]), N
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
+        .apply_private_mode()
         .open(destination)
         .map_err(|error| io_error(destination, error))?;
     let mut hasher = Hasher::new();
@@ -770,6 +774,26 @@ fn copy_and_hash(source: &Path, destination: &Path) -> Result<(u64, [u8; 32]), N
         .sync_all()
         .map_err(|error| io_error(destination, error))?;
     Ok((copied, *hasher.finalize().as_bytes()))
+}
+
+trait PrivateOpenOptions {
+    fn apply_private_mode(&mut self) -> &mut Self;
+}
+
+impl PrivateOpenOptions for OpenOptions {
+    fn apply_private_mode(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        self.mode(0o600);
+        self
+    }
+}
+
+fn create_private_directory(path: &Path) -> Result<(), NativeBackupError> {
+    fs::create_dir(path).map_err(|source| io_error(path, source))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|source| io_error(path, source))?;
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<(u64, [u8; 32]), NativeBackupError> {

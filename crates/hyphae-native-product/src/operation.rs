@@ -1171,7 +1171,7 @@ fn dispatch_inner(
                 &authorization,
                 context.limits,
                 |batch| {
-                    apply_search_mutation(batch, mutation)?;
+                    apply_search_mutation(product, batch, mutation, context.logical_time_micros)?;
                     Ok(ProductTransactionStageResult::Search)
                 },
             )?)
@@ -3056,6 +3056,7 @@ impl ProductTransactionSearchMutation {
             Self::Index { index, .. }
             | Self::Replace { index, .. }
             | Self::Delete { index, .. } => *index,
+            Self::Document { collection, .. } => *collection,
         }
     }
 }
@@ -3312,8 +3313,10 @@ fn validate_transaction_sql(mutation: &ProductTransactionSqlMutation) -> Result<
 }
 
 fn apply_search_mutation(
+    product: &NativeProduct,
     batch: &mut NativeWriteBatch,
     mutation: ProductTransactionSearchMutation,
+    logical_time_micros: i64,
 ) -> Result<(), ProductError> {
     match mutation {
         ProductTransactionSearchMutation::Index {
@@ -3329,6 +3332,10 @@ fn apply_search_mutation(
         ProductTransactionSearchMutation::Delete { index, document_id } => {
             batch.delete_document(index, document_id)?;
         }
+        ProductTransactionSearchMutation::Document {
+            collection,
+            document,
+        } => product.stage_document_in_batch(batch, collection, &document, logical_time_micros)?,
     }
     Ok(())
 }
