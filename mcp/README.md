@@ -1,7 +1,7 @@
 # Native MCP adapter
 
 `hyphae mcp` is a bounded, read-only stdio adapter for an already running
-managed Native HTTP v2 service. It never opens a data directory, starts a
+managed Native local or HTTP v2 service. It never opens a data directory, starts a
 listener, accepts a format-2 bearer token, or exposes Native write operations.
 
 ## Start and configure
@@ -12,9 +12,13 @@ hyphae serve --data-dir ./hyphae-data \
   --http-bind 127.0.0.1:8787 \
   --native-api-key-auth
 
-hyphae mcp --base-url http://127.0.0.1:8787 \
+hyphae mcp --endpoint ./hyphae.sock \
   --native-api-key-file ./auditor.key
 ```
+
+The native local endpoint is preferred when the adapter and daemon run on the
+same machine. `--base-url http://127.0.0.1:8787` remains available for a
+loopback HTTP deployment.
 
 Plaintext `http://` is accepted only for a canonical loopback host
 (`127.0.0.0/8`, `[::1]`, or exact `localhost`). Any other MCP base URL must use

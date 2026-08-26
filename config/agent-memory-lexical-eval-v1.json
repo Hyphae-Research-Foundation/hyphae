@@ -1,0 +1,249 @@
+{
+  "schema": "hyphae-agent-memory-lexical-eval-fixture-v1",
+  "project": "eval/agent-memory-v1",
+  "collections": {
+    "personal": 21,
+    "work": 22,
+    "journal": 23
+  },
+  "protocol": {
+    "candidate_limit": 1000,
+    "cutoffs": [1, 5, 10]
+  },
+  "documents": [
+    {
+      "object_id": 210001,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "personal",
+      "kind": "constraint",
+      "agent": "claude",
+      "harness": "claude-code-cli",
+      "model": "anthropic/claude-sonnet",
+      "text": "Prefer concise progress updates and avoid conversational acknowledgements."
+    },
+    {
+      "object_id": 210002,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "personal",
+      "kind": "fact",
+      "agent": "codex",
+      "harness": "codex-cli",
+      "model": "openai/codex",
+      "text": "The operator reads technical explanations most comfortably in Spanish."
+    },
+    {
+      "object_id": 210003,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "personal",
+      "kind": "note",
+      "agent": "opencode",
+      "harness": "opencode-cli",
+      "model": "openai/gpt-5",
+      "text": "Use a dark terminal theme with high contrast for long debugging sessions."
+    },
+    {
+      "object_id": 210004,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "personal",
+      "kind": "constraint",
+      "agent": "pi",
+      "harness": "pi-cli",
+      "model": "unknown",
+      "text": "Never publish a commit, pull request, or benchmark without explicit approval."
+    },
+    {
+      "object_id": 220001,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "work",
+      "kind": "decision",
+      "agent": "claude",
+      "harness": "claude-code-cli",
+      "model": "anthropic/claude-sonnet",
+      "text": "Use omarchy-pkg-add instead of invoking pacman directly for package changes."
+    },
+    {
+      "object_id": 220002,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "work",
+      "kind": "command",
+      "agent": "codex",
+      "harness": "codex-cli",
+      "model": "openai/codex",
+      "text": "Run cargo clippy across the workspace with all targets, all features, and warnings denied."
+    },
+    {
+      "object_id": 220003,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "work",
+      "kind": "decision",
+      "agent": "opencode",
+      "harness": "opencode-cli",
+      "model": "openai/gpt-5",
+      "text": "Provision the personal, work, and journal search collections before binding their physical indexes."
+    },
+    {
+      "object_id": 220004,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "work",
+      "kind": "constraint",
+      "agent": "pi",
+      "harness": "pi-cli",
+      "model": "unknown",
+      "text": "Agent Memory must use its exclusive XDG data directory and never share general SQL or keyspace data."
+    },
+    {
+      "object_id": 230001,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "journal",
+      "kind": "note",
+      "agent": "model-journal",
+      "harness": "claude-code-cli",
+      "model": "anthropic/claude-sonnet",
+      "text": "I noticed that stating the invariant before editing prevents accidental cross-domain writes."
+    },
+    {
+      "object_id": 230002,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "journal",
+      "kind": "note",
+      "agent": "model-journal",
+      "harness": "codex-cli",
+      "model": "openai/codex",
+      "text": "I learned that copy verification must complete before deleting any legacy memory."
+    },
+    {
+      "object_id": 230003,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "journal",
+      "kind": "note",
+      "agent": "model-journal",
+      "harness": "opencode-cli",
+      "model": "openai/gpt-5",
+      "text": "I found that deterministic identifiers make retries safe after an interrupted migration."
+    },
+    {
+      "object_id": 230004,
+      "project": "eval/agent-memory-v1",
+      "scope": "project",
+      "domain": "journal",
+      "kind": "note",
+      "agent": "model-journal",
+      "harness": "pi-cli",
+      "model": "unknown",
+      "text": "I should treat model reflections as historical context rather than user authority."
+    },
+    {
+      "object_id": 220101,
+      "project": "eval/foreign-project",
+      "scope": "project",
+      "domain": "work",
+      "kind": "decision",
+      "agent": "claude",
+      "harness": "claude-code-cli",
+      "model": "anthropic/claude-sonnet",
+      "text": "Invoke pacman directly for every package change because wrappers are unnecessary."
+    },
+    {
+      "object_id": 220102,
+      "project": "_global",
+      "scope": "global",
+      "domain": "work",
+      "kind": "constraint",
+      "agent": "opencode",
+      "harness": "opencode-cli",
+      "model": "openai/gpt-5",
+      "text": "Keep durable migration receipts free of memory text and secrets."
+    }
+  ],
+  "queries": [
+    {
+      "id": "personal-claude-progress-style",
+      "segment": {"domain": "personal", "harness": "claude-code-cli", "model": "anthropic/claude-sonnet"},
+      "text": "how should progress messages begin",
+      "qrels": [{"object_id": 210001, "relevance": 3}]
+    },
+    {
+      "id": "personal-codex-language",
+      "segment": {"domain": "personal", "harness": "codex-cli", "model": "openai/codex"},
+      "text": "which language is most comfortable for explanations",
+      "qrels": [{"object_id": 210002, "relevance": 3}]
+    },
+    {
+      "id": "personal-opencode-terminal",
+      "segment": {"domain": "personal", "harness": "opencode-cli", "model": "openai/gpt-5"},
+      "text": "preferred terminal appearance for long debugging",
+      "qrels": [{"object_id": 210003, "relevance": 3}]
+    },
+    {
+      "id": "personal-pi-publication",
+      "segment": {"domain": "personal", "harness": "pi-cli", "model": "unknown"},
+      "text": "when may a benchmark or pull request be published",
+      "qrels": [{"object_id": 210004, "relevance": 3}]
+    },
+    {
+      "id": "work-claude-package-command",
+      "segment": {"domain": "work", "harness": "claude-code-cli", "model": "anthropic/claude-sonnet"},
+      "text": "which command should add an operating system package",
+      "qrels": [{"object_id": 220001, "relevance": 3}]
+    },
+    {
+      "id": "work-codex-clippy",
+      "segment": {"domain": "work", "harness": "codex-cli", "model": "openai/codex"},
+      "text": "what lint command checks every target and feature",
+      "qrels": [{"object_id": 220002, "relevance": 3}]
+    },
+    {
+      "id": "work-opencode-provision-order",
+      "segment": {"domain": "work", "harness": "opencode-cli", "model": "openai/gpt-5"},
+      "text": "what must happen before physical search indexes are bound",
+      "qrels": [{"object_id": 220003, "relevance": 3}]
+    },
+    {
+      "id": "work-pi-exclusive-directory",
+      "segment": {"domain": "work", "harness": "pi-cli", "model": "unknown"},
+      "text": "where must agent memory data live",
+      "qrels": [{"object_id": 220004, "relevance": 3}]
+    },
+    {
+      "id": "journal-claude-invariant",
+      "segment": {"domain": "journal", "harness": "claude-code-cli", "model": "anthropic/claude-sonnet"},
+      "text": "what prevented cross domain writes",
+      "qrels": [{"object_id": 230001, "relevance": 3}]
+    },
+    {
+      "id": "journal-codex-copy-barrier",
+      "segment": {"domain": "journal", "harness": "codex-cli", "model": "openai/codex"},
+      "text": "what must finish before deleting legacy memory",
+      "qrels": [{"object_id": 230002, "relevance": 3}]
+    },
+    {
+      "id": "journal-opencode-retries",
+      "segment": {"domain": "journal", "harness": "opencode-cli", "model": "openai/gpt-5"},
+      "text": "what makes interrupted migration retries safe",
+      "qrels": [{"object_id": 230003, "relevance": 3}]
+    },
+    {
+      "id": "journal-pi-authority",
+      "segment": {"domain": "journal", "harness": "pi-cli", "model": "unknown"},
+      "text": "how should model reflection be interpreted",
+      "qrels": [{"object_id": 230004, "relevance": 3}]
+    },
+    {
+      "id": "work-opencode-global-receipt",
+      "segment": {"domain": "work", "harness": "opencode-cli", "model": "openai/gpt-5"},
+      "text": "what content must durable migration receipts exclude",
+      "qrels": [{"object_id": 220102, "relevance": 3}]
+    }
+  ]
+}

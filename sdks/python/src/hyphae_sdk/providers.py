@@ -177,8 +177,51 @@ class OpenAiProvider:
         return vectors, record
 
 
+class DigitalOceanProvider:
+    """DigitalOcean Inference embeddings with declared-provider records."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        base_url: str = "https://inference.do-ai.run/v1",
+        timeout: float = 120.0,
+    ) -> None:
+        key = api_key if api_key is not None else os.environ.get("DIGITALOCEAN_INFERENCE_KEY", "")
+        if not key:
+            raise ProviderError("a DigitalOcean inference key is required")
+        self._api_key = key
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+
+    def embed(self, model: str, texts: list[str]) -> tuple[list[list[float]], DeclaredProviderRecord]:
+        """Embeds ``texts`` and returns vectors with the attestation record."""
+        if not texts:
+            raise ProviderError("no texts to embed")
+        request_bytes, response_bytes = _post_json(
+            f"{self._base_url}/embeddings",
+            {"model": model, "input": texts},
+            {"Authorization": f"Bearer {self._api_key}"},
+            self._timeout,
+        )
+        decoded = json.loads(response_bytes)
+        data = decoded.get("data")
+        if not isinstance(data, list) or len(data) != len(texts):
+            raise ProviderError("provider returned an unexpected embedding shape")
+        vectors = [entry.get("embedding") for entry in data]
+        if any(not isinstance(vector, list) for vector in vectors):
+            raise ProviderError("provider returned an unexpected embedding shape")
+        return vectors, DeclaredProviderRecord(
+            provider="digitalocean-inference",
+            model=model,
+            request_digest=_digest(request_bytes),
+            response_digest=_digest(response_bytes),
+        )
+
+
 __all__ = [
     "DeclaredProviderRecord",
+    "DigitalOceanProvider",
     "OllamaProvider",
     "OpenAiProvider",
     "ProviderError",
