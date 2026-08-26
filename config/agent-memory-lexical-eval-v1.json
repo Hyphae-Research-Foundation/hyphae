@@ -1,4 +1,5 @@
 {
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-agent-memory-lexical-eval-fixture-v1",
   "project": "eval/agent-memory-v1",
   "collections": {

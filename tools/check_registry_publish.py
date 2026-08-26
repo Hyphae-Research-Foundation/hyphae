@@ -28,7 +28,7 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
-    "version": "2.1.0",
+    "version": "2.2.0",
     "tag": "v2.1.0",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
@@ -372,7 +372,7 @@ def _policy(root: Path) -> dict[str, Any]:
         value["schema"] != "hyphae-registry-publish-authority-v1"
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
-        or value["version"] != "2.1.0"
+        or value["version"] != "2.2.0"
         or value["tag"] != "v2.1.0"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
@@ -1221,7 +1221,7 @@ def _load_publication_state(
     expected = {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "2.1.0",
+        "version": "2.2.0",
         "source": authority["source"],
         "inventory": _publication_inventory(ecosystem, root),
     }

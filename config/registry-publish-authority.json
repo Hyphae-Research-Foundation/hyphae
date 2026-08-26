@@ -3,7 +3,7 @@
   "schema": "hyphae-registry-publish-authority-v1",
   "repository": "Hyphae-Research-Foundation/hyphae",
   "branch": "main",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "tag": "v2.1.0",
   "tag_kind": "annotated",
   "tag_signature": {

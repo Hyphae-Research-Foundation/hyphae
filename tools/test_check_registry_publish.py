@@ -155,7 +155,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "2.1.0",
+        "version": "2.2.0",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -412,7 +412,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 2.1.0" in item for item in failures))
+        self.assertTrue(any("blocked until exact version 2.2.0" in item for item in failures))
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (
