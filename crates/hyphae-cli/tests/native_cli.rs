@@ -3,6 +3,7 @@
 //! Black-box conformance for the native-authority single binary.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs,
     path::{Path, PathBuf},
@@ -23,7 +24,10 @@ use hyphae_native_product::proof::{
     NativeProofContent, NativeProofKind, ProofCodecLimits, WitnessCodecLimits,
     bundle_native_witness, encode_native_proof,
 };
-use hyphae_native_product::{BuiltInRole, NativeProduct, ProductErrorCode};
+use hyphae_native_product::{
+    BuiltInRole, NativeProduct, ProductDocValue, ProductDocument, ProductDurability,
+    ProductErrorCode, ProductSearchIngestBatch,
+};
 use hyphae_storage::{SnapshotReadLimits, load_snapshot};
 use uuid::Uuid;
 
@@ -3498,11 +3502,11 @@ fn read_child_stderr(child: &mut Child) -> Result<String, std::io::Error> {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        encoded.push(char::from(hex[usize::from(byte >> 4)]));
+        encoded.push(char::from(hex[usize::from(byte & 0x0f)]));
     }
     encoded
 }
@@ -4497,11 +4501,25 @@ fn agent_lifecycle_is_idempotent_and_preserves_data() -> Result<(), Box<dyn Erro
     let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
     assert_eq!(doctor["status"], "healthy");
     // Configure writes host configurations that never contain a secret.
-    let opencode = run_agent(&["agent", "configure", "opencode", "--write"])?;
+    let opencode = run_agent(&["agent", "configure", "opencode"])?;
     assert!(opencode.status.success());
-    let opencode_config = fs::read_to_string(home.0.join(".config/opencode/opencode.json"))?;
-    assert!(opencode_config.contains("hyphae-memory"));
+    let opencode_config = String::from_utf8(opencode.stdout)?;
+    assert!(opencode_config.contains("opencode mcp add hyphae-memory"));
+    assert!(opencode_config.contains("memory-reader.key"));
+    assert!(!opencode_config.contains("--allow-write"));
     assert!(!opencode_config.contains("hyp1_"));
+    // Proactive hooks fail open before setup or when the daemon is absent,
+    // returning no context rather than blocking the host.
+    let hook = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .env("HOME", &home_text)
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["agent", "hook", "--host", "opencode"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let hook = hook.wait_with_output()?;
+    assert!(!hook.status.success(), "empty hook input must fail closed");
     // Remove preserves data; purge deletes only with the explicit flag.
     let remove = run_agent(&["agent", "remove"])?;
     assert!(remove.status.success());
@@ -4513,9 +4531,316 @@ fn agent_lifecycle_is_idempotent_and_preserves_data() -> Result<(), Box<dyn Erro
             .join(".config/hyphae/credentials/memory-writer.key")
             .exists()
     );
+    // Reinstall recovers Owner authority, reissues the agent keys, and keeps
+    // the preserved directory usable.
+    let reinstalled = run_agent(&["agent", "setup", "--no-service"])?;
+    assert!(
+        reinstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reinstalled.stderr)
+    );
+    let reinstalled_status = run_agent(&["agent", "status"])?;
+    let reinstalled_status: serde_json::Value = serde_json::from_slice(&reinstalled_status.stdout)?;
+    assert_eq!(reinstalled_status["initialized"], true);
+    assert_eq!(reinstalled_status["credentials"]["operator"], true);
+    assert_eq!(reinstalled_status["credentials"]["memory_reader"], true);
+    assert_eq!(reinstalled_status["credentials"]["memory_writer"], true);
     let purge = run_agent(&["agent", "purge-data", "--yes"])?;
     assert!(purge.status.success());
     assert!(!data.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_domain_migration_copies_verifies_and_removes_legacy_data() -> Result<(), Box<dyn Error>> {
+    let home = TestDirectory::new()?;
+    let home_text = path(&home.0);
+    let run_agent = |arguments: &[&str]| -> Result<std::process::Output, Box<dyn Error>> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+            .env("HOME", &home_text)
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+            .args(arguments)
+            .output()?)
+    };
+    let setup = run_agent(&["agent", "setup", "--no-service"])?;
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let data = home.0.join(".local/share/hyphae/agent-memory");
+    let project = "migration/project";
+    let text = "Keep the domain migration retry-safe";
+    let layer = "work";
+    let digest = blake3::Hasher::new()
+        .update(b"hyphae-agent-memory")
+        .update(&[0])
+        .update(project.as_bytes())
+        .update(&[0])
+        .update(layer.as_bytes())
+        .update(&[0])
+        .update(text.as_bytes())
+        .finalize();
+    let mut identity_bytes = [0_u8; 16];
+    identity_bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    let identity = u128::from_le_bytes(identity_bytes).max(1);
+    let object_id = hyphae_native_product::ObjectId::new(identity)?;
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "project": project,
+        "scope": "project",
+        "kind": "decision",
+        "layer": layer,
+        "agent": "legacy-agent",
+        "harness": "legacy-harness",
+        "model": "legacy-model",
+        "text": text,
+        "expires_at_micros": null,
+    }))?;
+    let mut product = NativeProduct::open(&data)?;
+    product.ingest_search_batch(
+        hyphae_native_product::ObjectId::new(13)?,
+        &ProductSearchIngestBatch {
+            idempotency_id: identity,
+            documents: vec![ProductDocument {
+                object_id,
+                text: text.to_owned(),
+                doc_values: BTreeMap::from([
+                    (
+                        "project".to_owned(),
+                        ProductDocValue::String(project.to_owned()),
+                    ),
+                    (
+                        "kind".to_owned(),
+                        ProductDocValue::String("decision".to_owned()),
+                    ),
+                    (
+                        "layer".to_owned(),
+                        ProductDocValue::String(layer.to_owned()),
+                    ),
+                    (
+                        "harness".to_owned(),
+                        ProductDocValue::String("legacy-harness".to_owned()),
+                    ),
+                    (
+                        "model".to_owned(),
+                        ProductDocValue::String("legacy-model".to_owned()),
+                    ),
+                ]),
+                vectors: BTreeMap::new(),
+            }],
+        },
+        0,
+        ProductDurability::Strict,
+    )?;
+    let mut lifecycle_key = b"hyphae-memory/".to_vec();
+    lifecycle_key.extend_from_slice(&13_u128.to_le_bytes());
+    lifecycle_key.extend_from_slice(&identity.to_le_bytes());
+    product.migration_store_public_entry(lifecycle_key.clone(), envelope.clone(), None)?;
+    drop(product);
+
+    let migrated = run_agent(&["agent", "migrate-domains"])?;
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let product = NativeProduct::open(&data)?;
+    let snapshot = product.snapshot_bounded(0)?;
+    let legacy = NativeProduct::search_documents_at_snapshot(
+        &snapshot,
+        hyphae_native_product::ObjectId::new(13)?,
+        None,
+        1,
+    )?;
+    let work = NativeProduct::search_documents_at_snapshot(
+        &snapshot,
+        hyphae_native_product::ObjectId::new(22)?,
+        None,
+        1,
+    )?;
+    assert!(legacy.documents.is_empty());
+    assert_eq!(work.documents.len(), 1);
+    assert_eq!(work.documents[0].object_id, object_id);
+    assert!(snapshot.structure_get(&lifecycle_key).is_none());
+    let mut work_key = b"hyphae-memory/".to_vec();
+    work_key.extend_from_slice(&22_u128.to_le_bytes());
+    work_key.extend_from_slice(&identity.to_le_bytes());
+    assert_eq!(snapshot.structure_get(&work_key), Some(envelope.as_slice()));
+    drop(product);
+
+    let repeated = run_agent(&["agent", "migrate-domains"])?;
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("already complete"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_domain_migration_resumes_after_source_lifecycle_deletion() -> Result<(), Box<dyn Error>> {
+    let home = TestDirectory::new()?;
+    let home_text = path(&home.0);
+    let run_agent = |arguments: &[&str]| -> Result<std::process::Output, Box<dyn Error>> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_hyphae"))
+            .env("HOME", &home_text)
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HYPHAE_NATIVE_API_KEY_FILE")
+            .args(arguments)
+            .output()?)
+    };
+    assert!(
+        run_agent(&["agent", "setup", "--no-service"])?
+            .status
+            .success()
+    );
+    let data = home.0.join(".local/share/hyphae/agent-memory");
+    let project = "migration/resume";
+    let text = "Resume source cleanup from the durable copy barrier";
+    let digest = blake3::Hasher::new()
+        .update(b"hyphae-agent-memory")
+        .update(&[0])
+        .update(project.as_bytes())
+        .update(&[0])
+        .update(b"work")
+        .update(&[0])
+        .update(text.as_bytes())
+        .finalize();
+    let mut identity_bytes = [0_u8; 16];
+    identity_bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    let identity = u128::from_le_bytes(identity_bytes).max(1);
+    let object_id = hyphae_native_product::ObjectId::new(identity)?;
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "project": project,
+        "scope": "project",
+        "kind": "decision",
+        "layer": "work",
+        "agent": "legacy-agent",
+        "harness": "legacy-harness",
+        "model": "legacy-model",
+        "text": text,
+        "expires_at_micros": null,
+    }))?;
+    let document = ProductDocument {
+        object_id,
+        text: text.to_owned(),
+        doc_values: BTreeMap::from([
+            (
+                "project".to_owned(),
+                ProductDocValue::String(project.to_owned()),
+            ),
+            (
+                "kind".to_owned(),
+                ProductDocValue::String("decision".to_owned()),
+            ),
+            (
+                "layer".to_owned(),
+                ProductDocValue::String("work".to_owned()),
+            ),
+            (
+                "harness".to_owned(),
+                ProductDocValue::String("legacy-harness".to_owned()),
+            ),
+            (
+                "model".to_owned(),
+                ProductDocValue::String("legacy-model".to_owned()),
+            ),
+        ]),
+        vectors: BTreeMap::new(),
+    };
+    let mut product = NativeProduct::open(&data)?;
+    product.ingest_search_batch(
+        hyphae_native_product::ObjectId::new(13)?,
+        &ProductSearchIngestBatch {
+            idempotency_id: identity,
+            documents: vec![document.clone()],
+        },
+        0,
+        ProductDurability::Strict,
+    )?;
+    let mut source_key = b"hyphae-memory/".to_vec();
+    source_key.extend_from_slice(&13_u128.to_le_bytes());
+    source_key.extend_from_slice(&identity.to_le_bytes());
+    product.migration_store_public_entry(source_key.clone(), envelope.clone(), None)?;
+    product.ingest_search_batch(
+        hyphae_native_product::ObjectId::new(22)?,
+        &ProductSearchIngestBatch {
+            idempotency_id: identity,
+            documents: vec![document.clone()],
+        },
+        0,
+        ProductDurability::Strict,
+    )?;
+    let mut destination_key = b"hyphae-memory/".to_vec();
+    destination_key.extend_from_slice(&22_u128.to_le_bytes());
+    destination_key.extend_from_slice(&identity.to_le_bytes());
+    product.migration_store_public_entry(destination_key.clone(), envelope.clone(), None)?;
+    let copy_key = b"hyphae-agent-memory/migration/13-to-domains/v1/copy-complete".to_vec();
+    let plan_key = b"hyphae-agent-memory/migration/13-to-domains/v1/plan".to_vec();
+    let snapshot = product.snapshot_bounded(0)?;
+    let mut document_hasher = blake3::Hasher::new();
+    document_hasher.update(b"hyphae-agent-memory-domain-document-v1\0");
+    document_hasher.update(&identity.to_le_bytes());
+    document_hasher.update(&(text.len() as u64).to_le_bytes());
+    document_hasher.update(text.as_bytes());
+    for (name, value) in &document.doc_values {
+        document_hasher.update(&(name.len() as u64).to_le_bytes());
+        document_hasher.update(name.as_bytes());
+        document_hasher.update(format!("{value:?}").as_bytes());
+    }
+    let document_digest = document_hasher.finalize().to_hex().to_string();
+    let payload_digest = blake3::hash(&envelope).to_hex().to_string();
+    let mut records_hasher = blake3::Hasher::new();
+    records_hasher.update(b"hyphae-agent-memory-domain-plan-v1\0");
+    for value in [
+        identity.to_string(),
+        "22".to_owned(),
+        document_digest.clone(),
+        payload_digest.clone(),
+    ] {
+        records_hasher.update(value.as_bytes());
+        records_hasher.update(&[0]);
+    }
+    let hex = b"0123456789abcdef";
+    let lineage = String::from_utf8(
+        snapshot
+            .identity()
+            .directory_lineage
+            .iter()
+            .flat_map(|byte| [hex[usize::from(byte >> 4)], hex[usize::from(byte & 0x0f)]])
+            .collect(),
+    )?;
+    let plan = serde_json::to_vec(&serde_json::json!({
+        "schema": "hyphae-agent-memory-domain-migration-v1",
+        "directory_lineage": lineage,
+        "records": [{
+            "object_id": identity.to_string(),
+            "destination": "22",
+            "document_digest": document_digest,
+            "payload_digest": payload_digest,
+        }],
+        "records_digest": records_hasher.finalize().to_hex().to_string(),
+    }))?;
+    let copy = blake3::hash(&plan).as_bytes().to_vec();
+    product.migration_store_public_entry(plan_key, plan, None)?;
+    product.migration_store_public_entry(copy_key, copy, None)?;
+    product.migration_delete_public_entry(source_key.clone())?;
+    drop(product);
+
+    let resumed = run_agent(&["agent", "migrate-domains"])?;
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let product = NativeProduct::open(&data)?;
+    let snapshot = product.snapshot_bounded(0)?;
+    assert!(snapshot.structure_get(&source_key).is_none());
+    assert!(snapshot.structure_get(&destination_key).is_some());
     Ok(())
 }
 
@@ -4546,6 +4871,36 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
         "main.public.agent_memory",
         "--memory-schema",
     ])?;
+    for (collection, name) in [(21, "personal"), (22, "work"), (23, "journal")] {
+        run_isolated(&[
+            "catalog",
+            "--data-dir",
+            &data_text,
+            "create-search-collection",
+            "--database",
+            "10",
+            "--schema",
+            "11",
+            "--collection",
+            &collection.to_string(),
+            "--analyzer",
+            "12",
+            "--name",
+            &format!("main.public.agent_memory_{name}"),
+            "--memory-schema",
+            "--reuse-schema",
+        ])?;
+    }
+    for collection in [21, 22, 23] {
+        run_isolated(&[
+            "search",
+            "--data-dir",
+            &data_text,
+            "provision",
+            "--collection",
+            &collection.to_string(),
+        ])?;
+    }
     run_isolated(&[
         "search",
         "--data-dir",
@@ -4618,7 +4973,14 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
 
     // The write profile stores under two projects plus one global memory.
     let store = |id: u64, project: &str, text: &str, scope: Option<&str>| {
-        let mut arguments = serde_json::json!({"project": project, "text": text, "kind": "decision", "agent": "claude"});
+        let mut arguments = serde_json::json!({
+            "project": project,
+            "text": text,
+            "kind": "decision",
+            "agent": "claude",
+            "harness": "claude-code-cli",
+            "model": "anthropic/claude-sonnet"
+        });
         if let Some(scope) = scope {
             arguments["scope"] = serde_json::json!(scope);
         }
@@ -4674,6 +5036,7 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
             "hyphae_memory_recall",
             "hyphae_memory_status",
             "hyphae_memory_store",
+            "hyphae_memory_journal",
             "hyphae_memory_forget",
         ]
     );
@@ -4695,6 +5058,20 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
             .any(|text| text.contains("global packaging constraint"))
     );
     assert!(!site.iter().any(|text| text.contains("gardening")));
+    let site_items = writer[5]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("site memory items")?;
+    let work = site_items
+        .iter()
+        .find(|memory| {
+            memory["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("packaging decision"))
+        })
+        .ok_or("work memory")?;
+    assert_eq!(work["layer"], "work");
+    assert_eq!(work["harness"], "claude-code-cli");
+    assert_eq!(work["model"], "anthropic/claude-sonnet");
     let other: Vec<_> = writer[6]["result"]["structuredContent"]["memories"]
         .as_array()
         .ok_or("other memories")?
@@ -4712,6 +5089,46 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
             .any(|text| text.contains("global packaging constraint"))
     );
     assert_eq!(writer[7]["result"]["structuredContent"]["status"], "ok");
+
+    // The model journal is a separate first-person layer with exact harness
+    // and model provenance. Work-only recall excludes it; journal recall
+    // returns it for cross-model reflection.
+    let journal = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+    "name":"hyphae_memory_journal","arguments":{
+        "project":"acme/site",
+        "text":"I noticed the deterministic pipeline reduces release ambiguity.",
+        "harness":"codex-cli",
+        "model":"openai/codex-model"
+    }}});
+    let journal_recall = |id: u64, layer: &str| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+        "name":"hyphae_memory_recall","arguments":{
+            "project":"acme/site",
+            "query":"deterministic pipeline ambiguity",
+            "layer":layer
+        }}})
+    };
+    let mut messages = handshake.to_vec();
+    messages.push(journal);
+    messages.push(journal_recall(4, "work"));
+    messages.push(journal_recall(5, "journal"));
+    let journal_results = run_mcp_session_with_flags(
+        &address_text,
+        &owner_key,
+        &["--profile", "memory", "--allow-write"],
+        &messages,
+    )?;
+    let work_only = journal_results[2]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("work-only memories")?;
+    assert!(work_only.iter().all(|memory| memory["layer"] == "work"));
+    let journal_only = journal_results[3]["result"]["structuredContent"]["memories"]
+        .as_array()
+        .ok_or("journal-only memories")?;
+    assert_eq!(journal_only.len(), 1);
+    assert_eq!(journal_only[0]["layer"], "journal");
+    assert_eq!(journal_only[0]["harness"], "codex-cli");
+    assert_eq!(journal_only[0]["model"], "openai/codex-model");
 
     // Forgetting demands the owning project; the wrong project is refused,
     // the right one removes permanently and idempotently.

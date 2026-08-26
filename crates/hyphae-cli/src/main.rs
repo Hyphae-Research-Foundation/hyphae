@@ -3,6 +3,7 @@
 //! Command-line entry point for the single native Hyphae executable.
 
 mod agent;
+mod agent_hooks;
 mod compatibility;
 mod exit;
 mod json_value;
@@ -338,8 +339,22 @@ enum Command {
         command: AgentCommand,
     },
     Mcp {
-        #[arg(long, env = "HYPHAE_BASE_URL")]
-        base_url: String,
+        /// Managed Native HTTP v2 root origin.
+        #[arg(
+            long,
+            env = "HYPHAE_BASE_URL",
+            conflicts_with = "endpoint",
+            required_unless_present = "endpoint"
+        )]
+        base_url: Option<String>,
+        /// Native local UDS path or Windows named-pipe identity.
+        #[arg(
+            long,
+            env = "HYPHAE_NATIVE_ENDPOINT",
+            conflicts_with = "base_url",
+            required_unless_present = "base_url"
+        )]
+        endpoint: Option<String>,
         /// Restricted file containing one durable Native API key.
         #[arg(
             long,
@@ -354,16 +369,22 @@ enum Command {
         #[arg(long)]
         allow_ingest: bool,
         /// Tool profile: the full native registry, or the Agent Memory
-        /// four-tool surface.
+        /// five-tool surface.
         #[arg(long, value_enum, default_value_t = McpProfile::Full)]
         profile: McpProfile,
-        /// Expose the write-scoped memory tools (store and forget) on the
+        /// Expose the write-scoped memory tools (store, journal, forget) on the
         /// memory profile.
         #[arg(long)]
         allow_write: bool,
-        /// Agent Memory collection identity for the memory profile.
-        #[arg(long, default_value_t = 13)]
-        memory_collection: u128,
+        /// Personal-memory collection identity.
+        #[arg(long, default_value_t = 21)]
+        personal_memory_collection: u128,
+        /// Shared work-memory collection identity.
+        #[arg(long, default_value_t = 22)]
+        work_memory_collection: u128,
+        /// Model-journal collection identity.
+        #[arg(long, default_value_t = 23)]
+        journal_memory_collection: u128,
     },
 }
 
@@ -949,6 +970,9 @@ enum CatalogCommand {
         /// schema: project and kind string doc-values.
         #[arg(long)]
         memory_schema: bool,
+        /// Reuse an existing database, schema, and analyzer; create only the collection.
+        #[arg(long)]
+        reuse_schema: bool,
         #[arg(long, requires = "bm25_b_micros")]
         bm25_k1_micros: Option<u64>,
         /// Tuned BM25 b in micros (defaults keep the canonical 0.75).
@@ -1658,13 +1682,23 @@ enum AgentCommand {
     },
     /// Stop, back up, doctor, and restart the service around an upgrade.
     Upgrade,
+    /// Offline copy legacy mixed memories into physical domain collections.
+    MigrateDomains,
     /// Generate one agent host's MCP configuration.
     Configure {
         #[arg(value_enum)]
         host: AgentHost,
-        /// Write the configuration instead of printing it.
+        /// Agent Memory authority granted to this host.
+        #[arg(long, value_enum, default_value_t = AgentAccess::Read)]
+        access: AgentAccess,
+        /// Apply the configuration through the host's supported interface.
         #[arg(long)]
-        write: bool,
+        apply: bool,
+    },
+    /// Process one proactive host lifecycle event from standard input.
+    Hook {
+        #[arg(long, value_enum)]
+        host: AgentHost,
     },
     /// Permanently delete the data directory after confirmation.
     PurgeData {
@@ -1679,13 +1713,21 @@ enum AgentHost {
     Claude,
     Codex,
     Opencode,
+    Pi,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum AgentAccess {
+    #[default]
+    Read,
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum McpProfile {
     /// Full native tool registry.
     Full,
-    /// Agent Memory four-tool surface.
+    /// Agent Memory five-tool surface.
     Memory,
 }
 
@@ -1994,32 +2036,54 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                 no_service,
             } => agent::setup(enable_service, no_service).map_err(Into::into),
             AgentCommand::Status => agent::status().map_err(Into::into),
-            AgentCommand::Doctor => agent::doctor().map_err(Into::into),
-            AgentCommand::Backup => agent::backup().map_err(Into::into),
+            AgentCommand::Doctor => agent::doctor().await.map_err(Into::into),
+            AgentCommand::Backup => agent::backup().await.map_err(Into::into),
             AgentCommand::Remove => agent::remove().map_err(Into::into),
             AgentCommand::Restore { backup } => agent::restore(&backup).map_err(Into::into),
-            AgentCommand::Upgrade => agent::upgrade().map_err(Into::into),
-            AgentCommand::Configure { host, write } => agent::configure(
+            AgentCommand::Upgrade => agent::upgrade().await.map_err(Into::into),
+            AgentCommand::MigrateDomains => agent::migrate_domains().map_err(Into::into),
+            AgentCommand::Configure {
+                host,
+                access,
+                apply,
+            } => agent::configure(
                 match host {
                     AgentHost::Claude => agent::Host::Claude,
                     AgentHost::Codex => agent::Host::Codex,
                     AgentHost::Opencode => agent::Host::Opencode,
+                    AgentHost::Pi => agent::Host::Pi,
                 },
-                write,
+                match access {
+                    AgentAccess::Read => agent::Access::Read,
+                    AgentAccess::Write => agent::Access::Write,
+                },
+                apply,
             )
+            .map_err(Into::into),
+            AgentCommand::Hook { host } => agent_hooks::handle(match host {
+                AgentHost::Claude => agent_hooks::Host::Claude,
+                AgentHost::Codex => agent_hooks::Host::Codex,
+                AgentHost::Opencode => agent_hooks::Host::Opencode,
+                AgentHost::Pi => agent_hooks::Host::Pi,
+            })
+            .await
             .map_err(Into::into),
             AgentCommand::PurgeData { yes } => agent::purge_data(yes).map_err(Into::into),
         },
         Command::Mcp {
             base_url,
+            endpoint,
             native_api_key_file,
             native_api_key_stdin,
             allow_ingest,
             profile,
             allow_write,
-            memory_collection,
+            personal_memory_collection,
+            work_memory_collection,
+            journal_memory_collection,
         } => mcp::run(
-            &base_url,
+            base_url.as_deref(),
+            endpoint.as_deref(),
             native_api_key_file.as_deref(),
             native_api_key_stdin,
             allow_ingest,
@@ -2027,7 +2091,11 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                 McpProfile::Full => mcp::Profile::Full,
                 McpProfile::Memory => mcp::Profile::Memory {
                     allow_write,
-                    collection: memory_collection,
+                    collections: mcp::MemoryCollections {
+                        personal: personal_memory_collection,
+                        work: work_memory_collection,
+                        journal: journal_memory_collection,
+                    },
                 },
             },
         )
@@ -3064,49 +3132,53 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer_english_stop,
             analyzer_english_stem,
             memory_schema,
+            reuse_schema,
             bm25_k1_micros,
             bm25_b_micros,
             durability,
         } => {
-            let mut objects = vec![
-                LogicalCatalogObject::V2(CatalogObjectV2::Database(catalog_header(
-                    database,
-                    EngineKind::Kernel,
-                    "main.public.database",
-                    None,
-                )?)),
-                LogicalCatalogObject::V2(CatalogObjectV2::Schema(catalog_header(
-                    schema,
-                    EngineKind::Kernel,
-                    "main.public.schema",
-                    Some(database),
-                )?)),
-            ];
-            let analyzer_name = format!("{name}_analyzer");
-            let analyzer_object =
-                LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
-                    header: catalog_header(
-                        analyzer,
-                        EngineKind::Search,
-                        &analyzer_name,
-                        Some(schema),
-                    )?,
-                    tokenizer: AnalyzerTokenizer::UnicodeWord,
-                    filters: {
-                        let mut filters = vec![AnalyzerFilter::Lowercase];
-                        if analyzer_ascii_folding {
-                            filters.push(AnalyzerFilter::AsciiFolding);
-                        }
-                        if analyzer_english_stop {
-                            filters.push(AnalyzerFilter::EnglishStopV1);
-                        }
-                        if analyzer_english_stem {
-                            filters.push(AnalyzerFilter::EnglishStemV1);
-                        }
-                        filters
+            let mut objects = Vec::new();
+            if !reuse_schema {
+                objects.extend([
+                    LogicalCatalogObject::V2(CatalogObjectV2::Database(catalog_header(
+                        database,
+                        EngineKind::Kernel,
+                        "main.public.database",
+                        None,
+                    )?)),
+                    LogicalCatalogObject::V2(CatalogObjectV2::Schema(catalog_header(
+                        schema,
+                        EngineKind::Kernel,
+                        "main.public.schema",
+                        Some(database),
+                    )?)),
+                ]);
+                let analyzer_name = format!("{name}_analyzer");
+                objects.push(LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(
+                    AnalyzerDefinition {
+                        header: catalog_header(
+                            analyzer,
+                            EngineKind::Search,
+                            &analyzer_name,
+                            Some(schema),
+                        )?,
+                        tokenizer: AnalyzerTokenizer::UnicodeWord,
+                        filters: {
+                            let mut filters = vec![AnalyzerFilter::Lowercase];
+                            if analyzer_ascii_folding {
+                                filters.push(AnalyzerFilter::AsciiFolding);
+                            }
+                            if analyzer_english_stop {
+                                filters.push(AnalyzerFilter::EnglishStopV1);
+                            }
+                            if analyzer_english_stem {
+                                filters.push(AnalyzerFilter::EnglishStemV1);
+                            }
+                            filters
+                        },
                     },
-                }));
-            objects.push(analyzer_object);
+                )));
+            }
             let ann = AnnIndexDefinition::new(VectorMetric::SquaredL2, 8, 32, 16, 256, 7)
                 .map_err(|_| CliFailure::invalid())?;
             let lifecycle = IncrementalVectorLifecycle {
@@ -3154,6 +3226,39 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                                 analyzer: None,
                                 options: doc_value_options(),
                             });
+                            for (id, field) in [(4, "layer"), (5, "harness"), (6, "model")] {
+                                fields.push(SearchFieldDefinitionV2 {
+                                    id: field_id(id)?,
+                                    name: catalog_name(field)?,
+                                    logical_type: LogicalType::Text,
+                                    analyzer: None,
+                                    options: doc_value_options(),
+                                });
+                            }
+                            for (id, field) in [(9, "session"), (10, "actor"), (11, "date_anchor")]
+                            {
+                                fields.push(SearchFieldDefinitionV2 {
+                                    id: field_id(id)?,
+                                    name: catalog_name(field)?,
+                                    logical_type: LogicalType::Text,
+                                    analyzer: None,
+                                    options: doc_value_options(),
+                                });
+                            }
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(12)?,
+                                name: catalog_name("session_ts")?,
+                                logical_type: LogicalType::Signed(IntegerWidth::Bits64),
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(13)?,
+                                name: catalog_name("turn_ord")?,
+                                logical_type: LogicalType::Signed(IntegerWidth::Bits64),
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
                         } else {
                             fields.push(SearchFieldDefinitionV2 {
                                 id: field_id(2)?,
@@ -3174,7 +3279,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                     },
                     vectors: vec![
                         NamedVectorDefinition {
-                            id: field_id(4)?,
+                            id: field_id(7)?,
                             name: catalog_name("exact")?,
                             vector_type: vector_type(dimension)?,
                             metric: VectorMetric::SquaredL2,
@@ -3182,7 +3287,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                             lifecycle,
                         },
                         NamedVectorDefinition {
-                            id: field_id(5)?,
+                            id: field_id(8)?,
                             name: catalog_name("ann")?,
                             vector_type: vector_type(dimension)?,
                             metric: VectorMetric::SquaredL2,
