@@ -279,7 +279,7 @@
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "36c8557a9243bfb3d5b35b047ac6f4d296c1d390718d608caeca723378896116"
+      "sha256": "4dfbe1155ee05190ce80410b8a38b9647e5ea918e66f8d385c90d0ea3ed48a3b"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "6f88ae5e292f35a8967fbbb77e7e0aa5fc8745b7",
+      "commit": "0c3fb49553e6e1e05db5223d720e24d8ba206e63",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "1bedf0ca256b09957aed818ea4670045f59cf589"
+      "tree": "45a0d4306ec6b33e21b0c922c3bc7aecf124b90d"
     }
   },
   "target_release": "1.2.0"
