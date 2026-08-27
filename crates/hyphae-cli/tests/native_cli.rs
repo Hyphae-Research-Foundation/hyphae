@@ -3102,6 +3102,10 @@ async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
 #[allow(clippy::too_many_lines)]
 fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result<(), Box<dyn Error>>
 {
+    // Shared CI runners can starve the MCP child for several seconds; the
+    // saturation contract is about cancellation, not wall-clock budgets.
+    const CONTENDED: Duration = Duration::from_secs(10);
+
     use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::sync::mpsc;
@@ -3157,9 +3161,6 @@ fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result
         input.write_all(b"\n")?;
         input.flush()?;
     }
-    // Shared CI runners can starve the MCP child for several seconds; the
-    // saturation contract is about cancellation, not wall-clock budgets.
-    const CONTENDED: Duration = Duration::from_secs(10);
     assert!(
         serde_json::from_str::<serde_json::Value>(
             &line_receiver.recv_timeout(CONTENDED)??
