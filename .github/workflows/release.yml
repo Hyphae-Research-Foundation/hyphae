@@ -461,7 +461,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$RELEASE_TAG" = "v2.2.0"
+          test "$RELEASE_TAG" = "release-v2.2.0"
           PYTHONPATH="$CONTROL_PACKAGING" python -c \
             'import os; from finalize_release import require_apache_release_version; require_apache_release_version(os.environ["RELEASE_TAG"].removeprefix("v"))'
           git fetch --force --no-tags origin \
