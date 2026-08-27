@@ -3199,9 +3199,8 @@ fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result
     )?;
     input.write_all(b"\n")?;
     input.flush()?;
-    let recovered = serde_json::from_str::<serde_json::Value>(
-        &line_receiver.recv_timeout(CONTENDED)??,
-    )?;
+    let recovered =
+        serde_json::from_str::<serde_json::Value>(&line_receiver.recv_timeout(CONTENDED)??)?;
     assert_eq!(recovered["id"], 4);
     assert_eq!(recovered["result"], serde_json::json!({}));
     drop(input);
