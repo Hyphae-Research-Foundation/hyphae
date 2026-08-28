@@ -19,7 +19,9 @@ from tools.run_native_g8_test_gate import SUITES
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-RELEASE_TAG = re.compile(r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
+RELEASE_TAG = re.compile(
+    r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?|[0-9]+\.[0-9]+\.[0-9]+-final)\Z"
+)
 POWER_LOSS_COMMIT = "7b70d8a6863c5de30933d42a7672d35d01d2dc6c"
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT_BOUNDARIES = {
@@ -405,6 +407,8 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
     tag = payload.get("tag")
     tag_match = RELEASE_TAG.fullmatch(tag) if isinstance(tag, str) else None
     version = tag_match.group(1) if tag_match is not None else None
+    if isinstance(tag, str) and tag.startswith("release-") and isinstance(version, str):
+        version = version.removesuffix("-final")
     expected_targets = {
         f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
         f"hyphae-{version}-x86_64-apple-darwin.tar.gz",

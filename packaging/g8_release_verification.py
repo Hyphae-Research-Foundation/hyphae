@@ -28,7 +28,9 @@ ROOT = Path(
         PACKAGING.parent,
     )
 ).resolve()
-RELEASE_TAG = re.compile(r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
+RELEASE_TAG = re.compile(
+    r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?|[0-9]+\.[0-9]+\.[0-9]+-final)\Z"
+)
 SOFTWARE_LICENSE = "Apache-2.0"
 
 
@@ -188,6 +190,8 @@ def expected_archives(tag: str) -> set[str]:
     if match is None:
         raise ValueError("release tag must be canonical")
     version = match.group(1)
+    if tag.startswith("release-") and version.endswith("-final"):
+        version = version.removesuffix("-final")
     return {
         f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
         f"hyphae-{version}-x86_64-apple-darwin.tar.gz",
