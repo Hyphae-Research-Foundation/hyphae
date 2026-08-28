@@ -399,6 +399,13 @@ class PackageTests(unittest.TestCase):
         self.assertIn("release_tag:", workflow)
         self.assertIn("release_commit:", workflow)
         self.assertIn("RELEASE_SOURCE_REF", workflow)
+        self.assertEqual(
+            workflow.count(
+                "RELEASE_SOURCE_REF: ${{ inputs.release_commit || "
+                "github.event.pull_request.head.sha || github.sha }}"
+            ),
+            2,
+        )
         self.assertIn("RELEASE_SOURCE_COMMIT", workflow)
         self.assertEqual(workflow.count("name: Check out recovery control plane"), 2)
         self.assertEqual(

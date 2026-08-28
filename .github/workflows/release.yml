@@ -29,7 +29,7 @@ jobs:
     name: Package ${{ matrix.target }}
     env:
       RELEASE_SOURCE_COMMIT: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
-      RELEASE_SOURCE_REF: ${{ inputs.release_tag || github.event.pull_request.head.sha || github.sha }}
+      RELEASE_SOURCE_REF: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
       RECOVERY_TAG: ${{ inputs.release_tag }}
     permissions:
       contents: read
@@ -164,7 +164,7 @@ jobs:
       RECOVERY_COMMIT: ${{ inputs.release_commit }}
       RECOVERY_TAG: ${{ inputs.release_tag }}
       RELEASE_SOURCE_COMMIT: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
-      RELEASE_SOURCE_REF: ${{ inputs.release_tag || github.event.pull_request.head.sha || github.sha }}
+      RELEASE_SOURCE_REF: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
