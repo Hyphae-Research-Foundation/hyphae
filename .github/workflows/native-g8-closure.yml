@@ -5,7 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       source_commit:
-        description: Exact 40-character commit shared by both evidence runs
+        description: Final exact 40-character merge commit closed by G8
+        required: true
+        type: string
+      release_source_commit:
+        description: Exact second-parent commit that produced Release evidence
         required: true
         type: string
       readiness_run_id:
@@ -38,12 +42,29 @@ jobs:
           [[ "${{ inputs.readiness_run_id }}" =~ ^[1-9][0-9]*$ ]]
           [[ "${{ inputs.release_run_id }}" =~ ^[1-9][0-9]*$ ]]
           test "${{ inputs.readiness_run_id }}" != "${{ inputs.release_run_id }}"
+          [[ "${{ inputs.release_source_commit }}" =~ ^[0-9a-f]{40}$ ]]
           test "${{ github.sha }}" = "${{ inputs.source_commit }}"
       - name: Check out the exact evidence commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_commit }}
-          fetch-depth: 1
+          fetch-depth: 0
+      - name: Prove release source equivalence to the final merge
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.release_source_commit }}
+        run: |
+          set -euo pipefail
+          read -r commit first_parent second_parent extra < <(
+            git rev-list --parents -n 1 "$SOURCE_COMMIT"
+          )
+          test "$commit" = "$SOURCE_COMMIT"
+          test -n "$first_parent"
+          test "$second_parent" = "$RELEASE_SOURCE_COMMIT"
+          test -z "${extra:-}"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = \
+            "$(git rev-parse "${RELEASE_SOURCE_COMMIT}^{tree}")"
       - name: Install pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -54,6 +75,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_SOURCE_COMMIT: ${{ inputs.release_source_commit }}
           READINESS_RUN: ${{ inputs.readiness_run_id }}
           RELEASE_RUN: ${{ inputs.release_run_id }}
         run: |
@@ -62,12 +84,19 @@ jobs:
           verify_run() {
             local run_id="$1"
             local expected_path="$2"
-            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .head_sha)" = "$SOURCE_COMMIT"
-            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .conclusion)" = success
-            test "$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .path)" = "$expected_path"
+            local expected_commit="$3"
+            local expected_event="$4"
+            metadata="$(gh api "repos/$REPOSITORY/actions/runs/$run_id")"
+            test "$(jq -r .head_sha <<<"$metadata")" = "$expected_commit"
+            test "$(jq -r .status <<<"$metadata")" = completed
+            test "$(jq -r .conclusion <<<"$metadata")" = success
+            test "$(jq -r .event <<<"$metadata")" = "$expected_event"
+            test "$(jq -r .path <<<"$metadata")" = "$expected_path"
           }
-          verify_run "$READINESS_RUN" ".github/workflows/native-g7-g8-readiness.yml"
-          verify_run "$RELEASE_RUN" ".github/workflows/release.yml"
+          verify_run "$READINESS_RUN" ".github/workflows/native-g7-g8-readiness.yml" \
+            "$SOURCE_COMMIT" workflow_dispatch
+          verify_run "$RELEASE_RUN" ".github/workflows/release.yml" \
+            "$RELEASE_SOURCE_COMMIT" pull_request
       - name: Download both bounded evidence sets
         shell: bash
         env:
@@ -89,6 +118,7 @@ jobs:
             -v
           PYTHONPATH=. python tools/check_native_g8_receipts.py \
             --expected-commit "${{ inputs.source_commit }}" \
+            --release-source-commit "${{ inputs.release_source_commit }}" \
             --receipts evidence \
             --output native-g8-aggregate.json
       - name: Upload exact-SHA G8 closure

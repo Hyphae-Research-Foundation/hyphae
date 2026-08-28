@@ -15,6 +15,9 @@ from typing import Any
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+RELEASE_REQUIREMENTS = frozenset(
+    {"multiplatform-packaging", "sbom-signatures-provenance"}
+)
 
 
 class GateFailure(ValueError):
@@ -130,9 +133,18 @@ def validate_receipt(
     }
 
 
-def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[str, Any]:
-    if HEX40.fullmatch(expected_commit) is None:
+def aggregate(
+    repository: Path,
+    receipts: Path,
+    expected_commit: str,
+    release_source_commit: str | None = None,
+) -> dict[str, Any]:
+    if HEX40.fullmatch(expected_commit) is None or (
+        release_source_commit is not None
+        and HEX40.fullmatch(release_source_commit) is None
+    ):
         raise GateFailure("expected commit is not a canonical SHA-1")
+    release_commit = release_source_commit or expected_commit
     profile, rows = authority(repository)
     seen: dict[str, dict[str, dict[str, Any]]] = {}
     receipt_files = sorted(receipts.rglob("*-receipt.json"))
@@ -145,7 +157,19 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
         requirement = payload.get("requirement")
         if requirement not in rows:
             raise GateFailure(f"unknown G8 requirement in {path}")
-        audit = validate_receipt(payload, expected_commit, rows[requirement])
+        relative = path.relative_to(receipts)
+        origin = relative.parts[0] if len(relative.parts) > 1 else None
+        expected_origin = (
+            "release" if requirement in RELEASE_REQUIREMENTS else "readiness"
+        )
+        if release_source_commit is not None and origin != expected_origin:
+            raise GateFailure(
+                f"G8 receipt origin differs for {requirement}: {origin}"
+            )
+        evidence_commit = (
+            release_commit if requirement in RELEASE_REQUIREMENTS else expected_commit
+        )
+        audit = validate_receipt(payload, evidence_commit, rows[requirement])
         artifact = payload["artifacts"][0]
         artifact_path = path.parent / artifact["name"]
         if artifact_path.is_symlink() or not artifact_path.is_file():
@@ -157,7 +181,7 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
 
         raw_artifact = load(artifact_path)
         verified = observations(
-            requirement, raw_artifact, expected_commit, audit["platform"]
+            requirement, raw_artifact, evidence_commit, audit["platform"]
         )
         for name, evidence in payload["acceptance"].items():
             if evidence.get("observation") != verified.get(name):
@@ -180,7 +204,11 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
                 f"expected={sorted(expected_platforms)}, actual={sorted(actual_platforms)}"
             )
     result = {
-        "schema": "hyphae-native-g8-aggregate-v1",
+        "schema": (
+            "hyphae-native-g8-aggregate-v2"
+            if release_source_commit is not None
+            else "hyphae-native-g8-aggregate-v1"
+        ),
         "gate": "G8",
         "status": "passed",
         "source_commit": expected_commit,
@@ -189,6 +217,16 @@ def aggregate(repository: Path, receipts: Path, expected_commit: str) -> dict[st
         "claims": ["G8"],
         "closure_declared": True,
     }
+    if release_source_commit is not None:
+        result.update(
+            {
+                "release_source_commit": release_source_commit,
+                "source_equivalence": {
+                    "status": "passed",
+                    "method": "git-second-parent-identical-tree-v1",
+                },
+            }
+        )
     validate_aggregate(result, expected_commit, repository)
     return result
 
@@ -200,7 +238,7 @@ def validate_aggregate(
     if HEX40.fullmatch(expected_commit) is None:
         raise GateFailure("expected commit is not a canonical SHA-1")
     profile, rows = authority(repository or Path(__file__).resolve().parents[1])
-    if set(aggregate) != {
+    v1_fields = {
         "schema",
         "gate",
         "status",
@@ -209,14 +247,30 @@ def validate_aggregate(
         "required_platforms",
         "claims",
         "closure_declared",
-    } or (
-        aggregate.get("schema") != "hyphae-native-g8-aggregate-v1"
+    }
+    split = aggregate.get("schema") == "hyphae-native-g8-aggregate-v2"
+    expected_fields = v1_fields | (
+        {"release_source_commit", "source_equivalence"} if split else set()
+    )
+    release_commit = aggregate.get("release_source_commit") if split else expected_commit
+    if set(aggregate) != expected_fields or (
+        aggregate.get("schema")
+        not in {"hyphae-native-g8-aggregate-v1", "hyphae-native-g8-aggregate-v2"}
         or aggregate.get("gate") != "G8"
         or aggregate.get("status") != "passed"
         or aggregate.get("source_commit") != expected_commit
         or aggregate.get("required_platforms") != profile["required_platforms"]
         or aggregate.get("claims") != ["G8"]
         or aggregate.get("closure_declared") is not True
+        or (split and HEX40.fullmatch(str(release_commit)) is None)
+        or (
+            split
+            and aggregate.get("source_equivalence")
+            != {
+                "status": "passed",
+                "method": "git-second-parent-identical-tree-v1",
+            }
+        )
     ):
         raise GateFailure("G8 aggregate identity is open or source-unbound")
     requirements = aggregate.get("requirements")
@@ -227,6 +281,10 @@ def validate_aggregate(
         if not isinstance(platforms, dict) or set(platforms) != set(row["platforms"]):
             raise GateFailure(f"G8 aggregate platform coverage differs for {requirement}")
         for platform, record in platforms.items():
+            audit_commit = (
+                release_commit if split and requirement in RELEASE_REQUIREMENTS
+                else expected_commit
+            )
             if (
                 not isinstance(record, dict)
                 or set(record) != {"receipt_sha256", "audit"}
@@ -235,7 +293,7 @@ def validate_aggregate(
                 != {
                     "schema": "hyphae-native-g8-receipt-audit-v1",
                     "status": "passed",
-                    "source_commit": expected_commit,
+                    "source_commit": audit_commit,
                     "requirement": requirement,
                     "platform": platform,
                 }
@@ -248,12 +306,14 @@ def validate_aggregate(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--release-source-commit")
     parser.add_argument("--receipts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     try:
         result = aggregate(
-            Path(__file__).resolve().parents[1], arguments.receipts, arguments.expected_commit
+            Path(__file__).resolve().parents[1], arguments.receipts,
+            arguments.expected_commit, arguments.release_source_commit,
         )
         arguments.output.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
