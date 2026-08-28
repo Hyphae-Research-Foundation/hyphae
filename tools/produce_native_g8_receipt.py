@@ -409,8 +409,6 @@ def validate_signed_release(payload: dict[str, Any], commit: str) -> dict[str, s
     version = tag_match.group(1) if tag_match is not None else None
     if isinstance(tag, str) and tag.startswith("release-") and isinstance(version, str):
         version = version.removesuffix("-final").removesuffix("-crates")
-    if isinstance(tag, str) and tag.startswith("release-") and isinstance(version, str):
-        version = version.removesuffix("-final")
     expected_targets = {
         f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
         f"hyphae-{version}-x86_64-apple-darwin.tar.gz",

@@ -192,8 +192,6 @@ def expected_archives(tag: str) -> set[str]:
     version = match.group(1)
     if tag.startswith("release-"):
         version = version.removesuffix("-final").removesuffix("-crates")
-    if tag.startswith("release-") and version.endswith("-final"):
-        version = version.removesuffix("-final")
     return {
         f"hyphae-{version}-aarch64-apple-darwin.tar.gz",
         f"hyphae-{version}-x86_64-apple-darwin.tar.gz",
