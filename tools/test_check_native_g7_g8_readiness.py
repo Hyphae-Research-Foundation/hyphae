@@ -170,6 +170,27 @@ class NativeG7G8ReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(GateFailure, "exact-SHA receipts"):
                 validate(root, "a" * 40)
 
+    def test_g8_split_release_source_must_prove_parent_and_tree_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / ".github/workflows").mkdir(parents=True)
+            for name in (
+                "native-g7-readiness-profile.json",
+                "native-g8-readiness-profile.json",
+                "native-g8-suite-manifest.json",
+            ):
+                (root / "config" / name).write_bytes((ROOT / "config" / name).read_bytes())
+            workflow = (ROOT / ".github/workflows/native-g8-closure.yml").read_text()
+            (root / ".github/workflows/native-g8-closure.yml").write_text(
+                workflow.replace('"${RELEASE_SOURCE_COMMIT}^{tree}"', '"unbound-tree"')
+            )
+            (root / ".github/workflows/native-g7-g8-readiness.yml").write_bytes(
+                (ROOT / ".github/workflows/native-g7-g8-readiness.yml").read_bytes()
+            )
+            with self.assertRaisesRegex(GateFailure, "exact-SHA receipts"):
+                validate(root, "a" * 40)
+
     def test_g8_closure_must_not_depend_on_g7(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from tools.check_native_g8_receipts import (
     GateFailure,
+    RELEASE_REQUIREMENTS,
     aggregate,
     authority,
     validate_aggregate,
@@ -19,19 +20,20 @@ from tools.check_native_g8_receipts import (
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
+RELEASE_COMMIT = "b" * 40
 
 
 ARTIFACT_BYTES = b"{}\n"
 ARTIFACT_DIGEST = hashlib.sha256(ARTIFACT_BYTES).hexdigest()
 
 
-def receipt(row: dict, platform: str) -> dict:
+def receipt(row: dict, platform: str, commit: str = COMMIT) -> dict:
     return {
         "schema": "hyphae-native-g8-receipt-v1",
         "gate": "G8",
         "status": "passed",
         "evidence_class": "closure-candidate",
-        "source_commit": COMMIT,
+        "source_commit": commit,
         "requirement": row["id"],
         "platform": platform,
         "acceptance": {
@@ -54,6 +56,17 @@ def write_receipt(root: Path, row: dict, platform: str) -> Path:
     (directory / "run.log").write_bytes(ARTIFACT_BYTES)
     path = directory / f"{row['id']}-{platform}-receipt.json"
     path.write_text(json.dumps(receipt(row, platform)), encoding="utf-8")
+    return path
+
+
+def write_split_receipt(root: Path, row: dict, platform: str) -> Path:
+    origin = "release" if row["id"] in RELEASE_REQUIREMENTS else "readiness"
+    directory = root / origin / f"{row['id']}-{platform}"
+    directory.mkdir(parents=True)
+    (directory / "run.log").write_bytes(ARTIFACT_BYTES)
+    commit = RELEASE_COMMIT if origin == "release" else COMMIT
+    path = directory / f"{row['id']}-{platform}-receipt.json"
+    path.write_text(json.dumps(receipt(row, platform, commit)), encoding="utf-8")
     return path
 
 
@@ -91,6 +104,56 @@ class G8ReceiptTests(unittest.TestCase):
                     write_receipt(receipts, row, platform)
             with self.semantic_validator(rows), self.assertRaises(GateFailure):
                 aggregate(ROOT, receipts, COMMIT)
+
+    def test_split_release_source_closes_with_distinct_audits(self) -> None:
+        _, rows = authority(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            receipts = Path(directory)
+            for row in rows.values():
+                for platform in row["platforms"]:
+                    write_split_receipt(receipts, row, platform)
+            with self.semantic_validator(rows):
+                result = aggregate(ROOT, receipts, COMMIT, RELEASE_COMMIT)
+        self.assertEqual(result["schema"], "hyphae-native-g8-aggregate-v2")
+        self.assertEqual(result["release_source_commit"], RELEASE_COMMIT)
+        self.assertEqual(
+            result["requirements"]["multiplatform-packaging"]
+            ["x86_64-unknown-linux-gnu"]["audit"]["source_commit"],
+            RELEASE_COMMIT,
+        )
+        self.assertEqual(
+            result["requirements"]["native-soak"]["linux"]
+            ["audit"]["source_commit"],
+            COMMIT,
+        )
+
+    def test_split_release_source_rejects_wrong_origin_or_commit(self) -> None:
+        _, rows = authority(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            receipts = Path(directory)
+            paths = []
+            for row in rows.values():
+                for platform in row["platforms"]:
+                    paths.append(write_split_receipt(receipts, row, platform))
+            release_path = next(
+                path for path in paths if "multiplatform-packaging" in path.name
+            )
+            payload = json.loads(release_path.read_text(encoding="utf-8"))
+            payload["source_commit"] = COMMIT
+            release_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.semantic_validator(rows), self.assertRaises(GateFailure):
+                aggregate(ROOT, receipts, COMMIT, RELEASE_COMMIT)
+
+        with tempfile.TemporaryDirectory() as directory:
+            receipts = Path(directory)
+            for row in rows.values():
+                for platform in row["platforms"]:
+                    write_split_receipt(receipts, row, platform)
+            source = next((receipts / "release").iterdir())
+            destination = receipts / "readiness" / source.name
+            source.rename(destination)
+            with self.semantic_validator(rows), self.assertRaises(GateFailure):
+                aggregate(ROOT, receipts, COMMIT, RELEASE_COMMIT)
 
     def test_false_acceptance_fails_closed(self) -> None:
         _, rows = authority(ROOT)

@@ -176,7 +176,15 @@ def validate(root: Path, expected_commit: str) -> dict[str, Any]:
     closure_workflow = (root / ".github/workflows/native-g8-closure.yml").read_text(
         encoding="utf-8"
     )
-    for required in ("check_native_g8_receipts.py", '"${{ inputs.source_commit }}"'):
+    for required in (
+        "check_native_g8_receipts.py",
+        '"${{ inputs.source_commit }}"',
+        '"${{ inputs.release_source_commit }}"',
+        'git rev-list --parents -n 1 "$SOURCE_COMMIT"',
+        '"${SOURCE_COMMIT}^{tree}"',
+        '"${RELEASE_SOURCE_COMMIT}^{tree}"',
+        '"$RELEASE_SOURCE_COMMIT" pull_request',
+    ):
         if required not in closure_workflow:
             raise GateFailure("G8 closure workflow does not enforce exact-SHA receipts")
     for forbidden in ("native-g7-aggregate.json", "check_native_g7_matrix.py"):
