@@ -538,8 +538,10 @@ class PackageTests(unittest.TestCase):
     def test_release_tag_and_slsa_predicate_are_bound_to_source(self) -> None:
         identity = source_identity(git_object("HEAD^{commit}"))
         with patch("finalize_release.source_identity") as source:
-            source.return_value = SimpleNamespace(version="1.2.0", tag="release-v1.2.0-final")
-            require_matching_tag("release-v1.2.0-final")
+            source.return_value = SimpleNamespace(
+                version="1.2.0", tag="release-v1.2.0-final-evidence"
+            )
+            require_matching_tag("release-v1.2.0-final-evidence")
             with self.assertRaisesRegex(RuntimeError, "does not match"):
                 require_matching_tag("v0.0.0")
         predicate = build_predicate(
@@ -1643,7 +1645,7 @@ class PackageTests(unittest.TestCase):
         with patch("release_evidence.commit_file", return_value=committed_cargo):
             identity = source_identity(commit)
         self.assertEqual(identity.version, "9.8.7")
-        self.assertEqual(identity.tag, "release-v9.8.7-final")
+        self.assertEqual(identity.tag, "release-v9.8.7-final-evidence")
         self.assertEqual(identity.commit, commit)
 
     @patch("release_evidence.current_commit")
