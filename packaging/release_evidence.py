@@ -117,7 +117,7 @@ def source_identity(commit: str) -> ReleaseIdentity:
         commit=commit,
         tree=tree_for_commit(commit),
         version=version,
-        tag=f"release-v{version}-final",
+        tag=f"release-v{version}-crates",
     )
 
 
@@ -173,12 +173,12 @@ def expected_primary_names(
         archives
         | {f"{archive}.provenance.json" for archive in archives}
         | {
-            f"hyphae-release-v{version}-final.spdx.json",
-            f"hyphae-release-v{version}-final.cdx.json",
+            f"hyphae-release-v{version}-crates.spdx.json",
+            f"hyphae-release-v{version}-crates.cdx.json",
         }
     )
     if include_required_checks:
-        expected.add(required_checks_name(f"release-v{version}-final"))
+        expected.add(required_checks_name(f"release-v{version}-crates"))
     return expected
 
 
