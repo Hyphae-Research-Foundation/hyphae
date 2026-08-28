@@ -223,9 +223,15 @@ jobs:
               "+refs/tags/${release_tag}:refs/hyphae/release-tag"
             tag_object="$(git rev-parse refs/hyphae/release-tag)"
             tag_target="$(git rev-parse 'refs/hyphae/release-tag^{commit}')"
-            test "$tag_target" = "$RELEASE_COMMIT_INPUT"
             git fetch --force --no-tags origin \
               "+refs/heads/main:refs/remotes/origin/main"
+            if [[ "$tag_target" != "$RELEASE_COMMIT_INPUT" ]]; then
+              parents=( $(git rev-list --parents -n 1 "$RELEASE_COMMIT_INPUT") )
+              test "${#parents[@]}" = 3
+              test "${parents[2]}" = "$tag_target"
+              test "$(git rev-parse "${tag_target}^{tree}")" = \
+                "$(git rev-parse "${RELEASE_COMMIT_INPUT}^{tree}")"
+            fi
             git merge-base --is-ancestor \
               "$RELEASE_COMMIT_INPUT" refs/remotes/origin/main
             echo "RELEASE_TAG_OBJECT=$tag_object" >> "$GITHUB_ENV"
