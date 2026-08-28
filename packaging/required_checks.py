@@ -91,7 +91,7 @@ def expected_check_commit(
 
 def expected_check_branch(name: str, *, head_ref: str) -> str:
     if name == "Validate all exact-SHA G8 receipts":
-        return CANONICAL_BASE_REF
+        return f"release/{head_ref}-merge-evidence"
     return head_ref
 
 
