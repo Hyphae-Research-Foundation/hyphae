@@ -447,7 +447,11 @@ jobs:
         run: |
           set -euo pipefail
           trap 'kill "$(cat "$RUNNER_TEMP/hyphae-mcp-daemon.pid")" 2>/dev/null || true' EXIT
-          cargo test --locked -p hyphae-cli native_mcp
+          # The saturation test binds its own temporary HTTP listener and must
+          # not race the long-lived real-host daemon in this job. The complete
+          # Linux test job already exercises it in isolation.
+          cargo test --locked -p hyphae-cli native_mcp -- \
+            --skip native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers
           PYTHONPATH=. python -m unittest tools.test_mcp_host_conformance -v
           evidence="$RUNNER_TEMP/mcp-evidence"
           mkdir -p "$evidence"
