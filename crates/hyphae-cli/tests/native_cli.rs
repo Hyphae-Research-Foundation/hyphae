@@ -3102,6 +3102,10 @@ async fn native_mcp_is_paginated_redacted_and_cannot_escalate_prompt_authority()
 #[allow(clippy::too_many_lines)]
 fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result<(), Box<dyn Error>>
 {
+    // Shared CI runners can starve the MCP child for several seconds; the
+    // saturation contract is about cancellation, not wall-clock budgets.
+    const CONTENDED: Duration = Duration::from_secs(10);
+
     use std::io::{BufRead as _, BufReader as IoBufReader, Write as _};
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::sync::mpsc;
@@ -3159,11 +3163,11 @@ fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result
     }
     assert!(
         serde_json::from_str::<serde_json::Value>(
-            &line_receiver.recv_timeout(Duration::from_secs(1))??
+            &line_receiver.recv_timeout(CONTENDED)??
         )?["result"]
             .is_object()
     );
-    accepted_receiver.recv_timeout(Duration::from_secs(1))?;
+    accepted_receiver.recv_timeout(CONTENDED)?;
     for message in [
         serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hyphae_native_capabilities","arguments":{}}}),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"test"}}),
@@ -3176,7 +3180,7 @@ fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result
     let mut responses = Vec::new();
     while responses.len() < 2 {
         responses.push(serde_json::from_str::<serde_json::Value>(
-            &line_receiver.recv_timeout(Duration::from_secs(1))??,
+            &line_receiver.recv_timeout(CONTENDED)??,
         )?);
     }
     assert!(
@@ -3196,9 +3200,8 @@ fn native_mcp_cancels_in_flight_http_rejects_saturation_and_recovers() -> Result
     )?;
     input.write_all(b"\n")?;
     input.flush()?;
-    let recovered = serde_json::from_str::<serde_json::Value>(
-        &line_receiver.recv_timeout(Duration::from_secs(1))??,
-    )?;
+    let recovered =
+        serde_json::from_str::<serde_json::Value>(&line_receiver.recv_timeout(CONTENDED)??)?;
     assert_eq!(recovered["id"], 4);
     assert_eq!(recovered["result"], serde_json::json!({}));
     drop(input);

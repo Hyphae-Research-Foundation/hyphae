@@ -28,7 +28,7 @@ ROOT = Path(
         PACKAGING.parent,
     )
 ).resolve()
-RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
+RELEASE_TAG = re.compile(r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
 SOFTWARE_LICENSE = "Apache-2.0"
 
 

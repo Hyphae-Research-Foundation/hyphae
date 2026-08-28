@@ -19,7 +19,7 @@ from tools.run_native_g8_test_gate import SUITES
 
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-RELEASE_TAG = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
+RELEASE_TAG = re.compile(r"(?:release-)?v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\Z")
 POWER_LOSS_COMMIT = "7b70d8a6863c5de30933d42a7672d35d01d2dc6c"
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT_BOUNDARIES = {
