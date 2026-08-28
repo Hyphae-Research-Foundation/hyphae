@@ -463,7 +463,7 @@ jobs:
           set -euo pipefail
           test "$RELEASE_TAG" = "release-v2.2.0-final"
           PYTHONPATH="$CONTROL_PACKAGING" python -c \
-            'import os; from finalize_release import require_apache_release_version; require_apache_release_version(os.environ["RELEASE_TAG"].removeprefix("v"))'
+            'import os; from finalize_release import require_apache_release_version; require_apache_release_version(os.environ["RELEASE_TAG"].removeprefix("release-v").removesuffix("-final"))'
           git fetch --force --no-tags origin \
             "+refs/tags/${RELEASE_TAG}:refs/hyphae/publish-tag"
           tag_object="$(git rev-parse refs/hyphae/publish-tag)"
