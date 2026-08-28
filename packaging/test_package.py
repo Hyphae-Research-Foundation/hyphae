@@ -917,6 +917,31 @@ class PackageTests(unittest.TestCase):
                 "required-checks",
                 {artifact["role"] for artifact in document["artifacts"]},
             )
+
+        with tempfile.TemporaryDirectory(prefix="hyphae-pr-tag-") as temporary:
+            root = Path(temporary)
+            identity, _, _ = write_test_primary_payloads(
+                root,
+                tag_release=True,
+                include_required_checks=True,
+                workflow_ref_override="refs/pull/231/merge",
+                event_override="pull_request",
+            )
+            document = build_release_evidence(
+                directory=root,
+                tag=identity.tag,
+                commit=identity.commit,
+                workflow_ref="refs/pull/231/merge",
+                event="pull_request",
+                run_id="123456",
+                run_attempt=1,
+                tag_object=identity.commit,
+                tag_target=identity.commit,
+            )
+            self.assertIn(
+                "required-checks",
+                {artifact["role"] for artifact in document["artifacts"]},
+            )
             validate_release_evidence(
                 document,
                 directory=root,

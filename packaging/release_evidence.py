@@ -149,10 +149,11 @@ def is_manual_tag_recovery(
     tag_target: str | None,
 ) -> bool:
     return (
-        event == "workflow_dispatch"
+        event in {"workflow_dispatch", "pull_request"}
         and (
             workflow_ref == "refs/heads/main"
             or workflow_ref.startswith("refs/tags/")
+            or workflow_ref.startswith("refs/pull/")
         )
         and isinstance(tag_object, str)
         and isinstance(tag_target, str)
