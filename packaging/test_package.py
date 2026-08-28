@@ -407,6 +407,10 @@ class PackageTests(unittest.TestCase):
             2,
         )
         self.assertIn("RELEASE_SOURCE_COMMIT", workflow)
+        self.assertIn('if [[ "$tag_target" != "$RELEASE_COMMIT_INPUT" ]]', workflow)
+        self.assertIn('git rev-list --parents -n 1 "$RELEASE_COMMIT_INPUT"', workflow)
+        self.assertIn('test "${parents[2]}" = "$tag_target"', workflow)
+        self.assertIn('"${RELEASE_COMMIT_INPUT}^{tree}"', workflow)
         self.assertEqual(workflow.count("name: Check out recovery control plane"), 2)
         self.assertEqual(
             workflow.count("HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE"),
