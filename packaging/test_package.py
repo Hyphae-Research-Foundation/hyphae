@@ -141,7 +141,7 @@ def fixture_workflow_runs(
             "path": REQUIRED_CHECK_WORKFLOWS[str(check_run["name"])],
             "head_sha": check_run["head_sha"],
             "head_branch": (
-                "main"
+                "release/codex/release-candidate-merge-evidence"
                 if check_run["name"] == "Validate all exact-SHA G8 receipts"
                 else "codex/release-candidate"
             ),
@@ -1037,7 +1037,7 @@ class PackageTests(unittest.TestCase):
         )
         self.assertEqual(
             {check["head_branch"] for check in report["checks"]},
-            {"codex/release-candidate", "main"},
+            {"codex/release-candidate", "release/codex/release-candidate-merge-evidence"},
         )
         self.assertEqual(
             {
