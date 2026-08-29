@@ -16,109 +16,127 @@
       "name": "Quality",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Test (Linux stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Test (Linux MSRV)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Test (macOS stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Test (Windows stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Public client conformance",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Optional framework integrations",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Release readiness",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Security hard-kill aggregate",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "MCP real hosts",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Dependency and license policy",
       "workflow": ".github/workflows/security.yml",
       "event": "push",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "name": "Package x86_64-unknown-linux-gnu",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Package x86_64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Package aarch64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Package x86_64-pc-windows-msvc",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Assemble and verify release candidate",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Publish GitHub release",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "main",
+      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
     },
     {
       "name": "Validate all exact-SHA G8 receipts",
       "workflow": ".github/workflows/native-g8-closure.yml",
       "event": "workflow_dispatch",
-      "head_branch": "release/fix/security-check-permission-merge-evidence"
+      "head_branch": "release/fix/security-check-permission-merge-evidence",
+      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     }
   ],
   "required_artifacts": [
@@ -172,5 +190,9 @@
     "tools/generate_third_party_licenses.py",
     "tools/produce_native_g8_receipt.py",
     "tools/verify_crate_packages.py"
-  ]
+  ],
+  "source_commit": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2",
+  "source_tree": "72c09ec5366d381c3ebf7b52d09bc98024d51a68",
+  "tag_object": "b961f7a40cd4bab9646d95727319638935ba4eb0",
+  "release_run_commit": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
 }
