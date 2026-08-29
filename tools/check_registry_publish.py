@@ -85,7 +85,11 @@ EXPECTED_CHECKS = (
 )
 EXPECTED_ARTIFACTS = (
     ("release-candidate", ".github/workflows/release.yml", "hyphae-release-candidate"),
-    ("signed-release-receipt", ".github/workflows/release.yml", "native-g8-signed-release-{commit}"),
+    (
+        "signed-release-receipt",
+        ".github/workflows/release.yml",
+        "native-g8-signed-release-5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2",
+    ),
     ("g8-aggregate", ".github/workflows/native-g8-closure.yml", "native-g8-aggregate-{commit}"),
     ("mcp-real-hosts", ".github/workflows/ci.yml", "mcp-real-hosts-{commit}"),
     ("security-hard-kill", ".github/workflows/ci.yml", "security-hard-kill-{commit}"),
@@ -799,12 +803,7 @@ def _artifact_authorities(
         if records is None:
             records = _artifact_records(repository, run, token)
             records_by_run[run["id"]] = records
-        artifact_commit = (
-            policy["release_run_commit"]
-            if expected["workflow"] == ".github/workflows/release.yml"
-            else commit
-        )
-        name = expected["name"].format(commit=artifact_commit)
+        name = expected["name"].format(commit=commit)
         matches = [record for record in records if record.get("name") == name]
         if len(matches) != 1:
             raise GateFailure(f"required workflow artifact must be unique: {name}")
@@ -1536,12 +1535,7 @@ def validate_authority_receipt(
         for check in checks
     }
     for expected, artifact in zip(expected_artifacts, artifacts, strict=True):
-        artifact_commit = (
-            policy["release_run_commit"]
-            if expected["workflow"] == ".github/workflows/release.yml"
-            else commit
-        )
-        expected_name = expected["name"].format(commit=artifact_commit)
+        expected_name = expected["name"].format(commit=commit)
         expected_run = check_runs.get(expected["workflow"])
         if not isinstance(artifact, dict) or (
             artifact.get("id") != expected["id"]

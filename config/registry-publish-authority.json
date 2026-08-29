@@ -148,7 +148,7 @@
     {
       "id": "signed-release-receipt",
       "workflow": ".github/workflows/release.yml",
-      "name": "native-g8-signed-release-{commit}"
+      "name": "native-g8-signed-release-5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     },
     {
       "id": "g8-aggregate",
