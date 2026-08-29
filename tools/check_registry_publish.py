@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
     "version": "2.2.0",
-    "tag": "v2.1.0",
+    "tag": "release-v2.2.0-crates",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
 }
@@ -67,13 +67,13 @@ EXPECTED_CHECKS = (
     ("Security hard-kill aggregate", ".github/workflows/ci.yml", "push", "main"),
     ("MCP real hosts", ".github/workflows/ci.yml", "push", "main"),
     ("Dependency and license policy", ".github/workflows/security.yml", "push", "main"),
-    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Assemble and verify release candidate", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Publish GitHub release", ".github/workflows/release.yml", "push", "v2.1.0"),
-    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "main"),
+    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Assemble and verify release candidate", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Publish GitHub release", ".github/workflows/release.yml", "workflow_dispatch", "main"),
+    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/security-check-permission-merge-evidence"),
 )
 EXPECTED_ARTIFACTS = (
     ("release-candidate", ".github/workflows/release.yml", "hyphae-release-candidate"),
@@ -373,7 +373,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
         or value["version"] != "2.2.0"
-        or value["tag"] != "v2.1.0"
+        or value["tag"] != "release-v2.2.0-crates"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
         != {
@@ -385,7 +385,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["required_artifacts"] != expected_artifacts
         or value["control_files"] != list(EXPECTED_CONTROL_FILES)
     ):
-        raise GateFailure("registry authority policy differs from the pinned 2.1.0 authority")
+        raise GateFailure("registry authority policy differs from the pinned 2.2.0 authority")
     return value
 
 
@@ -489,6 +489,7 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         "checks: read",
         "id-token: write",
         "Reject a non-main live dispatch before checkout",
+        "test '${{ inputs.source_tag }}' = release-v2.2.0-crates",
         "refs/heads/main",
         "test \"${{ github.ref }}\" = refs/heads/main",
         "github.workflow_ref",
@@ -1375,8 +1376,10 @@ def resolve_live_authority(
     source_tree = _git(root, "rev-parse", f"{source_commit}^{{tree}}").stdout.strip()
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
-    if source_commit != origin_main:
-        raise GateFailure("v2.1.0 target is not the exact origin/main commit")
+    if not _git(root, "merge-base", "--is-ancestor", source_commit, origin_main, check=False).returncode == 0:
+        raise GateFailure("2.2.0 source tag is not an ancestor of origin/main")
+    if workflow_sha != origin_main:
+        raise GateFailure("registry control workflow is not the exact origin/main commit")
     checks, runs_by_path = fetch_required_checks(
         repository, source_commit, token, workflow_run_id, policy
     )
@@ -1440,7 +1443,9 @@ def validate_authority_receipt(
         or HEX40.fullmatch(commit) is None
         or not isinstance(source.get("tree"), str)
         or HEX40.fullmatch(source["tree"]) is None
-        or source.get("origin_main") != commit
+        or not isinstance(source.get("origin_main"), str)
+        or HEX40.fullmatch(source["origin_main"]) is None
+        or control.get("workflow_sha") != source.get("origin_main")
         or control.get("workflow_ref")
         != "Hyphae-Research-Foundation/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
         or not isinstance(control.get("workflow_sha"), str)
@@ -1563,7 +1568,7 @@ def _verify_release_and_g8(
     )
     certificate_identity = (
         f"https://github.com/{authority['repository']}/.github/workflows/release.yml@"
-        f"refs/tags/{tag}"
+        "refs/heads/main"
     )
     subprocess.run(
         [
@@ -1615,8 +1620,8 @@ def _verify_release_and_g8(
         != str(release_check["workflow_run_id"])
         or release_document.get("workflow", {}).get("run_attempt")
         != release_check["workflow_run_attempt"]
-        or release_document.get("workflow", {}).get("event") != "push"
-        or release_document.get("workflow", {}).get("ref") != f"refs/tags/{tag}"
+        or release_document.get("workflow", {}).get("event") != "workflow_dispatch"
+        or release_document.get("workflow", {}).get("ref") != "refs/heads/main"
     ):
         raise GateFailure("release evidence differs from the selected Release authority")
     return {
@@ -1780,7 +1785,7 @@ def validate_evidence_receipt(value: dict[str, Any], ecosystem: str, authority: 
         or value["control"] != authority["control"]
         or value.get("transition", {}).get("target_release") != "1.2.0"
         or value.get("transition", {}).get("tree") != authority["source"]["tree"]
-        or value.get("package_inventory", {}).get("version") != "2.1.0"
+        or value.get("package_inventory", {}).get("version") != "2.2.0"
     ):
         raise GateFailure("publication evidence receipt identity differs")
     release = value.get("release")
