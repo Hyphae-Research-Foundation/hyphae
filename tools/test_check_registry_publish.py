@@ -20,6 +20,7 @@ from tools.check_registry_publish import (
     EXPECTED_AUTHORITY,
     EXPECTED_CHECKS,
     EXPECTED_CONTROL_FILES,
+    TRUSTED_MAIN_ONLY_CONTROL_FILES,
     ROOT,
     GateFailure,
     fetch_required_checks,
@@ -175,6 +176,11 @@ class RegistryPublishGateTests(unittest.TestCase):
         ]
         self.assertEqual(filtered, [])
         self.assertEqual(EXPECTED_AUTHORITY["version"], "2.2.0")
+        self.assertIn(
+            ".github/workflows/registry-publish.yml",
+            TRUSTED_MAIN_ONLY_CONTROL_FILES,
+        )
+        self.assertNotIn("Cargo.toml", TRUSTED_MAIN_ONLY_CONTROL_FILES)
 
     def test_crate_download_requests_the_archive_not_a_url_document(self) -> None:
         from tools.check_registry_publish import _url_bytes

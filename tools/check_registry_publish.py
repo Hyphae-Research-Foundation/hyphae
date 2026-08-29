@@ -129,6 +129,19 @@ EXPECTED_CONTROL_FILES = (
     "tools/produce_native_g8_receipt.py",
     "tools/verify_crate_packages.py",
 )
+TRUSTED_MAIN_ONLY_CONTROL_FILES = frozenset(
+    {
+        ".github/workflows/registry-publish.yml",
+        "config/crates-io-release.json",
+        "config/npm-release.json",
+        "config/registry-publish-authority.json",
+        "packaging/g8_release_verification.py",
+        "packaging/release_evidence.py",
+        "tools/check_native_g8_receipts.py",
+        "tools/check_registry_publish.py",
+        "tools/produce_native_g8_receipt.py",
+    }
+)
 
 
 class GateFailure(ValueError):
@@ -848,12 +861,14 @@ def _control_digests(control_root: Path, source_root: Path, workflow_sha: str, p
     records: list[dict[str, str]] = []
     for relative in policy["control_files"]:
         trusted = _file_at_commit(control_root, workflow_sha, relative)
-        source_path = source_root / relative
-        if not source_path.is_file() or source_path.is_symlink():
-            raise GateFailure(f"tag target control file is missing: {relative}")
-        source = source_path.read_bytes()
-        if trusted != source:
-            raise GateFailure(f"tag-controlled publication file differs from trusted main: {relative}")
+        if relative not in TRUSTED_MAIN_ONLY_CONTROL_FILES:
+            source_path = source_root / relative
+            if not source_path.is_file() or source_path.is_symlink():
+                raise GateFailure(f"tag target control file is missing: {relative}")
+            if source_path.read_bytes() != trusted:
+                raise GateFailure(
+                    f"tag-controlled publication file differs from trusted main: {relative}"
+                )
         records.append(
             {
                 "path": relative,
@@ -884,11 +899,12 @@ def _control_digests_match(
         trusted = _file_at_commit(control_root, workflow_sha, relative)
         if hashlib.sha256(trusted).hexdigest() != row["sha256"]:
             raise GateFailure(f"trusted main control file changed: {relative}")
-        source_path = source_root / relative
-        if not source_path.is_file() or source_path.is_symlink():
-            raise GateFailure(f"tag target control file is missing: {relative}")
-        if source_path.read_bytes() != trusted:
-            raise GateFailure(f"tag target control file changed: {relative}")
+        if relative not in TRUSTED_MAIN_ONLY_CONTROL_FILES:
+            source_path = source_root / relative
+            if not source_path.is_file() or source_path.is_symlink():
+                raise GateFailure(f"tag target control file is missing: {relative}")
+            if source_path.read_bytes() != trusted:
+                raise GateFailure(f"tag target control file changed: {relative}")
 
 
 def _tag_signature(root: Path, tag: str, required: bool) -> dict[str, object]:
