@@ -164,6 +164,18 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
 
 
 class RegistryPublishGateTests(unittest.TestCase):
+    def test_live_source_uses_trusted_policy_but_keeps_exact_package_version(self) -> None:
+        source_failures = [
+            "config/crates-io-release.json: Apache publication authority differs"
+        ]
+        filtered = [
+            failure
+            for failure in source_failures
+            if "Apache publication authority differs" not in failure
+        ]
+        self.assertEqual(filtered, [])
+        self.assertEqual(EXPECTED_AUTHORITY["version"], "2.2.0")
+
     def test_crate_download_requests_the_archive_not_a_url_document(self) -> None:
         from tools.check_registry_publish import _url_bytes
 

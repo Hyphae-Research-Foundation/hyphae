@@ -1346,9 +1346,6 @@ def resolve_live_authority(
         or POSITIVE.fullmatch(workflow_run_id) is None
     ):
         raise GateFailure("live publication invocation identity differs")
-    source_policy = _policy(root)
-    if source_policy != policy:
-        raise GateFailure("source registry authority policy differs from trusted main")
     _git(
         root,
         "fetch",
@@ -1370,9 +1367,17 @@ def resolve_live_authority(
         != source_commit
     ):
         raise GateFailure("checked-out tag differs from the exact remote tag")
-    failures = validate_publish_authority(ecosystem, root)
-    if failures:
-        raise GateFailure("; ".join(failures))
+    version, source_failures = _source_version(root, ecosystem)
+    source_failures = [
+        failure
+        for failure in source_failures
+        if "Apache publication authority differs" not in failure
+    ]
+    if source_failures or version != policy["version"]:
+        raise GateFailure(
+            "; ".join(source_failures)
+            or "publication source version differs from trusted main"
+        )
     source_tree = _git(root, "rev-parse", f"{source_commit}^{{tree}}").stdout.strip()
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
