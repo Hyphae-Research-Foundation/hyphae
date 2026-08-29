@@ -26,8 +26,10 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`v2.1.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0)
-is the latest release of the active Native architecture. G0 through
+**Stable Native release:** [`2.2.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v2.2.0-crates)
+is the latest release of the active Native architecture and the complete
+24-crate graph is [published on crates.io](https://crates.io/crates/hyphae-cli/2.2.0).
+G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
 SBOMs, signatures, provenance, and fault matrices to the exact release
@@ -35,16 +37,14 @@ commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
 
-**Published release:** the 1.2 program ships durable native access control,
-the operator console, agent plugins, the published Python client, and the
-Apache-2.0 software transition. [`v1.2.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v1.2.0)
-closed the exact-SHA release gates with signed GitHub Release archives;
-`v2.1.0` re-issues that program from the current integration tree as the
-Apache-2.0 registry publication for crates.io, PyPI, and npm. Until a given
-registry publication completes, the latest already-published registry version
-is `1.1.0` under that release's original terms; its exact checksums, source
-identities, workflow runs, and consumer verification are in the
-[1.1.0 publication receipt](docs/release/receipts/1.1.0.md).
+**What changed in 2.2.0:** Agent Memory can now commit its search document,
+lifecycle envelope, and TTL under one transaction and one CSN. The complete
+document transaction stage also supports named vectors for callers that supply
+them; the five-verb Agent Memory MCP remains lexical in 2.2.0. The release adds
+proactive host hooks, physical personal/work/journal domain separation,
+temporal and session doc-values, retry-safe migration from the legacy mixed
+collection, and reproducible LoCoMo/LongMemEval retrieval harnesses. See the
+[2.2.0 changelog](CHANGELOG.md#220---2026-08-26).
 
 G8 release evidence binds publication to the exact release commit. The G7
 closure certifies the C-60 operational-scale control matrix but makes no
@@ -60,6 +60,9 @@ canonical dedicated-hardware latency, interference, or bare-metal claim.
   same-snapshot hybrid search without an external search engine.
 - Commits SQL, structure, and search mutations under one catalog, WAL, MVCC
   root set, commit sequence, scheduler, and stable object-ID namespace.
+- Runs one shared, local Agent Memory for Claude Code, Codex, OpenCode, and Pi,
+  with project isolation, TTL, proactive recall, conservative capture, durable
+  spool, PII/secret rejection, and offline-verifiable recall proofs.
 - Exposes one embedded Rust facade, local UDS/named-pipe protocol, CLI, optional
   loopback HTTP `/v2`, and typed Python and TypeScript SDKs.
 - Creates Native checkpoints, proofs, witnesses, backups, restores, vacuum
@@ -70,6 +73,107 @@ canonical dedicated-hardware latency, interference, or bare-metal claim.
 See the [Native capability matrix](docs/product/native-capabilities.md),
 including surface differences, boundaries, and deliberate non-capabilities.
 The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
+
+## Agent Memory
+
+Agent Memory is the first product that uses Hyphae's multipurpose substrate as
+one system rather than a collection of sidecars. In 2.2.0 each memory carries
+lifecycle state and TTL, searchable text, temporal and project doc-values,
+provenance, and optional proof material while retaining one identity and one
+commit sequence. The underlying complete-document transaction also admits
+named vectors, but the shipped memory MCP does not yet accept or query them.
+
+```text
+Claude Code ─┐
+Codex ───────┼─ lifecycle hook / MCP ──► one local Hyphae directory
+OpenCode ────┤                              │
+Pi ──────────┘                              ├─ personal collection
+                                            ├─ work collection
+                                            └─ journal collection
+
+store: search document + doc-values + lifecycle envelope + TTL
+       └────────────────── one transaction / one CSN ──────────────────┘
+```
+
+The bounded MCP profile exposes five verbs:
+
+```text
+hyphae_memory_store     hyphae_memory_journal
+hyphae_memory_recall    hyphae_memory_forget    hyphae_memory_status
+```
+
+- Recall sees exactly the requested project plus explicitly labeled `_global`
+  memories; project data never crosses that boundary.
+- Personal, work, and model-journal memories are physically separated.
+- Hooks inject bounded historical context before a host handles a prompt.
+  Automatic capture stores only explicit decisions, constraints, facts, and a
+  narrow allowlist of successful reusable commands. It never stores full
+  prompts, responses, reasoning, or tool output.
+- PII and likely secrets fail closed instead of being partially redacted.
+- If the local daemon is unavailable, sanitized candidates enter an owner-only,
+  content-identified spool and are removed only after a durable acknowledgement.
+- A proved recall returns artifacts that can be checked offline with
+  `hyphae proof verify`.
+- When a transport cannot serve the explicit all-engine transaction within its
+  bounded step budget, the store falls back to the historical ingest-then-set
+  sequence; recall still gates every result on the live lifecycle envelope.
+
+Set up the local service and generate host configuration:
+
+```bash
+hyphae agent setup
+hyphae agent configure opencode --access read --apply
+hyphae agent status
+```
+
+Use `claude`, `codex`, `opencode`, or `pi` as the host. Writer access is
+explicit; the default reader credential cannot store, journal, forget, manage
+keys, administer backups, or execute arbitrary SQL. Existing 2.1.0 mixed
+collection data moves offline with `hyphae agent migrate-domains`.
+
+Read the [Agent Memory product contract](docs/product/agent-memory.md),
+[Omarchy integration guide](docs/integrations/omarchy.md), and
+[MCP adapter contract](mcp/README.md).
+
+## Memory retrieval measurements
+
+Hyphae 2.2.0 includes a pinned, digest-verified evaluation harness for LoCoMo
+and LongMemEval-S-cleaned. These are **retrieval measurements**, not generated
+answer accuracy and not directly comparable to published LLM-as-a-judge scores
+from systems that perform model-based extraction or answer generation.
+
+| Benchmark | Denominator | Evidence recall@10 / Recall-all@10 | NDCG@10 |
+|---|---:|---:|---:|
+| LoCoMo evidence retrieval, nested leave-one-conversation-out | 1,982 queries / 10 conversations | **70.12%** | **48.40%** |
+| Frozen LoCoMo lexical baseline | 1,982 queries / 10 conversations | 54.24% | 40.15% |
+| LongMemEval-S-cleaned, user-evidence retrieval | 419 eligible / 500 questions | **89.26%** | **87.75%** |
+
+LoCoMo selection used five frozen candidates, nested
+leave-one-conversation-out validation, the one-standard-error rule, 10,000
+conversation-cluster bootstrap replicates, and an exact two-sided paired
+sign-flip test over all `2^10` assignments. The selected `enriched` candidate
+won all ten outer folds. Its Evidence Recall@10 uplift over baseline was
+**+15.88 percentage points** question-micro and +16.01 points
+conversation-macro; the exact sign-flip result was `p = 0.001953125` and the
+Holm-adjusted value was `0.033203125`. The conversation-bootstrap interval for
+the micro uplift was **[12.72, 18.77] percentage points**.
+
+LongMemEval evaluated the official non-abstention questions with positive user
+evidence: 30 abstention questions and 51 questions without a positive user
+target were excluded by protocol. Recall-any@10 was **96.66%**,
+Recall-all@30 was **97.85%**, and Recall-all@50 reached **100%**. All 419
+rankings were repeat-stable (`changed_rankings_on_repeat = 0`).
+
+The runs were offline over the Native local protocol on declared DigitalOcean
+compute hosts; no model ran during retrieval. Datasets remain caller-supplied
+and are not redistributed. Machine-readable local diagnostic receipts remain
+ignored under `artifacts-local-*`, carry source/host/protocol/dataset digests,
+declare no closure, and do not authorize publication claims. The harness and
+statistical selector are in
+[`tools/long_term_memory_benchmarks.py`](tools/long_term_memory_benchmarks.py)
+and [`tools/locomo_slice_a_statistics.py`](tools/locomo_slice_a_statistics.py);
+the complete methodology is in the
+[Agent Memory evaluation contract](docs/product/agent-memory.md#external-retrieval-evaluation).
 
 ## Operational-scale measurements
 
@@ -111,20 +215,19 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`v2.1.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0),
+[`2.2.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v2.2.0-crates),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 2.1.0 --locked
+cargo install hyphae-cli --version 2.2.0 --locked
 ```
 
-That coordinate is valid once the `v2.1.0` publication completes; the latest
-already-published version is `1.1.0`. Build and embed the exact release from
-source with:
+That coordinate is live for all 24 published crates. Build and embed the exact
+release source with:
 
 ```bash
-git checkout v2.1.0
+git checkout release-v2.2.0-crates
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```
@@ -203,7 +306,7 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-Version `2.1.0` publishes the complete 24-crate graph:
+Version `2.2.0` publishes the complete 24-crate graph:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;
@@ -237,6 +340,8 @@ The compatibility crates remain available as part of that graph:
 Start at the [documentation index](docs/README.md). Key guides:
 
 - [Native capabilities and limits](docs/product/native-capabilities.md)
+- [Agent Memory product contract](docs/product/agent-memory.md)
+- [Agent Memory on Omarchy](docs/integrations/omarchy.md)
 - [Native quickstart](docs/quickstart-native.md)
 - [Published 0.2.1 compatibility guide](docs/quickstart.md)
 - [CLI reference](docs/cli/reference.md)
