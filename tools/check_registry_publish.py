@@ -54,26 +54,34 @@ EXPECTED_POLICY_KEYS = {
     "required_checks",
     "required_artifacts",
     "control_files",
+    "source_commit",
+    "source_tree",
+    "tag_object",
+    "release_run_commit",
 }
+SOURCE_COMMIT = "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+SOURCE_TREE = "72c09ec5366d381c3ebf7b52d09bc98024d51a68"
+TAG_OBJECT = "b961f7a40cd4bab9646d95727319638935ba4eb0"
+RELEASE_RUN_COMMIT = "97bc3ff6034eac55bfe570f824be21aafd5c153b"
 EXPECTED_CHECKS = (
-    ("Quality", ".github/workflows/ci.yml", "push", "main"),
-    ("Test (Linux stable)", ".github/workflows/ci.yml", "push", "main"),
-    ("Test (Linux MSRV)", ".github/workflows/ci.yml", "push", "main"),
-    ("Test (macOS stable)", ".github/workflows/ci.yml", "push", "main"),
-    ("Test (Windows stable)", ".github/workflows/ci.yml", "push", "main"),
-    ("Public client conformance", ".github/workflows/ci.yml", "push", "main"),
-    ("Optional framework integrations", ".github/workflows/ci.yml", "push", "main"),
-    ("Release readiness", ".github/workflows/ci.yml", "push", "main"),
-    ("Security hard-kill aggregate", ".github/workflows/ci.yml", "push", "main"),
-    ("MCP real hosts", ".github/workflows/ci.yml", "push", "main"),
-    ("Dependency and license policy", ".github/workflows/security.yml", "push", "main"),
-    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Assemble and verify release candidate", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Publish GitHub release", ".github/workflows/release.yml", "workflow_dispatch", "main"),
-    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/security-check-permission-merge-evidence"),
+    ("Quality", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Test (Linux stable)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Test (Linux MSRV)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Test (macOS stable)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Test (Windows stable)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Public client conformance", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Optional framework integrations", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Release readiness", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Security hard-kill aggregate", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("MCP real hosts", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
+    ("Dependency and license policy", ".github/workflows/security.yml", "push", "main", SOURCE_COMMIT),
+    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Assemble and verify release candidate", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Publish GitHub release", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
+    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/security-check-permission-merge-evidence", SOURCE_COMMIT),
 )
 EXPECTED_ARTIFACTS = (
     ("release-candidate", ".github/workflows/release.yml", "hyphae-release-candidate"),
@@ -361,8 +369,14 @@ def _policy(root: Path) -> dict[str, Any]:
     if set(value) != EXPECTED_POLICY_KEYS:
         raise GateFailure("registry authority policy fields differ")
     expected_checks = [
-        {"name": name, "workflow": workflow, "event": event, "head_branch": branch}
-        for name, workflow, event, branch in EXPECTED_CHECKS
+        {
+            "name": name,
+            "workflow": workflow,
+            "event": event,
+            "head_branch": branch,
+            "head_sha": head_sha,
+        }
+        for name, workflow, event, branch, head_sha in EXPECTED_CHECKS
     ]
     expected_artifacts = [
         {"id": identifier, "workflow": workflow, "name": name}
@@ -384,6 +398,10 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["required_checks"] != expected_checks
         or value["required_artifacts"] != expected_artifacts
         or value["control_files"] != list(EXPECTED_CONTROL_FILES)
+        or value["source_commit"] != SOURCE_COMMIT
+        or value["source_tree"] != SOURCE_TREE
+        or value["tag_object"] != TAG_OBJECT
+        or value["release_run_commit"] != RELEASE_RUN_COMMIT
     ):
         raise GateFailure("registry authority policy differs from the pinned 2.2.0 authority")
     return value
@@ -671,12 +689,17 @@ def _select_check_run(
 def fetch_required_checks(
     repository: str, commit: str, token: str, excluded_run_id: str, policy: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    checks = _pages(
-        _api(repository, f"commits/{commit}/check-runs?filter=all"),
-        "check_runs",
-        token,
-        "check runs",
-    )
+    check_commits = sorted({row["head_sha"] for row in policy["required_checks"]})
+    checks: list[object] = []
+    for check_commit in check_commits:
+        checks.extend(
+            _pages(
+                _api(repository, f"commits/{check_commit}/check-runs?filter=all"),
+                "check_runs",
+                token,
+                "check runs",
+            )
+        )
     selected: list[dict[str, Any]] = []
     runs_by_path: dict[str, dict[str, Any]] = {}
     excluded_fragment = f"/actions/runs/{excluded_run_id}/"
@@ -693,12 +716,13 @@ def fetch_required_checks(
                 for check in checks
                 if isinstance(check, dict)
                 and check.get("name") == publish_expected["name"]
-                and check.get("head_sha") == commit
+                and check.get("head_sha") == publish_expected["head_sha"]
                 and excluded_fragment not in str(check.get("details_url", ""))
             ]
             selected_publish = _select_check_run(candidates, publish_expected["name"])
             release_run, _job_metadata = _run_for_check(
-                selected_publish, publish_expected, repository, commit, token
+                selected_publish, publish_expected, repository,
+                publish_expected["head_sha"], token
             )
             break
     if release_run is None:
@@ -709,7 +733,7 @@ def fetch_required_checks(
             for check in checks
             if isinstance(check, dict)
             and check.get("name") == expected["name"]
-            and check.get("head_sha") == commit
+            and check.get("head_sha") == expected["head_sha"]
             and excluded_fragment not in str(check.get("details_url", ""))
         ]
         if expected["name"] in EXPECTED_RELEASE_RUN_JOBS:
@@ -727,7 +751,7 @@ def fetch_required_checks(
         else:
             selected_check = _select_check_run(candidates, expected["name"])
         run, _job_metadata = _run_for_check(
-            selected_check, expected, repository, commit, token
+            selected_check, expected, repository, expected["head_sha"], token
         )
         existing = runs_by_path.get(expected["workflow"])
         if existing is not None and existing.get("id") != run.get("id"):
@@ -742,7 +766,7 @@ def fetch_required_checks(
                 "workflow": expected["workflow"],
                 "event": expected["event"],
                 "head_branch": expected["head_branch"],
-                "head_sha": commit,
+                "head_sha": expected["head_sha"],
             }
         )
     return selected, runs_by_path
@@ -775,7 +799,12 @@ def _artifact_authorities(
         if records is None:
             records = _artifact_records(repository, run, token)
             records_by_run[run["id"]] = records
-        name = expected["name"].format(commit=commit)
+        artifact_commit = (
+            policy["release_run_commit"]
+            if expected["workflow"] == ".github/workflows/release.yml"
+            else commit
+        )
+        name = expected["name"].format(commit=artifact_commit)
         matches = [record for record in records if record.get("name") == name]
         if len(matches) != 1:
             raise GateFailure(f"required workflow artifact must be unique: {name}")
@@ -1379,6 +1408,12 @@ def resolve_live_authority(
             or "publication source version differs from trusted main"
         )
     source_tree = _git(root, "rev-parse", f"{source_commit}^{{tree}}").stdout.strip()
+    if (
+        source_commit != policy["source_commit"]
+        or source_tree != policy["source_tree"]
+        or tag_object != policy["tag_object"]
+    ):
+        raise GateFailure("2.2.0 source tag identity differs from pinned authority")
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
     if not _git(root, "merge-base", "--is-ancestor", source_commit, origin_main, check=False).returncode == 0:
@@ -1451,6 +1486,9 @@ def validate_authority_receipt(
         or not isinstance(source.get("origin_main"), str)
         or HEX40.fullmatch(source["origin_main"]) is None
         or control.get("workflow_sha") != source.get("origin_main")
+        or commit != policy["source_commit"]
+        or source.get("tree") != policy["source_tree"]
+        or source.get("tag_object") != policy["tag_object"]
         or control.get("workflow_ref")
         != "Hyphae-Research-Foundation/hyphae/.github/workflows/registry-publish.yml@refs/heads/main"
         or not isinstance(control.get("workflow_sha"), str)
@@ -1481,7 +1519,7 @@ def validate_authority_receipt(
             or check.get("workflow") != expected["workflow"]
             or check.get("event") != expected["event"]
             or check.get("head_branch") != expected["head_branch"]
-            or check.get("head_sha") != commit
+            or check.get("head_sha") != expected["head_sha"]
             or not isinstance(check.get("check_run_id"), int)
             or not isinstance(check.get("workflow_run_id"), int)
             or not isinstance(check.get("workflow_run_attempt"), int)
@@ -1498,7 +1536,12 @@ def validate_authority_receipt(
         for check in checks
     }
     for expected, artifact in zip(expected_artifacts, artifacts, strict=True):
-        expected_name = expected["name"].format(commit=commit)
+        artifact_commit = (
+            policy["release_run_commit"]
+            if expected["workflow"] == ".github/workflows/release.yml"
+            else commit
+        )
+        expected_name = expected["name"].format(commit=artifact_commit)
         expected_run = check_runs.get(expected["workflow"])
         if not isinstance(artifact, dict) or (
             artifact.get("id") != expected["id"]

@@ -53,7 +53,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         workflow: index + 100
         for index, workflow in enumerate(dict.fromkeys(row[1] for row in EXPECTED_CHECKS))
     }
-    for index, (name, workflow, event, branch) in enumerate(EXPECTED_CHECKS):
+    for index, (name, workflow, event, branch, head_sha) in enumerate(EXPECTED_CHECKS):
         checks.append(
             {
                 "name": name,
@@ -63,7 +63,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
                 "workflow": workflow,
                 "event": event,
                 "head_branch": branch,
-                "head_sha": COMMIT,
+                "head_sha": head_sha,
             }
         )
     artifacts = [
@@ -511,7 +511,7 @@ class RegistryPublishGateTests(unittest.TestCase):
         for name in ("Security hard-kill aggregate", "MCP real hosts"):
             expected = next(
                 {"name": check, "workflow": workflow, "event": event, "head_branch": branch}
-                for check, workflow, event, branch in EXPECTED_CHECKS
+                for check, workflow, event, branch, _head_sha in EXPECTED_CHECKS
                 if check == name
             )
             candidate = {
@@ -859,17 +859,17 @@ class RegistryPublishGateTests(unittest.TestCase):
         workflow_runs = {
             workflow: index + 800
             for index, workflow in enumerate(
-                dict.fromkeys(workflow for _name, workflow, _event, _branch in EXPECTED_CHECKS)
+                dict.fromkeys(workflow for _name, workflow, _event, _branch, _head_sha in EXPECTED_CHECKS)
             )
         }
         workflow_runs[".github/workflows/release.yml"] = release_run
-        for index, (name, workflow, _event, _branch) in enumerate(EXPECTED_CHECKS):
+        for index, (name, workflow, _event, _branch, head_sha) in enumerate(EXPECTED_CHECKS):
             run_id = workflow_runs[workflow]
             check_runs.append(
                 {
                     "id": index + 1,
                     "name": name,
-                    "head_sha": COMMIT,
+                    "head_sha": head_sha,
                     "completed_at": f"2026-08-16T13:{index:02d}:00Z",
                     "details_url": (
                         f"https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/{run_id}/job/{index + 1}"
@@ -878,7 +878,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             )
         release_index = next(
             index
-            for index, (_name, workflow, _event, _branch) in enumerate(EXPECTED_CHECKS)
+            for index, (_name, workflow, _event, _branch, _head_sha) in enumerate(EXPECTED_CHECKS)
             if workflow == ".github/workflows/release.yml"
         )
         stale = copy.deepcopy(check_runs[release_index])
@@ -893,8 +893,15 @@ class RegistryPublishGateTests(unittest.TestCase):
             run_id = int(check["details_url"].split("/runs/", 1)[1].split("/", 1)[0])
             return {"id": run_id, "run_attempt": 1}, {}
 
+        def page_values(url: str, *_args):
+            return [
+                check
+                for check in check_runs
+                if f"commits/{check['head_sha']}/check-runs" in url
+            ]
+
         with patch(
-            "tools.check_registry_publish._pages", return_value=check_runs
+            "tools.check_registry_publish._pages", side_effect=page_values
         ), patch(
             "tools.check_registry_publish._run_for_check", side_effect=verified
         ):
@@ -915,10 +922,10 @@ class RegistryPublishGateTests(unittest.TestCase):
         workflow_runs = {
             workflow: index + 800
             for index, workflow in enumerate(
-                dict.fromkeys(workflow for _name, workflow, _event, _branch in EXPECTED_CHECKS)
+                dict.fromkeys(workflow for _name, workflow, _event, _branch, _head_sha in EXPECTED_CHECKS)
             )
         }
-        for index, (name, workflow, _event, _branch) in enumerate(EXPECTED_CHECKS):
+        for index, (name, workflow, _event, _branch, head_sha) in enumerate(EXPECTED_CHECKS):
             run_id = workflow_runs[workflow]
             check_runs.append(
                 {
@@ -958,8 +965,15 @@ class RegistryPublishGateTests(unittest.TestCase):
                 else:
                     candidates[0]["completed_at"] = mutation["completed_at"]
                     candidates.append(mutation)
+                def page_values(url: str, *_args):
+                    return [
+                        check
+                        for check in candidates
+                        if f"commits/{check['head_sha']}/check-runs" in url
+                    ]
+
                 with patch(
-                    "tools.check_registry_publish._pages", return_value=candidates
+                    "tools.check_registry_publish._pages", side_effect=page_values
                 ), patch(
                     "tools.check_registry_publish._run_for_check", side_effect=verified
                 ), self.assertRaises(GateFailure):
