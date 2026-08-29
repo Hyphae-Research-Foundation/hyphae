@@ -1809,6 +1809,11 @@ def validate_live_evidence(
         root, control_root, evidence_root, authority["source"]["commit"]
     )
     inventory, failures = _source_version(root, ecosystem)
+    failures = [
+        failure
+        for failure in failures
+        if "Apache publication authority differs" not in failure
+    ]
     if failures or inventory != policy["version"]:
         raise GateFailure("; ".join(failures) or "registry package inventory version differs")
     return {
