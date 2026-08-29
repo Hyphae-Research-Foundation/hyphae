@@ -161,6 +161,7 @@ jobs:
       pull-requests: read
     env:
       CONTROL_PACKAGING: packaging
+      CONTROL_ROOT: .
       RECOVERY_COMMIT: ${{ inputs.release_commit }}
       RECOVERY_TAG: ${{ inputs.release_tag }}
       RELEASE_SOURCE_COMMIT: ${{ inputs.release_commit || github.event.pull_request.head.sha || github.sha }}
@@ -186,6 +187,7 @@ jobs:
           test "$(git -C .release-control rev-parse HEAD)" = "$GITHUB_SHA"
           control_root="$RUNNER_TEMP/release-control"
           mv .release-control "$control_root"
+          echo "CONTROL_ROOT=$control_root" >> "$GITHUB_ENV"
           echo "CONTROL_PACKAGING=$control_root/packaging" >> "$GITHUB_ENV"
           echo "HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Verify the pull-request integration tree
@@ -392,7 +394,7 @@ jobs:
           fi
           PYTHONPATH="$CONTROL_PACKAGING" python "$CONTROL_PACKAGING/g8_release_verification.py" \
             "${arguments[@]}"
-          PYTHONPATH=. python tools/produce_native_g8_receipt.py \
+          PYTHONPATH="$CONTROL_ROOT" python "$CONTROL_ROOT/tools/produce_native_g8_receipt.py" \
             --requirement sbom-signatures-provenance \
             --platform release \
             --expected-commit "$RELEASE_COMMIT" \
