@@ -101,6 +101,7 @@ Consumer verification is documented in
 
 crates.io and npm use the separate `Registry publish` workflow. Dry-runs are
 allowed against the current manifests, but live publication is fail-closed
-unless the source is a clean checkout of the annotated `v2.1.0` tag and every
-package manifest and registry policy declares exact version `2.1.0` with
+unless the source is a clean checkout of the annotated
+`release-v2.2.0-crates` tag and every package manifest and registry policy
+declares exact version `2.2.0` with
 Apache-2.0 authority.

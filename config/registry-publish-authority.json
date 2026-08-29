@@ -4,7 +4,7 @@
   "repository": "Hyphae-Research-Foundation/hyphae",
   "branch": "main",
   "version": "2.2.0",
-  "tag": "v2.1.0",
+  "tag": "release-v2.2.0-crates",
   "tag_kind": "annotated",
   "tag_signature": {
     "required": false,
@@ -81,44 +81,44 @@
     {
       "name": "Package x86_64-unknown-linux-gnu",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Package x86_64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Package aarch64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Package x86_64-pc-windows-msvc",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Assemble and verify release candidate",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Publish GitHub release",
       "workflow": ".github/workflows/release.yml",
-      "event": "push",
-      "head_branch": "v2.1.0"
+      "event": "workflow_dispatch",
+      "head_branch": "main"
     },
     {
       "name": "Validate all exact-SHA G8 receipts",
       "workflow": ".github/workflows/native-g8-closure.yml",
       "event": "workflow_dispatch",
-      "head_branch": "main"
+      "head_branch": "release/fix/security-check-permission-merge-evidence"
     }
   ],
   "required_artifacts": [

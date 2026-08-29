@@ -87,7 +87,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         "repository": "Hyphae-Research-Foundation/hyphae",
         "ecosystem": ecosystem,
         "source": {
-            "tag": "v2.1.0",
+            "tag": "release-v2.2.0-crates",
             "tag_object": TAG_OBJECT,
             "commit": COMMIT,
             "tree": TREE,
@@ -139,7 +139,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "2.1.0",
+            "version": "2.2.0",
             "config": "config/crates-io-release.json",
         },
     }
