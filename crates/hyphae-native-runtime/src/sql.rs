@@ -440,6 +440,8 @@ enum PreparedPlan {
         group_limit: Option<usize>,
         /// Primary-key-prefix contiguous-run fold vs bounded ordered fold.
         streaming_groups: bool,
+        /// Post-fold `HAVING`/`ORDER BY`/trim shaping.
+        group_shape: Option<BoundGroupShape>,
     },
 }
 
@@ -671,8 +673,16 @@ impl PreparedPlan {
                         .ok_or(SqlError::InvalidAggregate)?;
                     schema.push((name.clone(), logical_type.clone()));
                 }
+                // Hidden HAVING/ORDER accumulators fold but never emit:
+                // the schema covers only the visible aggregate prefix.
+                let visible = output_columns
+                    .len()
+                    .checked_sub(group_columns.len())
+                    .ok_or(SqlError::InvalidAggregate)?;
                 schema.extend(aggregate_schema(
-                    aggregates,
+                    aggregates
+                        .get(..visible)
+                        .ok_or(SqlError::InvalidAggregate)?,
                     output_columns
                         .get(group_columns.len()..)
                         .ok_or(SqlError::InvalidAggregate)?,
@@ -702,6 +712,7 @@ fn fold_aggregate_rows(
     group_types: &[LogicalType],
     group_limit: Option<usize>,
     streaming_groups: bool,
+    complete: bool,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     if group_columns.is_empty() {
         let mut state = AggregateState::new(aggregates);
@@ -717,6 +728,7 @@ fn fold_aggregate_rows(
             group_columns,
             group_types,
             group_limit,
+            complete,
         );
     }
     let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
@@ -770,6 +782,7 @@ fn fold_ordered_grouped_rows(
     group_columns: &[usize],
     group_types: &[LogicalType],
     group_limit: Option<usize>,
+    complete: bool,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
     if limit == 0 || limit > MAX_SQL_ORDERED_GROUPS {
@@ -800,6 +813,11 @@ fn fold_ordered_grouped_rows(
             continue;
         }
         if groups.len() == limit {
+            if complete {
+                // A complete fold (HAVING/ORDER BY) past the group ceiling
+                // fails closed rather than shaping a partial group set.
+                return Err(SqlError::InvalidAggregate);
+            }
             // Full: only a key below the current maximum may enter.
             let Some(maximum) = groups.keys().next_back().cloned() else {
                 return Err(SqlError::InvalidAggregate);
@@ -854,6 +872,316 @@ fn aggregate_schema(
             Ok((output.clone(), logical_type))
         })
         .collect()
+}
+
+/// Result type of one aggregate output, shared by schema and shaping.
+fn aggregate_output_type(aggregate: &BoundAggregate) -> Result<LogicalType, SqlError> {
+    Ok(match aggregate.function {
+        AggregateFunction::Count => LogicalType::Unsigned(IntegerWidth::Bits64),
+        AggregateFunction::Avg => LogicalType::Float64,
+        AggregateFunction::Sum => match &aggregate.logical_type {
+            Some(LogicalType::Float32 | LogicalType::Float64) => LogicalType::Float64,
+            Some(LogicalType::Decimal(decimal)) => LogicalType::Decimal(*decimal),
+            Some(LogicalType::Unsigned(_)) => LogicalType::Unsigned(IntegerWidth::Bits64),
+            _ => LogicalType::Signed(IntegerWidth::Bits64),
+        },
+        AggregateFunction::Min | AggregateFunction::Max => aggregate
+            .logical_type
+            .clone()
+            .ok_or(SqlError::InvalidAggregate)?,
+    })
+}
+
+/// Resolves one `HAVING`/grouped-`ORDER BY` operand to a fold-row index,
+/// appending a hidden accumulator when the aggregate is not projected.
+///
+/// Fold rows are `[keys.., projected aggregates.., hidden aggregates..]`.
+fn resolve_group_operand(
+    definition: &RelationDefinition,
+    operand: &GroupOperand,
+    group_by: &[String],
+    aggregate_items: &[AggregateItem],
+    key_aliases: &[Option<String>],
+    bound_aggregates: &mut Vec<BoundAggregate>,
+    hidden_items: &mut Vec<AggregateItem>,
+) -> Result<(usize, LogicalType), SqlError> {
+    let keys = group_by.len();
+    match operand {
+        GroupOperand::Name(name) => {
+            // 1. Group-key column name or its alias.
+            for (position, key) in group_by.iter().enumerate() {
+                let alias = key_aliases.get(position).and_then(|alias| alias.as_ref());
+                if key.eq_ignore_ascii_case(name)
+                    || alias.is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                {
+                    let index = column_index(&definition.columns, key)?;
+                    let logical_type = definition
+                        .columns
+                        .get(index)
+                        .ok_or(SqlError::InvalidCatalogObject)?
+                        .logical_type
+                        .clone();
+                    return Ok((position, logical_type));
+                }
+            }
+            // 2. Projected aggregate alias or output name.
+            for (position, item) in aggregate_items.iter().enumerate() {
+                let output = match (&item.alias, &item.column) {
+                    (Some(alias), _) => alias.clone(),
+                    (None, None) => format!("{}(*)", item.function.keyword()),
+                    (None, Some(column)) => format!("{}({column})", item.function.keyword()),
+                };
+                if output.eq_ignore_ascii_case(name) {
+                    let aggregate = bound_aggregates
+                        .get(position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((keys + position, aggregate_output_type(aggregate)?));
+                }
+            }
+            Err(SqlError::UnknownColumn)
+        }
+        GroupOperand::Aggregate { function, column } => {
+            // Match a projected aggregate by shape first.
+            for (position, item) in aggregate_items.iter().enumerate() {
+                if item.function == *function && item.column == *column {
+                    let aggregate = bound_aggregates
+                        .get(position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((keys + position, aggregate_output_type(aggregate)?));
+                }
+            }
+            // Reuse an already-added hidden accumulator when repeated.
+            for (position, item) in hidden_items.iter().enumerate() {
+                if item.function == *function && item.column == *column {
+                    let aggregate = bound_aggregates
+                        .get(aggregate_items.len() + position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((
+                        keys + aggregate_items.len() + position,
+                        aggregate_output_type(aggregate)?,
+                    ));
+                }
+            }
+            // Bind one hidden accumulator.
+            let item = AggregateItem {
+                function: *function,
+                column: column.clone(),
+                alias: None,
+            };
+            let (bound, _) = bind_aggregates(definition, std::slice::from_ref(&item))?;
+            let aggregate = bound.into_iter().next().ok_or(SqlError::InvalidAggregate)?;
+            let logical_type = aggregate_output_type(&aggregate)?;
+            let index = keys + bound_aggregates.len();
+            bound_aggregates.push(aggregate);
+            hidden_items.push(item);
+            Ok((index, logical_type))
+        }
+    }
+}
+
+/// Binds the grouped `HAVING` tree against resolved fold-row indexes.
+fn bind_having_expression(
+    definition: &RelationDefinition,
+    expression: &HavingExpression,
+    group_by: &[String],
+    aggregate_items: &[AggregateItem],
+    key_aliases: &[Option<String>],
+    bound_aggregates: &mut Vec<BoundAggregate>,
+    hidden_items: &mut Vec<AggregateItem>,
+) -> Result<BoundHavingExpression, SqlError> {
+    match expression {
+        HavingExpression::Comparison {
+            operand,
+            operator,
+            value,
+        } => {
+            let (index, logical_type) = resolve_group_operand(
+                definition,
+                operand,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?;
+            let value = bind_having_literal(value, &logical_type)?;
+            Ok(BoundHavingExpression::Comparison {
+                index,
+                logical_type,
+                operator: *operator,
+                value,
+            })
+        }
+        HavingExpression::And(left, right) => Ok(BoundHavingExpression::And(
+            Box::new(bind_having_expression(
+                definition,
+                left,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+            Box::new(bind_having_expression(
+                definition,
+                right,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+        )),
+        HavingExpression::Or(left, right) => Ok(BoundHavingExpression::Or(
+            Box::new(bind_having_expression(
+                definition,
+                left,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+            Box::new(bind_having_expression(
+                definition,
+                right,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+        )),
+        HavingExpression::Not(inner) => Ok(BoundHavingExpression::Not(Box::new(
+            bind_having_expression(
+                definition,
+                inner,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?,
+        ))),
+    }
+}
+
+/// Coerces one `HAVING` literal to the compared output's logical type.
+fn bind_having_literal(
+    value: &ScalarOperand,
+    logical_type: &LogicalType,
+) -> Result<SqlValue, SqlError> {
+    let value = match value {
+        ScalarOperand::Parameter(_) => return Err(SqlError::InvalidAggregate),
+        ScalarOperand::Null => SqlValue::Null,
+        ScalarOperand::Boolean(boolean) => SqlValue::Boolean(*boolean),
+        ScalarOperand::Integer(text) => match logical_type {
+            LogicalType::Unsigned(_) => {
+                SqlValue::Unsigned(text.parse::<u64>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            LogicalType::Float32 | LogicalType::Float64 => {
+                SqlValue::Float64(hyphae_native_types::CanonicalF64::new(
+                    text.parse::<f64>().map_err(|_| SqlError::TypeMismatch)?,
+                ))
+            }
+            LogicalType::Decimal(_) => {
+                SqlValue::Decimal(text.parse::<i128>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            _ => SqlValue::Signed(text.parse::<i64>().map_err(|_| SqlError::TypeMismatch)?),
+        },
+        ScalarOperand::Text(text) => SqlValue::Text(text.clone()),
+    };
+    Ok(value)
+}
+
+/// Evaluates one bound `HAVING` tree over a complete fold row using
+/// three-valued logic; unknown filters the group out.
+fn evaluate_having(
+    expression: &BoundHavingExpression,
+    row: &[SqlValue],
+) -> Result<TruthValue, SqlError> {
+    match expression {
+        BoundHavingExpression::Comparison {
+            index,
+            logical_type,
+            operator,
+            value,
+        } => {
+            let output = row.get(*index).ok_or(SqlError::InvalidAggregate)?;
+            let Some(ordering) = compare_sql_values(logical_type, output, value)? else {
+                return Ok(TruthValue::Unknown);
+            };
+            let matched = match operator {
+                ComparisonOperator::Equal => ordering == Ordering::Equal,
+                ComparisonOperator::NotEqual => ordering != Ordering::Equal,
+                ComparisonOperator::Less => ordering == Ordering::Less,
+                ComparisonOperator::LessOrEqual => ordering != Ordering::Greater,
+                ComparisonOperator::Greater => ordering == Ordering::Greater,
+                ComparisonOperator::GreaterOrEqual => ordering != Ordering::Less,
+            };
+            Ok(truth(matched))
+        }
+        BoundHavingExpression::And(left, right) => {
+            Ok(evaluate_having(left, row)?.and(evaluate_having(right, row)?))
+        }
+        BoundHavingExpression::Or(left, right) => {
+            Ok(evaluate_having(left, row)?.or(evaluate_having(right, row)?))
+        }
+        BoundHavingExpression::Not(inner) => Ok(evaluate_having(inner, row)?.not()),
+    }
+}
+
+/// Applies `HAVING`, grouped `ORDER BY`, `LIMIT`, and hidden-column
+/// trimming to complete fold rows.
+fn shape_grouped_rows(
+    mut rows: Vec<Vec<SqlValue>>,
+    shape: &BoundGroupShape,
+    limit: usize,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if let Some(having) = &shape.having {
+        let mut filtered = Vec::with_capacity(rows.len());
+        for row in rows {
+            if evaluate_having(having, &row)? == TruthValue::True {
+                filtered.push(row);
+            }
+        }
+        rows = filtered;
+    }
+    if !shape.order.is_empty() {
+        // Precompute ordered encodings per row and term; ties keep the
+        // fold's ascending group-key order (stable sort).
+        let mut keyed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut keys = Vec::with_capacity(shape.order.len());
+            for term in &shape.order {
+                let value = row.get(term.index).ok_or(SqlError::InvalidAggregate)?;
+                let encoded = value
+                    .encode_ordered_component(&term.logical_type)
+                    .map_err(|_| SqlError::InvalidStoredRow)?;
+                keys.push(encoded);
+            }
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|(left, _), (right, _)| {
+            for (term, (left_key, right_key)) in shape.order.iter().zip(left.iter().zip(right)) {
+                let ordering = left_key.cmp(right_key);
+                if ordering != Ordering::Equal {
+                    return if term.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            Ordering::Equal
+        });
+        rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    rows.truncate(limit);
+    for row in &mut rows {
+        row.truncate(shape.visible_width);
+    }
+    Ok(rows)
 }
 
 fn projected_schema(
@@ -957,12 +1285,16 @@ enum Statement {
         projection: Projection,
         filter: Option<FilterExpression>,
         parameter_count: usize,
-        /// `GROUP BY` columns; admitted only as a left prefix of the
-        /// primary key with an aggregate projection.
+        /// `GROUP BY` columns: a primary-key left prefix (streaming) or
+        /// arbitrary admitted columns (bounded ordered fold).
         group_by: Vec<String>,
         order_by: Vec<String>,
         /// `ORDER BY ... DESC` over the complete primary key.
         descending: bool,
+        /// Grouped `HAVING` predicate (grouped selects only).
+        having: Option<HavingExpression>,
+        /// Grouped `ORDER BY` terms (grouped selects only).
+        group_order: Vec<GroupOrderTerm>,
         limit: Option<usize>,
     },
     ExplainSelect {
@@ -973,6 +1305,8 @@ enum Statement {
         group_by: Vec<String>,
         order_by: Vec<String>,
         descending: bool,
+        having: Option<HavingExpression>,
+        group_order: Vec<GroupOrderTerm>,
         limit: Option<usize>,
     },
     SelectJoin(ParsedInnerJoin),
@@ -1130,6 +1464,40 @@ struct NamedColumn {
     name: String,
     /// Optional `AS <identifier>` output alias.
     alias: Option<String>,
+}
+
+/// One `HAVING`/grouped-`ORDER BY` operand: a group-key column, a
+/// projected alias, or an aggregate call (projected or hidden).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupOperand {
+    /// Bare identifier: group-key column name, projected alias, or an
+    /// aggregate output name (resolved at bind time in that order).
+    Name(String),
+    /// Explicit aggregate call, e.g. `COUNT(*)` or `SUM(amount)`.
+    Aggregate {
+        function: AggregateFunction,
+        column: Option<String>,
+    },
+}
+
+/// Bounded `HAVING` predicate tree over group outputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HavingExpression {
+    Comparison {
+        operand: GroupOperand,
+        operator: ComparisonOperator,
+        value: ScalarOperand,
+    },
+    And(Box<HavingExpression>, Box<HavingExpression>),
+    Or(Box<HavingExpression>, Box<HavingExpression>),
+    Not(Box<HavingExpression>),
+}
+
+/// One grouped `ORDER BY` term with its own direction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupOrderTerm {
+    operand: GroupOperand,
+    descending: bool,
 }
 
 /// Total aggregate functions admitted by the bounded V1 slice.
@@ -1354,6 +1722,50 @@ struct BoundSelect {
     /// True when group keys are a primary-key left prefix (contiguous
     /// runs); false takes the bounded ordered-grouped fold.
     streaming_groups: bool,
+    /// Post-fold group shaping (`HAVING`, grouped `ORDER BY`, hidden
+    /// accumulator trimming); `None` for plain grouped selects.
+    group_shape: Option<BoundGroupShape>,
+}
+
+/// Bound post-fold shaping of grouped output rows.
+///
+/// Group rows fold as `[keys.., visible aggregates.., hidden aggregates..]`;
+/// `visible_width` is the emitted prefix after `HAVING` filtering and
+/// `ORDER BY` sorting run over the complete row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundGroupShape {
+    /// Emitted columns: group keys plus projected aggregates.
+    visible_width: usize,
+    /// Bound `HAVING` predicate over the complete fold row.
+    having: Option<BoundHavingExpression>,
+    /// Bound grouped `ORDER BY` terms over the complete fold row.
+    order: Vec<BoundGroupOrderTerm>,
+}
+
+/// One bound `HAVING` comparison tree node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoundHavingExpression {
+    Comparison {
+        /// Fold-row index of the compared output.
+        index: usize,
+        /// Ordered-encoding type of that output.
+        logical_type: LogicalType,
+        operator: ComparisonOperator,
+        value: SqlValue,
+    },
+    And(Box<BoundHavingExpression>, Box<BoundHavingExpression>),
+    Or(Box<BoundHavingExpression>, Box<BoundHavingExpression>),
+    Not(Box<BoundHavingExpression>),
+}
+
+/// One bound grouped `ORDER BY` term.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundGroupOrderTerm {
+    /// Fold-row index of the sorted output.
+    index: usize,
+    /// Ordered-encoding type of that output.
+    logical_type: LogicalType,
+    descending: bool,
 }
 
 /// One catalog-bound total aggregate.
@@ -1375,6 +1787,8 @@ struct SelectQuery<'query> {
     group_by: &'query [String],
     order_by: &'query [String],
     descending: bool,
+    having: Option<&'query HavingExpression>,
+    group_order: &'query [GroupOrderTerm],
     limit: Option<usize>,
 }
 
@@ -1468,6 +1882,8 @@ fn prepare_parsed_catalog(
             group_by,
             order_by,
             descending,
+            having,
+            group_order,
             limit,
         } => prepare_select_plan(
             catalog,
@@ -1479,6 +1895,8 @@ fn prepare_parsed_catalog(
                 group_by: &group_by,
                 order_by: &order_by,
                 descending,
+                having: having.as_ref(),
+                group_order: &group_order,
                 limit,
             },
             ordered_secondary_indexes,
@@ -1601,6 +2019,7 @@ fn prepare_select_plan(
     let group_columns = std::mem::take(&mut bound.group_columns);
     let group_types = std::mem::take(&mut bound.group_types);
     let streaming_groups = bound.streaming_groups;
+    let group_shape = bound.group_shape.take();
     let group_limit = (!group_columns.is_empty()).then_some(query.limit).flatten();
     let aggregate_columns = aggregates
         .is_some()
@@ -1749,6 +2168,7 @@ fn prepare_select_plan(
             group_types,
             group_limit,
             streaming_groups,
+            group_shape,
         },
         _ => inner,
     })
@@ -1911,6 +2331,8 @@ pub(crate) fn execute_transaction(
             group_by,
             order_by,
             descending,
+            having,
+            group_order,
             limit,
         } => execute_select(
             transaction,
@@ -1922,6 +2344,8 @@ pub(crate) fn execute_transaction(
                 group_by: &group_by,
                 order_by: &order_by,
                 descending,
+                having: having.as_ref(),
+                group_order: &group_order,
                 limit,
             },
             parameters,
@@ -1935,6 +2359,8 @@ pub(crate) fn execute_transaction(
             group_by,
             order_by,
             descending,
+            having,
+            group_order,
             limit,
         } => execute_explain(
             transaction,
@@ -1946,6 +2372,8 @@ pub(crate) fn execute_transaction(
                 group_by: &group_by,
                 order_by: &order_by,
                 descending,
+                having: having.as_ref(),
+                group_order: &group_order,
                 limit,
             },
             parameters,
@@ -2134,12 +2562,14 @@ fn execute_window_select(
         group_by,
         order_by,
         descending,
+        having,
+        group_order,
         limit,
     } = parse(&query)?
     else {
         return Err(SqlError::InvalidSyntax);
     };
-    if descending || !group_by.is_empty() {
+    if descending || !group_by.is_empty() || having.is_some() || !group_order.is_empty() {
         return Err(SqlError::InvalidSyntax);
     }
     let SqlResult::Rows { columns: _, rows } = execute_select(
@@ -2152,6 +2582,8 @@ fn execute_window_select(
             group_by: &[],
             order_by: &order_by,
             descending: false,
+            having: None,
+            group_order: &[],
             limit,
         },
         &[],
@@ -2211,6 +2643,8 @@ fn execute_cte_select(
         group_by,
         order_by,
         descending,
+        having,
+        group_order,
         limit,
     } = cte.outer.as_ref()
     else {
@@ -2222,6 +2656,8 @@ fn execute_cte_select(
         || !order_by.is_empty()
         || !group_by.is_empty()
         || *descending
+        || having.is_some()
+        || !group_order.is_empty()
     {
         return Err(SqlError::InvalidSyntax);
     }
@@ -2289,6 +2725,8 @@ fn execute_parsed_transaction(
             group_by,
             order_by,
             descending,
+            having,
+            group_order,
             limit,
         } => execute_select(
             transaction,
@@ -2300,6 +2738,8 @@ fn execute_parsed_transaction(
                 group_by,
                 order_by,
                 descending: *descending,
+                having: having.as_ref(),
+                group_order,
                 limit: *limit,
             },
             parameters,
@@ -2608,24 +3048,60 @@ fn execute_bound_snapshot(
             group_types,
             group_limit,
             streaming_groups,
+            group_shape,
         } => {
             let SqlResult::Rows { rows, .. } = execute_bound_snapshot(snapshot, input, parameters)?
             else {
                 return Err(SqlError::InvalidAggregate);
             };
-            Ok(SqlResult::Rows {
-                columns: output_columns.clone(),
-                rows: fold_aggregate_rows(
-                    &rows,
-                    aggregates,
-                    group_columns,
-                    group_types,
-                    *group_limit,
-                    *streaming_groups,
-                )?,
-            })
+            execute_aggregate_plan(
+                &rows,
+                aggregates,
+                output_columns,
+                group_columns,
+                group_types,
+                *group_limit,
+                *streaming_groups,
+                group_shape.as_ref(),
+            )
         }
     }
+}
+
+/// Executes one `PreparedPlan::Aggregate`: fold, then optional shaping.
+#[allow(clippy::too_many_arguments)]
+fn execute_aggregate_plan(
+    rows: &[Vec<SqlValue>],
+    aggregates: &[BoundAggregate],
+    output_columns: &[String],
+    group_columns: &[usize],
+    group_types: &[LogicalType],
+    group_limit: Option<usize>,
+    streaming_groups: bool,
+    group_shape: Option<&BoundGroupShape>,
+) -> Result<SqlResult, SqlError> {
+    let fold_limit = if group_shape.is_some() {
+        Some(MAX_SQL_ORDERED_GROUPS)
+    } else {
+        group_limit
+    };
+    let mut grouped = fold_aggregate_rows(
+        rows,
+        aggregates,
+        group_columns,
+        group_types,
+        fold_limit,
+        streaming_groups && group_shape.is_none(),
+        group_shape.is_some(),
+    )?;
+    if let Some(shape) = group_shape {
+        let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
+        grouped = shape_grouped_rows(grouped, shape, limit)?;
+    }
+    Ok(SqlResult::Rows {
+        columns: output_columns.to_vec(),
+        rows: grouped,
+    })
 }
 
 fn execute_bound_latest(
@@ -2714,6 +3190,7 @@ fn execute_bound_latest(
             group_types,
             group_limit,
             streaming_groups,
+            group_shape,
         } => {
             let SqlResult::Rows { rows, .. } = execute_bound_latest(
                 database, snapshot, input, parameters, permit, checkpoint, profile,
@@ -2722,17 +3199,16 @@ fn execute_bound_latest(
                 return Err(SqlError::InvalidAggregate);
             };
             execution_checkpoint(checkpoint)?;
-            Ok(SqlResult::Rows {
-                columns: output_columns.clone(),
-                rows: fold_aggregate_rows(
-                    &rows,
-                    aggregates,
-                    group_columns,
-                    group_types,
-                    *group_limit,
-                    *streaming_groups,
-                )?,
-            })
+            execute_aggregate_plan(
+                &rows,
+                aggregates,
+                output_columns,
+                group_columns,
+                group_types,
+                *group_limit,
+                *streaming_groups,
+                group_shape.as_ref(),
+            )
         }
     }
 }
@@ -5849,6 +6325,7 @@ fn execute_select(
         group_columns,
         group_types,
         streaming_groups,
+        group_shape,
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -5903,16 +6380,29 @@ fn execute_select(
         )?,
     };
     if let Some(aggregates) = aggregates {
+        let fold_limit = if group_shape.is_some() {
+            // Complete fold before HAVING/ORDER: the ordered-group ceiling
+            // is the work bound; LIMIT applies after shaping.
+            Some(MAX_SQL_ORDERED_GROUPS)
+        } else {
+            query.limit
+        };
+        let mut grouped = fold_aggregate_rows(
+            &rows,
+            &aggregates,
+            &group_columns,
+            &group_types,
+            fold_limit,
+            streaming_groups && group_shape.is_none(),
+            group_shape.is_some(),
+        )?;
+        if let Some(shape) = &group_shape {
+            let limit = query.limit.ok_or(SqlError::InvalidAggregate)?;
+            grouped = shape_grouped_rows(grouped, shape, limit)?;
+        }
         return Ok(SqlResult::Rows {
             columns: output_columns,
-            rows: fold_aggregate_rows(
-                &rows,
-                &aggregates,
-                &group_columns,
-                &group_types,
-                query.limit,
-                streaming_groups,
-            )?,
+            rows: grouped,
         });
     }
     Ok(SqlResult::Rows {
@@ -6356,6 +6846,76 @@ fn bind_select_projection(
     Ok((bound, None, columns))
 }
 
+/// Binds the grouped `HAVING`/`ORDER BY` shape when present, appending
+/// hidden accumulators for aggregates that are not projected.
+fn bind_group_shape(
+    definition: &RelationDefinition,
+    query: &SelectQuery<'_>,
+    group_columns: &[usize],
+    aggregates: Option<&mut Vec<BoundAggregate>>,
+) -> Result<Option<BoundGroupShape>, SqlError> {
+    if query.having.is_none() && query.group_order.is_empty() {
+        return Ok(None);
+    }
+    if group_columns.is_empty() {
+        return Err(SqlError::InvalidAggregate);
+    }
+    let bound_aggregates = aggregates.ok_or(SqlError::InvalidAggregate)?;
+    let (aggregate_items, key_aliases): (&[AggregateItem], Vec<Option<String>>) =
+        match query.projection {
+            Projection::Aggregates(items) => (items, vec![None; group_columns.len()]),
+            Projection::Named {
+                columns,
+                aggregates,
+            } => (
+                aggregates,
+                columns.iter().map(|column| column.alias.clone()).collect(),
+            ),
+            _ => return Err(SqlError::InvalidAggregate),
+        };
+    let visible_width = group_columns.len() + aggregate_items.len();
+    let mut hidden_items = Vec::new();
+    let having = query
+        .having
+        .map(|expression| {
+            bind_having_expression(
+                definition,
+                expression,
+                query.group_by,
+                aggregate_items,
+                &key_aliases,
+                bound_aggregates,
+                &mut hidden_items,
+            )
+        })
+        .transpose()?;
+    let order = query
+        .group_order
+        .iter()
+        .map(|term| {
+            let (index, logical_type) = resolve_group_operand(
+                definition,
+                &term.operand,
+                query.group_by,
+                aggregate_items,
+                &key_aliases,
+                bound_aggregates,
+                &mut hidden_items,
+            )?;
+            Ok(BoundGroupOrderTerm {
+                index,
+                logical_type,
+                descending: term.descending,
+            })
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    Ok(Some(BoundGroupShape {
+        visible_width,
+        having,
+        order,
+    }))
+}
+
 fn bind_select(
     catalog: &crate::model::CatalogState,
     query: SelectQuery<'_>,
@@ -6391,8 +6951,9 @@ fn bind_select(
                 .ok_or(SqlError::InvalidCatalogObject)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (projection, aggregates, output_columns) =
+    let (projection, mut aggregates, output_columns) =
         bind_select_projection(definition, query.projection, &group_columns)?;
+    let group_shape = bind_group_shape(definition, &query, &group_columns, aggregates.as_mut())?;
     let filter = query
         .filter
         .map(|expression| bind_filter_expression(definition, expression))
@@ -6429,6 +6990,7 @@ fn bind_select(
         group_columns,
         group_types,
         streaming_groups,
+        group_shape,
     })
 }
 
@@ -6962,6 +7524,8 @@ fn bind_indexed_inner_join(
             group_by: &[],
             order_by: &parsed.order_by,
             descending: false,
+            having: None,
+            group_order: &[],
             limit: parsed.limit,
         },
         ordered_secondary_indexes,
@@ -9814,6 +10378,8 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
                 group_by,
                 order_by,
                 descending,
+                having,
+                group_order,
                 limit,
             } => Statement::ExplainSelect {
                 name,
@@ -9823,6 +10389,8 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
                 group_by,
                 order_by,
                 descending,
+                having,
+                group_order,
                 limit,
             },
             Statement::SelectJoin(join) => Statement::ExplainSelectJoin(join),
@@ -10157,6 +10725,38 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     }))
 }
 
+/// Parses the optional `ORDER BY` tail: plain-column list with one
+/// trailing direction (ungrouped), or per-term directed group operands.
+fn parse_select_order(
+    parser: &mut Parser,
+    ungrouped: bool,
+) -> Result<(Vec<String>, bool, Vec<GroupOrderTerm>), SqlError> {
+    if !parser.consume_keyword("ORDER") {
+        return Ok((Vec::new(), false, Vec::new()));
+    }
+    parser.expect_keyword("BY")?;
+    if ungrouped {
+        let mut columns = vec![parser.identifier()?];
+        while parser.consume_symbol(',') {
+            columns.push(parser.identifier()?);
+        }
+        let descending = if parser.consume_keyword("DESC") {
+            true
+        } else {
+            parser.consume_keyword("ASC");
+            false
+        };
+        return Ok((columns, descending, Vec::new()));
+    }
+    // Grouped ORDER BY: each term is a group output or aggregate call
+    // with its own direction.
+    let mut terms = vec![parser.group_order_term()?];
+    while parser.consume_symbol(',') {
+        terms.push(parser.group_order_term()?);
+    }
+    Ok((Vec::new(), false, terms))
+}
+
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     if parser.looks_like_window_select() {
         return parse_window_select(parser);
@@ -10192,22 +10792,15 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         Vec::new()
     };
-    let (order_by, descending) = if parser.consume_keyword("ORDER") {
-        parser.expect_keyword("BY")?;
-        let mut columns = vec![parser.identifier()?];
-        while parser.consume_symbol(',') {
-            columns.push(parser.identifier()?);
+    let having = if parser.consume_keyword("HAVING") {
+        if group_by.is_empty() {
+            return Err(SqlError::InvalidAggregate);
         }
-        let descending = if parser.consume_keyword("DESC") {
-            true
-        } else {
-            parser.consume_keyword("ASC");
-            false
-        };
-        (columns, descending)
+        Some(parse_having_expression(parser)?)
     } else {
-        (Vec::new(), false)
+        None
     };
+    let (order_by, descending, group_order) = parse_select_order(parser, group_by.is_empty())?;
     let limit = if parser.consume_keyword("LIMIT") {
         Some(parser.number_usize()?)
     } else {
@@ -10218,8 +10811,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     if !group_by.is_empty() {
         // Grouped selects require an aggregate projection — implicit-key
         // (aggregates only) or PostgreSQL-style with the key columns named
-        // ahead of the aggregates. ORDER BY stays fail-closed; LIMIT
-        // (mandatory) bounds emitted groups.
+        // ahead of the aggregates. LIMIT (mandatory) bounds emitted rows.
         if !has_aggregates || !order_by.is_empty() || descending || limit.is_none() {
             return Err(SqlError::InvalidAggregate);
         }
@@ -10236,14 +10828,14 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
             }
         }
     } else if has_aggregates {
-        // Total aggregates emit exactly one bounded row; ORDER BY/LIMIT have
-        // no admitted meaning and the scan-candidate budget is the work
-        // bound. Plain columns mixed into an ungrouped aggregate stay
-        // fail-closed.
+        // Total aggregates emit exactly one bounded row; ORDER BY/LIMIT/
+        // HAVING have no admitted meaning and the scan-candidate budget is
+        // the work bound. Plain columns mixed into an ungrouped aggregate
+        // stay fail-closed.
         if matches!(&projection, Projection::Named { columns, .. } if !columns.is_empty()) {
             return Err(SqlError::InvalidAggregate);
         }
-        if !order_by.is_empty() || limit.is_some() {
+        if !order_by.is_empty() || limit.is_some() || having.is_some() {
             return Err(SqlError::InvalidAggregate);
         }
     } else {
@@ -10266,6 +10858,8 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         group_by,
         order_by,
         descending,
+        having,
+        group_order,
         limit,
     })
 }
@@ -10328,6 +10922,53 @@ fn parse_inner_join(
         order_by,
         limit,
     }))
+}
+
+/// Parses one bounded `HAVING` predicate: `AND`/`OR`/`NOT` over
+/// comparisons of a group operand against a literal.
+fn parse_having_expression(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    let mut expression = parse_having_term(parser)?;
+    while parser.consume_keyword("OR") {
+        expression =
+            HavingExpression::Or(Box::new(expression), Box::new(parse_having_term(parser)?));
+    }
+    Ok(expression)
+}
+
+fn parse_having_term(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    let mut expression = parse_having_factor(parser)?;
+    while parser.consume_keyword("AND") {
+        expression =
+            HavingExpression::And(Box::new(expression), Box::new(parse_having_factor(parser)?));
+    }
+    Ok(expression)
+}
+
+fn parse_having_factor(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    if parser.consume_keyword("NOT") {
+        return Ok(HavingExpression::Not(Box::new(parse_having_factor(
+            parser,
+        )?)));
+    }
+    if parser.consume_symbol('(') {
+        let expression = parse_having_expression(parser)?;
+        parser.expect_symbol(')')?;
+        return Ok(expression);
+    }
+    let operand = parser.group_operand()?;
+    let operator = parser.comparison_operator()?;
+    // HAVING literals only: parameters inside HAVING stay fail-closed so
+    // prepared-plan parameter binding remains purely filter-owned.
+    let mut no_parameters = 0_usize;
+    let value = parser.scalar_operand(&mut no_parameters)?;
+    if no_parameters != 0 || matches!(value, ScalarOperand::Parameter(_)) {
+        return Err(SqlError::InvalidAggregate);
+    }
+    Ok(HavingExpression::Comparison {
+        operand,
+        operator,
+        value,
+    })
 }
 
 fn parse_filter_expression(
@@ -10787,6 +11428,37 @@ impl Parser {
             return Ok(None);
         }
         self.identifier().map(Some)
+    }
+
+    /// Parses one `HAVING`/grouped-`ORDER BY` operand: an aggregate call
+    /// or a bare identifier (group key, alias, or aggregate output name).
+    fn group_operand(&mut self) -> Result<GroupOperand, SqlError> {
+        if self.at_aggregate_item() {
+            let item = self.aggregate_item()?;
+            if item.alias.is_some() {
+                return Err(SqlError::InvalidAggregate);
+            }
+            return Ok(GroupOperand::Aggregate {
+                function: item.function,
+                column: item.column,
+            });
+        }
+        self.identifier().map(GroupOperand::Name)
+    }
+
+    /// Parses one grouped `ORDER BY` term with its own direction.
+    fn group_order_term(&mut self) -> Result<GroupOrderTerm, SqlError> {
+        let operand = self.group_operand()?;
+        let descending = if self.consume_keyword("DESC") {
+            true
+        } else {
+            self.consume_keyword("ASC");
+            false
+        };
+        Ok(GroupOrderTerm {
+            operand,
+            descending,
+        })
     }
 
     /// Returns whether the next projection item is `<aggregate> (`.

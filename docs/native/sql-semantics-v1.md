@@ -222,8 +222,40 @@ group keys form one group, ordered before every non-null key. The underlying
 walk still charges the scan-candidate ceiling in both paths.
 
 In both grouped paths the key values are emitted ahead of the accumulator
-outputs, and `LIMIT` is mandatory. `HAVING`, index-ordered grouped walks,
-`ORDER BY`, and `DESC` on the grouped form remain fail-closed non-claims.
+outputs, and `LIMIT` is mandatory.
+
+The grouped form additionally admits `HAVING` and `ORDER BY`:
+
+```text
+SELECT <keys and aggregates, with optional AS aliases>
+FROM <table>
+[WHERE <admitted-filter>]
+GROUP BY <admitted-group-keys>
+[HAVING <group-predicate>]
+[ORDER BY <output-or-aggregate> [ASC|DESC] [, ...]]
+LIMIT <positive-integer>
+```
+
+- The `HAVING` predicate is a bounded `AND`/`OR`/`NOT` tree of
+  comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) whose left side names a
+  group-key column, a projected alias, or an aggregate call (which need
+  not be projected), and whose right side is a literal. Parameters inside
+  `HAVING` remain fail-closed. A comparison involving SQL null is unknown
+  and the group is filtered out.
+- `ORDER BY` terms name a group-key column, a projected alias, an
+  aggregate output name, or an aggregate call (which need not be
+  projected); each term carries its own `ASC`/`DESC`. Ordering compares
+  canonical ordered encodings, so SQL null orders first ascending and
+  last descending, and ties preserve ascending group-key order.
+- Aggregates referenced only by `HAVING`/`ORDER BY` fold as hidden
+  accumulators and never appear in the result columns.
+- With `HAVING` or `ORDER BY` present the fold is complete before
+  filtering and ordering: every distinct group folds first, the group
+  ceiling (65,536) applies to both grouped paths as a fail-closed work
+  bound (`HYSQL021` past it), and `LIMIT` bounds the rows emitted after
+  filter and sort.
+
+Index-ordered grouped walks remain a fail-closed non-claim.
 
 The grouped projection may name the group-key columns explicitly ahead of
 the aggregates in PostgreSQL style — `SELECT kind, COUNT(*) FROM t GROUP BY

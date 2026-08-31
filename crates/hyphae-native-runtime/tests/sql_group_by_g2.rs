@@ -324,3 +324,128 @@ fn plain_column_aliases_rename_outputs_only() -> Result<(), TestError> {
     transaction.rollback();
     Ok(())
 }
+
+#[test]
+fn having_and_grouped_order_shape_the_canonical_analytics_query() -> Result<(), TestError> {
+    const CANONICAL: &str = "SELECT tenant, COUNT(*) AS n FROM ledger GROUP BY tenant \
+         HAVING COUNT(*) > 1 ORDER BY n DESC, tenant ASC LIMIT 10";
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let expected = vec![
+        vec![SqlValue::Text("acme".to_owned()), SqlValue::Unsigned(3)],
+        vec![SqlValue::Text("globex".to_owned()), SqlValue::Unsigned(2)],
+    ];
+
+    // Transactional.
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+    let SqlResult::Rows { columns, rows } = transaction.execute_sql(CANONICAL, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["tenant", "n"]);
+    assert_eq!(rows, expected);
+    transaction.rollback();
+
+    // Prepared snapshot.
+    let snapshot = database.snapshot(0)?;
+    let prepared = snapshot.prepare_sql(CANONICAL)?;
+    let SqlResult::Rows { rows, .. } = snapshot.execute_prepared(&prepared, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(rows, expected);
+
+    // Prepared latest.
+    let latest = database.prepare_sql_latest(CANONICAL)?;
+    let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(&latest, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(rows, expected);
+    Ok(())
+}
+
+#[test]
+fn having_hidden_aggregates_and_alias_operands_fold_without_emitting() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+
+    // HAVING references SUM(amount), which is not projected: it folds as a
+    // hidden accumulator and never appears in the result columns.
+    let SqlResult::Rows { columns, rows } = transaction.execute_sql(
+        "SELECT tenant, COUNT(*) AS n FROM ledger GROUP BY tenant \
+         HAVING SUM(amount) >= 40 ORDER BY tenant ASC LIMIT 10",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["tenant", "n"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Text("acme".to_owned()), SqlValue::Unsigned(3)],
+            vec![SqlValue::Text("initech".to_owned()), SqlValue::Unsigned(1)],
+        ]
+    );
+
+    // HAVING over a projected alias; NULL comparisons filter out (amount
+    // NULL exists in acme but SUM skips nulls — MAX(amount) of the NULL-
+    // only group would be NULL and filtered).
+    let SqlResult::Rows { rows, .. } = transaction.execute_sql(
+        "SELECT tenant, MAX(amount) AS peak FROM ledger GROUP BY tenant \
+         HAVING peak > 20 ORDER BY peak DESC LIMIT 10",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Text("initech".to_owned()), SqlValue::Signed(100)],
+            vec![SqlValue::Text("acme".to_owned()), SqlValue::Signed(30)],
+        ]
+    );
+    transaction.rollback();
+    Ok(())
+}
+
+#[test]
+fn having_shapes_outside_the_slice_fail_closed() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+
+    // Parameters inside HAVING.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT COUNT(*) FROM ledger GROUP BY tenant HAVING COUNT(*) > ? LIMIT 5",
+            &[SqlValue::Unsigned(1)],
+        ),
+        Err(SqlError::InvalidAggregate)
+    ));
+    // HAVING without GROUP BY.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT tenant FROM ledger HAVING tenant = 'acme' LIMIT 5",
+            &[]
+        ),
+        Err(SqlError::InvalidAggregate)
+    ));
+    // Unknown operand names.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT COUNT(*) FROM ledger GROUP BY tenant HAVING bogus > 1 LIMIT 5",
+            &[],
+        ),
+        Err(SqlError::UnknownColumn)
+    ));
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT COUNT(*) FROM ledger GROUP BY tenant ORDER BY amount LIMIT 5",
+            &[],
+        ),
+        Err(SqlError::UnknownColumn)
+    ));
+    transaction.rollback();
+    Ok(())
+}
