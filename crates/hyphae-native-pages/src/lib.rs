@@ -302,15 +302,25 @@ impl Page {
 }
 
 fn page_checksum(encoded: &[u8]) -> u32 {
-    let mut canonical = encoded.to_vec();
-    canonical[CHECKSUM_START..DIGEST_END].fill(0);
-    crc32c::crc32c(&canonical)
+    // Streaming CRC over the canonical form (checksum and digest fields
+    // zeroed) without materializing a 16 KiB copy. Identical to hashing a
+    // zero-filled copy because CRC32C is a pure function of the byte stream.
+    const ZEROED: [u8; DIGEST_END - CHECKSUM_START] = [0; DIGEST_END - CHECKSUM_START];
+    let checksum = crc32c::crc32c(&encoded[..CHECKSUM_START]);
+    let checksum = crc32c::crc32c_append(checksum, &ZEROED);
+    crc32c::crc32c_append(checksum, &encoded[DIGEST_END..])
 }
 
 fn page_digest(encoded: &[u8]) -> [u8; 32] {
-    let mut canonical = encoded.to_vec();
-    canonical[DIGEST_START..DIGEST_END].fill(0);
-    *blake3::hash(&canonical).as_bytes()
+    // Incremental BLAKE3 over the canonical form (digest field zeroed)
+    // without materializing a 16 KiB copy. `Hasher::update` chains produce
+    // the same digest as hashing the concatenated bytes.
+    const ZEROED: [u8; DIGEST_END - DIGEST_START] = [0; DIGEST_END - DIGEST_START];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&encoded[..DIGEST_START]);
+    hasher.update(&ZEROED);
+    hasher.update(&encoded[DIGEST_END..]);
+    *hasher.finalize().as_bytes()
 }
 
 fn read_u16(bytes: &[u8]) -> u16 {

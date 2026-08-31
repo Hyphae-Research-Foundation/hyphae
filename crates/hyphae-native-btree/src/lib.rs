@@ -429,6 +429,94 @@ impl BTree {
             .collect())
     }
 
+    /// Plans bounded leaf segments through the buffer pool.
+    ///
+    /// Behaves exactly like [`Self::plan_range_segments`] but reuses verified
+    /// cached frames instead of rereading and re-verifying every traversed
+    /// page from the page file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt reached pages, buffer-pool failures,
+    /// cycles, or excessive tree height.
+    pub fn plan_range_segments_cached(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Vec<BTreeSegment>, BTreeError> {
+        let Some(root) = self.root else {
+            return Ok(Vec::new());
+        };
+        if range_is_empty(lower, upper) {
+            return Ok(Vec::new());
+        }
+        let mut segments = Vec::new();
+        let mut visited = BTreeSet::new();
+        plan_range_segments_node_cached(
+            store,
+            pool,
+            root,
+            root,
+            lower,
+            upper,
+            0,
+            &mut visited,
+            &mut segments,
+        )?;
+        Ok(segments)
+    }
+
+    /// Executes one previously planned leaf segment through the buffer pool.
+    ///
+    /// Behaves exactly like [`Self::scan_planned_segment`] but reuses the
+    /// verified cached frame instead of rereading and re-verifying the page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a segment from another root and any changed, missing, corrupt,
+    /// or non-leaf page.
+    pub fn scan_planned_segment_cached(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        segment: &BTreeSegment,
+    ) -> Result<Vec<KeyValue>, BTreeError> {
+        if self.root != Some(segment.root) {
+            return Err(BTreeError::ForeignSegment);
+        }
+        let frame = pool.get_or_load(store, segment.page)?;
+        let Node::Leaf(entries) = decode_page(frame.page())? else {
+            return Err(BTreeError::WrongPageKind);
+        };
+        let minimum = entries
+            .first()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        let maximum = entries
+            .last()
+            .ok_or(BTreeError::InvalidCount)?
+            .key
+            .as_slice();
+        if minimum != segment.minimum
+            || maximum != segment.maximum
+            || entries.len() != segment.entry_count
+        {
+            return Err(BTreeError::InvalidSeparator);
+        }
+        let lower = borrowed_bound(&segment.lower);
+        let upper = borrowed_bound(&segment.upper);
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                key_satisfies_lower(&entry.key, lower) && key_satisfies_upper(&entry.key, upper)
+            })
+            .map(|entry| (entry.key, entry.value))
+            .collect())
+    }
+
     /// Verifies the complete tree and returns its node height.
     ///
     /// An empty tree has height zero and a single leaf has height one.
@@ -1261,9 +1349,13 @@ fn lookup_leaf(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeError> 
     if count == 0 || count > (payload.len() - LEAF_HEADER_SIZE) / 8 {
         return Err(BTreeError::InvalidCount);
     }
+    // Entries are canonically ascending: canonical order is enforced by every
+    // writer, the page bytes are CRC32C+BLAKE3-verified at load, and complete
+    // node validation remains available through tree verification. The point
+    // lookup therefore stops as soon as the ascending walk passes the target,
+    // still validating order for every entry it actually visits.
     let mut cursor = Cursor::new(&payload[LEAF_HEADER_SIZE..]);
     let mut previous_key = None;
-    let mut found = None;
     for _ in 0..count {
         let key_length = cursor.length()?;
         let value_length = cursor.length()?;
@@ -1274,16 +1366,20 @@ fn lookup_leaf(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeError> 
         if previous_key.is_some_and(|previous| previous >= key) {
             return Err(BTreeError::NoncanonicalKeyOrder);
         }
+        if key > target {
+            return Ok(LookupStep::Value(None));
+        }
         let value_start = cursor.position();
         cursor.take(value_length)?;
         if key == target {
-            found =
-                Some(LEAF_HEADER_SIZE + value_start..LEAF_HEADER_SIZE + value_start + value_length);
+            return Ok(LookupStep::Value(Some(
+                LEAF_HEADER_SIZE + value_start..LEAF_HEADER_SIZE + value_start + value_length,
+            )));
         }
         previous_key = Some(key);
     }
     cursor.finish()?;
-    Ok(LookupStep::Value(found))
+    Ok(LookupStep::Value(None))
 }
 
 fn lookup_internal(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeError> {
@@ -1304,6 +1400,9 @@ fn lookup_internal(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeErr
     let mut selected = first_child;
     let mut previous_key = None;
     let mut cursor = Cursor::new(&payload[INTERNAL_HEADER_SIZE..]);
+    // Separators are canonically ascending (writer-enforced, page verified at
+    // load), so the walk stops at the first separator beyond the target: no
+    // later separator can satisfy `target >= key`.
     for _ in 0..count {
         let key_length = cursor.length()?;
         if key_length > BTREE_MAX_KEY_SIZE {
@@ -1313,10 +1412,11 @@ fn lookup_internal(payload: &[u8], target: &[u8]) -> Result<LookupStep, BTreeErr
         if previous_key.is_some_and(|previous| previous >= key) {
             return Err(BTreeError::NoncanonicalKeyOrder);
         }
-        let child = PageId::new(cursor.u64()?).map_err(|_| BTreeError::ZeroChild)?;
-        if target >= key {
-            selected = child;
+        if target < key {
+            return Ok(LookupStep::Descend(selected));
         }
+        let child = PageId::new(cursor.u64()?).map_err(|_| BTreeError::ZeroChild)?;
+        selected = child;
         previous_key = Some(key);
     }
     cursor.finish()?;
@@ -2499,6 +2599,64 @@ fn plan_range_segments_node(
                 if child_intersects_bounds(child_lower, child_upper, lower, upper) {
                     plan_range_segments_node(
                         store,
+                        root,
+                        child,
+                        lower,
+                        upper,
+                        depth + 1,
+                        visited,
+                        output,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_range_segments_node_cached(
+    store: &PageStore,
+    pool: &BufferPool,
+    root: PageId,
+    page_id: PageId,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+    depth: usize,
+    visited: &mut BTreeSet<PageId>,
+    output: &mut Vec<BTreeSegment>,
+) -> Result<(), BTreeError> {
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    if !visited.insert(page_id) {
+        return Err(BTreeError::Cycle);
+    }
+    let frame = pool.get_or_load(store, page_id)?;
+    match decode_page(frame.page())? {
+        Node::Leaf(entries) => {
+            let minimum = entries.first().ok_or(BTreeError::InvalidCount)?.key.clone();
+            let maximum = entries.last().ok_or(BTreeError::InvalidCount)?.key.clone();
+            if segment_intersects_bounds(&minimum, &maximum, lower, upper) {
+                output.push(BTreeSegment {
+                    root,
+                    page: page_id,
+                    minimum,
+                    maximum,
+                    entry_count: entries.len(),
+                    lower: owned_bound(lower),
+                    upper: owned_bound(upper),
+                });
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
+                let child_upper = keys.get(index);
+                if child_intersects_bounds(child_lower, child_upper, lower, upper) {
+                    plan_range_segments_node_cached(
+                        store,
+                        pool,
                         root,
                         child,
                         lower,
@@ -3754,7 +3912,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_lookup_validates_the_complete_leaf_after_a_match()
+    fn borrowed_lookup_validates_the_visited_prefix_and_stops_at_the_match()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::create()?;
         let mut store = PageStore::create(temporary.page_file())?;
@@ -3771,8 +3929,18 @@ mod tests {
         payload[34] = b'a';
         let root = store.append(PageKind::BTreeLeaf, Some(Csn::new(1)?), None, payload)?;
         let pool = BufferPool::new(2, 1)?;
+        // The ascending walk ends at the match: the lookup returns the value
+        // without visiting the corrupt later entry. Writers reject
+        // noncanonical leaves at encode time and complete-tree verification
+        // still detects them.
+        let pinned = BTree::from_root(root)
+            .get_cached_pinned(&store, &pool, b"a")?
+            .ok_or("expected pinned value")?;
+        assert_eq!(pinned.bytes(), b"1");
+        // Any target beyond the corrupt entry still walks through it and
+        // fails closed on the noncanonical order.
         assert!(matches!(
-            BTree::from_root(root).get_cached_pinned(&store, &pool, b"a"),
+            BTree::from_root(root).get_cached_pinned(&store, &pool, b"c"),
             Err(BTreeError::NoncanonicalKeyOrder)
         ));
         Ok(())

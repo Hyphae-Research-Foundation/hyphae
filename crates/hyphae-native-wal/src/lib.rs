@@ -410,6 +410,21 @@ impl WalBlock {
         previous_digest: [u8; 32],
         pending: Vec<PendingRecord>,
     ) -> Result<Self, WalError> {
+        Ok(Self::build_encoded(sequence, previous_digest, pending)?.0)
+    }
+
+    /// Builds one block and returns it together with its final encoded
+    /// bytes, encoding exactly once for the append hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty block, oversized payload, or exhausted
+    /// address space.
+    pub fn build_encoded(
+        sequence: u64,
+        previous_digest: [u8; 32],
+        pending: Vec<PendingRecord>,
+    ) -> Result<(Self, Vec<u8>), WalError> {
         if sequence == 0 {
             return Err(WalError::AddressExhausted);
         }
@@ -454,9 +469,10 @@ impl WalBlock {
             digest: [0; 32],
             records,
         };
-        let encoded = block.encode_with_zero_digest()?;
+        let mut encoded = block.encode_with_zero_digest()?;
         block.digest = block_digest(&encoded);
-        Ok(block)
+        encoded[BLOCK_DIGEST_START..BLOCK_DIGEST_END].copy_from_slice(&block.digest);
+        Ok((block, encoded))
     }
 
     /// Returns the strictly increasing block sequence.
@@ -681,16 +697,30 @@ fn validate_block_record_range(records: &[WalRecord], encoded: &[u8]) -> Result<
 }
 
 fn block_checksum(encoded: &[u8]) -> u32 {
-    let mut canonical = encoded.to_vec();
-    canonical[BLOCK_CHECKSUM_START..BLOCK_CHECKSUM_END].fill(0);
-    canonical[BLOCK_DIGEST_START..BLOCK_DIGEST_END].fill(0);
-    crc32c::crc32c(&canonical)
+    // Streaming CRC over the canonical form (checksum and digest fields
+    // zeroed) without materializing a 64 KiB copy.
+    const CHECKSUM_ZEROED: [u8; BLOCK_CHECKSUM_END - BLOCK_CHECKSUM_START] =
+        [0; BLOCK_CHECKSUM_END - BLOCK_CHECKSUM_START];
+    const DIGEST_ZEROED: [u8; BLOCK_DIGEST_END - BLOCK_DIGEST_START] =
+        [0; BLOCK_DIGEST_END - BLOCK_DIGEST_START];
+    let checksum = crc32c::crc32c(&encoded[..BLOCK_CHECKSUM_START]);
+    let checksum = crc32c::crc32c_append(checksum, &CHECKSUM_ZEROED);
+    let checksum =
+        crc32c::crc32c_append(checksum, &encoded[BLOCK_CHECKSUM_END..BLOCK_DIGEST_START]);
+    let checksum = crc32c::crc32c_append(checksum, &DIGEST_ZEROED);
+    crc32c::crc32c_append(checksum, &encoded[BLOCK_DIGEST_END..])
 }
 
 fn block_digest(encoded: &[u8]) -> [u8; 32] {
-    let mut canonical = encoded.to_vec();
-    canonical[BLOCK_DIGEST_START..BLOCK_DIGEST_END].fill(0);
-    *blake3::hash(&canonical).as_bytes()
+    // Incremental BLAKE3 over the canonical form (digest field zeroed)
+    // without materializing a 64 KiB copy.
+    const DIGEST_ZEROED: [u8; BLOCK_DIGEST_END - BLOCK_DIGEST_START] =
+        [0; BLOCK_DIGEST_END - BLOCK_DIGEST_START];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&encoded[..BLOCK_DIGEST_START]);
+    hasher.update(&DIGEST_ZEROED);
+    hasher.update(&encoded[BLOCK_DIGEST_END..]);
+    *hasher.finalize().as_bytes()
 }
 
 fn read_u16(bytes: &[u8]) -> u16 {
@@ -1603,8 +1633,8 @@ impl WalFile {
         self.poisoned = true;
         let mut receipts = Vec::with_capacity(groups.len());
         for group in groups {
-            let block = WalBlock::build(self.next_sequence, self.previous_digest, group)?;
-            let encoded = block.encode()?;
+            let (block, encoded) =
+                WalBlock::build_encoded(self.next_sequence, self.previous_digest, group)?;
             if let Err(source) = self.file.write_all(&encoded) {
                 return Err(WalError::Io(source));
             }
