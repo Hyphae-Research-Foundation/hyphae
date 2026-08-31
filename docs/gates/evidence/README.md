@@ -793,6 +793,7 @@ non-claims.
 - [`weaviate-139-lexical-rerun-2026-08-30.md`](weaviate-139-lexical-rerun-2026-08-30.md)
   and
   [`weaviate-139-hybrid-rerun-2026-08-31.md`](weaviate-139-hybrid-rerun-2026-08-31.md):
-  same-host reruns against Weaviate 1.39.0, including the honest finding
-  that 1.39 repaired the BM25 weakness measured in 1.38; raw receipts in
+  same-host reruns against Weaviate 1.39.0, recording that its 1.39 BM25
+  rework substantially improved the lexical scores measured on 1.38 and
+  superseding the earlier lexical comparison; raw receipts in
   [`memory-2026-08-30/`](memory-2026-08-30/).

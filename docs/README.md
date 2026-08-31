@@ -18,6 +18,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 - [Hyphae usage manual](usage-manual.md)
 - [Native 1.0 capabilities and limits](product/native-capabilities.md)
+- [Canonical claims and non-claims](product/claims.md)
 - [Hyphae Agent Memory — product contract](product/agent-memory.md)
 - [Native quickstart](quickstart-native.md)
 - [Published 0.2.1 capabilities and limits](product/capabilities.md)
@@ -39,6 +40,13 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [RAG attested rerank uplift — NFCorpus (2026-08-23)](gates/evidence/rag-attested-rerank-nfcorpus-2026-08-23.md)
 - [RAG head-to-head vs Weaviate OSS (2026-08-23)](gates/evidence/rag-weaviate-head-to-head-2026-08-23.md)
 - [Attested local embedding replay — bge-small-en-v1.5 (2026-08-22)](gates/evidence/attested-embed-replay-2026-08-22.md)
+- [Weaviate 1.39 lexical rerun (2026-08-30)](gates/evidence/weaviate-139-lexical-rerun-2026-08-30.md)
+- [Weaviate 1.39 hybrid rerun — same attested vectors (2026-08-31)](gates/evidence/weaviate-139-hybrid-rerun-2026-08-31.md)
+- [Agent Memory retrieval sweep and analyzer uplift (2026-08-30)](gates/evidence/agent-memory-sweep-2026-08-30.md)
+- [Agent Memory sweep raw receipts](gates/evidence/memory-2026-08-30/README.md)
+- [Dedicated-hardware baselines and commit-protocol model checking (2026-08-30)](gates/evidence/baseline-i7i-metal-2026-08-30.md)
+- [Phase-1 hot-path optimization before/after (2026-08-30)](gates/evidence/phase1-optimization-2026-08-30.md)
+- [Phase-1 optimization raw receipts](gates/evidence/phase1/README.md)
 
 ## Build and embed
 
@@ -78,6 +86,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native WAL format v1](native/wal-format-v1.md)
 - [Native WAL retention and bounded replay v1](native/wal-retention-v1.md)
 - [Native MVCC and commit semantics v1](native/mvcc-commit-v1.md)
+- [Formal models of core protocols](formal/README.md)
 - [Native durable snapshot pins v1](native/snapshot-pins-v1.md)
 - [Native group commit v1](native/group-commit-v1.md)
 - [Native mixed-durability scheduler v1](native/mixed-durability-scheduler-v1.md)

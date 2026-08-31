@@ -22,19 +22,21 @@
 | Hyphae BM25 (defaults) | 0.3069 | 0.1492 | 0.5151 |
 | **Hyphae BM25 + stop/stem + k1=1.2,b=0.6** | **0.3241** | **0.1549** | **0.5308** |
 
-## Honest findings
+## Findings
 
-1. **Weaviate fixed its BM25.** The 2026-08-23 head-to-head measured
-   1.38.0 at nDCG@10 0.1437 on this corpus; 1.39.0 measures 0.3073 —
-   their BlockMax WAND rework repaired scoring. The old "2× BM25" talking
-   point is dead and must not be repeated.
-2. **Defaults now tie** (0.3069 vs 0.3073 — inside rounding noise).
-3. **Hyphae's analyzer pipeline retakes the lead**: +1.7 nDCG points over
-   Weaviate 1.39 defaults (0.3241 vs 0.3073), with recall and MRR up as
+1. **Weaviate 1.39.0 substantially improved BM25 scoring on this
+   corpus.** The 2026-08-23 comparison measured 1.38.0 at nDCG@10 0.1437;
+   1.39.0 measures 0.3073, consistent with their published BM25 rework.
+   Any earlier lexical comparison based on the 1.38.0 measurement is
+   obsolete and must not be repeated.
+2. **Defaults measure equal** (0.3069 vs 0.3073 — inside rounding noise).
+3. **Enabling Hyphae's analyzer pipeline measures +1.7 nDCG points over
+   both defaults** (0.3241 vs 0.3073), with recall and MRR higher as
    well. The analyzer flags are a per-collection catalog option recorded
-   in the receipt protocol.
+   in the receipt protocol; an equivalent tuned-Weaviate configuration
+   was not exercised in this run and remains open work.
 4. Weaviate 1.39.0 rerun stability on this host: 0/323 changed rankings
-   (their 1.38.0 measured 4/323 on the earlier dedicated host; both
+   (its 1.38.0 measured 4/323 on the earlier dedicated host; both
    observations stand as recorded, environments differ).
 5. Cold start (container restart to ready): 9.26 s for Weaviate 1.39 on
    this droplet; Hyphae cold-start comparison was not re-measured here.

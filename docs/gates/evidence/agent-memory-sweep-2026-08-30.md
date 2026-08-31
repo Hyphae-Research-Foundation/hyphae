@@ -84,12 +84,11 @@ Complete evidence coverage at k=50 for every evaluated question.
 | + k1=1.2, b=0.6 | **0.3241** | **0.1549** | **0.5308** |
 
 The stop/stem pipeline closes the previously documented gap to the
-published BM25 reference (~0.325 on NFCorpus). For context only: the
-2026-08-23 head-to-head measured Weaviate 1.38.0 BM25 at 0.1437 and its
-default hybrid at 0.3570 on identical hardware; the lexical-only branch
-above is within 3.3 points of that full hybrid. A fresh same-host
-head-to-head against current Weaviate is required before any comparative
-claim is published.
+published BM25 reference (~0.325 on NFCorpus). Comparative measurements
+against current Weaviate live in the same-host reruns
+([lexical](weaviate-139-lexical-rerun-2026-08-30.md),
+[hybrid](weaviate-139-hybrid-rerun-2026-08-31.md)); no comparative claim
+is made here.
 
 ## Fixes landed with this evidence
 

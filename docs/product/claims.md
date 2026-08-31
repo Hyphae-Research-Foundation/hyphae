@@ -85,3 +85,20 @@ crash matrices (`tests/all_engine_transaction_g5.rs`,
 - Any latency number without its environment class and receipt.
 - Any comparative statement without the baseline's version, configuration,
   durability posture, and the shared workload definition.
+
+## Third-party conduct
+
+Named third-party systems are measurement subjects and prior art, never
+adversaries. Public wording about them:
+
+- states measurements neutrally ("measures", "records", "differs by"),
+  never combatively ("beats", "crushes", "wins against", "weakness",
+  "dethrones", or equivalents in any language);
+- makes no general superiority or inferiority claim in either direction —
+  every comparison is scoped to its dataset, configuration, host, and
+  receipt, and records the other system's stronger results with the same
+  prominence as Hyphae's;
+- credits improvements in other systems plainly and marks any superseded
+  Hyphae comparison as obsolete rather than continuing to quote it;
+- frames strategy documents around Hyphae's capabilities, not around
+  another project's deficiencies.

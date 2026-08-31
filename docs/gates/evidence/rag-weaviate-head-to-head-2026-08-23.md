@@ -1,5 +1,12 @@
 # V2 evidence — Weaviate OSS head-to-head on identical hardware
 
+> Superseded in part: the lexical BM25 rows below measured Weaviate
+> `1.38.0` and no longer describe current Weaviate — its 1.39.0 BM25
+> rework substantially improved those scores. See the
+> [1.39 lexical rerun](weaviate-139-lexical-rerun-2026-08-30.md) and
+> [1.39 hybrid rerun](weaviate-139-hybrid-rerun-2026-08-31.md) for the
+> current measurements. Do not quote the 1.38 lexical numbers.
+
 - Date: 2026-08-23
 - Harnesses: `tools/rag_eval.py` and `tools/weaviate_compare.py` — same
   dataset digests, corpus order, qrels, metrics, and rounding discipline;
@@ -20,9 +27,9 @@
 | Hyphae BM25 | 0.306945 | 0.149150 | 0.515083 |
 | Weaviate BM25 | 0.143738 | 0.065610 | 0.236257 |
 
-Hyphae's hybrid wins on every metric (+1.4% nDCG@10), and its lexical
-branch scores more than twice Weaviate's BM25 on this corpus under each
-system's defaults.
+Hyphae's hybrid measured higher on each metric in this run (+1.4%
+nDCG@10). The lexical rows reflect Weaviate 1.38.0 only and are
+superseded by the 1.39 rerun noted above.
 
 ## Determinism, measured not claimed
 
