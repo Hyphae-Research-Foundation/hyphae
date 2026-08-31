@@ -14,7 +14,7 @@
     "test": "npm run build:astro && npm run build:next && npm run build:vite"
   },
   "dependencies": {
-    "astro": "7.1.3",
+    "astro": "7.2.9",
     "next": "16.2.12",
     "react": "19.2.7",
     "react-dom": "19.2.7",
