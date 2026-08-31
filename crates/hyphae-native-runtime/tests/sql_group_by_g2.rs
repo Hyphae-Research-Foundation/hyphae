@@ -157,20 +157,169 @@ fn grouped_shapes_outside_the_slice_fail_closed() -> Result<(), TestError> {
         transaction.execute_sql("SELECT tenant FROM ledger GROUP BY tenant LIMIT 5", &[]),
         Err(SqlError::InvalidAggregate)
     ));
-    // GROUP BY without LIMIT.
+    // GROUP BY without LIMIT (streaming and ordered-grouped paths).
     assert!(matches!(
         transaction.execute_sql("SELECT COUNT(*) FROM ledger GROUP BY tenant", &[]),
         Err(SqlError::InvalidAggregate)
     ));
-    // GROUP BY over a non-prefix column.
     assert!(matches!(
-        transaction.execute_sql("SELECT COUNT(*) FROM ledger GROUP BY sequence LIMIT 5", &[],),
+        transaction.execute_sql("SELECT COUNT(*) FROM ledger GROUP BY amount", &[]),
         Err(SqlError::InvalidAggregate)
     ));
-    // GROUP BY over a non-key column.
+    // Named plain columns that are not exactly the GROUP BY list.
     assert!(matches!(
-        transaction.execute_sql("SELECT COUNT(*) FROM ledger GROUP BY amount LIMIT 5", &[],),
+        transaction.execute_sql(
+            "SELECT amount, COUNT(*) FROM ledger GROUP BY tenant LIMIT 5",
+            &[],
+        ),
         Err(SqlError::InvalidAggregate)
+    ));
+    // Plain column after an aggregate stays outside the slice.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT COUNT(*), tenant FROM ledger GROUP BY tenant LIMIT 5",
+            &[],
+        ),
+        Err(SqlError::InvalidAggregate)
+    ));
+    // Ordered-grouped LIMIT above the explicit group ceiling.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT COUNT(*) FROM ledger GROUP BY amount LIMIT 65537",
+            &[],
+        ),
+        Err(SqlError::InvalidAggregate)
+    ));
+    transaction.rollback();
+    Ok(())
+}
+
+#[test]
+fn ordered_grouping_over_arbitrary_columns_matches_postgres_shape() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+
+    // Postgres-style named key over a non-key column, with aliases.
+    let SqlResult::Rows { columns, rows } = transaction.execute_sql(
+        "SELECT amount AS bucket, COUNT(*) AS n FROM ledger GROUP BY amount LIMIT 10",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["bucket", "n"]);
+    // NULL groups order before every non-null amount.
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(5), SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(7), SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(10), SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(30), SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(100), SqlValue::Unsigned(1)],
+        ]
+    );
+
+    // LIMIT retains exactly the smallest keys even when later rows revisit
+    // an evicted key: NULL and amount=5 are the two smallest buckets.
+    let SqlResult::Rows { rows, .. } =
+        transaction.execute_sql("SELECT COUNT(*) FROM ledger GROUP BY amount LIMIT 2", &[])?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Unsigned(1)],
+            vec![SqlValue::Signed(5), SqlValue::Unsigned(1)],
+        ]
+    );
+    transaction.rollback();
+    Ok(())
+}
+
+#[test]
+fn named_group_keys_and_aliases_bind_across_all_surfaces() -> Result<(), TestError> {
+    const NAMED: &str = "SELECT tenant AS who, COUNT(*) AS n, SUM(amount) AS total FROM ledger \
+         GROUP BY tenant LIMIT 10";
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let expected_rows = vec![
+        vec![
+            SqlValue::Text("acme".to_owned()),
+            SqlValue::Unsigned(3),
+            SqlValue::Signed(40),
+        ],
+        vec![
+            SqlValue::Text("globex".to_owned()),
+            SqlValue::Unsigned(2),
+            SqlValue::Signed(12),
+        ],
+        vec![
+            SqlValue::Text("initech".to_owned()),
+            SqlValue::Unsigned(1),
+            SqlValue::Signed(100),
+        ],
+    ];
+
+    // Transactional.
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+    let SqlResult::Rows { columns, rows } = transaction.execute_sql(NAMED, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["who", "n", "total"]);
+    assert_eq!(rows, expected_rows);
+    transaction.rollback();
+
+    // Prepared snapshot.
+    let snapshot = database.snapshot(0)?;
+    let prepared = snapshot.prepare_sql(NAMED)?;
+    let SqlResult::Rows { columns, rows } = snapshot.execute_prepared(&prepared, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["who", "n", "total"]);
+    assert_eq!(rows, expected_rows);
+
+    // Prepared latest.
+    let latest = database.prepare_sql_latest(NAMED)?;
+    let SqlResult::Rows { columns, rows } = database.execute_prepared_latest(&latest, &[])? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["who", "n", "total"]);
+    assert_eq!(rows, expected_rows);
+    Ok(())
+}
+
+#[test]
+fn plain_column_aliases_rename_outputs_only() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+
+    let SqlResult::Rows { columns, rows } = transaction.execute_sql(
+        "SELECT tenant AS who, sequence AS seq FROM ledger WHERE tenant = 'acme' LIMIT 2",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["who", "seq"]);
+    assert_eq!(rows.len(), 2);
+
+    // Duplicate aliases fail closed.
+    assert!(matches!(
+        transaction.execute_sql("SELECT tenant AS a, sequence AS a FROM ledger LIMIT 1", &[],),
+        Err(SqlError::DuplicateColumn)
+    ));
+    // Aliases are output names only: not referenceable from WHERE.
+    assert!(matches!(
+        transaction.execute_sql(
+            "SELECT tenant AS who FROM ledger WHERE who = 'acme' LIMIT 1",
+            &[],
+        ),
+        Err(SqlError::UnknownColumn)
     ));
     transaction.rollback();
     Ok(())

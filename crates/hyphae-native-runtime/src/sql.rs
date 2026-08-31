@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::{Bound, ControlFlow},
 };
 
@@ -434,8 +434,12 @@ enum PreparedPlan {
         aggregates: Vec<BoundAggregate>,
         output_columns: Vec<String>,
         group_columns: Vec<usize>,
+        /// Logical types of the group-key columns, in order.
+        group_types: Vec<LogicalType>,
         /// Maximum emitted groups (parser-mandatory for grouped selects).
         group_limit: Option<usize>,
+        /// Primary-key-prefix contiguous-run fold vs bounded ordered fold.
+        streaming_groups: bool,
     },
 }
 
@@ -681,15 +685,23 @@ impl PreparedPlan {
 
 /// Folds ordered complete rows into aggregate output rows.
 ///
+/// Explicit ceiling on emitted groups for the ordered-grouped fold.
+const MAX_SQL_ORDERED_GROUPS: usize = 65_536;
+
 /// With empty `group_columns` this emits exactly one total row. With group
-/// columns it emits one row per contiguous group-key run (the input must be
-/// primary-key ordered, which the binder guarantees), bounded by
-/// `group_limit`; the run's key values prefix each output row.
+/// columns over a primary-key prefix (`streaming_groups`) it emits one row
+/// per contiguous group-key run bounded by `group_limit`. With arbitrary
+/// group columns it folds through an order-preserving encoded key table
+/// that never holds more than `group_limit` groups (largest key evicts
+/// first, so the retained set is exactly the smallest `group_limit` keys)
+/// and emits them in ascending key order.
 fn fold_aggregate_rows(
     rows: &[Vec<SqlValue>],
     aggregates: &[BoundAggregate],
     group_columns: &[usize],
+    group_types: &[LogicalType],
     group_limit: Option<usize>,
+    streaming_groups: bool,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     if group_columns.is_empty() {
         let mut state = AggregateState::new(aggregates);
@@ -697,6 +709,15 @@ fn fold_aggregate_rows(
             state.fold(row)?;
         }
         return Ok(vec![state.finish()?]);
+    }
+    if !streaming_groups {
+        return fold_ordered_grouped_rows(
+            rows,
+            aggregates,
+            group_columns,
+            group_types,
+            group_limit,
+        );
     }
     let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
     let mut output: Vec<Vec<SqlValue>> = Vec::new();
@@ -732,6 +753,74 @@ fn fold_aggregate_rows(
         output.push(emitted);
     }
     Ok(output)
+}
+
+/// Bounded ordered-grouped fold over arbitrary group columns.
+///
+/// Keys fold through their canonical order-preserving encoding into a
+/// `BTreeMap` capped at `group_limit` entries: once full, a key greater
+/// than the current maximum is skipped (it can never enter the smallest-
+/// `limit` set), and inserting a smaller key evicts the current maximum.
+/// The retained set is therefore exactly the smallest `limit` distinct
+/// keys, emitted in ascending encoded order. NULL encodes ahead of every
+/// non-null value and forms one group.
+fn fold_ordered_grouped_rows(
+    rows: &[Vec<SqlValue>],
+    aggregates: &[BoundAggregate],
+    group_columns: &[usize],
+    group_types: &[LogicalType],
+    group_limit: Option<usize>,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
+    if limit == 0 || limit > MAX_SQL_ORDERED_GROUPS {
+        return Err(SqlError::InvalidAggregate);
+    }
+    let mut groups: BTreeMap<Vec<u8>, (Vec<SqlValue>, AggregateState)> = BTreeMap::new();
+    for row in rows {
+        let mut key_values = Vec::with_capacity(group_columns.len());
+        let mut encoded = Vec::new();
+        for (position, column) in group_columns.iter().enumerate() {
+            let value = row.get(*column).ok_or(SqlError::InvalidAggregate)?;
+            let logical_type = group_types
+                .get(position)
+                .ok_or(SqlError::InvalidAggregate)?;
+            // The canonical ordered component already sorts null first via
+            // its leading marker byte and preserves the type's total order.
+            let component = value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::InvalidStoredRow)?;
+            // Each ordered component is prefix-free (fixed width, or
+            // memcomparable with its own terminator), so plain
+            // concatenation preserves composite lexicographic order.
+            encoded.extend_from_slice(&component);
+            key_values.push(value.clone());
+        }
+        if let Some((_, state)) = groups.get_mut(&encoded) {
+            state.fold(row)?;
+            continue;
+        }
+        if groups.len() == limit {
+            // Full: only a key below the current maximum may enter.
+            let Some(maximum) = groups.keys().next_back().cloned() else {
+                return Err(SqlError::InvalidAggregate);
+            };
+            if encoded >= maximum {
+                continue;
+            }
+            groups.remove(&maximum);
+        }
+        let mut state = AggregateState::new(aggregates);
+        state.fold(row)?;
+        groups.insert(encoded, (key_values, state));
+    }
+    groups
+        .into_values()
+        .map(|(key_values, state)| {
+            let mut emitted = key_values;
+            emitted.extend(state.finish()?);
+            Ok(emitted)
+        })
+        .collect()
 }
 
 /// Synthetic result schema for one aggregate output row.
@@ -1015,6 +1104,14 @@ enum Projection {
     /// Total aggregation over the bounded access path: the statement
     /// produces exactly one row of accumulator outputs.
     Aggregates(Vec<AggregateItem>),
+    /// Aliased and/or PostgreSQL-style mixed projection: plain columns
+    /// (each with an optional `AS` alias) optionally followed by
+    /// aggregates. With aggregates present the binder requires the named
+    /// columns to equal the `GROUP BY` list in order.
+    Named {
+        columns: Vec<NamedColumn>,
+        aggregates: Vec<AggregateItem>,
+    },
 }
 
 /// One parsed aggregate projection item.
@@ -1023,6 +1120,16 @@ struct AggregateItem {
     function: AggregateFunction,
     /// `None` is `COUNT(*)`; every other function names one column.
     column: Option<String>,
+    /// Optional `AS <identifier>` output alias.
+    alias: Option<String>,
+}
+
+/// One plain projected column with its optional `AS` output alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamedColumn {
+    name: String,
+    /// Optional `AS <identifier>` output alias.
+    alias: Option<String>,
 }
 
 /// Total aggregate functions admitted by the bounded V1 slice.
@@ -1240,8 +1347,13 @@ struct BoundSelect {
     /// row folded from the bounded access path (or one row per group when
     /// `group_columns` is nonempty).
     aggregates: Option<Vec<BoundAggregate>>,
-    /// Streaming group keys: a left prefix of the primary key.
+    /// Group-key column indexes (primary-key prefix or arbitrary).
     group_columns: Vec<usize>,
+    /// Logical types of the group-key columns, in `group_columns` order.
+    group_types: Vec<LogicalType>,
+    /// True when group keys are a primary-key left prefix (contiguous
+    /// runs); false takes the bounded ordered-grouped fold.
+    streaming_groups: bool,
 }
 
 /// One catalog-bound total aggregate.
@@ -1487,6 +1599,8 @@ fn prepare_select_plan(
     let mut bound = bind_select(catalog, query, ordered_secondary_indexes)?;
     let aggregates = bound.aggregates.take();
     let group_columns = std::mem::take(&mut bound.group_columns);
+    let group_types = std::mem::take(&mut bound.group_types);
+    let streaming_groups = bound.streaming_groups;
     let group_limit = (!group_columns.is_empty()).then_some(query.limit).flatten();
     let aggregate_columns = aggregates
         .is_some()
@@ -1632,7 +1746,9 @@ fn prepare_select_plan(
             aggregates,
             output_columns,
             group_columns,
+            group_types,
             group_limit,
+            streaming_groups,
         },
         _ => inner,
     })
@@ -2121,8 +2237,11 @@ fn execute_cte_select(
                     .ok_or(SqlError::UnknownColumn)
             })
             .collect::<Result<Vec<_>, _>>()?,
-        // Aggregates over a materialized CTE are not in the bounded slice.
-        Projection::Aggregates(_) => return Err(SqlError::InvalidAggregate),
+        // Aggregates and aliased/mixed projections over a materialized
+        // CTE are not in the bounded slice.
+        Projection::Aggregates(_) | Projection::Named { .. } => {
+            return Err(SqlError::InvalidAggregate);
+        }
     };
     let output_columns = projection
         .iter()
@@ -2486,7 +2605,9 @@ fn execute_bound_snapshot(
             aggregates,
             output_columns,
             group_columns,
+            group_types,
             group_limit,
+            streaming_groups,
         } => {
             let SqlResult::Rows { rows, .. } = execute_bound_snapshot(snapshot, input, parameters)?
             else {
@@ -2494,7 +2615,14 @@ fn execute_bound_snapshot(
             };
             Ok(SqlResult::Rows {
                 columns: output_columns.clone(),
-                rows: fold_aggregate_rows(&rows, aggregates, group_columns, *group_limit)?,
+                rows: fold_aggregate_rows(
+                    &rows,
+                    aggregates,
+                    group_columns,
+                    group_types,
+                    *group_limit,
+                    *streaming_groups,
+                )?,
             })
         }
     }
@@ -2583,7 +2711,9 @@ fn execute_bound_latest(
             aggregates,
             output_columns,
             group_columns,
+            group_types,
             group_limit,
+            streaming_groups,
         } => {
             let SqlResult::Rows { rows, .. } = execute_bound_latest(
                 database, snapshot, input, parameters, permit, checkpoint, profile,
@@ -2594,7 +2724,14 @@ fn execute_bound_latest(
             execution_checkpoint(checkpoint)?;
             Ok(SqlResult::Rows {
                 columns: output_columns.clone(),
-                rows: fold_aggregate_rows(&rows, aggregates, group_columns, *group_limit)?,
+                rows: fold_aggregate_rows(
+                    &rows,
+                    aggregates,
+                    group_columns,
+                    group_types,
+                    *group_limit,
+                    *streaming_groups,
+                )?,
             })
         }
     }
@@ -5710,6 +5847,8 @@ fn execute_select(
         access,
         aggregates,
         group_columns,
+        group_types,
+        streaming_groups,
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -5766,7 +5905,14 @@ fn execute_select(
     if let Some(aggregates) = aggregates {
         return Ok(SqlResult::Rows {
             columns: output_columns,
-            rows: fold_aggregate_rows(&rows, &aggregates, &group_columns, query.limit)?,
+            rows: fold_aggregate_rows(
+                &rows,
+                &aggregates,
+                &group_columns,
+                &group_types,
+                query.limit,
+                streaming_groups,
+            )?,
         });
     }
     Ok(SqlResult::Rows {
@@ -6141,54 +6287,112 @@ impl TransactionSelectContext<'_> {
     }
 }
 
+/// Binds one select projection: aggregates (with optional named group
+/// keys and aliases), aliased plain columns, or the legacy plain shapes.
+#[allow(clippy::type_complexity)]
+fn bind_select_projection(
+    definition: &RelationDefinition,
+    projection: &Projection,
+    group_columns: &[usize],
+) -> Result<(Vec<usize>, Option<Vec<BoundAggregate>>, Vec<String>), SqlError> {
+    // Split into aggregate items (when any) plus the aliases attached to
+    // explicitly named group-key columns.
+    let (aggregate_items, key_aliases): (Option<&[AggregateItem]>, Vec<Option<String>>) =
+        match projection {
+            Projection::Aggregates(items) => (Some(items), Vec::new()),
+            Projection::Named {
+                columns,
+                aggregates,
+            } if !aggregates.is_empty() => (
+                Some(aggregates),
+                columns.iter().map(|column| column.alias.clone()).collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+    if let Some(items) = aggregate_items {
+        let (bound, columns) = bind_aggregates(definition, items)?;
+        let mut output = Vec::with_capacity(group_columns.len() + columns.len());
+        for (position, column) in group_columns.iter().enumerate() {
+            let alias = key_aliases.get(position).cloned().flatten();
+            output.push(match alias {
+                Some(alias) => alias,
+                None => definition
+                    .columns
+                    .get(*column)
+                    .ok_or(SqlError::InvalidCatalogObject)?
+                    .name
+                    .to_string(),
+            });
+        }
+        output.extend(columns);
+        // The inner row materializes the complete catalog row so every
+        // aggregate input index is a plain column index.
+        return Ok(((0..definition.columns.len()).collect(), Some(bound), output));
+    }
+    if let Projection::Named { columns, .. } = projection {
+        // Plain aliased projection: bind by name, rename outputs.
+        let bound = columns
+            .iter()
+            .map(|column| column_index(&definition.columns, &column.name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = columns
+            .iter()
+            .zip(&bound)
+            .map(|(column, index)| match &column.alias {
+                Some(alias) => alias.clone(),
+                None => definition.columns[*index].name.display().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        for name in &output {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(SqlError::DuplicateColumn);
+            }
+        }
+        return Ok((bound, None, output));
+    }
+    let bound = bind_projection(definition, projection)?;
+    let columns = projection_output_columns(definition, &bound);
+    Ok((bound, None, columns))
+}
+
 fn bind_select(
     catalog: &crate::model::CatalogState,
     query: SelectQuery<'_>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<BoundSelect, SqlError> {
     let (table, definition) = relation_named(catalog, query.name)?;
-    let group_columns = if query.group_by.is_empty() {
-        Vec::new()
+    let (group_columns, streaming_groups) = if query.group_by.is_empty() {
+        (Vec::new(), true)
     } else {
-        // Streaming GROUP BY: keys must be a left prefix of the primary key
-        // in catalog order so the physical walk emits groups contiguously.
         let expected_primary_key = primary_key_indices(definition)?;
         let group_columns = query
             .group_by
             .iter()
             .map(|name| column_index(&definition.columns, name))
             .collect::<Result<Vec<_>, _>>()?;
-        if group_columns.is_empty()
-            || group_columns.len() > expected_primary_key.len()
-            || group_columns.as_slice() != &expected_primary_key[..group_columns.len()]
-        {
+        if group_columns.is_empty() {
             return Err(SqlError::InvalidAggregate);
         }
-        group_columns
+        // Streaming GROUP BY: keys form a left prefix of the primary key in
+        // catalog order, so the physical walk emits groups contiguously.
+        // Any other admitted key set takes the bounded ordered-grouped path.
+        let streaming = group_columns.len() <= expected_primary_key.len()
+            && group_columns.as_slice() == &expected_primary_key[..group_columns.len()];
+        (group_columns, streaming)
     };
+    let group_types = group_columns
+        .iter()
+        .map(|column| {
+            definition
+                .columns
+                .get(*column)
+                .map(|definition| definition.logical_type.clone())
+                .ok_or(SqlError::InvalidCatalogObject)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let (projection, aggregates, output_columns) =
-        if let Projection::Aggregates(items) = query.projection {
-            let (bound, columns) = bind_aggregates(definition, items)?;
-            let mut output = Vec::with_capacity(group_columns.len() + columns.len());
-            for column in &group_columns {
-                output.push(
-                    definition
-                        .columns
-                        .get(*column)
-                        .ok_or(SqlError::InvalidCatalogObject)?
-                        .name
-                        .to_string(),
-                );
-            }
-            output.extend(columns);
-            // The inner row materializes the complete catalog row so every
-            // aggregate input index is a plain column index.
-            ((0..definition.columns.len()).collect(), Some(bound), output)
-        } else {
-            let projection = bind_projection(definition, query.projection)?;
-            let columns = projection_output_columns(definition, &projection);
-            (projection, None, columns)
-        };
+        bind_select_projection(definition, query.projection, &group_columns)?;
     let filter = query
         .filter
         .map(|expression| bind_filter_expression(definition, expression))
@@ -6223,6 +6427,8 @@ fn bind_select(
         access,
         aggregates,
         group_columns,
+        group_types,
+        streaming_groups,
     })
 }
 
@@ -6261,9 +6467,10 @@ fn bind_aggregates(
                 (Some(index), Some(column.logical_type.clone()))
             }
         };
-        names.push(match &item.column {
-            None => format!("{}(*)", item.function.keyword()),
-            Some(column) => format!("{}({column})", item.function.keyword()),
+        names.push(match (&item.alias, &item.column) {
+            (Some(alias), _) => alias.clone(),
+            (None, None) => format!("{}(*)", item.function.keyword()),
+            (None, Some(column)) => format!("{}({column})", item.function.keyword()),
         });
         bound.push(BoundAggregate {
             function: item.function,
@@ -6733,8 +6940,9 @@ fn bind_projection(
             .iter()
             .map(|name| column_index(&definition.columns, name))
             .collect(),
-        // Aggregate projections bind through bind_aggregates, never here.
-        Projection::Aggregates(_) => Err(SqlError::InvalidAggregate),
+        // Aggregate projections bind through bind_aggregates; aliased
+        // projections bind inline in bind_select. Neither reaches here.
+        Projection::Aggregates(_) | Projection::Named { .. } => Err(SqlError::InvalidAggregate),
     }
 }
 
@@ -9958,7 +10166,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else if parser.looks_like_aggregate_projection() {
         Projection::Aggregates(parser.aggregate_list_until_keyword("FROM")?)
     } else {
-        Projection::Columns(parser.identifier_list_until_keyword("FROM")?)
+        parser.projection_list_until_from()?
     };
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
@@ -10005,21 +10213,36 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         None
     };
+    let has_aggregates = matches!(projection, Projection::Aggregates(_))
+        || matches!(&projection, Projection::Named { aggregates, .. } if !aggregates.is_empty());
     if !group_by.is_empty() {
-        // Grouped selects require an aggregate projection; group keys are
-        // emitted implicitly ahead of the accumulator outputs. ORDER BY is
-        // the group prefix order by construction; LIMIT (mandatory) bounds
-        // emitted groups.
-        if !matches!(projection, Projection::Aggregates(_))
-            || !order_by.is_empty()
-            || descending
-            || limit.is_none()
-        {
+        // Grouped selects require an aggregate projection — implicit-key
+        // (aggregates only) or PostgreSQL-style with the key columns named
+        // ahead of the aggregates. ORDER BY stays fail-closed; LIMIT
+        // (mandatory) bounds emitted groups.
+        if !has_aggregates || !order_by.is_empty() || descending || limit.is_none() {
             return Err(SqlError::InvalidAggregate);
         }
-    } else if matches!(projection, Projection::Aggregates(_)) {
+        if let Projection::Named { columns, .. } = &projection {
+            // The named plain columns must be exactly the GROUP BY list in
+            // GROUP BY order.
+            if columns.len() != group_by.len()
+                || columns
+                    .iter()
+                    .zip(&group_by)
+                    .any(|(column, key)| !column.name.eq_ignore_ascii_case(key))
+            {
+                return Err(SqlError::InvalidAggregate);
+            }
+        }
+    } else if has_aggregates {
         // Total aggregates emit exactly one bounded row; ORDER BY/LIMIT have
-        // no admitted meaning and the scan-candidate budget is the work bound.
+        // no admitted meaning and the scan-candidate budget is the work
+        // bound. Plain columns mixed into an ungrouped aggregate stay
+        // fail-closed.
+        if matches!(&projection, Projection::Named { columns, .. } if !columns.is_empty()) {
+            return Err(SqlError::InvalidAggregate);
+        }
         if !order_by.is_empty() || limit.is_some() {
             return Err(SqlError::InvalidAggregate);
         }
@@ -10526,17 +10749,6 @@ impl Parser {
         Ok(identifiers)
     }
 
-    fn identifier_list_until_keyword(&mut self, terminator: &str) -> Result<Vec<String>, SqlError> {
-        let mut identifiers = vec![self.identifier()?];
-        while !self.tokens.get(self.offset).is_some_and(
-            |token| matches!(token, Token::Word(value) if value.eq_ignore_ascii_case(terminator)),
-        ) {
-            self.expect_symbol(',')?;
-            identifiers.push(self.identifier()?);
-        }
-        Ok(identifiers)
-    }
-
     /// Returns whether the projection starts with `<aggregate-keyword> (`.
     fn looks_like_aggregate_projection(&self) -> bool {
         matches!(
@@ -10561,7 +10773,28 @@ impl Parser {
             Some(self.identifier()?)
         };
         self.expect_symbol(')')?;
-        Ok(AggregateItem { function, column })
+        let alias = self.optional_alias()?;
+        Ok(AggregateItem {
+            function,
+            column,
+            alias,
+        })
+    }
+
+    /// Consumes one optional `AS <identifier>` projection alias.
+    fn optional_alias(&mut self) -> Result<Option<String>, SqlError> {
+        if !self.consume_keyword("AS") {
+            return Ok(None);
+        }
+        self.identifier().map(Some)
+    }
+
+    /// Returns whether the next projection item is `<aggregate> (`.
+    fn at_aggregate_item(&self) -> bool {
+        matches!(
+            self.tokens.get(self.offset),
+            Some(Token::Word(word)) if AggregateFunction::from_keyword(word).is_some()
+        ) && self.tokens.get(self.offset + 1) == Some(&Token::Symbol('('))
     }
 
     fn aggregate_list_until_keyword(
@@ -10576,6 +10809,50 @@ impl Parser {
             items.push(self.aggregate_item()?);
         }
         Ok(items)
+    }
+
+    /// Parses the general projection list up to `FROM`: named columns
+    /// (each with an optional alias) optionally followed by aggregates.
+    /// Plain columns after the first aggregate stay fail-closed.
+    fn projection_list_until_from(&mut self) -> Result<Projection, SqlError> {
+        let mut keys: Vec<NamedColumn> = Vec::new();
+        let mut aggregates: Vec<AggregateItem> = Vec::new();
+        loop {
+            if self.at_aggregate_item() {
+                aggregates.push(self.aggregate_item()?);
+            } else {
+                if !aggregates.is_empty() {
+                    // Plain column after an aggregate: outside the slice.
+                    return Err(SqlError::InvalidAggregate);
+                }
+                let name = self.identifier()?;
+                let alias = self.optional_alias()?;
+                keys.push(NamedColumn { name, alias });
+            }
+            if self.tokens.get(self.offset).is_some_and(
+                |token| matches!(token, Token::Word(value) if value.eq_ignore_ascii_case("FROM")),
+            ) {
+                break;
+            }
+            self.expect_symbol(',')?;
+        }
+        match (keys.is_empty(), aggregates.is_empty()) {
+            // Pure unaliased column list keeps the plain legacy shape so
+            // every existing consumer (joins, CTE binding) is untouched.
+            (false, true) if keys.iter().all(|column| column.alias.is_none()) => Ok(
+                Projection::Columns(keys.into_iter().map(|column| column.name).collect()),
+            ),
+            (false, true) => Ok(Projection::Named {
+                columns: keys,
+                aggregates: Vec::new(),
+            }),
+            (true, false) => Ok(Projection::Aggregates(aggregates)),
+            (false, false) => Ok(Projection::Named {
+                columns: keys,
+                aggregates,
+            }),
+            (true, true) => Err(SqlError::InvalidSyntax),
+        }
     }
 
     fn logical_type(&mut self) -> Result<LogicalType, SqlError> {

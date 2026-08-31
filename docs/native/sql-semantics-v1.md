@@ -206,14 +206,36 @@ GROUP BY <primary-key-left-prefix-in-catalog-order>
 LIMIT <positive-integer>
 ```
 
-Group keys must be a left prefix of the primary key in catalog order
-(`HYSQL021` otherwise), so the primary-key-ordered physical walk emits each
-group as one contiguous run folded in O(1) memory per group. The key values
-are emitted implicitly ahead of the accumulator outputs, groups arrive in
-ascending key order, `LIMIT` is mandatory and bounds emitted groups, and the
-underlying walk still charges the scan-candidate ceiling. `HAVING`, hash
-grouping over arbitrary columns, index-ordered grouped walks, `ORDER BY`,
-and `DESC` on the grouped form remain fail-closed non-claims.
+Group keys that form a left prefix of the primary key in catalog order keep
+the streaming path: the primary-key-ordered physical walk emits each group as
+one contiguous run folded in O(1) memory per group, and groups arrive in
+ascending key order.
+
+Group keys over arbitrary admitted columns take the bounded ordered-grouped
+path: the same bounded access materializes rows, group keys fold through an
+order-preserving composite encoding into an accumulator table that never
+holds more than `LIMIT` groups (the largest key evicts first; a key outside
+the current smallest-`LIMIT` set can never re-enter it, so eviction is
+exact), and the smallest `LIMIT` groups emit in ascending key order. `LIMIT`
+is mandatory and at most 65,536 on this path (`HYSQL021` otherwise). NULL
+group keys form one group, ordered before every non-null key. The underlying
+walk still charges the scan-candidate ceiling in both paths.
+
+In both grouped paths the key values are emitted ahead of the accumulator
+outputs, and `LIMIT` is mandatory. `HAVING`, index-ordered grouped walks,
+`ORDER BY`, and `DESC` on the grouped form remain fail-closed non-claims.
+
+The grouped projection may name the group-key columns explicitly ahead of
+the aggregates in PostgreSQL style — `SELECT kind, COUNT(*) FROM t GROUP BY
+kind LIMIT n` — provided the named plain columns are exactly the `GROUP BY`
+columns in `GROUP BY` order (`HYSQL021` otherwise). The implicit form
+without named key columns remains admitted with unchanged output shape.
+
+Every projection item — plain column, aggregate, and window output — admits
+one optional `AS <identifier>` alias renaming its output column. Aliases
+bind output names only: they are not referenceable from `WHERE`, `GROUP
+BY`, or `ORDER BY` in this slice, and a duplicated alias fails closed with
+`HYSQL005`.
 
 Residual predicates extend the admitted filter grammar without ever binding
 an access path on their own:
