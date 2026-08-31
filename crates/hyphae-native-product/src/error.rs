@@ -860,6 +860,12 @@ pub enum ProductSqlSubcode {
     Hysql018,
     /// `HYSQL019`: bounded scan candidate budget exhausted.
     Hysql019,
+    /// `HYSQL020`: multi-row INSERT row budget exhausted.
+    Hysql020,
+    /// `HYSQL021`: invalid aggregate binding.
+    Hysql021,
+    /// `HYSQL022`: aggregate accumulator overflow.
+    Hysql022,
 }
 
 impl ProductSqlSubcode {
@@ -885,6 +891,9 @@ impl ProductSqlSubcode {
             Self::Hysql017 => "HYSQL017",
             Self::Hysql018 => "HYSQL018",
             Self::Hysql019 => "HYSQL019",
+            Self::Hysql020 => "HYSQL020",
+            Self::Hysql021 => "HYSQL021",
+            Self::Hysql022 => "HYSQL022",
         }
     }
 
@@ -909,6 +918,9 @@ impl ProductSqlSubcode {
             b"HYSQL017" => Some(Self::Hysql017),
             b"HYSQL018" => Some(Self::Hysql018),
             b"HYSQL019" => Some(Self::Hysql019),
+            b"HYSQL020" => Some(Self::Hysql020),
+            b"HYSQL021" => Some(Self::Hysql021),
+            b"HYSQL022" => Some(Self::Hysql022),
             _ => None,
         }
     }
@@ -1496,6 +1508,7 @@ fn io_retry(kind: io::ErrorKind) -> ProductRetry {
 }
 
 impl From<SqlError> for ProductError {
+    #[allow(clippy::too_many_lines)]
     fn from(source: SqlError) -> Self {
         match source {
             SqlError::InvalidSyntax => Self::sql(
@@ -1582,6 +1595,23 @@ impl From<SqlError> for ProductError {
                     ),
                 )
             }
+            SqlError::InsertRowBudgetExceeded => {
+                Self::sql(ProductErrorCode::LimitExceeded, ProductSqlSubcode::Hysql020).with_limit(
+                    ProductLimit::new(
+                        ProductLimitKind::SqlStatementBytes,
+                        usize_to_u64(hyphae_native_runtime::MAX_SQL_INSERT_ROWS),
+                        usize_to_u64(hyphae_native_runtime::MAX_SQL_INSERT_ROWS.saturating_add(1)),
+                    ),
+                )
+            }
+            SqlError::InvalidAggregate => Self::sql(
+                ProductErrorCode::SqlInvalidSyntax,
+                ProductSqlSubcode::Hysql021,
+            ),
+            SqlError::AggregateOverflow => Self::sql(
+                ProductErrorCode::SqlInvalidValue,
+                ProductSqlSubcode::Hysql022,
+            ),
             SqlError::ExecutionInterrupted => Self::from_code(ProductErrorCode::Cancelled),
             SqlError::Runtime(source) => source.into(),
         }

@@ -231,7 +231,8 @@ pub use set_algebra::{
 };
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{
-    BoundSqlStatement, MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
+    BoundSqlStatement, MAX_SQL_IN_MEMBERS, MAX_SQL_INSERT_ROWS, MAX_SQL_JOIN_CANDIDATES,
+    MAX_SQL_LIKE_PATTERN_BYTES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
     NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlStatementClass, SqlValue,
     classify_sql_statement,
 };
@@ -403,8 +404,16 @@ fn segmented_result_memory_bytes(physical_entries: usize) -> u64 {
 }
 
 fn default_buffer_pool() -> Result<Arc<BufferPool>, BufferPoolError> {
+    // `HYPHAE_BUFFER_POOL_FRAMES` overrides the default frame count for
+    // operators sizing the cache to their working set. Invalid or absent
+    // values keep the shipped default; the partition count is unchanged.
+    let frames = std::env::var("HYPHAE_BUFFER_POOL_FRAMES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|frames| *frames >= DEFAULT_BUFFER_POOL_PARTITIONS)
+        .unwrap_or(DEFAULT_BUFFER_POOL_FRAMES);
     Ok(Arc::new(BufferPool::new(
-        DEFAULT_BUFFER_POOL_FRAMES,
+        frames,
         DEFAULT_BUFFER_POOL_PARTITIONS,
     )?))
 }
@@ -2112,6 +2121,20 @@ pub struct CommitReceipt {
     pub page_synchronization_time: Duration,
     /// WAL synchronization time.
     pub wal_synchronization_time: Duration,
+}
+
+impl CommitReceipt {
+    /// Returns commit execution time excluding physical synchronization.
+    ///
+    /// `execution_time` spans the complete commit walk and therefore
+    /// contains `page_synchronization_time` and `wal_synchronization_time`;
+    /// this accessor reports the disjoint logical component so durability
+    /// classes can be compared without double-counting fsync.
+    pub fn logical_execution_time(&self) -> Duration {
+        self.execution_time
+            .saturating_sub(self.page_synchronization_time)
+            .saturating_sub(self.wal_synchronization_time)
+    }
 }
 
 /// Durable transaction outcome retained by the native WAL authority.
@@ -8042,8 +8065,9 @@ impl NativeDatabase {
             }
             bound => bound,
         };
-        let segments = tree.plan_range_segments(
+        let segments = tree.plan_range_segments_cached(
             &self.pages,
+            &self.buffer_pool,
             bound_as_slice(&planned_lower),
             bound_as_slice(&planned_upper),
         )?;
@@ -8209,6 +8233,70 @@ impl NativeDatabase {
         let mut failure = None;
         let _outcome = tree
             .visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                bound_as_slice(&lower),
+                bound_as_slice(&upper),
+                |physical_key, encoded| {
+                    let Some(primary_key) = physical_key.get(prefix.len()..) else {
+                        failure = Some(RelationalVisitError::Runtime(
+                            NativeRuntimeError::InvalidRelationalTree,
+                        ));
+                        return ControlFlow::Break(());
+                    };
+                    match decode_relational_value_cached(&context, table, primary_key, encoded) {
+                        Ok(Some(row)) => match visitor(primary_key, &row) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                failure = Some(RelationalVisitError::Visitor(error));
+                                ControlFlow::Break(())
+                            }
+                        },
+                        Ok(None) => ControlFlow::Continue(()),
+                        Err(error) => {
+                            failure = Some(RelationalVisitError::Runtime(error));
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Visits committed relational rows in descending primary-key order.
+    ///
+    /// The physical mirror of [`Self::visit_relational_range_at`] over the
+    /// reverse B+tree walk; visibility, decoding, and failure classes are
+    /// identical.
+    pub(crate) fn visit_relational_range_at_reverse<E>(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), RelationalVisitError<E>> {
+        let (tree, prefix) = self
+            .relational_table_tree_at(snapshot, table)
+            .map_err(RelationalVisitError::Runtime)?;
+        let lower = map_primary_key_bound(table, lower);
+        let upper = map_primary_key_bound(table, upper);
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut failure = None;
+        let _outcome = tree
+            .visit_prefix_range_cached_reverse(
                 &self.pages,
                 &self.buffer_pool,
                 &prefix,
@@ -17153,7 +17241,7 @@ impl NativeDatabase {
                 .saturating_add(DELTA_ENGINE_CONTAINER_OVERHEAD),
         )
         .map_err(SqlError::from)?;
-        let dml = sql::TransactionDml::parse(statement)?;
+        let dml = sql::TransactionDml::parse_single_row(statement)?;
         let relation_rollback = self
             .hydrate_delta_relation(batch, dml.relation_name()?)
             .map_err(SqlError::from)?;
@@ -30064,7 +30152,7 @@ fn decode_lexical_segment(
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
     let mut live_postings = 0_u64;
     let mut contributions = Vec::with_capacity(work.segment.entry_count());
-    for (key, encoded_frequency) in tree.scan_planned_segment(pages, &work.segment)? {
+    for (key, encoded_frequency) in tree.scan_planned_segment_cached(pages, pool, &work.segment)? {
         let document_id = key
             .strip_prefix(work.posting_prefix.as_slice())
             .ok_or(NativeRuntimeError::InvalidSearchTree)?
@@ -31861,6 +31949,7 @@ fn structure_root_after_mutations(
         .root()),
         StructureFormat::BTreeV3 => Ok(structure_v3::apply_structure_mutations_v3(
             pages,
+            context.buffer_pool,
             BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?),
             creating_csn,
             context.transaction_id,
@@ -32360,24 +32449,54 @@ fn search_tree_after_mutations(
             )?
             .tree;
     }
-    for mutation in mutations.iter().filter(|mutation| {
-        mutation.engine == EngineKind::Search
-            && matches!(
-                mutation.opcode,
-                Opcode::CreateIndex
-                    | Opcode::IndexDocument
-                    | Opcode::ReplaceDocument
-                    | Opcode::DeleteDocument
-            )
-    }) {
-        tree = apply_search_tree_mutation(
-            pages,
-            blobs,
-            tree,
-            creating_csn,
-            mutation,
-            blob_references,
-        )?;
+    let search_mutations: Vec<&Mutation> = mutations
+        .iter()
+        .filter(|mutation| {
+            mutation.engine == EngineKind::Search
+                && matches!(
+                    mutation.opcode,
+                    Opcode::CreateIndex
+                        | Opcode::IndexDocument
+                        | Opcode::ReplaceDocument
+                        | Opcode::DeleteDocument
+                )
+        })
+        .collect();
+    // Consecutive document insertions coalesce into one copy-on-write batch:
+    // every touched leaf and internal path is rewritten once per run instead
+    // of once per document, which removes the dominant ingest write
+    // amplification while preserving the exact logical tree contents and the
+    // fail-closed per-document validations in order.
+    let mut cursor = 0;
+    while cursor < search_mutations.len() {
+        let mutation = search_mutations[cursor];
+        if mutation.opcode == Opcode::IndexDocument && mutation.expires_at_micros.is_none() {
+            let mut end = cursor + 1;
+            while end < search_mutations.len()
+                && search_mutations[end].opcode == Opcode::IndexDocument
+                && search_mutations[end].expires_at_micros.is_none()
+            {
+                end += 1;
+            }
+            tree = index_documents_batch_in_search_tree(
+                pages,
+                tree,
+                creating_csn,
+                &search_mutations[cursor..end],
+                blob_references,
+            )?;
+            cursor = end;
+        } else {
+            tree = apply_search_tree_mutation(
+                pages,
+                blobs,
+                tree,
+                creating_csn,
+                mutation,
+                blob_references,
+            )?;
+            cursor += 1;
+        }
     }
     ann_store::apply_tree_mutations(pages, tree, creating_csn, catalog, mutations)
 }
@@ -32447,6 +32566,100 @@ fn apply_search_tree_mutation(
         }
         _ => Err(NativeRuntimeError::InvalidSearchTree),
     }
+}
+
+/// Applies one run of document insertions as a single copy-on-write batch.
+///
+/// Per-document validation order, admitted states, and failure classes are
+/// identical to [`index_document_in_search_tree`]; a run of length one
+/// produces exactly that function's entry set. Runs may span multiple search
+/// indexes. Duplicate document identities inside one run fail closed exactly
+/// like a sequential reinsertion would.
+fn index_documents_batch_in_search_tree(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    mutations: &[&Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let format = physical_search_format(pages, tree)?;
+    let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    // (document_count, total_document_terms) accumulated per index.
+    let mut index_metadata: BTreeMap<ObjectId, (u64, u64)> = BTreeMap::new();
+    // Document frequency accumulated per term key across the run.
+    let mut term_frequencies: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for mutation in mutations {
+        let index = mutation
+            .target
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let text = std::str::from_utf8(&mutation.value)
+            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        validate_search_document_identity(&mutation.key, text)?;
+        if let std::collections::btree_map::Entry::Vacant(vacant) = index_metadata.entry(index) {
+            let metadata = tree
+                .get(pages, &search_index_meta_key(index))?
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            vacant.insert(decode_search_index_metadata(&metadata)?);
+        }
+        let document_key = search_document_key(index, &mutation.key)?;
+        if entries.contains_key(&document_key) {
+            // Same identity twice in one run: a sequential application would
+            // observe the first insertion and fail closed.
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        if let Some(existing) = tree.get(pages, &document_key)?
+            && (!format.admits_tombstones() || !is_search_document_tombstone(&existing))
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let (token_count, frequencies) = search_term_frequencies(text)?;
+        entries.insert(
+            document_key,
+            search_document_storage_value(&mutation.value, token_count, blob_references)?,
+        );
+        for (term, term_frequency) in frequencies {
+            let term_key = search_term_meta_key(index, &term)?;
+            let accumulated = if let Some(previous) = term_frequencies.get(&term_key) {
+                *previous
+            } else {
+                tree.get(pages, &term_key)?
+                    .map(|encoded| decode_live_search_term_metadata(&encoded, format))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(0)
+            };
+            let document_frequency = accumulated
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let posting_key = search_posting_key(index, &term, &mutation.key)?;
+            if let Some(encoded) = tree.get(pages, &posting_key)?
+                && decode_live_search_posting(&encoded, format)?.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            term_frequencies.insert(term_key.clone(), document_frequency);
+            entries.insert(term_key, encode_search_term_metadata(document_frequency));
+            entries.insert(posting_key, encode_search_posting(term_frequency));
+        }
+        let (document_count, total_document_terms) = index_metadata
+            .get_mut(&index)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        *document_count = document_count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        *total_document_terms = total_document_terms
+            .checked_add(token_count)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    }
+    for (index, (document_count, total_document_terms)) in index_metadata {
+        entries.insert(
+            search_index_meta_key(index),
+            encode_search_index_metadata(document_count, total_document_terms),
+        );
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
 }
 
 fn index_document_in_search_tree(
