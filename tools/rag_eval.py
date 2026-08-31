@@ -150,29 +150,44 @@ def run_binary(binary: Path, arguments: list[str], timeout: int = 600) -> dict:
     return json.loads(completed.stdout)
 
 
-def provision(binary: Path, data_dir: Path, dimension: int) -> None:
+def provision(
+    binary: Path,
+    data_dir: Path,
+    dimension: int,
+    analyzer_flags: list[str] | None = None,
+    bm25_k1_micros: int | None = None,
+    bm25_b_micros: int | None = None,
+) -> None:
     run_binary(binary, ["init", "--data-dir", str(data_dir)])
-    run_binary(
-        binary,
-        [
-            "catalog",
-            "--data-dir",
-            str(data_dir),
-            "create-search-collection",
-            "--database",
-            "10",
-            "--schema",
-            "11",
-            "--collection",
-            "13",
-            "--analyzer",
-            "12",
-            "--name",
-            "main.public.rag_eval",
-            "--dimension",
-            str(dimension),
-        ],
-    )
+    arguments = [
+        "catalog",
+        "--data-dir",
+        str(data_dir),
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.rag_eval",
+        "--dimension",
+        str(dimension),
+    ]
+    arguments.extend(analyzer_flags or [])
+    if bm25_k1_micros is not None and bm25_b_micros is not None:
+        arguments.extend(
+            [
+                "--bm25-k1-micros",
+                str(bm25_k1_micros),
+                "--bm25-b-micros",
+                str(bm25_b_micros),
+            ]
+        )
+    run_binary(binary, arguments)
     run_binary(
         binary,
         ["search", "--data-dir", str(data_dir), "provision", "--collection", "13"],
@@ -376,6 +391,9 @@ def evaluate(
     fusion: str | None,
     rerank_candidates: int,
     lexical_only: bool,
+    analyzer_flags: list[str] | None = None,
+    bm25_k1_micros: int | None = None,
+    bm25_b_micros: int | None = None,
 ) -> dict:
     extracted = acquire_dataset(dataset, data_root, download)
     corpus = load_jsonl(extracted / "corpus.jsonl")
@@ -428,7 +446,14 @@ def evaluate(
                 corpus_vectors.extend(vectors)
                 corpus_attestations.append(attestation)
             embed_dimension = len(corpus_vectors[0]) if corpus_vectors else 2
-        provision(binary, data_dir, embed_dimension)
+        provision(
+            binary,
+            data_dir,
+            embed_dimension,
+            analyzer_flags,
+            bm25_k1_micros,
+            bm25_b_micros,
+        )
         process, endpoint = start_daemon(binary, data_dir)
         try:
             client = HyphaeClient.local(str(endpoint))
@@ -572,6 +597,9 @@ def evaluate(
             ),
             "transport": "local-uds-daemon",
             "ingest_order": "sorted-corpus-id",
+            "analyzer_flags": sorted(analyzer_flags or []),
+            "bm25_k1_micros": bm25_k1_micros,
+            "bm25_b_micros": bm25_b_micros,
         },
         "host": host_declaration(),
         "cost": {
@@ -620,8 +648,28 @@ def main() -> int:
         help="run a checkpoint+vacuum cycle after every N ingest batches"
         " (0 keeps the single post-ingest cycle)",
     )
+    parser.add_argument(
+        "--analyzer-english-stop",
+        action="store_true",
+        help="add frozen English stop-word removal to the collection analyzer",
+    )
+    parser.add_argument(
+        "--analyzer-english-stem",
+        action="store_true",
+        help="add frozen English Porter stemming to the collection analyzer",
+    )
+    parser.add_argument(
+        "--analyzer-ascii-folding",
+        action="store_true",
+        help="add frozen Latin diacritic folding to the collection analyzer",
+    )
+    parser.add_argument("--bm25-k1-micros", type=int, default=None)
+    parser.add_argument("--bm25-b-micros", type=int, default=None)
     parser.add_argument("--output", type=Path, default=None)
     arguments = parser.parse_args()
+    if (arguments.bm25_k1_micros is None) != (arguments.bm25_b_micros is None):
+        print("error: both BM25 parameters must be supplied together", file=sys.stderr)
+        return 1
     if not arguments.binary.is_file():
         print(f"error: binary is missing: {arguments.binary}", file=sys.stderr)
         return 1
@@ -653,6 +701,17 @@ def main() -> int:
             arguments.fusion,
             arguments.rerank_candidates,
             arguments.lexical_only,
+            [
+                flag
+                for flag, enabled in [
+                    ("--analyzer-english-stop", arguments.analyzer_english_stop),
+                    ("--analyzer-english-stem", arguments.analyzer_english_stem),
+                    ("--analyzer-ascii-folding", arguments.analyzer_ascii_folding),
+                ]
+                if enabled
+            ],
+            arguments.bm25_k1_micros,
+            arguments.bm25_b_micros,
         )
     except (HarnessError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         print(f"error: {error}", file=sys.stderr)
