@@ -771,3 +771,28 @@ detectable.
   commit. Staging remains in the microsecond domain; memory and strict commit
   remain in milliseconds. The receipt exposes that deficit and is not a
   regression threshold or G0/G1/G5/G6/G7 closure.
+
+## 2026-08-30/31 dedicated-hardware, optimization, memory, and rerun series
+
+Five narrative documents with their raw-receipt directories. Every raw
+receipt is verbatim harness output (`local-diagnostic`, no publication
+authority); the narratives carry the scope, environment class, and honest
+non-claims.
+
+- [`baseline-i7i-metal-2026-08-30.md`](baseline-i7i-metal-2026-08-30.md):
+  first dedicated-hardware baselines (SQLite/DuckDB/Redis/Tantivy) plus the
+  TLC model-checking run of the commit protocol; raw suite receipts are the
+  sibling `baseline-i7i-metal-*.json` files.
+- [`phase1-optimization-2026-08-30.md`](phase1-optimization-2026-08-30.md):
+  hot-path optimization before/after with the interleaved B-A-B-A series;
+  raw receipts in [`phase1/`](phase1/).
+- [`agent-memory-sweep-2026-08-30.md`](agent-memory-sweep-2026-08-30.md):
+  LoCoMo candidate sweep with nested LOCO-CV selection and the LongMemEval
+  official-denominator run; raw receipts in
+  [`memory-2026-08-30/`](memory-2026-08-30/).
+- [`weaviate-139-lexical-rerun-2026-08-30.md`](weaviate-139-lexical-rerun-2026-08-30.md)
+  and
+  [`weaviate-139-hybrid-rerun-2026-08-31.md`](weaviate-139-hybrid-rerun-2026-08-31.md):
+  same-host reruns against Weaviate 1.39.0, including the honest finding
+  that 1.39 repaired the BM25 weakness measured in 1.38; raw receipts in
+  [`memory-2026-08-30/`](memory-2026-08-30/).

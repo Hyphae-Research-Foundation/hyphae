@@ -1,0 +1,210 @@
+{
+  "benchmark": "hyphae-baseline-harness-v1",
+  "environment": {
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz",
+    "hypervisor_flag": true,
+    "kernel": "6.8.0-124-generic",
+    "logical_cpus": 16,
+    "os": "linux",
+    "scaling_governor": null
+  },
+  "results": {
+    "sql": {
+      "duckdb": {
+        "durability": "default durable WAL (OLAP reference point)",
+        "engine": "duckdb",
+        "load": {
+          "label": "load_batch_1000",
+          "latency_nanos": {
+            "max": 292905103,
+            "mean": 175833054,
+            "p50": 181465145,
+            "p95": 208163275,
+            "p99": 221491175,
+            "p999": 247743423
+          },
+          "operations": 1000,
+          "ops_per_second": 5.687198324330406,
+          "wall_nanos": 175833502363
+        },
+        "point_select": {
+          "label": "point_select_prepared",
+          "latency_nanos": {
+            "max": 3862762,
+            "mean": 428502,
+            "p50": 420749,
+            "p95": 497994,
+            "p99": 526794,
+            "p999": 614431
+          },
+          "operations": 200000,
+          "ops_per_second": 2332.776300065383,
+          "wall_nanos": 85734753047
+        },
+        "point_update_batched": {
+          "label": "point_update_batched_100",
+          "latency_nanos": {
+            "max": 62255028,
+            "mean": 50141769,
+            "p50": 50189648,
+            "p95": 53777901,
+            "p99": 55175345,
+            "p999": 57403170
+          },
+          "operations": 1000,
+          "ops_per_second": 19.94301231660749,
+          "wall_nanos": 50142876318
+        },
+        "point_update_strict": {
+          "label": "point_update_strict",
+          "latency_nanos": {
+            "max": 8286660,
+            "mean": 2159636,
+            "p50": 2106372,
+            "p95": 2581390,
+            "p99": 3019266,
+            "p999": 5281751
+          },
+          "operations": 10000,
+          "ops_per_second": 463.0050782049724,
+          "wall_nanos": 21598035250
+        },
+        "read_checksum": 200000,
+        "version": "v1.5.5"
+      },
+      "hyphae": {
+        "durability": "strict per commit (WAL fsync)",
+        "engine": "hyphae-native",
+        "load": {
+          "label": "load_batch_1000",
+          "latency_nanos": {
+            "max": 1217366594,
+            "mean": 672433339,
+            "p50": 678223229,
+            "p95": 780603369,
+            "p99": 1105725249,
+            "p999": 1212611383
+          },
+          "operations": 1000,
+          "ops_per_second": 1.4871349578789876,
+          "wall_nanos": 672433927198
+        },
+        "point_select": {
+          "label": "point_select_prepared",
+          "latency_nanos": {
+            "max": 43051260,
+            "mean": 219556,
+            "p50": 96243,
+            "p95": 465837,
+            "p99": 653457,
+            "p999": 898755
+          },
+          "operations": 200000,
+          "ops_per_second": 4550.2875721772825,
+          "wall_nanos": 43953265992
+        },
+        "point_update_batched": {
+          "label": "point_update_batched_100",
+          "latency_nanos": {
+            "max": 186189024,
+            "mean": 89668913,
+            "p50": 88457976,
+            "p95": 98121095,
+            "p99": 113506899,
+            "p999": 160498789
+          },
+          "operations": 1000,
+          "ops_per_second": 11.152004618896946,
+          "wall_nanos": 89669977208
+        },
+        "point_update_strict": {
+          "label": "point_update_strict",
+          "latency_nanos": {
+            "max": 21784236,
+            "mean": 4604225,
+            "p50": 4529513,
+            "p95": 5203327,
+            "p99": 6558660,
+            "p999": 11761086
+          },
+          "operations": 10000,
+          "ops_per_second": 217.18272065594178,
+          "wall_nanos": 46044178698
+        },
+        "read_checksum": 200000
+      },
+      "sqlite": {
+        "durability": "WAL + synchronous=FULL",
+        "engine": "sqlite",
+        "load": {
+          "label": "load_batch_1000",
+          "latency_nanos": {
+            "max": 15137139,
+            "mean": 2863628,
+            "p50": 2501600,
+            "p95": 3878781,
+            "p99": 13286082,
+            "p999": 15104672
+          },
+          "operations": 1000,
+          "ops_per_second": 349.1935775898177,
+          "wall_nanos": 2863741100
+        },
+        "point_select": {
+          "label": "point_select_prepared",
+          "latency_nanos": {
+            "max": 139711,
+            "mean": 5682,
+            "p50": 5596,
+            "p95": 6096,
+            "p99": 8896,
+            "p999": 18716
+          },
+          "operations": 200000,
+          "ops_per_second": 174505.06237266384,
+          "wall_nanos": 1146098556
+        },
+        "point_update_batched": {
+          "label": "point_update_batched_100",
+          "latency_nanos": {
+            "max": 30248104,
+            "mean": 5463009,
+            "p50": 3150887,
+            "p95": 26016279,
+            "p99": 27454242,
+            "p999": 30055767
+          },
+          "operations": 1000,
+          "ops_per_second": 183.01085932926887,
+          "wall_nanos": 5464156628
+        },
+        "point_update_strict": {
+          "label": "point_update_strict",
+          "latency_nanos": {
+            "max": 103246276,
+            "mean": 1168036,
+            "p50": 1206532,
+            "p95": 1344076,
+            "p99": 2053775,
+            "p999": 20245140
+          },
+          "operations": 10000,
+          "ops_per_second": 856.0710267440711,
+          "wall_nanos": 11681273735
+        },
+        "read_checksum": 200000,
+        "version": "3.50.2"
+      },
+      "workload": {
+        "batched_updates": 100000,
+        "point_reads": 200000,
+        "rows": 1000000,
+        "seed": 6840158756763402241,
+        "strict_updates": 10000
+      }
+    }
+  },
+  "rustc": "",
+  "source_commit": "phase1-optimized"
+}

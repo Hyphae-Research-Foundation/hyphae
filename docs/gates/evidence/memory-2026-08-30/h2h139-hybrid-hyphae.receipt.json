@@ -1,0 +1,51 @@
+{
+  "cost": {
+    "data_directory_bytes_after_ingest": 596945021,
+    "data_directory_bytes_after_maintenance": 77580435,
+    "ingest_seconds": 262.7,
+    "maintenance_seconds": 427.77,
+    "query_seconds": 94.45
+  },
+  "dataset": {
+    "archive_sha256": "efe5be03f8c5b86a5870102d0599d227c8c6e2484328e68c6522560385671b0b",
+    "documents": 3633,
+    "name": "nfcorpus",
+    "qrels": "qrels/test.tsv",
+    "queries_evaluated": 323
+  },
+  "engine": {
+    "api_version": "v1",
+    "disk_format_version": 2,
+    "engine_version": "2.2.0",
+    "native_directory_format": 1,
+    "product": "hyphae",
+    "product_api_version": 1
+  },
+  "host": {
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8280 CPU @ 2.70GHz",
+    "machine": "x86_64",
+    "platform": "Linux-6.8.0-124-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "metrics": {
+    "mrr@10": 0.577092,
+    "ndcg@10": 0.36192,
+    "recall@10": 0.174458
+  },
+  "protocol": {
+    "analyzer_flags": [],
+    "bm25_b_micros": null,
+    "bm25_k1_micros": null,
+    "branches": "lexical+exact-vector",
+    "candidate_limit": 1000,
+    "embedding_attestations": 15,
+    "fusion": "weighted-reciprocal-rank",
+    "ingest_batch_documents": 256,
+    "ingest_order": "sorted-corpus-id",
+    "k": 10,
+    "maintenance_interval_batches": 12,
+    "rerank": null,
+    "transport": "local-uds-daemon"
+  },
+  "schema": "hyphae-rag-relevance-receipt-v1"
+}

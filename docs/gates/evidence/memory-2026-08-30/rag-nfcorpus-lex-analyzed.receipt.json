@@ -1,0 +1,54 @@
+{
+  "cost": {
+    "data_directory_bytes_after_ingest": 503965798,
+    "data_directory_bytes_after_maintenance": 39020910,
+    "ingest_seconds": 41.84,
+    "maintenance_seconds": 27.99,
+    "query_seconds": 1.21
+  },
+  "dataset": {
+    "archive_sha256": "efe5be03f8c5b86a5870102d0599d227c8c6e2484328e68c6522560385671b0b",
+    "documents": 3633,
+    "name": "nfcorpus",
+    "qrels": "qrels/test.tsv",
+    "queries_evaluated": 323
+  },
+  "engine": {
+    "api_version": "v1",
+    "disk_format_version": 2,
+    "engine_version": "2.2.0",
+    "native_directory_format": 1,
+    "product": "hyphae",
+    "product_api_version": 1
+  },
+  "host": {
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8559C",
+    "machine": "x86_64",
+    "platform": "Linux-7.0.0-1011-aws-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "metrics": {
+    "mrr@10": 0.527737,
+    "ndcg@10": 0.322942,
+    "recall@10": 0.152971
+  },
+  "protocol": {
+    "analyzer_flags": [
+      "--analyzer-english-stem",
+      "--analyzer-english-stop"
+    ],
+    "bm25_b_micros": null,
+    "bm25_k1_micros": null,
+    "branches": "lexical",
+    "candidate_limit": 1000,
+    "embedding_attestations": 0,
+    "fusion": "weighted-reciprocal-rank",
+    "ingest_batch_documents": 256,
+    "ingest_order": "sorted-corpus-id",
+    "k": 10,
+    "maintenance_interval_batches": 0,
+    "rerank": null,
+    "transport": "local-uds-daemon"
+  },
+  "schema": "hyphae-rag-relevance-receipt-v1"
+}
