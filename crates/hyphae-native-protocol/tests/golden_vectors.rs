@@ -551,6 +551,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 candidate_limit: 8,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -680,6 +681,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     candidate_limit: 4,
                     weight: 1,
                     operator: None,
+                    prefix: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -730,6 +732,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -779,6 +782,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -831,6 +835,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     candidate_limit: 4,
                     weight: 1,
                     operator: None,
+                    prefix: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2295,6 +2300,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2342,6 +2348,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                     candidate_limit: 4,
                     weight: 1,
                     operator: None,
+                    prefix: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2402,6 +2409,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -2467,6 +2475,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                     candidate_limit: 4,
                     weight: 1,
                     operator: None,
+                    prefix: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2684,6 +2693,7 @@ fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn s
                     candidate_limit: 4,
                     weight: 1,
                     operator,
+                    prefix: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2739,5 +2749,60 @@ fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn s
     let length = forged.len();
     forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |prefix| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust dat".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(false), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| !lexical.prefix)
+    ));
+    let gated = request(true);
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.prefix)
+    ));
     Ok(())
 }

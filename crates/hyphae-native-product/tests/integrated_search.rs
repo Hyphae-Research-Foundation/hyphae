@@ -315,6 +315,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -428,6 +429,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 candidate_limit: 4,
                 weight: 2,
                 operator: None,
+                prefix: false,
             }),
             vectors: vec![
                 ProductVectorBranch {
@@ -623,6 +625,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 4,
             weight: 2,
             operator: None,
+            prefix: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "semantic".into(),
@@ -816,6 +819,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1214,6 +1218,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::In {
@@ -1261,6 +1266,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -1307,6 +1313,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -1423,6 +1430,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                         candidate_limit: 4,
                         weight: 1,
                         operator: None,
+                        prefix: false,
                     }),
                     vectors: Vec::new(),
                     filter: ProductSearchFilter::MatchAll,
@@ -1585,6 +1593,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
             candidate_limit: 8,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -1704,6 +1713,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
             candidate_limit: 16,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1788,6 +1798,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1875,6 +1886,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2019,6 +2031,7 @@ fn lexical_ranking(
                 candidate_limit: 4,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2132,6 +2145,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
                 candidate_limit: 10,
                 weight: 1,
                 operator: None,
+                prefix: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2270,6 +2284,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -2400,6 +2415,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2501,6 +2517,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
             candidate_limit: 8,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -2608,6 +2625,7 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
             candidate_limit: 4,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2881,6 +2899,7 @@ fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
             candidate_limit: 8,
             weight: 1,
             operator,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2956,6 +2975,72 @@ fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
     );
     let Err(error) = error else {
         return Err("zero minimum_match was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn std::error::Error>>
+{
+    let path = temporary("lexical-prefix");
+    let (mut product, binding) = configure(&path)?;
+    // Terms: database, hardware, rust, garden, tools, engine, field, guide.
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |query: &str, prefix| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // "gar" matches nothing exactly, but expands to "garden".
+    let exact = product.search_collection(binding.collection, &request("gar", false), 7)?;
+    assert!(exact.hits.is_empty());
+    let expanded = product.search_collection(binding.collection, &request("gar", true), 7)?;
+    assert_eq!(
+        expanded
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![204],
+    );
+    // Earlier terms stay exact: "rust gu" expands only the final term.
+    let mixed = product.search_collection(binding.collection, &request("rust gu", true), 7)?;
+    let ids: Vec<u128> = mixed.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert!(ids.contains(&202));
+    // A prefix with no expansion leaves the branch empty.
+    let none = product.search_collection(binding.collection, &request("zzz", true), 7)?;
+    assert!(none.hits.is_empty());
+    // Prefix and operator together fail closed.
+    let mut conflicted = request("rust", true);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.operator = Some(hyphae_native_product::ProductLexicalOperator::And);
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("prefix+operator was admitted".into());
     };
     assert_eq!(
         error.code(),

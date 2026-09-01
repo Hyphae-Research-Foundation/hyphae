@@ -450,6 +450,7 @@ fn search_request() -> ProductSearchRequest {
             candidate_limit: 8,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,

@@ -1099,7 +1099,8 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             candidate_limit: 8,
             weight: 1,
                     operator: None,
-        }
+                            prefix: false,
+                }
     });
     let targets: &[&str] = match mode {
         "exact" => &["exact"],

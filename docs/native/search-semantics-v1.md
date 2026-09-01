@@ -157,6 +157,17 @@ unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
 
+The lexical branch may declare prefix expansion: the final analyzed
+query term is treated as a prefix and expands to every distinct indexed
+term starting with it, then the branch scores ordinary BM25 over the
+expanded OR of terms (earlier query terms stay exact). Expansion scans
+the bounded committed corpus of the collection (within the collection
+document ceiling) and admits at most 64 distinct expanded terms
+(`MAX_LEXICAL_PREFIX_TERMS`); more distinct matches fail closed as
+limit-exceeded rather than answering from a truncated vocabulary. A
+prefix with no expansion leaves the branch empty. Prefix expansion and
+the term operator are mutually exclusive in one request.
+
 The lexical branch may declare an optional term operator. The default
 (absent) keeps pure OR semantics: any analyzed query term admits a
 candidate. `And` admits only candidates containing every distinct

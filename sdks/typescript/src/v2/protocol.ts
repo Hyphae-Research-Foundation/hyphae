@@ -1535,7 +1535,11 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
 
 function encodeLexicalOperator(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {
   const operator = lexical?.operator as Readonly<Record<string, unknown>> | string | undefined;
-  if (operator === undefined || operator === null) return [];
+  if (operator === undefined || operator === null) {
+    if (lexical?.prefix === true) return [Uint8Array.of(9, 2)];
+    return [];
+  }
+  if (lexical?.prefix === true) throw new ClientError("lexical prefix excludes the operator");
   if (operator === "and") return [Uint8Array.of(9, 0)];
   if (typeof operator === "object" && typeof operator.minimum_match === "number") {
     return [join(Uint8Array.of(9, 1), u32(Number(operator.minimum_match)))];

@@ -151,7 +151,14 @@ pub struct ProductLexicalBranch {
     pub weight: u32,
     /// Optional term-admission operator. Absent keeps pure OR semantics.
     pub operator: Option<ProductLexicalOperator>,
+    /// Treat the final analyzed query term as a prefix and expand it to
+    /// every distinct indexed term starting with it (bounded). Mutually
+    /// exclusive with `operator`.
+    pub prefix: bool,
 }
+
+/// Maximum distinct terms one prefix may expand to.
+pub const MAX_LEXICAL_PREFIX_TERMS: usize = 64;
 
 /// Maximum `minimum_match` distinct terms in one lexical operator.
 pub const MAX_LEXICAL_MINIMUM_MATCH: usize = 64;
@@ -1467,6 +1474,37 @@ impl NativeProduct {
     }
 }
 
+/// Rewrites the final analyzed query term as its bounded prefix
+/// expansion; earlier terms stay exact. No expansion leaves the branch
+/// query empty (scoring nothing); overflow fails closed.
+fn expand_prefix_query(
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+) -> Result<String, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let Some(last) = analysis.tokens.last() else {
+        return Ok(String::new());
+    };
+    let expansion =
+        match snapshot
+            .inner
+            .search_expand_term_prefix(index, &last.term, MAX_LEXICAL_PREFIX_TERMS)
+        {
+            hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
+                return Err(invalid_request());
+            }
+            hyphae_native_runtime::TermPrefixExpansion::Overflow => return Err(limit_exceeded()),
+            hyphae_native_runtime::TermPrefixExpansion::Terms(terms) => terms,
+        };
+    let mut terms: Vec<&str> = analysis.tokens[..analysis.tokens.len() - 1]
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    terms.extend(expansion.iter().map(String::as_str));
+    Ok(terms.join(" "))
+}
+
 /// Per-term membership sets and the required distinct-match minimum.
 type LexicalMembership = (Vec<BTreeSet<crate::ObjectId>>, usize);
 
@@ -1553,6 +1591,11 @@ fn execute_lexical_branch(
     let query = match transform {
         None => lexical.query.clone(),
         Some(transform) => transform.apply(&lexical.query),
+    };
+    let query = if lexical.prefix {
+        expand_prefix_query(snapshot, index, &query)?
+    } else {
+        query
     };
     let query = query.as_str();
     // The durable posting scorer is bit-identical to the retained model; a
@@ -2089,6 +2132,7 @@ fn validate_search_request(
     if let Some(lexical) = &request.lexical
         && (!(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
             || lexical.weight == 0
+            || (lexical.prefix && lexical.operator.is_some())
             || matches!(
                 lexical.operator,
                 Some(ProductLexicalOperator::Or { minimum_match })

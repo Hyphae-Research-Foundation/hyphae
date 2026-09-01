@@ -1134,6 +1134,9 @@ enum SearchCommand {
         /// Minimum distinct analyzed terms a candidate must contain.
         #[arg(long)]
         minimum_match: Option<usize>,
+        /// Expand the final analyzed query term as a bounded prefix.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match"])]
+        lexical_prefix: bool,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3714,6 +3717,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             range_facets_json,
             lexical_and,
             minimum_match,
+            lexical_prefix,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3756,6 +3760,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                     }
                                 })
                             },
+                            prefix: lexical_prefix,
                         }),
                         vectors,
                         filter: filter_json

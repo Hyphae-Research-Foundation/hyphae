@@ -1608,6 +1608,7 @@ async fn memory_store(
 /// lifecycle key still lives — expired or forgotten memories never return.
 /// With `prove`, the retrieval itself is sealed and the artifacts ride the
 /// response; the lifecycle filter is applied after the proved search.
+#[allow(clippy::too_many_lines)]
 async fn memory_recall(
     client: &HyphaeClient,
     input: MemoryRecallInput,
@@ -1623,6 +1624,7 @@ async fn memory_recall(
             candidate_limit: 1_000,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2034,6 +2036,7 @@ async fn profile_memory_recall(
             candidate_limit: 1_000,
             weight: 1,
             operator: None,
+            prefix: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::All(clauses),
@@ -2509,6 +2512,7 @@ pub(crate) fn collection_search_request(
             candidate_limit: branch.candidate_limit,
             weight: branch.weight,
             operator: None,
+            prefix: false,
         }),
         vectors: input
             .vectors

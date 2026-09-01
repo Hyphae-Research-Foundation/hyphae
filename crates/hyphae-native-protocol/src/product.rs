@@ -1164,7 +1164,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let operator = if request
         .lexical
         .as_ref()
-        .is_some_and(|lexical| lexical.operator.is_some())
+        .is_some_and(|lexical| lexical.operator.is_some() || lexical.prefix)
     {
         6
     } else {
@@ -5555,18 +5555,19 @@ fn encode_search_collection(
             encoded.extend_from_slice(&cutoff.bits().to_le_bytes());
         }
     }
-    if let Some(operator) = request
-        .lexical
-        .as_ref()
-        .and_then(|lexical| lexical.operator)
-    {
-        encoded.push(9);
-        match operator {
-            hyphae_native_product::ProductLexicalOperator::And => encoded.push(0),
-            hyphae_native_product::ProductLexicalOperator::Or { minimum_match } => {
-                encoded.push(1);
-                put_u32(encoded, minimum_match)?;
+    if let Some(lexical) = request.lexical.as_ref() {
+        if let Some(operator) = lexical.operator {
+            encoded.push(9);
+            match operator {
+                hyphae_native_product::ProductLexicalOperator::And => encoded.push(0),
+                hyphae_native_product::ProductLexicalOperator::Or { minimum_match } => {
+                    encoded.push(1);
+                    put_u32(encoded, minimum_match)?;
+                }
             }
+        } else if lexical.prefix {
+            encoded.push(9);
+            encoded.push(2);
         }
     }
     Ok(())
@@ -5588,6 +5589,7 @@ fn decode_search_collection(
                 candidate_limit: decoder.usize()?,
                 weight: decoder.u32()?,
                 operator: None,
+                prefix: false,
             })
         })
         .transpose()?;
@@ -5839,8 +5841,11 @@ fn decode_search_collection(
                 }
             }
             9 => {
-                let operator = match decoder.u8()? {
-                    0 => hyphae_native_product::ProductLexicalOperator::And,
+                let branch = lexical.as_mut().ok_or(ProductCodecError::InvalidValue)?;
+                match decoder.u8()? {
+                    0 => {
+                        branch.operator = Some(hyphae_native_product::ProductLexicalOperator::And);
+                    }
                     1 => {
                         let minimum_match = decoder.usize_u32()?;
                         if !(1..=hyphae_native_product::MAX_LEXICAL_MINIMUM_MATCH)
@@ -5848,14 +5853,13 @@ fn decode_search_collection(
                         {
                             return Err(ProductCodecError::InvalidValue);
                         }
-                        hyphae_native_product::ProductLexicalOperator::Or { minimum_match }
+                        branch.operator = Some(hyphae_native_product::ProductLexicalOperator::Or {
+                            minimum_match,
+                        });
                     }
+                    2 => branch.prefix = true,
                     _ => return Err(ProductCodecError::InvalidValue),
-                };
-                lexical
-                    .as_mut()
-                    .ok_or(ProductCodecError::InvalidValue)?
-                    .operator = Some(operator);
+                }
             }
             _ => return Err(ProductCodecError::InvalidValue),
         }

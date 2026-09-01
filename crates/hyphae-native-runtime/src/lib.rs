@@ -1674,6 +1674,17 @@ fn hash_field_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<HashFieldEntry> {
         .collect()
 }
 
+/// Result of one bounded analyzed term-prefix expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TermPrefixExpansion {
+    /// The lexical index does not exist.
+    UnknownIndex,
+    /// More distinct terms matched than the caller's bound admits.
+    Overflow,
+    /// Every distinct matching term, ascending.
+    Terms(Vec<String>),
+}
+
 /// One bounded glob page of visible top-level keys across families.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyScanPage {
@@ -3799,6 +3810,33 @@ impl NativeSnapshot {
     }
 
     /// Returns the exact retained source text for one physical lexical index.
+    /// Expands one analyzed term prefix to every distinct indexed term of
+    /// the collection, ascending, bounded by `limit`.
+    pub fn search_expand_term_prefix(
+        &self,
+        index: ObjectId,
+        prefix: &str,
+        limit: usize,
+    ) -> TermPrefixExpansion {
+        let Some(documents) = self.state.search.documents(index) else {
+            return TermPrefixExpansion::UnknownIndex;
+        };
+        let mut terms = BTreeSet::new();
+        for text in documents.values() {
+            let analysis = CanonicalAnalyzer::analyze(text);
+            for token in &analysis.tokens {
+                if token.term.starts_with(prefix) && !terms.contains(&token.term) {
+                    if terms.len() == limit {
+                        return TermPrefixExpansion::Overflow;
+                    }
+                    terms.insert(token.term.clone());
+                }
+            }
+        }
+        TermPrefixExpansion::Terms(terms.into_iter().collect())
+    }
+
+    /// Returns every retained document of one lexical index.
     pub fn search_documents(&self, index: ObjectId) -> Option<Vec<(Vec<u8>, String)>> {
         self.state.search.documents(index).map(|documents| {
             documents
