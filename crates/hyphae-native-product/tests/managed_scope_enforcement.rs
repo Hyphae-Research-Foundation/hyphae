@@ -451,6 +451,7 @@ fn search_request() -> ProductSearchRequest {
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,

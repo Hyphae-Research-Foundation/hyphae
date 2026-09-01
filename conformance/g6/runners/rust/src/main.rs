@@ -1100,7 +1100,8 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             weight: 1,
                     operator: None,
                             prefix: false,
-                }
+                                            fields: Vec::new(),
+                        }
     });
     let targets: &[&str] = match mode {
         "exact" => &["exact"],

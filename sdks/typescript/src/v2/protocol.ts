@@ -1530,7 +1530,21 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...encodeRangeFacets(request.range_facets),
     ...encodeDistanceCutoffs(request.vectors as ReadonlyArray<Readonly<Record<string, unknown>>>),
     ...encodeLexicalOperator(lexical),
+    ...encodeFieldBoosts(lexical),
   );
+}
+
+function encodeFieldBoosts(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {
+  const fields = lexical?.fields as ReadonlyArray<Readonly<Record<string, unknown>>> | undefined;
+  if (fields === undefined || fields === null || fields.length === 0) return [];
+  return [join(
+    Uint8Array.of(10),
+    u32(fields.length),
+    ...fields.flatMap((boost) => [
+      bytes(new TextEncoder().encode(String(boost.field))),
+      u32(Number(boost.weight_micros)),
+    ]),
+  )];
 }
 
 function encodeLexicalOperator(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {

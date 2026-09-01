@@ -1625,6 +1625,7 @@ async fn memory_recall(
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2037,6 +2038,7 @@ async fn profile_memory_recall(
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::All(clauses),
@@ -2513,6 +2515,7 @@ pub(crate) fn collection_search_request(
             weight: branch.weight,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: input
             .vectors

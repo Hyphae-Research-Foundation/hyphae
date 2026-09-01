@@ -1161,11 +1161,9 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     } else {
         0
     };
-    let operator = if request
-        .lexical
-        .as_ref()
-        .is_some_and(|lexical| lexical.operator.is_some() || lexical.prefix)
-    {
+    let operator = if request.lexical.as_ref().is_some_and(|lexical| {
+        lexical.operator.is_some() || lexical.prefix || !lexical.fields.is_empty()
+    }) {
         6
     } else {
         0
@@ -5569,6 +5567,14 @@ fn encode_search_collection(
             encoded.push(9);
             encoded.push(2);
         }
+        if !lexical.fields.is_empty() {
+            encoded.push(10);
+            put_u32(encoded, lexical.fields.len())?;
+            for boost in &lexical.fields {
+                put_text(encoded, &boost.field)?;
+                encoded.extend_from_slice(&boost.weight_micros.to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -5590,6 +5596,7 @@ fn decode_search_collection(
                 weight: decoder.u32()?,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             })
         })
         .transpose()?;
@@ -5859,6 +5866,29 @@ fn decode_search_collection(
                     }
                     2 => branch.prefix = true,
                     _ => return Err(ProductCodecError::InvalidValue),
+                }
+            }
+            10 => {
+                let branch = lexical.as_mut().ok_or(ProductCodecError::InvalidValue)?;
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let weight_micros = decoder.u32()?;
+                    if weight_micros == 0
+                        || weight_micros
+                            > hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS
+                    {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    branch
+                        .fields
+                        .push(hyphae_native_product::ProductLexicalFieldBoost {
+                            field,
+                            weight_micros,
+                        });
                 }
             }
             _ => return Err(ProductCodecError::InvalidValue),

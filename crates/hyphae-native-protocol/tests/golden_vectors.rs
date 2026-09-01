@@ -552,6 +552,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -682,6 +683,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     weight: 1,
                     operator: None,
                     prefix: false,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -733,6 +735,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -783,6 +786,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -836,6 +840,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     weight: 1,
                     operator: None,
                     prefix: false,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2301,6 +2306,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2349,6 +2355,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                     weight: 1,
                     operator: None,
                     prefix: false,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2410,6 +2417,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -2476,6 +2484,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                     weight: 1,
                     operator: None,
                     prefix: false,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2694,6 +2703,7 @@ fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn s
                     weight: 1,
                     operator,
                     prefix: false,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2765,6 +2775,7 @@ fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std
                     weight: 1,
                     operator: None,
                     prefix,
+                    fields: Vec::new(),
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2804,5 +2815,80 @@ fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std
         ProductOperation::SearchCollection { request, .. }
             if request.lexical.as_ref().is_some_and(|lexical| lexical.prefix)
     ));
+    Ok(())
+}
+
+#[test]
+fn field_boosts_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |fields| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(Vec::new()), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fields.is_empty())
+    ));
+    let boosts = vec![
+        hyphae_native_product::ProductLexicalFieldBoost {
+            field: "category".to_owned(),
+            weight_micros: 5_000_000,
+        },
+        hyphae_native_product::ProductLexicalFieldBoost {
+            field: "body".to_owned(),
+            weight_micros: 1_000_000,
+        },
+    ];
+    let gated = request(boosts.clone());
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fields == boosts)
+    ));
+    // A forged zero weight fails closed at decode.
+    let weight = 1_000_000_u32.to_le_bytes();
+    let position = encoded
+        .windows(4)
+        .rposition(|window| window == weight)
+        .ok_or("weight bytes not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 4].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }

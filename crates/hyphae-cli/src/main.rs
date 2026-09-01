@@ -1137,6 +1137,9 @@ enum SearchCommand {
         /// Expand the final analyzed query term as a bounded prefix.
         #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match"])]
         lexical_prefix: bool,
+        /// JSON array of `{field,weight_micros}` BM25F boosts.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix"])]
+        field_boosts_json: Option<String>,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3718,7 +3721,15 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             lexical_and,
             minimum_match,
             lexical_prefix,
+            field_boosts_json,
         } => {
+            let field_boosts = field_boosts_json
+                .map(|value| serde_json::from_str::<Vec<Value>>(&value))
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(product_field_boost)
+                .collect::<Result<Vec<_>, _>>()?;
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
                     target,
@@ -3761,6 +3772,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                 })
                             },
                             prefix: lexical_prefix,
+                            fields: field_boosts.clone(),
                         }),
                         vectors,
                         filter: filter_json
@@ -6530,6 +6542,27 @@ fn product_range_facet(
         })
         .collect::<Result<Vec<_>, CliFailure>>()?;
     Ok(hyphae_native_product::ProductRangeFacetRequest { field, ranges })
+}
+
+fn product_field_boost(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalFieldBoost, CliFailure> {
+    let Value::Object(mut object) = value else {
+        return Err(CliFailure::invalid());
+    };
+    let field = take_string(&mut object, "field")?;
+    let weight_micros = object
+        .remove("weight_micros")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(CliFailure::invalid)?;
+    if !object.is_empty() {
+        return Err(CliFailure::invalid());
+    }
+    Ok(hyphae_native_product::ProductLexicalFieldBoost {
+        field,
+        weight_micros,
+    })
 }
 
 fn product_aggregation(value: Value) -> Result<ProductNamedAggregation, CliFailure> {

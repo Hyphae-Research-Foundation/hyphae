@@ -157,6 +157,21 @@ unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
 
+The lexical branch may declare weighted field boosts: an ordered list of
+`(field, weight)` pairs (weights in micros, `1..=1_000_000_000`; at most
+64 fields) switches the branch from single-field BM25 to versioned BM25F
+over the bounded committed corpus. The reserved field name `body` scores
+the canonical indexed source text; any other name scores the exact
+string doc value of that field (a missing or non-string value reads as
+the empty field). Per-field statistics (document frequency, field
+length, average field length) follow the legacy-equivalent BM25F
+reference with fixed `k1 = 1.2`, `b = 0.75`, nano-quantized scores and
+bytewise document-key tie-breaks. The boosted branch participates in
+fusion exactly like the ordinary branch (scores map to
+`score_nanos / 1e9`). Field boosts are mutually exclusive with the term
+operator and prefix expansion; duplicate field names, unknown non-`body`
+names, zero weights, or an empty analyzed query fail closed.
+
 The lexical branch may declare prefix expansion: the final analyzed
 query term is treated as a prefix and expands to every distinct indexed
 term starting with it, then the branch scores ordinary BM25 over the

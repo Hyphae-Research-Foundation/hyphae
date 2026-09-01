@@ -316,6 +316,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -430,6 +431,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 weight: 2,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: vec![
                 ProductVectorBranch {
@@ -626,6 +628,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             weight: 2,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: vec![ProductVectorBranch {
             target: "semantic".into(),
@@ -771,6 +774,7 @@ fn invalid_batch_is_atomic_and_stream_enforces_backpressure_and_idempotency()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn idempotency_conflicts_and_document_update_delete_survive_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("lifecycle");
@@ -820,6 +824,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1219,6 +1224,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::In {
@@ -1267,6 +1273,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -1314,6 +1321,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -1431,6 +1439,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                         weight: 1,
                         operator: None,
                         prefix: false,
+                        fields: Vec::new(),
                     }),
                     vectors: Vec::new(),
                     filter: ProductSearchFilter::MatchAll,
@@ -1564,6 +1573,7 @@ fn configure_chunked(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn std::error::Error>>
 {
     let path = temporary("chunk-provenance");
@@ -1594,6 +1604,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -1714,6 +1725,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1799,6 +1811,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1887,6 +1900,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2032,6 +2046,7 @@ fn lexical_ranking(
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2146,6 +2161,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
                 weight: 1,
                 operator: None,
                 prefix: false,
+                fields: Vec::new(),
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2285,6 +2301,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -2416,6 +2433,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2518,6 +2536,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -2626,6 +2645,7 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
             weight: 1,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2900,6 +2920,7 @@ fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
             weight: 1,
             operator,
             prefix: false,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2999,6 +3020,7 @@ fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn
             weight: 1,
             operator: None,
             prefix,
+            fields: Vec::new(),
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3041,6 +3063,115 @@ fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn
     let error = product.search_collection(binding.collection, &conflicted, 7);
     let Err(error) = error else {
         return Err("prefix+operator was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn field_boosts_run_bm25f_over_body_and_doc_values() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("field-boosts");
+    let (mut product, binding) = configure(&path)?;
+    // Body vs category: doc 301 says "rust" only in category; doc 302
+    // says it only in body.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            {
+                let mut document =
+                    document(301, "database engine", "rust", 30, [0.0, 0.0], [0.0, 0.0])?;
+                document
+                    .doc_values
+                    .insert("category".into(), ProductDocValue::String("rust".into()));
+                document
+            },
+            document(302, "rust handbook", "book", 10, [1.0, 0.0], [0.0, 1.0])?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |fields| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Single-field BM25 sees only the body: 302 alone matches.
+    let plain = product.search_collection(binding.collection, &request(Vec::new()), 7)?;
+    assert_eq!(
+        plain
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![302],
+    );
+    // Boosting category heavily surfaces 301 first; body keeps 302 present.
+    let boosted = product.search_collection(
+        binding.collection,
+        &request(vec![
+            hyphae_native_product::ProductLexicalFieldBoost {
+                field: "category".into(),
+                weight_micros: 5_000_000,
+            },
+            hyphae_native_product::ProductLexicalFieldBoost {
+                field: "body".into(),
+                weight_micros: 1_000_000,
+            },
+        ]),
+        7,
+    )?;
+    let ids: Vec<u128> = boosted.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids.first().copied(), Some(301));
+    assert!(ids.contains(&302));
+    // Unknown field names fail closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(vec![hyphae_native_product::ProductLexicalFieldBoost {
+            field: "missing".into(),
+            weight_micros: 1_000_000,
+        }]),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("unknown boost field was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    // Boosts exclude the operator and prefix.
+    let mut conflicted = request(vec![hyphae_native_product::ProductLexicalFieldBoost {
+        field: "body".into(),
+        weight_micros: 1_000_000,
+    }]);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.prefix = true;
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("boosts+prefix was admitted".into());
     };
     assert_eq!(
         error.code(),

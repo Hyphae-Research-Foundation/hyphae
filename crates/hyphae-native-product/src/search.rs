@@ -155,7 +155,23 @@ pub struct ProductLexicalBranch {
     /// every distinct indexed term starting with it (bounded). Mutually
     /// exclusive with `operator`.
     pub prefix: bool,
+    /// Ordered weighted field boosts switching the branch to versioned
+    /// BM25F. Empty keeps single-field BM25. Mutually exclusive with
+    /// `operator` and `prefix`.
+    pub fields: Vec<ProductLexicalFieldBoost>,
 }
+
+/// One weighted BM25F field boost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductLexicalFieldBoost {
+    /// `body` for the canonical indexed text, or a string doc-value field.
+    pub field: String,
+    /// Positive weight in micros; one million is a whole weight.
+    pub weight_micros: u32,
+}
+
+/// Reserved field name scoring the canonical indexed source text.
+pub const LEXICAL_BODY_FIELD: &str = "body";
 
 /// Maximum distinct terms one prefix may expand to.
 pub const MAX_LEXICAL_PREFIX_TERMS: usize = 64;
@@ -1198,6 +1214,8 @@ impl NativeProduct {
         let lexical_candidates = execute_lexical_branch(
             &self.database,
             &snapshot,
+            collection,
+            &source,
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
@@ -1330,6 +1348,8 @@ impl NativeProduct {
         let lexical_candidates = execute_lexical_branch(
             &product.database,
             snapshot,
+            collection,
+            &source,
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
@@ -1474,6 +1494,90 @@ impl NativeProduct {
     }
 }
 
+/// Scores the boosted branch with versioned BM25F over the bounded
+/// committed corpus: `body` reads the canonical indexed text, every
+/// other declared field reads its exact string doc value (missing or
+/// non-string reads as the empty field). Nano scores map to
+/// `score_nanos / 1e9` so fusion sees ordinary nonnegative floats.
+fn execute_bm25f_branch(
+    snapshot: &ProductSnapshot,
+    collection: crate::ObjectId,
+    source: &DocumentSource,
+    index: crate::ObjectId,
+    lexical: &ProductLexicalBranch,
+    query: &str,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
+    let corpus = snapshot
+        .inner
+        .search_documents(index)
+        .ok_or_else(invalid_request)?;
+    let mut documents = Vec::with_capacity(corpus.len());
+    for (document_id, body) in corpus {
+        checkpoint()?;
+        let object_id = decode_object_id(&document_id)?;
+        let values = source.values_of(snapshot, collection, object_id)?;
+        let fields = lexical
+            .fields
+            .iter()
+            .map(|boost| {
+                if boost.field == LEXICAL_BODY_FIELD {
+                    body.clone()
+                } else {
+                    match values.get(&boost.field) {
+                        Some(ProductDocValue::String(value)) => value.clone(),
+                        _ => String::new(),
+                    }
+                }
+            })
+            .collect();
+        documents.push(hyphae_native_runtime::bm25f::Bm25fDocument {
+            key: document_id,
+            fields,
+        });
+    }
+    let fields = lexical
+        .fields
+        .iter()
+        .map(|boost| hyphae_native_runtime::bm25f::Bm25fField {
+            weight_micros: boost.weight_micros,
+        })
+        .collect::<Vec<_>>();
+    if hyphae_native_runtime::CanonicalAnalyzer::analyze(query)
+        .tokens
+        .is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let matches = hyphae_native_runtime::bm25f::score_bm25f(
+        &documents,
+        &fields,
+        query,
+        lexical.candidate_limit,
+    )
+    .map_err(|_| invalid_request())?;
+    Ok(matches
+        .into_iter()
+        .map(|entry| hyphae_native_runtime::MatchHit {
+            document_id: entry.key,
+            score: integer_nanos_as_f64(entry.score_nanos),
+        })
+        .collect())
+}
+
+/// Deterministic nanos -> f64 through halved integer arithmetic.
+fn integer_nanos_as_f64(nanos: i64) -> f64 {
+    let negative = nanos < 0;
+    let magnitude = nanos.unsigned_abs();
+    let upper = u32::try_from(magnitude >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(magnitude & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    let mut value = f64::from(upper) * 4_294_967_296.0 + f64::from(lower);
+    if negative {
+        value = -value;
+    }
+    value / 1_000_000_000.0
+}
+
 /// Rewrites the final analyzed query term as its bounded prefix
 /// expansion; earlier terms stay exact. No expansion leaves the branch
 /// query empty (scoring nothing); overflow fails closed.
@@ -1576,6 +1680,8 @@ fn lexical_operator_membership(
 fn execute_lexical_branch(
     database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
+    collection: crate::ObjectId,
+    source: &DocumentSource,
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
     parameters: hyphae_native_runtime::Bm25ScoreParameters,
@@ -1601,18 +1707,24 @@ fn execute_lexical_branch(
     // The durable posting scorer is bit-identical to the retained model; a
     // reclaimed page generation or inline-format directory falls open to
     // the model, never to a different answer.
-    let hits = match database.match_text_at_snapshot(
-        &snapshot.inner,
-        index,
-        query,
-        lexical.candidate_limit,
-        parameters,
-    ) {
-        Ok(hits) => hits,
-        Err(_) => snapshot
-            .inner
-            .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
-            .map_err(map_runtime_error)?,
+    let hits = if lexical.fields.is_empty() {
+        match database.match_text_at_snapshot(
+            &snapshot.inner,
+            index,
+            query,
+            lexical.candidate_limit,
+            parameters,
+        ) {
+            Ok(hits) => hits,
+            Err(_) => snapshot
+                .inner
+                .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
+                .map_err(map_runtime_error)?,
+        }
+    } else {
+        execute_bm25f_branch(
+            snapshot, collection, source, index, lexical, query, checkpoint,
+        )?
     };
     let required = lexical_operator_membership(
         database,
@@ -2129,17 +2241,33 @@ fn validate_search_request(
     {
         return Err(limit_exceeded());
     }
-    if let Some(lexical) = &request.lexical
-        && (!(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
+    if let Some(lexical) = &request.lexical {
+        let boosted = !lexical.fields.is_empty();
+        let mut boost_names = BTreeSet::new();
+        if !(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
             || lexical.weight == 0
             || (lexical.prefix && lexical.operator.is_some())
+            || (boosted && (lexical.prefix || lexical.operator.is_some()))
+            || lexical.fields.len() > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS
+            || lexical.fields.iter().any(|boost| {
+                boost.field.is_empty()
+                    || !(1..=hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS)
+                        .contains(&boost.weight_micros)
+                    || !boost_names.insert(boost.field.as_str())
+                    || (boost.field != LEXICAL_BODY_FIELD
+                        && !definition.fields.iter().any(|field| {
+                            field.name.lookup() == boost.field
+                                && field.logical_type == LogicalType::Text
+                        }))
+            })
             || matches!(
                 lexical.operator,
                 Some(ProductLexicalOperator::Or { minimum_match })
                     if !(1..=MAX_LEXICAL_MINIMUM_MATCH).contains(&minimum_match)
-            ))
-    {
-        return Err(invalid_request());
+            )
+        {
+            return Err(invalid_request());
+        }
     }
     let mut targets = BTreeSet::new();
     for branch in &request.vectors {

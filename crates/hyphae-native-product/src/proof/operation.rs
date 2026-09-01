@@ -814,10 +814,9 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
             if request.autocut.is_some()
                 || request.offset > 0
                 || !request.range_facets.is_empty()
-                || request
-                    .lexical
-                    .as_ref()
-                    .is_some_and(|lexical| lexical.operator.is_some() || lexical.prefix)
+                || request.lexical.as_ref().is_some_and(|lexical| {
+                    lexical.operator.is_some() || lexical.prefix || !lexical.fields.is_empty()
+                })
     );
     let highlighted = matches!(
         operation,
@@ -1737,6 +1736,7 @@ fn decode_integrated_request(
             weight: decoder.u32()?,
             operator: None,
             prefix: false,
+            fields: Vec::new(),
         }),
         _ => return Err(NativeProofError::Invalid("invalid lexical presence tag")),
     };
@@ -1928,6 +1928,22 @@ fn decode_integrated_request(
                         _ => {
                             return Err(NativeProofError::Invalid("invalid lexical operator"));
                         }
+                    }
+                }
+                10 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let branch = lexical.as_mut().ok_or(NativeProofError::Invalid(
+                        "field boosts without lexical branch",
+                    ))?;
+                    let count = bounded_count(
+                        decoder,
+                        hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS,
+                        "field boosts",
+                    )?;
+                    for _ in 0..count {
+                        branch.fields.push(crate::ProductLexicalFieldBoost {
+                            field: text(decoder, limits.max_reexecution_bytes)?,
+                            weight_micros: decoder.u32()?,
+                        });
                     }
                 }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
@@ -2269,6 +2285,14 @@ fn encode_autocut_sections(
         } else if lexical.prefix {
             encoded.byte(9);
             encoded.byte(2);
+        }
+        if !lexical.fields.is_empty() {
+            encoded.byte(10);
+            put_count(encoded, lexical.fields.len())?;
+            for boost in &lexical.fields {
+                put_text(encoded, &boost.field)?;
+                encoded.u32(boost.weight_micros);
+            }
         }
     }
     Ok(())
