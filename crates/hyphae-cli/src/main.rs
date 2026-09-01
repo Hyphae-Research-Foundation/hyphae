@@ -3411,6 +3411,13 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                                 analyzer: None,
                                 options: doc_value_options(),
                             });
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(14)?,
+                                name: catalog_name("rating")?,
+                                logical_type: LogicalType::Float64,
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
                         }
                         fields
                     },
@@ -5267,6 +5274,13 @@ fn response_json(response: ProductResponse) -> Value {
                     "count": bucket.count,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
+            "range_facets": result.range_facets.into_iter().map(|facet| json!({
+                "field": facet.field,
+                "buckets": facet.buckets.into_iter().map(|bucket| json!({
+                    "range_ordinal": doc_value_json(bucket.value),
+                    "count": bucket.count,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
             "aggregations": result.aggregations.into_iter().map(|aggregation| json!({
                 "name": aggregation.name,
                 "value": aggregation_value_json(aggregation.value),
@@ -6326,10 +6340,18 @@ const fn sorted_set_order(order: SortOrderInput) -> hyphae_native_product::Produ
 fn product_doc_value(value: Value) -> Result<ProductDocValue, CliFailure> {
     match value {
         Value::Bool(value) => Ok(ProductDocValue::Boolean(value)),
-        Value::Number(value) => value
-            .as_i64()
-            .map(ProductDocValue::Integer)
-            .ok_or_else(CliFailure::invalid),
+        Value::Number(value) => value.as_i64().map(ProductDocValue::Integer).map_or_else(
+            || {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .map(|value| {
+                        ProductDocValue::Float(hyphae_native_product::CanonicalF64::new(value))
+                    })
+                    .ok_or_else(CliFailure::invalid)
+            },
+            Ok,
+        ),
         Value::String(value) => Ok(ProductDocValue::String(value)),
         Value::Object(mut object) if object.len() == 1 && object.contains_key("bytes_hex") => {
             let encoded = object
