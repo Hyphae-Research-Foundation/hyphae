@@ -2118,20 +2118,38 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
   const lexicalCandidates = reader.u64();
   const retrievalCandidates = reader.u64();
   const matchedCandidates = reader.u64();
-  if (reader.remaining > 0) {
-    // Content-derived response tail: per-hit highlight fragments.
-    if (reader.u8() !== 1) throw new ClientError("integrated response section is invalid");
-    for (const hit of hits) {
-      const fragmentCount = reader.u32();
-      if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
-      const fragments = Array.from({ length: fragmentCount }, () => reader.text());
-      if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
-        throw new ClientError("integrated highlight fragments are unbounded");
+  const rangeFacets: Array<Readonly<Record<string, unknown>>> = [];
+  let previousTail = 0;
+  while (reader.remaining > 0) {
+    // Content-derived response tail in ascending tag order.
+    const tag = reader.u8();
+    if (tag <= previousTail) throw new ClientError("integrated response section is invalid");
+    previousTail = tag;
+    if (tag === 1) {
+      for (const hit of hits) {
+        const fragmentCount = reader.u32();
+        if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
+        const fragments = Array.from({ length: fragmentCount }, () => reader.text());
+        if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
+          throw new ClientError("integrated highlight fragments are unbounded");
+        }
+        (hit as Record<string, unknown>).fragments = fragments;
       }
-      (hit as Record<string, unknown>).fragments = fragments;
+    } else if (tag === 2) {
+      const facetCount = reader.u32();
+      if (facetCount === 0 || facetCount > 8) throw new ClientError("integrated range facets are unbounded");
+      for (let index = 0; index < facetCount; index += 1) {
+        const field = reader.text();
+        const bucketCount = reader.u32();
+        if (bucketCount > 64) throw new ClientError("integrated range facets are unbounded");
+        const buckets = Array.from({ length: bucketCount }, () => ({ value: decodeDocValue(reader), count: reader.u64() }));
+        rangeFacets.push({ field, buckets });
+      }
+    } else {
+      throw new ClientError("integrated response section is invalid");
     }
   }
-  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
+  return { snapshot, hits, facets, rangeFacets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
     lexicalCandidates, retrievalCandidates, matchedCandidates };
 }
 
