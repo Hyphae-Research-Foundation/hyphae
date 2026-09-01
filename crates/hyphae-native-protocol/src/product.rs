@@ -22,18 +22,19 @@ use hyphae_native_product::{
     ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
     ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
-    ProductHybridExplanation, ProductHybridVectorStrategy, ProductIntegratedSearchHit,
-    ProductLexicalBranch, ProductLimits, ProductListSide, ProductMissingPlacement,
-    ProductNamedAggregation, ProductNamedAggregationValue, ProductOperation, ProductPermission,
-    ProductPhysicalObservation, ProductPreparedHandle, ProductRead, ProductResponse,
-    ProductRollbackReceipt, ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
-    ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductSearchOperator, ProductSearchRequest, ProductSearchResult, ProductSearchResults,
-    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
-    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductHashScanStop, ProductHybridExplanation, ProductHybridVectorStrategy,
+    ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
+    ProductMissingPlacement, ProductNamedAggregation, ProductNamedAggregationValue,
+    ProductOperation, ProductPermission, ProductPhysicalObservation, ProductPreparedHandle,
+    ProductRead, ProductResponse, ProductRollbackReceipt, ProductScope, ProductScoreBound,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
+    ProductSearchRequest, ProductSearchResult, ProductSearchResults, ProductSearchSort,
+    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProductVectorBranch,
     ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy, RestoreRequest,
@@ -1202,6 +1203,11 @@ fn ensure_operation_minor(
         ProductOperation::SearchDocumentUpdate { update, .. } => {
             document_required_minor(&update.document)
         }
+        ProductOperation::StructureRead(
+            ProductStructureReadRequest::SortedSetScoreRange { .. }
+            | ProductStructureReadRequest::HashScanReverse { .. }
+            | ProductStructureReadRequest::HashScanMatch { .. },
+        ) => 6,
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1247,6 +1253,10 @@ fn ensure_response_minor(
             };
             values.max(fragments)
         }
+        ProductResponse::StructureRead(read) => match &read.value {
+            ProductStructureReadResult::HashPage { .. } => 6,
+            _ => 0,
+        },
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -4164,6 +4174,54 @@ fn encode_structure_read_request(
             encoded.extend_from_slice(&end.to_le_bytes());
             put_u64(encoded, *limit)?;
         }
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => {
+            encoded.push(18);
+            encode_structure_key(encoded, key)?;
+            encode_score_bound(encoded, *lower)?;
+            encode_score_bound(encoded, *upper)?;
+            put_u64(encoded, *offset)?;
+            put_u64(encoded, *limit)?;
+            encoded.push(sorted_order_tag(*order));
+        }
+        ProductStructureReadRequest::HashScanReverse {
+            key,
+            start_before,
+            limit,
+        } => {
+            encoded.push(19);
+            encode_structure_key(encoded, key)?;
+            encoded.push(u8::from(start_before.is_some()));
+            if let Some(cursor) = start_before {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *limit)?;
+        }
+        ProductStructureReadRequest::HashScanMatch {
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => {
+            encoded.push(20);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, pattern)?;
+            encoded.push(u8::from(start_after.is_some()));
+            if let Some(cursor) = start_after {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *output_limit)?;
+            put_u64(encoded, *visit_limit)?;
+            put_u64(encoded, *match_step_limit)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4276,6 +4334,63 @@ fn decode_structure_read_request(
             end: decoder.u64()?,
             limit: decoder.usize()?,
         },
+        18 => ProductStructureReadRequest::SortedSetScoreRange {
+            key: decode_structure_key(decoder)?,
+            lower: decode_score_bound(decoder)?,
+            upper: decode_score_bound(decoder)?,
+            offset: decoder.usize()?,
+            limit: decoder.usize()?,
+            order: decode_sorted_order(decoder.u8()?)?,
+        },
+        19 => ProductStructureReadRequest::HashScanReverse {
+            key: decode_structure_key(decoder)?,
+            start_before: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            limit: decoder.usize()?,
+        },
+        20 => ProductStructureReadRequest::HashScanMatch {
+            key: decode_structure_key(decoder)?,
+            pattern: decoder.owned_bytes()?,
+            start_after: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            output_limit: decoder.usize()?,
+            visit_limit: decoder.usize()?,
+            match_step_limit: decoder.usize()?,
+        },
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+fn encode_score_bound(
+    encoded: &mut Vec<u8>,
+    bound: ProductScoreBound,
+) -> Result<(), ProductCodecError> {
+    match bound {
+        ProductScoreBound::Unbounded => encoded.push(0),
+        ProductScoreBound::Inclusive(score) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&score.to_bits().to_le_bytes());
+        }
+        ProductScoreBound::Exclusive(score) => {
+            encoded.push(2);
+            encoded.extend_from_slice(&score.to_bits().to_le_bytes());
+        }
+        _ => return Err(ProductCodecError::Unsupported),
+    }
+    Ok(())
+}
+
+fn decode_score_bound(decoder: &mut Decoder<'_>) -> Result<ProductScoreBound, ProductCodecError> {
+    Ok(match decoder.u8()? {
+        0 => ProductScoreBound::Unbounded,
+        1 => ProductScoreBound::Inclusive(f64::from_bits(decoder.u64()?)),
+        2 => ProductScoreBound::Exclusive(f64::from_bits(decoder.u64()?)),
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -4295,6 +4410,8 @@ fn decode_sorted_order(value: u8) -> Result<ProductSortedSetOrder, ProductCodecE
     }
 }
 
+// Exhaustive result dispatch: one arm per result shape, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn encode_structure_read_result(
     encoded: &mut Vec<u8>,
     result: &ProductStructureReadResult,
@@ -4374,6 +4491,32 @@ fn encode_structure_read_result(
                 }
             }
         }
+        ProductStructureReadResult::HashPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => {
+            encoded.push(12);
+            put_u32(encoded, entries.len())?;
+            for entry in entries {
+                put_bytes(encoded, &entry.field)?;
+                put_bytes(encoded, &entry.value)?;
+            }
+            encoded.push(u8::from(continuation.is_some()));
+            if let Some(cursor) = continuation {
+                put_bytes(encoded, cursor)?;
+            }
+            encoded.push(match stop {
+                ProductHashScanStop::Exhausted => 0,
+                ProductHashScanStop::OutputLimit => 1,
+                ProductHashScanStop::VisitLimit => 2,
+                _ => return Err(ProductCodecError::Unsupported),
+            });
+            put_u64(encoded, *visited)?;
+            put_u64(encoded, *match_steps)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4447,6 +4590,34 @@ fn decode_structure_read_result(
                 entries.push(ProductStreamEntry { id, fields });
             }
             ProductStructureReadResult::StreamEntries(entries)
+        }
+        12 => {
+            let count = decoder.usize_u32()?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push(ProductHashEntry {
+                    field: decoder.owned_bytes()?,
+                    value: decoder.owned_bytes()?,
+                });
+            }
+            let continuation = if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            };
+            let stop = match decoder.u8()? {
+                0 => ProductHashScanStop::Exhausted,
+                1 => ProductHashScanStop::OutputLimit,
+                2 => ProductHashScanStop::VisitLimit,
+                _ => return Err(ProductCodecError::InvalidValue),
+            };
+            ProductStructureReadResult::HashPage {
+                entries,
+                continuation,
+                stop,
+                visited: decoder.usize()?,
+                match_steps: decoder.usize()?,
+            }
         }
         _ => return Err(ProductCodecError::InvalidValue),
     })

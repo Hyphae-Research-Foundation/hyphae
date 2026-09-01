@@ -44,15 +44,15 @@ use crate::{
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
     ProductDurability, ProductError, ProductErrorCode, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
-    ProductHashEntry, ProductLimits, ProductListSide, ProductPermission, ProductPreparedHandle,
-    ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
-    ProductSearchIngestReceipt, ProductSearchRequest, ProductSearchResult, ProductSession,
-    ProductSessionId, ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult,
-    ProductStreamEntry, ProductStructureKey, ProductStructureMutation,
-    ProductStructureMutationResult, ProductStructureRead, ProductStructureReadRequest,
-    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductHashEntry, ProductHashScanStop, ProductLimits, ProductListSide, ProductPermission,
+    ProductPreparedHandle, ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
+    ProductScoreBound, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchRequest,
+    ProductSearchResult, ProductSession, ProductSessionId, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult, ProductStructureRead,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProgressControl, QualifiedName,
     RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
@@ -2746,6 +2746,8 @@ fn delete_structure(
     Ok(ProductStructureMutationResult::Boolean(deleted))
 }
 
+// Exhaustive read dispatch: one arm per request shape, cohesive by design.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn read_structure(
     snapshot: &crate::ProductSnapshot,
     request: ProductStructureReadRequest,
@@ -2844,7 +2846,134 @@ pub(crate) fn read_structure(
             end,
             limit,
         } => read_stream_range(snapshot, &key.key, start, end, limit),
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => read_sorted_set_score_range(snapshot, &key.key, lower, upper, offset, limit, order),
+        ProductStructureReadRequest::HashScanReverse {
+            key,
+            start_before,
+            limit,
+        } => snapshot
+            .inner
+            .hscan_reverse(&key.key, start_before.as_deref(), limit)
+            .map(|entries| {
+                ProductStructureReadResult::HashEntries(
+                    entries
+                        .into_iter()
+                        .map(|entry| ProductHashEntry {
+                            field: entry.field().to_vec(),
+                            value: entry.value().to_vec(),
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(Into::into),
+        ProductStructureReadRequest::HashScanMatch {
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => read_hash_scan_match(
+            snapshot,
+            &key.key,
+            &pattern,
+            start_after.as_deref(),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        ),
     }
+}
+
+/// Executes one bounded canonical score range in the requested direction.
+fn read_sorted_set_score_range(
+    snapshot: &crate::ProductSnapshot,
+    key: &[u8],
+    lower: ProductScoreBound,
+    upper: ProductScoreBound,
+    offset: usize,
+    limit: usize,
+    order: ProductSortedSetOrder,
+) -> Result<ProductStructureReadResult, ProductError> {
+    let lower = score_bound(lower)?;
+    let upper = score_bound(upper)?;
+    let entries = match order {
+        ProductSortedSetOrder::Ascending => snapshot
+            .inner
+            .zrange_by_score(key, lower, upper, offset, limit),
+        ProductSortedSetOrder::Descending => snapshot
+            .inner
+            .zrevrange_by_score(key, lower, upper, offset, limit),
+    }?;
+    Ok(ProductStructureReadResult::SortedSetEntries(
+        entries
+            .into_iter()
+            .map(|entry| ProductSortedSetEntry {
+                member: entry.member().to_vec(),
+                score: crate::CanonicalF64::new(entry.score()),
+            })
+            .collect(),
+    ))
+}
+
+/// Maps one product score endpoint onto the runtime bound, rejecting NaN.
+fn score_bound(bound: ProductScoreBound) -> Result<std::ops::Bound<f64>, ProductError> {
+    Ok(match bound {
+        ProductScoreBound::Unbounded => std::ops::Bound::Unbounded,
+        ProductScoreBound::Inclusive(score) if !score.is_nan() => std::ops::Bound::Included(score),
+        ProductScoreBound::Exclusive(score) if !score.is_nan() => std::ops::Bound::Excluded(score),
+        _ => return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
+    })
+}
+
+/// Executes one bounded binary-glob page over a hash.
+fn read_hash_scan_match(
+    snapshot: &crate::ProductSnapshot,
+    key: &[u8],
+    pattern: &[u8],
+    start_after: Option<&[u8]>,
+    output_limit: usize,
+    visit_limit: usize,
+    match_step_limit: usize,
+) -> Result<ProductStructureReadResult, ProductError> {
+    let request = hyphae_native_runtime::HashPatternScanRequest::try_new(
+        pattern,
+        start_after.map(<[u8]>::to_vec),
+        output_limit,
+        visit_limit,
+        match_step_limit,
+    )
+    .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    let page = snapshot.inner.hscan_match(key, &request)?;
+    let stop = match page.stop() {
+        hyphae_native_runtime::HashPatternScanStop::Exhausted => ProductHashScanStop::Exhausted,
+        hyphae_native_runtime::HashPatternScanStop::OutputLimit => ProductHashScanStop::OutputLimit,
+        hyphae_native_runtime::HashPatternScanStop::VisitLimit => ProductHashScanStop::VisitLimit,
+    };
+    let visited = page.visited();
+    let match_steps = page.match_steps();
+    let continuation = page.continuation().map(<[u8]>::to_vec);
+    Ok(ProductStructureReadResult::HashPage {
+        entries: page
+            .into_entries()
+            .into_iter()
+            .map(|entry| ProductHashEntry {
+                field: entry.field().to_vec(),
+                value: entry.value().to_vec(),
+            })
+            .collect(),
+        continuation,
+        stop,
+        visited,
+        match_steps,
+    })
 }
 
 fn read_sorted_set_rank(
@@ -3016,7 +3145,10 @@ impl ProductStructureReadRequest {
             | Self::SortedSetRank { key, .. }
             | Self::SortedSetRange { key, .. }
             | Self::SortedSetCardinality { key }
-            | Self::StreamRange { key, .. } => Some(key),
+            | Self::StreamRange { key, .. }
+            | Self::SortedSetScoreRange { key, .. }
+            | Self::HashScanReverse { key, .. }
+            | Self::HashScanMatch { key, .. } => Some(key),
         }
     }
 
@@ -3035,6 +3167,8 @@ impl ProductStructureReadRequest {
             Self::HashGet { .. }
             | Self::HashFieldTtl { .. }
             | Self::HashScan { .. }
+            | Self::HashScanReverse { .. }
+            | Self::HashScanMatch { .. }
             | Self::HashLength { .. } => StructureKind::Hash,
             Self::ListRange { .. } | Self::ListLength { .. } => StructureKind::List,
             Self::SetContains { .. }
@@ -3044,6 +3178,7 @@ impl ProductStructureReadRequest {
             Self::SortedSetScore { .. }
             | Self::SortedSetRank { .. }
             | Self::SortedSetRange { .. }
+            | Self::SortedSetScoreRange { .. }
             | Self::SortedSetCardinality { .. } => StructureKind::SortedSet,
             Self::StreamRange { .. } => StructureKind::Stream,
         }

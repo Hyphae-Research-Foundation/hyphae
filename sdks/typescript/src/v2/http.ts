@@ -5,7 +5,7 @@ import { decodeProductError, decodeProductResponse, encodeProductRequest, operat
 
 /** Every protocol minor this build speaks, ascending. The request offers the
  * whole set and the server echoes its selection, which must be a member. */
-const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3, 4, 5];
+const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3, 4, 5, 6];
 
 export const PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1";
 export const ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1";

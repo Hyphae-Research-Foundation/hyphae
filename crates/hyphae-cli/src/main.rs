@@ -1400,6 +1400,47 @@ enum StructureReadInput {
         end: u64,
         limit: usize,
     },
+    SortedSetScoreRange {
+        keyspace: JsonU128,
+        key: String,
+        #[serde(default)]
+        lower: ScoreBoundInput,
+        #[serde(default)]
+        upper: ScoreBoundInput,
+        #[serde(default)]
+        offset: usize,
+        limit: usize,
+        order: SortOrderInput,
+    },
+    HashScanReverse {
+        keyspace: JsonU128,
+        key: String,
+        start_before: Option<String>,
+        limit: usize,
+    },
+    HashScanMatch {
+        keyspace: JsonU128,
+        key: String,
+        pattern: String,
+        start_after: Option<String>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+}
+
+/// One canonical score endpoint: unbounded by default.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScoreBoundInput {
+    #[default]
+    Unbounded,
+    #[serde(untagged)]
+    Bounded {
+        #[serde(default)]
+        exclusive: bool,
+        score: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -5420,6 +5461,30 @@ fn structure_read_json(result: ProductStructureReadResult) -> Value {
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
+        ProductStructureReadResult::HashPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => json!({
+            "type": "hash_page",
+            "entries": entries.into_iter().map(|entry| json!({
+                "field_hex": encode_hex(&entry.field),
+                "field": std::str::from_utf8(&entry.field).ok(),
+                "value_hex": encode_hex(&entry.value),
+                "value": std::str::from_utf8(&entry.value).ok(),
+            })).collect::<Vec<_>>(),
+            "continuation_hex": continuation.map(|cursor| encode_hex(&cursor)),
+            "stop": match stop {
+                hyphae_native_product::ProductHashScanStop::Exhausted => "exhausted",
+                hyphae_native_product::ProductHashScanStop::OutputLimit => "output_limit",
+                hyphae_native_product::ProductHashScanStop::VisitLimit => "visit_limit",
+                _ => "unknown",
+            },
+            "visited": visited,
+            "match_steps": match_steps,
+        }),
         _ => json!({ "type": "unsupported" }),
     }
 }
@@ -5925,7 +5990,63 @@ fn structure_read(input: StructureReadInput) -> Result<ProductStructureReadReque
             end,
             limit,
         },
+        StructureReadInput::SortedSetScoreRange {
+            keyspace,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => ProductStructureReadRequest::SortedSetScoreRange {
+            key: structure_key(keyspace, key)?,
+            lower: score_bound_input(lower),
+            upper: score_bound_input(upper),
+            offset,
+            limit,
+            order: sorted_set_order(order),
+        },
+        StructureReadInput::HashScanReverse {
+            keyspace,
+            key,
+            start_before,
+            limit,
+        } => ProductStructureReadRequest::HashScanReverse {
+            key: structure_key(keyspace, key)?,
+            start_before: start_before.map(String::into_bytes),
+            limit,
+        },
+        StructureReadInput::HashScanMatch {
+            keyspace,
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => ProductStructureReadRequest::HashScanMatch {
+            key: structure_key(keyspace, key)?,
+            pattern: pattern.into_bytes(),
+            start_after: start_after.map(String::into_bytes),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        },
     })
+}
+
+const fn score_bound_input(input: ScoreBoundInput) -> hyphae_native_product::ProductScoreBound {
+    match input {
+        ScoreBoundInput::Unbounded => hyphae_native_product::ProductScoreBound::Unbounded,
+        ScoreBoundInput::Bounded {
+            exclusive: false,
+            score,
+        } => hyphae_native_product::ProductScoreBound::Inclusive(score),
+        ScoreBoundInput::Bounded {
+            exclusive: true,
+            score,
+        } => hyphae_native_product::ProductScoreBound::Exclusive(score),
+    }
 }
 
 const fn sorted_set_order(order: SortOrderInput) -> hyphae_native_product::ProductSortedSetOrder {

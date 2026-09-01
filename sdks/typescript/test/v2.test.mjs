@@ -649,7 +649,7 @@ test("v2 HTTP client uses /v2 and validates correlation", async () => {
   });
   const response = await client.capabilities({ requestId: 17n });
   assert.equal(response.kind, "capabilities");
-  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5" });
+  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5,6" });
   assert.equal(ERROR_MEDIA_TYPE, "application/vnd.hyphae.error-v1");
 });
 
@@ -776,6 +776,6 @@ test("v2 HTTP routes all API-key lifecycle phases through the dedicated family",
   }
   assert.deepEqual(seen, operations.map(() => ({
     url: "https://example.test/v2/security/keys",
-    minor: "3,4,5",
+    minor: "3,4,5,6",
   })));
 });

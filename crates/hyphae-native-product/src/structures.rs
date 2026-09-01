@@ -200,6 +200,42 @@ pub enum ProductStructureReadRequest {
         end: u64,
         limit: usize,
     },
+    /// Read one bounded canonical score range (native protocol minor 6).
+    SortedSetScoreRange {
+        key: ProductStructureKey,
+        lower: ProductScoreBound,
+        upper: ProductScoreBound,
+        offset: usize,
+        limit: usize,
+        order: ProductSortedSetOrder,
+    },
+    /// Scan hash fields in descending exact-byte order (minor 6).
+    HashScanReverse {
+        key: ProductStructureKey,
+        start_before: Option<Vec<u8>>,
+        limit: usize,
+    },
+    /// Scan one bounded binary-glob page of hash fields (minor 6).
+    HashScanMatch {
+        key: ProductStructureKey,
+        pattern: Vec<u8>,
+        start_after: Option<Vec<u8>>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+}
+
+/// One canonical sorted-set score endpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ProductScoreBound {
+    /// No bound on this endpoint.
+    Unbounded,
+    /// Endpoint included in the interval.
+    Inclusive(f64),
+    /// Endpoint excluded from the interval.
+    Exclusive(f64),
 }
 
 /// Snapshot-bound result of one product structure read.
@@ -236,6 +272,32 @@ pub enum ProductStructureReadResult {
     SortedSetEntries(Vec<ProductSortedSetEntry>),
     /// Stream entries in ascending ID order.
     StreamEntries(Vec<ProductStreamEntry>),
+    /// One bounded glob-scan page with physical progress (minor 6).
+    HashPage {
+        /// Matched fields in ascending exact-byte order.
+        entries: Vec<ProductHashEntry>,
+        /// Exclusive physical continuation, present when more candidates
+        /// remain even if this page matched nothing.
+        continuation: Option<Vec<u8>>,
+        /// Why the page stopped.
+        stop: ProductHashScanStop,
+        /// Physical candidates visited.
+        visited: usize,
+        /// Matcher steps consumed.
+        match_steps: usize,
+    },
+}
+
+/// Stop reason for one bounded glob-scan page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProductHashScanStop {
+    /// The selected physical range has no later candidate.
+    Exhausted,
+    /// The page emitted its requested live-match count.
+    OutputLimit,
+    /// The page consumed its requested physical candidate count.
+    VisitLimit,
 }
 
 /// Typed result returned while staging one structure mutation.

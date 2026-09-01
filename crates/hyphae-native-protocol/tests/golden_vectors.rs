@@ -1251,7 +1251,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
+fn protocol_minor_negotiation_preserves_1_0_through_1_5_and_selects_1_6()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1329,6 +1329,21 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
         .minor,
         4
     );
+    let minor_five = Hello {
+        maximum_minor: 5,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_five,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        5
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -1338,12 +1353,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
             1
         )?
         .minor,
-        5
+        6
     );
 
     let incompatible = Hello {
-        minimum_minor: 6,
-        maximum_minor: 6,
+        minimum_minor: 7,
+        maximum_minor: 7,
         ..Hello::default()
     };
     assert_eq!(
@@ -1902,5 +1917,101 @@ async fn negotiated_frame_payload_bounds_send_and_receive() -> Result<(), Box<dy
     let (mut writer, mut reader) = tokio::io::duplex(oversized.len());
     writer.write_all(&oversized).await?;
     assert!(codec.receive(&mut reader).await.is_err());
+    Ok(())
+}
+
+#[test]
+fn minor_six_structure_reads_gate_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        ProductHashScanStop, ProductRead, ProductScoreBound, ProductSortedSetOrder,
+        ProductStructureKey, ProductStructureReadRequest, ProductStructureReadResult,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+    let requests = [
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            lower: ProductScoreBound::Exclusive(1.5),
+            upper: ProductScoreBound::Unbounded,
+            offset: 2,
+            limit: 16,
+            order: ProductSortedSetOrder::Descending,
+        },
+        ProductStructureReadRequest::HashScanReverse {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"profile".to_vec(),
+            },
+            start_before: Some(b"user:2".to_vec()),
+            limit: 8,
+        },
+        ProductStructureReadRequest::HashScanMatch {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"profile".to_vec(),
+            },
+            pattern: b"user:*".to_vec(),
+            start_after: None,
+            output_limit: 8,
+            visit_limit: 32,
+            match_step_limit: 256,
+        },
+    ];
+    for request in requests {
+        let wire = security_wire_request(ProductOperation::StructureRead(request));
+        // Below minor 6 the request is unsupported on both directions.
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        let ProductOperation::StructureRead(decoded_read) = decoded.operation else {
+            return Err("decoded operation is not a structure read".into());
+        };
+        let ProductOperation::StructureRead(original_read) = wire.operation else {
+            return Err("original operation is not a structure read".into());
+        };
+        assert_eq!(format!("{decoded_read:?}"), format!("{original_read:?}"));
+    }
+
+    // HashPage response gates identically and round-trips.
+    let response = ProductResponse::StructureRead(ProductRead {
+        snapshot: SnapshotIdentity {
+            directory_lineage: [7; 24],
+            visible_csn: hyphae_native_product::Csn::new(3).ok(),
+            catalog_version: hyphae_native_product::CatalogVersion::new(2)?,
+            root_digest: [9; 32],
+            logical_time_micros: 10,
+        },
+        value: ProductStructureReadResult::HashPage {
+            entries: vec![hyphae_native_product::ProductHashEntry {
+                field: b"user:1".to_vec(),
+                value: b"ana".to_vec(),
+            }],
+            continuation: Some(b"user:1".to_vec()),
+            stop: ProductHashScanStop::VisitLimit,
+            visited: 3,
+            match_steps: 12,
+        },
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&response, 6)?;
+    assert!(matches!(
+        decode_product_response_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_response_for_minor(&encoded, 6)?;
+    assert_eq!(decoded, response);
     Ok(())
 }

@@ -750,6 +750,35 @@ class; they are not evicted. Cache objects may choose no-eviction, LRU, LFU,
 TTL-priority, random, or size policy. Every eviction is a committed tombstone
 or an explicitly non-durable memory-class event recorded in telemetry.
 
+## Product read surface
+
+The typed product structure read (`StructureRead`) exposes, in addition to
+the original eighteen request shapes, three bounded reads that surface the
+already-contracted runtime operations above (native protocol minor 6):
+
+- `SortedSetScoreRange`: `ZRANGE_BY_SCORE`/`ZREVRANGE_BY_SCORE` with
+  independently inclusive, exclusive, or unbounded canonical score bounds,
+  nonnegative `offset`, mandatory `limit`, and an explicit direction.
+  Results are `SortedSetEntries` in the requested direction with the exact
+  semantics of the runtime operations, including `NaN` rejection and
+  zero-limit validation.
+- `HashScanReverse`: `HSCAN_REVERSE` with an optional exclusive
+  `start_before` cursor and mandatory `limit`; results are `HashEntries`
+  in descending exact field-byte order.
+- `HashScanMatch`: `HSCAN_MATCH` with a bounded binary-glob `pattern`
+  (`*`, `?`, `[set]`, `\\` escape; at most 512 pattern bytes), optional
+  exclusive `start_after` cursor, and separate `output_limit`,
+  `visit_limit`, and `match_step_limit` bounds. The result is the new
+  `HashPage`: matched entries in ascending field-byte order, the optional
+  physical continuation cursor (progress even when a page matches
+  nothing), the stop reason (`exhausted`, `output_limit`, `visit_limit`),
+  and the visited/match-step counters.
+
+All three inherit the `structure.read` registry entry (`data.read`,
+request-object scope) and every transport bound of the existing read
+family; a request decoded at a negotiated minor below 6 is rejected as
+unsupported before dispatch.
+
 ## Blocking and streams
 
 Blocking operations wait on version publication, support deadlines and

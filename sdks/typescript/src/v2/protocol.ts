@@ -185,7 +185,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 5) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 6) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +212,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 5,
+  maximumMinor = 6,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -266,6 +266,11 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "structure_read") {
+    const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
+    const kind = String(request.kind ?? "");
+    if (kind === "sorted_set_score_range" || kind === "hash_scan_reverse" || kind === "hash_scan_match") return 6;
+  }
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
     const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
@@ -1816,6 +1821,7 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     hash_scan: 5, hash_length: 6, list_range: 7, list_length: 8, set_contains: 9,
     set_members: 10, set_cardinality: 11, set_algebra: 12, sorted_set_score: 13,
     sorted_set_rank: 14, sorted_set_range: 15, sorted_set_cardinality: 16, stream_range: 17,
+    sorted_set_score_range: 18, hash_scan_reverse: 19, hash_scan_match: 20,
   };
   const kind = String(value.kind);
   const tag = tags[kind];
@@ -1845,7 +1851,50 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     if (kind === "sorted_set_range") parts.push(Uint8Array.of(sortedOrderTag(value.order ?? "ascending")));
   }
   else if (kind === "stream_range") parts.push(u64(BigInt(value.start as bigint | number)), u64(BigInt(value.end as bigint | number)), u64(BigInt(value.limit as number)));
+  else if (kind === "sorted_set_score_range") {
+    parts.push(
+      encodeScoreBound(value.lower),
+      encodeScoreBound(value.upper),
+      u64(BigInt(value.offset as number ?? 0)),
+      u64(BigInt(value.limit as number)),
+      Uint8Array.of(sortedOrderTag(value.order ?? "ascending")),
+    );
+  } else if (kind === "hash_scan_reverse") {
+    const cursor = value.start_before;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(u64(BigInt(value.limit as number)));
+  } else if (kind === "hash_scan_match") {
+    parts.push(bytes(requireBytes(value.pattern)));
+    const cursor = value.start_after;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(
+      u64(BigInt(value.output_limit as number)),
+      u64(BigInt(value.visit_limit as number)),
+      u64(BigInt(value.match_step_limit as number)),
+    );
+  }
   return join(...parts);
+}
+
+/** Encodes one canonical score endpoint: unbounded, or ±inclusive f64. */
+function encodeScoreBound(raw: unknown): Uint8Array {
+  if (raw === undefined || raw === null) return Uint8Array.of(0);
+  const bound = raw as { inclusive?: number; exclusive?: number };
+  if (typeof bound.inclusive === "number") {
+    const encoded = new Uint8Array(9);
+    encoded[0] = 1;
+    new DataView(encoded.buffer).setFloat64(1, bound.inclusive, true);
+    return encoded;
+  }
+  if (typeof bound.exclusive === "number") {
+    const encoded = new Uint8Array(9);
+    encoded[0] = 2;
+    new DataView(encoded.buffer).setFloat64(1, bound.exclusive, true);
+    return encoded;
+  }
+  throw new ClientError("sorted-set score bound is invalid");
 }
 
 function sortedOrderTag(raw: unknown): number {
@@ -1878,6 +1927,13 @@ function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> 
   if (tag === 9) return { kind: "sorted_set_rank", value: reader.boolean() ? reader.u64() : undefined };
   if (tag === 10) return { kind: "sorted_set_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "sorted-set entry") }, () => ({ member: reader.bytes(), score: reader.f64() })) };
   if (tag === 11) return { kind: "stream_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "stream entry") }, () => ({ id: reader.u64(), fields: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "stream field") }, () => [reader.bytes(), reader.bytes()]) })) };
+  if (tag === 12) {
+    const entries = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "hash entry") }, () => ({ field: reader.bytes(), value: reader.bytes() }));
+    const continuation = reader.boolean() ? reader.bytes() : undefined;
+    const stop = ["exhausted", "output_limit", "visit_limit"][reader.u8()];
+    if (stop === undefined) throw new ClientError("hash page stop reason is invalid");
+    return { kind: "hash_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
+  }
   throw new ClientError("structure read response is invalid");
 }
 

@@ -580,3 +580,216 @@ fn unknown_explicit_commit_resolves_after_reopen() -> Result<(), Box<dyn std::er
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_reads_surface_runtime_score_ranges_and_glob_scans()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{ProductHashScanStop, ProductScoreBound, ProductSortedSetOrder};
+
+    let path = temporary("minor-six-reads");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(4, "boards", StructureKind::SortedSet)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(5, "profiles", StructureKind::Hash)?,
+    ))?;
+    seed.create_sorted_set(b"board".to_vec())?;
+    for (member, score) in [
+        (&b"alpha"[..], 1.0),
+        (b"bravo", 2.5),
+        (b"charlie", 2.5),
+        (b"delta", 9.0),
+    ] {
+        seed.zadd(b"board".to_vec(), score, member.to_vec())?;
+    }
+    seed.create_hash(b"profile".to_vec())?;
+    for (field, value) in [
+        (&b"user:1"[..], &b"ana"[..]),
+        (b"user:2", b"bruno"),
+        (b"user:10", b"carla"),
+        (b"admin:1", b"root"),
+    ] {
+        seed.hset(b"profile".to_vec(), field.to_vec(), value.to_vec())?;
+    }
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+
+    // Ascending score range with an exclusive lower bound and offset.
+    let read = {
+        let request_context = context(&session, 1);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Exclusive(1.0),
+                upper: ProductScoreBound::Inclusive(9.0),
+                offset: 1,
+                limit: 10,
+                order: ProductSortedSetOrder::Ascending,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("score range did not read".into());
+    };
+    let ProductStructureReadResult::SortedSetEntries(entries) = read.value else {
+        return Err("score range result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.member.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"charlie"[..], b"delta"],
+    );
+
+    // Descending direction reverses traversal before offset/limit.
+    let read = {
+        let request_context = context(&session, 2);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Unbounded,
+                upper: ProductScoreBound::Unbounded,
+                offset: 0,
+                limit: 2,
+                order: ProductSortedSetOrder::Descending,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("descending range did not read".into());
+    };
+    let ProductStructureReadResult::SortedSetEntries(entries) = read.value else {
+        return Err("descending result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.member.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"delta"[..], b"charlie"],
+    );
+
+    // NaN bounds fail closed.
+    let error = {
+        let request_context = context(&session, 3);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Inclusive(f64::NAN),
+                upper: ProductScoreBound::Unbounded,
+                offset: 0,
+                limit: 1,
+                order: ProductSortedSetOrder::Ascending,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("NaN bound was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    // Reverse hash scan pages descending with an exclusive cursor.
+    let read = {
+        let request_context = context(&session, 4);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanReverse {
+                key: key(5, b"profile")?,
+                start_before: Some(b"user:2".to_vec()),
+                limit: 2,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("reverse scan did not read".into());
+    };
+    let ProductStructureReadResult::HashEntries(entries) = read.value else {
+        return Err("reverse scan result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.field.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"user:10"[..], b"user:1"],
+    );
+
+    // Glob scan matches user:* only and reports progress.
+    let read = {
+        let request_context = context(&session, 5);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanMatch {
+                key: key(5, b"profile")?,
+                pattern: b"user:*".to_vec(),
+                start_after: None,
+                output_limit: 8,
+                visit_limit: 8,
+                match_step_limit: 512,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("glob scan did not read".into());
+    };
+    let ProductStructureReadResult::HashPage {
+        entries,
+        continuation,
+        stop,
+        visited,
+        ..
+    } = read.value
+    else {
+        return Err("glob scan result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.field.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"user:1"[..], b"user:10", b"user:2"],
+    );
+    assert_eq!(continuation, None);
+    assert_eq!(stop, ProductHashScanStop::Exhausted);
+    // The leading literal prefix prunes the physical range to user:*,
+    // so admin:1 is never a candidate.
+    assert_eq!(visited, 3);
+
+    // Malformed pattern fails closed.
+    let error = {
+        let request_context = context(&session, 6);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanMatch {
+                key: key(5, b"profile")?,
+                pattern: b"user:[".to_vec(),
+                start_after: None,
+                output_limit: 8,
+                visit_limit: 8,
+                match_step_limit: 512,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("malformed glob was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+    Ok(())
+}
