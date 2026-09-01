@@ -2081,6 +2081,10 @@ fn encode_aggregation(
             encoded.byte(4);
             put_text(encoded, field)?;
         }
+        DocValueAggregation::Average(field) => {
+            encoded.byte(5);
+            put_text(encoded, field)?;
+        }
     }
     Ok(())
 }
@@ -2094,6 +2098,7 @@ fn decode_aggregation(
         2 => DocValueAggregation::Sum(text(decoder, limits.max_reexecution_bytes)?),
         3 => DocValueAggregation::Min(text(decoder, limits.max_reexecution_bytes)?),
         4 => DocValueAggregation::Max(text(decoder, limits.max_reexecution_bytes)?),
+        5 => DocValueAggregation::Average(text(decoder, limits.max_reexecution_bytes)?),
         _ => return Err(NativeProofError::Invalid("invalid aggregation tag")),
     })
 }

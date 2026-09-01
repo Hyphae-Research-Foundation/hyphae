@@ -2492,3 +2492,48 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }
+
+#[test]
+fn average_aggregation_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+                name: "mean".to_owned(),
+                aggregation: hyphae_native_product::ProductAggregation::Average("price".to_owned()),
+            }],
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if matches!(
+                request.aggregations.first().map(|aggregation| &aggregation.aggregation),
+                Some(hyphae_native_product::ProductAggregation::Average(field)) if field == "price"
+            )
+    ));
+    Ok(())
+}

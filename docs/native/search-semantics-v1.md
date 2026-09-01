@@ -230,8 +230,10 @@ treat them exactly like every other comparable scalar across hosts.
 Float doc values bind to `Float32`/`Float64` catalog field types. `Sum`
 aggregates integers with checked 128-bit accumulation or floats with
 finite-guarded binary64 accumulation; a non-finite float sum fails
-closed. Comparisons between different scalar types never match, as
-before.
+closed. `Average` divides the same checked sum by the count of present
+values and always yields a canonical float aggregate (absent when no
+value is present); a non-finite intermediate fails closed. Comparisons
+between different scalar types never match, as before.
 
 ## Aggregations and memory
 

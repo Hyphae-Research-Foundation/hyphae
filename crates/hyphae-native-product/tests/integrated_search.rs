@@ -2607,3 +2607,54 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+fn average_aggregation_is_a_canonical_float_over_present_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("average-aggregation");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |field: &str| ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "mean".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Average(field.into()),
+        }],
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Integer field: (30 + 10 + 20 + 40) / 4 = 25.0 as a canonical float.
+    let result = product.search_collection(binding.collection, &request("price"), 7)?;
+    assert_eq!(
+        result
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Float(
+            Some(CanonicalF64::new(25.0))
+        )),
+    );
+    // A field with no present values yields an absent float aggregate.
+    let absent = product.search_collection(binding.collection, &request("missing"), 7)?;
+    assert_eq!(
+        absent
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Float(None)),
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}

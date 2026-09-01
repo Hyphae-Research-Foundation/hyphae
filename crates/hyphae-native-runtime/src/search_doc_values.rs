@@ -214,6 +214,8 @@ pub enum DocValueAggregation {
     Min(String),
     /// Maximum present scalar under the canonical total order.
     Max(String),
+    /// Arithmetic mean of present numeric scalars as a canonical float.
+    Average(String),
 }
 
 /// One named aggregate calculation.
@@ -532,7 +534,8 @@ fn validate_request(
         }
         if let DocValueAggregation::Sum(field)
         | DocValueAggregation::Min(field)
-        | DocValueAggregation::Max(field) = &aggregation.aggregation
+        | DocValueAggregation::Max(field)
+        | DocValueAggregation::Average(field) = &aggregation.aggregation
         {
             validate_name(field, limits.max_value_bytes)?;
         }
@@ -830,6 +833,63 @@ fn evaluate_sum(
     })
 }
 
+/// Arithmetic mean of present numeric scalars: the checked sum divided
+/// by the present-value count, always as a canonical float. No present
+/// values yield an absent aggregate; a non-finite mean fails closed.
+fn evaluate_average(
+    matched: &[&DocValueCandidate],
+    field: &str,
+    name: &str,
+) -> Result<DocValueAggregationValue, DocValueError> {
+    let count = matched
+        .iter()
+        .filter(|candidate| candidate.values.contains_key(field))
+        .count();
+    let Ok(count) = u32::try_from(count) else {
+        return Err(DocValueError::AggregationOverflow {
+            name: name.to_owned(),
+        });
+    };
+    if count == 0 {
+        return Ok(DocValueAggregationValue::Float(None));
+    }
+    let sum = match evaluate_sum(matched, field, name)? {
+        DocValueAggregationValue::Integer(Some(sum)) => integer_sum_as_f64(sum),
+        DocValueAggregationValue::Float(Some(sum)) => sum.get(),
+        _ => return Ok(DocValueAggregationValue::Float(None)),
+    };
+    let mean = sum / f64::from(count);
+    if !mean.is_finite() {
+        return Err(DocValueError::AggregationOverflow {
+            name: name.to_owned(),
+        });
+    }
+    Ok(DocValueAggregationValue::Float(Some(CanonicalF64::new(
+        mean,
+    ))))
+}
+
+/// Deterministic i128 -> f64 conversion via two u64 halves (IEEE
+/// round-to-nearest on canonical inputs; avoids the lossy direct cast).
+fn integer_sum_as_f64(sum: i128) -> f64 {
+    let negative = sum < 0;
+    let magnitude = sum.unsigned_abs();
+    let high = u64::try_from(magnitude >> 64).unwrap_or(u64::MAX);
+    let low = u64::try_from(magnitude & u128::from(u64::MAX)).unwrap_or(u64::MAX);
+    let mut value = high_to_f64(high) * 18_446_744_073_709_551_616.0 + high_to_f64(low);
+    if negative {
+        value = -value;
+    }
+    value
+}
+
+/// Lossless-enough u64 -> f64 through two u32 halves.
+fn high_to_f64(value: u64) -> f64 {
+    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(upper) * 4_294_967_296.0 + f64::from(lower)
+}
+
 fn evaluate_facets(
     matched: &[&DocValueCandidate],
     requests: &[FacetRequest],
@@ -891,6 +951,9 @@ fn evaluate_aggregations(
                         })?,
                     ),
                     DocValueAggregation::Sum(field) => evaluate_sum(matched, field, &request.name)?,
+                    DocValueAggregation::Average(field) => {
+                        evaluate_average(matched, field, &request.name)?
+                    }
                     DocValueAggregation::Min(field) => DocValueAggregationValue::Value(
                         matched
                             .iter()

@@ -1152,6 +1152,16 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let highlight = if request.highlight.is_some() { 5 } else { 0 };
     let autocut = if request.autocut.is_some() { 6 } else { 0 };
     let offset = if request.offset > 0 { 6 } else { 0 };
+    let average = if request.aggregations.iter().any(|aggregation| {
+        matches!(
+            aggregation.aggregation,
+            hyphae_native_product::ProductAggregation::Average(_)
+        )
+    }) {
+        6
+    } else {
+        0
+    };
     filter_required_minor(&request.filter)
         .max(fusion)
         .max(dedupe)
@@ -1159,6 +1169,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         .max(highlight)
         .max(autocut)
         .max(offset)
+        .max(average)
 }
 
 fn ensure_operation_minor(
@@ -5424,6 +5435,10 @@ fn encode_search_collection(
                 encoded.push(3);
                 put_text(encoded, field)?;
             }
+            hyphae_native_product::ProductAggregation::Average(field) => {
+                encoded.push(4);
+                put_text(encoded, field)?;
+            }
         }
     }
     put_u64(encoded, request.limit)?;
@@ -5596,6 +5611,7 @@ fn decode_search_collection(
             1 => hyphae_native_product::ProductAggregation::Sum(decoder.text()?),
             2 => hyphae_native_product::ProductAggregation::Min(decoder.text()?),
             3 => hyphae_native_product::ProductAggregation::Max(decoder.text()?),
+            4 => hyphae_native_product::ProductAggregation::Average(decoder.text()?),
             _ => return Err(ProductCodecError::InvalidValue),
         };
         aggregations.push(ProductNamedAggregation { name, aggregation });

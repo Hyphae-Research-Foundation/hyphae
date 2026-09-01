@@ -1708,7 +1708,7 @@ function encodeFacets(facets: ReadonlyArray<Readonly<Record<string, unknown>>>):
 
 function encodeAggregations(aggregations: ReadonlyArray<Readonly<Record<string, unknown>>>): Uint8Array {
   return join(u32(aggregations.length), ...aggregations.map((aggregation) => {
-    const kind = ["count", "sum", "min", "max"].indexOf(String(aggregation.kind));
+    const kind = ["count", "sum", "min", "max", "average"].indexOf(String(aggregation.kind));
     if (kind < 0) throw new ClientError("integrated aggregation is invalid");
     return join(bytes(new TextEncoder().encode(String(aggregation.name))), Uint8Array.of(kind),
       ...(kind === 0 ? [] : [bytes(new TextEncoder().encode(String(aggregation.field)))]));
