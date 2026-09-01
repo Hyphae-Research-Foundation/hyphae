@@ -811,7 +811,7 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
     let autocut = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
-            if request.autocut.is_some()
+            if request.autocut.is_some() || request.offset > 0
     );
     let highlighted = matches!(
         operation,
@@ -1714,6 +1714,10 @@ fn encode_integrated_request(
             encoded.byte(5);
             put_usize(encoded, autocut)?;
         }
+        if semantics_version >= SEMANTICS_VERSION_AUTOCUT && request.offset > 0 {
+            encoded.byte(6);
+            put_usize(encoded, request.offset)?;
+        }
     }
     Ok(())
 }
@@ -1806,6 +1810,7 @@ fn decode_integrated_request(
     let mut rerank = None;
     let mut highlight = None;
     let mut autocut = None;
+    let mut offset = 0_usize;
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1858,6 +1863,9 @@ fn decode_integrated_request(
                 5 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
                     autocut = Some(usize_value(decoder)?);
                 }
+                6 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    offset = usize_value(decoder)?;
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1875,6 +1883,7 @@ fn decode_integrated_request(
         rerank,
         highlight,
         autocut,
+        offset,
     })
 }
 

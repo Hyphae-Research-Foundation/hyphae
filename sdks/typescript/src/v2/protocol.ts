@@ -1526,6 +1526,7 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...encodeRerank(request.rerank),
     ...encodeHighlight(request.highlight),
     ...(request.autocut === undefined || request.autocut === null ? [] : [join(Uint8Array.of(5), u32(Number(request.autocut)))]),
+    ...(request.offset === undefined || request.offset === null || Number(request.offset) === 0 ? [] : [join(Uint8Array.of(6), u32(Number(request.offset)))]),
   );
 }
 

@@ -289,6 +289,10 @@ pub struct ProductSearchRequest {
     /// normalized score curve's deviation from uniform linear decay.
     /// Runs after reranking/deduplication and before the final limit.
     pub autocut: Option<usize>,
+    /// Leading hits skipped from the final ranking before the limit
+    /// window. `offset + limit` must stay within the bounded ranking
+    /// ceiling.
+    pub offset: usize,
 }
 
 /// Maximum autocut extremum count in one request.
@@ -1204,20 +1208,21 @@ impl NativeProduct {
                 // ranking before the final truncation.
                 hyphae_native_runtime::MAX_DOC_VALUE_HITS
             } else {
-                request.limit
+                request.offset.saturating_add(request.limit)
             },
             facets: request.facets.clone(),
             aggregations: request.aggregations.clone(),
         };
         let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        let window = request.offset.saturating_add(request.limit);
         if let Some(stage) = &request.rerank {
             apply_rerank(&mut result.hits, stage)?;
         }
         if let Some(dedupe) = &request.parent_dedupe {
-            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+            result.hits = apply_parent_dedupe(result.hits, dedupe, window)?;
         } else if request.rerank.is_some() {
-            result.hits.truncate(request.limit);
+            result.hits.truncate(window);
         }
         if let Some(steepness) = request.autocut
             && request.sort.is_empty()
@@ -1228,6 +1233,10 @@ impl NativeProduct {
             );
             result.hits.truncate(cut);
         }
+        if request.offset > 0 {
+            result.hits = result.hits.split_off(request.offset.min(result.hits.len()));
+        }
+        result.hits.truncate(request.limit);
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
@@ -1939,6 +1948,10 @@ fn validate_search_request(
     validate_highlight(request)?;
     validate_autocut(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
+        || request
+            .offset
+            .checked_add(request.limit)
+            .is_none_or(|window| window > MAX_PRODUCT_SEARCH_HITS)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
         return Err(limit_exceeded());

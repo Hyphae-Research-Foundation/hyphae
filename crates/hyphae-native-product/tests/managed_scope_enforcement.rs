@@ -461,6 +461,7 @@ fn search_request() -> ProductSearchRequest {
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     }
 }
 

@@ -3758,6 +3758,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             }
                         }),
                         autocut: None,
+                        offset: 0,
                     },
                 },
             )

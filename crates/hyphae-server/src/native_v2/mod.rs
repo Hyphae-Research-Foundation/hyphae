@@ -2572,6 +2572,7 @@ mod tests {
                 rerank: None,
                 highlight: None,
                 autocut: None,
+                offset: 0,
             },
         };
         assert!(super::server::family_accepts(

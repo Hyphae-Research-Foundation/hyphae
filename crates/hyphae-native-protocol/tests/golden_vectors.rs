@@ -577,6 +577,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -644,6 +645,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 rerank: None,
                 highlight: None,
                 autocut: None,
+                offset: 0,
             },
         });
         assert!(matches!(
@@ -686,6 +688,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 rerank: None,
                 highlight: None,
                 autocut: None,
+                offset: 0,
             },
         })
     };
@@ -736,6 +739,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -782,6 +786,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             }),
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -828,6 +833,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                 rerank: None,
                 highlight,
                 autocut: None,
+                offset: 0,
             },
         })
     };
@@ -2288,6 +2294,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -2332,6 +2339,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                 rerank: None,
                 highlight: None,
                 autocut,
+                offset: 0,
             },
         })
     };
@@ -2393,6 +2401,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -2424,6 +2433,62 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
         .ok_or("float bits not found")?;
     let mut forged = encoded.clone();
     forged[position..position + 8].copy_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |offset| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset,
+            },
+        })
+    };
+    // A zero offset keeps the exact historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(0), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.offset == 0
+    ));
+    let paged = request(8);
+    assert!(matches!(
+        encode_product_request_for_minor(&paged, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&paged, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. } if request.offset == 8
+    ));
+    // A forged explicit zero-offset section fails closed.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }

@@ -157,6 +157,13 @@ unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
 
+An optional nonnegative `offset` skips that many leading hits of the
+final ranking before the `limit` window, after every other stage
+(fusion, filter, sort, rerank, deduplication, autocut). `offset + limit`
+must stay within the bounded ranking ceiling (1,024 hits), so deep
+paging cannot silently degrade; facets, aggregations, and counters keep
+describing the complete filtered candidate set, not the window.
+
 An optional autocut stage truncates the final score-ordered ranking at
 the first steep quality drop instead of a fixed count. With hit scores
 `s_0 >= s_1 >= … >= s_{n-1}` mapped to `x_i = i/(n-1)` and

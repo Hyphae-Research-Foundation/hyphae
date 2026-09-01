@@ -346,6 +346,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
         7,
     )?;
@@ -404,6 +405,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -455,6 +457,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -499,6 +502,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 rerank: None,
                 highlight: None,
                 autocut: None,
+                offset: 0,
             },
             0,
         )
@@ -532,6 +536,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 rerank: None,
                 highlight: None,
                 autocut: None,
+                offset: 0,
             },
             0,
         )
@@ -573,6 +578,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -593,6 +599,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
@@ -617,6 +624,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
 
     let mut ann_artifact = None;
@@ -800,6 +808,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     assert!(
         product
@@ -1069,6 +1078,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     rerank: None,
                     highlight: None,
                     autocut: None,
+                    offset: 0,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1128,6 +1138,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1154,6 +1165,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1195,6 +1207,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1233,6 +1246,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
     };
     let context = proof_context(&session, 42);
@@ -1282,6 +1296,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let rrf = product.search_collection(binding.collection, &request(None), 11)?;
     let weighted = product.search_collection(
@@ -1388,6 +1403,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                     rerank: None,
                     highlight: None,
                     autocut: None,
+                    offset: 0,
                 },
                 12,
             )
@@ -1551,6 +1567,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     assert!(!result.hits.is_empty());
@@ -1663,6 +1680,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let all = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(all.hits.len() >= 4);
@@ -1744,6 +1762,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
         rerank,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let base = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(base.hits.len() >= 3);
@@ -1828,6 +1847,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
         rerank: None,
         highlight,
         autocut: None,
+        offset: 0,
     };
     let plain = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(plain.hits.iter().all(|hit| hit.fragments.is_empty()));
@@ -1969,6 +1989,7 @@ fn lexical_ranking(
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
         11,
     )?;
@@ -2079,6 +2100,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
             rerank: None,
             highlight: None,
             autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -2220,6 +2242,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let relative = product.search_collection(
         binding.collection,
@@ -2340,6 +2363,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
         rerank: None,
         highlight: None,
         autocut,
+        offset: 0,
     };
     let full = product.search_collection(binding.collection, &request(None), 7)?;
     let cut = product.search_collection(binding.collection, &request(Some(1)), 7)?;
@@ -2452,6 +2476,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
         rerank: None,
         highlight: None,
         autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     let ids: Vec<u128> = result.hits.iter().map(|hit| hit.object_id.get()).collect();
@@ -2511,6 +2536,72 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
         Some(&hyphae_native_product::ProductAggregationValue::Integer(
             Some(40)
         )),
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn offset_pages_the_final_ranking_without_touching_aggregates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("offset-paging");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |offset, limit| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "count".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Count,
+        }],
+        limit,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset,
+    };
+    let full = product.search_collection(binding.collection, &request(0, 4), 7)?;
+    let paged = product.search_collection(binding.collection, &request(1, 2), 7)?;
+    let full_ids: Vec<u128> = full.hits.iter().map(|hit| hit.object_id.get()).collect();
+    let paged_ids: Vec<u128> = paged.hits.iter().map(|hit| hit.object_id.get()).collect();
+    // The page is the exact middle window of the full ranking.
+    assert!(full_ids.len() >= 3);
+    assert_eq!(paged_ids, full_ids[1..3].to_vec());
+    // Aggregates describe the complete filtered set, not the window.
+    assert_eq!(
+        paged
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        full.aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+    );
+    // Past-the-end offsets return empty pages, never errors.
+    let empty = product.search_collection(binding.collection, &request(full_ids.len(), 2), 7)?;
+    assert!(empty.hits.is_empty());
+    // offset + limit above the bounded ceiling fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(hyphae_native_product::MAX_PRODUCT_SEARCH_HITS, 1),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("unbounded offset was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::LimitExceeded
     );
     drop(product);
     fs::remove_dir_all(path)?;
