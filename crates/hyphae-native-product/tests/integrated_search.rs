@@ -3269,3 +3269,61 @@ fn fuzzy_expansion_matches_typo_distance_terms() -> Result<(), Box<dyn std::erro
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+fn highlighting_covers_expanded_prefix_and_fuzzy_terms() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("highlight-expansion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |query: &str, prefix, fuzzy| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix,
+            fields: Vec::new(),
+            fuzzy,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: Some(hyphae_native_product::ProductHighlight {
+            max_fragments: 2,
+            fragment_bytes: 32,
+        }),
+        autocut: None,
+        offset: 0,
+    };
+    // Prefix "gar" -> garden: the fragment must contain the expanded term.
+    let prefixed = product.search_collection(binding.collection, &request("gar", true, None), 7)?;
+    let hit = prefixed.hits.first().ok_or("missing prefix hit")?;
+    assert!(
+        hit.fragments
+            .iter()
+            .any(|fragment| fragment.contains("garden")),
+        "fragments {:?}",
+        hit.fragments
+    );
+    // Fuzzy "datbase" -> database: same guarantee.
+    let fuzzy =
+        product.search_collection(binding.collection, &request("datbase", false, Some(1)), 7)?;
+    let hit = fuzzy.hits.first().ok_or("missing fuzzy hit")?;
+    assert!(
+        hit.fragments
+            .iter()
+            .any(|fragment| fragment.contains("database")),
+        "fragments {:?}",
+        hit.fragments
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}

@@ -2620,7 +2620,7 @@ fn integrated_hits(
     request: &ProductSearchRequest,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
 ) -> Result<Vec<ProductIntegratedSearchHit>, ProductError> {
-    let terms = highlight_terms(request, transform);
+    let terms = highlight_terms(snapshot, lexical_index, request, transform);
     hits.into_iter()
         .map(|hit| {
             let fragments = match (&terms, &request.highlight) {
@@ -2643,6 +2643,8 @@ fn integrated_hits(
 /// Analyzed query terms for highlighting, derived from exactly the
 /// transformed query string the lexical branch scores with.
 fn highlight_terms(
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
     request: &ProductSearchRequest,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
 ) -> Option<BTreeSet<String>> {
@@ -2651,6 +2653,17 @@ fn highlight_terms(
     let query = match transform {
         None => lexical.query.clone(),
         Some(transform) => transform.apply(&lexical.query),
+    };
+    // Re-run the deterministic expansion the scoring branch used, so
+    // expanded terms highlight exactly like exact ones. Expansion
+    // failures fall back to the unexpanded terms rather than dropping
+    // highlights outright.
+    let query = if lexical.prefix {
+        expand_prefix_query(snapshot, index, &query).unwrap_or(query)
+    } else if let Some(distance) = lexical.fuzzy {
+        expand_fuzzy_query(snapshot, index, &query, distance).unwrap_or(query)
+    } else {
+        query
     };
     let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(&query);
     Some(
