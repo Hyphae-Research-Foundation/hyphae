@@ -90,7 +90,9 @@ const MIN_M: u16 = 2;
 const MAX_M: u16 = 64;
 /// Maximum deterministic HNSW layer used for validation and build budgeting.
 pub const MAX_HNSW_LEVEL: u16 = 32;
-const BUILD_IDENTITY_VERSION: u16 = 1;
+// Version 2 adopts the deterministic diversity neighbor-selection rule;
+// version 1 graphs (plain truncate-to-M) fail closed as corrupt.
+const BUILD_IDENTITY_VERSION: u16 = 2;
 // Covers normalization, dot-product, radius, square-root, and subtraction
 // roundoff so uncertainty always widens routing rather than pruning a child.
 const ROUTING_ROUNDOFF_BASE_OPERATIONS: u32 = 64;
@@ -1800,12 +1802,13 @@ impl HnswIndex {
                 usize::from(self.definition.config.ef_construction),
                 &mut visited,
             )?;
-            let selected = candidates
+            let eligible = candidates
                 .iter()
                 .filter(|candidate| candidate.object_id != object_id)
-                .take(usize::from(self.definition.config.m))
-                .map(|candidate| candidate.object_id)
+                .copied()
                 .collect::<Vec<_>>();
+            let selected =
+                self.select_diverse_neighbors(eligible, usize::from(self.definition.config.m))?;
             self.connect(object_id, layer, &selected)?;
             if let Some(next) = candidates
                 .iter()
@@ -1877,16 +1880,71 @@ impl HnswIndex {
             })
             .collect::<Result<Vec<_>, AnnError>>()?;
         ranked.sort_by(compare_candidates);
-        ranked.truncate(usize::from(self.definition.config.m));
-        let retained = ranked
+        let retained = self
+            .select_diverse_neighbors(ranked, usize::from(self.definition.config.m))?
             .into_iter()
-            .map(|candidate| candidate.object_id)
             .collect();
         self.nodes
             .get_mut(&object_id)
             .and_then(|node| node.neighbors.get_mut(layer_index))
             .ok_or(AnnError::CorruptGraph)
             .map(|neighbors| *neighbors = retained)
+    }
+
+    /// Deterministic diversity neighbor selection: HNSW Algorithm 4 with
+    /// pruned backfill and without candidate extension. Candidates must
+    /// arrive sorted by `(distance-to-anchor, object id)`. A candidate is
+    /// accepted while strictly closer to the anchor than to every
+    /// already-accepted neighbor, so retained edges spread across
+    /// directions; remaining capacity then backfills with the nearest
+    /// pruned candidates in order, keeping graph degree at `max` even on
+    /// adversarial collinear data.
+    fn select_diverse_neighbors(
+        &self,
+        candidates: Vec<Candidate>,
+        max: usize,
+    ) -> Result<Vec<ObjectId>, AnnError> {
+        debug_assert!(
+            candidates
+                .windows(2)
+                .all(|pair| { compare_candidates(&pair[0], &pair[1]) != Ordering::Greater })
+        );
+        let mut selected: Vec<Candidate> = Vec::with_capacity(max.min(candidates.len()));
+        let mut pruned: Vec<Candidate> = Vec::new();
+        for candidate in candidates {
+            if selected.len() == max {
+                break;
+            }
+            let candidate_vector = &self.entry(candidate.object_id)?.vector;
+            let mut diverse = true;
+            for kept in &selected {
+                let peer = distance(
+                    self.definition.metric,
+                    candidate_vector,
+                    &self.entry(kept.object_id)?.vector,
+                )?;
+                if peer <= candidate.distance {
+                    diverse = false;
+                    break;
+                }
+            }
+            if diverse {
+                selected.push(candidate);
+            } else {
+                pruned.push(candidate);
+            }
+        }
+        for candidate in pruned {
+            if selected.len() == max {
+                break;
+            }
+            selected.push(candidate);
+        }
+        selected.sort_by(compare_candidates);
+        Ok(selected
+            .into_iter()
+            .map(|candidate| candidate.object_id)
+            .collect())
     }
 
     fn greedy_at_layer(
@@ -3873,8 +3931,8 @@ mod tests {
         assert_eq!(
             restore_fixture()?.build_identity(),
             [
-                167, 22, 41, 248, 199, 113, 23, 225, 118, 147, 152, 216, 175, 136, 150, 106, 67,
-                221, 74, 124, 123, 13, 145, 10, 59, 203, 190, 237, 196, 46, 220, 30,
+                82, 49, 203, 145, 40, 114, 112, 216, 127, 105, 24, 33, 29, 208, 63, 3, 240, 195,
+                181, 101, 7, 92, 251, 178, 162, 105, 99, 134, 100, 141, 191, 233,
             ]
         );
         Ok(())

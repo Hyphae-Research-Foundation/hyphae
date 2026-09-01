@@ -50,9 +50,19 @@ identity.
 The first executable kernel is `hyphae-native-ann`. V1 bounds `M` to 2 through
 64, requires `ef_construction >= M`, derives each node level from BLAKE3 over
 the index-definition digest and object ID, and retains at most `M` directed
-neighbors per layer. Neighbor selection uses exact metric distance followed by
-object ID. Foreground update and delete do not rebuild this graph. They replace
-one object-keyed delta record above it.
+neighbors per layer. Neighbor selection uses the deterministic diversity
+heuristic (HNSW paper Algorithm 4 without candidate extension or pruned
+backfill): candidates ordered by exact metric distance then object ID are
+accepted only while strictly closer to the anchor node than to every
+already-accepted neighbor, so retained edges spread across directions
+instead of clustering; a node may therefore retain fewer than `M`
+neighbors. The same rule selects insertion links from the
+`ef_construction` frontier and re-prunes overflowing backlinks. The build
+identity hashes a version tag (`2` for this rule; `1` was plain
+truncate-to-`M`), so graphs persisted under the previous rule fail closed
+as corrupt rather than validating against the wrong canonical form.
+Foreground update and delete do not rebuild this graph. They replace one
+object-keyed delta record above it.
 
 `IndexSnapshot` exports definition, vectors with creating CSNs, graph nodes,
 entry point, maximum level and build identity. Restore reconstructs the graph

@@ -104,3 +104,82 @@ fn deterministic_vector(seed: u64) -> Result<Vector, Box<dyn std::error::Error>>
         .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
     Ok(Vector::new(values)?)
 }
+
+/// Clustered corpora are the regime where naive truncate-to-M pruning
+/// collapses recall: all M nearest neighbors of a node fall inside its own
+/// cluster and the graph loses inter-cluster connectivity. The diversity
+/// selection rule must keep cross-cluster edges alive.
+#[test]
+fn clustered_corpus_keeps_cross_cluster_recall() -> Result<(), Box<dyn std::error::Error>> {
+    const CLUSTERS: u16 = 12;
+    const PER_CLUSTER: u16 = 48;
+    const CLUSTER_DIMENSION: u16 = 16;
+    const CLUSTER_K: usize = 10;
+
+    let definition = VectorIndexDefinition::new(
+        ObjectId::new(94_002)?,
+        CLUSTER_DIMENSION,
+        Metric::SquaredL2,
+        HnswConfig::new(8, 64, 48, 96, 0x434c_5553_5445_5253)?,
+    )?;
+    let mut records = Vec::new();
+    for cluster in 0..CLUSTERS {
+        for member in 0..PER_CLUSTER {
+            let id = u128::from(cluster) * u128::from(PER_CLUSTER) + u128::from(member) + 1;
+            records.push(VectorRecord {
+                object_id: ObjectId::new(id)?,
+                creating_csn: Csn::new(u64::try_from(id)?)?,
+                vector: clustered_vector(cluster, u64::from(member))?,
+            });
+        }
+    }
+    let index = HnswIndex::build(definition, records)?;
+
+    // Queries sit near cluster centroids; ground truth via the exact oracle.
+    let mut overlap = 0_usize;
+    let mut total = 0_usize;
+    for cluster in 0..CLUSTERS {
+        let query = clustered_vector(cluster, 1_000_003)?;
+        let expected = index
+            .search_exact(&query, CLUSTER_K)?
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<BTreeSet<_>>();
+        let options = SearchOptions::new(CLUSTER_K, 48, None)?;
+        overlap += index
+            .search(&query, options)?
+            .hits
+            .iter()
+            .filter(|hit| expected.contains(&hit.object_id))
+            .count();
+        total += CLUSTER_K;
+    }
+    let recall_ppm = overlap * 1_000_000 / total;
+    assert!(
+        recall_ppm >= 950_000,
+        "clustered recall@10 was {recall_ppm} ppm"
+    );
+    Ok(())
+}
+
+fn clustered_vector(cluster: u16, member: u64) -> Result<Vector, Box<dyn std::error::Error>> {
+    // Distant centroid per cluster plus a small deterministic jitter.
+    let mut state = (u64::from(cluster) << 32) ^ member ^ 0x9e37_79b9_7f4a_7c15;
+    let values = (0..16_u16)
+        .map(|component| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            let jitter =
+                f32::from(u16::try_from(state >> 48).unwrap_or(0)) / f32::from(u16::MAX) / 8.0;
+            let centroid = if component % 4 == cluster % 4 {
+                f32::from(cluster) * 10.0
+            } else {
+                f32::from(cluster % 3) * 5.0
+            };
+            centroid + jitter
+        })
+        .collect::<Vec<_>>();
+    Ok(Vector::new(values)?)
+}
