@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+use hyphae_native_types::CanonicalF64;
 use thiserror::Error;
 
 /// Maximum candidates admitted by the default policy.
@@ -39,6 +40,9 @@ pub enum DocValue {
     Boolean(bool),
     /// Signed 64-bit integer scalar.
     Integer(i64),
+    /// Canonical IEEE-754 binary64 scalar under the deterministic total
+    /// order; `NaN` payloads and signed zero are collapsed on ingest.
+    Float(CanonicalF64),
     /// UTF-8 scalar.
     String(String),
     /// Opaque binary scalar.
@@ -307,6 +311,8 @@ pub enum DocValueAggregationValue {
     Count(u64),
     /// Checked sum; `None` means no present inputs.
     Integer(Option<i128>),
+    /// Finite-guarded float sum; `None` means no present inputs.
+    Float(Option<CanonicalF64>),
     /// Minimum or maximum; `None` means no present inputs.
     Value(Option<DocValue>),
 }
@@ -554,7 +560,7 @@ fn validate_candidate(
         let length = match value {
             DocValue::String(value) => value.len(),
             DocValue::Bytes(value) => value.len(),
-            DocValue::Boolean(_) | DocValue::Integer(_) => 0,
+            DocValue::Boolean(_) | DocValue::Integer(_) | DocValue::Float(_) => 0,
         };
         if length > limits.max_value_bytes {
             return Err(DocValueError::ValueTooLarge {
@@ -777,6 +783,53 @@ fn compare_optional_values(
     }
 }
 
+/// Sums one field across matched candidates: integers under checked
+/// 128-bit accumulation, floats under finite-guarded binary64
+/// accumulation. Mixed types or a non-finite float sum fail closed.
+fn evaluate_sum(
+    matched: &[&DocValueCandidate],
+    field: &str,
+    name: &str,
+) -> Result<DocValueAggregationValue, DocValueError> {
+    let mut integer_sum = None::<i128>;
+    let mut float_sum = None::<f64>;
+    for candidate in matched {
+        let Some(value) = candidate.values.get(field) else {
+            continue;
+        };
+        match value {
+            DocValue::Integer(value) if float_sum.is_none() => {
+                integer_sum = Some(
+                    integer_sum
+                        .unwrap_or_default()
+                        .checked_add(i128::from(*value))
+                        .ok_or(DocValueError::AggregationOverflow {
+                            name: name.to_owned(),
+                        })?,
+                );
+            }
+            DocValue::Float(value) if integer_sum.is_none() => {
+                let updated = float_sum.unwrap_or_default() + value.get();
+                if !updated.is_finite() {
+                    return Err(DocValueError::AggregationOverflow {
+                        name: name.to_owned(),
+                    });
+                }
+                float_sum = Some(updated);
+            }
+            _ => {
+                return Err(DocValueError::AggregationType {
+                    name: name.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(match float_sum {
+        Some(sum) => DocValueAggregationValue::Float(Some(CanonicalF64::new(sum))),
+        None => DocValueAggregationValue::Integer(integer_sum),
+    })
+}
+
 fn evaluate_facets(
     matched: &[&DocValueCandidate],
     requests: &[FacetRequest],
@@ -837,27 +890,7 @@ fn evaluate_aggregations(
                             maximum: usize::MAX,
                         })?,
                     ),
-                    DocValueAggregation::Sum(field) => {
-                        let mut sum = None::<i128>;
-                        for candidate in matched {
-                            let Some(value) = candidate.values.get(field) else {
-                                continue;
-                            };
-                            let DocValue::Integer(value) = value else {
-                                return Err(DocValueError::AggregationType {
-                                    name: request.name.clone(),
-                                });
-                            };
-                            sum = Some(
-                                sum.unwrap_or_default()
-                                    .checked_add(i128::from(*value))
-                                    .ok_or(DocValueError::AggregationOverflow {
-                                        name: request.name.clone(),
-                                    })?,
-                            );
-                        }
-                        DocValueAggregationValue::Integer(sum)
-                    }
+                    DocValueAggregation::Sum(field) => evaluate_sum(matched, field, &request.name)?,
                     DocValueAggregation::Min(field) => DocValueAggregationValue::Value(
                         matched
                             .iter()

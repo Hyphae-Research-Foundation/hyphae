@@ -211,6 +211,21 @@ transaction observes them without refresh or CDC.
 Segment merging and analyzer shadow builds preserve the logical snapshot and
 publish a new generation atomically.
 
+## Doc-value types
+
+Doc values are typed scalars: boolean, signed 64-bit integer, canonical
+IEEE-754 binary64 float, UTF-8 string, and binary bytes. Floats are
+canonicalized on ingest (`NaN` payloads collapse to one canonical `NaN`,
+signed zero collapses to `+0`) and order under the deterministic total
+order (`-NaN < -inf < … < -0=+0 < … < +inf < +NaN` via canonical-bit
+comparison), so filters, sort, `IN`, facets and min/max aggregations
+treat them exactly like every other comparable scalar across hosts.
+Float doc values bind to `Float32`/`Float64` catalog field types. `Sum`
+aggregates integers with checked 128-bit accumulation or floats with
+finite-guarded binary64 accumulation; a non-finite float sum fails
+closed. Comparisons between different scalar types never match, as
+before.
+
 ## Aggregations and memory
 
 Aggregations operate on doc values or bounded typed field data. Every query

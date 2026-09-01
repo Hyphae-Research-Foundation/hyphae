@@ -1083,6 +1083,7 @@ fn doc_value_required_minor(value: &ProductDocValue) -> u16 {
         | ProductDocValue::Integer(_)
         | ProductDocValue::String(_)
         | ProductDocValue::Bytes(_) => 0,
+        ProductDocValue::Float(_) => 6,
     }
 }
 
@@ -5982,6 +5983,13 @@ fn encode_aggregation_value(
                 encode_doc_value(encoded, value)?;
             }
         }
+        hyphae_native_product::ProductAggregationValue::Float(value) => {
+            encoded.push(3);
+            encoded.push(u8::from(value.is_some()));
+            if let Some(value) = value {
+                encoded.extend_from_slice(&value.bits().to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -6001,6 +6009,21 @@ fn decode_aggregation_value(
             let present = decoder.boolean()?;
             hyphae_native_product::ProductAggregationValue::Value(
                 present.then(|| decode_doc_value(decoder)).transpose()?,
+            )
+        }
+        3 => {
+            let present = decoder.boolean()?;
+            hyphae_native_product::ProductAggregationValue::Float(
+                present
+                    .then(|| -> Result<_, ProductCodecError> {
+                        let bits = decoder.u64()?;
+                        let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+                        if float.bits() != bits {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        Ok(float)
+                    })
+                    .transpose()?,
             )
         }
         _ => return Err(ProductCodecError::InvalidValue),
@@ -6246,6 +6269,10 @@ fn encode_doc_value(
             encoded.push(3);
             put_bytes(encoded, value)?;
         }
+        ProductDocValue::Float(value) => {
+            encoded.push(4);
+            encoded.extend_from_slice(&value.bits().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -6256,6 +6283,14 @@ fn decode_doc_value(decoder: &mut Decoder<'_>) -> Result<ProductDocValue, Produc
         1 => Ok(ProductDocValue::Integer(decoder.i64()?)),
         2 => Ok(ProductDocValue::String(decoder.text()?)),
         3 => Ok(ProductDocValue::Bytes(decoder.owned_bytes()?)),
+        4 => {
+            let bits = decoder.u64()?;
+            let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+            if float.bits() != bits {
+                return Err(ProductCodecError::InvalidValue);
+            }
+            Ok(ProductDocValue::Float(float))
+        }
         _ => Err(ProductCodecError::InvalidValue),
     }
 }

@@ -1663,9 +1663,19 @@ function encodeDocValue(value: unknown): Uint8Array {
   if (typeof value === "boolean") return Uint8Array.of(0, Number(value));
   if (typeof value === "bigint") return join(Uint8Array.of(1), i64(value));
   if (typeof value === "number" && Number.isSafeInteger(value)) return join(Uint8Array.of(1), i64(BigInt(value)));
+  if (typeof value === "number" && Number.isFinite(value)) return join(Uint8Array.of(4), f64(canonicalFloat(value)));
+  if (typeof value === "object" && value !== null && typeof (value as { float?: unknown }).float === "number") {
+    return join(Uint8Array.of(4), f64(canonicalFloat((value as { float: number }).float)));
+  }
   if (typeof value === "string") return join(Uint8Array.of(2), bytes(new TextEncoder().encode(value)));
   if (value instanceof Uint8Array) return join(Uint8Array.of(3), bytes(value));
   throw new ClientError("integrated doc value is invalid");
+}
+
+/** Collapses NaN payloads and signed zero to the canonical forms. */
+function canonicalFloat(value: number): number {
+  if (Number.isNaN(value)) return Number.NaN;
+  return value === 0 ? 0 : value;
 }
 
 function decodeDocValue(reader: Reader): unknown {
@@ -1674,6 +1684,7 @@ function decodeDocValue(reader: Reader): unknown {
   if (tag === 1) return reader.i64();
   if (tag === 2) return reader.text();
   if (tag === 3) return reader.bytes();
+  if (tag === 4) return reader.f64();
   throw new ClientError("integrated doc value is invalid");
 }
 
@@ -1708,6 +1719,7 @@ function decodeAggregationValue(reader: Reader): Readonly<Record<string, unknown
   if (tag === 0) return { kind: "count", value: reader.u64() };
   if (tag === 1) return { kind: "integer", value: reader.boolean() ? reader.i128() : undefined };
   if (tag === 2) return { kind: "value", value: reader.boolean() ? decodeDocValue(reader) : undefined };
+  if (tag === 3) return { kind: "float", value: reader.boolean() ? reader.f64() : undefined };
   throw new ClientError("integrated aggregation value is invalid");
 }
 
@@ -2012,7 +2024,7 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
     for (let index = 0; index < valueCount; index += 1) {
       const name = reader.text();
       const tag = reader.u8();
-      docValues[name] = tag === 0 ? reader.boolean() : tag === 1 ? reader.i64() : tag === 2 ? reader.text() : tag === 3 ? reader.bytes() : undefined;
+      docValues[name] = tag === 0 ? reader.boolean() : tag === 1 ? reader.i64() : tag === 2 ? reader.text() : tag === 3 ? reader.bytes() : tag === 4 ? reader.f64() : undefined;
       if (docValues[name] === undefined) throw new ClientError("integrated doc value is invalid");
     }
     return { objectId, score, docValues };

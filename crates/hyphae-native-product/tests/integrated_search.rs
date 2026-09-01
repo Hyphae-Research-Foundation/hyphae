@@ -154,6 +154,18 @@ fn configure_full(
                             lexical: LexicalIndexPolicy::None,
                         },
                     },
+                    SearchFieldDefinitionV2 {
+                        id: FieldId::new(9)?,
+                        name: name("rating")?,
+                        logical_type: LogicalType::Float64,
+                        analyzer: None,
+                        options: SearchFieldOptions {
+                            stored: true,
+                            doc_values: true,
+                            source: FieldSourcePolicy::Retained,
+                            lexical: LexicalIndexPolicy::None,
+                        },
+                    },
                 ],
                 vectors: vec![
                     NamedVectorDefinition {
@@ -2374,6 +2386,132 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
         &NativeVerificationLimits::default(),
     )?;
     assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("float-doc-values");
+    let (mut product, binding) = configure(&path)?;
+    let rated = |id: u128,
+                 text: &str,
+                 rating: f64|
+     -> Result<ProductDocument, Box<dyn std::error::Error>> {
+        let mut document = document(id, text, "book", 10, [0.0, 0.0], [0.0, 0.0])?;
+        document.doc_values.insert(
+            "rating".into(),
+            ProductDocValue::Float(CanonicalF64::new(rating)),
+        );
+        Ok(document)
+    };
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            rated(501, "rust database", 4.5)?,
+            rated(502, "rust database", 2.5)?,
+            rated(503, "rust database", 4.5)?,
+            rated(504, "rust database", -0.0)?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+
+    // Range filter over floats (>= 4.0), sorted ascending by rating.
+    let request = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::Compare {
+            field: "rating".into(),
+            operator: hyphae_native_product::ProductSearchOperator::GreaterOrEqual,
+            value: ProductDocValue::Float(CanonicalF64::new(4.0)),
+        },
+        sort: vec![hyphae_native_product::ProductSearchSort {
+            source: hyphae_native_product::ProductSortSource::Field("rating".into()),
+            direction: hyphae_native_product::ProductSortDirection::Ascending,
+            missing: hyphae_native_product::ProductMissingPlacement::Last,
+        }],
+        facets: vec![hyphae_native_product::ProductFacetRequest {
+            field: "rating".into(),
+            limit: 8,
+        }],
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "total".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Sum("rating".into()),
+        }],
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+    };
+    let result = product.search_collection(binding.collection, &request, 7)?;
+    let ids: Vec<u128> = result.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids, vec![501, 503]);
+    // Facet buckets carry the exact canonical float values.
+    let facet = result.facets.first().ok_or("missing facet")?;
+    assert!(facet.buckets.iter().any(|bucket| {
+        bucket.value == ProductDocValue::Float(CanonicalF64::new(4.5)) && bucket.count == 2
+    }));
+    // Sum over the filtered set is a finite float aggregate.
+    let aggregation = result.aggregations.first().ok_or("missing aggregation")?;
+    assert_eq!(
+        aggregation.value,
+        hyphae_native_product::ProductAggregationValue::Float(Some(CanonicalF64::new(9.0))),
+    );
+
+    // Signed zero collapses to canonical +0 and equality matches it.
+    let zero_request = ProductSearchRequest {
+        filter: ProductSearchFilter::Compare {
+            field: "rating".into(),
+            operator: hyphae_native_product::ProductSearchOperator::Equal,
+            value: ProductDocValue::Float(CanonicalF64::new(0.0)),
+        },
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        ..request.clone()
+    };
+    let zeros = product.search_collection(binding.collection, &zero_request, 7)?;
+    assert_eq!(
+        zeros
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![504],
+    );
+
+    // Mixed-type sum (integer price + float rating on the same field
+    // name is impossible here, so force it: sum over "price" stays the
+    // integer path).
+    let integer_sum = ProductSearchRequest {
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "prices".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Sum("price".into()),
+        }],
+        ..request.clone()
+    };
+    let sums = product.search_collection(binding.collection, &integer_sum, 7)?;
+    assert_eq!(
+        sums.aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Integer(
+            Some(40)
+        )),
+    );
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())

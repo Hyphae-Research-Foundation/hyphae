@@ -2158,6 +2158,13 @@ fn encode_named_aggregation_value(
                 encode_doc_value(encoded, value)?;
             }
         }
+        ProductAggregationValue::Float(value) => {
+            encoded.byte(4);
+            encoded.byte(u8::from(value.is_some()));
+            if let Some(value) = value {
+                encoded.extend(&value.bits().to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -2195,6 +2202,10 @@ fn encode_doc_value(
             encoded.byte(4);
             put_bytes(encoded, value)?;
         }
+        ProductDocValue::Float(value) => {
+            encoded.byte(5);
+            encoded.extend(&value.bits().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -2208,6 +2219,14 @@ fn decode_doc_value(
         2 => ProductDocValue::Integer(i64::from_le_bytes(decoder.array()?)),
         3 => ProductDocValue::String(text(decoder, limits.max_reexecution_bytes)?),
         4 => ProductDocValue::Bytes(bytes(decoder, limits.max_reexecution_bytes)?),
+        5 => {
+            let bits = u64::from_le_bytes(decoder.array()?);
+            let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+            if float.bits() != bits {
+                return Err(NativeProofError::Invalid("noncanonical float doc value"));
+            }
+            ProductDocValue::Float(float)
+        }
         _ => return Err(NativeProofError::Invalid("invalid doc-value tag")),
     })
 }

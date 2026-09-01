@@ -2363,3 +2363,67 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }
+
+#[test]
+fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::Compare {
+                field: "rating".to_owned(),
+                operator: hyphae_native_product::ProductSearchOperator::GreaterOrEqual,
+                value: hyphae_native_product::ProductDocValue::Float(CanonicalF64::new(4.0)),
+            },
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if matches!(
+                &request.filter,
+                ProductSearchFilter::Compare { value, .. }
+                    if *value == hyphae_native_product::ProductDocValue::Float(
+                        CanonicalF64::new(4.0)
+                    )
+            )
+    ));
+    // Non-canonical float bits (negative zero) fail closed at decode.
+    let canonical = CanonicalF64::new(4.0).bits().to_le_bytes();
+    let position = encoded
+        .windows(8)
+        .position(|window| window == canonical)
+        .ok_or("float bits not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 8].copy_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}

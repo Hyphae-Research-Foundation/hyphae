@@ -2077,6 +2077,10 @@ fn doc_value_matches_type(value: &ProductDocValue, logical: &LogicalType) -> boo
                 ProductDocValue::Integer(_),
                 LogicalType::Signed(_) | LogicalType::Date | LogicalType::Timestamp
             )
+            | (
+                ProductDocValue::Float(_),
+                LogicalType::Float32 | LogicalType::Float64
+            )
             | (ProductDocValue::String(_), LogicalType::Text)
             | (ProductDocValue::Bytes(_), LogicalType::Binary)
     )
@@ -2159,7 +2163,7 @@ fn batch_logical_bytes(batch: &ProductSearchIngestBatch) -> Result<usize, Produc
 const fn doc_value_bytes(value: &ProductDocValue) -> usize {
     match value {
         ProductDocValue::Boolean(_) => 1,
-        ProductDocValue::Integer(_) => 8,
+        ProductDocValue::Integer(_) | ProductDocValue::Float(_) => 8,
         ProductDocValue::String(value) => value.len(),
         ProductDocValue::Bytes(value) => value.len(),
     }
@@ -2408,6 +2412,18 @@ fn posting_component(value: &ProductDocValue) -> Result<(u8, Vec<u8>), ProductEr
             4,
             hyphae_native_types::encode_memcomparable_bytes(value).map_err(|_| limit_exceeded())?,
         ),
+        ProductDocValue::Float(value) => {
+            // Sign-flip trick maps the IEEE total order onto unsigned
+            // byte order: non-negative values flip the sign bit, negative
+            // values flip every bit.
+            let bits = value.bits();
+            let ordered = if bits & (1 << 63) == 0 {
+                bits ^ (1 << 63)
+            } else {
+                !bits
+            };
+            (5, ordered.to_be_bytes().to_vec())
+        }
     })
 }
 
@@ -2922,6 +2938,10 @@ fn encode_document(document: &ProductDocument) -> Result<Vec<u8>, ProductError> 
                 encoded.push(4);
                 put_bytes(&mut encoded, value)?;
             }
+            ProductDocValue::Float(value) => {
+                encoded.push(5);
+                put_bytes(&mut encoded, &value.bits().to_le_bytes())?;
+            }
         }
     }
     Ok(encoded)
@@ -2962,6 +2982,14 @@ fn decode_document(
                 String::from_utf8(value.to_vec()).map_err(|_| corruption())?,
             ),
             4 => ProductDocValue::Bytes(value.to_vec()),
+            5 if value.len() == 8 => {
+                let bits = u64::from_le_bytes(value.try_into().map_err(|_| corruption())?);
+                let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+                if float.bits() != bits {
+                    return Err(corruption());
+                }
+                ProductDocValue::Float(float)
+            }
             _ => return Err(corruption()),
         };
         if name.is_empty() || values.insert(name, value).is_some() {

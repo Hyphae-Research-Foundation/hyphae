@@ -6611,6 +6611,7 @@ fn doc_value_json(value: ProductDocValue) -> Value {
     match value {
         ProductDocValue::Boolean(value) => json!(value),
         ProductDocValue::Integer(value) => json!(value),
+        ProductDocValue::Float(value) => json!(value.get()),
         ProductDocValue::String(value) => json!(value),
         ProductDocValue::Bytes(value) => json!({ "bytes_hex": encode_hex(&value) }),
     }
@@ -6624,6 +6625,9 @@ fn aggregation_value_json(value: hyphae_native_product::ProductAggregationValue)
         }
         hyphae_native_product::ProductAggregationValue::Value(value) => {
             value.map_or(Value::Null, doc_value_json)
+        }
+        hyphae_native_product::ProductAggregationValue::Float(value) => {
+            value.map_or(Value::Null, |value| json!(value.get()))
         }
     }
 }
