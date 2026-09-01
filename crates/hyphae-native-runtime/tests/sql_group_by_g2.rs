@@ -449,3 +449,91 @@ fn having_shapes_outside_the_slice_fail_closed() -> Result<(), TestError> {
     transaction.rollback();
     Ok(())
 }
+
+#[test]
+fn distinct_offset_and_between_shape_plain_and_grouped_selects() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+
+    // DISTINCT deduplicates and preserves first-seen order.
+    let SqlResult::Rows { columns, rows } =
+        transaction.execute_sql("SELECT DISTINCT tenant FROM ledger LIMIT 10", &[])?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["tenant"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Text("acme".to_owned())],
+            vec![SqlValue::Text("globex".to_owned())],
+            vec![SqlValue::Text("initech".to_owned())],
+        ]
+    );
+
+    // OFFSET skips shaped rows; the access path widens by the skip.
+    let SqlResult::Rows { rows, .. } = transaction.execute_sql(
+        "SELECT tenant, sequence FROM ledger ORDER BY tenant, sequence ASC LIMIT 2 OFFSET 2",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Text("acme".to_owned()), SqlValue::Signed(3)],
+            vec![SqlValue::Text("globex".to_owned()), SqlValue::Signed(1)],
+        ]
+    );
+
+    // BETWEEN desugars to the admitted comparison pair (NULL amount rows
+    // are unknown and filtered).
+    let SqlResult::Rows { rows, .. } = transaction.execute_sql(
+        "SELECT sequence FROM ledger WHERE tenant = 'acme' AND amount BETWEEN 10 AND 30 LIMIT 10",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Signed(1)], vec![SqlValue::Signed(2)]]
+    );
+
+    // Grouped OFFSET after HAVING/ORDER shaping.
+    let SqlResult::Rows { rows, .. } = transaction.execute_sql(
+        "SELECT tenant, COUNT(*) AS n FROM ledger GROUP BY tenant \
+         ORDER BY n DESC LIMIT 2 OFFSET 1",
+        &[],
+    )?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(
+        rows,
+        vec![vec![
+            SqlValue::Text("globex".to_owned()),
+            SqlValue::Unsigned(2)
+        ]]
+    );
+    transaction.rollback();
+
+    // Fail-closed shapes.
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+    assert!(matches!(
+        transaction.execute_sql("SELECT DISTINCT tenant FROM ledger", &[]),
+        Err(SqlError::InvalidSyntax)
+    ));
+    assert!(matches!(
+        transaction.execute_sql("SELECT tenant FROM ledger LIMIT 2 OFFSET 1 OFFSET 2", &[]),
+        Err(SqlError::InvalidSyntax)
+    ));
+    assert!(matches!(
+        transaction.execute_sql("SELECT DISTINCT COUNT(*) FROM ledger", &[]),
+        Err(SqlError::InvalidSyntax)
+    ));
+    transaction.rollback();
+    Ok(())
+}

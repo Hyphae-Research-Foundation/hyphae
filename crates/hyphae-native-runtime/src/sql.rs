@@ -443,6 +443,16 @@ enum PreparedPlan {
         /// Post-fold `HAVING`/`ORDER BY`/trim shaping.
         group_shape: Option<BoundGroupShape>,
     },
+    /// Post-access row shaping for plain selects: `DISTINCT` dedupe by
+    /// ordered encoding and/or `OFFSET` skip, then `LIMIT`.
+    RowShape {
+        input: Box<PreparedPlan>,
+        /// Ordered-encoding types of the projected columns (dedupe key).
+        projected_types: Vec<LogicalType>,
+        distinct: bool,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -529,7 +539,7 @@ impl PreparedPlan {
                     referenced.insert(*index);
                 }
             }
-            Self::Aggregate { input, .. } => {
+            Self::Aggregate { input, .. } | Self::RowShape { input, .. } => {
                 referenced.extend(input.referenced_object_ids());
             }
         }
@@ -565,7 +575,7 @@ impl PreparedPlan {
             | Self::IndexedInnerJoin {
                 parameter_count, ..
             } => *parameter_count,
-            Self::Aggregate { input, .. } => input.parameter_count(),
+            Self::Aggregate { input, .. } | Self::RowShape { input, .. } => input.parameter_count(),
         }
     }
 
@@ -596,6 +606,11 @@ impl PreparedPlan {
                 }
                 JoinLeftAccess::BoundedSecondaryIndex { limit, .. }
                 | JoinLeftAccess::BoundedPrimaryKeyScan { limit, .. } => Some(*limit),
+            },
+            Self::RowShape { input, limit, .. } => match (limit, input.maximum_result_rows()) {
+                (Some(limit), Some(inner)) => Some((*limit).min(inner)),
+                (Some(limit), None) => Some(*limit),
+                (None, inner) => inner,
             },
         }
     }
@@ -689,6 +704,7 @@ impl PreparedPlan {
                 )?);
                 Ok(schema)
             }
+            Self::RowShape { input, .. } => input.result_schema(),
         }
     }
 }
@@ -1184,6 +1200,52 @@ fn shape_grouped_rows(
     Ok(rows)
 }
 
+/// Deduplicates projected rows by canonical ordered encoding, preserving
+/// first-seen order, bounded by `limit` emitted rows.
+fn distinct_rows(
+    rows: Vec<Vec<SqlValue>>,
+    projected_types: &[LogicalType],
+    limit: usize,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut output = Vec::new();
+    for row in rows {
+        if row.len() != projected_types.len() {
+            return Err(SqlError::InvalidStoredRow);
+        }
+        let mut encoded = Vec::new();
+        for (value, logical_type) in row.iter().zip(projected_types) {
+            let component = value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::InvalidStoredRow)?;
+            encoded.extend_from_slice(&component);
+        }
+        if seen.insert(encoded) {
+            output.push(row);
+            if output.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Applies `OFFSET` (skip) then re-applies `LIMIT` to shaped rows.
+fn apply_offset(
+    rows: &mut Vec<Vec<SqlValue>>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<(), SqlError> {
+    let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+    if offset >= rows.len() {
+        rows.clear();
+        return Ok(());
+    }
+    rows.drain(..offset);
+    rows.truncate(limit);
+    Ok(())
+}
+
 fn projected_schema(
     relation: &RelationDefinition,
     projection: &[usize],
@@ -1295,7 +1357,11 @@ enum Statement {
         having: Option<HavingExpression>,
         /// Grouped `ORDER BY` terms (grouped selects only).
         group_order: Vec<GroupOrderTerm>,
+        /// `SELECT DISTINCT` over a plain projection (LIMIT mandatory).
+        distinct: bool,
         limit: Option<usize>,
+        /// `OFFSET` rows skipped after shaping (LIMIT mandatory).
+        offset: Option<usize>,
     },
     ExplainSelect {
         name: String,
@@ -1307,7 +1373,9 @@ enum Statement {
         descending: bool,
         having: Option<HavingExpression>,
         group_order: Vec<GroupOrderTerm>,
+        distinct: bool,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     SelectJoin(ParsedInnerJoin),
     ExplainSelectJoin(ParsedInnerJoin),
@@ -1725,6 +1793,10 @@ struct BoundSelect {
     /// Post-fold group shaping (`HAVING`, grouped `ORDER BY`, hidden
     /// accumulator trimming); `None` for plain grouped selects.
     group_shape: Option<BoundGroupShape>,
+    /// `SELECT DISTINCT`: deduplicate projected rows before LIMIT.
+    distinct: bool,
+    /// Rows skipped after shaping; `LIMIT` bounds emitted rows after it.
+    offset: Option<usize>,
 }
 
 /// Bound post-fold shaping of grouped output rows.
@@ -1789,7 +1861,9 @@ struct SelectQuery<'query> {
     descending: bool,
     having: Option<&'query HavingExpression>,
     group_order: &'query [GroupOrderTerm],
+    distinct: bool,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 enum SelectAccess {
@@ -1884,7 +1958,9 @@ fn prepare_parsed_catalog(
             descending,
             having,
             group_order,
+            distinct,
             limit,
+            offset,
         } => prepare_select_plan(
             catalog,
             SelectQuery {
@@ -1897,7 +1973,9 @@ fn prepare_parsed_catalog(
                 descending,
                 having: having.as_ref(),
                 group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             ordered_secondary_indexes,
         )?,
@@ -2159,7 +2237,7 @@ fn prepare_select_plan(
             descending,
         },
     };
-    Ok(match (aggregates, aggregate_columns) {
+    let plan = match (aggregates, aggregate_columns) {
         (Some(aggregates), Some(output_columns)) => PreparedPlan::Aggregate {
             input: Box::new(inner),
             aggregates,
@@ -2171,7 +2249,28 @@ fn prepare_select_plan(
             group_shape,
         },
         _ => inner,
-    })
+    };
+    if bound.distinct || bound.offset.is_some() {
+        if matches!(plan, PreparedPlan::Aggregate { .. }) && bound.distinct {
+            return Err(SqlError::InvalidSyntax);
+        }
+        let projected_types = if bound.distinct {
+            plan.result_schema()?
+                .into_iter()
+                .map(|(_, logical_type)| logical_type)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(PreparedPlan::RowShape {
+            input: Box::new(plan),
+            projected_types,
+            distinct: bound.distinct,
+            offset: bound.offset,
+            limit: query.limit,
+        });
+    }
+    Ok(plan)
 }
 
 pub(crate) fn execute_prepared(
@@ -2235,7 +2334,8 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         | PreparedPlan::PrimaryKeyPrefixRangeScan { .. }
         | PreparedPlan::PrimaryKeyRangeScan { .. }
         | PreparedPlan::IndexedInnerJoin { .. }
-        | PreparedPlan::Aggregate { .. } => Err(SqlError::ParameterMismatch),
+        | PreparedPlan::Aggregate { .. }
+        | PreparedPlan::RowShape { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -2333,7 +2433,9 @@ pub(crate) fn execute_transaction(
             descending,
             having,
             group_order,
+            distinct,
             limit,
+            offset,
         } => execute_select(
             transaction,
             SelectQuery {
@@ -2346,7 +2448,9 @@ pub(crate) fn execute_transaction(
                 descending,
                 having: having.as_ref(),
                 group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             parameters,
             &mut || true,
@@ -2361,7 +2465,9 @@ pub(crate) fn execute_transaction(
             descending,
             having,
             group_order,
+            distinct,
             limit,
+            offset,
         } => execute_explain(
             transaction,
             SelectQuery {
@@ -2374,7 +2480,9 @@ pub(crate) fn execute_transaction(
                 descending,
                 having: having.as_ref(),
                 group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             parameters,
         ),
@@ -2516,6 +2624,8 @@ fn execute_parsed_bound_transaction(
     }
 }
 
+// Statement dispatch over every window shape: cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_window_select(
     transaction: &mut NativeWriteBatch,
     window: &ParsedWindowSelect,
@@ -2564,12 +2674,20 @@ fn execute_window_select(
         descending,
         having,
         group_order,
+        distinct,
         limit,
+        offset,
     } = parse(&query)?
     else {
         return Err(SqlError::InvalidSyntax);
     };
-    if descending || !group_by.is_empty() || having.is_some() || !group_order.is_empty() {
+    if descending
+        || !group_by.is_empty()
+        || having.is_some()
+        || !group_order.is_empty()
+        || distinct
+        || offset.is_some()
+    {
         return Err(SqlError::InvalidSyntax);
     }
     let SqlResult::Rows { columns: _, rows } = execute_select(
@@ -2584,7 +2702,9 @@ fn execute_window_select(
             descending: false,
             having: None,
             group_order: &[],
+            distinct: false,
             limit,
+            offset: None,
         },
         &[],
         checkpoint,
@@ -2645,7 +2765,9 @@ fn execute_cte_select(
         descending,
         having,
         group_order,
+        distinct,
         limit,
+        offset,
     } = cte.outer.as_ref()
     else {
         return Err(SqlError::InvalidSyntax);
@@ -2658,6 +2780,8 @@ fn execute_cte_select(
         || *descending
         || having.is_some()
         || !group_order.is_empty()
+        || *distinct
+        || offset.is_some()
     {
         return Err(SqlError::InvalidSyntax);
     }
@@ -2727,7 +2851,9 @@ fn execute_parsed_transaction(
             descending,
             having,
             group_order,
+            distinct,
             limit,
+            offset,
         } => execute_select(
             transaction,
             SelectQuery {
@@ -2740,7 +2866,9 @@ fn execute_parsed_transaction(
                 descending: *descending,
                 having: having.as_ref(),
                 group_order,
+                distinct: *distinct,
                 limit: *limit,
+                offset: *offset,
             },
             parameters,
             checkpoint,
@@ -2973,6 +3101,29 @@ pub(crate) fn execute_transaction_dml(
     TransactionDml::parse(statement)?.execute(transaction, parameters)
 }
 
+/// Applies one `PreparedPlan::RowShape` to its inner result.
+fn shape_plain_rows(
+    result: SqlResult,
+    projected_types: &[LogicalType],
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<SqlResult, SqlError> {
+    let SqlResult::Rows { columns, mut rows } = result else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if distinct {
+        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        rows = distinct_rows(rows, projected_types, bound)?;
+    }
+    if let Some(offset) = offset {
+        apply_offset(&mut rows, offset, limit)?;
+    }
+    Ok(SqlResult::Rows { columns, rows })
+}
+
+// Exhaustive plan dispatch: one arm per plan variant, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_bound_snapshot(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,
@@ -3040,6 +3191,19 @@ fn execute_bound_snapshot(
         PreparedPlan::IndexedInnerJoin { .. } => {
             execute_indexed_join_snapshot(snapshot, plan, parameters)
         }
+        PreparedPlan::RowShape {
+            input,
+            projected_types,
+            distinct,
+            offset,
+            limit,
+        } => shape_plain_rows(
+            execute_bound_snapshot(snapshot, input, parameters)?,
+            projected_types,
+            *distinct,
+            *offset,
+            *limit,
+        ),
         PreparedPlan::Aggregate {
             input,
             aggregates,
@@ -3104,6 +3268,8 @@ fn execute_aggregate_plan(
     })
 }
 
+// Exhaustive plan dispatch: one arm per plan variant, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_bound_latest(
     database: &NativeDatabase,
     snapshot: &Snapshot,
@@ -3182,6 +3348,21 @@ fn execute_bound_latest(
         PreparedPlan::IndexedInnerJoin { .. } => {
             execute_indexed_join_latest(database, snapshot, plan, parameters, checkpoint, profile)
         }
+        PreparedPlan::RowShape {
+            input,
+            projected_types,
+            distinct,
+            offset,
+            limit,
+        } => shape_plain_rows(
+            execute_bound_latest(
+                database, snapshot, input, parameters, permit, checkpoint, profile,
+            )?,
+            projected_types,
+            *distinct,
+            *offset,
+            *limit,
+        ),
         PreparedPlan::Aggregate {
             input,
             aggregates,
@@ -6301,6 +6482,8 @@ fn command_result(rows_affected: u64) -> SqlResult {
     }
 }
 
+// Access dispatch plus aggregate/plain shaping: cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_select(
     transaction: &NativeWriteBatch,
     query: SelectQuery<'_>,
@@ -6326,6 +6509,8 @@ fn execute_select(
         group_types,
         streaming_groups,
         group_shape,
+        distinct,
+        offset,
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -6400,15 +6585,49 @@ fn execute_select(
             let limit = query.limit.ok_or(SqlError::InvalidAggregate)?;
             grouped = shape_grouped_rows(grouped, shape, limit)?;
         }
+        if let Some(offset) = offset {
+            apply_offset(&mut grouped, offset, query.limit)?;
+        }
         return Ok(SqlResult::Rows {
             columns: output_columns,
             rows: grouped,
         });
     }
+    let rows =
+        shape_transaction_plain_rows(definition, &projection, rows, distinct, offset, query.limit)?;
     Ok(SqlResult::Rows {
         columns: output_columns,
         rows,
     })
+}
+
+/// Applies `DISTINCT`/`OFFSET` shaping to plain transactional rows.
+fn shape_transaction_plain_rows(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    mut rows: Vec<Vec<SqlValue>>,
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if distinct {
+        let projected_types = projection
+            .iter()
+            .map(|column| {
+                definition
+                    .columns
+                    .get(*column)
+                    .map(|column| column.logical_type.clone())
+                    .ok_or(SqlError::InvalidCatalogObject)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        rows = distinct_rows(rows, &projected_types, bound)?;
+    }
+    if let Some(offset) = offset {
+        apply_offset(&mut rows, offset, limit)?;
+    }
+    Ok(rows)
 }
 
 pub(crate) fn transaction_ordered_secondary_indexes(
@@ -6967,6 +7186,22 @@ fn bind_select(
             limit: Some(MAX_SQL_SCAN_CANDIDATES),
             ..query
         }
+    } else if query.offset.is_some() || query.distinct {
+        // OFFSET skips shaped rows and DISTINCT deduplicates them: the
+        // access path must materialize enough input first. OFFSET widens
+        // the bound by the skipped rows; DISTINCT charges the explicit
+        // scan ceiling because duplicates are unbounded ahead of dedupe.
+        let widened = if query.distinct {
+            Some(MAX_SQL_SCAN_CANDIDATES)
+        } else {
+            query
+                .limit
+                .and_then(|limit| limit.checked_add(query.offset.unwrap_or(0)))
+        };
+        SelectQuery {
+            limit: widened,
+            ..query
+        }
     } else {
         query
     };
@@ -6991,6 +7226,8 @@ fn bind_select(
         group_types,
         streaming_groups,
         group_shape,
+        distinct: query.distinct,
+        offset: query.offset,
     })
 }
 
@@ -7526,7 +7763,9 @@ fn bind_indexed_inner_join(
             descending: false,
             having: None,
             group_order: &[],
+            distinct: false,
             limit: parsed.limit,
+            offset: None,
         },
         ordered_secondary_indexes,
     )?;
@@ -10380,7 +10619,9 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
                 descending,
                 having,
                 group_order,
+                distinct,
                 limit,
+                offset,
             } => Statement::ExplainSelect {
                 name,
                 projection,
@@ -10391,7 +10632,9 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
                 descending,
                 having,
                 group_order,
+                distinct,
                 limit,
+                offset,
             },
             Statement::SelectJoin(join) => Statement::ExplainSelectJoin(join),
             _ => return Err(SqlError::InvalidSyntax),
@@ -10757,10 +11000,44 @@ fn parse_select_order(
     Ok((Vec::new(), false, terms))
 }
 
+/// Parses the optional `OFFSET` tail (LIMIT mandatory alongside it).
+fn parse_select_offset(
+    parser: &mut Parser,
+    limit: Option<usize>,
+) -> Result<Option<usize>, SqlError> {
+    if !parser.consume_keyword("OFFSET") {
+        return Ok(None);
+    }
+    // OFFSET without LIMIT has no bounded meaning in this dialect.
+    if limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.number_usize().map(Some)
+}
+
+/// `DISTINCT` admits plain projections only, ungrouped, with LIMIT.
+fn validate_distinct_shape(
+    distinct: bool,
+    projection: &Projection,
+    group_by: &[String],
+    limit: Option<usize>,
+) -> Result<(), SqlError> {
+    if !distinct {
+        return Ok(());
+    }
+    let plain = matches!(projection, Projection::All | Projection::Columns(_))
+        || matches!(projection, Projection::Named { aggregates, .. } if aggregates.is_empty());
+    if !plain || !group_by.is_empty() || limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    Ok(())
+}
+
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     if parser.looks_like_window_select() {
         return parse_window_select(parser);
     }
+    let distinct = parser.consume_keyword("DISTINCT");
     let projection = if parser.consume_symbol('*') {
         Projection::All
     } else if parser.looks_like_aggregate_projection() {
@@ -10806,6 +11083,8 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         None
     };
+    let offset = parse_select_offset(parser, limit)?;
+    validate_distinct_shape(distinct, &projection, &group_by, limit)?;
     let has_aggregates = matches!(projection, Projection::Aggregates(_))
         || matches!(&projection, Projection::Named { aggregates, .. } if !aggregates.is_empty());
     if !group_by.is_empty() {
@@ -10860,7 +11139,9 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         descending,
         having,
         group_order,
+        distinct,
         limit,
+        offset,
     })
 }
 
@@ -11020,6 +11301,42 @@ fn parse_filter_factor(
     parse_filter_predicate(parser, parameter_count)
 }
 
+/// Desugars `x [NOT] BETWEEN a AND b` to the admitted comparison pair
+/// (`>= AND <=`; negated `< OR >`), inheriting comparison semantics.
+fn parse_between(
+    parser: &mut Parser,
+    parameter_count: &mut usize,
+    column: String,
+    negated: bool,
+) -> Result<FilterExpression, SqlError> {
+    let low = parser.scalar_operand(parameter_count)?;
+    parser.expect_keyword("AND")?;
+    let high = parser.scalar_operand(parameter_count)?;
+    let lower = FilterExpression::Comparison {
+        columns: vec![column.clone()],
+        operator: if negated {
+            ComparisonOperator::Less
+        } else {
+            ComparisonOperator::GreaterOrEqual
+        },
+        operands: vec![low],
+    };
+    let upper = FilterExpression::Comparison {
+        columns: vec![column],
+        operator: if negated {
+            ComparisonOperator::Greater
+        } else {
+            ComparisonOperator::LessOrEqual
+        },
+        operands: vec![high],
+    };
+    Ok(if negated {
+        FilterExpression::Or(Box::new(lower), Box::new(upper))
+    } else {
+        FilterExpression::And(Box::new(lower), Box::new(upper))
+    })
+}
+
 fn parse_filter_predicate(
     parser: &mut Parser,
     parameter_count: &mut usize,
@@ -11073,6 +11390,10 @@ fn parse_filter_predicate(
                 members,
                 negated,
             });
+        }
+        if parser.consume_keyword("BETWEEN") {
+            let column = columns.into_iter().next().ok_or(SqlError::InvalidSyntax)?;
+            return parse_between(parser, parameter_count, column, negated);
         }
         if negated {
             return Err(SqlError::InvalidSyntax);

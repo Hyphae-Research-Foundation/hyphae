@@ -257,6 +257,21 @@ LIMIT <positive-integer>
 
 Index-ordered grouped walks remain a fail-closed non-claim.
 
+Three further PostgreSQL-affinity forms are admitted:
+
+- `SELECT DISTINCT` over a plain (non-aggregate, ungrouped) projection
+  deduplicates projected rows by their canonical ordered encodings,
+  preserving first-seen order, with `LIMIT` mandatory as the emission
+  bound; the underlying access charges the explicit scan ceiling because
+  duplicate density is unbounded ahead of deduplication. `DISTINCT` with
+  aggregates or `GROUP BY` stays fail-closed.
+- `OFFSET <n>` (plain and grouped selects) skips `n` shaped rows before
+  `LIMIT` bounds the emission; `LIMIT` is mandatory with `OFFSET`, and on
+  plain selects the bounded access widens by exactly the skipped rows.
+- `<column> [NOT] BETWEEN <scalar> AND <scalar>` desugars to the admitted
+  comparison pair (`>= AND <=`; negated `< OR >`), inheriting comparison
+  and three-valued NULL semantics unchanged, including parameters.
+
 The grouped projection may name the group-key columns explicitly ahead of
 the aggregates in PostgreSQL style — `SELECT kind, COUNT(*) FROM t GROUP BY
 kind LIMIT n` — provided the named plain columns are exactly the `GROUP BY`
