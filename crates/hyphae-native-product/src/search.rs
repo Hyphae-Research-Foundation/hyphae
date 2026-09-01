@@ -1196,6 +1196,31 @@ impl NativeProduct {
         })
     }
 
+    /// Durable posting scorer receipt. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns runtime errors mapped to product errors.
+    #[doc(hidden)]
+    pub fn match_text_receipt_for_diagnostics(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        index: crate::ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<hyphae_native_runtime::NativeLexicalSearchExecutionReceipt, ProductError> {
+        self.database
+            .match_text_at_snapshot_with_receipt(
+                &snapshot.inner,
+                index,
+                query,
+                limit,
+                hyphae_native_runtime::Bm25ScoreParameters::default(),
+            )
+            .map_err(map_runtime_error)
+    }
+
     /// Times the durable posting scorer alone. Diagnostic surface for the
     /// cap-ladder evidence harness; not a public contract.
     #[doc(hidden)]

@@ -3497,6 +3497,7 @@ struct LexicalExecutionPlan {
     expected_document_frequencies: Vec<u64>,
     work: Vec<LexicalSegmentWork>,
     planning: Option<NativeEngineWorkReceipt>,
+    document_lengths: Option<Arc<BTreeMap<Vec<u8>, f64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -16081,6 +16082,36 @@ impl NativeDatabase {
         Ok(receipt.hits)
     }
 
+    /// Durable posting scorer returning the complete execution receipt.
+    /// Diagnostic surface for the cap-ladder evidence harness; not a
+    /// public contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::match_text_at_snapshot`].
+    #[doc(hidden)]
+    pub fn match_text_at_snapshot_with_receipt(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        parameters: model::Bm25ScoreParameters,
+    ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let planning_permit = self.admit_foreground_bounded()?;
+        self.match_btree_text_profiled(
+            &snapshot.metadata,
+            index,
+            query,
+            limit,
+            parameters,
+            planning_permit,
+        )
+    }
+
     fn match_btree_text_profiled(
         &self,
         snapshot: &hyphae_native_mvcc::Snapshot,
@@ -16138,6 +16169,24 @@ impl NativeDatabase {
             document_count,
             document_count_f64,
         )?;
+        // Dense queries (planned postings within one quarter of the
+        // corpus) replace per-posting document descents with one shared
+        // sequential header scan: each posting then costs a map lookup
+        // instead of a full tree descent, which dominated the
+        // 100k-document profile.
+        let planned_posting_total = term_plans
+            .iter()
+            .map(|plan| plan.document_frequency)
+            .try_fold(0_u64, |total, plan| {
+                total
+                    .checked_add(plan)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)
+            })?;
+        let document_lengths = if planned_posting_total >= document_count / 4 {
+            Some(Arc::new(self.scan_document_lengths(tree, format, index)?))
+        } else {
+            None
+        };
         let planned_terms = term_plans.len();
         let planned_segments = term_plans.iter().try_fold(0_usize, |total, plan| {
             total
@@ -16169,9 +16218,50 @@ impl NativeDatabase {
                 expected_document_frequencies,
                 work,
                 planning,
+                document_lengths,
             },
             limit,
         )
+    }
+
+    /// One sequential scan of every live document header of the index,
+    /// keyed by document id. Tombstones are skipped; the map is bounded
+    /// by the collection document ceiling.
+    fn scan_document_lengths(
+        &self,
+        tree: BTree,
+        format: PhysicalSearchFormat,
+        index: ObjectId,
+    ) -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
+        let mut prefix = Vec::with_capacity(17);
+        prefix.push(SEARCH_DOCUMENT_PREFIX);
+        prefix.extend_from_slice(&index.get().to_be_bytes());
+        let plan = self.plan_btree_segments(
+            tree,
+            prefix.clone(),
+            Bound::Unbounded,
+            Bound::Unbounded,
+            NativeRuntimeError::InvalidSearchTree,
+        )?;
+        let mut lengths = BTreeMap::new();
+        for segment in &plan.segments {
+            for (key, value) in
+                tree.scan_planned_segment_cached(&self.pages, &self.buffer_pool, segment)?
+            {
+                let document_id = key
+                    .strip_prefix(prefix.as_slice())
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                if is_search_document_tombstone(&value) {
+                    if format.admits_tombstones() {
+                        continue;
+                    }
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let (document_length, _, _) = decode_search_document_header(&value)?;
+                lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
+            }
+        }
+        Ok(lengths)
     }
 
     fn execute_lexical_plan(
@@ -16199,6 +16289,7 @@ impl NativeDatabase {
                     plan.work,
                     execution_pool,
                     permit.permit(),
+                    plan.document_lengths.clone(),
                 )?,
             _ => (
                 self.scan_lexical_segments_serial(
@@ -16208,6 +16299,7 @@ impl NativeDatabase {
                     plan.average_length,
                     plan.parameters,
                     &plan.work,
+                    plan.document_lengths.as_deref(),
                 )?,
                 0,
             ),
@@ -16354,6 +16446,7 @@ impl NativeDatabase {
         Ok(plans)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_lexical_segments_serial(
         &self,
         tree: BTree,
@@ -16362,6 +16455,7 @@ impl NativeDatabase {
         average_length: f64,
         parameters: model::Bm25ScoreParameters,
         work: &[LexicalSegmentWork],
+        document_lengths: Option<&BTreeMap<Vec<u8>, f64>>,
     ) -> Result<Vec<LexicalPostingBatch>, NativeRuntimeError> {
         work.iter()
             .map(|work| {
@@ -16374,6 +16468,7 @@ impl NativeDatabase {
                     average_length,
                     parameters,
                     work,
+                    document_lengths,
                 )
             })
             .collect()
@@ -16391,6 +16486,7 @@ impl NativeDatabase {
         work: Vec<LexicalSegmentWork>,
         execution_pool: &NativeExecutionPool,
         permit: &OwnedGovernorPermit,
+        document_lengths: Option<Arc<BTreeMap<Vec<u8>, f64>>>,
     ) -> Result<(Vec<LexicalPostingBatch>, usize), NativeRuntimeError> {
         let pages = Arc::new(self.pages.read_handle()?);
         let pool = Arc::clone(&self.buffer_pool);
@@ -16413,6 +16509,7 @@ impl NativeDatabase {
                         average_length,
                         parameters,
                         &work,
+                        document_lengths.as_deref(),
                     )
                 },
             )?;
@@ -30744,33 +30841,43 @@ fn decode_lexical_segment(
     average_length: f64,
     parameters: model::Bm25ScoreParameters,
     work: &LexicalSegmentWork,
+    document_lengths: Option<&BTreeMap<Vec<u8>, f64>>,
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
     let mut live_postings = 0_u64;
     let mut contributions = Vec::with_capacity(work.segment.entry_count());
     for (key, encoded_frequency) in tree.scan_planned_segment_cached(pages, pool, &work.segment)? {
         let document_id = key
             .strip_prefix(work.posting_prefix.as_slice())
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?
-            .to_vec();
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
         let Some(term_frequency) = decode_live_search_posting(&encoded_frequency, format)? else {
             continue;
         };
         live_postings = live_postings
             .checked_add(1)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        let document = tree
-            .get_cached_pinned(pages, pool, &search_document_key(index, &document_id)?)?
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        if is_search_document_tombstone(document.bytes()) {
-            return Err(NativeRuntimeError::InvalidSearchTree);
-        }
-        let (document_length, _, _) = decode_search_document_header(document.bytes())?;
+        // Dense queries pre-scan every live document header once; a
+        // posting for an id absent from that complete map is corruption.
+        // Sparse queries keep the direct per-posting descent.
+        let document_length = if let Some(lengths) = document_lengths {
+            *lengths
+                .get(document_id)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?
+        } else {
+            let document = tree
+                .get_cached_pinned(pages, pool, &search_document_key(index, document_id)?)?
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            if is_search_document_tombstone(document.bytes()) {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            let (document_length, _, _) = decode_search_document_header(document.bytes())?;
+            search_count_f64(document_length)?
+        };
         contributions.push((
-            document_id,
+            document_id.to_vec(),
             bm25_term_score(
                 work.idf,
                 f64::from(term_frequency),
-                search_count_f64(document_length)?,
+                document_length,
                 average_length,
                 parameters,
             ),
