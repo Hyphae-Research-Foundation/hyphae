@@ -43,3 +43,7 @@ workspace = true
 [[example]]
 name = "security_crash_matrix"
 test = false
+
+[[example]]
+name = "collection_scale_evidence"
+test = false
