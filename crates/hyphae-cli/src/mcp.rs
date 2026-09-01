@@ -2517,6 +2517,7 @@ pub(crate) fn collection_search_request(
                     candidate_limit: branch.candidate_limit,
                     weight: branch.weight,
                     execution: None,
+                    max_distance: None,
                 })
             })
             .collect::<Result<_, Box<ProductError>>>()?,

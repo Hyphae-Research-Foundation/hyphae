@@ -1748,6 +1748,7 @@ fn decode_integrated_request(
             candidate_limit: usize_value(decoder)?,
             weight: decoder.u32()?,
             execution: Some(decode_vector_execution(decoder)?),
+            max_distance: None,
         });
     }
     let filter = decode_filter(decoder, 0, limits)?;
@@ -1883,6 +1884,25 @@ fn decode_integrated_request(
                             });
                         }
                         range_facets.push(crate::ProductRangeFacetRequest { field, ranges });
+                    }
+                }
+                8 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let count = bounded_count(
+                        decoder,
+                        crate::MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
+                        "distance cutoffs",
+                    )?;
+                    for _ in 0..count {
+                        let ordinal = usize_value(decoder)?;
+                        let bits = u64::from_le_bytes(decoder.array()?);
+                        let cutoff = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+                        if cutoff.bits() != bits {
+                            return Err(NativeProofError::Invalid("noncanonical distance cutoff"));
+                        }
+                        vectors
+                            .get_mut(ordinal)
+                            .ok_or(NativeProofError::Invalid("cutoff ordinal out of range"))?
+                            .max_distance = Some(cutoff);
                     }
                 }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
@@ -2195,6 +2215,20 @@ fn encode_autocut_sections(
                 encode_optional_float(encoded, range.lower);
                 encode_optional_float(encoded, range.upper);
             }
+        }
+    }
+    let cutoffs: Vec<(usize, hyphae_native_types::CanonicalF64)> = request
+        .vectors
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, branch)| branch.max_distance.map(|cutoff| (ordinal, cutoff)))
+        .collect();
+    if !cutoffs.is_empty() {
+        encoded.byte(8);
+        put_count(encoded, cutoffs.len())?;
+        for (ordinal, cutoff) in cutoffs {
+            put_usize(encoded, ordinal)?;
+            encoded.extend(&cutoff.bits().to_le_bytes());
         }
     }
     Ok(())

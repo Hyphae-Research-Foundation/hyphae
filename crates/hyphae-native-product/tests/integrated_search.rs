@@ -391,6 +391,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                     ef_search: 8,
                     exact_rerank: Some(4),
                 }),
+                max_distance: None,
             }],
             filter: ProductSearchFilter::Compare {
                 field: "price".into(),
@@ -436,6 +437,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 8,
                         exact_rerank: Some(4),
                     }),
+                    max_distance: None,
                 },
                 ProductVectorBranch {
                     target: "semantic".into(),
@@ -447,6 +449,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 8,
                         exact_rerank: Some(4),
                     }),
+                    max_distance: None,
                 },
             ],
             filter: ProductSearchFilter::MatchAll,
@@ -494,6 +497,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                     candidate_limit: 2,
                     weight: 1,
                     execution: Some(ProductVectorExecution::Exact),
+                    max_distance: None,
                 }],
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
@@ -529,6 +533,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 257,
                         exact_rerank: None,
                     }),
+                    max_distance: None,
                 }],
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
@@ -572,6 +577,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 2,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
@@ -594,6 +600,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 3,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
@@ -620,6 +627,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 3,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
@@ -1299,6 +1307,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             candidate_limit: 4,
             weight: 2,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
@@ -2253,6 +2262,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
             candidate_limit: 4,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
@@ -2770,6 +2780,69 @@ fn range_facets_bucket_numeric_values_in_declared_order() -> Result<(), Box<dyn 
     assert_eq!(
         error.code(),
         hyphae_native_product::ProductErrorCode::LimitExceeded
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn vector_distance_cutoff_discards_far_hits_before_fusion() -> Result<(), Box<dyn std::error::Error>>
+{
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("distance-cutoff");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    // Image vectors sit at x = 0,1,2,3; the query at the origin. Distances
+    // (squared L2) are 0, 1, 4, 9.
+    let origin = ProductVector::new([0.0, 0.0])?;
+    let request = |max_distance| ProductSearchRequest {
+        lexical: None,
+        vectors: vec![ProductVectorBranch {
+            target: "image".into(),
+            query: origin.clone(),
+            candidate_limit: 4,
+            weight: 1,
+            execution: None,
+            max_distance,
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let full = product.search_collection(binding.collection, &request(None), 7)?;
+    assert_eq!(full.hits.len(), 4);
+    let cut = product.search_collection(
+        binding.collection,
+        &request(Some(CanonicalF64::new(4.0))),
+        7,
+    )?;
+    // Distances 0, 1, 4 stay (inclusive cutoff); 9 is discarded.
+    let ids: Vec<u128> = cut.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(!ids.contains(&204));
+    // A negative cutoff fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(Some(CanonicalF64::new(-1.0))),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("negative cutoff was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
     );
     drop(product);
     fs::remove_dir_all(path)?;

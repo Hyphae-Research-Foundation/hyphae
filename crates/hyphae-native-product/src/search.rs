@@ -12,7 +12,7 @@ use hyphae_native_runtime::{
     AnnSearchOptions, HnswConfig, NativeRuntimeError, VectorHit,
     VectorMetric as RuntimeVectorMetric, execute_doc_values,
 };
-use hyphae_native_types::{LogicalType, TransactionId};
+use hyphae_native_types::{CanonicalF64, LogicalType, TransactionId};
 
 use crate::{
     NativeProduct, ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode,
@@ -189,6 +189,9 @@ pub struct ProductVectorBranch {
     /// A supplied strategy must agree with the catalog policy and cannot alter
     /// its adaptive threshold or exceed its `ef_search_max`.
     pub execution: Option<ProductVectorExecution>,
+    /// Optional finite nonnegative distance cutoff: hits strictly farther
+    /// than this canonical metric distance are discarded before fusion.
+    pub max_distance: Option<CanonicalF64>,
 }
 
 /// Branch-combination method for the fused relevance score.
@@ -1561,13 +1564,16 @@ fn execute_vector_branches(
             .iter()
             .find(|vector| vector.name.lookup() == branch.target)
             .ok_or_else(invalid_request)?;
-        let (hits, receipt) =
+        let (mut hits, receipt) =
             execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
         if hits
             .iter()
             .any(|hit| !hit.distance.is_finite() || hit.distance < 0.0)
         {
             return Err(invalid_request());
+        }
+        if let Some(cutoff) = branch.max_distance {
+            hits.retain(|hit| hit.distance <= cutoff.get());
         }
         let (branch_min, branch_max) = score_bounds(hits.iter().map(|hit| hit.distance));
         for (rank, hit) in hits.into_iter().enumerate() {
@@ -1984,6 +1990,11 @@ fn validate_search_request(
     }
     let mut targets = BTreeSet::new();
     for branch in &request.vectors {
+        if let Some(cutoff) = branch.max_distance
+            && (!cutoff.get().is_finite() || cutoff.get() < 0.0)
+        {
+            return Err(invalid_request());
+        }
         let vector = definition
             .vectors
             .iter()

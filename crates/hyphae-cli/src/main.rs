@@ -3696,6 +3696,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             exact_rerank: Some(candidate_limit),
                         },
                     }),
+                    max_distance: None,
                 }],
                 None if vector.is_empty() => Vec::new(),
                 None => return Err(CliFailure::invalid()),

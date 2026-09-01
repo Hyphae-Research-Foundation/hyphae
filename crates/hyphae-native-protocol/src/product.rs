@@ -1152,6 +1152,15 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let highlight = if request.highlight.is_some() { 5 } else { 0 };
     let autocut = if request.autocut.is_some() { 6 } else { 0 };
     let offset = if request.offset > 0 { 6 } else { 0 };
+    let cutoff = if request
+        .vectors
+        .iter()
+        .any(|branch| branch.max_distance.is_some())
+    {
+        6
+    } else {
+        0
+    };
     let range_facets = if request.range_facets.is_empty() {
         0
     } else {
@@ -1176,6 +1185,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         .max(offset)
         .max(average)
         .max(range_facets)
+        .max(cutoff)
 }
 
 fn ensure_operation_minor(
@@ -5521,6 +5531,20 @@ fn encode_search_collection(
             }
         }
     }
+    let cutoffs: Vec<(usize, hyphae_native_product::CanonicalF64)> = request
+        .vectors
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, branch)| branch.max_distance.map(|cutoff| (ordinal, cutoff)))
+        .collect();
+    if !cutoffs.is_empty() {
+        encoded.push(8);
+        put_u32(encoded, cutoffs.len())?;
+        for (ordinal, cutoff) in cutoffs {
+            put_u32(encoded, ordinal)?;
+            encoded.extend_from_slice(&cutoff.bits().to_le_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -5601,6 +5625,7 @@ fn decode_search_collection(
             candidate_limit,
             weight,
             execution,
+            max_distance: None,
         });
     }
     let filter = decode_search_filter(decoder, 0)?;
@@ -5768,6 +5793,24 @@ fn decode_search_collection(
                     }
                     range_facets
                         .push(hyphae_native_product::ProductRangeFacetRequest { field, ranges });
+                }
+            }
+            8 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let ordinal = decoder.usize_u32()?;
+                    let bits = decoder.u64()?;
+                    let cutoff = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+                    if cutoff.bits() != bits || !cutoff.get().is_finite() || cutoff.get() < 0.0 {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    vectors
+                        .get_mut(ordinal)
+                        .ok_or(ProductCodecError::InvalidValue)?
+                        .max_distance = Some(cutoff);
                 }
             }
             _ => return Err(ProductCodecError::InvalidValue),

@@ -157,6 +157,15 @@ unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
 
+A vector branch may declare an optional `max_distance` cutoff: hits at
+a canonical metric distance strictly greater than the cutoff are
+discarded before fusion, so garbage matches never earn a reciprocal
+rank or a normalized score. The cutoff must be a finite nonnegative
+canonical float; it never widens a branch (the candidate limit still
+applies first) and exact and approximate strategies honor it
+identically. Branch receipts keep reporting pre-cutoff candidate
+counts, so recall risk stays observable.
+
 An optional nonnegative `offset` skips that many leading hits of the
 final ranking before the `limit` window, after every other stage
 (fusion, filter, sort, rerank, deduplication, autocut). `offset + limit`

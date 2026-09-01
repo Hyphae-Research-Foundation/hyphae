@@ -2604,3 +2604,61 @@ fn range_facets_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::er
     ));
     Ok(())
 }
+
+#[test]
+fn vector_distance_cutoff_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: vec![hyphae_native_product::ProductVectorBranch {
+                target: "image".to_owned(),
+                query: hyphae_native_product::ProductVector::new([0.0, 0.0])?,
+                candidate_limit: 4,
+                weight: 1,
+                execution: Some(hyphae_native_product::ProductVectorExecution::Exact),
+                max_distance: Some(CanonicalF64::new(4.0)),
+            }],
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.vectors[0].max_distance == Some(CanonicalF64::new(4.0))
+    ));
+    // A forged negative cutoff fails closed at decode.
+    let canonical = CanonicalF64::new(4.0).bits().to_le_bytes();
+    let position = encoded
+        .windows(8)
+        .rposition(|window| window == canonical)
+        .ok_or("cutoff bits not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 8].copy_from_slice(&(-1.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
