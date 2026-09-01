@@ -10,6 +10,18 @@
 //!
 //! Usage: `cargo run --release -p hyphae-native-product \
 //!   --example collection_scale_evidence -- <documents> <data-dir>`
+//!
+//! First receipts (c-16 devbox, release, real disk, Group durability):
+//!
+//! | rung | ingest docs/s | bm25 p50 | filtered p50 | phrase p50 | fuzzy p50 |
+//! |------|--------------|----------|--------------|------------|-----------|
+//! | 10k  | 309          | 14.7 ms  | 17.6 ms      | 17.7 ms    | 40.4 ms   |
+//! | 100k | 48           | 323 ms   | 356 ms       | 329 ms     | 516 ms    |
+//!
+//! Both ingest and query scale superlinearly (10x documents -> ~22x query
+//! latency, ~6x slower per-document ingest): per-batch manifest rewrite and
+//! whole-manifest eligibility cloning dominate. Fixing those is the
+//! prerequisite for the next cap rung, not raising the constant.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
