@@ -183,3 +183,142 @@ fn clustered_vector(cluster: u16, member: u64) -> Result<Vector, Box<dyn std::er
         .collect::<Vec<_>>();
     Ok(Vector::new(values)?)
 }
+
+/// SQ8 quality gate: compressed top-3k candidates rescored with exact
+/// distances must recover recall@k >= 0.95 against the exact oracle for
+/// every metric, per ann-semantics-v1.
+#[test]
+fn sq8_compressed_rescoring_meets_the_recall_floor() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_ann::Sq8Quantizer;
+
+    const SQ_VECTORS: u16 = 256;
+    const SQ_DIMENSION: u16 = 16;
+    const SQ_QUERIES: u16 = 16;
+    const SQ_K: usize = 10;
+
+    for metric in [Metric::SquaredL2, Metric::Cosine, Metric::NegativeDot] {
+        let vectors: Vec<Vector> = (1..=SQ_VECTORS)
+            .map(|seed| sq_vector(u64::from(seed), SQ_DIMENSION))
+            .collect::<Result<_, _>>()?;
+        let quantizer = Sq8Quantizer::train(SQ_DIMENSION, metric, &vectors)?;
+        let codes = vectors
+            .iter()
+            .map(|vector| quantizer.encode(vector))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut recalled = 0_usize;
+        for query_seed in 0..SQ_QUERIES {
+            let query = sq_vector(1_000_000 + u64::from(query_seed), SQ_DIMENSION)?;
+            let query_code = quantizer.encode(&query)?;
+
+            // Exact oracle top-k.
+            let mut exact: Vec<(usize, f64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(ordinal, vector)| (ordinal, exact_distance(metric, &query, vector)))
+                .collect();
+            exact.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let expected: std::collections::BTreeSet<usize> = exact
+                .iter()
+                .take(SQ_K)
+                .map(|(ordinal, _)| *ordinal)
+                .collect();
+
+            // Compressed candidates: top 3k by approximate distance.
+            let mut approximate: Vec<(usize, f64)> = codes
+                .iter()
+                .enumerate()
+                .map(|(ordinal, code)| Ok((ordinal, quantizer.distance(&query_code, code)?)))
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+            approximate.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            approximate.truncate(SQ_K * 3);
+
+            // Exact rescoring of the compressed candidates.
+            let mut rescored: Vec<(usize, f64)> = approximate
+                .into_iter()
+                .map(|(ordinal, _)| (ordinal, exact_distance(metric, &query, &vectors[ordinal])))
+                .collect();
+            rescored.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            recalled += rescored
+                .iter()
+                .take(SQ_K)
+                .filter(|(ordinal, _)| expected.contains(ordinal))
+                .count();
+        }
+        let opportunities = usize::from(SQ_QUERIES) * SQ_K;
+        assert!(
+            recalled * 100 >= opportunities * 95,
+            "metric {metric:?} recalled {recalled}/{opportunities}"
+        );
+    }
+
+    // Degenerate training fails closed.
+    let flat = vec![sq_constant_vector(4, 1.5)?; 3];
+    assert!(Sq8Quantizer::train(4, Metric::SquaredL2, &flat).is_err());
+    Ok(())
+}
+
+fn sq_vector(seed: u64, dimension: u16) -> Result<Vector, Box<dyn std::error::Error>> {
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let values = (0..dimension)
+        .map(|component| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            let unit = f32::from(u16::try_from(state >> 48).unwrap_or(0)) / f32::from(u16::MAX);
+            unit * 4.0 - 2.0 + f32::from(component % 3)
+        })
+        .collect::<Vec<_>>();
+    Ok(Vector::new(values)?)
+}
+
+fn sq_constant_vector(dimension: u16, value: f32) -> Result<Vector, Box<dyn std::error::Error>> {
+    Ok(Vector::new(vec![value; usize::from(dimension)])?)
+}
+
+fn exact_distance(metric: Metric, left: &Vector, right: &Vector) -> f64 {
+    let dot: f64 = left
+        .values()
+        .iter()
+        .zip(right.values())
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum();
+    match metric {
+        Metric::SquaredL2 => left
+            .values()
+            .iter()
+            .zip(right.values())
+            .map(|(left, right)| {
+                let delta = f64::from(*left) - f64::from(*right);
+                delta * delta
+            })
+            .sum(),
+        Metric::NegativeDot => -dot,
+        Metric::Cosine => {
+            let left_norm: f64 = left
+                .values()
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum();
+            let right_norm: f64 = right
+                .values()
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum();
+            1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())
+        }
+    }
+}

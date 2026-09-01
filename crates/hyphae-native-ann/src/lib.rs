@@ -12,6 +12,9 @@ use std::{
     ops::ControlFlow,
 };
 
+pub mod sq8;
+pub use sq8::{Sq8Code, Sq8Quantizer};
+
 #[cfg(test)]
 thread_local! {
     static SEARCH_SCRATCH_PEAKS: std::cell::Cell<(usize, usize, usize, usize)> =
@@ -497,6 +500,9 @@ pub enum AnnError {
     /// A vector does not match the index dimension.
     #[error("native ANN vector dimension does not match the index")]
     DimensionMismatch,
+    /// Quantizer training data is empty, misaligned, or degenerate.
+    #[error("native SQ8 training requires aligned vectors with a positive finite range")]
+    InvalidQuantizerTraining,
     /// Cosine distance cannot admit a zero vector.
     #[error("native cosine ANN vectors cannot be zero")]
     ZeroCosineVector,

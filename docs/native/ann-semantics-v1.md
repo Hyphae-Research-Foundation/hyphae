@@ -197,6 +197,29 @@ A proof can attest to execution, inputs, graph identity, candidates and exact
 reranking. It cannot claim global nearest-neighbor optimality unless the query
 used the exact oracle.
 
+## Scalar quantization primitive
+
+`Sq8Quantizer` is the audited compression primitive for a future
+compressed traversal mode. Training folds the exact global minimum
+(`b`) and range (`a`) over the training vectors in input order;
+training data whose range is zero or non-finite fails closed. Encoding
+maps each component to `clamp(floor((x − b) · 255 / a), 0, 255)` and
+retains the code sum and squared-code sum, so asymmetric distances
+never decode:
+
+- squared L2 ≈ `a2 · Σ(cx − cy)²`;
+- dot ≈ `a2 · Σ cx·cy + ab · (Σcx + Σcy) + ib2`; and
+- cosine derives both norms from the retained sums via
+  `norm² ≈ a2 · Σc² + 2·ab · Σc + ib2`, rejecting zero norms,
+
+with `a2 = a²/255²`, `ab = a·b/255`, `ib2 = b²·dimension`. All
+arithmetic is f64 in deterministic input order. The V1 quality gate
+requires that compressed top-`3k` candidates rescored with exact
+distances recover recall@k ≥ 0.95 against the exact oracle on the
+bounded deterministic corpus, per metric. The primitive is not yet
+wired into the durable index format; graphs continue to persist exact
+`f32` vectors.
+
 ## Quality gates
 
 The G4 bounded correctness profile requires deterministic exact-oracle recall
