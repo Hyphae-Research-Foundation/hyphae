@@ -47,3 +47,7 @@ test = false
 [[example]]
 name = "collection_scale_evidence"
 test = false
+
+[[example]]
+name = "scale_stage_diagnostic"
+test = false

@@ -1196,6 +1196,28 @@ impl NativeProduct {
         })
     }
 
+    /// Times the durable posting scorer alone. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_at_snapshot_for_diagnostics(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        index: crate::ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<usize, ProductError> {
+        self.database
+            .match_text_at_snapshot(
+                &snapshot.inner,
+                index,
+                query,
+                limit,
+                hyphae_native_runtime::Bm25ScoreParameters::default(),
+            )
+            .map(|hits| hits.len())
+            .map_err(map_runtime_error)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,

@@ -225,6 +225,21 @@ pub struct ProductSnapshot {
 }
 
 impl ProductSnapshot {
+    /// Times the retained-model scorer alone. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_for_diagnostics(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<usize, ProductError> {
+        self.inner
+            .match_text(index, query, limit)
+            .map(|hits| hits.len())
+            .map_err(ProductError::from)
+    }
+
     /// Returns snapshot identity shared by all engines.
     pub fn identity(&self) -> SnapshotIdentity {
         SnapshotIdentity {
