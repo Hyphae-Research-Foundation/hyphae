@@ -1166,6 +1166,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
             || lexical.prefix
             || !lexical.fields.is_empty()
             || lexical.fuzzy.is_some()
+            || lexical.phrase
     }) {
         6
     } else {
@@ -5573,6 +5574,9 @@ fn encode_search_collection(
             encoded.push(9);
             encoded.push(3);
             put_u32(encoded, distance)?;
+        } else if lexical.phrase {
+            encoded.push(9);
+            encoded.push(4);
         }
         if !lexical.fields.is_empty() {
             encoded.push(10);
@@ -5605,6 +5609,7 @@ fn decode_search_collection(
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             })
         })
         .transpose()?;
@@ -5882,6 +5887,7 @@ fn decode_search_collection(
                         }
                         branch.fuzzy = Some(distance);
                     }
+                    4 => branch.phrase = true,
                     _ => return Err(ProductCodecError::InvalidValue),
                 }
             }

@@ -1143,6 +1143,9 @@ enum SearchCommand {
         /// Levenshtein edit distance (1..=2) expanding every query term.
         #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix", "field_boosts_json"])]
         fuzzy: Option<usize>,
+        /// Require the exact consecutive analyzed phrase.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix", "field_boosts_json", "fuzzy"])]
+        phrase: bool,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3726,6 +3729,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             lexical_prefix,
             field_boosts_json,
             fuzzy,
+            phrase,
         } => {
             let field_boosts = field_boosts_json
                 .map(|value| serde_json::from_str::<Vec<Value>>(&value))
@@ -3778,6 +3782,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             prefix: lexical_prefix,
                             fields: field_boosts.clone(),
                             fuzzy,
+                            phrase,
                         }),
                         vectors,
                         filter: filter_json

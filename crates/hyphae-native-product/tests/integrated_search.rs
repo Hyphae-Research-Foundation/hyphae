@@ -318,6 +318,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -434,6 +435,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: vec![
                 ProductVectorBranch {
@@ -632,6 +634,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "semantic".into(),
@@ -829,6 +832,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1230,6 +1234,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::In {
@@ -1280,6 +1285,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -1329,6 +1335,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -1448,6 +1455,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                         prefix: false,
                         fields: Vec::new(),
                         fuzzy: None,
+                        phrase: false,
                     }),
                     vectors: Vec::new(),
                     filter: ProductSearchFilter::MatchAll,
@@ -1614,6 +1622,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -1695,6 +1704,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("parent-dedupe");
@@ -1736,6 +1746,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1823,6 +1834,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1913,6 +1925,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2060,6 +2073,7 @@ fn lexical_ranking(
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2176,6 +2190,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2317,6 +2332,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -2450,6 +2466,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2554,6 +2571,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -2664,6 +2682,7 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2940,6 +2959,7 @@ fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
             prefix: false,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3041,6 +3061,7 @@ fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn
             prefix,
             fields: Vec::new(),
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3094,6 +3115,7 @@ fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn field_boosts_run_bm25f_over_body_and_doc_values() -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("field-boosts");
     let (mut product, binding) = configure(&path)?;
@@ -3123,6 +3145,7 @@ fn field_boosts_run_bm25f_over_body_and_doc_values() -> Result<(), Box<dyn std::
             prefix: false,
             fields,
             fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3217,6 +3240,7 @@ fn fuzzy_expansion_matches_typo_distance_terms() -> Result<(), Box<dyn std::erro
             prefix: false,
             fields: Vec::new(),
             fuzzy,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3284,6 +3308,7 @@ fn highlighting_covers_expanded_prefix_and_fuzzy_terms() -> Result<(), Box<dyn s
             prefix,
             fields: Vec::new(),
             fuzzy,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -3322,6 +3347,95 @@ fn highlighting_covers_expanded_prefix_and_fuzzy_terms() -> Result<(), Box<dyn s
             .any(|fragment| fragment.contains("database")),
         "fragments {:?}",
         hit.fragments
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn phrase_matching_requires_consecutive_positions() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("phrase-matching");
+    let (mut product, binding) = configure(&path)?;
+    // 401 has "rust database" adjacent; 402 has both terms separated.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                401,
+                "the rust database engine",
+                "book",
+                30,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(
+                402,
+                "rust is a great database companion",
+                "book",
+                10,
+                [1.0, 0.0],
+                [0.0, 1.0],
+            )?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |phrase| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Ordinary match admits both; the phrase admits only the adjacent one.
+    let any = product.search_collection(binding.collection, &request(false), 7)?;
+    assert_eq!(any.hits.len(), 2);
+    let phrase = product.search_collection(binding.collection, &request(true), 7)?;
+    assert_eq!(
+        phrase
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![401],
+    );
+    // A single-term phrase degrades to an ordinary match.
+    let mut single = request(true);
+    if let Some(lexical) = single.lexical.as_mut() {
+        lexical.query = "rust".into();
+    }
+    let single = product.search_collection(binding.collection, &single, 7)?;
+    assert_eq!(single.hits.len(), 2);
+    // Phrase excludes fuzzy.
+    let mut conflicted = request(true);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.fuzzy = Some(1);
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("phrase+fuzzy was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
     );
     drop(product);
     fs::remove_dir_all(path)?;

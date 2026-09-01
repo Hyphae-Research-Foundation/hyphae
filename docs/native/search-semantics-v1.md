@@ -172,6 +172,17 @@ fusion exactly like the ordinary branch (scores map to
 operator and prefix expansion; duplicate field names, unknown non-`body`
 names, zero weights, or an empty analyzed query fail closed.
 
+The lexical branch may declare phrase matching: candidates score
+ordinary BM25 over the analyzed query terms, then admission requires
+the exact consecutive analyzed-position sequence to occur in the
+candidate's canonical indexed text (positions from the canonical
+analyzer, including gaps left by discarded oversized tokens — a
+discarded token therefore breaks adjacency, deterministically).
+Verification re-analyzes only the BM25 candidates, never the whole
+corpus. A query with fewer than two analyzed terms is an ordinary
+match. Phrase matching is pairwise mutually exclusive with the term
+operator, prefix expansion, fuzzy expansion, and field boosts.
+
 The lexical branch may declare fuzzy expansion: each analyzed query
 term expands to every distinct indexed term within the declared
 Levenshtein character-edit distance (`1..=2`), then the branch scores

@@ -554,6 +554,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -686,6 +687,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -739,6 +741,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -791,6 +794,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -831,6 +835,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
 -> Result<(), Box<dyn std::error::Error>> {
     let collection = ObjectId::new(13)?;
@@ -846,6 +851,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2313,6 +2319,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2363,6 +2370,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2426,6 +2434,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
                 prefix: false,
                 fields: Vec::new(),
                 fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -2494,6 +2503,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2714,6 +2724,7 @@ fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn s
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2787,6 +2798,7 @@ fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std
                     prefix,
                     fields: Vec::new(),
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2844,6 +2856,7 @@ fn field_boosts_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::er
                     prefix: false,
                     fields,
                     fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2921,6 +2934,7 @@ fn fuzzy_expansion_requires_minor_six_and_rejects_invalid_distances()
                     prefix: false,
                     fields: Vec::new(),
                     fuzzy,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2965,5 +2979,63 @@ fn fuzzy_expansion_requires_minor_six_and_rejects_invalid_distances()
     let length = forged.len();
     forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn phrase_matching_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |phrase| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust database".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(false), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| !lexical.phrase)
+    ));
+    let gated = request(true);
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.phrase)
+    ));
     Ok(())
 }

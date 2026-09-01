@@ -163,6 +163,10 @@ pub struct ProductLexicalBranch {
     /// every analyzed query term over the bounded committed vocabulary.
     /// Mutually exclusive with `operator`, `prefix`, and `fields`.
     pub fuzzy: Option<usize>,
+    /// Require the exact consecutive analyzed-position sequence in the
+    /// candidate's canonical indexed text. Mutually exclusive with every
+    /// other lexical mode.
+    pub phrase: bool,
 }
 
 /// Maximum Levenshtein distance one fuzzy expansion may declare.
@@ -1646,6 +1650,64 @@ fn expand_fuzzy_query(
     Ok(collected.into_iter().collect::<Vec<_>>().join(" "))
 }
 
+/// Retains only BM25 candidates whose canonical indexed text contains
+/// the exact consecutive analyzed-position sequence of the query.
+/// Queries with fewer than two analyzed terms pass every hit through.
+fn filter_phrase_hits(
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    hits: Vec<hyphae_native_runtime::MatchHit>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    if analysis.tokens.len() < 2 {
+        return Ok(hits);
+    }
+    let sequence: Vec<&str> = analysis
+        .tokens
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    let mut retained = Vec::with_capacity(hits.len());
+    for hit in hits {
+        checkpoint()?;
+        let Some(text) = snapshot.inner.search_document_text(index, &hit.document_id) else {
+            continue;
+        };
+        if phrase_occurs(text, &sequence) {
+            retained.push(hit);
+        }
+    }
+    Ok(retained)
+}
+
+/// Whether the exact consecutive analyzed-position sequence occurs in
+/// the text. Discarded oversized tokens leave position gaps that break
+/// adjacency, deterministically.
+fn phrase_occurs(text: &str, sequence: &[&str]) -> bool {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(text);
+    let tokens = &analysis.tokens;
+    'starts: for start in 0..tokens.len() {
+        if tokens[start].term != sequence[0] {
+            continue;
+        }
+        let base = tokens[start].position;
+        let mut cursor = start;
+        for (offset, term) in sequence.iter().enumerate().skip(1) {
+            cursor += 1;
+            let Some(token) = tokens.get(cursor) else {
+                continue 'starts;
+            };
+            if token.position != base + offset || token.term != *term {
+                continue 'starts;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Per-term membership sets and the required distinct-match minimum.
 type LexicalMembership = (Vec<BTreeSet<crate::ObjectId>>, usize);
 
@@ -1764,6 +1826,11 @@ fn execute_lexical_branch(
         execute_bm25f_branch(
             snapshot, collection, source, index, lexical, query, checkpoint,
         )?
+    };
+    let hits = if lexical.phrase {
+        filter_phrase_hits(snapshot, index, query, hits, checkpoint)?
+    } else {
+        hits
     };
     let required = lexical_operator_membership(
         database,
@@ -2264,7 +2331,8 @@ fn validate_lexical_branch(
         let modes = usize::from(lexical.prefix)
             + usize::from(lexical.operator.is_some())
             + usize::from(boosted)
-            + usize::from(fuzzy);
+            + usize::from(fuzzy)
+            + usize::from(lexical.phrase);
         let mut boost_names = BTreeSet::new();
         if !(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
             || lexical.weight == 0
