@@ -172,6 +172,17 @@ fusion exactly like the ordinary branch (scores map to
 operator and prefix expansion; duplicate field names, unknown non-`body`
 names, zero weights, or an empty analyzed query fail closed.
 
+The lexical branch may declare fuzzy expansion: each analyzed query
+term expands to every distinct indexed term within the declared
+Levenshtein character-edit distance (`1..=2`), then the branch scores
+ordinary BM25 over the union of expanded terms. Expansion walks the
+same bounded committed vocabulary as prefix expansion and admits at
+most 64 distinct expanded terms across the whole query
+(`MAX_LEXICAL_PREFIX_TERMS`); overflow fails closed as limit-exceeded.
+Terms whose expansion is empty contribute nothing. Fuzzy expansion,
+prefix expansion, field boosts, and the term operator are pairwise
+mutually exclusive in one request.
+
 The lexical branch may declare prefix expansion: the final analyzed
 query term is treated as a prefix and expands to every distinct indexed
 term starting with it, then the branch scores ordinary BM25 over the

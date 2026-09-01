@@ -159,7 +159,14 @@ pub struct ProductLexicalBranch {
     /// BM25F. Empty keeps single-field BM25. Mutually exclusive with
     /// `operator` and `prefix`.
     pub fields: Vec<ProductLexicalFieldBoost>,
+    /// Optional Levenshtein character-edit distance (`1..=2`) expanding
+    /// every analyzed query term over the bounded committed vocabulary.
+    /// Mutually exclusive with `operator`, `prefix`, and `fields`.
+    pub fuzzy: Option<usize>,
 }
+
+/// Maximum Levenshtein distance one fuzzy expansion may declare.
+pub const MAX_LEXICAL_FUZZY_DISTANCE: usize = 2;
 
 /// One weighted BM25F field boost.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1609,6 +1616,36 @@ fn expand_prefix_query(
     Ok(terms.join(" "))
 }
 
+/// Rewrites every analyzed query term as its bounded fuzzy expansion
+/// over the committed vocabulary; empty expansions contribute nothing.
+fn expand_fuzzy_query(
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    max_distance: usize,
+) -> Result<String, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let mut collected = BTreeSet::new();
+    for token in &analysis.tokens {
+        match snapshot.inner.search_expand_term_fuzzy(
+            index,
+            &token.term,
+            max_distance,
+            MAX_LEXICAL_PREFIX_TERMS,
+            &mut collected,
+        ) {
+            hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
+                return Err(invalid_request());
+            }
+            hyphae_native_runtime::TermPrefixExpansion::Overflow => {
+                return Err(limit_exceeded());
+            }
+            hyphae_native_runtime::TermPrefixExpansion::Terms(_) => {}
+        }
+    }
+    Ok(collected.into_iter().collect::<Vec<_>>().join(" "))
+}
+
 /// Per-term membership sets and the required distinct-match minimum.
 type LexicalMembership = (Vec<BTreeSet<crate::ObjectId>>, usize);
 
@@ -1700,6 +1737,8 @@ fn execute_lexical_branch(
     };
     let query = if lexical.prefix {
         expand_prefix_query(snapshot, index, &query)?
+    } else if let Some(distance) = lexical.fuzzy {
+        expand_fuzzy_query(snapshot, index, &query, distance)?
     } else {
         query
     };
@@ -2214,6 +2253,52 @@ fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductE
     Ok(())
 }
 
+/// Validates the lexical branch's bounds and mode exclusivity.
+fn validate_lexical_branch(
+    definition: &SearchCollectionDefinitionV2,
+    request: &ProductSearchRequest,
+) -> Result<(), ProductError> {
+    if let Some(lexical) = &request.lexical {
+        let boosted = !lexical.fields.is_empty();
+        let fuzzy = lexical.fuzzy.is_some();
+        let modes = usize::from(lexical.prefix)
+            + usize::from(lexical.operator.is_some())
+            + usize::from(boosted)
+            + usize::from(fuzzy);
+        let mut boost_names = BTreeSet::new();
+        if !(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
+            || lexical.weight == 0
+            || modes > 1
+            || matches!(
+                lexical.fuzzy,
+                Some(distance) if !(1..=MAX_LEXICAL_FUZZY_DISTANCE).contains(&distance)
+            )
+            || (lexical.prefix && lexical.operator.is_some())
+            || (boosted && (lexical.prefix || lexical.operator.is_some()))
+            || lexical.fields.len() > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS
+            || lexical.fields.iter().any(|boost| {
+                boost.field.is_empty()
+                    || !(1..=hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS)
+                        .contains(&boost.weight_micros)
+                    || !boost_names.insert(boost.field.as_str())
+                    || (boost.field != LEXICAL_BODY_FIELD
+                        && !definition.fields.iter().any(|field| {
+                            field.name.lookup() == boost.field
+                                && field.logical_type == LogicalType::Text
+                        }))
+            })
+            || matches!(
+                lexical.operator,
+                Some(ProductLexicalOperator::Or { minimum_match })
+                    if !(1..=MAX_LEXICAL_MINIMUM_MATCH).contains(&minimum_match)
+            )
+        {
+            return Err(invalid_request());
+        }
+    }
+    Ok(())
+}
+
 fn validate_search_request(
     definition: &SearchCollectionDefinitionV2,
     binding: &ProductSearchCollectionBinding,
@@ -2241,34 +2326,7 @@ fn validate_search_request(
     {
         return Err(limit_exceeded());
     }
-    if let Some(lexical) = &request.lexical {
-        let boosted = !lexical.fields.is_empty();
-        let mut boost_names = BTreeSet::new();
-        if !(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
-            || lexical.weight == 0
-            || (lexical.prefix && lexical.operator.is_some())
-            || (boosted && (lexical.prefix || lexical.operator.is_some()))
-            || lexical.fields.len() > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS
-            || lexical.fields.iter().any(|boost| {
-                boost.field.is_empty()
-                    || !(1..=hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS)
-                        .contains(&boost.weight_micros)
-                    || !boost_names.insert(boost.field.as_str())
-                    || (boost.field != LEXICAL_BODY_FIELD
-                        && !definition.fields.iter().any(|field| {
-                            field.name.lookup() == boost.field
-                                && field.logical_type == LogicalType::Text
-                        }))
-            })
-            || matches!(
-                lexical.operator,
-                Some(ProductLexicalOperator::Or { minimum_match })
-                    if !(1..=MAX_LEXICAL_MINIMUM_MATCH).contains(&minimum_match)
-            )
-        {
-            return Err(invalid_request());
-        }
-    }
+    validate_lexical_branch(definition, request)?;
     let mut targets = BTreeSet::new();
     for branch in &request.vectors {
         if let Some(cutoff) = branch.max_distance

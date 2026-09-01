@@ -1162,7 +1162,10 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         0
     };
     let operator = if request.lexical.as_ref().is_some_and(|lexical| {
-        lexical.operator.is_some() || lexical.prefix || !lexical.fields.is_empty()
+        lexical.operator.is_some()
+            || lexical.prefix
+            || !lexical.fields.is_empty()
+            || lexical.fuzzy.is_some()
     }) {
         6
     } else {
@@ -5566,6 +5569,10 @@ fn encode_search_collection(
         } else if lexical.prefix {
             encoded.push(9);
             encoded.push(2);
+        } else if let Some(distance) = lexical.fuzzy {
+            encoded.push(9);
+            encoded.push(3);
+            put_u32(encoded, distance)?;
         }
         if !lexical.fields.is_empty() {
             encoded.push(10);
@@ -5597,6 +5604,7 @@ fn decode_search_collection(
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             })
         })
         .transpose()?;
@@ -5865,6 +5873,15 @@ fn decode_search_collection(
                         });
                     }
                     2 => branch.prefix = true,
+                    3 => {
+                        let distance = decoder.usize_u32()?;
+                        if !(1..=hyphae_native_product::MAX_LEXICAL_FUZZY_DISTANCE)
+                            .contains(&distance)
+                        {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        branch.fuzzy = Some(distance);
+                    }
                     _ => return Err(ProductCodecError::InvalidValue),
                 }
             }

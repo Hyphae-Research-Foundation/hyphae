@@ -815,7 +815,10 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
                 || request.offset > 0
                 || !request.range_facets.is_empty()
                 || request.lexical.as_ref().is_some_and(|lexical| {
-                    lexical.operator.is_some() || lexical.prefix || !lexical.fields.is_empty()
+                    lexical.operator.is_some()
+                        || lexical.prefix
+                        || !lexical.fields.is_empty()
+                        || lexical.fuzzy.is_some()
                 })
     );
     let highlighted = matches!(
@@ -1737,6 +1740,7 @@ fn decode_integrated_request(
             operator: None,
             prefix: false,
             fields: Vec::new(),
+            fuzzy: None,
         }),
         _ => return Err(NativeProofError::Invalid("invalid lexical presence tag")),
     };
@@ -1925,6 +1929,7 @@ fn decode_integrated_request(
                             });
                         }
                         2 => branch.prefix = true,
+                        3 => branch.fuzzy = Some(usize_value(decoder)?),
                         _ => {
                             return Err(NativeProofError::Invalid("invalid lexical operator"));
                         }
@@ -2285,6 +2290,10 @@ fn encode_autocut_sections(
         } else if lexical.prefix {
             encoded.byte(9);
             encoded.byte(2);
+        } else if let Some(distance) = lexical.fuzzy {
+            encoded.byte(9);
+            encoded.byte(3);
+            put_usize(encoded, distance)?;
         }
         if !lexical.fields.is_empty() {
             encoded.byte(10);

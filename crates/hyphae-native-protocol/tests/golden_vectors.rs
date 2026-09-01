@@ -553,6 +553,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -684,6 +685,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     operator: None,
                     prefix: false,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -736,6 +738,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -787,6 +790,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -841,6 +845,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     operator: None,
                     prefix: false,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2307,6 +2312,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2356,6 +2362,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                     operator: None,
                     prefix: false,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2418,6 +2425,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
                 operator: None,
                 prefix: false,
                 fields: Vec::new(),
+                fuzzy: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -2485,6 +2493,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                     operator: None,
                     prefix: false,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2704,6 +2713,7 @@ fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn s
                     operator,
                     prefix: false,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2776,6 +2786,7 @@ fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std
                     operator: None,
                     prefix,
                     fields: Vec::new(),
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2832,6 +2843,7 @@ fn field_boosts_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::er
                     operator: None,
                     prefix: false,
                     fields,
+                    fuzzy: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2889,6 +2901,69 @@ fn field_boosts_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::er
         .ok_or("weight bytes not found")?;
     let mut forged = encoded.clone();
     forged[position..position + 4].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn fuzzy_expansion_requires_minor_six_and_rejects_invalid_distances()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |fuzzy| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "datbase".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fuzzy.is_none())
+    ));
+    let gated = request(Some(2));
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().and_then(|lexical| lexical.fuzzy) == Some(2)
+    ));
+    // A forged zero distance fails closed at decode.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }

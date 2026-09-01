@@ -1746,6 +1746,28 @@ fn seeded_member_walk(members: &[Vec<u8>], seed: u64, count: usize) -> Vec<Vec<u
         .collect()
 }
 
+/// Whether two character sequences are within `max_distance` Levenshtein
+/// edits, using the banded early-exit dynamic program.
+fn bounded_levenshtein(left: &[char], right: &[char], max_distance: usize) -> bool {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0_usize; right.len() + 1];
+    for (left_index, left_character) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_minimum = current[0];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_character != right_character));
+            row_minimum = row_minimum.min(current[right_index + 1]);
+        }
+        if row_minimum > max_distance {
+            return false;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()] <= max_distance
+}
+
 /// Exclusive upper bound of a literal binary prefix, `None` when unbounded.
 fn binary_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     if prefix.is_empty() {
@@ -3834,6 +3856,44 @@ impl NativeSnapshot {
             }
         }
         TermPrefixExpansion::Terms(terms.into_iter().collect())
+    }
+
+    /// Expands one analyzed term to every distinct indexed term within
+    /// the Levenshtein character-edit distance, ascending, bounded by
+    /// `limit` alongside previously collected terms.
+    pub fn search_expand_term_fuzzy(
+        &self,
+        index: ObjectId,
+        term: &str,
+        max_distance: usize,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> TermPrefixExpansion {
+        let Some(documents) = self.state.search.documents(index) else {
+            return TermPrefixExpansion::UnknownIndex;
+        };
+        let query: Vec<char> = term.chars().collect();
+        let mut added = Vec::new();
+        for text in documents.values() {
+            let analysis = CanonicalAnalyzer::analyze(text);
+            for token in &analysis.tokens {
+                if collected.contains(&token.term) {
+                    continue;
+                }
+                let candidate: Vec<char> = token.term.chars().collect();
+                if query.len().abs_diff(candidate.len()) > max_distance {
+                    continue;
+                }
+                if bounded_levenshtein(&query, &candidate, max_distance) {
+                    if collected.len() == limit {
+                        return TermPrefixExpansion::Overflow;
+                    }
+                    collected.insert(token.term.clone());
+                    added.push(token.term.clone());
+                }
+            }
+        }
+        TermPrefixExpansion::Terms(added)
     }
 
     /// Returns every retained document of one lexical index.

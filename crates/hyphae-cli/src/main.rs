@@ -1140,6 +1140,9 @@ enum SearchCommand {
         /// JSON array of `{field,weight_micros}` BM25F boosts.
         #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix"])]
         field_boosts_json: Option<String>,
+        /// Levenshtein edit distance (1..=2) expanding every query term.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix", "field_boosts_json"])]
+        fuzzy: Option<usize>,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3722,6 +3725,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             minimum_match,
             lexical_prefix,
             field_boosts_json,
+            fuzzy,
         } => {
             let field_boosts = field_boosts_json
                 .map(|value| serde_json::from_str::<Vec<Value>>(&value))
@@ -3773,6 +3777,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             },
                             prefix: lexical_prefix,
                             fields: field_boosts.clone(),
+                            fuzzy,
                         }),
                         vectors,
                         filter: filter_json
