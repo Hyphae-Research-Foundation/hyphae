@@ -2571,6 +2571,7 @@ mod tests {
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
             },
         };
         assert!(super::server::family_accepts(

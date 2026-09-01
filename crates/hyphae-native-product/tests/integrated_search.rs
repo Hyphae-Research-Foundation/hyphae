@@ -333,6 +333,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
         7,
     )?;
@@ -390,6 +391,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
         0,
     )?;
@@ -440,6 +442,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
         0,
     )?;
@@ -483,6 +486,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
             },
             0,
         )
@@ -515,6 +519,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
             },
             0,
         )
@@ -555,6 +560,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -574,6 +580,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
@@ -597,6 +604,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
 
     let mut ann_artifact = None;
@@ -779,6 +787,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     assert!(
         product
@@ -1047,6 +1056,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     parent_dedupe: None,
                     rerank: None,
                     highlight: None,
+                    autocut: None,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1105,6 +1115,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1130,6 +1141,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1170,6 +1182,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1207,6 +1220,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
     };
     let context = proof_context(&session, 42);
@@ -1255,6 +1269,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let rrf = product.search_collection(binding.collection, &request(None), 11)?;
     let weighted = product.search_collection(
@@ -1360,6 +1375,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                     parent_dedupe: None,
                     rerank: None,
                     highlight: None,
+                    autocut: None,
                 },
                 12,
             )
@@ -1522,6 +1538,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     assert!(!result.hits.is_empty());
@@ -1633,6 +1650,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
         parent_dedupe: dedupe,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let all = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(all.hits.len() >= 4);
@@ -1713,6 +1731,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
         parent_dedupe: None,
         rerank,
         highlight: None,
+        autocut: None,
     };
     let base = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(base.hits.len() >= 3);
@@ -1796,6 +1815,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
         parent_dedupe: None,
         rerank: None,
         highlight,
+        autocut: None,
     };
     let plain = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(plain.hits.iter().all(|hit| hit.fragments.is_empty()));
@@ -1936,6 +1956,7 @@ fn lexical_ranking(
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
         11,
     )?;
@@ -1985,6 +2006,7 @@ fn tuned_bm25_parameters_change_the_ranking_and_survive_reopen()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn explicit_transaction_stages_a_complete_document_atomically()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("atomic-document");
@@ -2044,6 +2066,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
         0,
     )?;
@@ -2184,6 +2207,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let relative = product.search_collection(
         binding.collection,
@@ -2238,6 +2262,111 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
         NativeProofGenerationLimits::default(),
     )?;
     assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("autocut");
+    let (mut product, binding) = configure(&path)?;
+    // Two documents strongly about "rust database", two only weakly
+    // related: the fused score curve has a steep knee after the leaders.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                401,
+                "rust database engine rust database core",
+                "book",
+                30,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(
+                402,
+                "rust database handbook rust database",
+                "book",
+                10,
+                [1.0, 0.0],
+                [0.0, 1.0],
+            )?,
+            document(403, "garden rust", "gear", 20, [2.0, 0.0], [1.0, 0.0])?,
+            document(
+                404,
+                "green garden database",
+                "gear",
+                40,
+                [3.0, 0.0],
+                [1.0, 1.0],
+            )?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |autocut| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut,
+    };
+    let full = product.search_collection(binding.collection, &request(None), 7)?;
+    let cut = product.search_collection(binding.collection, &request(Some(1)), 7)?;
+    // Without autocut the weak tail is present; with steepness 1 the
+    // ranking stops at the knee after the strong leaders.
+    assert!(full.hits.len() > cut.hits.len());
+    assert!(!cut.hits.is_empty());
+    let cut_ids: Vec<u128> = cut.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert!(cut_ids.iter().all(|id| *id == 401 || *id == 402));
+    // The cut ranking is a strict prefix of the full ranking.
+    let full_ids: Vec<u128> = full.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(&full_ids[..cut_ids.len()], cut_ids.as_slice());
+
+    // Zero and oversized steepness fail closed.
+    for steepness in [0, hyphae_native_product::MAX_AUTOCUT_STEEPNESS + 1] {
+        let error = product.search_collection(binding.collection, &request(Some(steepness)), 7);
+        let Err(error) = error else {
+            return Err("invalid autocut was admitted".into());
+        };
+        assert_eq!(
+            error.code(),
+            hyphae_native_product::ProductErrorCode::InvalidRequest
+        );
+    }
+
+    // The proof pipeline binds the stage at semantics version 5.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 53);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(1)),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 5);
     let report = verify_native_proof_offline(
         &artifact.proof_bytes,
         &artifact.witness_bytes,

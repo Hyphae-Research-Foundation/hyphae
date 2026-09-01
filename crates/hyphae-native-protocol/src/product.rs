@@ -1149,11 +1149,13 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     };
     let rerank = if request.rerank.is_some() { 4 } else { 0 };
     let highlight = if request.highlight.is_some() { 5 } else { 0 };
+    let autocut = if request.autocut.is_some() { 6 } else { 0 };
     filter_required_minor(&request.filter)
         .max(fusion)
         .max(dedupe)
         .max(rerank)
         .max(highlight)
+        .max(autocut)
 }
 
 fn ensure_operation_minor(
@@ -5450,6 +5452,10 @@ fn encode_search_collection(
         put_u32(encoded, highlight.max_fragments)?;
         put_u32(encoded, highlight.fragment_bytes)?;
     }
+    if let Some(autocut) = request.autocut {
+        encoded.push(5);
+        put_u32(encoded, autocut)?;
+    }
     Ok(())
 }
 
@@ -5592,6 +5598,7 @@ fn decode_search_collection(
     let mut parent_dedupe = None;
     let mut rerank = None;
     let mut highlight = None;
+    let mut autocut = None;
     let mut previous = 0_u8;
     while decoder.has_remaining() {
         let tag = decoder.u8()?;
@@ -5658,6 +5665,13 @@ fn decode_search_collection(
                     fragment_bytes,
                 });
             }
+            5 => {
+                let steepness = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_AUTOCUT_STEEPNESS).contains(&steepness) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                autocut = Some(steepness);
+            }
             _ => return Err(ProductCodecError::InvalidValue),
         }
     }
@@ -5675,6 +5689,7 @@ fn decode_search_collection(
             parent_dedupe,
             rerank,
             highlight,
+            autocut,
         },
     ))
 }

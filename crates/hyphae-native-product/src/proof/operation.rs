@@ -47,6 +47,8 @@ const SEMANTICS_VERSION: u16 = 2;
 const SEMANTICS_VERSION_OPERATORS: u16 = 3;
 /// Semantics version required by requests carrying a highlight budget.
 const SEMANTICS_VERSION_HIGHLIGHT: u16 = 4;
+/// Semantics version required by requests carrying an autocut stage.
+const SEMANTICS_VERSION_AUTOCUT: u16 = 5;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -806,6 +808,11 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
     };
+    let autocut = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. }
+            if request.autocut.is_some()
+    );
     let highlighted = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
@@ -818,7 +825,9 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
                 || request.parent_dedupe.is_some()
                 || request.rerank.is_some()
     );
-    if highlighted {
+    if autocut {
+        SEMANTICS_VERSION_AUTOCUT
+    } else if highlighted {
         SEMANTICS_VERSION_HIGHLIGHT
     } else if extended || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
@@ -893,7 +902,10 @@ fn decode_semantic_operation(
     if !magic_ok
         || !matches!(
             semantics_version,
-            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS | SEMANTICS_VERSION_HIGHLIGHT
+            SEMANTICS_VERSION
+                | SEMANTICS_VERSION_OPERATORS
+                | SEMANTICS_VERSION_HIGHLIGHT
+                | SEMANTICS_VERSION_AUTOCUT
         )
         || decoder.u16()? != ORDERING_VERSION
     {
@@ -1696,6 +1708,12 @@ fn encode_integrated_request(
             put_usize(encoded, highlight.max_fragments)?;
             put_usize(encoded, highlight.fragment_bytes)?;
         }
+        if semantics_version >= SEMANTICS_VERSION_AUTOCUT
+            && let Some(autocut) = request.autocut
+        {
+            encoded.byte(5);
+            put_usize(encoded, autocut)?;
+        }
     }
     Ok(())
 }
@@ -1787,6 +1805,7 @@ fn decode_integrated_request(
     let mut parent_dedupe = None;
     let mut rerank = None;
     let mut highlight = None;
+    let mut autocut = None;
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1836,6 +1855,9 @@ fn decode_integrated_request(
                         fragment_bytes: usize_value(decoder)?,
                     });
                 }
+                5 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    autocut = Some(usize_value(decoder)?);
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1852,6 +1874,7 @@ fn decode_integrated_request(
         parent_dedupe,
         rerank,
         highlight,
+        autocut,
     })
 }
 

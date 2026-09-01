@@ -3757,6 +3757,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                 fragment_bytes: highlight_bytes,
                             }
                         }),
+                        autocut: None,
                     },
                 },
             )

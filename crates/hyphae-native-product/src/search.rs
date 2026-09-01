@@ -284,7 +284,15 @@ pub struct ProductSearchRequest {
     pub rerank: Option<ProductRerankStage>,
     /// Optional budgeted highlighting over the final hits.
     pub highlight: Option<ProductHighlight>,
+    /// Optional knee-detection truncation of the score-ordered ranking:
+    /// cut immediately before the N-th strict local maximum of the
+    /// normalized score curve's deviation from uniform linear decay.
+    /// Runs after reranking/deduplication and before the final limit.
+    pub autocut: Option<usize>,
 }
+
+/// Maximum autocut extremum count in one request.
+pub const MAX_AUTOCUT_STEEPNESS: usize = 16;
 
 /// Physical vector strategy that actually ran.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1211,6 +1219,15 @@ impl NativeProduct {
         } else if request.rerank.is_some() {
             result.hits.truncate(request.limit);
         }
+        if let Some(steepness) = request.autocut
+            && request.sort.is_empty()
+        {
+            let cut = autocut_extremum(
+                &result.hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+                steepness,
+            );
+            result.hits.truncate(cut);
+        }
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
@@ -1880,6 +1897,15 @@ fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
     Ok(())
 }
 
+fn validate_autocut(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(steepness) = request.autocut
+        && !(1..=MAX_AUTOCUT_STEEPNESS).contains(&steepness)
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_highlight(request: &ProductSearchRequest) -> Result<(), ProductError> {
     if let Some(highlight) = &request.highlight
         && (!(1..=MAX_HIGHLIGHT_FRAGMENTS).contains(&highlight.max_fragments)
@@ -1911,6 +1937,7 @@ fn validate_search_request(
     validate_parent_dedupe(request)?;
     validate_rerank(request)?;
     validate_highlight(request)?;
+    validate_autocut(request)?;
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
@@ -2288,6 +2315,52 @@ fn extract_fragments(
         cursor = end;
     }
     fragments
+}
+
+/// Knee-detection cut point over a descending score curve: normalize
+/// scores to `[0, 1]` against uniform linear decay and cut immediately
+/// before the `steepness`-th strict local maximum of the deviation.
+/// Degenerate inputs (one hit, equal extremes) return the whole length.
+fn autocut_extremum(scores: &[f64], steepness: usize) -> usize {
+    if scores.len() <= 1 {
+        return scores.len();
+    }
+    let first = scores[0];
+    let last = scores[scores.len() - 1];
+    let range = last - first;
+    if range == 0.0 || !range.is_finite() {
+        return scores.len();
+    }
+    let count = scores.len();
+    // Hit counts are bounded far below 2^32; the lossless u32->f64 path
+    // keeps the normalization exact.
+    let denominator = f64::from(u32::try_from(count - 1).unwrap_or(u32::MAX));
+    let step = 1.0 / denominator;
+    let deviation: Vec<f64> = scores
+        .iter()
+        .enumerate()
+        .map(|(index, score)| {
+            let position = f64::from(u32::try_from(index).unwrap_or(u32::MAX));
+            (score - first) / range - position * step
+        })
+        .collect();
+    let mut extrema = 0_usize;
+    for index in 1..count {
+        let is_maximum = if index == count - 1 {
+            count > 2
+                && deviation[index] > deviation[index - 1]
+                && deviation[index] > deviation[index - 2]
+        } else {
+            deviation[index] > deviation[index - 1] && deviation[index] > deviation[index + 1]
+        };
+        if is_maximum {
+            extrema += 1;
+            if extrema >= steepness {
+                return index;
+            }
+        }
+    }
+    count
 }
 
 fn apply_parent_dedupe(

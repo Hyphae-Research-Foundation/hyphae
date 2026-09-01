@@ -1633,6 +1633,7 @@ async fn memory_recall(
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let (result, proof) = if input.prove {
         let response = client
@@ -2040,6 +2041,7 @@ async fn profile_memory_recall(
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let (result, proof) = if input.prove {
         let response = client
@@ -2411,6 +2413,7 @@ async fn profile_memory_status(
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     };
     let response = client
         .search_collection(collection_id, request, options)
@@ -2545,6 +2548,7 @@ pub(crate) fn collection_search_request(
         }),
         rerank: None,
         highlight: None,
+        autocut: None,
     })
 }
 

@@ -576,6 +576,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -642,6 +643,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
             },
         });
         assert!(matches!(
@@ -683,6 +685,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
             },
         })
     };
@@ -732,6 +735,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             }),
             rerank: None,
             highlight: None,
+            autocut: None,
         },
     });
     assert!(matches!(
@@ -777,6 +781,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 scores: vec![(ObjectId::new(201)?, 0.75), (ObjectId::new(202)?, 0.25)],
             }),
             highlight: None,
+            autocut: None,
         },
     });
     assert!(matches!(
@@ -822,6 +827,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                 parent_dedupe: None,
                 rerank: None,
                 highlight,
+                autocut: None,
             },
         })
     };
@@ -2281,6 +2287,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
         },
     });
     assert!(matches!(
@@ -2299,5 +2306,60 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
             if request.fusion
                 == Some(hyphae_native_product::ProductFusionMethod::RelativeScore)
     ));
+    Ok(())
+}
+
+#[test]
+fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |autocut| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut,
+            },
+        })
+    };
+    // Absent autocut keeps the exact historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.autocut.is_none()
+    ));
+    let cut = request(Some(2));
+    assert!(matches!(
+        encode_product_request_for_minor(&cut, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&cut, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. } if request.autocut == Some(2)
+    ));
+    // A zero steepness fails closed at decode.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }

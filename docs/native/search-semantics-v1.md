@@ -155,9 +155,21 @@ or a declared provider, always accompanied by their canonical attestation
 envelope — sort their hits by score descending with stable-identity ties,
 unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
-deterministically; it never runs a model. Wildcard,
-highlighting, persistent multi-field doc-value columns and unrestricted query
-language remain non-claims.
+deterministically; it never runs a model.
+
+An optional autocut stage truncates the final score-ordered ranking at
+the first steep quality drop instead of a fixed count. With hit scores
+`s_0 >= s_1 >= … >= s_{n-1}` mapped to `x_i = i/(n-1)` and
+`y_i = (s_i − s_0)/(s_{n-1} − s_0)`, the deviation `d_i = y_i − x_i`
+measures how far the score curve sits above uniform linear decay; the
+ranking is cut immediately before the `N`-th strict local maximum of
+`d` (`N` in `1..=16`). A ranking with one hit, equal extreme scores, or
+fewer than `N` such maxima is returned whole. Autocut runs after
+reranking and parent deduplication and before the final `limit`; it is
+deterministic, needs no score threshold tuning, and composes best with
+`relative_score` fusion whose normalized magnitudes it inspects.
+Wildcard, persistent multi-field doc-value columns and unrestricted
+query language remain non-claims.
 
 ## Lexical scoring
 

@@ -460,6 +460,7 @@ fn search_request() -> ProductSearchRequest {
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
     }
 }
 
