@@ -24,10 +24,12 @@ pub use hyphae_native_runtime::{
     DocValueAggregationValue as ProductAggregationValue, DocValueFilter as ProductSearchFilter,
     DocValueOperator as ProductSearchOperator, DocValueSort as ProductSearchSort,
     DocValueSortDirection as ProductSortDirection, DocValueSortSource as ProductSortSource,
-    FacetBucket as ProductFacetBucket, FacetRequest as ProductFacetRequest,
-    FacetResult as ProductFacetResult, MissingPlacement as ProductMissingPlacement,
+    FacetBucket as ProductFacetBucket, FacetRange as ProductFacetRange,
+    FacetRequest as ProductFacetRequest, FacetResult as ProductFacetResult,
+    MissingPlacement as ProductMissingPlacement,
     NamedDocValueAggregation as ProductNamedAggregation,
-    NamedDocValueAggregationValue as ProductNamedAggregationValue, Vector as ProductVector,
+    NamedDocValueAggregationValue as ProductNamedAggregationValue,
+    RangeFacetRequest as ProductRangeFacetRequest, Vector as ProductVector,
 };
 
 const MANIFEST_MAGIC: &[u8; 8] = b"HYPSMAN1";
@@ -271,6 +273,8 @@ pub struct ProductSearchRequest {
     pub sort: Vec<ProductSearchSort>,
     /// Complete candidate-set facets.
     pub facets: Vec<ProductFacetRequest>,
+    /// Complete candidate-set range facets over numeric fields.
+    pub range_facets: Vec<ProductRangeFacetRequest>,
     /// Complete candidate-set metric aggregations.
     pub aggregations: Vec<ProductNamedAggregation>,
     /// Maximum final hits.
@@ -352,6 +356,8 @@ pub struct ProductSearchResult {
     pub hits: Vec<ProductIntegratedSearchHit>,
     /// Facets over the complete fused candidate set after the typed filter.
     pub facets: Vec<ProductFacetResult>,
+    /// Range facets in request order, one bucket per declared range.
+    pub range_facets: Vec<ProductFacetResult>,
     /// Named metric aggregations over the same set.
     pub aggregations: Vec<ProductNamedAggregationValue>,
     /// Per-target vector strategy evidence.
@@ -1211,6 +1217,7 @@ impl NativeProduct {
                 request.offset.saturating_add(request.limit)
             },
             facets: request.facets.clone(),
+            range_facets: request.range_facets.clone(),
             aggregations: request.aggregations.clone(),
         };
         let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
@@ -1249,6 +1256,7 @@ impl NativeProduct {
                 transform.as_ref(),
             )?,
             facets: result.facets,
+            range_facets: result.range_facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
             approximate,
@@ -1339,6 +1347,7 @@ impl NativeProduct {
                     request.limit
                 },
                 facets: request.facets.clone(),
+                range_facets: Vec::new(),
                 aggregations: request.aggregations.clone(),
             },
             &doc_value_limits(),
@@ -1362,6 +1371,7 @@ impl NativeProduct {
                 transform.as_ref(),
             )?,
             facets: result.facets,
+            range_facets: result.range_facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
             approximate: false,
@@ -1832,6 +1842,7 @@ fn validate_documents(
         sort: Vec::new(),
         limit: batch.documents.len(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
     };
     execute_doc_values(&candidates, &validation_request, &doc_value_limits())
@@ -1947,6 +1958,15 @@ fn validate_search_request(
     validate_rerank(request)?;
     validate_highlight(request)?;
     validate_autocut(request)?;
+    if request.range_facets.len() > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS
+        || request.range_facets.iter().any(|facet| {
+            facet.field.is_empty()
+                || facet.ranges.is_empty()
+                || facet.ranges.len() > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES
+        })
+    {
+        return Err(invalid_request());
+    }
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
         || request
             .offset
@@ -2000,6 +2020,7 @@ fn validate_search_request(
         sort: request.sort.clone(),
         limit: request.limit,
         facets: request.facets.clone(),
+        range_facets: Vec::new(),
         aggregations: request.aggregations.clone(),
     };
     execute_doc_values(&empty, &validation, &doc_value_limits())
@@ -2020,6 +2041,7 @@ pub fn conformance_validate_integrated_request(
         sort: request.sort.clone(),
         limit: request.limit,
         facets: request.facets.clone(),
+        range_facets: Vec::new(),
         aggregations: request.aggregations.clone(),
     };
     execute_doc_values(&empty, &validation, &doc_value_limits())
@@ -2065,6 +2087,7 @@ fn filter_documents_with_checkpoint(
         sort: Vec::new(),
         limit: documents.len().max(1),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
     };
     let result = execute_doc_values(documents, &request, &doc_value_limits())

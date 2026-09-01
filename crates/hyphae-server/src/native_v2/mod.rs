@@ -2565,6 +2565,7 @@ mod tests {
                 filter: hyphae_native_product::ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 1,
                 fusion: None,

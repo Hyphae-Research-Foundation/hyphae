@@ -1527,7 +1527,31 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...encodeHighlight(request.highlight),
     ...(request.autocut === undefined || request.autocut === null ? [] : [join(Uint8Array.of(5), u32(Number(request.autocut)))]),
     ...(request.offset === undefined || request.offset === null || Number(request.offset) === 0 ? [] : [join(Uint8Array.of(6), u32(Number(request.offset)))]),
+    ...encodeRangeFacets(request.range_facets),
   );
+}
+
+function encodeRangeFacets(raw: unknown): Uint8Array[] {
+  if (raw === undefined || raw === null) return [];
+  const facets = raw as ReadonlyArray<Readonly<Record<string, unknown>>>;
+  if (!Array.isArray(facets) || facets.length === 0) return [];
+  const bound = (value: unknown): Uint8Array => {
+    if (value === undefined || value === null) return Uint8Array.of(0);
+    return join(Uint8Array.of(1), f64(Number(value)));
+  };
+  return [join(
+    Uint8Array.of(7),
+    u32(facets.length),
+    ...facets.flatMap((facet) => {
+      const ranges = facet.ranges as ReadonlyArray<Readonly<Record<string, unknown>>>;
+      if (!Array.isArray(ranges) || ranges.length === 0) throw new ClientError("range facet needs ranges");
+      return [
+        bytes(new TextEncoder().encode(String(facet.field))),
+        u32(ranges.length),
+        ...ranges.flatMap((range) => [bound(range.lower), bound(range.upper)]),
+      ];
+    }),
+  )];
 }
 
 function encodeHighlight(value: unknown): Uint8Array[] {

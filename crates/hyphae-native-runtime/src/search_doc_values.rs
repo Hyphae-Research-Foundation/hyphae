@@ -203,6 +203,30 @@ pub struct FacetRequest {
     pub limit: usize,
 }
 
+/// Maximum range facets in one request.
+pub const MAX_DOC_VALUE_RANGE_FACETS: usize = 8;
+/// Maximum ranges in one range facet.
+pub const MAX_DOC_VALUE_FACET_RANGES: usize = 64;
+
+/// One half-open numeric interval `[lower, upper)` with independently
+/// optional canonical-float bounds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetRange {
+    /// Inclusive lower bound; absent means unbounded below.
+    pub lower: Option<CanonicalF64>,
+    /// Exclusive upper bound; absent means unbounded above.
+    pub upper: Option<CanonicalF64>,
+}
+
+/// One complete range-facet request over a numeric field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeFacetRequest {
+    /// Exact doc-value field.
+    pub field: String,
+    /// Declared intervals, at most [`MAX_DOC_VALUE_FACET_RANGES`].
+    pub ranges: Vec<FacetRange>,
+}
+
 /// One aggregate calculation over the complete filtered set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocValueAggregation {
@@ -238,6 +262,8 @@ pub struct DocValueRequest {
     pub limit: usize,
     /// Terms facets evaluated over every filtered candidate.
     pub facets: Vec<FacetRequest>,
+    /// Range facets evaluated over every filtered candidate.
+    pub range_facets: Vec<RangeFacetRequest>,
     /// Aggregations evaluated over every filtered candidate.
     pub aggregations: Vec<NamedDocValueAggregation>,
 }
@@ -335,6 +361,8 @@ pub struct DocValueResult {
     pub hits: Vec<DocValueCandidate>,
     /// Facets in request order.
     pub facets: Vec<FacetResult>,
+    /// Range facets in request order, one bucket per declared range.
+    pub range_facets: Vec<FacetResult>,
     /// Aggregations in request order.
     pub aggregations: Vec<NamedDocValueAggregationValue>,
     /// Number of candidates inspected.
@@ -468,6 +496,7 @@ pub fn execute_doc_values(
     }
 
     let facets = evaluate_facets(&matched, &request.facets, limits.max_facet_terms)?;
+    let range_facets = evaluate_range_facets(&matched, &request.range_facets)?;
     let aggregations = evaluate_aggregations(&matched, &request.aggregations)?;
     matched.sort_by(|left, right| compare_candidates(left, right, &request.sort));
     let matched_candidates = matched.len();
@@ -475,6 +504,7 @@ pub fn execute_doc_values(
     Ok(DocValueResult {
         hits,
         facets,
+        range_facets,
         aggregations,
         scanned_candidates: candidates.len(),
         matched_candidates,
@@ -493,6 +523,35 @@ fn validate_request(
     }
     check_shape("sort", request.sort.len(), limits.max_sorts)?;
     check_shape("facet", request.facets.len(), limits.max_facets)?;
+    check_shape(
+        "range facet",
+        request.range_facets.len(),
+        MAX_DOC_VALUE_RANGE_FACETS,
+    )?;
+    for range_facet in &request.range_facets {
+        validate_name(&range_facet.field, limits.max_value_bytes)?;
+        if range_facet.ranges.is_empty() || range_facet.ranges.len() > MAX_DOC_VALUE_FACET_RANGES {
+            return Err(DocValueError::ShapeLimit {
+                kind: "facet range",
+                actual: range_facet.ranges.len(),
+                maximum: MAX_DOC_VALUE_FACET_RANGES,
+            });
+        }
+        for range in &range_facet.ranges {
+            let lower = range.lower.map(CanonicalF64::get);
+            let upper = range.upper.map(CanonicalF64::get);
+            if lower.is_some_and(f64::is_nan)
+                || upper.is_some_and(f64::is_nan)
+                || matches!((lower, upper), (Some(low), Some(high)) if low >= high)
+            {
+                return Err(DocValueError::ShapeLimit {
+                    kind: "facet range bound",
+                    actual: 0,
+                    maximum: 0,
+                });
+            }
+        }
+    }
     check_shape(
         "aggregation",
         request.aggregations.len(),
@@ -929,6 +988,62 @@ fn evaluate_facets(
         results.push(FacetResult {
             field: request.field.clone(),
             buckets,
+        });
+    }
+    Ok(results)
+}
+
+/// Buckets numeric values into declared half-open intervals, one bucket
+/// per range in request order with the range ordinal as the value.
+fn evaluate_range_facets(
+    matched: &[&DocValueCandidate],
+    requests: &[RangeFacetRequest],
+) -> Result<Vec<FacetResult>, DocValueError> {
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        let mut counts = vec![0_u64; request.ranges.len()];
+        for candidate in matched {
+            let Some(value) = candidate.values.get(&request.field) else {
+                continue;
+            };
+            let numeric = match value {
+                DocValue::Integer(value) => integer_sum_as_f64(i128::from(*value)),
+                DocValue::Float(value) => value.get(),
+                _ => continue,
+            };
+            for (ordinal, range) in request.ranges.iter().enumerate() {
+                let above = range.lower.is_none_or(|lower| numeric >= lower.get());
+                let below = range.upper.is_none_or(|upper| numeric < upper.get());
+                if above && below {
+                    counts[ordinal] =
+                        counts[ordinal]
+                            .checked_add(1)
+                            .ok_or(DocValueError::ShapeLimit {
+                                kind: "range facet count",
+                                actual: usize::MAX,
+                                maximum: usize::MAX - 1,
+                            })?;
+                }
+            }
+        }
+        results.push(FacetResult {
+            field: request.field.clone(),
+            buckets: counts
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, count)| {
+                    Ok(FacetBucket {
+                        value: DocValue::Integer(i64::try_from(ordinal).map_err(|_| {
+                            DocValueError::ShapeLimit {
+                                kind: "range ordinal",
+                                actual: ordinal,
+                                maximum: MAX_DOC_VALUE_FACET_RANGES,
+                            }
+                        })?),
+                        count,
+                    })
+                })
+                .collect::<Result<Vec<_>, DocValueError>>()?,
         });
     }
     Ok(results)

@@ -76,7 +76,7 @@ enum SemanticOperation {
     },
     SearchCollection {
         collection: ObjectId,
-        request: ProductSearchRequest,
+        request: Box<ProductSearchRequest>,
         logical_time_micros: i64,
     },
     CatalogList(CatalogListRequest),
@@ -449,7 +449,7 @@ fn capture_execution(
         ) => (
             SemanticOperation::SearchCollection {
                 collection: *collection,
-                request: resolve_proof_search_request(product, *collection, request)?,
+                request: Box::new(resolve_proof_search_request(product, *collection, request)?),
                 logical_time_micros: context.logical_time_micros,
             },
             integrated_kind(request, result)?,
@@ -811,7 +811,7 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
     let autocut = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
-            if request.autocut.is_some() || request.offset > 0
+            if request.autocut.is_some() || request.offset > 0 || !request.range_facets.is_empty()
     );
     let highlighted = matches!(
         operation,
@@ -945,7 +945,11 @@ fn decode_semantic_operation(
         OP_SEARCH_COLLECTION => SemanticOperation::SearchCollection {
             logical_time_micros: i64::from_le_bytes(decoder.array()?),
             collection: object_id(decoder.u128()?)?,
-            request: decode_integrated_request(&mut decoder, limits, semantics_version)?,
+            request: Box::new(decode_integrated_request(
+                &mut decoder,
+                limits,
+                semantics_version,
+            )?),
         },
         OP_CATALOG_LIST => {
             SemanticOperation::CatalogList(decode_catalog_list_request(&mut decoder)?)
@@ -1708,16 +1712,7 @@ fn encode_integrated_request(
             put_usize(encoded, highlight.max_fragments)?;
             put_usize(encoded, highlight.fragment_bytes)?;
         }
-        if semantics_version >= SEMANTICS_VERSION_AUTOCUT
-            && let Some(autocut) = request.autocut
-        {
-            encoded.byte(5);
-            put_usize(encoded, autocut)?;
-        }
-        if semantics_version >= SEMANTICS_VERSION_AUTOCUT && request.offset > 0 {
-            encoded.byte(6);
-            put_usize(encoded, request.offset)?;
-        }
+        encode_autocut_sections(encoded, request, semantics_version)?;
     }
     Ok(())
 }
@@ -1811,6 +1806,7 @@ fn decode_integrated_request(
     let mut highlight = None;
     let mut autocut = None;
     let mut offset = 0_usize;
+    let mut range_facets = Vec::new();
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1866,6 +1862,29 @@ fn decode_integrated_request(
                 6 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
                     offset = usize_value(decoder)?;
                 }
+                7 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let count = bounded_count(
+                        decoder,
+                        hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS,
+                        "range facets",
+                    )?;
+                    for _ in 0..count {
+                        let field = text(decoder, limits.max_reexecution_bytes)?;
+                        let range_count = bounded_count(
+                            decoder,
+                            hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES,
+                            "facet ranges",
+                        )?;
+                        let mut ranges = Vec::with_capacity(range_count);
+                        for _ in 0..range_count {
+                            ranges.push(crate::ProductFacetRange {
+                                lower: decode_optional_float(decoder)?,
+                                upper: decode_optional_float(decoder)?,
+                            });
+                        }
+                        range_facets.push(crate::ProductRangeFacetRequest { field, ranges });
+                    }
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1876,6 +1895,7 @@ fn decode_integrated_request(
         filter,
         sort,
         facets,
+        range_facets,
         aggregations,
         limit,
         fusion,
@@ -2146,6 +2166,59 @@ fn encode_vector_receipt(
     put_usize(encoded, receipt.visited_nodes)?;
     encoded.byte(u8::from(receipt.exact_reranked));
     Ok(())
+}
+
+/// Encodes the semantics-v5 tagged sections (autocut, offset, ranges).
+fn encode_autocut_sections(
+    encoded: &mut Encoder,
+    request: &ProductSearchRequest,
+    semantics_version: u16,
+) -> Result<(), NativeProofError> {
+    if semantics_version < SEMANTICS_VERSION_AUTOCUT {
+        return Ok(());
+    }
+    if let Some(autocut) = request.autocut {
+        encoded.byte(5);
+        put_usize(encoded, autocut)?;
+    }
+    if request.offset > 0 {
+        encoded.byte(6);
+        put_usize(encoded, request.offset)?;
+    }
+    if !request.range_facets.is_empty() {
+        encoded.byte(7);
+        put_count(encoded, request.range_facets.len())?;
+        for range_facet in &request.range_facets {
+            put_text(encoded, &range_facet.field)?;
+            put_count(encoded, range_facet.ranges.len())?;
+            for range in &range_facet.ranges {
+                encode_optional_float(encoded, range.lower);
+                encode_optional_float(encoded, range.upper);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_optional_float(encoded: &mut Encoder, value: Option<hyphae_native_types::CanonicalF64>) {
+    encoded.byte(u8::from(value.is_some()));
+    if let Some(value) = value {
+        encoded.extend(&value.bits().to_le_bytes());
+    }
+}
+
+fn decode_optional_float(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<hyphae_native_types::CanonicalF64>, NativeProofError> {
+    if !boolean(decoder)? {
+        return Ok(None);
+    }
+    let bits = u64::from_le_bytes(decoder.array()?);
+    let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+    if float.bits() != bits {
+        return Err(NativeProofError::Invalid("noncanonical facet range bound"));
+    }
+    Ok(Some(float))
 }
 
 fn encode_named_aggregation_value(

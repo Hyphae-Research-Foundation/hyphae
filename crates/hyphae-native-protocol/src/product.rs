@@ -1152,6 +1152,11 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let highlight = if request.highlight.is_some() { 5 } else { 0 };
     let autocut = if request.autocut.is_some() { 6 } else { 0 };
     let offset = if request.offset > 0 { 6 } else { 0 };
+    let range_facets = if request.range_facets.is_empty() {
+        0
+    } else {
+        6
+    };
     let average = if request.aggregations.iter().any(|aggregation| {
         matches!(
             aggregation.aggregation,
@@ -1170,6 +1175,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         .max(autocut)
         .max(offset)
         .max(average)
+        .max(range_facets)
 }
 
 fn ensure_operation_minor(
@@ -1281,7 +1287,8 @@ fn ensure_response_minor(
             } else {
                 0
             };
-            values.max(fragments)
+            let range_facets = if result.range_facets.is_empty() { 0 } else { 6 };
+            values.max(fragments).max(range_facets)
         }
         ProductResponse::StructureRead(read) => match &read.value {
             ProductStructureReadResult::HashPage { .. }
@@ -4580,6 +4587,30 @@ fn decode_structure_read_request(
     })
 }
 
+fn encode_optional_canonical_float(
+    encoded: &mut Vec<u8>,
+    value: Option<hyphae_native_product::CanonicalF64>,
+) {
+    encoded.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        encoded.extend_from_slice(&value.bits().to_le_bytes());
+    }
+}
+
+fn decode_optional_canonical_float(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<hyphae_native_product::CanonicalF64>, ProductCodecError> {
+    if !decoder.boolean()? {
+        return Ok(None);
+    }
+    let bits = decoder.u64()?;
+    let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+    if float.bits() != bits {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok(Some(float))
+}
+
 fn encode_score_bound(
     encoded: &mut Vec<u8>,
     bound: ProductScoreBound,
@@ -5478,6 +5509,18 @@ fn encode_search_collection(
         encoded.push(6);
         put_u32(encoded, request.offset)?;
     }
+    if !request.range_facets.is_empty() {
+        encoded.push(7);
+        put_u32(encoded, request.range_facets.len())?;
+        for range_facet in &request.range_facets {
+            put_text(encoded, &range_facet.field)?;
+            put_u32(encoded, range_facet.ranges.len())?;
+            for range in &range_facet.ranges {
+                encode_optional_canonical_float(encoded, range.lower);
+                encode_optional_canonical_float(encoded, range.upper);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5623,6 +5666,7 @@ fn decode_search_collection(
     let mut highlight = None;
     let mut autocut = None;
     let mut offset = 0_usize;
+    let mut range_facets = Vec::new();
     let mut previous = 0_u8;
     while decoder.has_remaining() {
         let tag = decoder.u8()?;
@@ -5702,6 +5746,30 @@ fn decode_search_collection(
                     return Err(ProductCodecError::InvalidValue);
                 }
             }
+            7 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let range_count = decoder.usize_u32()?;
+                    if range_count == 0
+                        || range_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES
+                    {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    let mut ranges = Vec::with_capacity(range_count);
+                    for _ in 0..range_count {
+                        ranges.push(hyphae_native_product::ProductFacetRange {
+                            lower: decode_optional_canonical_float(decoder)?,
+                            upper: decode_optional_canonical_float(decoder)?,
+                        });
+                    }
+                    range_facets
+                        .push(hyphae_native_product::ProductRangeFacetRequest { field, ranges });
+                }
+            }
             _ => return Err(ProductCodecError::InvalidValue),
         }
     }
@@ -5713,6 +5781,7 @@ fn decode_search_collection(
             filter,
             sort,
             facets,
+            range_facets,
             aggregations,
             limit,
             fusion,
@@ -6128,6 +6197,18 @@ fn encode_integrated_search(
             }
         }
     }
+    if !result.range_facets.is_empty() {
+        encoded.push(2);
+        put_u32(encoded, result.range_facets.len())?;
+        for facet in &result.range_facets {
+            put_text(encoded, &facet.field)?;
+            put_u32(encoded, facet.buckets.len())?;
+            for bucket in &facet.buckets {
+                encode_doc_value(encoded, &bucket.value)?;
+                encoded.extend_from_slice(&bucket.count.to_le_bytes());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -6238,35 +6319,66 @@ fn decode_integrated_search(
     let lexical_candidates = decoder.usize()?;
     let retrieval_candidates = decoder.usize()?;
     let matched_candidates = decoder.usize()?;
-    if decoder.has_remaining() {
-        if decoder.u8()? != 1 {
+    let mut range_facets = Vec::new();
+    let mut previous_tail = 0_u8;
+    while decoder.has_remaining() {
+        let tag = decoder.u8()?;
+        if tag <= previous_tail {
             return Err(ProductCodecError::InvalidValue);
         }
-        let mut any = false;
-        for hit in &mut hits {
-            let fragment_count = decoder.usize_u32()?;
-            if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
-                return Err(ProductCodecError::LimitExceeded);
-            }
-            let mut fragments = Vec::with_capacity(fragment_count);
-            for _ in 0..fragment_count {
-                let fragment = decoder.text()?;
-                if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
-                    return Err(ProductCodecError::LimitExceeded);
+        previous_tail = tag;
+        match tag {
+            1 => {
+                let mut any = false;
+                for hit in &mut hits {
+                    let fragment_count = decoder.usize_u32()?;
+                    if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
+                        return Err(ProductCodecError::LimitExceeded);
+                    }
+                    let mut fragments = Vec::with_capacity(fragment_count);
+                    for _ in 0..fragment_count {
+                        let fragment = decoder.text()?;
+                        if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
+                            return Err(ProductCodecError::LimitExceeded);
+                        }
+                        fragments.push(fragment);
+                    }
+                    any |= !fragments.is_empty();
+                    hit.fragments = fragments;
                 }
-                fragments.push(fragment);
+                if !any {
+                    return Err(ProductCodecError::InvalidValue);
+                }
             }
-            any |= !fragments.is_empty();
-            hit.fragments = fragments;
-        }
-        if !any {
-            return Err(ProductCodecError::InvalidValue);
+            2 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let bucket_count = decoder.usize_u32()?;
+                    if bucket_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES {
+                        return Err(ProductCodecError::LimitExceeded);
+                    }
+                    let mut buckets = Vec::with_capacity(bucket_count);
+                    for _ in 0..bucket_count {
+                        buckets.push(hyphae_native_product::ProductFacetBucket {
+                            value: decode_doc_value(decoder)?,
+                            count: decoder.u64()?,
+                        });
+                    }
+                    range_facets.push(hyphae_native_product::ProductFacetResult { field, buckets });
+                }
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
         }
     }
     Ok(ProductSearchResult {
         snapshot,
         hits,
         facets,
+        range_facets,
         aggregations,
         vector_branches,
         approximate,

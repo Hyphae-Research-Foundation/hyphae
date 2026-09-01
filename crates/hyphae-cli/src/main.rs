@@ -3731,6 +3731,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             .into_iter()
                             .map(product_facet)
                             .collect::<Result<_, _>>()?,
+                        range_facets: Vec::new(),
                         aggregations: metrics_json
                             .map(|value| serde_json::from_str::<Vec<Value>>(&value))
                             .transpose()?

@@ -570,6 +570,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             ]),
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -638,6 +639,7 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 filter,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
@@ -681,6 +683,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion,
@@ -729,6 +732,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
@@ -776,6 +780,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -826,6 +831,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
@@ -887,6 +893,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                 fragments,
             }],
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             vector_branches: Vec::new(),
             approximate: false,
@@ -2287,6 +2294,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
@@ -2332,6 +2340,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
@@ -2394,6 +2403,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
             },
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -2453,6 +2463,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
@@ -2504,6 +2515,7 @@ fn average_aggregation_requires_minor_six() -> Result<(), Box<dyn std::error::Er
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: vec![hyphae_native_product::ProductNamedAggregation {
                 name: "mean".to_owned(),
                 aggregation: hyphae_native_product::ProductAggregation::Average("price".to_owned()),
@@ -2534,6 +2546,61 @@ fn average_aggregation_requires_minor_six() -> Result<(), Box<dyn std::error::Er
                 request.aggregations.first().map(|aggregation| &aggregation.aggregation),
                 Some(hyphae_native_product::ProductAggregation::Average(field)) if field == "price"
             )
+    ));
+    Ok(())
+}
+
+#[test]
+fn range_facets_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+                field: "price".to_owned(),
+                ranges: vec![
+                    hyphae_native_product::ProductFacetRange {
+                        lower: None,
+                        upper: Some(CanonicalF64::new(15.0)),
+                    },
+                    hyphae_native_product::ProductFacetRange {
+                        lower: Some(CanonicalF64::new(15.0)),
+                        upper: None,
+                    },
+                ],
+            }],
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.range_facets.len() == 1
+                && request.range_facets[0].ranges.len() == 2
     ));
     Ok(())
 }

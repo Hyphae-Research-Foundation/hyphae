@@ -1627,6 +1627,7 @@ async fn memory_recall(
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: input.limit,
         fusion: None,
@@ -2036,6 +2037,7 @@ async fn profile_memory_recall(
         filter: ProductSearchFilter::All(clauses),
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: input.limit,
         fusion: None,
@@ -2406,6 +2408,7 @@ async fn profile_memory_status(
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "memories".to_owned(),
             aggregation: hyphae_native_product::ProductAggregation::Count,
@@ -2532,6 +2535,7 @@ pub(crate) fn collection_search_request(
             .into_iter()
             .map(|value| crate::product_facet(value).map_err(|_| invalid_request()))
             .collect::<Result<_, _>>()?,
+        range_facets: Vec::new(),
         aggregations: input
             .aggregations
             .into_iter()

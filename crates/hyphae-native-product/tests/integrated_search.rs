@@ -330,6 +330,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 field: "category".into(),
                 limit: 4,
             }],
+            range_facets: Vec::new(),
             aggregations: vec![
                 ProductNamedAggregation {
                     name: "count".into(),
@@ -398,6 +399,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             },
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 2,
             fusion: None,
@@ -450,6 +452,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -495,6 +498,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
@@ -529,6 +533,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
@@ -571,6 +576,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 2,
         fusion: None,
@@ -592,6 +598,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 3,
         fusion: None,
@@ -617,6 +624,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
@@ -801,6 +809,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
@@ -1071,6 +1080,7 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     filter: filter.clone(),
                     sort: Vec::new(),
                     facets: Vec::new(),
+                    range_facets: Vec::new(),
                     aggregations: Vec::new(),
                     limit: 64,
                     fusion: None,
@@ -1131,6 +1141,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         filter: category_filter,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
@@ -1158,6 +1169,7 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         },
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
@@ -1200,6 +1212,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             },
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -1239,6 +1252,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -1289,6 +1303,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion,
@@ -1396,6 +1411,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                     filter: ProductSearchFilter::MatchAll,
                     sort: Vec::new(),
                     facets: Vec::new(),
+                    range_facets: Vec::new(),
                     aggregations: Vec::new(),
                     limit: 4,
                     fusion: None,
@@ -1560,6 +1576,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         },
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
@@ -1673,6 +1690,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 10,
         fusion: None,
@@ -1755,6 +1773,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
@@ -1840,6 +1859,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
@@ -1982,6 +2002,7 @@ fn lexical_ranking(
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -2093,6 +2114,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 5,
             fusion: None,
@@ -2235,6 +2257,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion,
@@ -2356,6 +2379,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
@@ -2466,6 +2490,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
             field: "rating".into(),
             limit: 8,
         }],
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "total".into(),
             aggregation: hyphae_native_product::ProductAggregation::Sum("rating".into()),
@@ -2502,6 +2527,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
         },
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         ..request.clone()
     };
@@ -2522,6 +2548,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "prices".into(),
             aggregation: hyphae_native_product::ProductAggregation::Sum("price".into()),
@@ -2558,6 +2585,7 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "count".into(),
             aggregation: hyphae_native_product::ProductAggregation::Count,
@@ -2622,6 +2650,7 @@ fn average_aggregation_is_a_canonical_float_over_present_values()
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "mean".into(),
             aggregation: hyphae_native_product::ProductAggregation::Average(field.into()),
@@ -2653,6 +2682,94 @@ fn average_aggregation_is_a_canonical_float_over_present_values()
             .first()
             .map(|aggregation| &aggregation.value),
         Some(&hyphae_native_product::ProductAggregationValue::Float(None)),
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn range_facets_bucket_numeric_values_in_declared_order() -> Result<(), Box<dyn std::error::Error>>
+{
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("range-facets");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    // Prices: 30, 10, 20, 40. Declared ranges: (-inf,15), [15,35), [35,+inf),
+    // plus an overlapping [0,+inf) that must count independently.
+    let request = ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+            field: "price".into(),
+            ranges: vec![
+                hyphae_native_product::ProductFacetRange {
+                    lower: None,
+                    upper: Some(CanonicalF64::new(15.0)),
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(15.0)),
+                    upper: Some(CanonicalF64::new(35.0)),
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(35.0)),
+                    upper: None,
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(0.0)),
+                    upper: None,
+                },
+            ],
+        }],
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let result = product.search_collection(binding.collection, &request, 7)?;
+    let facet = result.range_facets.first().ok_or("missing range facet")?;
+    assert_eq!(facet.field, "price");
+    let counts: Vec<u64> = facet.buckets.iter().map(|bucket| bucket.count).collect();
+    assert_eq!(counts, vec![1, 2, 1, 4]);
+    // Bucket values are the declared range ordinals, in request order.
+    let ordinals: Vec<_> = facet
+        .buckets
+        .iter()
+        .map(|bucket| bucket.value.clone())
+        .collect();
+    assert_eq!(
+        ordinals,
+        (0..4).map(ProductDocValue::Integer).collect::<Vec<_>>(),
+    );
+
+    // An inverted range fails closed.
+    let inverted = ProductSearchRequest {
+        range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+            field: "price".into(),
+            ranges: vec![hyphae_native_product::ProductFacetRange {
+                lower: Some(CanonicalF64::new(35.0)),
+                upper: Some(CanonicalF64::new(15.0)),
+            }],
+        }],
+        ..request.clone()
+    };
+    let error = product.search_collection(binding.collection, &inverted, 7);
+    let Err(error) = error else {
+        return Err("inverted range was admitted".into());
+    };
+    // The runtime validator rejects malformed range shapes as a shape
+    // limit, which the product maps to limit-exceeded.
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::LimitExceeded
     );
     drop(product);
     fs::remove_dir_all(path)?;

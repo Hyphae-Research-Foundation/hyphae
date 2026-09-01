@@ -235,6 +235,19 @@ values and always yields a canonical float aggregate (absent when no
 value is present); a non-finite intermediate fails closed. Comparisons
 between different scalar types never match, as before.
 
+Range facets bucket numeric doc values into caller-declared half-open
+intervals `[lower, upper)` with independently optional canonical-float
+bounds (`NaN` bounds are rejected; an absent bound is unbounded on that
+side; `lower < upper` when both are present). Each request admits at
+most 8 range facets of at most 64 ranges each. Buckets return exactly
+one per declared range in request order — never count-sorted — with the
+zero-based range ordinal as an `Integer` bucket value and the count of
+filtered candidates whose integer or float value falls inside the
+interval (integers convert through deterministic exact-halved binary64
+conversion). Missing fields and non-numeric values never count.
+Overlapping ranges are legal and count independently. Terms facets are
+unchanged and continue to reject non-scalar shapes.
+
 ## Aggregations and memory
 
 Aggregations operate on doc values or bounded typed field data. Every query

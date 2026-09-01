@@ -454,6 +454,7 @@ fn search_request() -> ProductSearchRequest {
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 8,
         fusion: None,
