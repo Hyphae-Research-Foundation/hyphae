@@ -1045,6 +1045,10 @@ enum StructureCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "clap subcommands are constructed once"
+)]
 enum SearchCommand {
     /// Provision catalog-owned physical search storage for one logical collection.
     Provision {
@@ -1112,6 +1116,18 @@ enum SearchCommand {
         /// Normalized-text byte budget per fragment (16..=512).
         #[arg(long, default_value_t = 128, requires = "highlight_fragments")]
         highlight_bytes: usize,
+        /// Knee-detection autocut steepness (1..=16).
+        #[arg(long)]
+        autocut: Option<usize>,
+        /// Leading hits skipped before the limit window.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Finite nonnegative vector distance cutoff for the branch.
+        #[arg(long, requires = "vector_target")]
+        max_distance: Option<f64>,
+        /// JSON array of `{field,ranges:[{lower?,upper?}]}` range facets.
+        #[arg(long)]
+        range_facets_json: Option<String>,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -1854,6 +1870,8 @@ enum McpProfile {
 enum FusionMethodInput {
     /// Normalized weighted score blend across branches.
     WeightedScore,
+    /// Min-max relative-score blend per branch.
+    RelativeScore,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -3677,6 +3695,10 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             dedupe_first_k,
             highlight_fragments,
             highlight_bytes,
+            autocut,
+            offset,
+            max_distance,
+            range_facets_json,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3696,7 +3718,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             exact_rerank: Some(candidate_limit),
                         },
                     }),
-                    max_distance: None,
+                    max_distance: max_distance.map(hyphae_native_product::CanonicalF64::new),
                 }],
                 None if vector.is_empty() => Vec::new(),
                 None => return Err(CliFailure::invalid()),
@@ -3732,7 +3754,13 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             .into_iter()
                             .map(product_facet)
                             .collect::<Result<_, _>>()?,
-                        range_facets: Vec::new(),
+                        range_facets: range_facets_json
+                            .map(|value| serde_json::from_str::<Vec<Value>>(&value))
+                            .transpose()?
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(product_range_facet)
+                            .collect::<Result<_, _>>()?,
                         aggregations: metrics_json
                             .map(|value| serde_json::from_str::<Vec<Value>>(&value))
                             .transpose()?
@@ -3744,6 +3772,9 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                         fusion: fusion.map(|method| match method {
                             FusionMethodInput::WeightedScore => {
                                 hyphae_native_product::ProductFusionMethod::WeightedScore
+                            }
+                            FusionMethodInput::RelativeScore => {
+                                hyphae_native_product::ProductFusionMethod::RelativeScore
                             }
                         }),
                         parent_dedupe: match (dedupe_field, dedupe_first_k) {
@@ -3759,8 +3790,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                 fragment_bytes: highlight_bytes,
                             }
                         }),
-                        autocut: None,
-                        offset: 0,
+                        autocut,
+                        offset,
                     },
                 },
             )
@@ -6414,6 +6445,49 @@ fn product_facet(value: Value) -> Result<ProductFacetRequest, CliFailure> {
     Ok(ProductFacetRequest { field, limit })
 }
 
+fn product_range_facet(
+    value: Value,
+) -> Result<hyphae_native_product::ProductRangeFacetRequest, CliFailure> {
+    let Value::Object(mut object) = value else {
+        return Err(CliFailure::invalid());
+    };
+    let field = take_string(&mut object, "field")?;
+    let Some(Value::Array(ranges)) = object.remove("ranges") else {
+        return Err(CliFailure::invalid());
+    };
+    if !object.is_empty() {
+        return Err(CliFailure::invalid());
+    }
+    let ranges = ranges
+        .into_iter()
+        .map(|range| {
+            let Value::Object(mut object) = range else {
+                return Err(CliFailure::invalid());
+            };
+            let bound = |value: Option<Value>| -> Result<
+                Option<hyphae_native_product::CanonicalF64>,
+                CliFailure,
+            > {
+                match value {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(value) => value
+                        .as_f64()
+                        .map(hyphae_native_product::CanonicalF64::new)
+                        .map(Some)
+                        .ok_or_else(CliFailure::invalid),
+                }
+            };
+            let lower = bound(object.remove("lower"))?;
+            let upper = bound(object.remove("upper"))?;
+            if !object.is_empty() {
+                return Err(CliFailure::invalid());
+            }
+            Ok(hyphae_native_product::ProductFacetRange { lower, upper })
+        })
+        .collect::<Result<Vec<_>, CliFailure>>()?;
+    Ok(hyphae_native_product::ProductRangeFacetRequest { field, ranges })
+}
+
 fn product_aggregation(value: Value) -> Result<ProductNamedAggregation, CliFailure> {
     let Value::Object(mut object) = value else {
         return Err(CliFailure::invalid());
@@ -6424,6 +6498,7 @@ fn product_aggregation(value: Value) -> Result<ProductNamedAggregation, CliFailu
         "sum" => ProductAggregation::Sum(take_string(&mut object, "field")?),
         "min" => ProductAggregation::Min(take_string(&mut object, "field")?),
         "max" => ProductAggregation::Max(take_string(&mut object, "field")?),
+        "average" => ProductAggregation::Average(take_string(&mut object, "field")?),
         _ => return Err(CliFailure::invalid()),
     };
     if !object.is_empty() {
