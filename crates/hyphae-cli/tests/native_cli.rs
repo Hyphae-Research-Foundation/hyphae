@@ -4178,11 +4178,18 @@ async fn native_mcp_search_tools_execute_with_authority_and_fail_closed_without(
             "filter":{"operation":"compare","field":"category","operator":"equal","value":"book"},
             "facets":[{"field":"category","limit":4}],
             "limit":10}}});
+    let phrase_call = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+        "name":"hyphae_native_search_collection",
+        "arguments":{
+            "collection":13,
+            "lexical":{"query":"rust database","candidate_limit":10,"phrase":true},
+            "limit":10}}});
 
     // The Reader authority executes both search tools.
     let mut messages = handshake.to_vec();
     messages.push(lexical_call.clone());
     messages.push(collection_call.clone());
+    messages.push(phrase_call);
     let reader = run_mcp_session(&address_text, &reader_key, &messages)?;
     assert_eq!(reader[1]["result"]["isError"], false);
     assert!(
@@ -4200,6 +4207,13 @@ async fn native_mcp_search_tools_execute_with_authority_and_fail_closed_without(
         "exact_filtered"
     );
     assert_eq!(integrated["approximate"], false);
+    // The phrase mode travels through the MCP surface end to end.
+    assert_eq!(reader[3]["result"]["isError"], false);
+    assert!(
+        reader[3]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .is_some()
+    );
 
     // The Auditor authority lacks search.execute and fails closed.
     let mut messages = handshake.to_vec();

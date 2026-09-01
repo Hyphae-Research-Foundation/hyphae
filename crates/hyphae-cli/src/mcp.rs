@@ -443,6 +443,21 @@ struct LexicalBranchInput {
     candidate_limit: usize,
     #[serde(default = "default_branch_weight")]
     weight: u32,
+    /// `"and"` or `{"minimum_match": N}`.
+    #[serde(default)]
+    operator: Option<Value>,
+    /// Expand the final analyzed term as a bounded prefix.
+    #[serde(default)]
+    prefix: bool,
+    /// Levenshtein edit distance (1..=2) expanding every query term.
+    #[serde(default)]
+    fuzzy: Option<usize>,
+    /// Require the exact consecutive analyzed phrase.
+    #[serde(default)]
+    phrase: bool,
+    /// BM25F boosts: array of `{"field": name, "weight_micros": N}`.
+    #[serde(default)]
+    fields: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2509,20 +2524,77 @@ async fn memory_forget(
     Ok(json!({"status": "forgotten", "id": identity.to_string()}))
 }
 
+fn lexical_operator_input(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalOperator, Box<ProductError>> {
+    match value {
+        Value::String(kind) if kind == "and" => {
+            Ok(hyphae_native_product::ProductLexicalOperator::And)
+        }
+        Value::Object(mut object) => {
+            let minimum_match = object
+                .remove("minimum_match")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(invalid_request)?;
+            if !object.is_empty() {
+                return Err(invalid_request());
+            }
+            Ok(hyphae_native_product::ProductLexicalOperator::Or { minimum_match })
+        }
+        _ => Err(invalid_request()),
+    }
+}
+
+fn lexical_field_boost_input(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalFieldBoost, Box<ProductError>> {
+    let Value::Object(mut object) = value else {
+        return Err(invalid_request());
+    };
+    let field = object
+        .remove("field")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(invalid_request)?;
+    let weight_micros = object
+        .remove("weight_micros")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(invalid_request)?;
+    if !object.is_empty() {
+        return Err(invalid_request());
+    }
+    Ok(hyphae_native_product::ProductLexicalFieldBoost {
+        field,
+        weight_micros,
+    })
+}
+
 pub(crate) fn collection_search_request(
     input: CollectionSearchInput,
 ) -> Result<ProductSearchRequest, Box<ProductError>> {
     Ok(ProductSearchRequest {
-        lexical: input.lexical.map(|branch| ProductLexicalBranch {
-            query: branch.query,
-            candidate_limit: branch.candidate_limit,
-            weight: branch.weight,
-            operator: None,
-            prefix: false,
-            fields: Vec::new(),
-            fuzzy: None,
-            phrase: false,
-        }),
+        lexical: input
+            .lexical
+            .map(
+                |branch| -> Result<ProductLexicalBranch, Box<ProductError>> {
+                    Ok(ProductLexicalBranch {
+                        query: branch.query,
+                        candidate_limit: branch.candidate_limit,
+                        weight: branch.weight,
+                        operator: branch.operator.map(lexical_operator_input).transpose()?,
+                        prefix: branch.prefix,
+                        fields: branch
+                            .fields
+                            .into_iter()
+                            .map(lexical_field_boost_input)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        fuzzy: branch.fuzzy,
+                        phrase: branch.phrase,
+                    })
+                },
+            )
+            .transpose()?,
         vectors: input
             .vectors
             .into_iter()
