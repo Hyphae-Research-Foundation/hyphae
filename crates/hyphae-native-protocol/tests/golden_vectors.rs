@@ -2165,3 +2165,96 @@ fn minor_six_key_scan_and_sorted_set_mutations_gate_and_round_trip()
     }
     Ok(())
 }
+
+#[test]
+fn minor_six_conditional_and_seeded_tags_gate_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        ProductStructureKey, ProductStructureMutation, ProductStructureReadRequest,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+    let key = |name: &[u8]| ProductStructureKey {
+        keyspace,
+        key: name.to_vec(),
+    };
+
+    // New reads gate below minor 6 and round-trip at 6.
+    let requests = [
+        ProductStructureReadRequest::StringRange {
+            key: key(b"greeting"),
+            start: -5,
+            end: -1,
+        },
+        ProductStructureReadRequest::SetRandomMembers {
+            key: key(b"tags"),
+            seed: 42,
+            count: 3,
+        },
+    ];
+    for request in requests {
+        let wire = security_wire_request(ProductOperation::StructureRead(request));
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+
+    // New mutations gate identically on both surfaces.
+    let mutations = [
+        ProductStructureMutation::StringSetConditional {
+            key: key(b"greeting"),
+            value: b"hello".to_vec(),
+            expires_at_micros: Some(99),
+            if_present: true,
+        },
+        ProductStructureMutation::StringAppend {
+            key: key(b"greeting"),
+            suffix: b" world".to_vec(),
+        },
+        ProductStructureMutation::StringSetRange {
+            key: key(b"padded"),
+            offset: 4,
+            patch: b"tail".to_vec(),
+        },
+        ProductStructureMutation::HashSetIfAbsent {
+            key: key(b"profile"),
+            field: b"city".to_vec(),
+            value: b"lima".to_vec(),
+        },
+        ProductStructureMutation::SetPop {
+            key: key(b"tags"),
+            seed: 42,
+        },
+    ];
+    for mutation in mutations {
+        let wire = security_wire_request(ProductOperation::StructureMutate {
+            mutations: vec![mutation],
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+    Ok(())
+}

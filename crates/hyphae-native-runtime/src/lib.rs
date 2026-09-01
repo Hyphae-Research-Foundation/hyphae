@@ -325,10 +325,10 @@ use crate::{
     hash_pattern::HashPatternMatchBudget,
     model::{
         CatalogState, HashPatternModelPage, HashPatternModelRequest, HashPatternModelStop, ListPop,
-        ModelError, RelationState, SearchState, SecondaryIndexLayout, SortedSetDirection,
-        SortedSetMemberState, SortedSetPopState, SortedSetRankState, SortedSetScore,
-        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
-        normalize_list_range, sorted_set_score_range_is_empty,
+        ModelError, RelationState, SearchState, SecondaryIndexLayout, SetPopState,
+        SortedSetDirection, SortedSetMemberState, SortedSetPopState, SortedSetRankState,
+        SortedSetScore, StructureEntry, StructureState, TtlValue, analyze, bm25_idf,
+        bm25_term_score, normalize_list_range, sorted_set_score_range_is_empty,
     },
     set_algebra::{SetAlgebraExecution, evaluate_materialized_set_algebra},
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
@@ -517,6 +517,8 @@ pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
 /// Maximum member positions admitted by one native set multi-member call.
 pub const MAX_SET_MEMBER_BATCH_SIZE: usize = 4_096;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
+/// Hard byte bound of one scalar value produced by `APPEND`/`SETRANGE`.
+pub const MAX_STRUCTURE_STRING_BYTES: usize = 8 * 1_024 * 1_024;
 const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
 type SearchTermFrequencies = BTreeMap<Vec<u8>, u32>;
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
@@ -871,6 +873,12 @@ pub enum NativeRuntimeError {
         /// Rejected caller-supplied field-position count.
         requested: usize,
     },
+    /// One string mutation would produce a value above its byte bound.
+    #[error("native string mutation result exceeds {MAX_STRUCTURE_STRING_BYTES} bytes")]
+    StructureStringTooLarge,
+    /// One seeded set sample requested zero members.
+    #[error("native set sample count must be at least one")]
+    InvalidSetSampleCount,
     /// One hash mutation batch contains the same exact field more than once.
     #[error("native hash field mutation batch contains a duplicate field")]
     DuplicateHashField,
@@ -1678,6 +1686,52 @@ pub struct KeyScanPage {
     pub visited: usize,
     /// Matcher steps consumed.
     pub match_steps: usize,
+}
+
+/// One inclusive Valkey-affine byte range of a value slice.
+fn byte_range_slice(value: &[u8], start: i64, end: i64) -> Vec<u8> {
+    let length = i128::try_from(value.len()).unwrap_or(i128::MAX);
+    if length == 0 {
+        return Vec::new();
+    }
+    let normalize = |index: i64| {
+        let index = i128::from(index);
+        if index < 0 { length + index } else { index }
+    };
+    let start = normalize(start).max(0);
+    let end = normalize(end).min(length - 1);
+    if start > end || start >= length || end < 0 {
+        return Vec::new();
+    }
+    let Ok(start) = usize::try_from(start) else {
+        return Vec::new();
+    };
+    let Ok(end) = usize::try_from(end) else {
+        return Vec::new();
+    };
+    value[start..=end].to_vec()
+}
+
+/// Public canonical splitmix64 finalizer used for seeded set selection.
+#[must_use]
+pub const fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Walks `min(count, len)` distinct members from the seeded start rank,
+/// ascending with one wrap.
+fn seeded_member_walk(members: &[Vec<u8>], seed: u64, count: usize) -> Vec<Vec<u8>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let take = count.min(members.len());
+    let start = usize::try_from(splitmix64(seed) % (members.len() as u64)).unwrap_or(0);
+    (0..take)
+        .map(|offset| members[(start + offset) % members.len()].clone())
+        .collect()
 }
 
 /// Exclusive upper bound of a literal binary prefix, `None` when unbounded.
@@ -3814,6 +3868,56 @@ impl NativeSnapshot {
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
         }
+    }
+
+    /// Reads one inclusive byte range of a visible scalar value.
+    ///
+    /// Negative positions count from the end, out-of-range positions
+    /// clamp, and an inverted or fully out-of-range request returns the
+    /// empty value. A missing or expired key reads as absent.
+    pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> Option<Vec<u8>> {
+        let value = self
+            .state
+            .structures
+            .get(key, self.metadata.logical_time_micros)?;
+        Some(byte_range_slice(value, start, end))
+    }
+
+    /// Returns bounded distinct set members under an explicit caller seed.
+    ///
+    /// The walk starts at rank `splitmix64(seed) % cardinality` in exact
+    /// ascending member-byte order and wraps once. An empty set returns no
+    /// members; `count` must be at least one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero count, another structure kind, or a
+    /// missing or expired set.
+    pub fn srandmember(
+        &self,
+        key: &[u8],
+        seed: u64,
+        count: usize,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if count == 0 {
+            return Err(NativeRuntimeError::InvalidSetSampleCount);
+        }
+        if self.state.structures.entries.contains_key(key)
+            || self
+                .state
+                .structures
+                .hash_is_visible(key, self.metadata.logical_time_micros)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let members = self
+            .state
+            .structures
+            .set_members_at(key, self.metadata.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)?;
+        Ok(seeded_member_walk(&members, seed, count))
     }
 
     /// Returns one bounded inclusive stream-ID range from this retained snapshot.
@@ -21881,6 +21985,150 @@ impl NativeWriteBatch {
         });
         self.dirty[2] = true;
         Ok(true)
+    }
+
+    /// Appends `suffix` after the current visible scalar value and
+    /// returns the resulting length. Missing or expired keys start empty;
+    /// existing keys keep their expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a collection key or an oversized result.
+    pub fn append(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        suffix: &[u8],
+    ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        let key = key.into();
+        if self.private_collection_is_visible(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let current = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros);
+        let expires_at_micros = current.and_then(|entry| entry.expires_at_micros);
+        let existing = current.map_or(&[][..], |entry| entry.value.as_slice());
+        let length = existing
+            .len()
+            .checked_add(suffix.len())
+            .filter(|length| *length <= MAX_STRUCTURE_STRING_BYTES)
+            .ok_or(NativeRuntimeError::StructureStringTooLarge)?;
+        let mut value = Vec::with_capacity(length);
+        value.extend_from_slice(existing);
+        value.extend_from_slice(suffix);
+        self.set(key, value, expires_at_micros)?;
+        Ok(length)
+    }
+
+    /// Overwrites `patch` at byte `offset`, zero-filling any gap, and
+    /// returns the resulting length. Missing or expired keys start empty;
+    /// existing keys keep their expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a collection key or an oversized result.
+    pub fn setrange(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        offset: usize,
+        patch: &[u8],
+    ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        let key = key.into();
+        if self.private_collection_is_visible(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let current = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros);
+        let expires_at_micros = current.and_then(|entry| entry.expires_at_micros);
+        let existing = current.map_or(&[][..], |entry| entry.value.as_slice());
+        let patch_end = offset
+            .checked_add(patch.len())
+            .filter(|end| *end <= MAX_STRUCTURE_STRING_BYTES)
+            .ok_or(NativeRuntimeError::StructureStringTooLarge)?;
+        let length = existing.len().max(patch_end);
+        let mut value = vec![0_u8; length];
+        value[..existing.len()].copy_from_slice(existing);
+        value[offset..patch_end].copy_from_slice(patch);
+        self.set(key, value, expires_at_micros)?;
+        Ok(length)
+    }
+
+    /// Writes one hash field only when it has no unexpired visible value,
+    /// and reports whether the write applied. The hash must exist: this
+    /// engine creates families explicitly, so a missing hash is an error
+    /// rather than an implicit create.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, an invalid
+    /// identity, or a missing or expired hash.
+    pub fn hsetnx(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into();
+        let field = field.into();
+        if self.hget(&key, &field)?.is_some() {
+            return Ok(false);
+        }
+        self.hset(key, field, value)?;
+        Ok(true)
+    }
+
+    /// Removes and returns the member at the seed-derived rank
+    /// (`splitmix64(seed) % cardinality`, ascending byte order) of one
+    /// visible set. An empty set returns absence without mutating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing
+    /// or expired set.
+    pub fn spop(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        seed: u64,
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let member = match self.state.structures.spop_at_rank(
+            &key,
+            |cardinality| usize::try_from(splitmix64(seed) % (cardinality as u64)).unwrap_or(0),
+            self.snapshot.logical_time_micros,
+        ) {
+            SetPopState::MissingSet => return Err(NativeRuntimeError::UnknownStructureSet),
+            SetPopState::Empty => return Ok(None),
+            SetPopState::Popped(member) => member,
+        };
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSetMember,
+            target: None,
+            key: set_member_identity(&key, &member)?,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(Some(member))
     }
 
     fn delete_expired_structure(

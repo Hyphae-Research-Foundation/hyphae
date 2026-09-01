@@ -1292,11 +1292,49 @@ enum StructureMutationInput {
         #[serde(default)]
         end: SortedSetEndInput,
     },
+    StringSetConditional {
+        keyspace: JsonU128,
+        key: String,
+        value: String,
+        expires_at_micros: Option<i64>,
+        #[serde(default)]
+        condition: SetConditionInput,
+    },
+    StringAppend {
+        keyspace: JsonU128,
+        key: String,
+        suffix: String,
+    },
+    StringSetRange {
+        keyspace: JsonU128,
+        key: String,
+        offset: u32,
+        patch: String,
+    },
+    HashSetIfAbsent {
+        keyspace: JsonU128,
+        key: String,
+        field: String,
+        value: String,
+    },
+    SetPop {
+        keyspace: JsonU128,
+        key: String,
+        seed: u64,
+    },
     StreamAdd {
         keyspace: JsonU128,
         key: String,
         fields: BTreeMap<String, String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SetConditionInput {
+    #[default]
+    IfAbsent,
+    IfPresent,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -1454,6 +1492,18 @@ enum StructureReadInput {
         output_limit: usize,
         visit_limit: usize,
         match_step_limit: usize,
+    },
+    StringRange {
+        keyspace: JsonU128,
+        key: String,
+        start: i64,
+        end: i64,
+    },
+    SetRandomMembers {
+        keyspace: JsonU128,
+        key: String,
+        seed: u64,
+        count: usize,
     },
 }
 
@@ -5920,6 +5970,54 @@ fn structure_mutation(
                 highest: matches!(end, SortedSetEndInput::Highest),
             }
         }
+        StructureMutationInput::StringSetConditional {
+            keyspace,
+            key,
+            value,
+            expires_at_micros,
+            condition,
+        } => ProductStructureMutation::StringSetConditional {
+            key: structure_key(keyspace, key)?,
+            value: value.into_bytes(),
+            expires_at_micros,
+            if_present: matches!(condition, SetConditionInput::IfPresent),
+        },
+        StructureMutationInput::StringAppend {
+            keyspace,
+            key,
+            suffix,
+        } => ProductStructureMutation::StringAppend {
+            key: structure_key(keyspace, key)?,
+            suffix: suffix.into_bytes(),
+        },
+        StructureMutationInput::StringSetRange {
+            keyspace,
+            key,
+            offset,
+            patch,
+        } => ProductStructureMutation::StringSetRange {
+            key: structure_key(keyspace, key)?,
+            offset,
+            patch: patch.into_bytes(),
+        },
+        StructureMutationInput::HashSetIfAbsent {
+            keyspace,
+            key,
+            field,
+            value,
+        } => ProductStructureMutation::HashSetIfAbsent {
+            key: structure_key(keyspace, key)?,
+            field: field.into_bytes(),
+            value: value.into_bytes(),
+        },
+        StructureMutationInput::SetPop {
+            keyspace,
+            key,
+            seed,
+        } => ProductStructureMutation::SetPop {
+            key: structure_key(keyspace, key)?,
+            seed,
+        },
         StructureMutationInput::StreamAdd {
             keyspace,
             key,
@@ -6145,6 +6243,26 @@ fn structure_read(input: StructureReadInput) -> Result<ProductStructureReadReque
             output_limit,
             visit_limit,
             match_step_limit,
+        },
+        StructureReadInput::StringRange {
+            keyspace,
+            key,
+            start,
+            end,
+        } => ProductStructureReadRequest::StringRange {
+            key: structure_key(keyspace, key)?,
+            start,
+            end,
+        },
+        StructureReadInput::SetRandomMembers {
+            keyspace,
+            key,
+            seed,
+            count,
+        } => ProductStructureReadRequest::SetRandomMembers {
+            key: structure_key(keyspace, key)?,
+            seed,
+            count,
         },
     })
 }

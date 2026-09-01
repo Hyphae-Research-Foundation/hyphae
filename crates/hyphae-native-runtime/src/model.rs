@@ -848,6 +848,17 @@ pub(crate) enum SortedSetMemberState {
     Present(SortedSetScore),
 }
 
+/// Result of popping one seeded rank from a set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SetPopState {
+    /// No visible set exists under the key.
+    MissingSet,
+    /// The set exists but has no members.
+    Empty,
+    /// The removed member.
+    Popped(Vec<u8>),
+}
+
 /// Result of popping one canonical extreme from a sorted set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SortedSetPopState {
@@ -1681,6 +1692,45 @@ impl StructureState {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// Every member of one visible set in exact ascending byte order.
+    pub(crate) fn set_members_at(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets
+            .get(key)
+            .map(|members| members.iter().cloned().collect())
+    }
+
+    /// Removes and returns the member at `rank` (ascending byte order) of
+    /// one visible set.
+    pub(crate) fn spop_at_rank(
+        &mut self,
+        key: &[u8],
+        rank_of: impl FnOnce(usize) -> usize,
+        logical_time_micros: i64,
+    ) -> SetPopState {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return SetPopState::MissingSet;
+        }
+        let Some(members) = self.sets.get_mut(key) else {
+            return SetPopState::MissingSet;
+        };
+        if members.is_empty() {
+            return SetPopState::Empty;
+        }
+        let rank = rank_of(members.len()).min(members.len() - 1);
+        let Some(member) = members.iter().nth(rank).cloned() else {
+            return SetPopState::Empty;
+        };
+        members.remove(&member);
+        SetPopState::Popped(member)
     }
 
     pub(crate) fn create_list(&mut self, key: Vec<u8>) -> bool {

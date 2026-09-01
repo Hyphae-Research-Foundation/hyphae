@@ -1207,7 +1207,9 @@ fn ensure_operation_minor(
             ProductStructureReadRequest::SortedSetScoreRange { .. }
             | ProductStructureReadRequest::HashScanReverse { .. }
             | ProductStructureReadRequest::HashScanMatch { .. }
-            | ProductStructureReadRequest::KeyScanMatch { .. },
+            | ProductStructureReadRequest::KeyScanMatch { .. }
+            | ProductStructureReadRequest::StringRange { .. }
+            | ProductStructureReadRequest::SetRandomMembers { .. },
         ) => 6,
         ProductOperation::StructureMutate { mutations }
             if mutations.iter().any(structure_mutation_requires_minor_six) =>
@@ -1290,6 +1292,11 @@ fn structure_mutation_requires_minor_six(mutation: &ProductStructureMutation) ->
         mutation,
         ProductStructureMutation::SortedSetIncrement { .. }
             | ProductStructureMutation::SortedSetPop { .. }
+            | ProductStructureMutation::StringSetConditional { .. }
+            | ProductStructureMutation::StringAppend { .. }
+            | ProductStructureMutation::StringSetRange { .. }
+            | ProductStructureMutation::HashSetIfAbsent { .. }
+            | ProductStructureMutation::SetPop { .. }
     )
 }
 
@@ -3669,6 +3676,40 @@ fn encode_structure_mutation(
             encode_structure_key(encoded, key)?;
             encoded.push(u8::from(*highest));
         }
+        ProductStructureMutation::StringSetConditional {
+            key,
+            value,
+            expires_at_micros,
+            if_present,
+        } => {
+            encoded.push(19);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, value)?;
+            encode_optional_i64(encoded, *expires_at_micros);
+            encoded.push(u8::from(*if_present));
+        }
+        ProductStructureMutation::StringAppend { key, suffix } => {
+            encoded.push(20);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, suffix)?;
+        }
+        ProductStructureMutation::StringSetRange { key, offset, patch } => {
+            encoded.push(21);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&offset.to_le_bytes());
+            put_bytes(encoded, patch)?;
+        }
+        ProductStructureMutation::HashSetIfAbsent { key, field, value } => {
+            encoded.push(22);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, field)?;
+            put_bytes(encoded, value)?;
+        }
+        ProductStructureMutation::SetPop { key, seed } => {
+            encoded.push(23);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&seed.to_le_bytes());
+        }
         ProductStructureMutation::StreamAdd { key, fields } => {
             encoded.push(16);
             encode_structure_key(encoded, key)?;
@@ -3773,6 +3814,45 @@ fn decode_structure_mutation(
             ProductStructureMutation::StreamAdd { key, fields }
         }
         tag @ (17 | 18) => decode_sorted_set_value_mutation(decoder, tag)?,
+        tag @ 19..=23 => decode_conditional_value_mutation(decoder, tag)?,
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes the minor-6 conditional and range mutations (tags 19-23).
+fn decode_conditional_value_mutation(
+    decoder: &mut Decoder<'_>,
+    tag: u8,
+) -> Result<ProductStructureMutation, ProductCodecError> {
+    Ok(match tag {
+        19 => ProductStructureMutation::StringSetConditional {
+            key: decode_structure_key(decoder)?,
+            value: decoder.owned_bytes()?,
+            expires_at_micros: decode_optional_i64(decoder)?,
+            if_present: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProductCodecError::InvalidValue),
+            },
+        },
+        20 => ProductStructureMutation::StringAppend {
+            key: decode_structure_key(decoder)?,
+            suffix: decoder.owned_bytes()?,
+        },
+        21 => ProductStructureMutation::StringSetRange {
+            key: decode_structure_key(decoder)?,
+            offset: decoder.u32()?,
+            patch: decoder.owned_bytes()?,
+        },
+        22 => ProductStructureMutation::HashSetIfAbsent {
+            key: decode_structure_key(decoder)?,
+            field: decoder.owned_bytes()?,
+            value: decoder.owned_bytes()?,
+        },
+        23 => ProductStructureMutation::SetPop {
+            key: decode_structure_key(decoder)?,
+            seed: decoder.u64()?,
+        },
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -4303,6 +4383,18 @@ fn encode_structure_read_request(
             put_u64(encoded, *visit_limit)?;
             put_u64(encoded, *match_step_limit)?;
         }
+        ProductStructureReadRequest::StringRange { key, start, end } => {
+            encoded.push(22);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&start.to_le_bytes());
+            encoded.extend_from_slice(&end.to_le_bytes());
+        }
+        ProductStructureReadRequest::SetRandomMembers { key, seed, count } => {
+            encoded.push(23);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&seed.to_le_bytes());
+            put_u64(encoded, *count)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4456,6 +4548,16 @@ fn decode_structure_read_request(
             output_limit: decoder.usize()?,
             visit_limit: decoder.usize()?,
             match_step_limit: decoder.usize()?,
+        },
+        22 => ProductStructureReadRequest::StringRange {
+            key: decode_structure_key(decoder)?,
+            start: decoder.i64()?,
+            end: decoder.i64()?,
+        },
+        23 => ProductStructureReadRequest::SetRandomMembers {
+            key: decode_structure_key(decoder)?,
+            seed: decoder.u64()?,
+            count: decoder.usize()?,
         },
         _ => return Err(ProductCodecError::InvalidValue),
     })

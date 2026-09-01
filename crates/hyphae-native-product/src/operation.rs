@@ -2636,21 +2636,12 @@ pub(crate) fn apply_structure_mutation(
             key,
             family,
             expires_at_micros,
-        } => {
-            let updated = match family {
-                StructureKind::String | StructureKind::Counter => {
-                    transaction.expire_structure(key.key, expires_at_micros)?
-                }
-                StructureKind::Hash => transaction.expire_hash(key.key, expires_at_micros)?,
-                StructureKind::List => transaction.expire_list(key.key, expires_at_micros)?,
-                StructureKind::Set => transaction.expire_set(key.key, expires_at_micros)?,
-                StructureKind::SortedSet => {
-                    transaction.expire_sorted_set(key.key, expires_at_micros)?
-                }
-                StructureKind::Stream => transaction.expire_stream(key.key, expires_at_micros)?,
-            };
-            Ok(ProductStructureMutationResult::Boolean(updated))
-        }
+        } => Ok(ProductStructureMutationResult::Boolean(apply_expire(
+            transaction,
+            key,
+            family,
+            expires_at_micros,
+        )?)),
         ProductStructureMutation::HashSet { key, field, value } => {
             transaction.hset(key.key, field, value)?;
             Ok(ProductStructureMutationResult::Unit)
@@ -2697,6 +2688,13 @@ pub(crate) fn apply_structure_mutation(
         mutation @ (ProductStructureMutation::SortedSetIncrement { .. }
         | ProductStructureMutation::SortedSetPop { .. }) => {
             apply_sorted_set_value_mutation(transaction, mutation)
+        }
+        mutation @ (ProductStructureMutation::StringSetConditional { .. }
+        | ProductStructureMutation::StringAppend { .. }
+        | ProductStructureMutation::StringSetRange { .. }
+        | ProductStructureMutation::HashSetIfAbsent { .. }
+        | ProductStructureMutation::SetPop { .. }) => {
+            apply_conditional_value_mutation(transaction, mutation)
         }
         ProductStructureMutation::SortedSetRemove { key, member } => Ok(
             ProductStructureMutationResult::Boolean(transaction.zrem(key.key, member)?),
@@ -2917,6 +2915,14 @@ pub(crate) fn read_structure(
             visit_limit,
             match_step_limit,
         ),
+        ProductStructureReadRequest::StringRange { key, start, end } => Ok(
+            ProductStructureReadResult::Value(snapshot.inner.getrange(&key.key, start, end)),
+        ),
+        ProductStructureReadRequest::SetRandomMembers { key, seed, count } => snapshot
+            .inner
+            .srandmember(&key.key, seed, count)
+            .map(ProductStructureReadResult::Values)
+            .map_err(Into::into),
     }
 }
 
@@ -2985,6 +2991,67 @@ fn apply_sorted_set_value_mutation(
                 },
             )))
         }
+        _ => Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
+    }
+}
+
+/// Replaces one top-level structure expiry for its declared family.
+fn apply_expire(
+    transaction: &mut NativeWriteBatch,
+    key: ProductStructureKey,
+    family: StructureKind,
+    expires_at_micros: i64,
+) -> Result<bool, ProductError> {
+    Ok(match family {
+        StructureKind::String | StructureKind::Counter => {
+            transaction.expire_structure(key.key, expires_at_micros)?
+        }
+        StructureKind::Hash => transaction.expire_hash(key.key, expires_at_micros)?,
+        StructureKind::List => transaction.expire_list(key.key, expires_at_micros)?,
+        StructureKind::Set => transaction.expire_set(key.key, expires_at_micros)?,
+        StructureKind::SortedSet => transaction.expire_sorted_set(key.key, expires_at_micros)?,
+        StructureKind::Stream => transaction.expire_stream(key.key, expires_at_micros)?,
+    })
+}
+
+/// Applies the minor-6 conditional and range string/hash/set mutations.
+fn apply_conditional_value_mutation(
+    transaction: &mut NativeWriteBatch,
+    mutation: ProductStructureMutation,
+) -> Result<ProductStructureMutationResult, ProductError> {
+    match mutation {
+        ProductStructureMutation::StringSetConditional {
+            key,
+            value,
+            expires_at_micros,
+            if_present,
+        } => {
+            let condition = if if_present {
+                hyphae_native_runtime::SetCondition::IfPresent
+            } else {
+                hyphae_native_runtime::SetCondition::IfAbsent
+            };
+            let outcome =
+                transaction.set_conditional(key.key, value, expires_at_micros, condition)?;
+            Ok(ProductStructureMutationResult::Boolean(matches!(
+                outcome,
+                hyphae_native_runtime::SetOutcome::Applied
+            )))
+        }
+        ProductStructureMutation::StringAppend { key, suffix } => Ok(
+            ProductStructureMutationResult::Count(transaction.append(key.key, &suffix)?),
+        ),
+        ProductStructureMutation::StringSetRange { key, offset, patch } => {
+            Ok(ProductStructureMutationResult::Count(
+                transaction.setrange(key.key, offset as usize, &patch)?,
+            ))
+        }
+        ProductStructureMutation::HashSetIfAbsent { key, field, value } => Ok(
+            ProductStructureMutationResult::Boolean(transaction.hsetnx(key.key, field, value)?),
+        ),
+        ProductStructureMutation::SetPop { key, seed } => Ok(
+            ProductStructureMutationResult::Value(transaction.spop(key.key, seed)?),
+        ),
         _ => Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
     }
 }
@@ -3189,6 +3256,11 @@ impl ProductStructureMutation {
             | Self::SortedSetAdd { key, .. }
             | Self::SortedSetIncrement { key, .. }
             | Self::SortedSetPop { key, .. }
+            | Self::StringSetConditional { key, .. }
+            | Self::StringAppend { key, .. }
+            | Self::StringSetRange { key, .. }
+            | Self::HashSetIfAbsent { key, .. }
+            | Self::SetPop { key, .. }
             | Self::SortedSetRemove { key, .. }
             | Self::StreamAdd { key, .. } => key,
         }
@@ -3196,7 +3268,11 @@ impl ProductStructureMutation {
 
     fn family(&self) -> StructureKind {
         match self {
-            Self::StringSet { .. } | Self::StringDelete { .. } => StructureKind::String,
+            Self::StringSet { .. }
+            | Self::StringDelete { .. }
+            | Self::StringSetConditional { .. }
+            | Self::StringAppend { .. }
+            | Self::StringSetRange { .. } => StructureKind::String,
             Self::CounterAdd { .. } => StructureKind::Counter,
             Self::Create { family, .. }
             | Self::Delete { family, .. }
@@ -3204,9 +3280,12 @@ impl ProductStructureMutation {
             Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashCounterAdd { .. }
-            | Self::HashExpireField { .. } => StructureKind::Hash,
+            | Self::HashExpireField { .. }
+            | Self::HashSetIfAbsent { .. } => StructureKind::Hash,
             Self::ListPush { .. } | Self::ListPop { .. } => StructureKind::List,
-            Self::SetAdd { .. } | Self::SetRemove { .. } => StructureKind::Set,
+            Self::SetAdd { .. } | Self::SetRemove { .. } | Self::SetPop { .. } => {
+                StructureKind::Set
+            }
             Self::SortedSetAdd { .. }
             | Self::SortedSetIncrement { .. }
             | Self::SortedSetPop { .. }
@@ -3243,6 +3322,8 @@ impl ProductStructureReadRequest {
             | Self::SetContains { key, .. }
             | Self::SetMembers { key, .. }
             | Self::SetCardinality { key }
+            | Self::StringRange { key, .. }
+            | Self::SetRandomMembers { key, .. }
             | Self::SortedSetScore { key, .. }
             | Self::SortedSetRank { key, .. }
             | Self::SortedSetRange { key, .. }
@@ -3265,7 +3346,9 @@ impl ProductStructureReadRequest {
 
     fn family(&self) -> StructureKind {
         match self {
-            Self::StringGet { .. } | Self::KeyScanMatch { .. } => StructureKind::String,
+            Self::StringGet { .. } | Self::KeyScanMatch { .. } | Self::StringRange { .. } => {
+                StructureKind::String
+            }
             Self::CounterGet { .. } => StructureKind::Counter,
             Self::Ttl { family, .. } => *family,
             Self::HashGet { .. }
@@ -3278,7 +3361,8 @@ impl ProductStructureReadRequest {
             Self::SetContains { .. }
             | Self::SetMembers { .. }
             | Self::SetCardinality { .. }
-            | Self::SetAlgebra { .. } => StructureKind::Set,
+            | Self::SetAlgebra { .. }
+            | Self::SetRandomMembers { .. } => StructureKind::Set,
             Self::SortedSetScore { .. }
             | Self::SortedSetRank { .. }
             | Self::SortedSetRange { .. }

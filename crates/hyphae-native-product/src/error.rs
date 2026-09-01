@@ -704,6 +704,8 @@ pub enum ProductLimitKind {
     SetMemberBatchItems,
     /// Keys admitted by one expiry sweep.
     ExpirySweepKeys,
+    /// Bytes of one scalar string mutation result.
+    StringValueBytes,
     /// Transactions admitted by one group commit.
     GroupCommitTransactions,
     /// A future bounded limit not recognized by this build.
@@ -724,6 +726,7 @@ impl ProductLimitKind {
             Self::HashFieldBatchItems => "hash_field_batch_items",
             Self::SetMemberBatchItems => "set_member_batch_items",
             Self::ExpirySweepKeys => "expiry_sweep_keys",
+            Self::StringValueBytes => "string_value_bytes",
             Self::GroupCommitTransactions => "group_commit_transactions",
             Self::Unknown(raw) => raw.as_str(),
         }
@@ -747,6 +750,7 @@ impl ProductLimitKind {
             "hash_field_batch_items" => Self::HashFieldBatchItems,
             "set_member_batch_items" => Self::SetMemberBatchItems,
             "expiry_sweep_keys" => Self::ExpirySweepKeys,
+            "string_value_bytes" => Self::StringValueBytes,
             "group_commit_transactions" => Self::GroupCommitTransactions,
             _ => Self::Unknown(ProductErrorIdentifier::new(raw)?),
         })
@@ -1436,6 +1440,11 @@ impl From<NativeRuntimeError> for ProductError {
                 hyphae_native_runtime::MAX_HASH_FIELD_BATCH_SIZE,
                 requested,
             ),
+            NativeRuntimeError::StructureStringTooLarge => Self::limit_exceeded(
+                ProductLimitKind::StringValueBytes,
+                hyphae_native_runtime::MAX_STRUCTURE_STRING_BYTES,
+                hyphae_native_runtime::MAX_STRUCTURE_STRING_BYTES.saturating_add(1),
+            ),
             NativeRuntimeError::SetMemberBatchTooLarge { requested } => Self::limit_exceeded(
                 ProductLimitKind::SetMemberBatchItems,
                 hyphae_native_runtime::MAX_SET_MEMBER_BATCH_SIZE,
@@ -1475,6 +1484,7 @@ impl From<NativeRuntimeError> for ProductError {
             | NativeRuntimeError::StructureKindMismatch
             | NativeRuntimeError::StructureStreamEntryNotCanonical
             | NativeRuntimeError::StructureScoreNotCanonical
+            | NativeRuntimeError::InvalidSetSampleCount
             | NativeRuntimeError::DuplicateHashField
             | NativeRuntimeError::DuplicateSetMember
             | NativeRuntimeError::LegacyStructureFamilyUnsupported

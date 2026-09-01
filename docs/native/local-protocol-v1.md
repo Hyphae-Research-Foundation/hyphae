@@ -14,6 +14,18 @@ byte `0` lowest / `1` highest), and structure-mutation result tags `6`
 (`Score`: binary64 bits) and `7` (`PoppedEntry`: one presence byte, then
 length-framed member and binary64 score bits when present).
 
+Protocol minor 6 further admits structure-read request tags `22`
+(`StringRange`: structure key and two `i64` inclusive positions) and `23`
+(`SetRandomMembers`: structure key, `u64` seed, and `u64` count), and
+structure-mutation tags `19` (`StringSetConditional`: structure key,
+length-framed value, optional `i64` expiry behind one presence byte, and
+one condition byte `0` if-absent / `1` if-present), `20` (`StringAppend`:
+structure key and length-framed suffix), `21` (`StringSetRange`:
+structure key, `u32` offset, and length-framed patch), `22`
+(`HashSetIfAbsent`: structure key, length-framed field, and length-framed
+value), and `23` (`SetPop`: structure key and `u64` seed). Their results
+reuse the existing `Boolean`, `Count`, `Value`, and `Values` shapes.
+
 Protocol minor 6 admits three appended structure-read request tags —
 `18` (`SortedSetScoreRange`: structure key, two score endpoints each
 encoded as one tag byte `0` unbounded / `1` inclusive / `2` exclusive

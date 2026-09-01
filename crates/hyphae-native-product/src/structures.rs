@@ -113,6 +113,37 @@ pub enum ProductStructureMutation {
         /// False pops the lowest `(score, member)`; true the highest.
         highest: bool,
     },
+    /// Conditionally set one scalar (minor 6).
+    StringSetConditional {
+        key: ProductStructureKey,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+        /// False applies only when absent; true only when present.
+        if_present: bool,
+    },
+    /// Append bytes after the current scalar value (minor 6).
+    StringAppend {
+        key: ProductStructureKey,
+        suffix: Vec<u8>,
+    },
+    /// Overwrite bytes at one offset, zero-filling any gap (minor 6).
+    StringSetRange {
+        key: ProductStructureKey,
+        offset: u32,
+        patch: Vec<u8>,
+    },
+    /// Write one hash field only when the field is absent (minor 6).
+    HashSetIfAbsent {
+        key: ProductStructureKey,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Remove and return the seed-selected member (minor 6).
+    SetPop {
+        key: ProductStructureKey,
+        /// Explicit caller seed for the deterministic rank.
+        seed: u64,
+    },
     /// Remove one exact sorted-set member.
     SortedSetRemove {
         key: ProductStructureKey,
@@ -245,6 +276,19 @@ pub enum ProductStructureReadRequest {
         output_limit: usize,
         visit_limit: usize,
         match_step_limit: usize,
+    },
+    /// Read one inclusive byte range of a scalar value (minor 6).
+    StringRange {
+        key: ProductStructureKey,
+        start: i64,
+        end: i64,
+    },
+    /// Sample bounded distinct set members under an explicit seed
+    /// (minor 6).
+    SetRandomMembers {
+        key: ProductStructureKey,
+        seed: u64,
+        count: usize,
     },
 }
 

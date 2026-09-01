@@ -765,6 +765,63 @@ without charging the output limit, and a leading literal pattern prefix
 prunes the visited range per family. Keys in the reserved internal
 namespace are never visited.
 
+## Conditional and range string writes
+
+`SET_IF_ABSENT(key, value, expiry?)` / `SET_IF_PRESENT(key, value,
+expiry?)` apply one scalar write only when the key currently has no
+unexpired visible value / has one, and report whether the write applied.
+A rejected condition stages nothing. Concurrent absent-key writers may
+both prepare; first-committer-wins admits one publication.
+
+`APPEND(key, suffix)` concatenates `suffix` after the current visible
+value and returns the resulting length in bytes. A missing or expired key
+starts from the empty value; an existing key keeps its expiry unchanged.
+
+`SETRANGE(key, offset, patch)` overwrites `patch` at byte `offset`,
+zero-filling any gap between the current length and `offset`, and returns
+the resulting length. A missing or expired key starts from the empty
+value; an existing key keeps its expiry unchanged.
+
+Both `APPEND` and `SETRANGE` reject, without staging, any operation whose
+resulting length would exceed the declared string mutation bound of
+8 MiB (`MAX_STRUCTURE_STRING_BYTES`). All four operations reject keys
+owned by another structure family.
+
+`GETRANGE(key, start, end)` reads the inclusive byte range of one scalar
+value with Valkey-affine indices: negative positions count from the end,
+out-of-range positions clamp, and an inverted or fully out-of-range
+request returns the empty value. A missing or expired key reads as
+absent.
+
+## Conditional hash writes
+
+`HSETNX(key, field, value)` writes one hash field only when the field has
+no unexpired visible value, and reports whether the write applied. The
+hash itself must already exist: families are created explicitly in this
+engine, so `HSETNX` on a missing or expired hash is an error rather than
+an implicit create (a deliberate divergence from Valkey).
+
+## Seeded set pop and sampling
+
+Set selection is deterministic under an explicit caller seed; the engine
+never draws hidden randomness.
+
+`SPOP(key, seed)` removes and returns the member at rank
+`splitmix64(seed) mod cardinality` in exact ascending member-byte order.
+Popping from an empty set returns an absent result without mutating; a
+missing or expired set is an error.
+
+`SRANDMEMBER(key, seed, count)` returns `min(count, cardinality)`
+distinct members without mutating: the walk starts at the seed-derived
+rank above and continues in ascending member-byte order, wrapping once at
+the end. `count` must be at least one; a missing or expired set is an
+error and an empty set returns no members.
+
+`splitmix64` is the public canonical finalizer (`z ^= z >> 30` multiply
+`0xBF58_476D_1CE4_E5B9`, `z ^= z >> 27` multiply `0x94D0_49BB_1331_11EB`,
+`z ^= z >> 31` over `seed + 0x9E37_79B9_7F4A_7C15`), so any client can
+predict the selected rank.
+
 ## Sorted-set increment and pop
 
 `ZINCRBY(key, delta, member)` adds a canonical binary64 delta to one
@@ -817,6 +874,25 @@ The typed product structure mutation additionally admits (minor 6):
 - `SortedSetPop`: `ZPOPMIN`/`ZPOPMAX` above behind an explicit end
   selector; the result is the optional popped `(member, score)` pair
   (`PoppedEntry`).
+- `StringSetConditional`: `SET_IF_ABSENT`/`SET_IF_PRESENT` above behind
+  an explicit condition selector; the result is `Boolean` (whether the
+  write applied).
+- `StringAppend`: `APPEND` above; the result is `Count` (the resulting
+  length in bytes).
+- `StringSetRange`: `SETRANGE` above with a `u32` offset; the result is
+  `Count` (the resulting length in bytes). Oversized results are
+  rejected as limit-exceeded without staging.
+- `HashSetIfAbsent`: `HSETNX` above; the result is `Boolean` (whether
+  the field was written).
+- `SetPop`: `SPOP` above with a mandatory `u64` seed; the result is the
+  optional popped member (`Value`).
+
+The typed product structure read additionally admits (minor 6):
+
+- `StringRange`: `GETRANGE` above with signed inclusive positions; the
+  result is `Value` (absent for a missing key, possibly empty bytes).
+- `SetRandomMembers`: `SRANDMEMBER` above with a mandatory `u64` seed
+  and a `count` of at least one; the result is `Values` in walk order.
 
 All three inherit the `structure.read` registry entry (`data.read`,
 request-object scope) and every transport bound of the existing read
@@ -828,6 +904,14 @@ unsupported before dispatch.
 Blocking operations wait on version publication, support deadlines and
 cancellation, and never occupy an engine owner thread. Stream consumer state
 is ordinary versioned structure data.
+
+## Keyspace no-goals
+
+The keyspace engine deliberately does not implement Valkey pub/sub,
+Lua/functions, cluster slots, key notifications, bitmaps/bitfields,
+HyperLogLog, geo commands, or client-side blocking list/stream pops.
+These are either transport concerns owned by other Hyphae surfaces or
+probabilistic/scripting features outside the bounded fail-closed model.
 
 ## Relational access
 

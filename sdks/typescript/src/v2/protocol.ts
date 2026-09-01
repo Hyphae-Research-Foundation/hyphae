@@ -1742,6 +1742,11 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
     stream_add: 16,
     sorted_set_increment: 17,
     sorted_set_pop: 18,
+    string_set_conditional: 19,
+    string_append: 20,
+    string_set_range: 21,
+    hash_set_if_absent: 22,
+    set_pop: 23,
   };
   const originalKind = String(value.kind);
   const [kind, implied] = aliases[originalKind] ?? [originalKind, undefined];
@@ -1766,6 +1771,16 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
   else if (kind === "sorted_set_add") parts.push(f64(Number(value.score)), bytes(requireBytes(value.member)));
   else if (kind === "sorted_set_increment") parts.push(f64(Number(value.delta)), bytes(requireBytes(value.member)));
   else if (kind === "sorted_set_pop") parts.push(Uint8Array.of(sortedSetEndTag(value.end ?? "lowest")));
+  else if (kind === "string_set_conditional") {
+    const expiry = value.expires_at_micros;
+    parts.push(bytes(requireBytes(value.value)), Uint8Array.of(expiry === undefined || expiry === null ? 0 : 1));
+    if (expiry !== undefined && expiry !== null) parts.push(i64(BigInt(expiry as bigint | number)));
+    parts.push(Uint8Array.of(setConditionTag(value.condition ?? "if_absent")));
+  }
+  else if (kind === "string_append") parts.push(bytes(requireBytes(value.suffix)));
+  else if (kind === "string_set_range") parts.push(u32(Number(value.offset)), bytes(requireBytes(value.patch)));
+  else if (kind === "hash_set_if_absent") parts.push(bytes(requireBytes(value.field)), bytes(requireBytes(value.value)));
+  else if (kind === "set_pop") parts.push(u64(BigInt(value.seed as bigint | number)));
   else if (kind === "stream_add") {
     const fields = value.fields;
     if (!Array.isArray(fields) || fields.length === 0 || fields.length > 4096) throw new ClientError("stream fields must be a nonempty bounded array");
@@ -1782,6 +1797,12 @@ function structureFamilyTag(raw: unknown): number {
   const tag = families[String(raw)];
   if (tag === undefined) throw new ClientError("structure family is invalid");
   return tag;
+}
+
+function setConditionTag(raw: unknown): number {
+  if (raw === "if_absent") return 0;
+  if (raw === "if_present") return 1;
+  throw new ClientError("string set condition is invalid");
 }
 
 function sortedSetEndTag(raw: unknown): number {
@@ -1834,7 +1855,7 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     set_members: 10, set_cardinality: 11, set_algebra: 12, sorted_set_score: 13,
     sorted_set_rank: 14, sorted_set_range: 15, sorted_set_cardinality: 16, stream_range: 17,
     sorted_set_score_range: 18, hash_scan_reverse: 19, hash_scan_match: 20,
-    key_scan_match: 21,
+    key_scan_match: 21, string_range: 22, set_random_members: 23,
   };
   const kind = String(value.kind);
   const tag = tags[kind];
@@ -1876,6 +1897,8 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     if (kind === "sorted_set_range") parts.push(Uint8Array.of(sortedOrderTag(value.order ?? "ascending")));
   }
   else if (kind === "stream_range") parts.push(u64(BigInt(value.start as bigint | number)), u64(BigInt(value.end as bigint | number)), u64(BigInt(value.limit as number)));
+  else if (kind === "string_range") parts.push(i64(BigInt(value.start as bigint | number)), i64(BigInt(value.end as bigint | number)));
+  else if (kind === "set_random_members") parts.push(u64(BigInt(value.seed as bigint | number)), u64(BigInt(value.count as number)));
   else if (kind === "sorted_set_score_range") {
     parts.push(
       encodeScoreBound(value.lower),
