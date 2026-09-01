@@ -134,7 +134,17 @@ surface additionally accepts a per-request fusion selector: the default is
 deterministic weighted reciprocal-rank fusion (`k = 60`), and
 `weighted_score` blends each branch's weight with its normalized score — a
 lexical candidate contributes `weight × score / branch_top_score` and a
-vector candidate contributes `weight × 1 / (1 + distance)`. An optional
+vector candidate contributes `weight × 1 / (1 + distance)`.
+`relative_score` min-max normalizes each branch over its admitted
+candidates before weighting: a lexical candidate contributes
+`weight × (score − branch_min) / (branch_max − branch_min)` and a vector
+candidate contributes `weight × (branch_max_distance − distance) /
+(branch_max_distance − branch_min_distance)`, so the best admitted
+candidate of every branch contributes exactly its weight and the worst
+contributes zero regardless of the branch's score scale. A branch whose
+admitted candidates all share one score contributes the full weight for
+each. Candidates excluded by the eligibility filter never participate in
+a branch's normalization bounds. An optional
 first-k-per-parent deduplication runs over the complete bounded ranking
 before the final limit: hits group by the exact typed value of one
 doc-value field, at most `k` (1..=100) survive per group in rank order,

@@ -197,6 +197,13 @@ pub enum ProductFusionMethod {
     /// vector candidate contributes its branch weight times the bounded
     /// similarity `1 / (1 + distance)`.
     WeightedScore,
+    /// Min-max relative-score blend: each branch normalizes its admitted
+    /// candidates to `[0, 1]` over that branch's own score range before
+    /// weighting, so the best admitted candidate contributes exactly the
+    /// branch weight and the worst contributes zero regardless of scale.
+    /// A branch whose candidates all share one score contributes the full
+    /// weight for each.
+    RelativeScore,
 }
 
 /// Bounded first-k-per-parent deduplication over the final ranking.
@@ -1440,27 +1447,58 @@ fn execute_lexical_branch(
             .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
             .map_err(map_runtime_error)?,
     };
-    let mut admitted = 0;
-    let top_score = hits.first().map_or(0.0, |hit| hit.score);
+    let mut admitted_hits = Vec::new();
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
         if eligible.contains(&object_id) {
-            match fusion {
-                None => add_rrf(fused, object_id, lexical.weight, rank)?,
-                Some(ProductFusionMethod::WeightedScore) => {
-                    let normalized = if top_score > 0.0 && hit.score >= 0.0 {
-                        hit.score / top_score
-                    } else {
-                        0.0
-                    };
-                    add_weighted_score(fused, object_id, lexical.weight, normalized)?;
-                }
+            admitted_hits.push((rank, object_id, hit.score));
+        }
+    }
+    let admitted = admitted_hits.len();
+    let top_score = admitted_hits.first().map_or(0.0, |(_, _, score)| *score);
+    let (branch_min, branch_max) = score_bounds(admitted_hits.iter().map(|(_, _, score)| *score));
+    for (rank, object_id, score) in admitted_hits {
+        checkpoint()?;
+        match fusion {
+            None => add_rrf(fused, object_id, lexical.weight, rank)?,
+            Some(ProductFusionMethod::WeightedScore) => {
+                let normalized = if top_score > 0.0 && score >= 0.0 {
+                    score / top_score
+                } else {
+                    0.0
+                };
+                add_weighted_score(fused, object_id, lexical.weight, normalized)?;
             }
-            admitted += 1;
+            Some(ProductFusionMethod::RelativeScore) => {
+                let normalized = min_max_normalized(score, branch_min, branch_max);
+                add_weighted_score(fused, object_id, lexical.weight, normalized)?;
+            }
         }
     }
     Ok(admitted)
+}
+
+/// Finite `(min, max)` bounds over one branch's admitted scores.
+fn score_bounds(scores: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut bounds: Option<(f64, f64)> = None;
+    for score in scores {
+        bounds = Some(match bounds {
+            None => (score, score),
+            Some((low, high)) => (low.min(score), high.max(score)),
+        });
+    }
+    bounds.unwrap_or((0.0, 0.0))
+}
+
+/// Min-max normalization to `[0, 1]`; a degenerate range contributes `1.0`
+/// so an all-equal branch still contributes its full weight.
+fn min_max_normalized(score: f64, min: f64, max: f64) -> f64 {
+    if max > min {
+        ((score - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1489,16 +1527,26 @@ fn execute_vector_branches(
             .ok_or_else(invalid_request)?;
         let (hits, receipt) =
             execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
+        if hits
+            .iter()
+            .any(|hit| !hit.distance.is_finite() || hit.distance < 0.0)
+        {
+            return Err(invalid_request());
+        }
+        let (branch_min, branch_max) = score_bounds(hits.iter().map(|hit| hit.distance));
         for (rank, hit) in hits.into_iter().enumerate() {
             checkpoint()?;
             match fusion {
                 None => add_rrf(fused, hit.object_id, branch.weight, rank)?,
                 Some(ProductFusionMethod::WeightedScore) => {
-                    let normalized = if hit.distance.is_finite() && hit.distance >= 0.0 {
-                        1.0 / (1.0 + hit.distance)
-                    } else {
-                        return Err(invalid_request());
-                    };
+                    let normalized = 1.0 / (1.0 + hit.distance);
+                    add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
+                }
+                Some(ProductFusionMethod::RelativeScore) => {
+                    // Distances rank ascending: the nearest admitted hit
+                    // contributes the full weight, the farthest zero.
+                    let normalized =
+                        min_max_normalized(branch_max - hit.distance, 0.0, branch_max - branch_min);
                     add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
                 }
             }

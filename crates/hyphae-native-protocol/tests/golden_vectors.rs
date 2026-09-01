@@ -2258,3 +2258,46 @@ fn minor_six_conditional_and_seeded_tags_gate_and_round_trip()
     }
     Ok(())
 }
+
+#[test]
+fn relative_score_fusion_requires_minor_six_and_round_trips()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.fusion
+                == Some(hyphae_native_product::ProductFusionMethod::RelativeScore)
+    ));
+    Ok(())
+}

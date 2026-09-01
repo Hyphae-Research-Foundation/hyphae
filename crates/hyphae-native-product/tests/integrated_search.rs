@@ -2154,3 +2154,98 @@ fn explicit_transaction_document_stage_rejects_unknown_collection_and_bad_doc_va
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("relative-fusion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let image = ProductVector::new([3.0, 0.0])?;
+    let request = |fusion| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+        }),
+        vectors: vec![ProductVectorBranch {
+            target: "image".into(),
+            query: image.clone(),
+            candidate_limit: 4,
+            weight: 1,
+            execution: None,
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+    };
+    let relative = product.search_collection(
+        binding.collection,
+        &request(Some(
+            hyphae_native_product::ProductFusionMethod::RelativeScore,
+        )),
+        11,
+    )?;
+    // Per-branch min-max normalization rewards candidates that are good
+    // in BOTH branches. Document 201 is the best lexical hit (norm 1.0)
+    // but the farthest vector hit (norm 0.0); document 204 sits exactly
+    // on the vector query (norm 1.0) but is lexically silent (no
+    // contribution). Document 203 ("database hardware", vector [2,0]) is
+    // strong in both: vector norm (9-1)/9 ~ 0.889 plus a positive
+    // lexical share pushes its fused score above either single-branch
+    // extreme, so the balanced candidate leads.
+    let ids: Vec<u128> = relative
+        .hits
+        .iter()
+        .map(|hit| hit.object_id.get())
+        .collect();
+    assert_eq!(ids.first().copied(), Some(203));
+    assert!(ids.contains(&201));
+    assert!(ids.contains(&204));
+
+    // The same request under RRF produces a valid ranking too; the two
+    // methods must both admit the identical candidate set.
+    let rrf = product.search_collection(binding.collection, &request(None), 11)?;
+    assert_eq!(
+        rrf.hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ids.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+    );
+
+    // The proof pipeline binds the new fusion method.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 52);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(
+                hyphae_native_product::ProductFusionMethod::RelativeScore,
+            )),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}

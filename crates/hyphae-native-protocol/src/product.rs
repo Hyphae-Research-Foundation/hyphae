@@ -1140,6 +1140,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let fusion = match request.fusion {
         None => 0,
         Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => 4,
+        Some(hyphae_native_product::ProductFusionMethod::RelativeScore) => 6,
     };
     let dedupe = if request.parent_dedupe.is_some() {
         4
@@ -5427,6 +5428,7 @@ fn encode_search_collection(
         encoded.push(1);
         encoded.push(match fusion {
             hyphae_native_product::ProductFusionMethod::WeightedScore => 1,
+            hyphae_native_product::ProductFusionMethod::RelativeScore => 2,
         });
     }
     if let Some(dedupe) = &request.parent_dedupe {
@@ -5601,6 +5603,7 @@ fn decode_search_collection(
             1 => {
                 fusion = Some(match decoder.u8()? {
                     1 => hyphae_native_product::ProductFusionMethod::WeightedScore,
+                    2 => hyphae_native_product::ProductFusionMethod::RelativeScore,
                     _ => return Err(ProductCodecError::InvalidValue),
                 });
             }

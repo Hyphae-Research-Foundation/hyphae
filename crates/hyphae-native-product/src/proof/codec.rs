@@ -438,6 +438,7 @@ fn decode_hybrid(
     let fusion_method = match decoder.byte()? {
         1 => HybridFusionMethod::WeightedReciprocalRank,
         2 => HybridFusionMethod::WeightedScore,
+        3 => HybridFusionMethod::RelativeScore,
         _ => return Err(NativeProofError::Invalid("invalid hybrid fusion method")),
     };
     let duplicate_policy = match decoder.byte()? {

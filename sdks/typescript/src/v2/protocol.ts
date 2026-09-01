@@ -1521,7 +1521,7 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     u64(BigInt(request.limit as number)),
     // Content-derived tagged sections in ascending tag order: an absent
     // section is the default and keeps the exact historical bytes.
-    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
+    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : request.fusion === "relative_score" ? [Uint8Array.of(1, 2)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
     ...encodeParentDedupe(request.parent_dedupe),
     ...encodeRerank(request.rerank),
     ...encodeHighlight(request.highlight),

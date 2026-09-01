@@ -1363,6 +1363,7 @@ fn hybrid_metadata(
         fusion_method: match request.fusion {
             None => HybridFusionMethod::WeightedReciprocalRank,
             Some(crate::ProductFusionMethod::WeightedScore) => HybridFusionMethod::WeightedScore,
+            Some(crate::ProductFusionMethod::RelativeScore) => HybridFusionMethod::RelativeScore,
         },
         duplicate_policy: HybridDuplicatePolicy::MergeByObjectId,
     }))
@@ -1670,6 +1671,7 @@ fn encode_integrated_request(
             encoded.byte(1);
             encoded.byte(match fusion {
                 crate::ProductFusionMethod::WeightedScore => 1,
+                crate::ProductFusionMethod::RelativeScore => 2,
             });
         }
         if let Some(dedupe) = &request.parent_dedupe {
@@ -1797,6 +1799,7 @@ fn decode_integrated_request(
                 1 => {
                     fusion = Some(match decoder.byte()? {
                         1 => crate::ProductFusionMethod::WeightedScore,
+                        2 => crate::ProductFusionMethod::RelativeScore,
                         _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
                     });
                 }

@@ -242,6 +242,8 @@ pub enum HybridFusionMethod {
     WeightedReciprocalRank = 1,
     /// Weighted normalized-score fusion.
     WeightedScore = 2,
+    /// Weighted min-max relative-score fusion.
+    RelativeScore = 3,
 }
 
 /// Duplicate handling across hybrid branches.
