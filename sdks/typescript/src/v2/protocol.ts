@@ -1529,7 +1529,18 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...(request.offset === undefined || request.offset === null || Number(request.offset) === 0 ? [] : [join(Uint8Array.of(6), u32(Number(request.offset)))]),
     ...encodeRangeFacets(request.range_facets),
     ...encodeDistanceCutoffs(request.vectors as ReadonlyArray<Readonly<Record<string, unknown>>>),
+    ...encodeLexicalOperator(lexical),
   );
+}
+
+function encodeLexicalOperator(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {
+  const operator = lexical?.operator as Readonly<Record<string, unknown>> | string | undefined;
+  if (operator === undefined || operator === null) return [];
+  if (operator === "and") return [Uint8Array.of(9, 0)];
+  if (typeof operator === "object" && typeof operator.minimum_match === "number") {
+    return [join(Uint8Array.of(9, 1), u32(Number(operator.minimum_match)))];
+  }
+  throw new ClientError("lexical operator is invalid");
 }
 
 function encodeDistanceCutoffs(vectors: ReadonlyArray<Readonly<Record<string, unknown>>>): Uint8Array[] {

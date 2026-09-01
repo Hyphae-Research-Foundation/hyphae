@@ -314,6 +314,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 query: "rust database".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -426,6 +427,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 2,
+                operator: None,
             }),
             vectors: vec![
                 ProductVectorBranch {
@@ -620,6 +622,7 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             query: "rust".into(),
             candidate_limit: 4,
             weight: 2,
+            operator: None,
         }),
         vectors: vec![ProductVectorBranch {
             target: "semantic".into(),
@@ -812,6 +815,7 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             query: text.into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1209,6 +1213,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::In {
@@ -1255,6 +1260,7 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -1300,6 +1306,7 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -1415,6 +1422,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                         query: query.into(),
                         candidate_limit: 4,
                         weight: 1,
+                        operator: None,
                     }),
                     vectors: Vec::new(),
                     filter: ProductSearchFilter::MatchAll,
@@ -1576,6 +1584,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
             query: "deterministic retrieval".into(),
             candidate_limit: 8,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -1694,6 +1703,7 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
             query: "shared token".into(),
             candidate_limit: 16,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1777,6 +1787,7 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -1863,6 +1874,7 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
             query: "Rust DATABASE".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2006,6 +2018,7 @@ fn lexical_ranking(
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2118,6 +2131,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
                 query: "atomic staged".to_owned(),
                 candidate_limit: 10,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2255,6 +2269,7 @@ fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -2384,6 +2399,7 @@ fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2484,6 +2500,7 @@ fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std:
             query: "rust database".into(),
             candidate_limit: 8,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -2590,6 +2607,7 @@ fn offset_pages_the_final_ranking_without_touching_aggregates()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2839,6 +2857,105 @@ fn vector_distance_cutoff_discards_far_hits_before_fusion() -> Result<(), Box<dy
     );
     let Err(error) = error else {
         return Err("negative cutoff was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("lexical-operator");
+    let (mut product, binding) = configure(&path)?;
+    // 201 "rust database engine" has both; 202 "rust field guide" only
+    // rust; 203 "database hardware" only database; 204 neither.
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |operator| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Default OR admits all three matching documents.
+    let any = product.search_collection(binding.collection, &request(None), 7)?;
+    assert_eq!(any.hits.len(), 3);
+    // AND admits only the document containing every analyzed term.
+    let all = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::And)),
+        7,
+    )?;
+    assert_eq!(
+        all.hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![201],
+    );
+    // OR with minimum_match 2 equals AND here.
+    let minimum = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 2,
+        })),
+        7,
+    )?;
+    assert_eq!(
+        minimum
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![201],
+    );
+    // minimum_match 1 restores OR behavior.
+    let one = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 1,
+        })),
+        7,
+    )?;
+    assert_eq!(one.hits.len(), 3);
+    // minimum_match above the distinct-term count admits nothing.
+    let unsatisfiable = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 3,
+        })),
+        7,
+    )?;
+    assert!(unsatisfiable.hits.is_empty());
+    // Zero minimum_match fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 0,
+        })),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("zero minimum_match was admitted".into());
     };
     assert_eq!(
         error.code(),

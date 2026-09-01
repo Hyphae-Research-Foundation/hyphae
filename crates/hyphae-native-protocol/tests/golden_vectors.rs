@@ -550,6 +550,7 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 query: "rust".to_owned(),
                 candidate_limit: 8,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -678,6 +679,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -727,6 +729,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -775,6 +778,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -826,6 +830,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2289,6 +2294,7 @@ fn relative_score_fusion_requires_minor_six_and_round_trips()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
@@ -2335,6 +2341,7 @@ fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2394,6 +2401,7 @@ fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -2458,6 +2466,7 @@ fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn st
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
@@ -2659,6 +2668,76 @@ fn vector_distance_cutoff_requires_minor_six() -> Result<(), Box<dyn std::error:
         .ok_or("cutoff bits not found")?;
     let mut forged = encoded.clone();
     forged[position..position + 8].copy_from_slice(&(-1.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |operator| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust database".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    // Absent operator keeps historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.operator.is_none())
+    ));
+    for operator in [
+        hyphae_native_product::ProductLexicalOperator::And,
+        hyphae_native_product::ProductLexicalOperator::Or { minimum_match: 2 },
+    ] {
+        let gated = request(Some(operator));
+        assert!(matches!(
+            encode_product_request_for_minor(&gated, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&gated, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert!(matches!(
+            decoded.operation,
+            ProductOperation::SearchCollection { request, .. }
+                if request.lexical.as_ref().and_then(|lexical| lexical.operator)
+                    == Some(operator)
+        ));
+    }
+    // A zero minimum_match fails closed at decode.
+    let gated = request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+        minimum_match: 2,
+    }));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
     assert!(decode_product_request_for_minor(&forged, 6).is_err());
     Ok(())
 }

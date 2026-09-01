@@ -157,6 +157,19 @@ unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
 
+The lexical branch may declare an optional term operator. The default
+(absent) keeps pure OR semantics: any analyzed query term admits a
+candidate. `And` admits only candidates containing every distinct
+analyzed query term; `Or { minimum_match }` admits candidates containing
+at least `minimum_match` distinct analyzed terms (`1..=64`; a
+`minimum_match` above the distinct-term count admits nothing). BM25
+scores are unchanged — the operator filters admission, never scoring.
+Membership is verified against complete bounded per-term posting sets:
+each distinct term's full match set must fit the branch candidate bound
+(10,000), and a term whose set reaches that bound fails closed as
+limit-exceeded rather than answering from a truncated set. A query whose
+analysis yields no terms leaves the branch empty as before.
+
 A vector branch may declare an optional `max_distance` cutoff: hits at
 a canonical metric distance strictly greater than the cutoff are
 discarded before fusion, so garbage matches never earn a reciprocal

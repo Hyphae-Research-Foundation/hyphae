@@ -149,6 +149,24 @@ pub struct ProductLexicalBranch {
     pub candidate_limit: usize,
     /// Positive deterministic RRF weight.
     pub weight: u32,
+    /// Optional term-admission operator. Absent keeps pure OR semantics.
+    pub operator: Option<ProductLexicalOperator>,
+}
+
+/// Maximum `minimum_match` distinct terms in one lexical operator.
+pub const MAX_LEXICAL_MINIMUM_MATCH: usize = 64;
+
+/// Term-admission operator over the analyzed query terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductLexicalOperator {
+    /// Admit only candidates containing every distinct analyzed term.
+    And,
+    /// Admit candidates containing at least this many distinct analyzed
+    /// terms (`1..=64`).
+    Or {
+        /// Minimum distinct-term matches required.
+        minimum_match: usize,
+    },
 }
 
 /// Exact, approximate, or adaptive vector execution requested by the product.
@@ -1449,6 +1467,73 @@ impl NativeProduct {
     }
 }
 
+/// Per-term membership sets and the required distinct-match minimum.
+type LexicalMembership = (Vec<BTreeSet<crate::ObjectId>>, usize);
+
+/// Complete bounded per-term membership sets for the lexical operator.
+///
+/// `None` when no operator applies. Each distinct analyzed term's full
+/// match set must fit the branch candidate bound; a set that reaches the
+/// bound fails closed as limit-exceeded rather than answering from a
+/// truncated set.
+fn lexical_operator_membership(
+    database: &hyphae_native_runtime::NativeDatabase,
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    operator: Option<ProductLexicalOperator>,
+    parameters: hyphae_native_runtime::Bm25ScoreParameters,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Option<LexicalMembership>, ProductError> {
+    let Some(operator) = operator else {
+        return Ok(None);
+    };
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let terms: BTreeSet<&str> = analysis
+        .tokens
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    if terms.is_empty() {
+        return Ok(Some((Vec::new(), usize::from(!terms.is_empty()))));
+    }
+    let minimum = match operator {
+        ProductLexicalOperator::And => terms.len(),
+        ProductLexicalOperator::Or { minimum_match } => minimum_match,
+    };
+    let mut memberships = Vec::with_capacity(terms.len());
+    for term in terms {
+        checkpoint()?;
+        let hits = match database.match_text_at_snapshot(
+            &snapshot.inner,
+            index,
+            term,
+            MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES,
+            parameters,
+        ) {
+            Ok(hits) => hits,
+            Err(_) => snapshot
+                .inner
+                .match_text_with_parameters(
+                    index,
+                    term,
+                    MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES,
+                    parameters,
+                )
+                .map_err(map_runtime_error)?,
+        };
+        if hits.len() >= MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES {
+            return Err(limit_exceeded());
+        }
+        let members = hits
+            .into_iter()
+            .map(|hit| decode_object_id(&hit.document_id))
+            .collect::<Result<BTreeSet<_>, ProductError>>()?;
+        memberships.push(members);
+    }
+    Ok(Some((memberships, minimum)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_lexical_branch(
     database: &hyphae_native_runtime::NativeDatabase,
@@ -1486,11 +1571,30 @@ fn execute_lexical_branch(
             .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
             .map_err(map_runtime_error)?,
     };
+    let required = lexical_operator_membership(
+        database,
+        snapshot,
+        index,
+        query,
+        lexical.operator,
+        parameters,
+        checkpoint,
+    )?;
     let mut admitted_hits = Vec::new();
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
-        if eligible.contains(&object_id) {
+        let operator_admits = match &required {
+            None => true,
+            Some((memberships, minimum)) => {
+                memberships
+                    .iter()
+                    .filter(|members| members.contains(&object_id))
+                    .count()
+                    >= *minimum
+            }
+        };
+        if operator_admits && eligible.contains(&object_id) {
             admitted_hits.push((rank, object_id, hit.score));
         }
     }
@@ -1984,7 +2088,12 @@ fn validate_search_request(
     }
     if let Some(lexical) = &request.lexical
         && (!(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
-            || lexical.weight == 0)
+            || lexical.weight == 0
+            || matches!(
+                lexical.operator,
+                Some(ProductLexicalOperator::Or { minimum_match })
+                    if !(1..=MAX_LEXICAL_MINIMUM_MATCH).contains(&minimum_match)
+            ))
     {
         return Err(invalid_request());
     }

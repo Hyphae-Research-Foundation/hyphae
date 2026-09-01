@@ -1128,6 +1128,12 @@ enum SearchCommand {
         /// JSON array of `{field,ranges:[{lower?,upper?}]}` range facets.
         #[arg(long)]
         range_facets_json: Option<String>,
+        /// Lexical term operator: every analyzed term must match.
+        #[arg(long, conflicts_with = "minimum_match")]
+        lexical_and: bool,
+        /// Minimum distinct analyzed terms a candidate must contain.
+        #[arg(long)]
+        minimum_match: Option<usize>,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -3706,6 +3712,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             offset,
             max_distance,
             range_facets_json,
+            lexical_and,
+            minimum_match,
         } => {
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
@@ -3739,6 +3747,15 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             query,
                             candidate_limit,
                             weight: 1,
+                            operator: if lexical_and {
+                                Some(hyphae_native_product::ProductLexicalOperator::And)
+                            } else {
+                                minimum_match.map(|minimum_match| {
+                                    hyphae_native_product::ProductLexicalOperator::Or {
+                                        minimum_match,
+                                    }
+                                })
+                            },
                         }),
                         vectors,
                         filter: filter_json

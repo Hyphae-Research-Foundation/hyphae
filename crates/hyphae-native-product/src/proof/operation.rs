@@ -811,7 +811,13 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
     let autocut = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
-            if request.autocut.is_some() || request.offset > 0 || !request.range_facets.is_empty()
+            if request.autocut.is_some()
+                || request.offset > 0
+                || !request.range_facets.is_empty()
+                || request
+                    .lexical
+                    .as_ref()
+                    .is_some_and(|lexical| lexical.operator.is_some())
     );
     let highlighted = matches!(
         operation,
@@ -1723,12 +1729,13 @@ fn decode_integrated_request(
     limits: &NativeVerificationLimits,
     semantics_version: u16,
 ) -> Result<ProductSearchRequest, NativeProofError> {
-    let lexical = match decoder.byte()? {
+    let mut lexical = match decoder.byte()? {
         0 => None,
         1 => Some(ProductLexicalBranch {
             query: text(decoder, limits.max_reexecution_bytes)?,
             candidate_limit: usize_value(decoder)?,
             weight: decoder.u32()?,
+            operator: None,
         }),
         _ => return Err(NativeProofError::Invalid("invalid lexical presence tag")),
     };
@@ -1904,6 +1911,21 @@ fn decode_integrated_request(
                             .ok_or(NativeProofError::Invalid("cutoff ordinal out of range"))?
                             .max_distance = Some(cutoff);
                     }
+                }
+                9 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let operator = match decoder.byte()? {
+                        0 => crate::ProductLexicalOperator::And,
+                        1 => crate::ProductLexicalOperator::Or {
+                            minimum_match: usize_value(decoder)?,
+                        },
+                        _ => {
+                            return Err(NativeProofError::Invalid("invalid lexical operator"));
+                        }
+                    };
+                    lexical
+                        .as_mut()
+                        .ok_or(NativeProofError::Invalid("operator without lexical branch"))?
+                        .operator = Some(operator);
                 }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
@@ -2229,6 +2251,20 @@ fn encode_autocut_sections(
         for (ordinal, cutoff) in cutoffs {
             put_usize(encoded, ordinal)?;
             encoded.extend(&cutoff.bits().to_le_bytes());
+        }
+    }
+    if let Some(operator) = request
+        .lexical
+        .as_ref()
+        .and_then(|lexical| lexical.operator)
+    {
+        encoded.byte(9);
+        match operator {
+            crate::ProductLexicalOperator::And => encoded.byte(0),
+            crate::ProductLexicalOperator::Or { minimum_match } => {
+                encoded.byte(1);
+                put_usize(encoded, minimum_match)?;
+            }
         }
     }
     Ok(())

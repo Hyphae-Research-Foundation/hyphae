@@ -1622,6 +1622,7 @@ async fn memory_recall(
             query: input.query,
             candidate_limit: 1_000,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
@@ -2032,6 +2033,7 @@ async fn profile_memory_recall(
             query: input.query,
             candidate_limit: 1_000,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::All(clauses),
@@ -2506,6 +2508,7 @@ pub(crate) fn collection_search_request(
             query: branch.query,
             candidate_limit: branch.candidate_limit,
             weight: branch.weight,
+            operator: None,
         }),
         vectors: input
             .vectors

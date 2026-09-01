@@ -449,6 +449,7 @@ fn search_request() -> ProductSearchRequest {
             query: "scope".into(),
             candidate_limit: 8,
             weight: 1,
+            operator: None,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,

@@ -1161,6 +1161,15 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     } else {
         0
     };
+    let operator = if request
+        .lexical
+        .as_ref()
+        .is_some_and(|lexical| lexical.operator.is_some())
+    {
+        6
+    } else {
+        0
+    };
     let range_facets = if request.range_facets.is_empty() {
         0
     } else {
@@ -1186,6 +1195,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
         .max(average)
         .max(range_facets)
         .max(cutoff)
+        .max(operator)
 }
 
 fn ensure_operation_minor(
@@ -5545,6 +5555,20 @@ fn encode_search_collection(
             encoded.extend_from_slice(&cutoff.bits().to_le_bytes());
         }
     }
+    if let Some(operator) = request
+        .lexical
+        .as_ref()
+        .and_then(|lexical| lexical.operator)
+    {
+        encoded.push(9);
+        match operator {
+            hyphae_native_product::ProductLexicalOperator::And => encoded.push(0),
+            hyphae_native_product::ProductLexicalOperator::Or { minimum_match } => {
+                encoded.push(1);
+                put_u32(encoded, minimum_match)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5557,12 +5581,13 @@ fn decode_search_collection(
     if decoder.bytes(7)? != [0; 7] {
         return Err(ProductCodecError::Malformed);
     }
-    let lexical = has_lexical
+    let mut lexical = has_lexical
         .then(|| -> Result<ProductLexicalBranch, ProductCodecError> {
             Ok(ProductLexicalBranch {
                 query: decoder.text()?,
                 candidate_limit: decoder.usize()?,
                 weight: decoder.u32()?,
+                operator: None,
             })
         })
         .transpose()?;
@@ -5812,6 +5837,25 @@ fn decode_search_collection(
                         .ok_or(ProductCodecError::InvalidValue)?
                         .max_distance = Some(cutoff);
                 }
+            }
+            9 => {
+                let operator = match decoder.u8()? {
+                    0 => hyphae_native_product::ProductLexicalOperator::And,
+                    1 => {
+                        let minimum_match = decoder.usize_u32()?;
+                        if !(1..=hyphae_native_product::MAX_LEXICAL_MINIMUM_MATCH)
+                            .contains(&minimum_match)
+                        {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        hyphae_native_product::ProductLexicalOperator::Or { minimum_match }
+                    }
+                    _ => return Err(ProductCodecError::InvalidValue),
+                };
+                lexical
+                    .as_mut()
+                    .ok_or(ProductCodecError::InvalidValue)?
+                    .operator = Some(operator);
             }
             _ => return Err(ProductCodecError::InvalidValue),
         }
