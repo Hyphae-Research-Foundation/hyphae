@@ -2015,3 +2015,153 @@ fn minor_six_structure_reads_gate_and_round_trip() -> Result<(), Box<dyn std::er
     assert_eq!(decoded, response);
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_key_scan_and_sorted_set_mutations_gate_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        CanonicalF64, ProductHashScanStop, ProductRead, ProductStructureKey,
+        ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+        ProductStructureReadResult, ProductTransactionHandle, ProductTransactionStageReceipt,
+        ProductTransactionStageResult, StructureKind,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+
+    // KeyScanMatch request gates below minor 6 and round-trips at 6.
+    let request = ProductStructureReadRequest::KeyScanMatch {
+        keyspace,
+        pattern: b"app:*".to_vec(),
+        start_after: Some(b"app:flag".to_vec()),
+        output_limit: 8,
+        visit_limit: 32,
+        match_step_limit: 256,
+    };
+    let wire = security_wire_request(ProductOperation::StructureRead(request));
+    assert!(matches!(
+        encode_product_request_for_minor(&wire, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&wire, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert_eq!(
+        format!("{:?}", decoded.operation),
+        format!("{:?}", wire.operation),
+    );
+
+    // SortedSetIncrement / SortedSetPop mutations gate on both surfaces.
+    let mutations = [
+        ProductStructureMutation::SortedSetIncrement {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            member: b"alpha".to_vec(),
+            delta: CanonicalF64::new(2.5),
+        },
+        ProductStructureMutation::SortedSetPop {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            highest: true,
+        },
+    ];
+    for mutation in mutations {
+        let wire = security_wire_request(ProductOperation::StructureMutate {
+            mutations: vec![mutation],
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+
+    // KeyPage response gates and round-trips with families intact.
+    let response = ProductResponse::StructureRead(ProductRead {
+        snapshot: SnapshotIdentity {
+            directory_lineage: [7; 24],
+            visible_csn: hyphae_native_product::Csn::new(3).ok(),
+            catalog_version: hyphae_native_product::CatalogVersion::new(2)?,
+            root_digest: [9; 32],
+            logical_time_micros: 10,
+        },
+        value: ProductStructureReadResult::KeyPage {
+            entries: vec![
+                hyphae_native_product::ProductKeyEntry {
+                    key: b"app:board".to_vec(),
+                    family: StructureKind::SortedSet,
+                },
+                hyphae_native_product::ProductKeyEntry {
+                    key: b"app:flag".to_vec(),
+                    family: StructureKind::String,
+                },
+            ],
+            continuation: Some(b"app:flag".to_vec()),
+            stop: ProductHashScanStop::OutputLimit,
+            visited: 2,
+            match_steps: 9,
+        },
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&response, 6)?;
+    assert!(matches!(
+        decode_product_response_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_response_for_minor(&encoded, 6)?;
+    assert_eq!(decoded, response);
+
+    // Staged Score and PoppedEntry results gate and round-trip.
+    let handle = ProductTransactionHandle::new(4).ok_or("handle")?;
+    let staged_results = [
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::Score(
+            CanonicalF64::new(4.0),
+        )),
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::PoppedEntry(
+            Some(hyphae_native_product::ProductSortedSetEntry {
+                member: b"bravo".to_vec(),
+                score: CanonicalF64::new(1.5),
+            }),
+        )),
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::PoppedEntry(None)),
+    ];
+    for result in staged_results {
+        let response = ProductResponse::TransactionStaged(ProductTransactionStageReceipt {
+            handle,
+            operation_ordinal: 1,
+            changed: true,
+            result,
+        });
+        assert!(matches!(
+            encode_product_response_for_minor(&response, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_response_for_minor(&response, 6)?;
+        assert!(matches!(
+            decode_product_response_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_response_for_minor(&encoded, 6)?;
+        assert_eq!(decoded, response);
+    }
+    Ok(())
+}

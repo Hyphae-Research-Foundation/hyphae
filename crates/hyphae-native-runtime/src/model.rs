@@ -848,6 +848,17 @@ pub(crate) enum SortedSetMemberState {
     Present(SortedSetScore),
 }
 
+/// Result of popping one canonical extreme from a sorted set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SortedSetPopState {
+    /// No sorted set exists under the key.
+    MissingSet,
+    /// The sorted set exists but has no members.
+    Empty,
+    /// The removed member and its score.
+    Popped(Vec<u8>, SortedSetScore),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SortedSetRankState {
     MissingSet,
@@ -1917,6 +1928,30 @@ impl StructureState {
             SortedSetMemberState::MissingMember,
             SortedSetMemberState::Present,
         )
+    }
+
+    /// Removes and returns the extreme `(score, member)` of the canonical
+    /// total order: lowest when `highest` is false, highest otherwise.
+    pub(crate) fn zpop_extreme(&mut self, key: &[u8], highest: bool) -> SortedSetPopState {
+        let Some(members) = self.sorted_sets.get_mut(key) else {
+            return SortedSetPopState::MissingSet;
+        };
+        let extreme = members
+            .iter()
+            .map(|(member, score)| (*score, member.clone()))
+            .reduce(|current, candidate| {
+                let keep_candidate = if highest {
+                    candidate > current
+                } else {
+                    candidate < current
+                };
+                if keep_candidate { candidate } else { current }
+            });
+        let Some((score, member)) = extreme else {
+            return SortedSetPopState::Empty;
+        };
+        members.remove(&member);
+        SortedSetPopState::Popped(member, score)
     }
 
     pub(crate) fn zcard(&self, key: &[u8]) -> Option<usize> {

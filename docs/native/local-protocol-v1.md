@@ -1,6 +1,19 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+Protocol minor 6 additionally admits structure-read request tag `21`
+(`KeyScanMatch`: keyspace object id, length-framed binary-glob pattern,
+optional `start_after` cursor behind one presence byte, and `u64`
+output/visit/match-step limits), structure-read result tag `13`
+(`KeyPage`: `u32`-counted entries of length-framed key plus one family
+byte, optional length-framed continuation behind one presence byte, one
+stop byte, and `u64` visited and match-step counters), structure-mutation
+tags `17` (`SortedSetIncrement`: structure key, binary64 delta bits,
+length-framed member) and `18` (`SortedSetPop`: structure key and one end
+byte `0` lowest / `1` highest), and structure-mutation result tags `6`
+(`Score`: binary64 bits) and `7` (`PoppedEntry`: one presence byte, then
+length-framed member and binary64 score bits when present).
+
 Protocol minor 6 admits three appended structure-read request tags —
 `18` (`SortedSetScoreRange`: structure key, two score endpoints each
 encoded as one tag byte `0` unbounded / `1` inclusive / `2` exclusive

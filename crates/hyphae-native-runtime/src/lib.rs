@@ -262,7 +262,7 @@ use hyphae_native_catalog::{
     ColumnCheckOperator, ColumnDefinition, DependencyDirection, DependencyEdge, DependencyKind,
     IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeader, QualifiedName,
     RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
+    SecondaryIndexDefinition, StructureKind, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{
     ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
@@ -326,9 +326,9 @@ use crate::{
     model::{
         CatalogState, HashPatternModelPage, HashPatternModelRequest, HashPatternModelStop, ListPop,
         ModelError, RelationState, SearchState, SecondaryIndexLayout, SortedSetDirection,
-        SortedSetMemberState, SortedSetRankState, SortedSetScore, StructureEntry, StructureState,
-        TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
-        sorted_set_score_range_is_empty,
+        SortedSetMemberState, SortedSetPopState, SortedSetRankState, SortedSetScore,
+        StructureEntry, StructureState, TtlValue, analyze, bm25_idf, bm25_term_score,
+        normalize_list_range, sorted_set_score_range_is_empty,
     },
     set_algebra::{SetAlgebraExecution, evaluate_materialized_set_algebra},
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
@@ -1663,6 +1663,115 @@ fn hash_field_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<HashFieldEntry> {
         .into_iter()
         .map(|(field, value)| HashFieldEntry::new(field, value))
         .collect()
+}
+
+/// One bounded glob page of visible top-level keys across families.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyScanPage {
+    /// Matched keys with their structure family, ascending by key bytes.
+    pub entries: Vec<(Vec<u8>, StructureKind)>,
+    /// Last physically visited key (exclusive) when the page stopped early.
+    pub continuation: Option<Vec<u8>>,
+    /// Why the page stopped.
+    pub stop: HashPatternScanStop,
+    /// Physical candidates visited.
+    pub visited: usize,
+    /// Matcher steps consumed.
+    pub match_steps: usize,
+}
+
+/// Exclusive upper bound of a literal binary prefix, `None` when unbounded.
+fn binary_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut upper = prefix.to_vec();
+    let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper[index] += 1;
+    upper.truncate(index + 1);
+    Some(upper)
+}
+
+/// Collects `(key, family, visible)` candidates across every structure
+/// family inside the bounded range, ascending by exact key bytes.
+fn key_scan_candidates(
+    structures: &StructureState,
+    logical_time_micros: i64,
+    start: &Bound<Vec<u8>>,
+    upper: Option<&[u8]>,
+) -> Vec<(Vec<u8>, StructureKind, bool)> {
+    let mut candidates: Vec<(Vec<u8>, StructureKind, bool)> = Vec::new();
+    for (key, entry) in &structures.entries {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        let visible = entry
+            .expires_at_micros
+            .is_none_or(|expiry| expiry > logical_time_micros);
+        candidates.push((key.clone(), StructureKind::String, visible));
+    }
+    for key in structures.hashes.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Hash,
+            structures.hash_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.sets.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Set,
+            structures.set_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.lists.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::List,
+            structures.list_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.sorted_sets.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::SortedSet,
+            structures.sorted_set_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.streams.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Stream,
+            structures.stream_is_visible(key, logical_time_micros),
+        ));
+    }
+    candidates.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+    candidates
+}
+
+/// Range membership under one start bound and optional exclusive upper.
+fn range_contains(start: &Bound<Vec<u8>>, upper: Option<&[u8]>, key: &[u8]) -> bool {
+    let after_start = match start {
+        Bound::Unbounded => true,
+        Bound::Included(bound) => key >= bound.as_slice(),
+        Bound::Excluded(bound) => key > bound.as_slice(),
+    };
+    after_start && upper.is_none_or(|bound| key < bound)
 }
 
 fn hash_pattern_scan_page(page: HashPatternModelPage, match_steps: usize) -> HashPatternScanPage {
@@ -3981,6 +4090,70 @@ impl NativeSnapshot {
             )?
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         Ok(hash_pattern_scan_page(page, budget.used()))
+    }
+
+    /// Scans one bounded binary-glob page of visible top-level keys across
+    /// every structure family in this snapshot, in ascending exact
+    /// key-byte order.
+    ///
+    /// The continuation is the last physically visited key (exclusive), so
+    /// progress is reported even when a page matches nothing. Logically
+    /// expired keys are skipped without charging the output limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for an exhausted matcher budget.
+    pub fn key_scan_match(
+        &self,
+        request: &HashPatternScanRequest,
+    ) -> Result<KeyScanPage, NativeRuntimeError> {
+        let prefix = request.compiled().leading_literal_prefix();
+        let upper = binary_prefix_upper_bound(prefix);
+        let start: Bound<Vec<u8>> = match request.start_after() {
+            Some(cursor) => Bound::Excluded(cursor.to_vec()),
+            None if prefix.is_empty() => Bound::Unbounded,
+            None => Bound::Included(prefix.to_vec()),
+        };
+        let candidates = key_scan_candidates(
+            &self.state.structures,
+            self.metadata.logical_time_micros,
+            &start,
+            upper.as_deref(),
+        );
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        let mut entries: Vec<(Vec<u8>, StructureKind)> = Vec::new();
+        let mut visited = 0_usize;
+        let mut last_visited: Option<Vec<u8>> = None;
+        let mut stop = HashPatternScanStop::Exhausted;
+        for (key, family, visible) in candidates {
+            if visited == request.visit_limit() {
+                stop = HashPatternScanStop::VisitLimit;
+                break;
+            }
+            visited += 1;
+            last_visited = Some(key.clone());
+            if !visible {
+                continue;
+            }
+            if request.compiled().matches(&key, &mut budget)? {
+                entries.push((key, family));
+                if entries.len() == request.output_limit() {
+                    stop = HashPatternScanStop::OutputLimit;
+                    break;
+                }
+            }
+        }
+        let continuation = match stop {
+            HashPatternScanStop::Exhausted => None,
+            _ => last_visited,
+        };
+        Ok(KeyScanPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps: budget.used(),
+        })
     }
 
     /// Tests exact membership in an existing native set in this snapshot.
@@ -23856,6 +24029,81 @@ impl NativeWriteBatch {
         });
         self.dirty[2] = true;
         Ok(true)
+    }
+
+    /// Adds a canonical binary64 delta to one member's score, treating a
+    /// missing member as `0.0`, and returns the new score.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family, a missing sorted set, or a
+    /// non-finite delta or resulting score.
+    pub fn zincrby(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        delta: f64,
+        member: impl Into<Vec<u8>>,
+    ) -> Result<f64, NativeRuntimeError> {
+        if !delta.is_finite() {
+            return Err(NativeRuntimeError::StructureScoreNotCanonical);
+        }
+        let key = key.into();
+        let member = member.into();
+        let current = self.zscore(&key, &member)?.unwrap_or(0.0);
+        let updated = current + delta;
+        if !updated.is_finite() {
+            return Err(NativeRuntimeError::StructureScoreNotCanonical);
+        }
+        self.zadd(key, updated, member)?;
+        Ok(updated)
+    }
+
+    /// Removes and returns the extreme `(member, score)` of the canonical
+    /// `(score, member-bytes)` total order: the lowest when `highest` is
+    /// false, the highest otherwise. An empty set returns `None` without
+    /// mutating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zpop(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        highest: bool,
+    ) -> Result<Option<(Vec<u8>, f64)>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let (member, score) = match self.state.structures.zpop_extreme(&key, highest) {
+            SortedSetPopState::MissingSet => {
+                return Err(NativeRuntimeError::UnknownStructureSortedSet);
+            }
+            SortedSetPopState::Empty => return Ok(None),
+            SortedSetPopState::Popped(member, score) => (member, score),
+        };
+        let identity = sorted_set_member_identity(&key, &member)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSetMember,
+            target: None,
+            key: identity,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(Some((member, score.value())))
     }
 
     /// Returns the current private exact sorted-set cardinality.

@@ -1206,8 +1206,19 @@ fn ensure_operation_minor(
         ProductOperation::StructureRead(
             ProductStructureReadRequest::SortedSetScoreRange { .. }
             | ProductStructureReadRequest::HashScanReverse { .. }
-            | ProductStructureReadRequest::HashScanMatch { .. },
+            | ProductStructureReadRequest::HashScanMatch { .. }
+            | ProductStructureReadRequest::KeyScanMatch { .. },
         ) => 6,
+        ProductOperation::StructureMutate { mutations }
+            if mutations.iter().any(structure_mutation_requires_minor_six) =>
+        {
+            6
+        }
+        ProductOperation::TransactionStageStructure { mutation, .. }
+            if structure_mutation_requires_minor_six(mutation) =>
+        {
+            6
+        }
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1254,7 +1265,15 @@ fn ensure_response_minor(
             values.max(fragments)
         }
         ProductResponse::StructureRead(read) => match &read.value {
-            ProductStructureReadResult::HashPage { .. } => 6,
+            ProductStructureReadResult::HashPage { .. }
+            | ProductStructureReadResult::KeyPage { .. } => 6,
+            _ => 0,
+        },
+        ProductResponse::TransactionStaged(receipt) => match &receipt.result {
+            ProductTransactionStageResult::Structure(
+                ProductStructureMutationResult::Score(_)
+                | ProductStructureMutationResult::PoppedEntry(_),
+            ) => 6,
             _ => 0,
         },
         _ => 0,
@@ -1264,6 +1283,14 @@ fn ensure_response_minor(
     } else {
         Ok(())
     }
+}
+
+fn structure_mutation_requires_minor_six(mutation: &ProductStructureMutation) -> bool {
+    matches!(
+        mutation,
+        ProductStructureMutation::SortedSetIncrement { .. }
+            | ProductStructureMutation::SortedSetPop { .. }
+    )
 }
 
 fn operation_requires_idempotency(operation: &ProductOperation) -> bool {
@@ -3631,6 +3658,17 @@ fn encode_structure_mutation(
             encode_structure_key(encoded, key)?;
             put_bytes(encoded, member)?;
         }
+        ProductStructureMutation::SortedSetIncrement { key, delta, member } => {
+            encoded.push(17);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&delta.bits().to_le_bytes());
+            put_bytes(encoded, member)?;
+        }
+        ProductStructureMutation::SortedSetPop { key, highest } => {
+            encoded.push(18);
+            encode_structure_key(encoded, key)?;
+            encoded.push(u8::from(*highest));
+        }
         ProductStructureMutation::StreamAdd { key, fields } => {
             encoded.push(16);
             encode_structure_key(encoded, key)?;
@@ -3734,6 +3772,30 @@ fn decode_structure_mutation(
             }
             ProductStructureMutation::StreamAdd { key, fields }
         }
+        tag @ (17 | 18) => decode_sorted_set_value_mutation(decoder, tag)?,
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes the minor-6 sorted-set mutations that return typed values.
+fn decode_sorted_set_value_mutation(
+    decoder: &mut Decoder<'_>,
+    tag: u8,
+) -> Result<ProductStructureMutation, ProductCodecError> {
+    Ok(match tag {
+        17 => ProductStructureMutation::SortedSetIncrement {
+            key: decode_structure_key(decoder)?,
+            delta: hyphae_native_product::CanonicalF64::new(f64::from_bits(decoder.u64()?)),
+            member: decoder.owned_bytes()?,
+        },
+        18 => ProductStructureMutation::SortedSetPop {
+            key: decode_structure_key(decoder)?,
+            highest: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProductCodecError::InvalidValue),
+            },
+        },
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -4222,6 +4284,25 @@ fn encode_structure_read_request(
             put_u64(encoded, *visit_limit)?;
             put_u64(encoded, *match_step_limit)?;
         }
+        ProductStructureReadRequest::KeyScanMatch {
+            keyspace,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => {
+            encoded.push(21);
+            encoded.extend_from_slice(&keyspace.get().to_le_bytes());
+            put_bytes(encoded, pattern)?;
+            encoded.push(u8::from(start_after.is_some()));
+            if let Some(cursor) = start_after {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *output_limit)?;
+            put_u64(encoded, *visit_limit)?;
+            put_u64(encoded, *match_step_limit)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4353,6 +4434,19 @@ fn decode_structure_read_request(
         },
         20 => ProductStructureReadRequest::HashScanMatch {
             key: decode_structure_key(decoder)?,
+            pattern: decoder.owned_bytes()?,
+            start_after: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            output_limit: decoder.usize()?,
+            visit_limit: decoder.usize()?,
+            match_step_limit: decoder.usize()?,
+        },
+        21 => ProductStructureReadRequest::KeyScanMatch {
+            keyspace: ObjectId::new(decoder.u128()?)
+                .map_err(|_| ProductCodecError::InvalidValue)?,
             pattern: decoder.owned_bytes()?,
             start_after: if decoder.boolean()? {
                 Some(decoder.owned_bytes()?)
@@ -4517,6 +4611,32 @@ fn encode_structure_read_result(
             put_u64(encoded, *visited)?;
             put_u64(encoded, *match_steps)?;
         }
+        ProductStructureReadResult::KeyPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => {
+            encoded.push(13);
+            put_u32(encoded, entries.len())?;
+            for entry in entries {
+                put_bytes(encoded, &entry.key)?;
+                encoded.push(entry.family as u8);
+            }
+            encoded.push(u8::from(continuation.is_some()));
+            if let Some(cursor) = continuation {
+                put_bytes(encoded, cursor)?;
+            }
+            encoded.push(match stop {
+                ProductHashScanStop::Exhausted => 0,
+                ProductHashScanStop::OutputLimit => 1,
+                ProductHashScanStop::VisitLimit => 2,
+                _ => return Err(ProductCodecError::Unsupported),
+            });
+            put_u64(encoded, *visited)?;
+            put_u64(encoded, *match_steps)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4619,7 +4739,39 @@ fn decode_structure_read_result(
                 match_steps: decoder.usize()?,
             }
         }
+        13 => decode_key_page(decoder)?,
         _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes one bounded cross-family key glob page (result tag 13).
+fn decode_key_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductStructureReadResult, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(hyphae_native_product::ProductKeyEntry {
+            key: decoder.owned_bytes()?,
+            family: decode_structure_kind(decoder.u8()?)?,
+        });
+    }
+    let continuation = decoder
+        .boolean()?
+        .then(|| decoder.owned_bytes())
+        .transpose()?;
+    let stop = match decoder.u8()? {
+        0 => ProductHashScanStop::Exhausted,
+        1 => ProductHashScanStop::OutputLimit,
+        2 => ProductHashScanStop::VisitLimit,
+        _ => return Err(ProductCodecError::InvalidValue),
+    };
+    Ok(ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        visited: decoder.usize()?,
+        match_steps: decoder.usize()?,
     })
 }
 
@@ -4829,6 +4981,18 @@ fn encode_structure_mutation_result(
             encoded.push(5);
             encoded.extend_from_slice(&value.to_le_bytes());
         }
+        ProductStructureMutationResult::Score(value) => {
+            encoded.push(6);
+            encoded.extend_from_slice(&value.bits().to_le_bytes());
+        }
+        ProductStructureMutationResult::PoppedEntry(entry) => {
+            encoded.push(7);
+            encoded.push(u8::from(entry.is_some()));
+            if let Some(entry) = entry {
+                put_bytes(encoded, &entry.member)?;
+                encoded.extend_from_slice(&entry.score.bits().to_le_bytes());
+            }
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4849,6 +5013,22 @@ fn decode_structure_mutation_result(
                 .transpose()?,
         )),
         5 => Ok(ProductStructureMutationResult::StreamId(decoder.u64()?)),
+        6 => Ok(ProductStructureMutationResult::Score(
+            hyphae_native_product::CanonicalF64::new(f64::from_bits(decoder.u64()?)),
+        )),
+        7 => Ok(ProductStructureMutationResult::PoppedEntry(
+            decoder
+                .boolean()?
+                .then(|| -> Result<_, ProductCodecError> {
+                    Ok(hyphae_native_product::ProductSortedSetEntry {
+                        member: decoder.owned_bytes()?,
+                        score: hyphae_native_product::CanonicalF64::new(f64::from_bits(
+                            decoder.u64()?,
+                        )),
+                    })
+                })
+                .transpose()?,
+        )),
         _ => Err(ProductCodecError::InvalidValue),
     }
 }

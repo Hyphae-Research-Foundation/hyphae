@@ -1280,11 +1280,31 @@ enum StructureMutationInput {
         key: String,
         member: String,
     },
+    SortedSetIncrement {
+        keyspace: JsonU128,
+        key: String,
+        member: String,
+        delta: f64,
+    },
+    SortedSetPop {
+        keyspace: JsonU128,
+        key: String,
+        #[serde(default)]
+        end: SortedSetEndInput,
+    },
     StreamAdd {
         keyspace: JsonU128,
         key: String,
         fields: BTreeMap<String, String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SortedSetEndInput {
+    #[default]
+    Lowest,
+    Highest,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1421,6 +1441,14 @@ enum StructureReadInput {
     HashScanMatch {
         keyspace: JsonU128,
         key: String,
+        pattern: String,
+        start_after: Option<String>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+    KeyScanMatch {
+        keyspace: JsonU128,
         pattern: String,
         start_after: Option<String>,
         output_limit: usize,
@@ -5485,7 +5513,50 @@ fn structure_read_json(result: ProductStructureReadResult) -> Value {
             "visited": visited,
             "match_steps": match_steps,
         }),
+        result @ ProductStructureReadResult::KeyPage { .. } => key_page_json(result),
         _ => json!({ "type": "unsupported" }),
+    }
+}
+
+fn key_page_json(result: ProductStructureReadResult) -> Value {
+    let ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        visited,
+        match_steps,
+    } = result
+    else {
+        return json!({ "type": "unsupported" });
+    };
+    json!({
+        "type": "key_page",
+        "entries": entries.into_iter().map(|entry| json!({
+            "key_hex": encode_hex(&entry.key),
+            "key": std::str::from_utf8(&entry.key).ok(),
+            "family": structure_family_name(entry.family),
+        })).collect::<Vec<_>>(),
+        "continuation_hex": continuation.map(|cursor| encode_hex(&cursor)),
+        "stop": match stop {
+            hyphae_native_product::ProductHashScanStop::Exhausted => "exhausted",
+            hyphae_native_product::ProductHashScanStop::OutputLimit => "output_limit",
+            hyphae_native_product::ProductHashScanStop::VisitLimit => "visit_limit",
+            _ => "unknown",
+        },
+        "visited": visited,
+        "match_steps": match_steps,
+    })
+}
+
+const fn structure_family_name(family: hyphae_native_product::StructureKind) -> &'static str {
+    match family {
+        hyphae_native_product::StructureKind::String => "string",
+        hyphae_native_product::StructureKind::Counter => "counter",
+        hyphae_native_product::StructureKind::Hash => "hash",
+        hyphae_native_product::StructureKind::List => "list",
+        hyphae_native_product::StructureKind::Set => "set",
+        hyphae_native_product::StructureKind::SortedSet => "sorted_set",
+        hyphae_native_product::StructureKind::Stream => "stream",
     }
 }
 
@@ -5571,6 +5642,18 @@ fn structure_mutation_result_json(result: ProductStructureMutationResult) -> Val
         ProductStructureMutationResult::StreamId(value) => {
             json!({ "type": "stream_id", "value": value })
         }
+        ProductStructureMutationResult::Score(value) => {
+            json!({ "type": "score", "value": value.get() })
+        }
+        ProductStructureMutationResult::PoppedEntry(entry) => json!({
+            "type": "popped_entry",
+            "found": entry.is_some(),
+            "member": entry
+                .as_ref()
+                .and_then(|entry| std::str::from_utf8(&entry.member).ok()),
+            "member_hex": entry.as_ref().map(|entry| encode_hex(&entry.member)),
+            "score": entry.map(|entry| entry.score.get()),
+        }),
         _ => json!({ "type": "unsupported" }),
     }
 }
@@ -5821,6 +5904,22 @@ fn structure_mutation(
             key: structure_key(keyspace, key)?,
             member: member.into_bytes(),
         },
+        StructureMutationInput::SortedSetIncrement {
+            keyspace,
+            key,
+            member,
+            delta,
+        } => ProductStructureMutation::SortedSetIncrement {
+            key: structure_key(keyspace, key)?,
+            member: member.into_bytes(),
+            delta: hyphae_native_product::CanonicalF64::new(delta),
+        },
+        StructureMutationInput::SortedSetPop { keyspace, key, end } => {
+            ProductStructureMutation::SortedSetPop {
+                key: structure_key(keyspace, key)?,
+                highest: matches!(end, SortedSetEndInput::Highest),
+            }
+        }
         StructureMutationInput::StreamAdd {
             keyspace,
             key,
@@ -6026,6 +6125,21 @@ fn structure_read(input: StructureReadInput) -> Result<ProductStructureReadReque
             match_step_limit,
         } => ProductStructureReadRequest::HashScanMatch {
             key: structure_key(keyspace, key)?,
+            pattern: pattern.into_bytes(),
+            start_after: start_after.map(String::into_bytes),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        },
+        StructureReadInput::KeyScanMatch {
+            keyspace,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => ProductStructureReadRequest::KeyScanMatch {
+            keyspace: object_id(keyspace.0)?,
             pattern: pattern.into_bytes(),
             start_after: start_after.map(String::into_bytes),
             output_limit,

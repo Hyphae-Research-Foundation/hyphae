@@ -101,6 +101,18 @@ pub enum ProductStructureMutation {
         member: Vec<u8>,
         score: CanonicalF64,
     },
+    /// Add a canonical delta to one member's score (minor 6).
+    SortedSetIncrement {
+        key: ProductStructureKey,
+        member: Vec<u8>,
+        delta: CanonicalF64,
+    },
+    /// Remove and return the lowest/highest member (minor 6).
+    SortedSetPop {
+        key: ProductStructureKey,
+        /// False pops the lowest `(score, member)`; true the highest.
+        highest: bool,
+    },
     /// Remove one exact sorted-set member.
     SortedSetRemove {
         key: ProductStructureKey,
@@ -224,6 +236,16 @@ pub enum ProductStructureReadRequest {
         visit_limit: usize,
         match_step_limit: usize,
     },
+    /// Scan one bounded binary-glob page of visible top-level keys across
+    /// every structure family of one keyspace (minor 6).
+    KeyScanMatch {
+        keyspace: ObjectId,
+        pattern: Vec<u8>,
+        start_after: Option<Vec<u8>>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
 }
 
 /// One canonical sorted-set score endpoint.
@@ -272,6 +294,19 @@ pub enum ProductStructureReadResult {
     SortedSetEntries(Vec<ProductSortedSetEntry>),
     /// Stream entries in ascending ID order.
     StreamEntries(Vec<ProductStreamEntry>),
+    /// One bounded key glob-scan page across families (minor 6).
+    KeyPage {
+        /// Matched keys with their family, ascending by key bytes.
+        entries: Vec<ProductKeyEntry>,
+        /// Exclusive physical continuation when more candidates remain.
+        continuation: Option<Vec<u8>>,
+        /// Why the page stopped.
+        stop: ProductHashScanStop,
+        /// Physical candidates visited.
+        visited: usize,
+        /// Matcher steps consumed.
+        match_steps: usize,
+    },
     /// One bounded glob-scan page with physical progress (minor 6).
     HashPage {
         /// Matched fields in ascending exact-byte order.
@@ -316,6 +351,19 @@ pub enum ProductStructureMutationResult {
     Value(Option<Vec<u8>>),
     /// Stable appended stream identity.
     StreamId(u64),
+    /// New canonical sorted-set score (minor 6).
+    Score(CanonicalF64),
+    /// Optional popped sorted-set member and score (minor 6).
+    PoppedEntry(Option<ProductSortedSetEntry>),
+}
+
+/// One scanned key with its structure family.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductKeyEntry {
+    /// Exact binary key.
+    pub key: Vec<u8>,
+    /// Structure family owning the key.
+    pub family: StructureKind,
 }
 
 /// Side selected by one list push or pop.

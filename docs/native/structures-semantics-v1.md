@@ -750,6 +750,36 @@ class; they are not evicted. Cache objects may choose no-eviction, LRU, LFU,
 TTL-priority, random, or size policy. Every eviction is a committed tombstone
 or an explicitly non-durable memory-class event recorded in telemetry.
 
+## Keyspace key scan
+
+`KEY_SCAN_MATCH(pattern, start_after?, output_limit, visit_limit,
+match_step_limit)` scans visible top-level keys across every structure
+family of one keyspace in ascending exact key-byte order, filtered by the
+same bounded binary glob as `HSCAN_MATCH` (identical pattern grammar,
+bounds, and match-step budget). Each returned entry is the key plus its
+structure family. The continuation is the last physically visited key
+(exclusive), so progress is reported even when a page matches nothing;
+the stop reason is `exhausted`, `output_limit`, or `visit_limit`. A key
+counts one visit regardless of family, logically expired keys are skipped
+without charging the output limit, and a leading literal pattern prefix
+prunes the visited range per family. Keys in the reserved internal
+namespace are never visited.
+
+## Sorted-set increment and pop
+
+`ZINCRBY(key, delta, member)` adds a canonical binary64 delta to one
+member's score, treating a missing member as score `0.0` before the
+addition, and returns the new score. A non-finite delta or a non-finite
+resulting score is rejected without mutating. The member's rank moves
+under the ordinary score/member total order.
+
+`ZPOPMIN(key)` / `ZPOPMAX(key)` remove and return the member with the
+lowest / highest `(score, member-bytes)` position — the deterministic
+first and last of the canonical total order, with exact member bytes as
+the tie-breaker. Popping from a missing or empty sorted set returns an
+absent result without mutating. Both forms return the removed member and
+its score.
+
 ## Product read surface
 
 The typed product structure read (`StructureRead`) exposes, in addition to
@@ -773,6 +803,20 @@ already-contracted runtime operations above (native protocol minor 6):
   physical continuation cursor (progress even when a page matches
   nothing), the stop reason (`exhausted`, `output_limit`, `visit_limit`),
   and the visited/match-step counters.
+- `KeyScanMatch`: `KEY_SCAN_MATCH` above, with the same glob grammar and
+  bounds as `HashScanMatch`. The result is the new `KeyPage`: matched
+  keys with their structure family in ascending key-byte order, the
+  optional physical continuation, the stop reason, and the
+  visited/match-step counters.
+
+The typed product structure mutation additionally admits (minor 6):
+
+- `SortedSetIncrement`: `ZINCRBY` above; the result is the new canonical
+  score (`Score`). Non-finite deltas or results are rejected as invalid
+  without staging a mutation.
+- `SortedSetPop`: `ZPOPMIN`/`ZPOPMAX` above behind an explicit end
+  selector; the result is the optional popped `(member, score)` pair
+  (`PoppedEntry`).
 
 All three inherit the `structure.read` registry entry (`data.read`,
 request-object scope) and every transport bound of the existing read

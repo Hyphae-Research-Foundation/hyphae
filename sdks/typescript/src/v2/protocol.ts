@@ -1089,6 +1089,8 @@ function decodeStructureMutationResult(reader: Reader): Readonly<Record<string, 
   if (tag === 3) return { kind: "count", value: reader.u64() };
   if (tag === 4) return { kind: "value", value: reader.boolean() ? reader.bytes() : undefined };
   if (tag === 5) return { kind: "stream_id", value: reader.u64() };
+  if (tag === 6) return { kind: "score", value: reader.f64() };
+  if (tag === 7) return { kind: "popped_entry", entry: reader.boolean() ? { member: reader.bytes(), score: reader.f64() } : undefined };
   throw new ClientError("structure mutation result is malformed");
 }
 
@@ -1738,6 +1740,8 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
     sorted_set_add: 14,
     sorted_set_remove: 15,
     stream_add: 16,
+    sorted_set_increment: 17,
+    sorted_set_pop: 18,
   };
   const originalKind = String(value.kind);
   const [kind, implied] = aliases[originalKind] ?? [originalKind, undefined];
@@ -1760,6 +1764,8 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
   else if (kind === "list_pop") parts.push(Uint8Array.of(listSideTag(value.side)));
   else if (kind === "set_add" || kind === "set_remove" || kind === "sorted_set_remove") parts.push(bytes(requireBytes(value.member)));
   else if (kind === "sorted_set_add") parts.push(f64(Number(value.score)), bytes(requireBytes(value.member)));
+  else if (kind === "sorted_set_increment") parts.push(f64(Number(value.delta)), bytes(requireBytes(value.member)));
+  else if (kind === "sorted_set_pop") parts.push(Uint8Array.of(sortedSetEndTag(value.end ?? "lowest")));
   else if (kind === "stream_add") {
     const fields = value.fields;
     if (!Array.isArray(fields) || fields.length === 0 || fields.length > 4096) throw new ClientError("stream fields must be a nonempty bounded array");
@@ -1776,6 +1782,12 @@ function structureFamilyTag(raw: unknown): number {
   const tag = families[String(raw)];
   if (tag === undefined) throw new ClientError("structure family is invalid");
   return tag;
+}
+
+function sortedSetEndTag(raw: unknown): number {
+  if (raw === "lowest") return 0;
+  if (raw === "highest") return 1;
+  throw new ClientError("sorted-set pop end is invalid");
 }
 
 function listSideTag(raw: unknown): number {
@@ -1822,6 +1834,7 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     set_members: 10, set_cardinality: 11, set_algebra: 12, sorted_set_score: 13,
     sorted_set_rank: 14, sorted_set_range: 15, sorted_set_cardinality: 16, stream_range: 17,
     sorted_set_score_range: 18, hash_scan_reverse: 19, hash_scan_match: 20,
+    key_scan_match: 21,
   };
   const kind = String(value.kind);
   const tag = tags[kind];
@@ -1835,6 +1848,18 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     return join(Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), Uint8Array.of(operation),
       u32(keys.length), ...keys.map((key) => bytes(requireBytes(key))),
       u64(BigInt(value.output_member_limit as number)), u64(BigInt(value.visit_limit as number)));
+  }
+  if (kind === "key_scan_match") {
+    const parts = [Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), bytes(requireBytes(value.pattern))];
+    const cursor = value.start_after;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(
+      u64(BigInt(value.output_limit as number)),
+      u64(BigInt(value.visit_limit as number)),
+      u64(BigInt(value.match_step_limit as number)),
+    );
+    return join(...parts);
   }
   const parts = [Uint8Array.of(tag), encodeStructureKey(value.key)];
   if (kind === "ttl") parts.push(Uint8Array.of(structureFamilyTag(value.family)));
@@ -1933,6 +1958,19 @@ function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> 
     const stop = ["exhausted", "output_limit", "visit_limit"][reader.u8()];
     if (stop === undefined) throw new ClientError("hash page stop reason is invalid");
     return { kind: "hash_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
+  }
+  if (tag === 13) {
+    const families: readonly string[] = ["", "string", "counter", "hash", "list", "set", "sorted_set", "stream"];
+    const entries = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 5, "key entry") }, () => {
+      const key = reader.bytes();
+      const family = families[reader.u8()];
+      if (family === undefined || family === "") throw new ClientError("key page family is invalid");
+      return { key, family };
+    });
+    const continuation = reader.boolean() ? reader.bytes() : undefined;
+    const stop = ["exhausted", "output_limit", "visit_limit"][reader.u8()];
+    if (stop === undefined) throw new ClientError("key page stop reason is invalid");
+    return { kind: "key_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
   }
   throw new ClientError("structure read response is invalid");
 }
