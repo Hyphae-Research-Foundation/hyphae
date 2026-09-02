@@ -461,7 +461,7 @@ impl NativeLexicalReadView {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
         }
-        let hits = rank_match_hits(scores, self.inner.state.limit);
+        let hits = rank_match_hits(scores.into_iter().collect(), self.inner.state.limit);
         let execution_sequence = self
             .inner
             .sequence
@@ -617,7 +617,10 @@ impl NativeFilteredLexicalReadView {
                 );
             }
         }
-        let hits = rank_match_hits(scores, self.inner.lexical.inner.state.limit);
+        let hits = rank_match_hits(
+            scores.into_iter().collect(),
+            self.inner.lexical.inner.state.limit,
+        );
         if cancellation.is_some_and(crate::GovernorCancellation::is_cancelled) {
             return Err(NativeRuntimeError::ResourceQueue(
                 crate::GovernorQueueError::Cancelled,

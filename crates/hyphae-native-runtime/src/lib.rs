@@ -16394,7 +16394,7 @@ impl NativeDatabase {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
         }
-        Ok(rank_match_hits(scores, limit))
+        Ok(rank_match_hits(scores.into_iter().collect(), limit))
     }
 
     fn plan_lexical_term_segments(
@@ -30804,19 +30804,26 @@ fn search_count_f64(value: u64) -> Result<f64, NativeRuntimeError> {
         .map_err(|_| NativeRuntimeError::InvalidSearchTree)
 }
 
-fn rank_match_hits(scores: BTreeMap<Vec<u8>, f64>, limit: usize) -> Vec<MatchHit> {
+fn rank_match_hits(scores: Vec<(Vec<u8>, f64)>, limit: usize) -> Vec<MatchHit> {
     let mut hits = scores
         .into_iter()
         .filter(|(_, score)| *score > 0.0)
         .map(|(document_id, score)| MatchHit { document_id, score })
         .collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
+    let order = |left: &MatchHit, right: &MatchHit| {
         right
             .score
             .total_cmp(&left.score)
             .then_with(|| left.document_id.cmp(&right.document_id))
-    });
-    hits.truncate(limit);
+    };
+    // The comparator is a total order (total_cmp then unique ids), so
+    // partitioning the top `limit` and sorting only that prefix yields
+    // exactly the ranking a full sort would, in O(n + k log k).
+    if limit < hits.len() {
+        hits.select_nth_unstable_by(limit, order);
+        hits.truncate(limit);
+    }
+    hits.sort_by(order);
     hits
 }
 
@@ -30978,7 +30985,7 @@ fn finalize_lexical_batches(
     limit: usize,
 ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
     let mut live_postings = vec![0_u64; expected_document_frequencies.len()];
-    let mut scores = BTreeMap::<Vec<u8>, f64>::new();
+    let mut contributions = Vec::new();
     let mut previous_term = None;
     for batch in batches {
         if batch.term_index >= live_postings.len()
@@ -30990,12 +30997,22 @@ fn finalize_lexical_batches(
         live_postings[batch.term_index] = live_postings[batch.term_index]
             .checked_add(batch.live_postings)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        for (document_id, score) in batch.contributions {
-            *scores.entry(document_id).or_default() += score;
-        }
+        contributions.extend(batch.contributions);
     }
     if live_postings != expected_document_frequencies {
         return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    // Sort once by document id and fold adjacent contributions. Batches
+    // are ordered by term then document id, so the stable sort keeps
+    // each document's per-term additions in term order — bit-identical
+    // to the previous BTreeMap accumulation, without 37k tree inserts.
+    contributions.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut scores = Vec::<(Vec<u8>, f64)>::with_capacity(contributions.len());
+    for (document_id, score) in contributions {
+        match scores.last_mut() {
+            Some((last_id, total)) if *last_id == document_id => *total += score,
+            _ => scores.push((document_id, score)),
+        }
     }
     Ok(rank_match_hits(scores, limit))
 }

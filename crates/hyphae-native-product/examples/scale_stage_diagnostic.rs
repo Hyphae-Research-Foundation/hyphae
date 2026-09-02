@@ -13,9 +13,9 @@
 //!
 //! | stage                  | baseline    | dense prescan | HYPOST02 corpus |
 //! |------------------------|-------------|---------------|-----------------|
-//! | durable posting scorer | ~260 ms     | ~140 ms       | ~65 ms          |
-//! | complete integrated    | ~200 ms     | ~165 ms       | ~88 ms          |
-//! | integrated + Eq filter | ~230 ms     | ~180 ms       | ~96 ms          |
+//! | durable posting scorer | ~260 ms     | ~140 ms       | ~47 ms          |
+//! | complete integrated    | ~200 ms     | ~165 ms       | ~71 ms          |
+//! | integrated + Eq filter | ~230 ms     | ~180 ms       | ~80 ms          |
 //! | integrated sparse      | —           | ~16 ms        | ~17 ms          |
 //! | retained-model scorer  | ~245,000 ms | (fail-open path only)         |
 //!
@@ -24,8 +24,10 @@
 //! dominated the baseline is gone: self-describing postings carry it,
 //! and legacy roots resolve it once per query through a lazily built
 //! header map that dense queries pay only when they actually meet a
-//! HYPOST01 posting. Remaining cost splits between term planning,
-//! segment decoding, and the BTreeMap score merge in finalize.
+//! HYPOST01 posting. The finalize stage merges contributions with one
+//! sort-and-fold plus a top-k partition instead of a `BTreeMap`
+//! accumulation and full sort. Remaining cost splits between term
+//! planning and segment decoding.
 
 use std::time::Instant;
 
