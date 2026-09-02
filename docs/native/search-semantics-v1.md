@@ -58,7 +58,7 @@ in one immutable copy-on-write native B+tree. It stores:
 | `0x01` | collection `ObjectId` | `HYIDX001` document count and total analyzed terms |
 | `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
 | `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
-| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01` or v2 `HYPOSTT1` tombstone |
+| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01`/`HYPOST02` or v2 `HYPOSTT1` tombstone |
 | `0x05` | vector-index `ObjectId` | legacy `HYANNM01` or current `HYANNM02` selected base-plus-delta metadata |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |

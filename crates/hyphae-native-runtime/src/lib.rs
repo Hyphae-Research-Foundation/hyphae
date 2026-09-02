@@ -536,6 +536,9 @@ const SEARCH_POSTING_MAGIC: &[u8; 8] = b"HYPOST01";
 const SEARCH_DOCUMENT_TOMBSTONE: &[u8; 8] = b"HYDOCT01";
 const SEARCH_TERM_META_TOMBSTONE: &[u8; 8] = b"HYTERMT1";
 const SEARCH_POSTING_TOMBSTONE: &[u8; 8] = b"HYPOSTT1";
+/// Self-describing posting: term frequency plus the owning document's
+/// analyzed token count, so scoring needs no document-header side lookup.
+const SEARCH_POSTING_MAGIC_V2: &[u8; 8] = b"HYPOST02";
 const ANN_CREATION_MAGIC: &[u8; 8] = b"HYANNCF1";
 type PhysicalStructureEntries = Vec<(Vec<u8>, Vec<u8>)>;
 const SEARCH_INDEX_META_SIZE: usize = 24;
@@ -16367,7 +16370,9 @@ impl NativeDatabase {
                 live_postings = live_postings
                     .checked_add(1)
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                let document_length = if let Some(length) = document_lengths.get(&document_id) {
+                let document_length = if let Some(length) = term_frequency.document_length {
+                    u64::from(length)
+                } else if let Some(length) = document_lengths.get(&document_id) {
                     *length
                 } else {
                     let document = tree
@@ -16386,7 +16391,7 @@ impl NativeDatabase {
                 };
                 *scores.entry(document_id).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     parameters,
@@ -30715,19 +30720,31 @@ fn decode_live_search_term_metadata(
     Ok(Some(document_frequency))
 }
 
-fn encode_search_posting(term_frequency: u32) -> Vec<u8> {
+/// One decoded live posting: term frequency plus the carried document
+/// token count when the posting is self-describing (`HYPOST02`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedPosting {
+    term_frequency: u32,
+    document_length: Option<u32>,
+}
+
+/// Encodes a self-describing `HYPOST02` posting.
+fn encode_search_posting(term_frequency: u32, document_length: u64) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(SEARCH_POSTING_SIZE);
-    encoded.extend_from_slice(SEARCH_POSTING_MAGIC);
+    encoded.extend_from_slice(SEARCH_POSTING_MAGIC_V2);
     encoded.extend_from_slice(&term_frequency.to_le_bytes());
-    encoded.extend_from_slice(&[0; 4]);
+    // Token counts above u32 are impossible under the key and text bounds;
+    // saturate defensively so the encoding never panics.
+    encoded.extend_from_slice(
+        &u32::try_from(document_length)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     encoded
 }
 
-fn decode_search_posting(encoded: &[u8]) -> Result<u32, NativeRuntimeError> {
-    if encoded.len() != SEARCH_POSTING_SIZE
-        || encoded.get(..8) != Some(SEARCH_POSTING_MAGIC.as_slice())
-        || encoded[12..16].iter().any(|byte| *byte != 0)
-    {
+fn decode_search_posting(encoded: &[u8]) -> Result<DecodedPosting, NativeRuntimeError> {
+    if encoded.len() != SEARCH_POSTING_SIZE {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
     let mut term_frequency = [0_u8; 4];
@@ -30736,7 +30753,30 @@ fn decode_search_posting(encoded: &[u8]) -> Result<u32, NativeRuntimeError> {
     if term_frequency == 0 {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
-    Ok(term_frequency)
+    let mut tail = [0_u8; 4];
+    tail.copy_from_slice(&encoded[12..16]);
+    match &encoded[..8] {
+        magic if magic == SEARCH_POSTING_MAGIC => {
+            if tail != [0; 4] {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Ok(DecodedPosting {
+                term_frequency,
+                document_length: None,
+            })
+        }
+        magic if magic == SEARCH_POSTING_MAGIC_V2 => {
+            let document_length = u32::from_le_bytes(tail);
+            if document_length == 0 || document_length < term_frequency {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Ok(DecodedPosting {
+                term_frequency,
+                document_length: Some(document_length),
+            })
+        }
+        _ => Err(NativeRuntimeError::InvalidSearchTree),
+    }
 }
 
 fn is_search_posting_tombstone(encoded: &[u8]) -> bool {
@@ -30746,7 +30786,7 @@ fn is_search_posting_tombstone(encoded: &[u8]) -> bool {
 fn decode_live_search_posting(
     encoded: &[u8],
     format: PhysicalSearchFormat,
-) -> Result<Option<u32>, NativeRuntimeError> {
+) -> Result<Option<DecodedPosting>, NativeRuntimeError> {
     if is_search_posting_tombstone(encoded) {
         return if format.admits_tombstones() {
             Ok(None)
@@ -30858,7 +30898,9 @@ fn decode_lexical_segment(
         // Dense queries pre-scan every live document header once; a
         // posting for an id absent from that complete map is corruption.
         // Sparse queries keep the direct per-posting descent.
-        let document_length = if let Some(lengths) = document_lengths {
+        let document_length = if let Some(length) = term_frequency.document_length {
+            f64::from(length)
+        } else if let Some(lengths) = document_lengths {
             *lengths
                 .get(document_id)
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?
@@ -30876,7 +30918,7 @@ fn decode_lexical_segment(
             document_id.to_vec(),
             bm25_term_score(
                 work.idf,
-                f64::from(term_frequency),
+                f64::from(term_frequency.term_frequency),
                 document_length,
                 average_length,
                 parameters,
@@ -33341,7 +33383,10 @@ fn index_documents_batch_in_search_tree(
             }
             term_frequencies.insert(term_key.clone(), document_frequency);
             entries.insert(term_key, encode_search_term_metadata(document_frequency));
-            entries.insert(posting_key, encode_search_posting(term_frequency));
+            entries.insert(
+                posting_key,
+                encode_search_posting(term_frequency, token_count),
+            );
         }
         let (document_count, total_document_terms) = index_metadata
             .get_mut(&index)
@@ -33410,7 +33455,10 @@ fn index_document_in_search_tree(
             return Err(NativeRuntimeError::InvalidSearchTree);
         }
         entries.insert(term_key, encode_search_term_metadata(document_frequency));
-        entries.insert(posting_key, encode_search_posting(term_frequency));
+        entries.insert(
+            posting_key,
+            encode_search_posting(term_frequency, token_count),
+        );
     }
     entries.insert(
         metadata_key,
@@ -33496,6 +33544,7 @@ fn lifecycle_document_in_search_tree(
         format,
         index,
         &mutation.key,
+        new_token_count,
         (&old_frequencies, &new_frequencies),
         &mut entries,
     )?;
@@ -33504,12 +33553,14 @@ fn lifecycle_document_in_search_tree(
         .tree)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_search_lifecycle_term_entries(
     pages: &PageStore,
     tree: BTree,
     format: PhysicalSearchFormat,
     index: ObjectId,
     document_id: &[u8],
+    new_token_count: u64,
     frequencies: (&SearchTermFrequencies, &SearchTermFrequencies),
     entries: &mut BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> Result<(), NativeRuntimeError> {
@@ -33533,13 +33584,14 @@ fn append_search_lifecycle_term_entries(
             .get(pages, &posting_key)?
             .map(|encoded| decode_live_search_posting(&encoded, format))
             .transpose()?
-            .flatten();
+            .flatten()
+            .map(|posting| posting.term_frequency);
         let next_document_frequency = match (old_frequency, new_frequency) {
             (Some(old), Some(new)) => {
                 if current_term_frequency != Some(old) {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
-                entries.insert(posting_key, encode_search_posting(new));
+                entries.insert(posting_key, encode_search_posting(new, new_token_count));
                 current_document_frequency.ok_or(NativeRuntimeError::InvalidSearchTree)?
             }
             (Some(old), None) => {
@@ -33556,7 +33608,7 @@ fn append_search_lifecycle_term_entries(
                 if current_term_frequency.is_some() {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
-                entries.insert(posting_key, encode_search_posting(new));
+                entries.insert(posting_key, encode_search_posting(new, new_token_count));
                 current_document_frequency
                     .unwrap_or(0)
                     .checked_add(1)
@@ -37075,6 +37127,8 @@ fn load_search_state_root(
     let mut index_metadata = BTreeMap::<ObjectId, (u64, u64)>::new();
     let mut term_metadata = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
     let mut postings = BTreeMap::<(ObjectId, Vec<u8>, Vec<u8>), u32>::new();
+    let mut document_token_counts = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
+    let mut carried_lengths = Vec::<((ObjectId, Vec<u8>), u32)>::new();
     for (key, value) in iterator {
         match key.first().copied() {
             Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
@@ -37095,7 +37149,8 @@ fn load_search_state_root(
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?;
                 validate_search_document_identity(document_id, "")
                     .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-                let Some((text, _)) = decode_live_search_document(&value, blobs, format)? else {
+                let Some((text, token_count)) = decode_live_search_document(&value, blobs, format)?
+                else {
                     continue;
                 };
                 validate_search_document_identity(document_id, &text)
@@ -37103,6 +37158,7 @@ fn load_search_state_root(
                 if documents.insert(document_id.to_vec(), text).is_some() {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
+                document_token_counts.insert((index, document_id.to_vec()), token_count);
             }
             Some(SEARCH_TERM_META_PREFIX) => {
                 let (index, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
@@ -37121,32 +37177,74 @@ fn load_search_state_root(
                 }
             }
             Some(SEARCH_POSTING_PREFIX) => {
-                let (index, term, document_id) = decode_search_posting_key(&key)?;
-                if !indexes.contains_key(&index)
-                    || !is_canonical_search_term(term)
-                    || validate_search_document_identity(document_id, "").is_err()
-                {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-                let Some(term_frequency) = decode_live_search_posting(&value, format)? else {
-                    continue;
-                };
-                if !indexes
-                    .get(&index)
-                    .is_some_and(|documents| documents.contains_key(document_id))
-                    || postings
-                        .insert((index, term.to_vec(), document_id.to_vec()), term_frequency)
-                        .is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
+                load_search_posting_entry(
+                    &key,
+                    &value,
+                    format,
+                    &indexes,
+                    &mut postings,
+                    &mut carried_lengths,
+                )?;
             }
             _ if ann_store::is_ann_physical_key(&key) => {}
             _ => return Err(NativeRuntimeError::InvalidSearchTree),
         }
     }
+    validate_carried_posting_lengths(&document_token_counts, &carried_lengths)?;
     validate_search_projection(&indexes, &index_metadata, &term_metadata, &postings)?;
     Ok(SearchState { indexes })
+}
+
+/// Loads one live posting entry into the projection, recording any
+/// carried document length for the cross-check against document headers.
+fn load_search_posting_entry(
+    key: &[u8],
+    value: &[u8],
+    format: PhysicalSearchFormat,
+    indexes: &BTreeMap<ObjectId, BTreeMap<Vec<u8>, String>>,
+    postings: &mut BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), u32>,
+    carried_lengths: &mut Vec<((ObjectId, Vec<u8>), u32)>,
+) -> Result<(), NativeRuntimeError> {
+    let (index, term, document_id) = decode_search_posting_key(key)?;
+    if !indexes.contains_key(&index)
+        || !is_canonical_search_term(term)
+        || validate_search_document_identity(document_id, "").is_err()
+    {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    let Some(posting) = decode_live_search_posting(value, format)? else {
+        return Ok(());
+    };
+    if !indexes
+        .get(&index)
+        .is_some_and(|documents| documents.contains_key(document_id))
+        || postings
+            .insert(
+                (index, term.to_vec(), document_id.to_vec()),
+                posting.term_frequency,
+            )
+            .is_some()
+    {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    if let Some(length) = posting.document_length {
+        carried_lengths.push(((index, document_id.to_vec()), length));
+    }
+    Ok(())
+}
+
+/// A self-describing posting must carry exactly its document's header
+/// token count; any drift is corruption, never a silent rescore.
+fn validate_carried_posting_lengths(
+    document_token_counts: &BTreeMap<(ObjectId, Vec<u8>), u64>,
+    carried_lengths: &[((ObjectId, Vec<u8>), u32)],
+) -> Result<(), NativeRuntimeError> {
+    for (document, length) in carried_lengths {
+        if document_token_counts.get(document) != Some(&u64::from(*length)) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+    }
+    Ok(())
 }
 
 fn validate_search_projection(
@@ -37676,6 +37774,46 @@ mod tests {
         super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
         super::FAIL_FULL_STATE_LOAD.set(false);
         result
+    }
+
+    #[test]
+    fn posting_codec_writes_self_describing_v2_and_reads_legacy_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // New postings carry the document length and decode both fields.
+        let encoded = super::encode_search_posting(3, 17);
+        assert_eq!(encoded.len(), super::SEARCH_POSTING_SIZE);
+        assert_eq!(&encoded[..8], super::SEARCH_POSTING_MAGIC_V2);
+        let decoded = super::decode_search_posting(&encoded)?;
+        assert_eq!(decoded.term_frequency, 3);
+        assert_eq!(decoded.document_length, Some(17));
+
+        // Legacy v1 postings (zero reserved tail) still decode without a
+        // carried length, so historical roots stay readable.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(super::SEARCH_POSTING_MAGIC);
+        legacy.extend_from_slice(&3_u32.to_le_bytes());
+        legacy.extend_from_slice(&[0; 4]);
+        let decoded = super::decode_search_posting(&legacy)?;
+        assert_eq!(decoded.term_frequency, 3);
+        assert_eq!(decoded.document_length, None);
+
+        // A v1 posting with a nonzero reserved tail is malformed.
+        legacy[12] = 1;
+        assert!(super::decode_search_posting(&legacy).is_err());
+        // A v2 posting whose length is zero or below its term frequency is
+        // malformed: a document cannot contain a term more often than it
+        // has tokens.
+        let zero_length = super::encode_search_posting(3, 0);
+        assert!(super::decode_search_posting(&zero_length).is_err());
+        let short_length = super::encode_search_posting(5, 4);
+        assert!(super::decode_search_posting(&short_length).is_err());
+        // Zero term frequency and unknown magics are malformed.
+        let zero_frequency = super::encode_search_posting(0, 4);
+        assert!(super::decode_search_posting(&zero_frequency).is_err());
+        let mut unknown = super::encode_search_posting(3, 17);
+        unknown[7] = b'9';
+        assert!(super::decode_search_posting(&unknown).is_err());
+        Ok(())
     }
 
     #[test]

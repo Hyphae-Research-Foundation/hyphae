@@ -53,7 +53,7 @@ The planner retains byte-for-byte:
 
 - the exact `HYSEABT2` format marker;
 - collection metadata;
-- every live `HYDOCS01`, `HYTERM01`, and `HYPOST01` value;
+- every live `HYDOCS01`, `HYTERM01`, `HYPOST01`, and `HYPOST02` value;
 - ANN generation metadata, vectors, and graph neighbors under prefixes
   `0x05` through `0x07`; and
 - every future entry only after a later format contract explicitly classifies

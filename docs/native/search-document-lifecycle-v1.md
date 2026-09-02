@@ -66,7 +66,19 @@ encodings:
 
 - document `HYDOCS01`;
 - term metadata `HYTERM01`; and
-- posting `HYPOST01`.
+- posting `HYPOST01` or `HYPOST02`.
+
+`HYPOST02` is the self-describing posting: the same 16-byte layout as
+`HYPOST01` (8-byte magic, u32 little-endian term frequency) with the
+formerly reserved trailing 4 bytes carrying the owning document's
+analyzed token count as u32 little-endian. New live postings are
+written as `HYPOST02`; existing `HYPOST01` postings stay valid and
+readable — a scorer reading `HYPOST01` resolves the document length
+through the document header, and a scorer reading `HYPOST02` uses the
+carried length without any side lookup. The carried length must equal
+the header token count of the document written in the same publication;
+replacing a document rewrites all of its postings, so a live posting can
+never carry a stale length. A zero carried length is malformed.
 
 `HYSEABT2` additionally admits these exact tombstone values:
 

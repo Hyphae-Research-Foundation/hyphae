@@ -445,7 +445,7 @@ impl NativeLexicalReadView {
                     decode_search_document_header(&posting.encoded_document_header)?;
                 *scores.entry(posting.document_id.clone()).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     crate::model::Bm25ScoreParameters::default(),
@@ -610,7 +610,7 @@ impl NativeFilteredLexicalReadView {
                     decode_search_document_header(&posting.encoded_document_header)?;
                 *scores.entry(posting.document_id.clone()).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     crate::model::Bm25ScoreParameters::default(),
