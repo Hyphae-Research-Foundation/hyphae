@@ -9,25 +9,23 @@
 //! Usage: `cargo run --release -p hyphae-native-product \
 //!   --example scale_stage_diagnostic -- <data-dir>`
 //!
-//! First receipt at the 100k rung (c-16 devbox, release):
+//! Receipts at the 100k rung (c-16 devbox, release):
 //!
-//! | stage                  | before      | after dense prescan |
-//! |------------------------|-------------|---------------------|
-//! | durable posting scorer | ~260 ms     | ~140 ms             |
-//! | retained-model scorer  | ~245,000 ms | (unchanged, fail-open only) |
-//! | complete integrated    | ~200 ms     | ~165 ms             |
-//! | integrated + Eq filter | ~230 ms     | ~180 ms             |
-//! | integrated sparse (2 rare terms) | — | ~16 ms            |
+//! | stage                  | baseline    | dense prescan | HYPOST02 corpus |
+//! |------------------------|-------------|---------------|-----------------|
+//! | durable posting scorer | ~260 ms     | ~140 ms       | ~65 ms          |
+//! | complete integrated    | ~200 ms     | ~165 ms       | ~88 ms          |
+//! | integrated + Eq filter | ~230 ms     | ~180 ms       | ~96 ms          |
+//! | integrated sparse      | —           | ~16 ms        | ~17 ms          |
+//! | retained-model scorer  | ~245,000 ms | (fail-open path only)         |
 //!
-//! The integrated pipeline adds almost nothing over the durable scorer.
-//! Per-posting profiling showed the scorer spent most of its time on one
-//! full tree descent per posting to read an 8-byte document-length
-//! header; dense queries (planned postings >= corpus/4) now replace
-//! those descents with one shared sequential header scan. A ceiling
-//! experiment that skipped lengths entirely measured ~40 ms, so the
-//! remaining gap is the posting-segment scan itself — the next lever is
-//! a posting layout that carries the document length (HYPOST02),
-//! eliminating the length side-channel for every query shape.
+//! Stage trace at the HYPOST02 rung: plan terms ~14 ms, scan 166 segments
+//! ~19 ms, finalize ~32 ms. The document-length side lookup that
+//! dominated the baseline is gone: self-describing postings carry it,
+//! and legacy roots resolve it once per query through a lazily built
+//! header map that dense queries pay only when they actually meet a
+//! HYPOST01 posting. Remaining cost splits between term planning,
+//! segment decoding, and the BTreeMap score merge in finalize.
 
 use std::time::Instant;
 

@@ -293,6 +293,7 @@ use thiserror::Error;
 #[cfg(test)]
 thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WRITE_LEGACY_POSTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_FULL_CATALOG_STATE_LOAD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FAIL_FULL_STRUCTURE_STATE_LOAD: std::cell::Cell<bool> =
@@ -3500,7 +3501,34 @@ struct LexicalExecutionPlan {
     expected_document_frequencies: Vec<u64>,
     work: Vec<LexicalSegmentWork>,
     planning: Option<NativeEngineWorkReceipt>,
-    document_lengths: Option<Arc<BTreeMap<Vec<u8>, f64>>>,
+    document_lengths: Option<Arc<LazyDocumentLengths>>,
+}
+
+/// Document-length map resolved at most once per query, and only when a
+/// legacy posting without a carried length is actually scored.
+struct LazyDocumentLengths {
+    lengths: std::sync::OnceLock<BTreeMap<Vec<u8>, f64>>,
+}
+
+impl LazyDocumentLengths {
+    const fn new() -> Self {
+        Self {
+            lengths: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Resolves the map on first use. A failed scan is not cached: the
+    /// error propagates and the whole query fails closed.
+    fn get_or_scan(
+        &self,
+        scan: impl FnOnce() -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError>,
+    ) -> Result<&BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
+        if let Some(lengths) = self.lengths.get() {
+            return Ok(lengths);
+        }
+        let scanned = scan()?;
+        Ok(self.lengths.get_or_init(|| scanned))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -9647,7 +9675,7 @@ impl NativeDatabase {
         let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
         ann_store::load(&self.pages, Some(root), &catalog)?;
         let reachable_pages_before = BTree::from_root(root).reachable_page_count(&self.pages)?;
-        if plan.dropped_tombstones == 0 {
+        if !plan.changes_root() {
             return Ok(SearchCompactionReceipt {
                 scanned_entries: plan.scanned_entries,
                 retained_entries: plan.retained_entries.len(),
@@ -16185,8 +16213,13 @@ impl NativeDatabase {
                     .checked_add(plan)
                     .ok_or(NativeRuntimeError::InvalidSearchTree)
             })?;
+        // Self-describing HYPOST02 postings carry their length, so the
+        // shared header prescan is only worth paying when a dense query
+        // meets legacy HYPOST01 postings. It is therefore resolved lazily
+        // by the executor the first time a posting without a carried
+        // length appears, and only for dense queries.
         let document_lengths = if planned_posting_total >= document_count / 4 {
-            Some(Arc::new(self.scan_document_lengths(tree, format, index)?))
+            Some(Arc::new(LazyDocumentLengths::new()))
         } else {
             None
         };
@@ -16225,46 +16258,6 @@ impl NativeDatabase {
             },
             limit,
         )
-    }
-
-    /// One sequential scan of every live document header of the index,
-    /// keyed by document id. Tombstones are skipped; the map is bounded
-    /// by the collection document ceiling.
-    fn scan_document_lengths(
-        &self,
-        tree: BTree,
-        format: PhysicalSearchFormat,
-        index: ObjectId,
-    ) -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
-        let mut prefix = Vec::with_capacity(17);
-        prefix.push(SEARCH_DOCUMENT_PREFIX);
-        prefix.extend_from_slice(&index.get().to_be_bytes());
-        let plan = self.plan_btree_segments(
-            tree,
-            prefix.clone(),
-            Bound::Unbounded,
-            Bound::Unbounded,
-            NativeRuntimeError::InvalidSearchTree,
-        )?;
-        let mut lengths = BTreeMap::new();
-        for segment in &plan.segments {
-            for (key, value) in
-                tree.scan_planned_segment_cached(&self.pages, &self.buffer_pool, segment)?
-            {
-                let document_id = key
-                    .strip_prefix(prefix.as_slice())
-                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                if is_search_document_tombstone(&value) {
-                    if format.admits_tombstones() {
-                        continue;
-                    }
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-                let (document_length, _, _) = decode_search_document_header(&value)?;
-                lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
-            }
-        }
-        Ok(lengths)
     }
 
     fn execute_lexical_plan(
@@ -16460,7 +16453,7 @@ impl NativeDatabase {
         average_length: f64,
         parameters: model::Bm25ScoreParameters,
         work: &[LexicalSegmentWork],
-        document_lengths: Option<&BTreeMap<Vec<u8>, f64>>,
+        document_lengths: Option<&LazyDocumentLengths>,
     ) -> Result<Vec<LexicalPostingBatch>, NativeRuntimeError> {
         work.iter()
             .map(|work| {
@@ -16491,7 +16484,7 @@ impl NativeDatabase {
         work: Vec<LexicalSegmentWork>,
         execution_pool: &NativeExecutionPool,
         permit: &OwnedGovernorPermit,
-        document_lengths: Option<Arc<BTreeMap<Vec<u8>, f64>>>,
+        document_lengths: Option<Arc<LazyDocumentLengths>>,
     ) -> Result<(Vec<LexicalPostingBatch>, usize), NativeRuntimeError> {
         let pages = Arc::new(self.pages.read_handle()?);
         let pool = Arc::clone(&self.buffer_pool);
@@ -30730,6 +30723,14 @@ struct DecodedPosting {
 
 /// Encodes a self-describing `HYPOST02` posting.
 fn encode_search_posting(term_frequency: u32, document_length: u64) -> Vec<u8> {
+    #[cfg(test)]
+    if WRITE_LEGACY_POSTINGS.get() {
+        let mut encoded = Vec::with_capacity(SEARCH_POSTING_SIZE);
+        encoded.extend_from_slice(SEARCH_POSTING_MAGIC);
+        encoded.extend_from_slice(&term_frequency.to_le_bytes());
+        encoded.extend_from_slice(&[0; 4]);
+        return encoded;
+    }
     let mut encoded = Vec::with_capacity(SEARCH_POSTING_SIZE);
     encoded.extend_from_slice(SEARCH_POSTING_MAGIC_V2);
     encoded.extend_from_slice(&term_frequency.to_le_bytes());
@@ -30871,6 +30872,44 @@ fn lexical_segment_work(plans: Vec<LexicalTermSegmentPlan>) -> Vec<LexicalSegmen
         .collect()
 }
 
+/// One sequential scan of every live document header of the index,
+/// keyed by document id. Tombstones are skipped; the map is bounded by
+/// the collection document ceiling.
+fn scan_document_lengths_in_tree(
+    tree: BTree,
+    pages: &PageStore,
+    pool: &BufferPool,
+    format: PhysicalSearchFormat,
+    index: ObjectId,
+) -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
+    let mut prefix = Vec::with_capacity(17);
+    prefix.push(SEARCH_DOCUMENT_PREFIX);
+    prefix.extend_from_slice(&index.get().to_be_bytes());
+    let successor = byte_prefix_successor(&prefix);
+    let upper = successor
+        .as_deref()
+        .map_or(Bound::Unbounded, Bound::Excluded);
+    let plan =
+        tree.plan_range_segments_cached(pages, pool, Bound::Included(prefix.as_slice()), upper)?;
+    let mut lengths = BTreeMap::new();
+    for segment in &plan {
+        for (key, value) in tree.scan_planned_segment_cached(pages, pool, segment)? {
+            let document_id = key
+                .strip_prefix(prefix.as_slice())
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            if is_search_document_tombstone(&value) {
+                if format.admits_tombstones() {
+                    continue;
+                }
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            let (document_length, _, _) = decode_search_document_header(&value)?;
+            lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
+        }
+    }
+    Ok(lengths)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_lexical_segment(
     tree: BTree,
@@ -30881,7 +30920,7 @@ fn decode_lexical_segment(
     average_length: f64,
     parameters: model::Bm25ScoreParameters,
     work: &LexicalSegmentWork,
-    document_lengths: Option<&BTreeMap<Vec<u8>, f64>>,
+    document_lengths: Option<&LazyDocumentLengths>,
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
     let mut live_postings = 0_u64;
     let mut contributions = Vec::with_capacity(work.segment.entry_count());
@@ -30902,6 +30941,7 @@ fn decode_lexical_segment(
             f64::from(length)
         } else if let Some(lengths) = document_lengths {
             *lengths
+                .get_or_scan(|| scan_document_lengths_in_tree(tree, pages, pool, format, index))?
                 .get(document_id)
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?
         } else {
@@ -33106,6 +33146,15 @@ struct SearchCompactionPlan {
     scanned_entries: usize,
     retained_entries: Vec<(Vec<u8>, Vec<u8>)>,
     dropped_tombstones: usize,
+    /// Legacy `HYPOST01` postings rewritten as self-describing `HYPOST02`.
+    upgraded_postings: usize,
+}
+
+impl SearchCompactionPlan {
+    /// Whether compaction would publish a physically different root.
+    const fn changes_root(&self) -> bool {
+        self.dropped_tombstones > 0 || self.upgraded_postings > 0
+    }
 }
 
 fn plan_search_compaction(
@@ -33118,22 +33167,53 @@ fn plan_search_compaction(
     let format = physical_search_format(pages, tree)?;
     let entries = tree.scan(pages)?;
     let scanned_entries = entries.len();
+    // Live document token counts, so legacy postings can be upgraded to
+    // the self-describing layout from validated header data.
+    let mut token_counts = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
+    for (key, value) in &entries {
+        if key.first().copied() == Some(SEARCH_DOCUMENT_PREFIX)
+            && !is_search_document_tombstone(value)
+        {
+            let (index, document_id) = decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
+            let (token_count, _, _) = decode_search_document_header(value)?;
+            token_counts.insert((index, document_id.to_vec()), token_count);
+        }
+    }
     let mut retained_entries = Vec::with_capacity(scanned_entries);
     let mut dropped_tombstones = 0_usize;
+    let mut upgraded_postings = 0_usize;
     for (key, value) in entries {
         if compactable_search_tombstone(format, &key, &value) {
             dropped_tombstones = dropped_tombstones
                 .checked_add(1)
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        } else {
-            retained_entries.push((key, value));
+            continue;
         }
+        if key.first().copied() == Some(SEARCH_POSTING_PREFIX)
+            && value.get(..8) == Some(SEARCH_POSTING_MAGIC.as_slice())
+        {
+            let (index, _, document_id) = decode_search_posting_key(&key)?;
+            let posting = decode_search_posting(&value)?;
+            let token_count = token_counts
+                .get(&(index, document_id.to_vec()))
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            retained_entries.push((
+                key,
+                encode_search_posting(posting.term_frequency, *token_count),
+            ));
+            upgraded_postings = upgraded_postings
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            continue;
+        }
+        retained_entries.push((key, value));
     }
     Ok(SearchCompactionPlan {
         state,
         scanned_entries,
         retained_entries,
         dropped_tombstones,
+        upgraded_postings,
     })
 }
 
@@ -33157,7 +33237,7 @@ fn compact_search_tree(
 ) -> Result<BTree, NativeRuntimeError> {
     let root = root.ok_or(NativeRuntimeError::InvalidSearchTree)?;
     let plan = plan_search_compaction(pages, blobs, root)?;
-    if plan.dropped_tombstones == 0 {
+    if !plan.changes_root() {
         return Ok(BTree::from_root(root));
     }
     let compacted = BTree::empty()
@@ -37774,6 +37854,73 @@ mod tests {
         super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
         super::FAIL_FULL_STATE_LOAD.set(false);
         result
+    }
+
+    #[test]
+    fn compaction_upgrades_legacy_postings_and_stays_noop_when_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let index = ObjectId::new(100)?;
+        let mut database = NativeDatabase::create(directory.path())?;
+        // Seed under the legacy encoder: every posting lands as HYPOST01.
+        super::WRITE_LEGACY_POSTINGS.set(true);
+        let seeded = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.create_search_index(index, "documents")?;
+            seed.index_document(index, b"doc-a".to_vec(), "alpha shared")?;
+            seed.index_document(index, b"doc-b".to_vec(), "beta shared twice shared")?;
+            seed.commit()?;
+            Ok(())
+        })();
+        super::WRITE_LEGACY_POSTINGS.set(false);
+        seeded?;
+        let before = database.match_latest_text(index, "shared", 10)?;
+        assert_eq!(before.len(), 2);
+
+        // Compaction rewrites the legacy postings even without tombstones.
+        let compacted = database.compact_search(DurabilityClass::Strict)?;
+        assert!(compacted.commit.is_some());
+        assert_eq!(compacted.dropped_tombstones, 0);
+        assert_eq!(database.match_latest_text(index, "shared", 10)?, before);
+
+        // The compacted root carries only self-describing postings with
+        // the exact header lengths, and a second compaction is a no-op.
+        let snapshot = database.snapshot(0)?;
+        let root = snapshot
+            .metadata
+            .roots()
+            .root(super::SLOT_SEARCH)
+            .ok_or("missing search root")?;
+        let entries = BTree::from_root(root).scan(&database.pages)?;
+        let mut lengths = BTreeMap::new();
+        for (key, value) in &entries {
+            if key.first() == Some(&super::SEARCH_DOCUMENT_PREFIX) {
+                let (_, document_id) =
+                    super::decode_search_object_key(key, super::SEARCH_DOCUMENT_PREFIX)?;
+                let (count, _, _) = super::decode_search_document_header(value)?;
+                lengths.insert(document_id.to_vec(), count);
+            }
+        }
+        let mut postings = 0;
+        for (key, value) in &entries {
+            if key.first() == Some(&super::SEARCH_POSTING_PREFIX) {
+                assert_eq!(&value[..8], super::SEARCH_POSTING_MAGIC_V2);
+                let (_, _, document_id) = super::decode_search_posting_key(key)?;
+                let posting = super::decode_search_posting(value)?;
+                assert_eq!(
+                    posting.document_length.map(u64::from),
+                    lengths.get(document_id).copied()
+                );
+                postings += 1;
+            }
+        }
+        assert!(postings >= 4);
+        let noop = database.compact_search(DurabilityClass::Strict)?;
+        assert!(noop.commit.is_none());
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.match_latest_text(index, "shared", 10)?, before);
+        Ok(())
     }
 
     #[test]

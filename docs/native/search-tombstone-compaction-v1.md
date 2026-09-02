@@ -53,7 +53,11 @@ The planner retains byte-for-byte:
 
 - the exact `HYSEABT2` format marker;
 - collection metadata;
-- every live `HYDOCS01`, `HYTERM01`, `HYPOST01`, and `HYPOST02` value;
+- every live `HYDOCS01`, `HYTERM01`, and `HYPOST02` value;
+- every live `HYPOST01` value, rewritten as the equivalent `HYPOST02`
+  (same term frequency, carried length taken from the owning document's
+  validated header) — the only value transformation compaction performs,
+  so a compacted root never needs the document-header side lookup again;
 - ANN generation metadata, vectors, and graph neighbors under prefixes
   `0x05` through `0x07`; and
 - every future entry only after a later format contract explicitly classifies
@@ -67,7 +71,8 @@ value is dead.
 
 ## No-op behavior
 
-If the validated root contains no compactable tombstone, the operation returns
+If the validated root contains no compactable tombstone and no `HYPOST01`
+posting, the operation returns
 a receipt with `commit=None`. It appends no page, writes no WAL record, changes
 no conflict state, advances no transaction identity, and advances no global
 CSN.
