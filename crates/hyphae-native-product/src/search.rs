@@ -1353,6 +1353,7 @@ impl NativeProduct {
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
             hits: integrated_hits(
+                &self.database,
                 result.hits,
                 &snapshot,
                 binding.lexical_index,
@@ -1381,6 +1382,7 @@ impl NativeProduct {
     ///
     /// Returns an error for an invalid binding/request, missing durable side
     /// record, exhausted bound, or native lexical/vector execution failure.
+    #[allow(clippy::too_many_lines)]
     pub fn search_collection_at_snapshot(
         product: &Self,
         snapshot: &crate::ProductSnapshot,
@@ -1470,6 +1472,7 @@ impl NativeProduct {
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
             hits: integrated_hits(
+                &product.database,
                 result.hits,
                 snapshot,
                 binding.lexical_index,
@@ -1640,6 +1643,7 @@ fn integer_nanos_as_f64(nanos: i64) -> f64 {
 /// expansion; earlier terms stay exact. No expansion leaves the branch
 /// query empty (scoring nothing); overflow fails closed.
 fn expand_prefix_query(
+    database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     query: &str,
@@ -1648,17 +1652,30 @@ fn expand_prefix_query(
     let Some(last) = analysis.tokens.last() else {
         return Ok(String::new());
     };
-    let expansion =
-        match snapshot
-            .inner
-            .search_expand_term_prefix(index, &last.term, MAX_LEXICAL_PREFIX_TERMS)
-        {
-            hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
-                return Err(invalid_request());
-            }
-            hyphae_native_runtime::TermPrefixExpansion::Overflow => return Err(limit_exceeded()),
-            hyphae_native_runtime::TermPrefixExpansion::Terms(terms) => terms,
-        };
+    // The durable term dictionary is authoritative; a reclaimed page
+    // generation falls open to the retained model, never to a different
+    // vocabulary.
+    let mut collected = BTreeSet::new();
+    let expansion = database
+        .search_expand_term_prefix_at_snapshot(
+            &snapshot.inner,
+            index,
+            &last.term,
+            MAX_LEXICAL_PREFIX_TERMS,
+            &mut collected,
+        )
+        .unwrap_or_else(|_| {
+            snapshot
+                .inner
+                .search_expand_term_prefix(index, &last.term, MAX_LEXICAL_PREFIX_TERMS)
+        });
+    let expansion = match expansion {
+        hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
+            return Err(invalid_request());
+        }
+        hyphae_native_runtime::TermPrefixExpansion::Overflow => return Err(limit_exceeded()),
+        hyphae_native_runtime::TermPrefixExpansion::Terms(terms) => terms,
+    };
     let mut terms: Vec<&str> = analysis.tokens[..analysis.tokens.len() - 1]
         .iter()
         .map(|token| token.term.as_str())
@@ -1670,6 +1687,7 @@ fn expand_prefix_query(
 /// Rewrites every analyzed query term as its bounded fuzzy expansion
 /// over the committed vocabulary; empty expansions contribute nothing.
 fn expand_fuzzy_query(
+    database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     query: &str,
@@ -1678,13 +1696,24 @@ fn expand_fuzzy_query(
     let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
     let mut collected = BTreeSet::new();
     for token in &analysis.tokens {
-        match snapshot.inner.search_expand_term_fuzzy(
+        let expansion = match database.search_expand_term_fuzzy_at_snapshot(
+            &snapshot.inner,
             index,
             &token.term,
             max_distance,
             MAX_LEXICAL_PREFIX_TERMS,
             &mut collected,
         ) {
+            Ok(expansion) => expansion,
+            Err(_) => snapshot.inner.search_expand_term_fuzzy(
+                index,
+                &token.term,
+                max_distance,
+                MAX_LEXICAL_PREFIX_TERMS,
+                &mut collected,
+            ),
+        };
+        match expansion {
             hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
                 return Err(invalid_request());
             }
@@ -1845,9 +1874,9 @@ fn execute_lexical_branch(
         Some(transform) => transform.apply(&lexical.query),
     };
     let query = if lexical.prefix {
-        expand_prefix_query(snapshot, index, &query)?
+        expand_prefix_query(database, snapshot, index, &query)?
     } else if let Some(distance) = lexical.fuzzy {
-        expand_fuzzy_query(snapshot, index, &query, distance)?
+        expand_fuzzy_query(database, snapshot, index, &query, distance)?
     } else {
         query
     };
@@ -2729,13 +2758,14 @@ fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
 /// highlight fragments when the request carries a budget. Both search
 /// twins share this exact mapping.
 fn integrated_hits(
+    database: &hyphae_native_runtime::NativeDatabase,
     hits: Vec<hyphae_native_runtime::DocValueCandidate>,
     snapshot: &ProductSnapshot,
     lexical_index: crate::ObjectId,
     request: &ProductSearchRequest,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
 ) -> Result<Vec<ProductIntegratedSearchHit>, ProductError> {
-    let terms = highlight_terms(snapshot, lexical_index, request, transform);
+    let terms = highlight_terms(database, snapshot, lexical_index, request, transform);
     hits.into_iter()
         .map(|hit| {
             let fragments = match (&terms, &request.highlight) {
@@ -2758,6 +2788,7 @@ fn integrated_hits(
 /// Analyzed query terms for highlighting, derived from exactly the
 /// transformed query string the lexical branch scores with.
 fn highlight_terms(
+    database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
     index: crate::ObjectId,
     request: &ProductSearchRequest,
@@ -2774,9 +2805,9 @@ fn highlight_terms(
     // failures fall back to the unexpanded terms rather than dropping
     // highlights outright.
     let query = if lexical.prefix {
-        expand_prefix_query(snapshot, index, &query).unwrap_or(query)
+        expand_prefix_query(database, snapshot, index, &query).unwrap_or(query)
     } else if let Some(distance) = lexical.fuzzy {
-        expand_fuzzy_query(snapshot, index, &query, distance).unwrap_or(query)
+        expand_fuzzy_query(database, snapshot, index, &query, distance).unwrap_or(query)
     } else {
         query
     };

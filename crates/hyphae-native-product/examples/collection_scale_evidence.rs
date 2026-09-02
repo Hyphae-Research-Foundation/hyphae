@@ -17,11 +17,14 @@
 //! |------|--------------|----------|--------------|------------|-----------|
 //! | 10k  | 309          | 14.7 ms  | 17.6 ms      | 17.7 ms    | 40.4 ms   |
 //! | 100k | 48           | 323 ms   | 356 ms       | 329 ms     | 516 ms    |
+//! | 100k after scorer work (HYPOST02 corpus) | reused | 65 ms | 101 ms | 86 ms | 194 ms |
 //!
-//! Both ingest and query scale superlinearly (10x documents -> ~22x query
-//! latency, ~6x slower per-document ingest): per-batch manifest rewrite and
-//! whole-manifest eligibility cloning dominate. Fixing those is the
-//! prerequisite for the next cap rung, not raising the constant.
+//! The first 100k row scaled superlinearly (10x documents -> ~22x query
+//! latency). The scorer work recorded in `scale_stage_diagnostic` —
+//! self-describing postings, lazy length prescan, linear score merge,
+//! dictionary-backed prefix/fuzzy expansion — brought the 100k query
+//! ladder to roughly 4x the 10k row, i.e. near-linear. Ingest (48 docs/s
+//! under per-batch atomic commits) is now the dominant cost of the rung.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -54,12 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: collection_scale_evidence <documents> <data-dir>")?;
     let path = std::path::PathBuf::from(data_dir);
-    if path.exists() {
-        return Err("data dir must not exist".into());
-    }
-
-    let mut product = NativeProduct::create(&path)?;
-    provision(&mut product)?;
+    // An existing data dir reopens and skips ingest so the query ladder
+    // can be re-measured after scorer changes without a 50-minute reseed.
+    let reuse = path.exists();
+    let mut product = if reuse {
+        NativeProduct::open(&path)?
+    } else {
+        let mut product = NativeProduct::create(&path)?;
+        provision(&mut product)?;
+        product
+    };
 
     // Deterministic corpus: rotating vocabulary + doc values.
     let vocabulary = [
@@ -67,8 +74,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "snapshot", "proof", "catalog", "keyspace", "durable", "bounded", "recall", "postings",
     ];
     let started = Instant::now();
-    let mut ingested = 0_usize;
-    let mut batch_id = 0_u128;
+    let mut ingested = if reuse { documents } else { 0_usize };
+    let mut batch_id = if reuse {
+        u128::try_from(documents.div_ceil(BATCH_DOCUMENTS))?
+    } else {
+        0_u128
+    };
     while ingested < documents {
         let count = BATCH_DOCUMENTS.min(documents - ingested);
         let mut batch = Vec::with_capacity(count);
@@ -161,11 +172,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("phrase", request("database engine", true, None, false)),
         ("fuzzy1", request("datbase", false, Some(1), false)),
     ];
-    println!(
-        "documents={documents} ingest_seconds={:.1} docs_per_second={:.0}",
-        ingest_elapsed.as_secs_f64(),
-        (documents as f64) / ingest_elapsed.as_secs_f64().max(0.001),
-    );
+    if reuse {
+        println!("documents={documents} ingest=reused");
+    } else {
+        println!(
+            "documents={documents} ingest_seconds={:.1} docs_per_second={:.0}",
+            ingest_elapsed.as_secs_f64(),
+            (documents as f64) / ingest_elapsed.as_secs_f64().max(0.001),
+        );
+    }
     for (name, search) in scenarios {
         let mut latencies = Vec::with_capacity(16);
         let mut hits = 0_usize;

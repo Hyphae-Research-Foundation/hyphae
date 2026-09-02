@@ -187,7 +187,9 @@ The lexical branch may declare fuzzy expansion: each analyzed query
 term expands to every distinct indexed term within the declared
 Levenshtein character-edit distance (`1..=2`), then the branch scores
 ordinary BM25 over the union of expanded terms. Expansion walks the
-same bounded committed vocabulary as prefix expansion and admits at
+same bounded committed vocabulary as prefix expansion — the durable
+live term dictionary of the index (namespace `0x03`), never the
+document texts — and admits at
 most 64 distinct expanded terms across the whole query
 (`MAX_LEXICAL_PREFIX_TERMS`); overflow fails closed as limit-exceeded.
 Terms whose expansion is empty contribute nothing. Fuzzy expansion,
@@ -198,8 +200,9 @@ The lexical branch may declare prefix expansion: the final analyzed
 query term is treated as a prefix and expands to every distinct indexed
 term starting with it, then the branch scores ordinary BM25 over the
 expanded OR of terms (earlier query terms stay exact). Expansion scans
-the bounded committed corpus of the collection (within the collection
-document ceiling) and admits at most 64 distinct expanded terms
+the durable live term dictionary of the index (namespace `0x03`; a
+prefix walk bounded by the literal prefix, tombstoned terms skipped)
+and admits at most 64 distinct expanded terms
 (`MAX_LEXICAL_PREFIX_TERMS`); more distinct matches fail closed as
 limit-exceeded rather than answering from a truncated vocabulary. A
 prefix with no expansion leaves the branch empty. Prefix expansion and

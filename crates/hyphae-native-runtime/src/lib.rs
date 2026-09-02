@@ -16113,6 +16113,140 @@ impl NativeDatabase {
         Ok(receipt.hits)
     }
 
+    /// Expands one analyzed term prefix over the durable live term
+    /// dictionary of the index at the snapshot's root — a prefix walk
+    /// bounded by the literal prefix, tombstoned terms skipped — without
+    /// touching document texts. `limit` bounds distinct terms counting
+    /// those already in `collected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an inline-format directory, a stale snapshot
+    /// page generation, or a corrupt term dictionary.
+    pub fn search_expand_term_prefix_at_snapshot(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        prefix: &str,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> Result<TermPrefixExpansion, NativeRuntimeError> {
+        let Some(tree) = self.durable_search_tree(snapshot, index)? else {
+            return Ok(snapshot.search_expand_term_prefix(index, prefix, limit));
+        };
+        let mut key_prefix = search_term_meta_key(index, prefix.as_bytes())
+            .or_else(|_| search_term_meta_key(index, b"\0"))?;
+        if prefix.is_empty() {
+            key_prefix.truncate(17);
+        }
+        let mut added = Vec::new();
+        for (key, value) in tree.scan_prefix(&self.pages, &key_prefix)? {
+            if is_search_term_metadata_tombstone(&value) {
+                continue;
+            }
+            let (_, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
+            let term =
+                std::str::from_utf8(term).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+            if collected.contains(term) {
+                continue;
+            }
+            if collected.len() == limit {
+                return Ok(TermPrefixExpansion::Overflow);
+            }
+            collected.insert(term.to_owned());
+            added.push(term.to_owned());
+        }
+        Ok(TermPrefixExpansion::Terms(added))
+    }
+
+    /// Expands one analyzed term over the durable live term dictionary
+    /// to every term within the Levenshtein distance, without touching
+    /// document texts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::search_expand_term_prefix_at_snapshot`].
+    pub fn search_expand_term_fuzzy_at_snapshot(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        term: &str,
+        max_distance: usize,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> Result<TermPrefixExpansion, NativeRuntimeError> {
+        let Some(tree) = self.durable_search_tree(snapshot, index)? else {
+            return Ok(snapshot.search_expand_term_fuzzy(
+                index,
+                term,
+                max_distance,
+                limit,
+                collected,
+            ));
+        };
+        let mut key_prefix = Vec::with_capacity(17);
+        key_prefix.push(SEARCH_TERM_META_PREFIX);
+        key_prefix.extend_from_slice(&index.get().to_be_bytes());
+        let query: Vec<char> = term.chars().collect();
+        let mut added = Vec::new();
+        for (key, value) in tree.scan_prefix(&self.pages, &key_prefix)? {
+            if is_search_term_metadata_tombstone(&value) {
+                continue;
+            }
+            let (_, candidate) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
+            let candidate = std::str::from_utf8(candidate)
+                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+            if collected.contains(candidate) {
+                continue;
+            }
+            let candidate_chars: Vec<char> = candidate.chars().collect();
+            if query.len().abs_diff(candidate_chars.len()) > max_distance
+                || !bounded_levenshtein(&query, &candidate_chars, max_distance)
+            {
+                continue;
+            }
+            if collected.len() == limit {
+                return Ok(TermPrefixExpansion::Overflow);
+            }
+            collected.insert(candidate.to_owned());
+            added.push(candidate.to_owned());
+        }
+        Ok(TermPrefixExpansion::Terms(added))
+    }
+
+    /// The durable search tree at the snapshot's root when the directory
+    /// uses the inverted B+tree format and the snapshot is current;
+    /// `None` on the inline-state format (callers fall back to the model).
+    fn durable_search_tree(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+    ) -> Result<Option<BTree>, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return Ok(None);
+        }
+        let current = self.coordinator.snapshot(0)?;
+        if snapshot.metadata.roots().page_generation() != current.roots().page_generation() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        let catalog_root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        match self.catalog_object_at_root(catalog_root, index)? {
+            Some(CatalogObject::Search(_)) => {}
+            _ => return Err(ModelError::UnknownObject.into()),
+        }
+        let root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        Ok(Some(BTree::from_root(root)))
+    }
+
     /// Durable posting scorer returning the complete execution receipt.
     /// Diagnostic surface for the cap-ladder evidence harness; not a
     /// public contract.
