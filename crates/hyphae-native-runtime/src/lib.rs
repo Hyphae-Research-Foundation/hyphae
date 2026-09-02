@@ -4058,6 +4058,26 @@ impl NativeSnapshot {
         )
     }
 
+    /// Visits the visible scalar keys inside `[start, end)` in ascending
+    /// order without copying them, or returns `None` fail-closed once more
+    /// than `limit` keys are visible. Same semantics as
+    /// [`Self::structure_keys_in_range`].
+    pub fn visit_structure_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        visitor: impl FnMut(&[u8]),
+    ) -> Option<()> {
+        self.state.structures.visit_visible_keys_in_range(
+            start,
+            end,
+            self.metadata.logical_time_micros,
+            limit,
+            visitor,
+        )
+    }
+
     /// Returns the key's TTL state at snapshot logical time.
     pub fn ttl(&self, key: &[u8]) -> Ttl {
         match self

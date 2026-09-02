@@ -3238,16 +3238,28 @@ fn posting_scan(
     start: &[u8],
     end: &[u8],
 ) -> Option<BTreeSet<crate::ObjectId>> {
-    let keys = snapshot.structure_keys_in_range_internal(
+    // Posting keys for one (field, value) range are ordered by value then
+    // object id, so a single-value range yields ids in ascending order and a
+    // multi-value range yields runs of ascending ids. Collect the ids
+    // without copying keys, sort once (already-sorted runs are cheap for the
+    // stable sort), and bulk-build the set from sorted unique input.
+    let mut identities = Vec::new();
+    let mut malformed = false;
+    snapshot.visit_structure_keys_in_range_internal(
         start,
         end,
         MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS.saturating_mul(2),
+        |key| match posting_object_id(key) {
+            Ok(object_id) => identities.push(object_id),
+            Err(_) => malformed = true,
+        },
     )?;
-    let mut identities = BTreeSet::new();
-    for key in keys {
-        identities.insert(posting_object_id(&key).ok()?);
+    if malformed {
+        return None;
     }
-    Some(identities)
+    identities.sort_unstable();
+    identities.dedup();
+    Some(identities.into_iter().collect())
 }
 
 /// Evaluates one filter against the posting index, producing exactly the
@@ -3559,17 +3571,23 @@ fn decode_manifest(encoded: &[u8]) -> Result<BTreeSet<crate::ObjectId>, ProductE
     if encoded.len() != 12_usize.saturating_add(count.saturating_mul(16)) {
         return Err(corruption());
     }
-    let mut identities = BTreeSet::new();
+    // The manifest is written from a `BTreeSet`, so a valid encoding is
+    // strictly ascending; verify that order while decoding and bulk-build
+    // the set from the sorted input instead of inserting one id at a time.
+    let mut identities = Vec::with_capacity(count);
+    let mut previous: Option<crate::ObjectId> = None;
     for chunk in encoded[12..].chunks_exact(16) {
         let object_id = crate::ObjectId::new(u128::from_be_bytes(
             chunk.try_into().map_err(|_| corruption())?,
         ))
         .map_err(|_| corruption())?;
-        if !identities.insert(object_id) {
+        if previous.is_some_and(|previous| previous >= object_id) {
             return Err(corruption());
         }
+        previous = Some(object_id);
+        identities.push(object_id);
     }
-    Ok(identities)
+    Ok(identities.into_iter().collect())
 }
 
 fn encode_binding(binding: &ProductSearchCollectionBinding) -> Result<Vec<u8>, ProductError> {

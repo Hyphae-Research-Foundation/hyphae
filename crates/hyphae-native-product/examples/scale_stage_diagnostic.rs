@@ -20,7 +20,12 @@
 //! | retained-model scorer  | ~245,000 ms | (fail-open path only)                             |
 //!
 //! At the 250k rung (393 segments, 93,702 physical entries) the durable
-//! scorer went ~112 ms -> ~23 ms with the same change. The "borrowed
+//! scorer went ~112 ms -> ~23 ms with the same change. Eligibility then
+//! stopped copying: posting scans visit keys in place and bulk-build the id
+//! set from sorted input, and the manifest decodes into a sorted bulk
+//! build. At 250k: integrated 63 -> 39 ms, Eq filter 74 -> 33 ms, the
+//! ladder's `price < 500` range + `category` facet (125,000 eligible)
+//! 121 -> 46 ms. The "borrowed
 //! leaves" column: segment planning reads only leaf boundary keys, posting
 //! scans borrow from the buffer-pool frame, and the merge ranks arena
 //! offsets — the allocator (malloc/free/memcmp on per-entry `Vec<u8>`) was
@@ -227,6 +232,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "stage=integrated_equal_filter round={round} hits={} ms={:.1}",
             result.hits.len(),
+            begun.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
+
+    // Stage 5: the ladder's range filter plus term facet — the most
+    // superlinear scenario in `collection_scale_evidence`.
+    let range_facet = ProductSearchRequest {
+        filter: ProductSearchFilter::Compare {
+            field: "price".to_owned(),
+            operator: hyphae_native_product::ProductSearchOperator::Less,
+            value: ProductDocValue::Integer(500),
+        },
+        facets: vec![hyphae_native_product::ProductFacetRequest {
+            field: "category".to_owned(),
+            limit: 8,
+        }],
+        ..filtered
+    };
+    let range_rounds: u32 = std::env::var("HYPHAE_DIAG_RANGE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    for round in 0..range_rounds {
+        let begun = Instant::now();
+        let result =
+            product.search_collection(collection, &range_facet, 1_000_020 + i64::from(round))?;
+        println!(
+            "stage=integrated_range_facet round={round} hits={} eligible={} ms={:.1}",
+            result.hits.len(),
+            result.eligible_documents,
             begun.elapsed().as_secs_f64() * 1_000.0,
         );
     }

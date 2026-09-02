@@ -1031,6 +1031,24 @@ impl StructureState {
         limit: usize,
     ) -> Option<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
+        self.visit_visible_keys_in_range(start, end, logical_time_micros, limit, |key| {
+            keys.push(key.to_vec());
+        })?;
+        Some(keys)
+    }
+
+    /// Visits the visible scalar keys inside `[start, end)` in ascending
+    /// order without copying them, or returns `None` fail-closed once more
+    /// than `limit` keys are visible.
+    pub(crate) fn visit_visible_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        logical_time_micros: i64,
+        limit: usize,
+        mut visitor: impl FnMut(&[u8]),
+    ) -> Option<()> {
+        let mut visited = 0_usize;
         for (key, entry) in self.entries.range(start.to_vec()..end.to_vec()) {
             let expired = entry
                 .expires_at_micros
@@ -1038,12 +1056,13 @@ impl StructureState {
             if expired {
                 continue;
             }
-            if keys.len() >= limit {
+            if visited >= limit {
                 return None;
             }
-            keys.push(key.clone());
+            visited += 1;
+            visitor(key);
         }
-        Some(keys)
+        Some(())
     }
 
     pub(crate) fn visible_entry(
