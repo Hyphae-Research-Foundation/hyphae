@@ -46,6 +46,16 @@
 //! filtered+facet 3.2x. The first bm25 sample after a fresh load is a
 //! cold-cache outlier (p95 in the seconds) and is reported, not hidden.
 //!
+//! After eligibility stopped copying keys (posting scans visit in place,
+//! sorted bulk set builds), shipped bound 250k, reopened corpora:
+//!
+//! | rung | bm25 p50 | filtered p50 | phrase p50 | fuzzy p50 |
+//! |------|----------|--------------|------------|-----------|
+//! | 100k | 19 ms    | 20 ms        | 22 ms      | 80 ms     |
+//! | 250k | 41 ms    | 46 ms        | 42 ms      | 211 ms    |
+//!
+//! Ratios for 2.5x documents: 2.2x / 2.4x / 1.9x / 2.6x.
+//!
 //! The 250k rung ran with the collection bound lifted on the measurement
 //! host only; the shipped bound is unchanged until the contract is raised.
 //! Open time is dominated by validating every retained committed root:

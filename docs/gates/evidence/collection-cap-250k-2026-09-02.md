@@ -56,9 +56,14 @@ verifies every retained root structurally.
 
 | rung | bm25 | filtered (`price < 500`) + facet | phrase | fuzzy (distance 1) |
 |------|------|----------------------------------|--------|--------------------|
-| 100k | 26 ms | 43 ms  | 28 ms | 78 ms  |
-| 250k | 63 ms | 137 ms | 68 ms | 227 ms |
-| ratio (2.5× documents) | 2.4× | 3.2× | 2.4× | 2.9× |
+| 100k | 19 ms | 20 ms | 22 ms | 80 ms  |
+| 250k | 41 ms | 46 ms | 42 ms | 211 ms |
+| ratio (2.5× documents) | 2.2× | 2.4× | 1.9× | 2.6× |
+
+Measured with the shipped bound (`c783e2c`, reopened corpora). The
+intermediate receipt before eligibility stopped copying keys — bm25 26 /
+63 ms, filtered+facet 43 / 137 ms (3.2×), phrase 28 / 68 ms, fuzzy 78 /
+227 ms — is kept in the `collection_scale_evidence` header for the trend.
 
 Baseline at 100k before the work: bm25 73 ms, filtered 108 ms, phrase
 97 ms, fuzzy 194 ms. The first bm25 sample after a fresh load is a
@@ -95,6 +100,7 @@ re-measured or restructured before that rung.
 - No named vectors in the ladder corpus: a batch that carries vectors keeps
   the materialized ingest transaction and its cost is not covered by the
   ingest table.
-- `filtered+facet` is the most superlinear stage (3.2×) and is the next
-  profiling target; the bound is raised on the aggregate receipt, not on a
-  claim that every stage is linear.
+- Fuzzy expansion (distance 1) is the least linear stage remaining (2.6×
+  for 2.5× documents; 211 ms p50 at 250k) and is the next profiling
+  target; the bound is raised on the aggregate receipt, not on a claim that
+  every stage is linear.
