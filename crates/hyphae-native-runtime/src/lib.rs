@@ -293,6 +293,9 @@ use thiserror::Error;
 #[cfg(test)]
 thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Complete-state loads performed on this thread; deterministic under
+    /// the parallel test harness where the process-wide counter is not.
+    static THREAD_FULL_STATE_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WRITE_LEGACY_POSTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_FULL_CATALOG_STATE_LOAD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -36029,9 +36032,22 @@ fn recover_committed_roots(
         {
             return Err(NativeRuntimeError::InvalidCommittedRoot);
         }
-        validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+        // The retained base root is the current root when no suffix commit
+        // follows; a suffix commit supersedes it below. Either way it is
+        // validated once, at the depth its final role requires.
+        if commits
+            .iter()
+            .all(|recovered| recovered.manifest.commit_csn < storage.retention_floor_csn)
+        {
+            validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+        } else {
+            validate_root_structure(storage.pages, root, visible_csn)?;
+        }
         committed_roots.insert(visible_csn, root.clone());
     }
+    let latest_commit_csn = commits
+        .last()
+        .map(|recovered| recovered.manifest.commit_csn);
     for recovered in commits {
         let anchor_digest = digest_for_lsn(wal_recovery, recovered.commit_lsn)?;
         let root = RootSet::committed_with_storage(
@@ -36050,12 +36066,21 @@ fn recover_committed_roots(
             if recovered.manifest.page_generation != storage.active_generation {
                 return Err(NativeRuntimeError::NoncontiguousCommitSequence);
             }
-            validate_roots(
-                storage.pages,
-                storage.blobs,
-                &root,
-                recovered.manifest.commit_csn,
-            )?;
+            // Every retained root is structurally verified: page kinds,
+            // creating CSNs, and complete reachable-tree shape. Only the root
+            // that becomes current is additionally decoded into complete
+            // logical state; a superseded root is reachable to readers only
+            // through a snapshot pin, which performs that decode when used.
+            if Some(recovered.manifest.commit_csn) == latest_commit_csn {
+                validate_roots(
+                    storage.pages,
+                    storage.blobs,
+                    &root,
+                    recovered.manifest.commit_csn,
+                )?;
+            } else {
+                validate_root_structure(storage.pages, &root, recovered.manifest.commit_csn)?;
+            }
         }
         committed_roots.insert(recovered.manifest.commit_csn, root.clone());
         latest_root = Some(root);
@@ -36134,9 +36159,30 @@ fn digest_for_lsn(
         .ok_or(NativeRuntimeError::InvalidCommittedRoot)
 }
 
+/// Structurally verifies one committed root set and decodes its complete
+/// logical state.
+///
+/// This is the full open-time and maintenance validation for the root a
+/// reader will observe: the current root, a snapshot-pin root, a vacuum
+/// candidate, and the blob-collection root.
 fn validate_roots(
     pages: &PageStore,
     blobs: &BlobStore,
+    roots: &RootSet,
+    visible_csn: Csn,
+) -> Result<(), NativeRuntimeError> {
+    validate_root_structure(pages, roots, visible_csn)?;
+    load_state(pages, blobs, roots)?;
+    Ok(())
+}
+
+/// Structurally verifies one committed root set without decoding its
+/// logical state: every engine root has an admitted page kind and a
+/// creating CSN at or below `visible_csn`, and every B+tree root reaches a
+/// complete, acyclic, canonically ordered, balanced tree whose pages are all
+/// visible at that CSN.
+fn validate_root_structure(
+    pages: &PageStore,
     roots: &RootSet,
     visible_csn: Csn,
 ) -> Result<(), NativeRuntimeError> {
@@ -36224,7 +36270,6 @@ fn validate_roots(
     ) {
         BTree::from_root(search_root).validate_visible(pages, visible_csn)?;
     }
-    load_state(pages, blobs, roots)?;
     Ok(())
 }
 
@@ -36234,6 +36279,8 @@ fn load_state(
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
     FULL_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_FULL_STATE_LOADS.with(|count| count.set(count.get() + 1));
     #[cfg(test)]
     if FAIL_FULL_STATE_LOAD.get() {
         return Err(NativeRuntimeError::UnexpectedFullStateLoad);
@@ -58765,6 +58812,82 @@ mod tests {
         page_file.sync_data()?;
 
         assert!(NativeDatabase::open(temporary.path()).is_err());
+        Ok(())
+    }
+
+    /// Open decodes complete logical state once, for the root that becomes
+    /// current, regardless of how many superseded commits remain retained;
+    /// every retained root is still structurally verified, so a future page
+    /// planted under a superseded root is rejected before visibility.
+    #[test]
+    fn open_decodes_complete_state_once_and_still_verifies_superseded_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let table = ObjectId::new(1)?;
+        for index in 0_u8..24 {
+            let mut commit = database.begin(200 + i64::from(index), DurabilityClass::Strict)?;
+            commit.insert(table, vec![b'k', index], b"v".to_vec())?;
+            commit.set(vec![b's', index], b"v".to_vec(), None)?;
+            commit.commit()?;
+        }
+        let superseded_root = database
+            .coordinator
+            .snapshot(150)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        drop(database);
+
+        let before = super::THREAD_FULL_STATE_LOADS.with(std::cell::Cell::get);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let after = super::THREAD_FULL_STATE_LOADS.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            1,
+            "open performed {} complete-state loads for 25 retained commits",
+            after - before
+        );
+        assert_eq!(reopened.snapshot(300)?.get(b"s\x17"), Some(b"v".as_slice()));
+        assert_eq!(reopened.recovery_report().replayed_transactions, 25);
+        drop(reopened);
+
+        // Re-encode the superseded structure root with a creating CSN from
+        // the future. Only superseded roots reach that page now; the
+        // structural pass over retained roots must still reject it.
+        let page_path = temporary.path().join(PAGE_FILE);
+        let store = PageStore::open(&page_path)?;
+        let page = store.read(superseded_root)?;
+        let forged = hyphae_native_pages::Page::new(
+            page.id(),
+            page.kind(),
+            Some(Csn::new(u64::MAX / 2)?),
+            page.next(),
+            page.payload().to_vec(),
+        )?
+        .encode();
+        drop(store);
+        let mut page_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(page_path)?;
+        let offset = superseded_root
+            .get()
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(u64::try_from(hyphae_native_pages::PAGE_SIZE).ok()?))
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        page_file.seek(SeekFrom::Start(offset))?;
+        page_file.write_all(&forged)?;
+        page_file.sync_data()?;
+        let outcome = NativeDatabase::open(temporary.path());
+        assert!(
+            matches!(
+                outcome,
+                Err(NativeRuntimeError::FuturePage | NativeRuntimeError::BTree(_))
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
         Ok(())
     }
 

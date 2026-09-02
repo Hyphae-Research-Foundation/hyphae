@@ -130,6 +130,18 @@ During open, Hyphae verifies that every checkpoint:
 4. retains valid reachable pages for every committed root, including roots
    superseded by later commits.
 
+Root validation at open has two depths. Every retained committed root is
+structurally verified: each engine root page has an admitted kind and a
+creating CSN at or below the commit CSN, and each B+tree root reaches a
+complete, acyclic, canonically ordered, balanced tree whose pages all verify
+and are visible at that CSN. Only the root that becomes current is
+additionally decoded into complete logical state before visibility advances.
+A superseded root is reachable to a reader only through a snapshot pin, and
+pin resolution performs that complete decode when the pin is used. Open time
+therefore scales with retained pages plus one complete-state decode, not with
+one complete decode per retained commit; retiring the prefix through vacuum,
+checkpoint, and WAL retention keeps the retained set bounded.
+
 Without a retention anchor, recovery scans the complete WAL. With a verified
 `HYWAR002` anchor, current-root retention and bounded suffix replay are
 implemented. The same anchor selects one exact immutable manifest generation
