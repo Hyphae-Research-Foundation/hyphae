@@ -23,8 +23,24 @@
 //! latency). The scorer work recorded in `scale_stage_diagnostic` —
 //! self-describing postings, lazy length prescan, linear score merge,
 //! dictionary-backed prefix/fuzzy expansion — brought the 100k query
-//! ladder to roughly 4x the 10k row, i.e. near-linear. Ingest (48 docs/s
-//! under per-batch atomic commits) is now the dominant cost of the rung.
+//! ladder to roughly 4x the 10k row, i.e. near-linear.
+//!
+//! Ingest receipts after point-resolved batch ingest (delta staging, no
+//! complete-state load at BEGIN/commit/receipt, coalesced scalar root
+//! construction, buffer-pool probes in root construction), same devbox:
+//!
+//! | rung | ingest docs/s | ingest s | vacuum s | dir after | reopen | bm25 p50 | filtered p50 | phrase p50 | fuzzy p50 |
+//! |------|--------------|----------|----------|-----------|--------|----------|--------------|------------|-----------|
+//! | 100k | 1,198        | 83.5     | 17.9     | 385 MB    | 11.5 s | 73 ms    | 108 ms       | 97 ms      | 194 ms    |
+//! | 250k | 934          | 268      | 50.1     | 2.1 GB    | 52 s   | 207 ms   | 308 ms       | 268 ms     | 634 ms    |
+//!
+//! The 250k rung ran with the collection bound lifted on the measurement
+//! host only; the shipped bound is unchanged until the contract is raised.
+//! Open time is dominated by validating every retained committed root:
+//! without the post-load `vacuum_pages` + `checkpoint` + `retain_wal`
+//! maintenance step a 100k directory holding ~400 unretired batch commits
+//! reopened in ~17 minutes (one complete-state validation per commit).
+//! Set `HYPHAE_SCALE_SKIP_MAINTENANCE=1` to reproduce that number.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -158,6 +174,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingested += count;
     }
     let ingest_elapsed = started.elapsed();
+    // Steady-state maintenance after a bulk load: rebuild the current root
+    // into a compact generation (advances the retention floor), publish a
+    // synchronized checkpoint at that floor, and retire the WAL prefix. A
+    // later open then validates the retained root and replays at most the
+    // suffix instead of re-validating one root per ingested batch. The
+    // open-time cost without this step is reported separately.
+    if (!reuse || append > 0) && std::env::var_os("HYPHAE_SCALE_SKIP_MAINTENANCE").is_none() {
+        let maintenance_started = Instant::now();
+        let mut admin = product.administration();
+        let vacuum = admin.vacuum_pages()?;
+        let after_vacuum = maintenance_started.elapsed();
+        admin.checkpoint()?;
+        admin.retain_wal()?;
+        admin.collect_retired_page_generations()?;
+        println!(
+            "maintenance vacuum_seconds={:.1} vacuum_applied={} checkpoint_retain_seconds={:.1}",
+            after_vacuum.as_secs_f64(),
+            vacuum.applied,
+            maintenance_started
+                .elapsed()
+                .saturating_sub(after_vacuum)
+                .as_secs_f64()
+        );
+    }
 
     // Query ladder: plain BM25, filtered+faceted, phrase, fuzzy.
     let request =
