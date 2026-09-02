@@ -17,6 +17,7 @@
 //! | retained-model scorer  | ~245,000 ms | (unchanged, fail-open only) |
 //! | complete integrated    | ~200 ms     | ~165 ms             |
 //! | integrated + Eq filter | ~230 ms     | ~180 ms             |
+//! | integrated sparse (2 rare terms) | — | ~16 ms            |
 //!
 //! The integrated pipeline adds almost nothing over the durable scorer.
 //! Per-posting profiling showed the scorer spent most of its time on one
@@ -126,6 +127,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result = product.search_collection(collection, &request, 1_000_002 + round)?;
         println!(
             "stage=integrated round={round} hits={} ms={:.1}",
+            result.hits.len(),
+            begun.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
+
+    // Stage 3b: a sparse query (rare trailing term) exercises the
+    // per-posting descent path that dense queries no longer take.
+    let sparse = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "99999 88888".to_owned(),
+            candidate_limit: 1_000,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 10,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    for round in 0..3 {
+        let begun = Instant::now();
+        let result = product.search_collection(collection, &sparse, 1_000_020 + round)?;
+        println!(
+            "stage=integrated_sparse round={round} hits={} ms={:.1}",
             result.hits.len(),
             begun.elapsed().as_secs_f64() * 1_000.0,
         );
