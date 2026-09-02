@@ -160,9 +160,14 @@ proceed as adopted and are orthogonal.
   in the product search path is deleted. Evidence: filtered recall/latency
   at 100k documents across a selectivity sweep, all recall-risk labels
   exercised.
-- **R5** Staged collection-cap raise: 10k → 100k on R4 evidence, → 1M on
-  measured consolidation cost and RSS at 1M×768-dim. The cap moves only
-  when the receipt exists.
+- **R5** Staged collection-cap raise: 10k → 100k on R4 evidence; → 250k on
+  the [2026-09-02 rung receipt](../gates/evidence/collection-cap-250k-2026-09-02.md)
+  (point-resolved batch ingest 48 → 949–1,261 docs/s, open decoding
+  complete state once, borrowed-leaf durable scorer 73 → 26 ms bm25 p50 at
+  100k and 63 ms at 250k, bit-identical model/durable scorer hits at both
+  rungs); → 1M on measured consolidation cost and RSS at 1M×768-dim plus a
+  manifest that no longer rewrites 16 bytes per document per batch. The cap
+  moves only when the receipt exists.
 - **R6** Filter operators In / ContainsAny / ContainsAll / bounded Like /
   IsNull and doc-value types Float, Date (canonical epoch integer), Array —
   product model, SQL surface, proof binding, SDKs. Decided ordering story:

@@ -46,8 +46,13 @@ pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
 /// Raised from 10,000 on the R-track evidence chain (posting-index
 /// eligibility, pinned posting scorer, cached snapshot state, and the
-/// sealed `FiQA` relevance receipt); the next rung is evidence-gated.
-pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 100_000;
+/// sealed `FiQA` relevance receipt), then to 250,000 on the
+/// point-resolved ingest, single-decode open, borrowed-leaf scorer, and
+/// bit-identical scorer-equivalence receipt
+/// (`docs/gates/evidence/collection-cap-250k-2026-09-02.md`). The next
+/// rung is evidence-gated; the manifest rewrite per batch (16 bytes per
+/// document) must be re-measured or restructured before 1,000,000.
+pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 250_000;
 /// Maximum named vector targets in one collection or request.
 pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
 /// Maximum retrieval candidates requested from one native branch.
@@ -3866,4 +3871,87 @@ fn idempotency_conflict() -> ProductError {
 
 fn corruption() -> ProductError {
     ProductError::from_code(ProductErrorCode::Corruption)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document(id: u128) -> ProductDocument {
+        ProductDocument {
+            object_id: crate::ObjectId::new(id).unwrap_or_else(|_| unreachable!("nonzero id")),
+            text: "bound".to_owned(),
+            doc_values: BTreeMap::new(),
+            vectors: BTreeMap::new(),
+        }
+    }
+
+    fn manifest_with(count: usize) -> Result<Vec<u8>, ProductError> {
+        let identities = (1..=count)
+            .map(|id| crate::ObjectId::new(u128::try_from(id).unwrap_or(1)))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| corruption())?;
+        encode_manifest(&identities)
+    }
+
+    /// The collection bound admits exactly `MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS`
+    /// identities, rejects the first document past it before any mutation,
+    /// and the manifest round-trips at that size.
+    #[test]
+    fn collection_bound_is_exact_and_fails_closed() -> Result<(), ProductError> {
+        assert_eq!(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS, 250_000);
+        let full_minus_one = manifest_with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
+        let last = ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents: vec![document(
+                u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS).unwrap_or(1),
+            )],
+        };
+        let (identities, was_empty) = NativeProduct::ingest_manifest(&full_minus_one, &last)?;
+        assert!(!was_empty);
+        assert_eq!(identities.len(), MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS);
+        let full = encode_manifest(&identities)?;
+        assert_eq!(
+            full.len(),
+            12 + MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS * 16,
+            "manifest is 16 bytes per identity plus header"
+        );
+        assert_eq!(decode_manifest(&full)?, identities);
+
+        let one_more = ProductSearchIngestBatch {
+            idempotency_id: 2,
+            documents: vec![document(
+                u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1),
+            )],
+        };
+        let error = NativeProduct::ingest_manifest(&full, &one_more)
+            .err()
+            .ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+
+        // A batch that would cross the bound is rejected as a whole even when
+        // part of it would fit.
+        let two = ProductSearchIngestBatch {
+            idempotency_id: 3,
+            documents: vec![
+                document(u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS).unwrap_or(1)),
+                document(u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1)),
+            ],
+        };
+        let error = NativeProduct::ingest_manifest(&full_minus_one, &two)
+            .err()
+            .ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+
+        // Duplicate identities fail closed under the bound.
+        let duplicate = ProductSearchIngestBatch {
+            idempotency_id: 4,
+            documents: vec![document(1)],
+        };
+        let error = NativeProduct::ingest_manifest(&full_minus_one, &duplicate)
+            .err()
+            .ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+        Ok(())
+    }
 }

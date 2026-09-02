@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3);
+    let mut durable_hits = Vec::new();
     for round in 0..scorer_rounds {
         let begun = Instant::now();
         let receipt = product.match_text_receipt_for_diagnostics(
@@ -72,6 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "database engine",
             1_000,
         )?;
+        if round == 0 {
+            durable_hits.clone_from(&receipt.hits);
+        }
         println!(
             "stage=durable_scorer round={round} hits={} ms={:.1} terms={} segments={} physical_entries={} workers={} batches={}",
             receipt.hits.len(),
@@ -87,19 +91,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 2: the retained-model scorer for comparison. Skipped under
     // HYPHAE_DIAG_SKIP_MODEL=1 (it costs minutes at the 100k rung and
     // drowns profiler samples).
+    // When it runs, the model's ranked hits are the oracle: the durable
+    // scorer must reproduce them exactly (ids, order, scores) or the run
+    // fails, so a rung receipt doubles as scorer equivalence evidence.
     let skip_model = std::env::var("HYPHAE_DIAG_SKIP_MODEL").is_ok();
     for round in 0..3 {
         if skip_model {
             break;
         }
         let begun = Instant::now();
-        let hits =
-            snapshot.match_text_for_diagnostics(binding.lexical_index, "database engine", 1_000)?;
+        let hits = snapshot.match_text_hits_for_diagnostics(
+            binding.lexical_index,
+            "database engine",
+            1_000,
+        )?;
         println!(
             "stage=model_scorer round={round} hits={} ms={:.1}",
-            hits,
+            hits.len(),
             begun.elapsed().as_secs_f64() * 1_000.0,
         );
+        if round == 0 {
+            if hits.len() != durable_hits.len() {
+                return Err(format!(
+                    "scorer divergence: model {} hits, durable {} hits",
+                    hits.len(),
+                    durable_hits.len()
+                )
+                .into());
+            }
+            for (position, (model, durable)) in hits.iter().zip(&durable_hits).enumerate() {
+                if model.document_id != durable.document_id
+                    || model.score.to_bits() != durable.score.to_bits()
+                {
+                    return Err(format!(
+                        "scorer divergence at rank {position}: model ({:?}, {}) durable ({:?}, {})",
+                        model.document_id, model.score, durable.document_id, durable.score
+                    )
+                    .into());
+                }
+            }
+            println!(
+                "stage=scorer_equivalence hits={} bit_identical=true",
+                hits.len()
+            );
+        }
     }
     drop(snapshot);
 

@@ -234,9 +234,22 @@ impl ProductSnapshot {
         query: &str,
         limit: usize,
     ) -> Result<usize, ProductError> {
+        self.match_text_hits_for_diagnostics(index, query, limit)
+            .map(|hits| hits.len())
+    }
+
+    /// Returns the retained-model scorer's ranked hits so the evidence
+    /// harness can compare them bit-for-bit against the durable scorer.
+    /// Diagnostic surface; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_hits_for_diagnostics(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
         self.inner
             .match_text(index, query, limit)
-            .map(|hits| hits.len())
             .map_err(ProductError::from)
     }
 
