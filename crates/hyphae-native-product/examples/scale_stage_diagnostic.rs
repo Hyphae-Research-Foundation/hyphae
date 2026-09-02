@@ -25,7 +25,8 @@
 //! set from sorted input, and the manifest decodes into a sorted bulk
 //! build. At 250k: integrated 63 -> 39 ms, Eq filter 74 -> 33 ms, the
 //! ladder's `price < 500` range + `category` facet (125,000 eligible)
-//! 121 -> 46 ms. The "borrowed
+//! 121 -> 46 ms. Fuzzy (distance 1) expansion over the durable dictionary
+//! then stopped materializing entries: 207 -> ~60 ms at 250k. The "borrowed
 //! leaves" column: segment planning reads only leaf boundary keys, posting
 //! scans borrow from the buffer-pool frame, and the merge ranks arena
 //! offsets — the allocator (malloc/free/memcmp on per-entry `Vec<u8>`) was
@@ -262,6 +263,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "stage=integrated_range_facet round={round} hits={} eligible={} ms={:.1}",
             result.hits.len(),
             result.eligible_documents,
+            begun.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
+
+    // Stage 6: fuzzy expansion (distance 1) over the durable dictionary
+    // in front of the same scorer.
+    let fuzzy = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "datbase".to_owned(),
+            candidate_limit: 1_000,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: Some(1),
+            phrase: false,
+        }),
+        filter: ProductSearchFilter::MatchAll,
+        facets: Vec::new(),
+        ..range_facet
+    };
+    let fuzzy_rounds: u32 = std::env::var("HYPHAE_DIAG_FUZZY_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    for round in 0..fuzzy_rounds {
+        let begun = Instant::now();
+        let result = product.search_collection(collection, &fuzzy, 1_000_030 + i64::from(round))?;
+        println!(
+            "stage=integrated_fuzzy round={round} hits={} ms={:.1}",
+            result.hits.len(),
             begun.elapsed().as_secs_f64() * 1_000.0,
         );
     }

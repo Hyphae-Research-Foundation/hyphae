@@ -56,11 +56,17 @@ verifies every retained root structurally.
 
 | rung | bm25 | filtered (`price < 500`) + facet | phrase | fuzzy (distance 1) |
 |------|------|----------------------------------|--------|--------------------|
-| 100k | 19 ms | 20 ms | 22 ms | 80 ms  |
-| 250k | 41 ms | 46 ms | 42 ms | 211 ms |
-| ratio (2.5× documents) | 2.2× | 2.4× | 1.9× | 2.6× |
+| 100k | 16 ms | 20 ms | 22 ms | 19 ms |
+| 250k | 39 ms | 46 ms | 42 ms | 61 ms |
+| ratio (2.5× documents) | 2.4× | 2.4× | 1.9× | 3.2× |
 
-Measured with the shipped bound (`c783e2c`, reopened corpora). The
+Measured with the shipped bound (reopened corpora). Fuzzy expansion walks
+the whole term dictionary of the index once per query term; after the
+dictionary walk stopped materializing entries (borrowed leaf visits,
+reusable Levenshtein rows, byte-length pre-filter) it went 80 → 19 ms at
+100k and 211 → 61 ms at 250k. Its ratio reflects a dictionary that grows
+with the corpus (`document {ordinal}` adds one unique term per document in
+this synthetic corpus), not the posting scan. The
 intermediate receipt before eligibility stopped copying keys — bm25 26 /
 63 ms, filtered+facet 43 / 137 ms (3.2×), phrase 28 / 68 ms, fuzzy 78 /
 227 ms — is kept in the `collection_scale_evidence` header for the trend.
@@ -100,7 +106,7 @@ re-measured or restructured before that rung.
 - No named vectors in the ladder corpus: a batch that carries vectors keeps
   the materialized ingest transaction and its cost is not covered by the
   ingest table.
-- Fuzzy expansion (distance 1) is the least linear stage remaining (2.6×
-  for 2.5× documents; 211 ms p50 at 250k) and is the next profiling
-  target; the bound is raised on the aggregate receipt, not on a claim that
-  every stage is linear.
+- Fuzzy expansion scales with the live term dictionary, which in this
+  synthetic corpus grows one unique term per document; a natural-language
+  corpus has a sublinear dictionary. The bound is raised on the aggregate
+  receipt, not on a claim that every stage is linear.

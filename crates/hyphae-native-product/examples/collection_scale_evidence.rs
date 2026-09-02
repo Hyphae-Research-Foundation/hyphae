@@ -54,7 +54,9 @@
 //! | 100k | 19 ms    | 20 ms        | 22 ms      | 80 ms     |
 //! | 250k | 41 ms    | 46 ms        | 42 ms      | 211 ms    |
 //!
-//! Ratios for 2.5x documents: 2.2x / 2.4x / 1.9x / 2.6x.
+//! Ratios for 2.5x documents: 2.2x / 2.4x / 1.9x / 2.6x. After the
+//! dictionary walk stopped materializing entries, fuzzy went 80 -> 19 ms
+//! at 100k and 211 -> 61 ms at 250k.
 //!
 //! The 250k rung ran with the collection bound lifted on the measurement
 //! host only; the shipped bound is unchanged until the contract is raised.

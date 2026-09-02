@@ -1756,23 +1756,47 @@ fn seeded_member_walk(members: &[Vec<u8>], seed: u64, count: usize) -> Vec<Vec<u
 /// Whether two character sequences are within `max_distance` Levenshtein
 /// edits, using the banded early-exit dynamic program.
 fn bounded_levenshtein(left: &[char], right: &[char], max_distance: usize) -> bool {
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current = vec![0_usize; right.len() + 1];
-    for (left_index, left_character) in left.iter().enumerate() {
-        current[0] = left_index + 1;
-        let mut row_minimum = current[0];
-        for (right_index, right_character) in right.iter().enumerate() {
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(previous[right_index] + usize::from(left_character != right_character));
-            row_minimum = row_minimum.min(current[right_index + 1]);
+    BoundedLevenshtein::new(right.len()).within(left, right, max_distance)
+}
+
+/// Reusable two-row Levenshtein workspace so a dictionary walk does not
+/// allocate per candidate. `within` is bit-identical to the free function.
+struct BoundedLevenshtein {
+    previous: Vec<usize>,
+    current: Vec<usize>,
+}
+
+impl BoundedLevenshtein {
+    fn new(capacity: usize) -> Self {
+        Self {
+            previous: Vec::with_capacity(capacity + 1),
+            current: Vec::with_capacity(capacity + 1),
         }
-        if row_minimum > max_distance {
-            return false;
-        }
-        std::mem::swap(&mut previous, &mut current);
     }
-    previous[right.len()] <= max_distance
+
+    fn within(&mut self, left: &[char], right: &[char], max_distance: usize) -> bool {
+        self.previous.clear();
+        self.previous.extend(0..=right.len());
+        self.current.clear();
+        self.current.resize(right.len() + 1, 0);
+        for (left_index, left_character) in left.iter().enumerate() {
+            self.current[0] = left_index + 1;
+            let mut row_minimum = self.current[0];
+            for (right_index, right_character) in right.iter().enumerate() {
+                self.current[right_index + 1] = (self.previous[right_index + 1] + 1)
+                    .min(self.current[right_index] + 1)
+                    .min(
+                        self.previous[right_index] + usize::from(left_character != right_character),
+                    );
+                row_minimum = row_minimum.min(self.current[right_index + 1]);
+            }
+            if row_minimum > max_distance {
+                return false;
+            }
+            std::mem::swap(&mut self.previous, &mut self.current);
+        }
+        self.previous[right.len()] <= max_distance
+    }
 }
 
 /// Exclusive upper bound of a literal binary prefix, `None` when unbounded.
@@ -16272,23 +16296,45 @@ impl NativeDatabase {
             key_prefix.truncate(17);
         }
         let mut added = Vec::new();
-        for (key, value) in tree.scan_prefix(&self.pages, &key_prefix)? {
-            if is_search_term_metadata_tombstone(&value) {
-                continue;
-            }
-            let (_, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
-            let term =
-                std::str::from_utf8(term).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-            if collected.contains(term) {
-                continue;
-            }
-            if collected.len() == limit {
-                return Ok(TermPrefixExpansion::Overflow);
-            }
-            collected.insert(term.to_owned());
-            added.push(term.to_owned());
+        let mut outcome: Result<Option<TermPrefixExpansion>, NativeRuntimeError> = Ok(None);
+        // The control flow is folded into `outcome`; an early break either
+        // carries an error or the overflow marker.
+        let _flow = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &key_prefix,
+            None,
+            |key, value| {
+                if is_search_term_metadata_tombstone(value) {
+                    return ControlFlow::Continue(());
+                }
+                let term = match decode_search_object_key(key, SEARCH_TERM_META_PREFIX).and_then(
+                    |(_, term)| {
+                        std::str::from_utf8(term).map_err(|_| NativeRuntimeError::InvalidSearchTree)
+                    },
+                ) {
+                    Ok(term) => term,
+                    Err(error) => {
+                        outcome = Err(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if collected.contains(term) {
+                    return ControlFlow::Continue(());
+                }
+                if collected.len() == limit {
+                    outcome = Ok(Some(TermPrefixExpansion::Overflow));
+                    return ControlFlow::Break(());
+                }
+                collected.insert(term.to_owned());
+                added.push(term.to_owned());
+                ControlFlow::Continue(())
+            },
+        )?;
+        match outcome? {
+            Some(overflow) => Ok(overflow),
+            None => Ok(TermPrefixExpansion::Terms(added)),
         }
-        Ok(TermPrefixExpansion::Terms(added))
     }
 
     /// Expands one analyzed term over the durable live term dictionary
@@ -16322,29 +16368,60 @@ impl NativeDatabase {
         key_prefix.extend_from_slice(&index.get().to_be_bytes());
         let query: Vec<char> = term.chars().collect();
         let mut added = Vec::new();
-        for (key, value) in tree.scan_prefix(&self.pages, &key_prefix)? {
-            if is_search_term_metadata_tombstone(&value) {
-                continue;
-            }
-            let (_, candidate) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
-            let candidate = std::str::from_utf8(candidate)
-                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-            if collected.contains(candidate) {
-                continue;
-            }
-            let candidate_chars: Vec<char> = candidate.chars().collect();
-            if query.len().abs_diff(candidate_chars.len()) > max_distance
-                || !bounded_levenshtein(&query, &candidate_chars, max_distance)
-            {
-                continue;
-            }
-            if collected.len() == limit {
-                return Ok(TermPrefixExpansion::Overflow);
-            }
-            collected.insert(candidate.to_owned());
-            added.push(candidate.to_owned());
+        let mut candidate_chars: Vec<char> = Vec::with_capacity(query.len() + max_distance);
+        let mut matcher = BoundedLevenshtein::new(query.len() + max_distance);
+        let mut outcome: Result<Option<TermPrefixExpansion>, NativeRuntimeError> = Ok(None);
+        // The control flow is folded into `outcome`; an early break either
+        // carries an error or the overflow marker.
+        let _flow = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &key_prefix,
+            None,
+            |key, value| {
+                if is_search_term_metadata_tombstone(value) {
+                    return ControlFlow::Continue(());
+                }
+                let candidate = match decode_search_object_key(key, SEARCH_TERM_META_PREFIX)
+                    .and_then(|(_, candidate)| {
+                        std::str::from_utf8(candidate)
+                            .map_err(|_| NativeRuntimeError::InvalidSearchTree)
+                    }) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        outcome = Err(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                // Byte length bounds character count from above, so a
+                // candidate that is too short in bytes needs no decode; a
+                // long one is cut by the character-count check below.
+                if candidate.len() + max_distance < query.len() {
+                    return ControlFlow::Continue(());
+                }
+                candidate_chars.clear();
+                candidate_chars.extend(candidate.chars());
+                if query.len().abs_diff(candidate_chars.len()) > max_distance
+                    || !matcher.within(&query, &candidate_chars, max_distance)
+                {
+                    return ControlFlow::Continue(());
+                }
+                if collected.contains(candidate) {
+                    return ControlFlow::Continue(());
+                }
+                if collected.len() == limit {
+                    outcome = Ok(Some(TermPrefixExpansion::Overflow));
+                    return ControlFlow::Break(());
+                }
+                collected.insert(candidate.to_owned());
+                added.push(candidate.to_owned());
+                ControlFlow::Continue(())
+            },
+        )?;
+        match outcome? {
+            Some(overflow) => Ok(overflow),
+            None => Ok(TermPrefixExpansion::Terms(added)),
         }
-        Ok(TermPrefixExpansion::Terms(added))
     }
 
     /// The durable search tree at the snapshot's root when the directory

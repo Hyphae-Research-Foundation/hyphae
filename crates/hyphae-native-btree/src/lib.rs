@@ -3024,27 +3024,35 @@ where
         return Err(BTreeError::Cycle);
     }
     let frame = pool.get_or_load(store, page_id)?;
-    match decode_page(frame.page())? {
-        Node::Leaf(entries) => {
-            for entry in entries
-                .into_iter()
-                .skip_while(|entry| entry.key.as_slice() < prefix)
-                .take_while(|entry| entry.key.starts_with(prefix))
-                .skip_while(|entry| !key_satisfies_lower(&entry.key, lower))
-                .take_while(|entry| key_satisfies_upper(&entry.key, upper))
-            {
-                if last_key
-                    .as_deref()
-                    .is_some_and(|previous| previous >= entry.key.as_slice())
-                {
-                    return Err(BTreeError::NoncanonicalKeyOrder);
+    // Leaves are visited in place: the borrowed decode performs the full
+    // leaf verification, and only the cross-leaf order cursor is copied.
+    if frame.page().kind() == PageKind::BTreeLeaf {
+        let leaf = BorrowedLeaf::decode(frame.page().payload())?;
+        for (key, value) in leaf
+            .entries()
+            .skip_while(|(key, _)| *key < prefix)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .skip_while(|(key, _)| !key_satisfies_lower(key, lower))
+            .take_while(|(key, _)| key_satisfies_upper(key, upper))
+        {
+            if last_key.as_deref().is_some_and(|previous| previous >= key) {
+                return Err(BTreeError::NoncanonicalKeyOrder);
+            }
+            match last_key.as_mut() {
+                Some(previous) => {
+                    previous.clear();
+                    previous.extend_from_slice(key);
                 }
-                last_key.replace(entry.key.clone());
-                if visitor(&entry.key, &entry.value).is_break() {
-                    return Ok(ControlFlow::Break(()));
-                }
+                None => *last_key = Some(key.to_vec()),
+            }
+            if visitor(key, value).is_break() {
+                return Ok(ControlFlow::Break(()));
             }
         }
+        return Ok(ControlFlow::Continue(()));
+    }
+    match decode_page(frame.page())? {
+        Node::Leaf(_) => return Err(BTreeError::WrongPageKind),
         Node::Internal { keys, children } => {
             for (index, child) in children.into_iter().enumerate() {
                 let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));
