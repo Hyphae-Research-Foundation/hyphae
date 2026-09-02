@@ -517,6 +517,57 @@ impl BTree {
             .collect())
     }
 
+    /// Visits one planned leaf segment's in-bound entries in canonical order
+    /// without materializing the leaf.
+    ///
+    /// Behaves exactly like [`Self::scan_planned_segment_cached`] — the same
+    /// foreign-segment, page-kind, and separator/count cross-checks against
+    /// the plan, the same bound filtering — but borrows each key and value
+    /// from the verified buffer-pool frame instead of allocating a `Vec`
+    /// per entry. Hot scans over wide leaves use this to keep their cost
+    /// proportional to the matched entries, not to the allocator.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::scan_planned_segment_cached`].
+    pub fn visit_planned_segment_cached<F, E>(
+        self,
+        store: &PageStore,
+        pool: &BufferPool,
+        segment: &BTreeSegment,
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<(), E>,
+        E: From<BTreeError>,
+    {
+        if self.root != Some(segment.root) {
+            return Err(BTreeError::ForeignSegment.into());
+        }
+        let frame = pool
+            .get_or_load(store, segment.page)
+            .map_err(BTreeError::from)?;
+        let page = frame.page();
+        if page.kind() != PageKind::BTreeLeaf {
+            return Err(BTreeError::WrongPageKind.into());
+        }
+        let leaf = BorrowedLeaf::decode(page.payload())?;
+        if leaf.minimum != segment.minimum.as_slice()
+            || leaf.maximum != segment.maximum.as_slice()
+            || leaf.count != segment.entry_count
+        {
+            return Err(BTreeError::InvalidSeparator.into());
+        }
+        let lower = borrowed_bound(&segment.lower);
+        let upper = borrowed_bound(&segment.upper);
+        for (key, value) in leaf.entries() {
+            if key_satisfies_lower(key, lower) && key_satisfies_upper(key, upper) {
+                visitor(key, value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies the complete tree and returns its node height.
     ///
     /// An empty tree has height zero and a single leaf has height one.
@@ -2263,6 +2314,80 @@ fn encode_leaf(entries: &[LeafEntry]) -> Result<Vec<u8>, BTreeError> {
     Ok(bytes)
 }
 
+/// One verified leaf payload whose entries are borrowed rather than copied.
+///
+/// Construction performs every check `decode_leaf` performs — preamble,
+/// count bound, exact length consumption, canonical strictly ascending key
+/// order, and key-size/length limits — so a `BorrowedLeaf` is as trusted as
+/// a decoded [`Node::Leaf`].
+struct BorrowedLeaf<'payload> {
+    body: &'payload [u8],
+    count: usize,
+    minimum: &'payload [u8],
+    maximum: &'payload [u8],
+}
+
+impl<'payload> BorrowedLeaf<'payload> {
+    fn decode(payload: &'payload [u8]) -> Result<Self, BTreeError> {
+        if payload.len() < LEAF_HEADER_SIZE {
+            return Err(BTreeError::InvalidLength);
+        }
+        if &payload[0..8] != LEAF_MAGIC
+            || read_u16(&payload[8..10]) != FORMAT_VERSION
+            || payload[12..16].iter().any(|byte| *byte != 0)
+        {
+            return Err(BTreeError::InvalidPreamble);
+        }
+        let count = usize::from(read_u16(&payload[10..12]));
+        if count == 0 || count > (payload.len() - LEAF_HEADER_SIZE) / 8 {
+            return Err(BTreeError::InvalidCount);
+        }
+        let body = &payload[LEAF_HEADER_SIZE..];
+        let mut cursor = Cursor::new(body);
+        let mut previous: Option<&[u8]> = None;
+        let mut minimum: &[u8] = &[];
+        for _ in 0..count {
+            let key_length = cursor.length()?;
+            let value_length = cursor.length()?;
+            let key = cursor.take(key_length)?;
+            cursor.take(value_length)?;
+            if key.len() > BTREE_MAX_KEY_SIZE {
+                return Err(BTreeError::KeyTooLarge);
+            }
+            u32::try_from(key_length).map_err(|_| BTreeError::LengthOverflow)?;
+            u32::try_from(value_length).map_err(|_| BTreeError::LengthOverflow)?;
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(BTreeError::NoncanonicalKeyOrder);
+            }
+            if previous.is_none() {
+                minimum = key;
+            }
+            previous = Some(key);
+        }
+        cursor.finish()?;
+        Ok(Self {
+            body,
+            count,
+            minimum,
+            maximum: previous.ok_or(BTreeError::InvalidCount)?,
+        })
+    }
+
+    /// Iterates the verified entries in stored order.
+    fn entries(&self) -> impl Iterator<Item = (&'payload [u8], &'payload [u8])> {
+        let mut cursor = Cursor::new(self.body);
+        (0..self.count).map(move |_| {
+            // Lengths and bounds were verified in `decode`; the payload is
+            // immutable, so these reads cannot fail.
+            let key_length = cursor.length().unwrap_or(0);
+            let value_length = cursor.length().unwrap_or(0);
+            let key = cursor.take(key_length).unwrap_or(&[]);
+            let value = cursor.take(value_length).unwrap_or(&[]);
+            (key, value)
+        })
+    }
+}
+
 fn decode_leaf(payload: &[u8]) -> Result<Node, BTreeError> {
     if payload.len() < LEAF_HEADER_SIZE {
         return Err(BTreeError::InvalidLength);
@@ -2633,22 +2758,25 @@ fn plan_range_segments_node_cached(
         return Err(BTreeError::Cycle);
     }
     let frame = pool.get_or_load(store, page_id)?;
-    match decode_page(frame.page())? {
-        Node::Leaf(entries) => {
-            let minimum = entries.first().ok_or(BTreeError::InvalidCount)?.key.clone();
-            let maximum = entries.last().ok_or(BTreeError::InvalidCount)?.key.clone();
-            if segment_intersects_bounds(&minimum, &maximum, lower, upper) {
-                output.push(BTreeSegment {
-                    root,
-                    page: page_id,
-                    minimum,
-                    maximum,
-                    entry_count: entries.len(),
-                    lower: owned_bound(lower),
-                    upper: owned_bound(upper),
-                });
-            }
+    // A leaf contributes only its verified boundary keys and count to the
+    // plan; borrow them instead of materializing every entry.
+    if frame.page().kind() == PageKind::BTreeLeaf {
+        let leaf = BorrowedLeaf::decode(frame.page().payload())?;
+        if segment_intersects_bounds(leaf.minimum, leaf.maximum, lower, upper) {
+            output.push(BTreeSegment {
+                root,
+                page: page_id,
+                minimum: leaf.minimum.to_vec(),
+                maximum: leaf.maximum.to_vec(),
+                entry_count: leaf.count,
+                lower: owned_bound(lower),
+                upper: owned_bound(upper),
+            });
         }
+        return Ok(());
+    }
+    match decode_page(frame.page())? {
+        Node::Leaf(_) => return Err(BTreeError::WrongPageKind),
         Node::Internal { keys, children } => {
             for (index, child) in children.into_iter().enumerate() {
                 let child_lower = index.checked_sub(1).and_then(|prior| keys.get(prior));

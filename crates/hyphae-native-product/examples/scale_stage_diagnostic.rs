@@ -11,13 +11,20 @@
 //!
 //! Receipts at the 100k rung (c-16 devbox, release):
 //!
-//! | stage                  | baseline    | dense prescan | HYPOST02 corpus |
-//! |------------------------|-------------|---------------|-----------------|
-//! | durable posting scorer | ~260 ms     | ~140 ms       | ~47 ms          |
-//! | complete integrated    | ~200 ms     | ~165 ms       | ~71 ms          |
-//! | integrated + Eq filter | ~230 ms     | ~180 ms       | ~80 ms          |
-//! | integrated sparse      | —           | ~16 ms        | ~17 ms          |
-//! | retained-model scorer  | ~245,000 ms | (fail-open path only)         |
+//! | stage                  | baseline    | dense prescan | HYPOST02 corpus | borrowed leaves |
+//! |------------------------|-------------|---------------|-----------------|-----------------|
+//! | durable posting scorer | ~260 ms     | ~140 ms       | ~47 ms          | ~8 ms           |
+//! | complete integrated    | ~200 ms     | ~165 ms       | ~71 ms          | ~28 ms          |
+//! | integrated + Eq filter | ~230 ms     | ~180 ms       | ~80 ms          | ~34 ms          |
+//! | integrated sparse      | —           | ~16 ms        | ~17 ms          | ~15 ms          |
+//! | retained-model scorer  | ~245,000 ms | (fail-open path only)                             |
+//!
+//! At the 250k rung (393 segments, 93,702 physical entries) the durable
+//! scorer went ~112 ms -> ~23 ms with the same change. The "borrowed
+//! leaves" column: segment planning reads only leaf boundary keys, posting
+//! scans borrow from the buffer-pool frame, and the merge ranks arena
+//! offsets — the allocator (malloc/free/memcmp on per-entry `Vec<u8>`) was
+//! ~70% of scorer samples before it.
 //!
 //! Stage trace at the HYPOST02 rung: plan terms ~14 ms, scan 166 segments
 //! ~19 ms, finalize ~32 ms. The document-length side lookup that

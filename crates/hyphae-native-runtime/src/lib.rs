@@ -3499,10 +3499,63 @@ struct LexicalSegmentWork {
     segment: BTreeSegment,
 }
 
+/// Scored postings from one planned leaf segment.
+///
+/// Document ids live back-to-back in `ids`; each contribution names its id
+/// by `(offset, length)` so the merge sorts, folds, and ranks without
+/// touching the allocator, and only the final `limit` hits copy their id.
 struct LexicalPostingBatch {
     term_index: usize,
     live_postings: u64,
-    contributions: Vec<(Vec<u8>, f64)>,
+    ids: Vec<u8>,
+    contributions: Vec<LexicalContribution>,
+}
+
+#[derive(Clone, Copy)]
+struct LexicalContribution {
+    id_offset: u32,
+    id_length: u32,
+    score: f64,
+}
+
+impl LexicalPostingBatch {
+    fn new(term_index: usize, capacity: usize) -> Self {
+        Self {
+            term_index,
+            live_postings: 0,
+            ids: Vec::with_capacity(capacity.saturating_mul(16)),
+            contributions: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, document_id: &[u8], score: f64) -> Result<(), NativeRuntimeError> {
+        let id_offset =
+            u32::try_from(self.ids.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        let id_length =
+            u32::try_from(document_id.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        id_offset
+            .checked_add(id_length)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        self.ids.extend_from_slice(document_id);
+        self.contributions.push(LexicalContribution {
+            id_offset,
+            id_length,
+            score,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn from_pairs(term_index: usize, live_postings: u64, pairs: &[(&[u8], f64)]) -> Self {
+        let mut batch = Self::new(term_index, pairs.len());
+        batch.live_postings = live_postings;
+        for (document_id, score) in pairs {
+            batch
+                .push(document_id, *score)
+                .unwrap_or_else(|_| unreachable!("test ids fit u32"));
+        }
+        batch
+    }
 }
 
 struct LexicalExecutionPlan {
@@ -31093,19 +31146,25 @@ fn scan_document_lengths_in_tree(
         tree.plan_range_segments_cached(pages, pool, Bound::Included(prefix.as_slice()), upper)?;
     let mut lengths = BTreeMap::new();
     for segment in &plan {
-        for (key, value) in tree.scan_planned_segment_cached(pages, pool, segment)? {
-            let document_id = key
-                .strip_prefix(prefix.as_slice())
-                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-            if is_search_document_tombstone(&value) {
-                if format.admits_tombstones() {
-                    continue;
+        tree.visit_planned_segment_cached(
+            pages,
+            pool,
+            segment,
+            |key, value| -> Result<(), NativeRuntimeError> {
+                let document_id = key
+                    .strip_prefix(prefix.as_slice())
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                if is_search_document_tombstone(value) {
+                    if format.admits_tombstones() {
+                        return Ok(());
+                    }
+                    return Err(NativeRuntimeError::InvalidSearchTree);
                 }
-                return Err(NativeRuntimeError::InvalidSearchTree);
-            }
-            let (document_length, _, _) = decode_search_document_header(&value)?;
-            lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
-        }
+                let (document_length, _, _) = decode_search_document_header(value)?;
+                lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
+                Ok(())
+            },
+        )?;
     }
     Ok(lengths)
 }
@@ -31122,54 +31181,61 @@ fn decode_lexical_segment(
     work: &LexicalSegmentWork,
     document_lengths: Option<&LazyDocumentLengths>,
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
-    let mut live_postings = 0_u64;
-    let mut contributions = Vec::with_capacity(work.segment.entry_count());
-    for (key, encoded_frequency) in tree.scan_planned_segment_cached(pages, pool, &work.segment)? {
-        let document_id = key
-            .strip_prefix(work.posting_prefix.as_slice())
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        let Some(term_frequency) = decode_live_search_posting(&encoded_frequency, format)? else {
-            continue;
-        };
-        live_postings = live_postings
-            .checked_add(1)
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        // Dense queries pre-scan every live document header once; a
-        // posting for an id absent from that complete map is corruption.
-        // Sparse queries keep the direct per-posting descent.
-        let document_length = if let Some(length) = term_frequency.document_length {
-            f64::from(length)
-        } else if let Some(lengths) = document_lengths {
-            *lengths
-                .get_or_scan(|| scan_document_lengths_in_tree(tree, pages, pool, format, index))?
-                .get(document_id)
-                .ok_or(NativeRuntimeError::InvalidSearchTree)?
-        } else {
-            let document = tree
-                .get_cached_pinned(pages, pool, &search_document_key(index, document_id)?)?
+    let mut batch = LexicalPostingBatch::new(work.term_index, work.segment.entry_count());
+    // Borrow each posting from the verified leaf frame: only the matched
+    // document id is appended to the batch arena, so a wide segment costs
+    // its live postings rather than one allocation per stored entry.
+    tree.visit_planned_segment_cached(
+        pages,
+        pool,
+        &work.segment,
+        |key, encoded_frequency| -> Result<(), NativeRuntimeError> {
+            let document_id = key
+                .strip_prefix(work.posting_prefix.as_slice())
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-            if is_search_document_tombstone(document.bytes()) {
-                return Err(NativeRuntimeError::InvalidSearchTree);
-            }
-            let (document_length, _, _) = decode_search_document_header(document.bytes())?;
-            search_count_f64(document_length)?
-        };
-        contributions.push((
-            document_id.to_vec(),
-            bm25_term_score(
-                work.idf,
-                f64::from(term_frequency.term_frequency),
-                document_length,
-                average_length,
-                parameters,
-            ),
-        ));
-    }
-    Ok(LexicalPostingBatch {
-        term_index: work.term_index,
-        live_postings,
-        contributions,
-    })
+            let Some(term_frequency) = decode_live_search_posting(encoded_frequency, format)?
+            else {
+                return Ok(());
+            };
+            batch.live_postings = batch
+                .live_postings
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            // Dense queries pre-scan every live document header once; a
+            // posting for an id absent from that complete map is corruption.
+            // Sparse queries keep the direct per-posting descent.
+            let document_length = if let Some(length) = term_frequency.document_length {
+                f64::from(length)
+            } else if let Some(lengths) = document_lengths {
+                *lengths
+                    .get_or_scan(|| {
+                        scan_document_lengths_in_tree(tree, pages, pool, format, index)
+                    })?
+                    .get(document_id)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?
+            } else {
+                let document = tree
+                    .get_cached_pinned(pages, pool, &search_document_key(index, document_id)?)?
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                if is_search_document_tombstone(document.bytes()) {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let (document_length, _, _) = decode_search_document_header(document.bytes())?;
+                search_count_f64(document_length)?
+            };
+            batch.push(
+                document_id,
+                bm25_term_score(
+                    work.idf,
+                    f64::from(term_frequency.term_frequency),
+                    document_length,
+                    average_length,
+                    parameters,
+                ),
+            )
+        },
+    )?;
+    Ok(batch)
 }
 
 fn finalize_lexical_batches(
@@ -31178,8 +31244,13 @@ fn finalize_lexical_batches(
     limit: usize,
 ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
     let mut live_postings = vec![0_u64; expected_document_frequencies.len()];
-    let mut contributions = Vec::new();
     let mut previous_term = None;
+    // Concatenate every batch arena once; contributions are rebased onto
+    // the shared arena so the merge below never allocates per id.
+    let total_ids: usize = batches.iter().map(|batch| batch.ids.len()).sum();
+    let total_contributions: usize = batches.iter().map(|batch| batch.contributions.len()).sum();
+    let mut ids = Vec::with_capacity(total_ids);
+    let mut contributions = Vec::with_capacity(total_contributions);
     for batch in batches {
         if batch.term_index >= live_postings.len()
             || previous_term.is_some_and(|previous| previous > batch.term_index)
@@ -31190,24 +31261,58 @@ fn finalize_lexical_batches(
         live_postings[batch.term_index] = live_postings[batch.term_index]
             .checked_add(batch.live_postings)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        contributions.extend(batch.contributions);
+        let base = u32::try_from(ids.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        ids.extend_from_slice(&batch.ids);
+        for contribution in batch.contributions {
+            let id_offset = base
+                .checked_add(contribution.id_offset)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            contributions.push(LexicalContribution {
+                id_offset,
+                ..contribution
+            });
+        }
     }
     if live_postings != expected_document_frequencies {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
+    let id_of = |contribution: &LexicalContribution| -> &[u8] {
+        let start = contribution.id_offset as usize;
+        let end = start.saturating_add(contribution.id_length as usize);
+        ids.get(start..end).unwrap_or(&[])
+    };
     // Sort once by document id and fold adjacent contributions. Batches
     // are ordered by term then document id, so the stable sort keeps
     // each document's per-term additions in term order — bit-identical
-    // to the previous BTreeMap accumulation, without 37k tree inserts.
-    contributions.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut scores = Vec::<(Vec<u8>, f64)>::with_capacity(contributions.len());
-    for (document_id, score) in contributions {
+    // to the previous BTreeMap accumulation, without per-id allocation.
+    contributions.sort_by(|left, right| id_of(left).cmp(id_of(right)));
+    let mut scores = Vec::<LexicalContribution>::with_capacity(contributions.len());
+    for contribution in contributions {
         match scores.last_mut() {
-            Some((last_id, total)) if *last_id == document_id => *total += score,
-            _ => scores.push((document_id, score)),
+            Some(last) if id_of(last) == id_of(&contribution) => last.score += contribution.score,
+            _ => scores.push(contribution),
         }
     }
-    Ok(rank_match_hits(scores, limit))
+    // Rank on the arena and copy only the retained ids.
+    scores.retain(|contribution| contribution.score > 0.0);
+    let order = |left: &LexicalContribution, right: &LexicalContribution| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| id_of(left).cmp(id_of(right)))
+    };
+    if limit < scores.len() {
+        scores.select_nth_unstable_by(limit, order);
+        scores.truncate(limit);
+    }
+    scores.sort_by(order);
+    Ok(scores
+        .into_iter()
+        .map(|contribution| MatchHit {
+            document_id: id_of(&contribution).to_vec(),
+            score: contribution.score,
+        })
+        .collect())
 }
 
 fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
@@ -38348,16 +38453,8 @@ mod tests {
     fn lexical_batch_merge_preserves_order_and_fails_closed_on_cardinality()
     -> Result<(), Box<dyn std::error::Error>> {
         let ordered = vec![
-            super::LexicalPostingBatch {
-                term_index: 0,
-                live_postings: 1,
-                contributions: vec![(b"a".to_vec(), 1.0)],
-            },
-            super::LexicalPostingBatch {
-                term_index: 1,
-                live_postings: 1,
-                contributions: vec![(b"a".to_vec(), 2.0), (b"b".to_vec(), 2.5)],
-            },
+            super::LexicalPostingBatch::from_pairs(0, 1, &[(b"a", 1.0)]),
+            super::LexicalPostingBatch::from_pairs(1, 1, &[(b"a", 2.0), (b"b", 2.5)]),
         ];
         assert_eq!(
             super::finalize_lexical_batches(ordered, &[1, 1], 2)?,
@@ -38374,11 +38471,7 @@ mod tests {
         );
         assert!(matches!(
             super::finalize_lexical_batches(
-                vec![super::LexicalPostingBatch {
-                    term_index: 0,
-                    live_postings: 1,
-                    contributions: Vec::new(),
-                }],
+                vec![super::LexicalPostingBatch::from_pairs(0, 1, &[])],
                 &[2],
                 1,
             ),
@@ -38387,22 +38480,39 @@ mod tests {
         assert!(matches!(
             super::finalize_lexical_batches(
                 vec![
-                    super::LexicalPostingBatch {
-                        term_index: 1,
-                        live_postings: 1,
-                        contributions: Vec::new(),
-                    },
-                    super::LexicalPostingBatch {
-                        term_index: 0,
-                        live_postings: 1,
-                        contributions: Vec::new(),
-                    },
+                    super::LexicalPostingBatch::from_pairs(1, 1, &[]),
+                    super::LexicalPostingBatch::from_pairs(0, 1, &[]),
                 ],
                 &[1, 1],
                 1,
             ),
             Err(NativeRuntimeError::InvalidSearchTree)
         ));
+        // Ranking on the shared arena: ties break on id, zero scores drop,
+        // and top-k truncation matches a full sort.
+        let ranked = super::finalize_lexical_batches(
+            vec![
+                super::LexicalPostingBatch::from_pairs(
+                    0,
+                    4,
+                    &[(b"a", 1.0), (b"b", 3.0), (b"c", 3.0), (b"d", 0.0)],
+                ),
+                super::LexicalPostingBatch::from_pairs(1, 2, &[(b"a", 0.5), (b"zz", 1.0)]),
+            ],
+            &[4, 2],
+            3,
+        )?;
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|hit| (hit.document_id.as_slice(), hit.score))
+                .collect::<Vec<_>>(),
+            [
+                (b"b".as_slice(), 3.0),
+                (b"c".as_slice(), 3.0),
+                (b"a".as_slice(), 1.5)
+            ]
+        );
         Ok(())
     }
 

@@ -282,6 +282,15 @@ materialized reference scorer remains the oracle: tests require physical
 posting traversal to return exactly the same scores and order. A dedicated
 quality/golden corpus remains pending.
 
+The durable scorer's cost scales with the live postings of the query terms.
+Segment planning reads only each leaf's verified boundary keys and entry
+count; posting scans borrow keys and values from the verified buffer-pool
+frame and append only the matched document id to a per-segment arena; the
+merge sorts, folds, and ranks arena offsets and copies ids only for the
+returned `limit` hits. Every borrowed decode performs the same preamble,
+count, length-consumption, key-order, and key-size checks as the owned
+decode, so a malformed leaf is rejected identically on either path.
+
 ## Transactional visibility
 
 The commit coordinator installs the search delta root with the same CSN as
