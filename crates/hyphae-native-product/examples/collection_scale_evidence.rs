@@ -34,6 +34,18 @@
 //! | 100k | 1,198        | 83.5     | 17.9     | 385 MB    | 11.5 s | 73 ms    | 108 ms       | 97 ms      | 194 ms    |
 //! | 250k | 934          | 268      | 50.1     | 2.1 GB    | 52 s   | 207 ms   | 308 ms       | 268 ms     | 634 ms    |
 //!
+//! After the borrowed-leaf scorer (planning on boundary keys, borrowed
+//! posting scans, arena ranking) and single complete-state open:
+//!
+//! | rung | ingest docs/s | reopen | bm25 p50 | filtered p50 | phrase p50 | fuzzy p50 |
+//! |------|--------------|--------|----------|--------------|------------|-----------|
+//! | 100k | 1,261        | 12.8 s | 26 ms    | 43 ms        | 28 ms      | 78 ms     |
+//! | 250k | 949          | 35.6 s | 63 ms    | 137 ms       | 68 ms      | 227 ms    |
+//!
+//! 100k -> 250k (2.5x documents): bm25 2.4x, phrase 2.4x, fuzzy 2.9x,
+//! filtered+facet 3.2x. The first bm25 sample after a fresh load is a
+//! cold-cache outlier (p95 in the seconds) and is reported, not hidden.
+//!
 //! The 250k rung ran with the collection bound lifted on the measurement
 //! host only; the shipped bound is unchanged until the contract is raised.
 //! Open time is dominated by validating every retained committed root:
