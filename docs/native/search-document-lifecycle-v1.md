@@ -171,6 +171,42 @@ document retain first-committer-wins. Disjoint document identities may rebase.
 No lifecycle operation may call complete catalog, search-state, term, document,
 or posting materialization.
 
+### Product batch ingest
+
+The product batch ingest (`ingest_search_batch`) is a point-resolved route
+whose cost scales with the batch, not with the collection:
+
+- The idempotency marker, the physical binding, the document manifest, and
+  the posting-coverage flag resolve through durable point reads of the
+  current structure root. The replay receipt and the fresh receipt bind the
+  committed root identity (`visible_csn`, `catalog_version`, `root_digest`)
+  without materializing engine state.
+- A batch whose documents carry no named vectors stages every document
+  source, doc-value posting, manifest, coverage flag, and idempotency marker
+  through the physical delta batch and commits it as one all-engine
+  transaction. The marker records the transaction identity the serialized
+  writer will publish under; a commit that publishes under any other identity
+  is a fail-closed corruption error, never a silent foreign receipt.
+- A batch that carries at least one named vector keeps the materialized
+  transaction until the ANN store gains a delta stage. Both paths write the
+  same durable records: a reopened directory cannot tell which path ingested
+  a batch.
+- Duplicate document identities, the collection document bound, and
+  idempotency conflicts are rejected before the first staged mutation on
+  either path.
+
+Root construction for either path treats a run of persistent scalar `SET`s
+over distinct keys as one sorted copy-on-write batch, and probes the
+immutable base tree through the verified buffer pool. Each key keeps the
+sequential guards (no live collection under the key; a prior TTL entry
+retires in the expiry index) and the logical tree contents are identical to
+applying the mutations one at a time. The run splits on the first repeated
+key, expiring value, or non-scalar opcode.
+
+The manifest itself remains one bounded `HYPSMAN1` value of 16-byte identities
+under the collection document bound; raising that bound requires re-measuring
+the manifest rewrite alongside the ladder evidence.
+
 ## Verification gates
 
 The slice requires:
@@ -193,6 +229,14 @@ The slice requires:
 - large-text blob replacement, deletion, reopen, vacuum, and blob-collection
   safety;
 - a thread-local fail gate proving no complete state or catalog load;
+- a process-counter gate proving vector-less batch ingest, its idempotent
+  replay, and its receipts perform no complete state load, with equivalence of
+  corpus, lexical, and doc-value results against the materialized path and
+  after reopen;
+- exact logical equivalence of a coalesced scalar `SET` run against sequential
+  application, including expiry-index retirement, plus rejection of a run that
+  reaches a live collection key or carries an expiring member without
+  appending pages;
 - hosted Linux, macOS, Windows, fuzz, dependency, packaging, and release gates;
   and
 - direct-Linux stage, memory-commit, strict-commit, page/WAL, allocation, and

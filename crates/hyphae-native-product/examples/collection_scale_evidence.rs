@@ -67,6 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         provision(&mut product)?;
         product
     };
+    // HYPHAE_SCALE_APPEND=<n> appends n more documents to an existing
+    // corpus (ids continue after `documents`) to profile ingest at scale.
+    let append: usize = std::env::var("HYPHAE_SCALE_APPEND")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
 
     // Deterministic corpus: rotating vocabulary + doc values.
     let vocabulary = [
@@ -80,8 +86,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         0_u128
     };
-    while ingested < documents {
-        let count = BATCH_DOCUMENTS.min(documents - ingested);
+    // Appended runs continue ids/batches after whatever is already there
+    // so repeated profiling runs never collide on idempotency markers.
+    let existing = if reuse {
+        product
+            .search_collection(
+                ObjectId::new(52)?,
+                &ProductSearchRequest {
+                    lexical: None,
+                    vectors: Vec::new(),
+                    filter: ProductSearchFilter::MatchAll,
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    range_facets: Vec::new(),
+                    aggregations: Vec::new(),
+                    limit: 1,
+                    fusion: None,
+                    parent_dedupe: None,
+                    rerank: None,
+                    highlight: None,
+                    autocut: None,
+                    offset: 0,
+                },
+                1,
+            )
+            .map_or(documents, |result| result.total_documents)
+    } else {
+        0
+    };
+    if reuse && existing > documents {
+        ingested = existing;
+        batch_id = u128::try_from(existing.div_ceil(BATCH_DOCUMENTS))? + 1;
+    }
+    let target = ingested.max(documents) + append;
+    while ingested < target {
+        let count = BATCH_DOCUMENTS.min(target - ingested);
         let mut batch = Vec::with_capacity(count);
         for offset in 0..count {
             let ordinal = ingested + offset;
@@ -172,7 +211,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("phrase", request("database engine", true, None, false)),
         ("fuzzy1", request("datbase", false, Some(1), false)),
     ];
-    if reuse {
+    if reuse && append > 0 {
+        println!(
+            "documents={target} ingest=appended appended={append} ingest_seconds={:.1} docs_per_second={:.0}",
+            ingest_elapsed.as_secs_f64(),
+            (append as f64) / ingest_elapsed.as_secs_f64().max(0.001),
+        );
+    } else if reuse {
         println!("documents={documents} ingest=reused");
     } else {
         println!(

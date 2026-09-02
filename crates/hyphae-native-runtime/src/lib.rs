@@ -2125,6 +2125,20 @@ pub struct CatalogSnapshotIdentity {
     pub root_digest: [u8; 32],
 }
 
+/// Exact immutable identity of one committed all-engine root set, captured
+/// without materializing any engine state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSnapshotIdentity {
+    /// Latest commit visible to every engine, absent for an empty directory.
+    pub visible_csn: Option<Csn>,
+    /// Catalog version bound to the root set.
+    pub catalog_version: CatalogVersion,
+    /// Digest of the complete immutable all-engine root set.
+    pub root_digest: [u8; 32],
+    /// Logical time the caller bound to this identity.
+    pub logical_time_micros: i64,
+}
+
 /// Lightweight immutable catalog-only snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeCatalogSnapshot {
@@ -7623,6 +7637,48 @@ impl NativeDatabase {
     pub fn snapshot(&self, logical_time_micros: i64) -> Result<NativeSnapshot, NativeRuntimeError> {
         let _permit = self.admit_foreground_bounded()?;
         self.snapshot_unadmitted(logical_time_micros)
+    }
+
+    /// Captures the exact immutable identity of the current committed root
+    /// set without materializing any engine state.
+    ///
+    /// Receipts and point-resolved routes use this instead of
+    /// [`Self::snapshot`] so their cost scales with the touched keys rather
+    /// than the total corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for admission or snapshot coordination failure.
+    pub fn snapshot_identity(
+        &self,
+        logical_time_micros: i64,
+    ) -> Result<NativeSnapshotIdentity, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        Ok(NativeSnapshotIdentity {
+            visible_csn: snapshot.visible_csn,
+            catalog_version: snapshot.catalog_version,
+            root_digest: snapshot.roots().digest(),
+            logical_time_micros: snapshot.logical_time_micros,
+        })
+    }
+
+    /// Returns the runtime transaction identity the next singleton commit on
+    /// this handle will publish under.
+    ///
+    /// The database owns one serialized writer, so a caller that stages a
+    /// detached batch and commits it immediately on the same handle may
+    /// record this identity inside the batch (for example as an idempotency
+    /// marker). The value is not reserved: another commit in between consumes
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::TransactionIdExhausted`] when the
+    /// identity space is exhausted.
+    pub fn next_transaction_id(&self) -> Result<TransactionId, NativeRuntimeError> {
+        TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)
     }
 
     fn snapshot_unadmitted(
@@ -32585,6 +32641,7 @@ fn pop_list_in_tree(
 
 fn structure_tree_after_mutations(
     pages: &mut PageStore,
+    pool: &BufferPool,
     root: Option<PageId>,
     format: StructureFormat,
     creating_csn: Csn,
@@ -32605,20 +32662,145 @@ fn structure_tree_after_mutations(
             )?
             .tree;
     }
-    for mutation in mutations
+    let structure_mutations: Vec<&Mutation> = mutations
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Structure)
-    {
-        tree = apply_structure_tree_mutation(
-            pages,
-            tree,
-            format,
-            creating_csn,
-            mutation,
-            blob_references,
-        )?;
+        .collect();
+    // Consecutive persistent scalar `SET`s over distinct keys coalesce into
+    // one copy-on-write batch: every touched leaf and internal path is
+    // rewritten once per run instead of once per key. Each key keeps the
+    // exact sequential guards (no live collection under the key, prior
+    // expiry-index maintenance) and the logical tree contents are identical.
+    let mut cursor = 0;
+    while cursor < structure_mutations.len() {
+        let mutation = structure_mutations[cursor];
+        if coalescable_scalar_set(mutation) {
+            let mut end = cursor + 1;
+            let mut keys = BTreeSet::from([mutation.key.as_slice()]);
+            while end < structure_mutations.len()
+                && coalescable_scalar_set(structure_mutations[end])
+                && keys.insert(structure_mutations[end].key.as_slice())
+            {
+                end += 1;
+            }
+            tree = upsert_scalar_set_run(
+                pages,
+                pool,
+                tree,
+                format.uses_ordered_expiry_index(),
+                creating_csn,
+                &structure_mutations[cursor..end],
+                blob_references,
+            )?;
+            cursor = end;
+        } else {
+            tree = apply_structure_tree_mutation(
+                pages,
+                tree,
+                format,
+                creating_csn,
+                mutation,
+                blob_references,
+            )?;
+            cursor += 1;
+        }
     }
     Ok(tree)
+}
+
+fn coalescable_scalar_set(mutation: &Mutation) -> bool {
+    mutation.opcode == Opcode::SetValue
+        && mutation.target.is_none()
+        && mutation.expires_at_micros.is_none()
+}
+
+/// Rejects a scalar write under a key that currently owns a live collection.
+///
+/// Descends through the verified buffer pool: committed pages and pages
+/// appended earlier in this commit are immutable, so cached frames stay
+/// valid for the whole root construction.
+fn ensure_scalar_key_has_no_live_collection(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    if tree
+        .get_cached_pinned(pages, pool, &structure_hash_meta_key(key))?
+        .map(|value| decode_live_hash_metadata(value.bytes()))
+        .transpose()?
+        .flatten()
+        .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_set_meta_key(key))?
+            .map(|value| decode_live_set_metadata(value.bytes()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_list_meta_key(key)?)?
+            .map(|value| decode_live_list_metadata(value.bytes()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_stream_meta_key(key)?)?
+            .filter(|value| !is_structure_tombstone(value.bytes()))
+            .map(|value| decode_stream_metadata(value.bytes()))
+            .transpose()?
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_sorted_set_meta_key(key)?)?
+            .filter(|value| !is_structure_tombstone(value.bytes()))
+            .map(|value| decode_sorted_set_metadata_state(value.bytes()))
+            .transpose()?
+            .is_some()
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+/// Applies one run of persistent scalar `SET`s over distinct keys as a
+/// single sorted batch. Semantically identical to applying
+/// [`upsert_scalar_structure_mutation`] to each mutation in order.
+fn upsert_scalar_set_run(
+    pages: &mut PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    maintain_expiry_index: bool,
+    creating_csn: Csn,
+    mutations: &[&Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for mutation in mutations {
+        if !coalescable_scalar_set(mutation) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        ensure_scalar_key_has_no_live_collection(pages, pool, tree, &mutation.key)?;
+        let entry_key = structure_key(&mutation.key);
+        if maintain_expiry_index
+            && let Some(prior_expiry) = tree
+                .get_cached_pinned(pages, pool, &entry_key)?
+                .map(|encoded| structure_value_expiry(encoded.bytes()))
+                .transpose()?
+                .flatten()
+        {
+            // The new value is persistent, so a prior expiry entry retires.
+            entries.insert(
+                structure_expiry_key(prior_expiry, &mutation.key)?,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            );
+        }
+        let value = structure_storage_value(&mutation.value, None, blob_references)?;
+        if entries.insert(entry_key, value).is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
 }
 
 fn apply_structure_tree_mutation(
@@ -32875,6 +33057,7 @@ fn structure_root_after_mutations(
         )?)),
         StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => Ok(structure_tree_after_mutations(
             pages,
+            context.buffer_pool,
             root,
             context.format,
             creating_csn,
@@ -33406,13 +33589,15 @@ fn compact_search_tree(
 
 fn search_tree_after_mutations(
     pages: &mut PageStore,
-    blobs: &BlobStore,
     root: Option<PageId>,
     creating_csn: Csn,
-    catalog: &CatalogState,
-    mutations: &[Mutation],
-    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+    context: &SearchMutationContext<'_>,
 ) -> Result<BTree, NativeRuntimeError> {
+    let pool = context.buffer_pool;
+    let blobs = context.blobs;
+    let catalog = context.catalog;
+    let mutations = context.mutations;
+    let blob_references = context.blob_references;
     let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
     if tree.root().is_none() {
         tree = tree
@@ -33455,6 +33640,7 @@ fn search_tree_after_mutations(
             }
             tree = index_documents_batch_in_search_tree(
                 pages,
+                pool,
                 tree,
                 creating_csn,
                 &search_mutations[cursor..end],
@@ -33552,11 +33738,15 @@ fn apply_search_tree_mutation(
 /// like a sequential reinsertion would.
 fn index_documents_batch_in_search_tree(
     pages: &mut PageStore,
+    pool: &BufferPool,
     tree: BTree,
     creating_csn: Csn,
     mutations: &[&Mutation],
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
+    // Buffer-pool descents: the tree is immutable for the whole run (every
+    // read precedes the single copy-on-write batch), so cached frames stay
+    // valid and repeated term/posting probes stop re-reading root paths.
     let format = physical_search_format(pages, tree)?;
     let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     // (document_count, total_document_terms) accumulated per index.
@@ -33572,9 +33762,9 @@ fn index_documents_batch_in_search_tree(
         validate_search_document_identity(&mutation.key, text)?;
         if let std::collections::btree_map::Entry::Vacant(vacant) = index_metadata.entry(index) {
             let metadata = tree
-                .get(pages, &search_index_meta_key(index))?
+                .get_cached_pinned(pages, pool, &search_index_meta_key(index))?
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-            vacant.insert(decode_search_index_metadata(&metadata)?);
+            vacant.insert(decode_search_index_metadata(metadata.bytes())?);
         }
         let document_key = search_document_key(index, &mutation.key)?;
         if entries.contains_key(&document_key) {
@@ -33582,8 +33772,8 @@ fn index_documents_batch_in_search_tree(
             // observe the first insertion and fail closed.
             return Err(NativeRuntimeError::InvalidSearchTree);
         }
-        if let Some(existing) = tree.get(pages, &document_key)?
-            && (!format.admits_tombstones() || !is_search_document_tombstone(&existing))
+        if let Some(existing) = tree.get_cached_pinned(pages, pool, &document_key)?
+            && (!format.admits_tombstones() || !is_search_document_tombstone(existing.bytes()))
         {
             return Err(NativeRuntimeError::InvalidSearchTree);
         }
@@ -33597,8 +33787,8 @@ fn index_documents_batch_in_search_tree(
             let accumulated = if let Some(previous) = term_frequencies.get(&term_key) {
                 *previous
             } else {
-                tree.get(pages, &term_key)?
-                    .map(|encoded| decode_live_search_term_metadata(&encoded, format))
+                tree.get_cached_pinned(pages, pool, &term_key)?
+                    .map(|encoded| decode_live_search_term_metadata(encoded.bytes(), format))
                     .transpose()?
                     .flatten()
                     .unwrap_or(0)
@@ -33607,8 +33797,8 @@ fn index_documents_batch_in_search_tree(
                 .checked_add(1)
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
             let posting_key = search_posting_key(index, &term, &mutation.key)?;
-            if let Some(encoded) = tree.get(pages, &posting_key)?
-                && decode_live_search_posting(&encoded, format)?.is_some()
+            if let Some(encoded) = tree.get_cached_pinned(pages, pool, &posting_key)?
+                && decode_live_search_posting(encoded.bytes(), format)?.is_some()
             {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
@@ -33959,16 +34149,9 @@ fn search_root_after_mutations(
                 context.state.encode()?,
             )?))
         }
-        SearchFormat::InvertedBTreeV1 => Ok(search_tree_after_mutations(
-            pages,
-            context.blobs,
-            root,
-            creating_csn,
-            context.catalog,
-            context.mutations,
-            context.blob_references,
-        )?
-        .root()),
+        SearchFormat::InvertedBTreeV1 => {
+            Ok(search_tree_after_mutations(pages, root, creating_csn, context)?.root())
+        }
     }
 }
 
@@ -62144,6 +62327,191 @@ mod tests {
 
     fn scalar_reuse_collection_keys() -> [&'static [u8]; 5] {
         [b"hash", b"set", b"list", b"stream", b"sorted"]
+    }
+
+    type LogicalEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// A coalesced run of persistent scalar `SET`s must produce exactly the
+    /// logical tree contents of applying each mutation in order, including
+    /// expiry-index retirement for keys that previously carried a TTL, and
+    /// must keep the per-key live-collection guard.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn coalesced_scalar_set_run_matches_sequential_v2_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"ttl".to_vec(), b"old".to_vec(), Some(500))?;
+        seed.set(b"plain".to_vec(), b"old".to_vec(), None)?;
+        seed.create_hash(b"owned".to_vec())?;
+        seed.commit()?;
+
+        // Run: overwrite a TTL key persistently, overwrite a plain key,
+        // insert fresh keys, and touch one key twice (splits the run).
+        let mut run = database.begin(20, DurabilityClass::Strict)?;
+        run.set(b"ttl".to_vec(), b"new".to_vec(), None)?;
+        run.set(b"plain".to_vec(), b"new".to_vec(), None)?;
+        for index in 0_u8..64 {
+            run.set(vec![b'k', index], vec![index], None)?;
+        }
+        run.set(b"plain".to_vec(), b"newer".to_vec(), None)?;
+        run.set(b"mixed".to_vec(), b"ttl".to_vec(), Some(900))?;
+        run.set(b"after".to_vec(), b"value".to_vec(), None)?;
+        run.commit()?;
+
+        // Reference: the same logical writes applied one commit at a time,
+        // which never enters the coalesced path.
+        let reference = TestDirectory::new();
+        let mut expected = NativeDatabase::create(reference.path())?;
+        let mut seed = expected.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"ttl".to_vec(), b"old".to_vec(), Some(500))?;
+        seed.set(b"plain".to_vec(), b"old".to_vec(), None)?;
+        seed.create_hash(b"owned".to_vec())?;
+        seed.commit()?;
+        let mut writes: Vec<(Vec<u8>, Vec<u8>, Option<i64>)> = vec![
+            (b"ttl".to_vec(), b"new".to_vec(), None),
+            (b"plain".to_vec(), b"new".to_vec(), None),
+        ];
+        for index in 0_u8..64 {
+            writes.push((vec![b'k', index], vec![index], None));
+        }
+        writes.push((b"plain".to_vec(), b"newer".to_vec(), None));
+        writes.push((b"mixed".to_vec(), b"ttl".to_vec(), Some(900)));
+        writes.push((b"after".to_vec(), b"value".to_vec(), None));
+        for (key, value, expiry) in writes {
+            let mut one = expected.begin(20, DurabilityClass::Strict)?;
+            one.set(key, value, expiry)?;
+            one.commit()?;
+        }
+
+        let logical = |database: &NativeDatabase| -> Result<LogicalEntries, NativeRuntimeError> {
+            let root = database
+                .coordinator
+                .snapshot(20)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            // Compare live logical entries (value + expiry) and the live
+            // expiry index rather than raw pages, since the reference
+            // spends many CSNs.
+            let state = super::load_structure_state_root(&database.pages, &database.blobs, root)?;
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = state
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    let mut value = entry.value.clone();
+                    value.extend_from_slice(
+                        &entry.expires_at_micros.unwrap_or(i64::MIN).to_le_bytes(),
+                    );
+                    (key.clone(), value)
+                })
+                .collect();
+            let expiry_index: Vec<(Vec<u8>, Vec<u8>)> = BTree::from_root(root)
+                .scan(&database.pages)?
+                .into_iter()
+                .filter(|(key, value)| {
+                    key.first() == Some(&super::STRUCTURE_EXPIRY_PREFIX)
+                        && value.as_slice() == [super::STRUCTURE_EXPIRY_LIVE]
+                })
+                .collect();
+            entries.extend(expiry_index);
+            Ok(entries)
+        };
+        assert_eq!(logical(&database)?, logical(&expected)?);
+        let snapshot = database.snapshot(20)?;
+        assert_eq!(snapshot.get(b"ttl"), Some(b"new".as_slice()));
+        assert_eq!(snapshot.get(b"plain"), Some(b"newer".as_slice()));
+        assert_eq!(snapshot.get(b"k\x3f"), Some([63_u8].as_slice()));
+        assert_eq!(
+            database.ttl_latest_structure(b"ttl", 20)?,
+            super::Ttl::Persistent
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"mixed", 20)?,
+            super::Ttl::RemainingMicros(880)
+        );
+
+        // Failure path: the root-construction guard rejects a run that
+        // reaches a key owning a live collection, independent of the model
+        // check that normally stops such a `set` earlier. Nothing publishes:
+        // the rejected pages are an unpublished tail.
+        let before = database.coordinator.snapshot(20)?.roots().digest();
+        let root = database
+            .coordinator
+            .snapshot(20)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let fresh = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"fresh".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+        };
+        let over_hash = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"owned".to_vec(),
+            value: b"scalar-over-hash".to_vec(),
+            expires_at_micros: None,
+        };
+        let pages_before = database.pages.page_count();
+        let outcome = super::upsert_scalar_set_run(
+            &mut database.pages,
+            &database.buffer_pool,
+            BTree::from_root(root),
+            true,
+            Csn::new(99)?,
+            &[&fresh, &over_hash],
+            &BTreeMap::new(),
+        );
+        assert!(
+            matches!(outcome, Err(NativeRuntimeError::InvalidStructureTree)),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            database.pages.page_count(),
+            pages_before,
+            "rejected run appended pages"
+        );
+        assert_eq!(database.coordinator.snapshot(20)?.roots().digest(), before);
+        // A run must not carry an expiring or targeted mutation.
+        let expiring = Mutation {
+            expires_at_micros: Some(1_000),
+            ..fresh.clone()
+        };
+        let outcome = super::upsert_scalar_set_run(
+            &mut database.pages,
+            &database.buffer_pool,
+            BTree::from_root(root),
+            true,
+            Csn::new(99)?,
+            &[&expiring],
+            &BTreeMap::new(),
+        );
+        assert!(matches!(
+            outcome,
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        // The public path still rejects a scalar over a live hash at the
+        // model boundary.
+        let mut public = database.begin(30, DurabilityClass::Strict)?;
+        assert!(matches!(
+            public.set(b"owned".to_vec(), b"x".to_vec(), None),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        drop(public);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(20)?;
+        assert_eq!(snapshot.get(b"after"), Some(b"value".as_slice()));
+        assert_eq!(snapshot.get(b"k\x00"), Some([0_u8].as_slice()));
+        Ok(())
     }
 
     fn stage_structure_v3_scalar_mutations<'database>(

@@ -652,11 +652,17 @@ impl NativeProduct {
 
     /// Validates and atomically ingests one bounded cross-engine document batch.
     ///
+    /// Cost scales with the batch: the idempotency marker, binding, and
+    /// manifest resolve through durable point reads, and a batch whose
+    /// documents carry no named vectors stages through the physical delta
+    /// batch, so neither `BEGIN`, staging, nor the receipt materializes the
+    /// complete all-engine state. A batch that carries vectors keeps the
+    /// materialized transaction until the ANN store gains a delta stage.
+    ///
     /// # Errors
     ///
     /// Returns without publication for any invalid document, exhausted bound,
     /// duplicate document, unknown target, or native commit failure.
-    #[allow(clippy::too_many_lines)]
     pub fn ingest_search_batch(
         &mut self,
         collection: crate::ObjectId,
@@ -669,27 +675,57 @@ impl NativeProduct {
         validate_documents(&definition, &binding, batch)?;
         let digest = ingest_digest(batch)?;
         let marker_key = idempotency_key(collection, batch.idempotency_id);
-        let current = self.snapshot_bounded(logical_time_micros)?;
-        if let Some(encoded) = current.structure_get_internal(&marker_key) {
-            let marker = decode_idempotency(encoded)?;
+        if let Some(encoded) = self.structure_point_read(&marker_key, logical_time_micros)? {
+            let marker = decode_idempotency(&encoded)?;
             if marker.digest != digest {
                 return Err(idempotency_conflict());
             }
             return Ok(ProductSearchIngestReceipt {
-                snapshot: current.identity(),
+                snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
                 commit: Some(self.original_search_receipt(marker.transaction_id)?),
                 documents: marker.documents,
                 idempotent_replay: true,
             });
         }
+        let catalog = self.catalog_snapshot()?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            self.catalog_describe(&catalog, id).ok().flatten()
+        })?;
+        let plan = IngestPlan {
+            collection,
+            binding: &binding,
+            batch,
+            digest,
+            marker_key,
+            transform,
+            logical_time_micros,
+            durability,
+        };
+        let carries_vectors = batch
+            .documents
+            .iter()
+            .any(|document| !document.vectors.is_empty());
+        let commit = if carries_vectors {
+            self.ingest_search_batch_materialized(&plan)?
+        } else {
+            self.ingest_search_batch_delta(&plan)?
+        };
+        self.observe_commit(&commit);
+        Ok(ProductSearchIngestReceipt {
+            snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
+            commit: Some(commit.into()),
+            documents: batch.documents.len(),
+            idempotent_replay: false,
+        })
+    }
 
-        let manifest_key = manifest_key(collection);
-        let mut transaction = self
-            .database
-            .begin(logical_time_micros, durability.into())
-            .map_err(map_runtime_error)?;
-        let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
-        let mut identities = decode_manifest(existing_manifest)?;
+    /// Resolves the manifest for one ingest and admits the batch against the
+    /// collection bound and duplicate identities.
+    fn ingest_manifest(
+        existing: &[u8],
+        batch: &ProductSearchIngestBatch,
+    ) -> Result<(BTreeSet<crate::ObjectId>, bool), ProductError> {
+        let mut identities = decode_manifest(existing)?;
         let collection_was_empty = identities.is_empty();
         if identities.len().saturating_add(batch.documents.len())
             > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS
@@ -701,20 +737,122 @@ impl NativeProduct {
                 return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
             }
         }
+        Ok((identities, collection_was_empty))
+    }
 
-        let transform = collection_lexical_transform(&definition, |id| {
-            current.inner.logical_catalog_object(id).cloned()
-        })?;
-        for document in &batch.documents {
+    /// Point-resolved ingest for a batch whose documents carry no vectors.
+    fn ingest_search_batch_delta(
+        &mut self,
+        plan: &IngestPlan<'_>,
+    ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
+        let manifest_key = manifest_key(plan.collection);
+        let existing = self
+            .structure_point_read(&manifest_key, plan.logical_time_micros)?
+            .ok_or_else(corruption)?;
+        let (identities, collection_was_empty) = Self::ingest_manifest(&existing, plan.batch)?;
+        let covered = collection_was_empty
+            || self
+                .structure_point_read(
+                    &posting_coverage_key(plan.collection),
+                    plan.logical_time_micros,
+                )?
+                .is_some();
+        let transaction_id = self
+            .database
+            .next_transaction_id()
+            .map_err(map_runtime_error)?;
+        let mut delta = self
+            .database
+            .begin_optimistic_delta(plan.logical_time_micros, plan.durability.into())
+            .map_err(map_runtime_error)?;
+        let mut set = |key: Vec<u8>, value: Vec<u8>| {
+            self.database
+                .stage_delta_set(&mut delta, key, value, None)
+                .map_err(map_runtime_error)
+        };
+        for document in &plan.batch.documents {
+            set(
+                document_key(plan.collection, document.object_id),
+                encode_document(document)?,
+            )?;
+            if covered {
+                let (keys, oversized) = document_posting_keys(
+                    plan.collection,
+                    document.object_id,
+                    &document.doc_values,
+                )?;
+                for key in keys {
+                    set(key, vec![1])?;
+                }
+                for field in oversized {
+                    set(unindexed_field_key(plan.collection, &field), vec![1])?;
+                }
+            }
+        }
+        if collection_was_empty {
+            set(
+                posting_coverage_key(plan.collection),
+                POSTING_COVERAGE_MAGIC.to_vec(),
+            )?;
+        }
+        set(manifest_key, encode_manifest(&identities)?)?;
+        set(
+            plan.marker_key.clone(),
+            encode_idempotency(&IdempotencyMarker {
+                digest: plan.digest,
+                documents: plan.batch.documents.len(),
+                transaction_id: transaction_id.get(),
+            })?,
+        )?;
+        for document in &plan.batch.documents {
+            let text = match &plan.transform {
+                None => document.text.clone(),
+                Some(transform) => transform.apply(&document.text),
+            };
+            self.database
+                .stage_delta_index_document(
+                    &mut delta,
+                    plan.binding.lexical_index,
+                    document.object_id.get().to_be_bytes().to_vec(),
+                    text,
+                )
+                .map_err(map_runtime_error)?;
+        }
+        let commit = self
+            .database
+            .commit_optimistic(delta)
+            .map_err(map_runtime_error)?;
+        if commit.transaction_id != transaction_id {
+            // The serialized writer published under another identity: the
+            // durable marker would point at a foreign receipt.
+            return Err(corruption());
+        }
+        Ok(commit)
+    }
+
+    /// Materialized ingest for a batch that carries named vectors.
+    fn ingest_search_batch_materialized(
+        &mut self,
+        plan: &IngestPlan<'_>,
+    ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
+        let manifest_key = manifest_key(plan.collection);
+        let mut transaction = self
+            .database
+            .begin(plan.logical_time_micros, plan.durability.into())
+            .map_err(map_runtime_error)?;
+        let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
+        let (identities, collection_was_empty) =
+            Self::ingest_manifest(existing_manifest, plan.batch)?;
+        for document in &plan.batch.documents {
             let object_bytes = document.object_id.get().to_be_bytes().to_vec();
-            let text = match &transform {
+            let text = match &plan.transform {
                 None => document.text.clone(),
                 Some(transform) => transform.apply(&document.text),
             };
             transaction
-                .index_document(binding.lexical_index, object_bytes, text)
+                .index_document(plan.binding.lexical_index, object_bytes, text)
                 .map_err(map_runtime_error)?;
-            for vector_binding in &binding.vectors {
+            for vector_binding in &plan.binding.vectors {
                 if let Some(vector) = document.vectors.get(&vector_binding.name) {
                     transaction
                         .upsert_vector(vector_binding.index, document.object_id, vector.clone())
@@ -723,23 +861,23 @@ impl NativeProduct {
             }
             transaction
                 .set(
-                    document_key(collection, document.object_id),
+                    document_key(plan.collection, document.object_id),
                     encode_document(document)?,
                     None,
                 )
                 .map_err(map_runtime_error)?;
         }
         let (covered, newly_covered) =
-            posting_coverage(&transaction, collection, collection_was_empty);
+            posting_coverage(&transaction, plan.collection, collection_was_empty);
         if covered {
-            for document in &batch.documents {
-                write_document_postings(&mut transaction, collection, document)?;
+            for document in &plan.batch.documents {
+                write_document_postings(&mut transaction, plan.collection, document)?;
             }
         }
         if newly_covered {
             transaction
                 .set(
-                    posting_coverage_key(collection),
+                    posting_coverage_key(plan.collection),
                     POSTING_COVERAGE_MAGIC.to_vec(),
                     None,
                 )
@@ -751,23 +889,46 @@ impl NativeProduct {
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
-                marker_key,
+                plan.marker_key.clone(),
                 encode_idempotency(&IdempotencyMarker {
-                    digest,
-                    documents: batch.documents.len(),
+                    digest: plan.digest,
+                    documents: plan.batch.documents.len(),
                     transaction_id,
                 })?,
                 None,
             )
             .map_err(map_runtime_error)?;
-        let commit = transaction.commit().map_err(map_runtime_error)?;
-        self.observe_commit(&commit);
-        let snapshot = self.snapshot_bounded(logical_time_micros)?.identity();
-        Ok(ProductSearchIngestReceipt {
-            snapshot,
-            commit: Some(commit.into()),
-            documents: batch.documents.len(),
-            idempotent_replay: false,
+        transaction.commit().map_err(map_runtime_error)
+    }
+
+    /// Reads one current structure value through its physical root without
+    /// materializing engine state.
+    fn structure_point_read(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Option<Vec<u8>>, ProductError> {
+        self.database
+            .get_latest_structure(key, logical_time_micros)
+            .map_err(map_runtime_error)
+    }
+
+    /// Captures the current committed root identity without materializing
+    /// engine state.
+    fn snapshot_identity_bounded(
+        &self,
+        logical_time_micros: i64,
+    ) -> Result<SnapshotIdentity, ProductError> {
+        let identity = self
+            .database
+            .snapshot_identity(logical_time_micros)
+            .map_err(map_runtime_error)?;
+        Ok(SnapshotIdentity {
+            directory_lineage: self.database.directory_identity().lineage().encode(),
+            visible_csn: identity.visible_csn,
+            catalog_version: identity.catalog_version,
+            root_digest: identity.root_digest,
+            logical_time_micros: identity.logical_time_micros,
         })
     }
 
@@ -1542,13 +1703,12 @@ impl NativeProduct {
         collection: crate::ObjectId,
         logical_time_micros: i64,
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
-        let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let encoded = snapshot
-            .structure_get_internal(&binding_key(collection))
+        let encoded = self
+            .structure_point_read(&binding_key(collection), logical_time_micros)?
             .ok_or_else(|| {
                 ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
             })?;
-        let binding = decode_binding(encoded)?;
+        let binding = decode_binding(&encoded)?;
         let definition = self.search_definition(collection)?;
         validate_binding_definition(&definition, &binding)?;
         Ok(binding)
@@ -2697,6 +2857,18 @@ const fn doc_value_bytes(value: &ProductDocValue) -> usize {
         ProductDocValue::String(value) => value.len(),
         ProductDocValue::Bytes(value) => value.len(),
     }
+}
+
+/// Validated inputs shared by the delta and materialized ingest paths.
+struct IngestPlan<'a> {
+    collection: crate::ObjectId,
+    binding: &'a ProductSearchCollectionBinding,
+    batch: &'a ProductSearchIngestBatch,
+    digest: [u8; 32],
+    marker_key: Vec<u8>,
+    transform: Option<crate::lexical_analyzer::LexicalTransform>,
+    logical_time_micros: i64,
+    durability: ProductDurability,
 }
 
 fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {
