@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEX_COMMIT = re.compile(r"[0-9a-f]{40}")
 CARGO_MANIFESTS = (
     "Cargo.toml",
+    "benchmarks/baseline-harness/Cargo.toml",
     "conformance/g6/runners/rust/Cargo.toml",
     "conformance/g7/runners/rust/Cargo.toml",
     "conformance/g8/independent-backup-verifier/Cargo.toml",
@@ -56,10 +57,17 @@ CARGO_MANIFESTS = (
 )
 CARGO_LOCKS = (
     "Cargo.lock",
+    "benchmarks/baseline-harness/Cargo.lock",
     "conformance/g6/runners/rust/Cargo.lock",
     "conformance/g7/runners/rust/Cargo.lock",
     "embed/Cargo.lock",
     "fuzz/Cargo.lock",
+)
+# Standalone workspaces with their own lock file next to the manifest.
+STANDALONE_CARGO_MANIFESTS = (
+    "benchmarks/baseline-harness/Cargo.toml",
+    "embed/Cargo.toml",
+    "fuzz/Cargo.toml",
 )
 ISOLATED_CARGO_MANIFESTS = (
     "conformance/g6/runners/rust/Cargo.toml",
@@ -430,11 +438,11 @@ def validate_manifest_lock_pairs(changed: set[str], head: str) -> None:
     validate_registered_dependency_files(changed)
     rust_manifests = {path for path in changed if path.endswith("Cargo.toml")}
     root_manifests = rust_manifests.difference(
-        ISOLATED_CARGO_MANIFESTS, {"embed/Cargo.toml", "fuzz/Cargo.toml"}
+        ISOLATED_CARGO_MANIFESTS, STANDALONE_CARGO_MANIFESTS
     )
     if root_manifests and "Cargo.lock" not in changed:
         validate_cargo_lock(head)
-    for isolated in ("embed/Cargo.toml", "fuzz/Cargo.toml"):
+    for isolated in STANDALONE_CARGO_MANIFESTS:
         lock = str(PurePosixPath(isolated).with_name("Cargo.lock"))
         if isolated in changed and lock not in changed:
             validate_cargo_lock(head, isolated)

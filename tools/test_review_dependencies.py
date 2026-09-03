@@ -288,6 +288,7 @@ class DependencyReviewTests(unittest.TestCase):
         expected_reads = []
         for path in (
             "Cargo.lock",
+            "benchmarks/baseline-harness/Cargo.lock",
             "conformance/g6/runners/rust/Cargo.lock",
             "conformance/g7/runners/rust/Cargo.lock",
             "embed/Cargo.lock",
