@@ -15,15 +15,28 @@ lscpu | grep -E 'Model name|Socket|Core|Thread' || true
 grep -c hypervisor /proc/cpuinfo || true
 
 echo "== local NVMe setup =="
-# i7i.metal carries local instance-store NVMe. Find the largest unmounted disk.
-DISK=$(lsblk -bdno NAME,SIZE,TYPE,MOUNTPOINT | awk '$3=="disk" && $4=="" {print $2, $1}' | sort -rn | head -1 | awk '{print $2}')
-if [ -n "${DISK:-}" ]; then
-  mkfs.ext4 -F "/dev/$DISK"
-  mkdir -p /mnt/nvme
-  mount -o noatime "/dev/$DISK" /mnt/nvme
+# i7i.metal carries local instance-store NVMe. Reuse /mnt/nvme when the
+# operator already mounted it; otherwise format the largest disk that has
+# neither a mountpoint nor partitions (the root EBS disk shows an empty
+# mountpoint on its disk row while its partition is mounted, so partitioned
+# disks are never candidates).
+if mountpoint -q /mnt/nvme; then
+  echo "reusing existing /mnt/nvme mount"
 else
-  echo "WARNING: no spare instance-store disk found; using root volume"
-  mkdir -p /mnt/nvme
+  DISK=$(lsblk -bdno NAME,SIZE,TYPE,MOUNTPOINT | awk '$3=="disk" && $4=="" {print $2, $1}' | sort -rn | awk '{print $2}' \
+    | while read -r candidate; do
+        if [ "$(lsblk -no MOUNTPOINT "/dev/$candidate" | grep -c .)" -eq 0 ] && [ "$(lsblk -no TYPE "/dev/$candidate" | grep -c part)" -eq 0 ]; then
+          echo "$candidate"; break
+        fi
+      done)
+  if [ -n "${DISK:-}" ]; then
+    mkfs.ext4 -F "/dev/$DISK"
+    mkdir -p /mnt/nvme
+    mount -o noatime "/dev/$DISK" /mnt/nvme
+  else
+    echo "WARNING: no spare instance-store disk found; using root volume"
+    mkdir -p /mnt/nvme
+  fi
 fi
 mkdir -p "$SCRATCH"
 lsblk
