@@ -9,6 +9,9 @@
 //! Usage: `cargo run --release -p hyphae-native-product \
 //!   --example scale_stage_diagnostic -- <data-dir>`
 //!
+//! `HYPHAE_DIAG_MODEL_ROUNDS=<n>` (default 3) bounds the retained-model
+//! oracle rounds; one round at the 1M rung already costs hours.
+//!
 //! Receipts at the 100k rung (c-16 devbox, release):
 //!
 //! | stage                  | baseline    | dense prescan | HYPOST02 corpus | borrowed leaves |
@@ -131,7 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // scorer must reproduce them exactly (ids, order, scores) or the run
     // fails, so a rung receipt doubles as scorer equivalence evidence.
     let skip_model = std::env::var("HYPHAE_DIAG_SKIP_MODEL").is_ok();
-    for round in 0..3 {
+    let model_rounds: u32 = std::env::var("HYPHAE_DIAG_MODEL_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    for round in 0..model_rounds {
         if skip_model {
             break;
         }

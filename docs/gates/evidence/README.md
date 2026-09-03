@@ -39,6 +39,11 @@ own commit as the evaluated source.
 - [Native G6 exact-SHA local-product closure](closures/native-g6-c57cc07.json)
 - [Native G7 C-60 operational-scale closure](closures/native-g7-ff188af.json)
 - [Collection document cap 250k rung](collection-cap-250k-2026-09-02.md)
+- [Chunked collection manifest — 250k re-measurement and the 1M ladder](collection-manifest-chunked-1m-ladder-2026-09-03.md)
+  records the `HYPSMAN2` manifest (per-batch write bounded by header plus
+  touched chunks), lazy eligibility, and the first complete lexical ladder
+  at 1,000,000 documents; the bound stays 250,000 pending the R5 vector
+  conditions
 - [Native G8 exact-SHA release closure](closures/native-g8-e88f2ea.json)
 
 ### Source-bound observations

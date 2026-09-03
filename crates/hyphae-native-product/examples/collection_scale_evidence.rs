@@ -58,6 +58,24 @@
 //! dictionary walk stopped materializing entries, fuzzy went 80 -> 19 ms
 //! at 100k and 211 -> 61 ms at 250k.
 //!
+//! After the chunked manifest (`HYPSMAN2` header + 16 KB `HYPSCHK1` chunks;
+//! a batch rewrites the header and the chunks it touches instead of a
+//! 16-byte-per-document blob) and lazy eligibility (`MatchAll` probes the
+//! owning chunk instead of cloning the manifest), fresh corpora, reopened
+//! before the query ladder:
+//!
+//! | rung | ingest docs/s | ingest s | vacuum s | dir after | reopen | chunks | header | bm25 p50 | filtered p50 | phrase p50 | fuzzy p50 |
+//! |------|--------------|----------|----------|-----------|--------|--------|--------|----------|--------------|------------|-----------|
+//! | 250k | 1,099        | 227      | 50.6     | 232 MB    | 24.8 s | 487    | 9.8 KB | 24 ms    | 39 ms        | 29 ms      | 46 ms     |
+//! | 1M   | 1,014        | 986      | 185      | 995 MB    | 107 s  | 1,952  | 39 KB  | 172 ms   | 233 ms       | 175 ms     | 308 ms    |
+//!
+//! The 1M load ran with `HYPHAE_SCALE_MAINTENANCE_EVERY=400` (9 windows,
+//! 868 s, excluded from `ingest s`) because the unmaintained directory
+//! transits ~28 GB at that rung. The 1M ladder is ~6–7x the 250k ladder
+//! for 4x the documents; the durable scorer, not the manifest, carries
+//! that superlinearity (see `scale_stage_diagnostic`). The shipped bound
+//! stays 250k: the R5 vector conditions for the 1M rung are unmeasured.
+//!
 //! The 250k rung ran with the collection bound lifted on the measurement
 //! host only; the shipped bound is unchanged until the contract is raised.
 //! Open time is dominated by validating every retained committed root:
@@ -113,6 +131,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
+    // HYPHAE_SCALE_MAINTENANCE_EVERY=<batches> runs vacuum + checkpoint +
+    // retain during the load, every that many batches, to bound the
+    // transient directory on hosts whose disk cannot hold the unmaintained
+    // page generations of a large load (~30 GB at 1M documents). The time
+    // it takes is reported separately and excluded from `ingest_seconds`.
+    let maintenance_every: usize = std::env::var("HYPHAE_SCALE_MAINTENANCE_EVERY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut windowed_maintenance = std::time::Duration::ZERO;
+    let mut windowed_rounds = 0_usize;
 
     // Deterministic corpus: rotating vocabulary + doc values.
     let vocabulary = [
@@ -196,8 +225,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProductDurability::Group,
         )?;
         ingested += count;
+        if maintenance_every > 0
+            && usize::try_from(batch_id)?.is_multiple_of(maintenance_every)
+            && ingested < target
+        {
+            let window_started = Instant::now();
+            let mut admin = product.administration();
+            admin.vacuum_pages()?;
+            admin.checkpoint()?;
+            admin.retain_wal()?;
+            admin.collect_retired_page_generations()?;
+            windowed_maintenance += window_started.elapsed();
+            windowed_rounds += 1;
+        }
     }
-    let ingest_elapsed = started.elapsed();
+    let ingest_elapsed = started.elapsed().saturating_sub(windowed_maintenance);
+    if windowed_rounds > 0 {
+        println!(
+            "windowed_maintenance rounds={windowed_rounds} every_batches={maintenance_every} seconds={:.1}",
+            windowed_maintenance.as_secs_f64()
+        );
+    }
     // Steady-state maintenance after a bulk load: rebuild the current root
     // into a compact generation (advances the retention floor), publish a
     // synchronized checkpoint at that floor, and retire the WAL prefix. A

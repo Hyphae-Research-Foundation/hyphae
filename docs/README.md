@@ -47,6 +47,8 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Dedicated-hardware baselines and commit-protocol model checking (2026-08-30)](gates/evidence/baseline-i7i-metal-2026-08-30.md)
 - [Phase-1 hot-path optimization before/after (2026-08-30)](gates/evidence/phase1-optimization-2026-08-30.md)
 - [Phase-1 optimization raw receipts](gates/evidence/phase1/README.md)
+- [Collection document cap — 250k rung (2026-09-02)](gates/evidence/collection-cap-250k-2026-09-02.md)
+- [Chunked collection manifest — 250k re-measurement and the 1M ladder (2026-09-03)](gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md)
 
 ## Build and embed
 
@@ -188,6 +190,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Decisions and governance
 
+- [Fable 5.1 handoff — doc-cap ladder, Studio, research state (2026-09-02, with the 2026-09-03 addendum)](handoffs/fable-5.1-doc-cap-ladder-2026-09-02.md)
 - [Superseded Fable 5 native-ecosystem handoff — 2026-08-02](handoffs/fable-5-native-ecosystem-2026-08-02.md)
 - [Roadmap](roadmap.md)
 - [0.2 execution roadmap](roadmap-0.2.md)

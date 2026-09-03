@@ -111,8 +111,8 @@ Stable) is in `~/Documents/hyphae-research/docs/RESEARCH-PUBLICATION-POLICY.md`.
 |---|---|
 | Repository | `Hyphae-Research-Foundation/hyphae` (local: `~/Documents/hyphae`) |
 | Branch | `feat/sql-slice-2-and-evidence` |
-| HEAD | `1b2cc70` — *Search: prefix and fuzzy expansion walk the dictionary without materializing it* |
-| Base | `17a841d` (41 commits on top) |
+| HEAD | `1b2cc70` at hand-off; `bda7e28` (this document), then the three 2026-09-03 commits in the addendum below |
+| Base | `17a841d` (41 commits on top at hand-off; 45 after the addendum) |
 | Pushed | **No.** Nothing on this branch is on the remote. |
 | Worktree | clean |
 | Suite | 1,753 tests green on the devbox; `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` clean |
@@ -281,15 +281,48 @@ See `docs/quickstart-native.md`.
 
 ---
 
+## Addendum — 2026-09-03 session (Fable 5.1)
+
+Three commits on top of `bda7e28`, all gate-verified on the devbox (fmt,
+clippy `-D warnings`, 1,772 tests):
+
+| Commit | Change | Receipt (c-16, release) |
+|---|---|---|
+| `92f3c7a` | **Chunked manifest**: `HYPSMAN2` header + `HYPSCHK1` 16 KB chunks (`crates/hyphae-native-product/src/search_manifest.rs`); inserts stage only `SET`s (sentinel floor 0, midpoint split), deletes merge/drop; one `ManifestState` for delta, materialized, and operation-batch writers; `HYPSMAN1` readable forever, upgraded on the first accepted mutation; contract section in `search-document-lifecycle-v1.md`; 19 tests | 250k: ingest 949 → 1,099 docs/s, directory after maintenance 2.1 GB → 232 MB, reopen 35.6 → 24.8 s; legacy 100k upgrades in 0.8 s |
+| `51d8fb0` | **Lazy eligibility**: `Eligibility::Universe(&ManifestView)` probes the owning chunk instead of cloning the manifest; `All` seeds from its first narrowing child; vector branches materialize once | 250k reopened: bm25 39 → 24 ms, phrase 44 → 29, filtered+facet 44 → 39, fuzzy 63 → 46; sparse query 16 → 0.4 ms |
+| (this commit) | 1M ladder receipt, `HYPHAE_SCALE_MAINTENANCE_EVERY`, `HYPHAE_DIAG_MODEL_ROUNDS`, roadmap/claims/handoff updates | 1M: 1,014 docs/s, reopen 107 s, bm25 172 ms, filtered+facet 233, phrase 175, fuzzy 308; manifest 1,952 chunks / 39 KB header / 17 µs probe |
+
+Evidence: [`docs/gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md`](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md).
+
+**The bound stays at 250,000.** R5 gates the 1M rung on the manifest (now
+met) *and* on ANN consolidation cost and RSS at 1M×768-dim, which cannot be
+measured until vector-carrying batches leave the materialized path (item 2
+below). The 1M lexical ladder is also ~6–7× the 250k ladder for 4× the
+documents, and the manifest is no longer why: the durable scorer spends
+~430 ns per posting entry at 1M against ~235 ns at 250k (1,562 segments,
+372k entries for "database engine"). Decision for the user: raise to an
+intermediate rung on this receipt, wait for the vector receipt, or amend R5.
+
+Devbox state after the session: corpora `/root/ladder2-250000` (chunked,
+232 MB), `/root/ladder-1000000` (chunked, 995 MB), `/root/ladder-100000-upgrade`
+(legacy copy upgraded); the originals `/root/ladder-100000` and
+`/root/ladder-250000` are untouched (still `HYPSMAN1`). The 1M model/durable
+scorer equivalence run was started detached (`/root/equiv-1000000.log`);
+append its result to the receipt. Deleting `/root/scale-*` (41 GB) needs the
+user's explicit approval; the auto-mode classifier blocks it.
+
 ## Part 4 — Open items and next moves
 
 ### Engine, in priority order
 
-1. **Manifest for the 1M rung.** `HYPSMAN1` is one blob of 16-byte ids
-   rewritten every batch (4 MB at 250k, 16 MB at 1M). Options: chunked
-   manifest keyed by id range, or count + posting-derived membership.
-   `posting_filter_ids(MatchAll)` also clones the whole manifest per query.
-   This is the declared blocker for raising the cap again.
+1. ~~Manifest for the 1M rung~~ — done (`92f3c7a`, `51d8fb0`). Next
+   manifest-adjacent item: sequential inserts fill chunks to 50–100 % via
+   midpoint splits (1,952 chunks at 1M instead of ~977); an append-aware
+   split would halve the header, at the cost of a different invariant proof.
+1b. **Durable scorer superlinearity at 1M** (new): 22 ms → 160 ms for 4×
+   the postings. Suspects: buffer-pool residency of the posting segments,
+   and item 3 (the parallel scorer never activates). Profile with `perf`
+   (`--call-graph dwarf`) on `/root/ladder-1000000` before touching code.
 2. **Vector-carrying batches** still take the materialized ingest
    transaction (`ingest_search_batch_materialized`) because the ANN store has
    no delta stage. The ladder corpus has no vectors; that cost is unmeasured.

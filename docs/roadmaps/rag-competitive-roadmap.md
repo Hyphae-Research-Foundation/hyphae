@@ -166,8 +166,13 @@ proceed as adopted and are orthogonal.
   complete state once, borrowed-leaf durable scorer 73 → 26 ms bm25 p50 at
   100k and 63 ms at 250k, bit-identical model/durable scorer hits at both
   rungs); → 1M on measured consolidation cost and RSS at 1M×768-dim plus a
-  manifest that no longer rewrites 16 bytes per document per batch. The cap
-  moves only when the receipt exists.
+  manifest that no longer rewrites 16 bytes per document per batch. The
+  manifest condition is met by the chunked `HYPSMAN2` manifest
+  ([2026-09-03 receipt](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md):
+  1,014 docs/s flat from 250k to 1M, bm25 p50 24 ms at 250k and 172 ms at
+  1M, reopen 25 s / 107 s); the two vector conditions wait on an ANN delta
+  stage, since a vector-carrying batch still takes the materialized ingest
+  transaction. The cap moves only when the receipt exists.
 - **R6** Filter operators In / ContainsAny / ContainsAll / bounded Like /
   IsNull and doc-value types Float, Date (canonical epoch integer), Array —
   product model, SQL surface, proof binding, SDKs. Decided ordering story:
