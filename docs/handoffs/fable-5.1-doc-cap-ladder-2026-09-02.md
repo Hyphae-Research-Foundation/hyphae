@@ -339,8 +339,12 @@ user's explicit approval; the auto-mode classifier blocks it.
    17 %, `_blake3_compress_in_place_avx512` 11 %, CRC32C 16 %) plus kernel
    file reads: the shipped 1,024-frame verified buffer pool (16 MiB) cannot
    hold the 1,562 posting segments of a two-term query at 1M, so every query
-   re-reads and re-verifies them. Next slice: frame budget from the memory
-   governor / a verified-once page cache per generation; then item 3.
+   re-reads and re-verifies them. **Done in part** (the buffer-pool commit): the default
+   pool bound is now 8,192 frames (128 MiB ceiling, lazy), measured on the
+   devbox at 1M: scorer 135–146 → 61–69 ms, fuzzy 266 → 159 ms; 65,536
+   frames buys nothing more. Still open: deriving the bound from the memory
+   governor instead of a constant, and item 3 (the parallel scorer never
+   activates).
    Also cheap: `drop_in_place<NativeRuntimeError>` at 2.8 % is the fail-open
    probe constructing errors on the hot path.
 1c. **Re-measure at `b53348e`**: the B+tree split fix changes the physical

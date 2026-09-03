@@ -142,6 +142,24 @@ segments and 93,702 entries because the posting leaves are dense again;
 the reopened ladder is in the table above. The 1M rows predate the fix and
 are pessimistic.
 
+### Buffer-pool residency sweep at 1M (`HYPHAE_BUFFER_POOL_FRAMES`)
+
+The bare-metal `perf` profile attributed 44 % of the 1M scorer to page
+verification. On this host, the same 1M directory (pre-fix layout, bound
+lifted), warm rounds, three pool sizes:
+
+| frames (× 16 KiB) | durable scorer | integrated `MatchAll` | `price < 500` + facet | fuzzy(1) |
+|---|---|---|---|---|
+| 1,024 (16 MiB, previous default) | 135–146 ms | 136–146 ms | 201–211 ms | 266–278 ms |
+| 8,192 (128 MiB) | 61–69 ms | 57–62 ms | 117–130 ms | 159–173 ms |
+| 65,536 (1 GiB) | 72–86 ms | 63–75 ms | 122–128 ms | 173–181 ms |
+
+The 1,562 posting segments of the two-term query fit in 8,192 frames and
+stay verified between queries; a larger pool buys nothing further. The
+default moved to 8,192 frames on this receipt (the pool is populated
+lazily, so the 128 MiB is a ceiling, not a working-set cost); the scorer at
+1M is then ~4.7× the 250k stage for 4× the entries.
+
 ## Scorer equivalence
 
 `scale_stage_diagnostic` compares the retained-model scorer's ranked hits

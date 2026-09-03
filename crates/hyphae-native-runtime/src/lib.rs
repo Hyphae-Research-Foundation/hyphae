@@ -552,7 +552,11 @@ const SEARCH_POSTING_SIZE: usize = 16;
 const SEARCH_DOCUMENT_INLINE: u8 = 0;
 const SEARCH_DOCUMENT_BLOB: u8 = 1;
 const SEARCH_INLINE_VALUE_LIMIT: usize = 8_192;
-const DEFAULT_BUFFER_POOL_FRAMES: usize = 1_024;
+/// Verified 16 KiB page frames the shared buffer pool may hold (a 128 MiB
+/// ceiling, populated lazily). Sized so the posting segments of a two-term
+/// query over a 1,000,000-document collection stay resident between queries;
+/// see `docs/performance/native-segmented-substrate-v1.md`.
+const DEFAULT_BUFFER_POOL_FRAMES: usize = 8_192;
 const DEFAULT_BUFFER_POOL_PARTITIONS: usize = 16;
 /// Maximum number of independent transactions sharing one native durability flush.
 pub const MAX_GROUP_COMMIT_BATCH_SIZE: usize = 256;

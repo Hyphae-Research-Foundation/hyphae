@@ -48,6 +48,19 @@ published after capture. `NativeDatabase` remains the sole append/publication
 authority; no global reader mutex is introduced. The shared buffer pool is
 partitioned and synchronized independently.
 
+The shared buffer pool holds at most `DEFAULT_BUFFER_POOL_FRAMES` verified
+16 KiB page frames (8,192 frames, a 128 MiB ceiling) across 16 partitions,
+populated lazily: a process pays only for the pages it touches, and a frame
+is verified once per `(page_generation, page_id)` while it stays resident.
+`HYPHAE_BUFFER_POOL_FRAMES` overrides the frame bound (never below the
+partition count) for operators sizing the cache to a larger working set.
+The bound is evidence-set, not guessed: at 1,000,000 documents a two-term
+BM25 query plans 1,562 posting segments, and with the previous 1,024-frame
+bound those segments were re-read and re-verified on every query — 44 % of
+the scorer's samples were BLAKE3 and CRC32C page verification — while 8,192
+frames keep them resident and halve the durable scorer stage; 65,536 frames
+measured no better ([1M ladder receipt](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md)).
+
 `scan_latest_relational_range_profiled` returns the common snapshot CSN,
 visible rows, selected segment count, covered physical entry count, planning
 and execution governor receipts, planned workers, and query-local worker batch
