@@ -1,0 +1,74 @@
+{
+  "benchmark": "hyphae-baseline-harness-v1",
+  "environment": {
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz",
+    "hypervisor_flag": true,
+    "kernel": "6.8.0-124-generic",
+    "logical_cpus": 16,
+    "os": "linux",
+    "scaling_governor": null
+  },
+  "results": {
+    "keyspace": {
+      "hyphae": {
+        "engine": "hyphae-native-embedded",
+        "get": {
+          "label": "get_latest",
+          "latency_nanos": {
+            "max": 8174842,
+            "mean": 31037,
+            "p50": 26154,
+            "p95": 39147,
+            "p99": 307974,
+            "p999": 451323
+          },
+          "operations": 500000,
+          "ops_per_second": 31991.022076418132,
+          "wall_nanos": 15629384982
+        },
+        "get_hits": 500000,
+        "set_memory": {
+          "label": "set_memory_no_fsync_ack",
+          "latency_nanos": {
+            "max": 135039426,
+            "mean": 856829,
+            "p50": 803023,
+            "p95": 999239,
+            "p99": 1429900,
+            "p999": 6023176
+          },
+          "operations": 200000,
+          "ops_per_second": 1166.9383758833576,
+          "wall_nanos": 171388656105
+        },
+        "set_strict": {
+          "label": "set_strict_fsync_per_commit",
+          "latency_nanos": {
+            "max": 21764897,
+            "mean": 4378977,
+            "p50": 4279236,
+            "p95": 4987645,
+            "p99": 6103149,
+            "p999": 12421398
+          },
+          "operations": 10000,
+          "ops_per_second": 228.35514313286157,
+          "wall_nanos": 43791437595
+        },
+        "transport": "none (in-process library call)"
+      },
+      "redis_everysec": null,
+      "redis_strict": null,
+      "workload": {
+        "gets": 500000,
+        "keys": 1000000,
+        "relaxed_sets": 200000,
+        "seed": 6840158756763402241,
+        "strict_sets": 10000
+      }
+    }
+  },
+  "rustc": "",
+  "source_commit": "phase1-optimized"
+}

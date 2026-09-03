@@ -1,6 +1,46 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+Protocol minor 6 additionally admits structure-read request tag `21`
+(`KeyScanMatch`: keyspace object id, length-framed binary-glob pattern,
+optional `start_after` cursor behind one presence byte, and `u64`
+output/visit/match-step limits), structure-read result tag `13`
+(`KeyPage`: `u32`-counted entries of length-framed key plus one family
+byte, optional length-framed continuation behind one presence byte, one
+stop byte, and `u64` visited and match-step counters), structure-mutation
+tags `17` (`SortedSetIncrement`: structure key, binary64 delta bits,
+length-framed member) and `18` (`SortedSetPop`: structure key and one end
+byte `0` lowest / `1` highest), and structure-mutation result tags `6`
+(`Score`: binary64 bits) and `7` (`PoppedEntry`: one presence byte, then
+length-framed member and binary64 score bits when present).
+
+Protocol minor 6 further admits structure-read request tags `22`
+(`StringRange`: structure key and two `i64` inclusive positions) and `23`
+(`SetRandomMembers`: structure key, `u64` seed, and `u64` count), and
+structure-mutation tags `19` (`StringSetConditional`: structure key,
+length-framed value, optional `i64` expiry behind one presence byte, and
+one condition byte `0` if-absent / `1` if-present), `20` (`StringAppend`:
+structure key and length-framed suffix), `21` (`StringSetRange`:
+structure key, `u32` offset, and length-framed patch), `22`
+(`HashSetIfAbsent`: structure key, length-framed field, and length-framed
+value), and `23` (`SetPop`: structure key and `u64` seed). Their results
+reuse the existing `Boolean`, `Count`, `Value`, and `Values` shapes.
+
+Protocol minor 6 admits three appended structure-read request tags —
+`18` (`SortedSetScoreRange`: structure key, two score endpoints each
+encoded as one tag byte `0` unbounded / `1` inclusive / `2` exclusive
+followed by binary64 bits when bounded, `u64` offset, `u64` limit, and
+the sorted-order byte), `19` (`HashScanReverse`: structure key, optional
+length-framed exclusive `start_before` cursor behind one presence byte,
+and `u64` limit), and `20` (`HashScanMatch`: structure key, length-framed
+binary-glob pattern, optional `start_after` cursor behind one presence
+byte, and `u64` output/visit/match-step limits) — plus structure-read
+result tag `12` (`HashPage`: `u32`-counted field/value entries, optional
+length-framed continuation behind one presence byte, one stop byte `0`
+exhausted / `1` output limit / `2` visit limit, and `u64` visited and
+match-step counters). Requests and results at these tags are rejected as
+unsupported below minor 6 on both encode and decode.
+
 Protocol minor 5 admits one new content-derived request section and one
 content-derived response tail inside the existing `SearchCollection`
 exchange. Request tag `4` is the highlight budget: fragments per hit

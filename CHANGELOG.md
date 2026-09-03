@@ -3,6 +3,131 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## [3.0.0] - 2026-09-03
+
+Hyphae 3.0.0 is the engine release measured for the Thursday brief: the
+bounded SQL slice grows into its analytics form, the keyspace gains the
+Valkey-shaped conditional and range commands, the search engine gains the
+lexical modes and doc-value shapes that the RAG roadmap listed as
+disqualifying gaps, and the document-cap ladder moves from 100,000 to
+250,000 documents on receipts — with the first complete lexical ladder at
+1,000,000 documents and a dedicated-hardware re-measurement of the whole
+release bound to an exact commit. The major version marks durable records
+that 2.x cannot read: a directory written by 3.0 (self-describing
+`HYPOST02` postings, the chunked `HYPSMAN2` / `HYPSCHK1` collection
+manifest) opens only on 3.0 or later, while every 2.x directory still opens
+on 3.0 and upgrades in place on its first accepted mutation. The native
+local protocol stays at minor 6 (additive) and the format-2 line is
+unchanged.
+
+### Added
+
+- SQL slice 2: `HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`,
+  `BETWEEN`, `AS` aliases and PostgreSQL-style named group keys on top of
+  multi-row `INSERT`, aggregates, `GROUP BY`, `DESC`, `LIKE`, and `IN`.
+- Keyspace: cross-family key scans, sorted-set `ZINCRBY` / `ZPOP` and score
+  ranges, directional and glob hash scans, `SETNX` / `SET`-if-present,
+  `APPEND`, `SETRANGE`, `GETRANGE`, `HSETNX`, and seeded `SPOP` /
+  `SRANDMEMBER` (`splitmix64`), all on wire minor 6.
+- Search (minor 6, semantics v5): relative-score fusion beside RRF and
+  weighted-score, autocut knee truncation, float doc values with a
+  deterministic total order, offset pagination over the final ranking,
+  `Average` aggregation, range facets, per-branch vector `max_distance`,
+  lexical `AND` / `OR` with minimum-match, bounded prefix expansion, BM25F
+  field boosts, fuzzy expansion, phrase matching, and highlighting that
+  covers expanded terms — exposed end to end through the CLI, the
+  TypeScript SDK codec, and the MCP agent tools.
+- ANN: HNSW diversity neighbour selection with pruned backfill (build
+  identity v2) and the SQ8 scalar-quantization primitive with its recall
+  gate (not yet in the durable format).
+- Document-cap ladder harnesses (`collection_scale_evidence`,
+  `scale_stage_diagnostic`) with windowed maintenance, a manifest stage, a
+  bit-identical model/durable scorer oracle, and configurable oracle
+  rounds; the standalone dedicated-hardware baseline harness and the
+  machine-checked TLA+ model of the cross-engine commit protocol.
+- Chunked collection manifest: a `HYPSMAN2` header plus 16 KB `HYPSCHK1`
+  chunks, so an ingest batch rewrites the header and the chunks it touches
+  instead of 16 bytes per document; inserts stage only `SET`s (sentinel
+  floor, midpoint split), deletes merge under an adjacent-pair invariant
+  that bounds the chunk count, and `HYPSMAN1` manifests read forever and
+  upgrade on the first accepted mutation.
+
+### Changed
+
+- `MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS` is 250,000, raised on the rung
+  receipt; the 1,000,000 rung is measured but not shipped until the ANN
+  consolidation and RSS conditions of roadmap item R5 are met.
+- Product batch ingest is point-resolved: idempotency, binding, manifest,
+  and coverage resolve through durable point reads, vector-less batches
+  stage through the physical delta batch, and runs of scalar `SET`s build
+  the structure root as one sorted copy-on-write batch.
+- Open decodes complete state once (the root that becomes current) and
+  verifies every retained superseded root structurally.
+- The durable posting scorer borrows leaf entries from the verified buffer
+  pool, plans on boundary keys, ranks on an id arena, and merges scores in
+  one linear pass; prefix and fuzzy expansion walk the durable dictionary
+  without materializing it; eligibility answers `MatchAll` by probing
+  manifest chunks instead of cloning the manifest.
+- Postings are self-describing (`HYPOST02` carries the document length);
+  compaction upgrades legacy `HYPOST01` postings, and a dense query pays the
+  legacy length prescan only when it meets one.
+- Hot-path copies and linear scans were removed from pages, WAL, and the
+  B+tree (streaming CRC32C and BLAKE3 over canonical forms, single-encode
+  WAL blocks).
+- External wording follows the canonical claims page; third-party systems
+  are measurement subjects, never adversaries.
+
+### Fixed
+
+- B+tree batch rewrites split an overflowing leaf evenly instead of
+  full-plus-remainder. Since the coalesced scalar root construction every
+  scalar `SET` had been degenerating the structure tree toward one leaf per
+  key (904 leaves for 4,000 random keys where 10 would be full), which
+  multiplied the pages every open and every materialized transaction read
+  and verified; the fix returns the materialized single-`SET` commit to its
+  2.2.0 cost and halves the durable scorer stage at 250,000 documents.
+- `run-metal.sh` no longer selects a partitioned or pre-mounted disk for the
+  scratch filesystem.
+
+### Measured
+
+Every number carries a receipt under `docs/gates/evidence/`; the shipped
+bound moved only on the aggregate receipt.
+
+- Dedicated hardware (`i7i.metal-24xl`, commit `2ff8a4b`,
+  `baseline-i7i-metal-2026-09-03.md`): TLC reproduced state for state with
+  spec digests; lexical BM25 query 4.09 ms → 255 µs and durable 1,000-doc
+  ingest 16.6 → 2.19 s against 2.2.0's baseline receipt; delta-transaction
+  cost flat across version depth (194–197 µs, 9 page reads, no
+  complete-state loads); 250k ladder 4,069 docs/s / reopen 7.7 s / bm25
+  6.2 ms; 1M ladder 3,755 docs/s / reopen 34.5 s / bm25 51.6 ms; 1M
+  model/durable scorer equivalence `bit_identical=true`; 44 % of the 1M
+  scorer in page verification, naming buffer-pool residency as the next
+  slice. The same receipt publishes the materialized-path regression it
+  found and its bisect.
+- Dedicated hardware after the B+tree fix and the 8,192-frame pool
+  (`i7i.metal-24xl`, commit `a443c52`,
+  `hyphae-3.0-metal-a443c52-2026-09-03.md`): materialized single-`SET`
+  commit 4.39 ms Strict / 3.86 ms Memory (2.2.0: 4.98 / 3.62; the
+  regression at `2ff8a4b`: 35.5 / 34.2); SQL prepared point read 20 µs;
+  embedded keyspace GET 2.2 µs p50 against Redis's 7.9 µs over UDS; BM25
+  top-10 111 µs against Tantivy's 78 µs, durable 1,000-doc ingest 1.12 s;
+  1M ladder linear in documents (bm25 23 ms, filtered+facet 43 ms, phrase
+  24 ms, fuzzy 54 ms — 3.3–4.5× the 250k stage for 4× the documents);
+  1,024 vs 8,192 pool frames on the same 1M directory: scorer 51 → 22 ms.
+- Virtualized c-16 ladder (`collection-cap-250k-2026-09-02.md`,
+  `collection-manifest-chunked-1m-ladder-2026-09-03.md`): 100k → 250k with
+  ingest 48 → 1,346 docs/s, bm25 73 → 22 ms, reopen ~17 min → 22.5 s;
+  1M at 1,014 docs/s, bm25 172 ms, reopen 107 s before the B+tree fix.
+
+### Compatibility
+
+- Directories written by 3.0.0 use `HYPOST02` postings and, after the first
+  accepted search mutation, `HYPSMAN2` / `HYPSCHK1` manifests; 2.x releases
+  do not read them. All 2.x native directories open on 3.0.0.
+- Native local protocol minor 6 is additive; format-2 (`hyphae-*` legacy
+  line) surfaces and fixtures are unchanged.
+
 ## [2.2.0] - 2026-08-26
 
 Hyphae 2.2.0 makes Agent Memory transactional and the memory surface a

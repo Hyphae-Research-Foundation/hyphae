@@ -154,6 +154,18 @@ fn configure_full(
                             lexical: LexicalIndexPolicy::None,
                         },
                     },
+                    SearchFieldDefinitionV2 {
+                        id: FieldId::new(9)?,
+                        name: name("rating")?,
+                        logical_type: LogicalType::Float64,
+                        analyzer: None,
+                        options: SearchFieldOptions {
+                            stored: true,
+                            doc_values: true,
+                            source: FieldSourcePolicy::Retained,
+                            lexical: LexicalIndexPolicy::None,
+                        },
+                    },
                 ],
                 vectors: vec![
                     NamedVectorDefinition {
@@ -302,6 +314,11 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 query: "rust database".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::Compare {
@@ -318,6 +335,7 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
                 field: "category".into(),
                 limit: 4,
             }],
+            range_facets: Vec::new(),
             aggregations: vec![
                 ProductNamedAggregation {
                     name: "count".into(),
@@ -333,6 +351,8 @@ fn integrated_search_reopens_with_filters_sort_facets_metrics_and_same_snapshot(
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
         7,
     )?;
@@ -376,6 +396,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                     ef_search: 8,
                     exact_rerank: Some(4),
                 }),
+                max_distance: None,
             }],
             filter: ProductSearchFilter::Compare {
                 field: "price".into(),
@@ -384,12 +405,15 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             },
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 2,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -407,6 +431,11 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 2,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: vec![
                 ProductVectorBranch {
@@ -418,6 +447,7 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 8,
                         exact_rerank: Some(4),
                     }),
+                    max_distance: None,
                 },
                 ProductVectorBranch {
                     target: "semantic".into(),
@@ -429,17 +459,21 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 8,
                         exact_rerank: Some(4),
                     }),
+                    max_distance: None,
                 },
             ],
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -473,16 +507,20 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                     candidate_limit: 2,
                     weight: 1,
                     execution: Some(ProductVectorExecution::Exact),
+                    max_distance: None,
                 }],
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
+                offset: 0,
             },
             0,
         )
@@ -505,16 +543,20 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
                         ef_search: 257,
                         exact_rerank: None,
                     }),
+                    max_distance: None,
                 }],
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 2,
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
+                offset: 0,
             },
             0,
         )
@@ -545,16 +587,20 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 2,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 2,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let ann = ProductSearchRequest {
         lexical: None,
@@ -564,22 +610,31 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 3,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 3,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let hybrid = ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
             query: "rust".into(),
             candidate_limit: 4,
             weight: 2,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "semantic".into(),
@@ -587,16 +642,20 @@ fn exact_ann_and_hybrid_proofs_reexecute_declared_branches_and_reject_ann_metada
             candidate_limit: 3,
             weight: 1,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
 
     let mut ann_artifact = None;
@@ -721,6 +780,7 @@ fn invalid_batch_is_atomic_and_stream_enforces_backpressure_and_idempotency()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn idempotency_conflicts_and_document_update_delete_survive_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("lifecycle");
@@ -768,17 +828,25 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             query: text.into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     assert!(
         product
@@ -1041,12 +1109,15 @@ fn posting_eligibility_matches_the_reference_under_randomized_lifecycle()
                     filter: filter.clone(),
                     sort: Vec::new(),
                     facets: Vec::new(),
+                    range_facets: Vec::new(),
                     aggregations: Vec::new(),
                     limit: 64,
                     fusion: None,
                     parent_dedupe: None,
                     rerank: None,
                     highlight: None,
+                    autocut: None,
+                    offset: 0,
                 };
                 let result = product.search_collection(binding.collection, &request, 0)?;
                 let expected = reference_eligible(&model, &filter);
@@ -1099,12 +1170,15 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         filter: category_filter,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &request, 0)?;
     assert_eq!(result.total_documents, 5);
@@ -1124,12 +1198,15 @@ fn oversized_doc_values_fall_back_to_the_scan_without_diverging()
         },
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 16,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &price_request, 0)?;
     let observed: std::collections::BTreeSet<u128> =
@@ -1153,6 +1230,11 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::In {
@@ -1164,12 +1246,15 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
             },
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
     };
     let (_, artifact) = generate_native_operation_proof(
@@ -1196,17 +1281,25 @@ fn membership_operator_proofs_seal_at_semantics_three_and_verify_offline()
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
     };
     let context = proof_context(&session, 42);
@@ -1238,6 +1331,11 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: vec![ProductVectorBranch {
             target: "image".into(),
@@ -1245,16 +1343,20 @@ fn weighted_score_fusion_reorders_hybrid_results_and_binds_the_proof_method()
             candidate_limit: 4,
             weight: 2,
             execution: None,
+            max_distance: None,
         }],
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let rrf = product.search_collection(binding.collection, &request(None), 11)?;
     let weighted = product.search_collection(
@@ -1349,17 +1451,25 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
                         query: query.into(),
                         candidate_limit: 4,
                         weight: 1,
+                        operator: None,
+                        prefix: false,
+                        fields: Vec::new(),
+                        fuzzy: None,
+                        phrase: false,
                     }),
                     vectors: Vec::new(),
                     filter: ProductSearchFilter::MatchAll,
                     sort: Vec::new(),
                     facets: Vec::new(),
+                    range_facets: Vec::new(),
                     aggregations: Vec::new(),
                     limit: 4,
                     fusion: None,
                     parent_dedupe: None,
                     rerank: None,
                     highlight: None,
+                    autocut: None,
+                    offset: 0,
                 },
                 12,
             )
@@ -1479,6 +1589,7 @@ fn configure_chunked(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn std::error::Error>>
 {
     let path = temporary("chunk-provenance");
@@ -1507,6 +1618,11 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
             query: "deterministic retrieval".into(),
             candidate_limit: 8,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::Compare {
@@ -1516,12 +1632,15 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
         },
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let result = product.search_collection(binding.collection, &request, 7)?;
     assert!(!result.hits.is_empty());
@@ -1585,6 +1704,7 @@ fn chunked_ingest_binds_every_hit_to_exact_source_bytes() -> Result<(), Box<dyn 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("parent-dedupe");
@@ -1622,17 +1742,25 @@ fn parent_dedupe_retains_first_k_per_parent_and_binds_the_proof()
             query: "shared token".into(),
             candidate_limit: 16,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 10,
         fusion: None,
         parent_dedupe: dedupe,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let all = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(all.hits.len() >= 4);
@@ -1702,17 +1830,25 @@ fn attested_rerank_reorders_the_ranking_and_seals_the_envelope()
             query: "rust database".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
         parent_dedupe: None,
         rerank,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let base = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(base.hits.len() >= 3);
@@ -1785,17 +1921,25 @@ fn budgeted_highlighting_cuts_normalized_fragments_and_seals_at_version_four()
             query: "Rust DATABASE".into(),
             candidate_limit: 4,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: 4,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight,
+        autocut: None,
+        offset: 0,
     };
     let plain = product.search_collection(binding.collection, &request(None), 7)?;
     assert!(plain.hits.iter().all(|hit| hit.fragments.is_empty()));
@@ -1925,17 +2069,25 @@ fn lexical_ranking(
                 query: "rust".into(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
         11,
     )?;
@@ -1985,6 +2137,7 @@ fn tuned_bm25_parameters_change_the_ranking_and_survive_reopen()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn explicit_transaction_stages_a_complete_document_atomically()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("atomic-document");
@@ -2033,17 +2186,25 @@ fn explicit_transaction_stages_a_complete_document_atomically()
                 query: "atomic staged".to_owned(),
                 candidate_limit: 10,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 5,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
         0,
     )?;
@@ -2150,6 +2311,1132 @@ fn explicit_transaction_document_stage_rejects_unknown_collection_and_bad_doc_va
         &c4,
         ProductOperation::TransactionRollback { handle },
     )?;
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn relative_score_fusion_normalizes_each_branch_over_its_own_range()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("relative-fusion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let image = ProductVector::new([3.0, 0.0])?;
+    let request = |fusion| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: vec![ProductVectorBranch {
+            target: "image".into(),
+            query: image.clone(),
+            candidate_limit: 4,
+            weight: 1,
+            execution: None,
+            max_distance: None,
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let relative = product.search_collection(
+        binding.collection,
+        &request(Some(
+            hyphae_native_product::ProductFusionMethod::RelativeScore,
+        )),
+        11,
+    )?;
+    // Per-branch min-max normalization rewards candidates that are good
+    // in BOTH branches. Document 201 is the best lexical hit (norm 1.0)
+    // but the farthest vector hit (norm 0.0); document 204 sits exactly
+    // on the vector query (norm 1.0) but is lexically silent (no
+    // contribution). Document 203 ("database hardware", vector [2,0]) is
+    // strong in both: vector norm (9-1)/9 ~ 0.889 plus a positive
+    // lexical share pushes its fused score above either single-branch
+    // extreme, so the balanced candidate leads.
+    let ids: Vec<u128> = relative
+        .hits
+        .iter()
+        .map(|hit| hit.object_id.get())
+        .collect();
+    assert_eq!(ids.first().copied(), Some(203));
+    assert!(ids.contains(&201));
+    assert!(ids.contains(&204));
+
+    // The same request under RRF produces a valid ranking too; the two
+    // methods must both admit the identical candidate set.
+    let rrf = product.search_collection(binding.collection, &request(None), 11)?;
+    assert_eq!(
+        rrf.hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ids.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+    );
+
+    // The proof pipeline binds the new fusion method.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 52);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(
+                hyphae_native_product::ProductFusionMethod::RelativeScore,
+            )),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 3);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn autocut_truncates_at_the_first_steep_quality_drop() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("autocut");
+    let (mut product, binding) = configure(&path)?;
+    // Two documents strongly about "rust database", two only weakly
+    // related: the fused score curve has a steep knee after the leaders.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                401,
+                "rust database engine rust database core",
+                "book",
+                30,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(
+                402,
+                "rust database handbook rust database",
+                "book",
+                10,
+                [1.0, 0.0],
+                [0.0, 1.0],
+            )?,
+            document(403, "garden rust", "gear", 20, [2.0, 0.0], [1.0, 0.0])?,
+            document(
+                404,
+                "green garden database",
+                "gear",
+                40,
+                [3.0, 0.0],
+                [1.0, 1.0],
+            )?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |autocut| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut,
+        offset: 0,
+    };
+    let full = product.search_collection(binding.collection, &request(None), 7)?;
+    let cut = product.search_collection(binding.collection, &request(Some(1)), 7)?;
+    // Without autocut the weak tail is present; with steepness 1 the
+    // ranking stops at the knee after the strong leaders.
+    assert!(full.hits.len() > cut.hits.len());
+    assert!(!cut.hits.is_empty());
+    let cut_ids: Vec<u128> = cut.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert!(cut_ids.iter().all(|id| *id == 401 || *id == 402));
+    // The cut ranking is a strict prefix of the full ranking.
+    let full_ids: Vec<u128> = full.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(&full_ids[..cut_ids.len()], cut_ids.as_slice());
+
+    // Zero and oversized steepness fail closed.
+    for steepness in [0, hyphae_native_product::MAX_AUTOCUT_STEEPNESS + 1] {
+        let error = product.search_collection(binding.collection, &request(Some(steepness)), 7);
+        let Err(error) = error else {
+            return Err("invalid autocut was admitted".into());
+        };
+        assert_eq!(
+            error.code(),
+            hyphae_native_product::ProductErrorCode::InvalidRequest
+        );
+    }
+
+    // The proof pipeline binds the stage at semantics version 5.
+    let mut session = proof_session()?;
+    let context = proof_context(&session, 53);
+    let (_, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::SearchCollection {
+            collection: binding.collection,
+            request: request(Some(1)),
+        },
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert_eq!(artifact.proof.content().semantics_version, 5);
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert!(report.semantic_reexecution_performed);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn float_doc_values_filter_sort_facet_and_aggregate() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("float-doc-values");
+    let (mut product, binding) = configure(&path)?;
+    let rated = |id: u128,
+                 text: &str,
+                 rating: f64|
+     -> Result<ProductDocument, Box<dyn std::error::Error>> {
+        let mut document = document(id, text, "book", 10, [0.0, 0.0], [0.0, 0.0])?;
+        document.doc_values.insert(
+            "rating".into(),
+            ProductDocValue::Float(CanonicalF64::new(rating)),
+        );
+        Ok(document)
+    };
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            rated(501, "rust database", 4.5)?,
+            rated(502, "rust database", 2.5)?,
+            rated(503, "rust database", 4.5)?,
+            rated(504, "rust database", -0.0)?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+
+    // Range filter over floats (>= 4.0), sorted ascending by rating.
+    let request = ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::Compare {
+            field: "rating".into(),
+            operator: hyphae_native_product::ProductSearchOperator::GreaterOrEqual,
+            value: ProductDocValue::Float(CanonicalF64::new(4.0)),
+        },
+        sort: vec![hyphae_native_product::ProductSearchSort {
+            source: hyphae_native_product::ProductSortSource::Field("rating".into()),
+            direction: hyphae_native_product::ProductSortDirection::Ascending,
+            missing: hyphae_native_product::ProductMissingPlacement::Last,
+        }],
+        facets: vec![hyphae_native_product::ProductFacetRequest {
+            field: "rating".into(),
+            limit: 8,
+        }],
+        range_facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "total".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Sum("rating".into()),
+        }],
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let result = product.search_collection(binding.collection, &request, 7)?;
+    let ids: Vec<u128> = result.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids, vec![501, 503]);
+    // Facet buckets carry the exact canonical float values.
+    let facet = result.facets.first().ok_or("missing facet")?;
+    assert!(facet.buckets.iter().any(|bucket| {
+        bucket.value == ProductDocValue::Float(CanonicalF64::new(4.5)) && bucket.count == 2
+    }));
+    // Sum over the filtered set is a finite float aggregate.
+    let aggregation = result.aggregations.first().ok_or("missing aggregation")?;
+    assert_eq!(
+        aggregation.value,
+        hyphae_native_product::ProductAggregationValue::Float(Some(CanonicalF64::new(9.0))),
+    );
+
+    // Signed zero collapses to canonical +0 and equality matches it.
+    let zero_request = ProductSearchRequest {
+        filter: ProductSearchFilter::Compare {
+            field: "rating".into(),
+            operator: hyphae_native_product::ProductSearchOperator::Equal,
+            value: ProductDocValue::Float(CanonicalF64::new(0.0)),
+        },
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        ..request.clone()
+    };
+    let zeros = product.search_collection(binding.collection, &zero_request, 7)?;
+    assert_eq!(
+        zeros
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![504],
+    );
+
+    // Mixed-type sum (integer price + float rating on the same field
+    // name is impossible here, so force it: sum over "price" stays the
+    // integer path).
+    let integer_sum = ProductSearchRequest {
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "prices".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Sum("price".into()),
+        }],
+        ..request.clone()
+    };
+    let sums = product.search_collection(binding.collection, &integer_sum, 7)?;
+    assert_eq!(
+        sums.aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Integer(
+            Some(40)
+        )),
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn offset_pages_the_final_ranking_without_touching_aggregates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("offset-paging");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |offset, limit| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 4,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "count".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Count,
+        }],
+        limit,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset,
+    };
+    let full = product.search_collection(binding.collection, &request(0, 4), 7)?;
+    let paged = product.search_collection(binding.collection, &request(1, 2), 7)?;
+    let full_ids: Vec<u128> = full.hits.iter().map(|hit| hit.object_id.get()).collect();
+    let paged_ids: Vec<u128> = paged.hits.iter().map(|hit| hit.object_id.get()).collect();
+    // The page is the exact middle window of the full ranking.
+    assert!(full_ids.len() >= 3);
+    assert_eq!(paged_ids, full_ids[1..3].to_vec());
+    // Aggregates describe the complete filtered set, not the window.
+    assert_eq!(
+        paged
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        full.aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+    );
+    // Past-the-end offsets return empty pages, never errors.
+    let empty = product.search_collection(binding.collection, &request(full_ids.len(), 2), 7)?;
+    assert!(empty.hits.is_empty());
+    // offset + limit above the bounded ceiling fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(hyphae_native_product::MAX_PRODUCT_SEARCH_HITS, 1),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("unbounded offset was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::LimitExceeded
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn average_aggregation_is_a_canonical_float_over_present_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("average-aggregation");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |field: &str| ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+            name: "mean".into(),
+            aggregation: hyphae_native_product::ProductAggregation::Average(field.into()),
+        }],
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Integer field: (30 + 10 + 20 + 40) / 4 = 25.0 as a canonical float.
+    let result = product.search_collection(binding.collection, &request("price"), 7)?;
+    assert_eq!(
+        result
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Float(
+            Some(CanonicalF64::new(25.0))
+        )),
+    );
+    // A field with no present values yields an absent float aggregate.
+    let absent = product.search_collection(binding.collection, &request("missing"), 7)?;
+    assert_eq!(
+        absent
+            .aggregations
+            .first()
+            .map(|aggregation| &aggregation.value),
+        Some(&hyphae_native_product::ProductAggregationValue::Float(None)),
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn range_facets_bucket_numeric_values_in_declared_order() -> Result<(), Box<dyn std::error::Error>>
+{
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("range-facets");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    // Prices: 30, 10, 20, 40. Declared ranges: (-inf,15), [15,35), [35,+inf),
+    // plus an overlapping [0,+inf) that must count independently.
+    let request = ProductSearchRequest {
+        lexical: None,
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+            field: "price".into(),
+            ranges: vec![
+                hyphae_native_product::ProductFacetRange {
+                    lower: None,
+                    upper: Some(CanonicalF64::new(15.0)),
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(15.0)),
+                    upper: Some(CanonicalF64::new(35.0)),
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(35.0)),
+                    upper: None,
+                },
+                hyphae_native_product::ProductFacetRange {
+                    lower: Some(CanonicalF64::new(0.0)),
+                    upper: None,
+                },
+            ],
+        }],
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let result = product.search_collection(binding.collection, &request, 7)?;
+    let facet = result.range_facets.first().ok_or("missing range facet")?;
+    assert_eq!(facet.field, "price");
+    let counts: Vec<u64> = facet.buckets.iter().map(|bucket| bucket.count).collect();
+    assert_eq!(counts, vec![1, 2, 1, 4]);
+    // Bucket values are the declared range ordinals, in request order.
+    let ordinals: Vec<_> = facet
+        .buckets
+        .iter()
+        .map(|bucket| bucket.value.clone())
+        .collect();
+    assert_eq!(
+        ordinals,
+        (0..4).map(ProductDocValue::Integer).collect::<Vec<_>>(),
+    );
+
+    // An inverted range fails closed.
+    let inverted = ProductSearchRequest {
+        range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+            field: "price".into(),
+            ranges: vec![hyphae_native_product::ProductFacetRange {
+                lower: Some(CanonicalF64::new(35.0)),
+                upper: Some(CanonicalF64::new(15.0)),
+            }],
+        }],
+        ..request.clone()
+    };
+    let error = product.search_collection(binding.collection, &inverted, 7);
+    let Err(error) = error else {
+        return Err("inverted range was admitted".into());
+    };
+    // The runtime validator rejects malformed range shapes as a shape
+    // limit, which the product maps to limit-exceeded.
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::LimitExceeded
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn vector_distance_cutoff_discards_far_hits_before_fusion() -> Result<(), Box<dyn std::error::Error>>
+{
+    use hyphae_native_product::CanonicalF64;
+
+    let path = temporary("distance-cutoff");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    // Image vectors sit at x = 0,1,2,3; the query at the origin. Distances
+    // (squared L2) are 0, 1, 4, 9.
+    let origin = ProductVector::new([0.0, 0.0])?;
+    let request = |max_distance| ProductSearchRequest {
+        lexical: None,
+        vectors: vec![ProductVectorBranch {
+            target: "image".into(),
+            query: origin.clone(),
+            candidate_limit: 4,
+            weight: 1,
+            execution: None,
+            max_distance,
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 4,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    let full = product.search_collection(binding.collection, &request(None), 7)?;
+    assert_eq!(full.hits.len(), 4);
+    let cut = product.search_collection(
+        binding.collection,
+        &request(Some(CanonicalF64::new(4.0))),
+        7,
+    )?;
+    // Distances 0, 1, 4 stay (inclusive cutoff); 9 is discarded.
+    let ids: Vec<u128> = cut.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(!ids.contains(&204));
+    // A negative cutoff fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(Some(CanonicalF64::new(-1.0))),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("negative cutoff was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn lexical_operator_and_requires_every_term_and_or_counts_minimum()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("lexical-operator");
+    let (mut product, binding) = configure(&path)?;
+    // 201 "rust database engine" has both; 202 "rust field guide" only
+    // rust; 203 "database hardware" only database; 204 neither.
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |operator| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Default OR admits all three matching documents.
+    let any = product.search_collection(binding.collection, &request(None), 7)?;
+    assert_eq!(any.hits.len(), 3);
+    // AND admits only the document containing every analyzed term.
+    let all = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::And)),
+        7,
+    )?;
+    assert_eq!(
+        all.hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![201],
+    );
+    // OR with minimum_match 2 equals AND here.
+    let minimum = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 2,
+        })),
+        7,
+    )?;
+    assert_eq!(
+        minimum
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![201],
+    );
+    // minimum_match 1 restores OR behavior.
+    let one = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 1,
+        })),
+        7,
+    )?;
+    assert_eq!(one.hits.len(), 3);
+    // minimum_match above the distinct-term count admits nothing.
+    let unsatisfiable = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 3,
+        })),
+        7,
+    )?;
+    assert!(unsatisfiable.hits.is_empty());
+    // Zero minimum_match fails closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+            minimum_match: 0,
+        })),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("zero minimum_match was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn lexical_prefix_expands_the_final_term_and_scores_bm25() -> Result<(), Box<dyn std::error::Error>>
+{
+    let path = temporary("lexical-prefix");
+    let (mut product, binding) = configure(&path)?;
+    // Terms: database, hardware, rust, garden, tools, engine, field, guide.
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |query: &str, prefix| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // "gar" matches nothing exactly, but expands to "garden".
+    let exact = product.search_collection(binding.collection, &request("gar", false), 7)?;
+    assert!(exact.hits.is_empty());
+    let expanded = product.search_collection(binding.collection, &request("gar", true), 7)?;
+    assert_eq!(
+        expanded
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![204],
+    );
+    // Earlier terms stay exact: "rust gu" expands only the final term.
+    let mixed = product.search_collection(binding.collection, &request("rust gu", true), 7)?;
+    let ids: Vec<u128> = mixed.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert!(ids.contains(&202));
+    // A prefix with no expansion leaves the branch empty.
+    let none = product.search_collection(binding.collection, &request("zzz", true), 7)?;
+    assert!(none.hits.is_empty());
+    // Prefix and operator together fail closed.
+    let mut conflicted = request("rust", true);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.operator = Some(hyphae_native_product::ProductLexicalOperator::And);
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("prefix+operator was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn field_boosts_run_bm25f_over_body_and_doc_values() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("field-boosts");
+    let (mut product, binding) = configure(&path)?;
+    // Body vs category: doc 301 says "rust" only in category; doc 302
+    // says it only in body.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            {
+                let mut document =
+                    document(301, "database engine", "rust", 30, [0.0, 0.0], [0.0, 0.0])?;
+                document
+                    .doc_values
+                    .insert("category".into(), ProductDocValue::String("rust".into()));
+                document
+            },
+            document(302, "rust handbook", "book", 10, [1.0, 0.0], [0.0, 1.0])?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |fields| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields,
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Single-field BM25 sees only the body: 302 alone matches.
+    let plain = product.search_collection(binding.collection, &request(Vec::new()), 7)?;
+    assert_eq!(
+        plain
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![302],
+    );
+    // Boosting category heavily surfaces 301 first; body keeps 302 present.
+    let boosted = product.search_collection(
+        binding.collection,
+        &request(vec![
+            hyphae_native_product::ProductLexicalFieldBoost {
+                field: "category".into(),
+                weight_micros: 5_000_000,
+            },
+            hyphae_native_product::ProductLexicalFieldBoost {
+                field: "body".into(),
+                weight_micros: 1_000_000,
+            },
+        ]),
+        7,
+    )?;
+    let ids: Vec<u128> = boosted.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert_eq!(ids.first().copied(), Some(301));
+    assert!(ids.contains(&302));
+    // Unknown field names fail closed.
+    let error = product.search_collection(
+        binding.collection,
+        &request(vec![hyphae_native_product::ProductLexicalFieldBoost {
+            field: "missing".into(),
+            weight_micros: 1_000_000,
+        }]),
+        7,
+    );
+    let Err(error) = error else {
+        return Err("unknown boost field was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    // Boosts exclude the operator and prefix.
+    let mut conflicted = request(vec![hyphae_native_product::ProductLexicalFieldBoost {
+        field: "body".into(),
+        weight_micros: 1_000_000,
+    }]);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.prefix = true;
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("boosts+prefix was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn fuzzy_expansion_matches_typo_distance_terms() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("fuzzy-expansion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |query: &str, fuzzy| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // "datbase" is one deletion from "database": exact match finds
+    // nothing, fuzzy(1) recovers both database documents.
+    let exact = product.search_collection(binding.collection, &request("datbase", None), 7)?;
+    assert!(exact.hits.is_empty());
+    let fuzzy = product.search_collection(binding.collection, &request("datbase", Some(1)), 7)?;
+    let ids: Vec<u128> = fuzzy.hits.iter().map(|hit| hit.object_id.get()).collect();
+    assert!(ids.contains(&201));
+    assert!(ids.contains(&203));
+    // Distance zero and above the bound fail closed.
+    for distance in [0, 3] {
+        let error =
+            product.search_collection(binding.collection, &request("datbase", Some(distance)), 7);
+        let Err(error) = error else {
+            return Err("invalid fuzzy distance was admitted".into());
+        };
+        assert_eq!(
+            error.code(),
+            hyphae_native_product::ProductErrorCode::InvalidRequest
+        );
+    }
+    // Fuzzy excludes prefix.
+    let mut conflicted = request("datbase", Some(1));
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.prefix = true;
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("fuzzy+prefix was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn highlighting_covers_expanded_prefix_and_fuzzy_terms() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("highlight-expansion");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let request = |query: &str, prefix, fuzzy| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix,
+            fields: Vec::new(),
+            fuzzy,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: Some(hyphae_native_product::ProductHighlight {
+            max_fragments: 2,
+            fragment_bytes: 32,
+        }),
+        autocut: None,
+        offset: 0,
+    };
+    // Prefix "gar" -> garden: the fragment must contain the expanded term.
+    let prefixed = product.search_collection(binding.collection, &request("gar", true, None), 7)?;
+    let hit = prefixed.hits.first().ok_or("missing prefix hit")?;
+    assert!(
+        hit.fragments
+            .iter()
+            .any(|fragment| fragment.contains("garden")),
+        "fragments {:?}",
+        hit.fragments
+    );
+    // Fuzzy "datbase" -> database: same guarantee.
+    let fuzzy =
+        product.search_collection(binding.collection, &request("datbase", false, Some(1)), 7)?;
+    let hit = fuzzy.hits.first().ok_or("missing fuzzy hit")?;
+    assert!(
+        hit.fragments
+            .iter()
+            .any(|fragment| fragment.contains("database")),
+        "fragments {:?}",
+        hit.fragments
+    );
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn phrase_matching_requires_consecutive_positions() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("phrase-matching");
+    let (mut product, binding) = configure(&path)?;
+    // 401 has "rust database" adjacent; 402 has both terms separated.
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 1,
+        documents: vec![
+            document(
+                401,
+                "the rust database engine",
+                "book",
+                30,
+                [0.0, 0.0],
+                [0.0, 0.0],
+            )?,
+            document(
+                402,
+                "rust is a great database companion",
+                "book",
+                10,
+                [1.0, 0.0],
+                [0.0, 1.0],
+            )?,
+        ],
+    };
+    product.ingest_search_batch(binding.collection, &batch, 7, ProductDurability::Strict)?;
+    let request = |phrase| ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: "rust database".into(),
+            candidate_limit: 8,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 8,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    };
+    // Ordinary match admits both; the phrase admits only the adjacent one.
+    let any = product.search_collection(binding.collection, &request(false), 7)?;
+    assert_eq!(any.hits.len(), 2);
+    let phrase = product.search_collection(binding.collection, &request(true), 7)?;
+    assert_eq!(
+        phrase
+            .hits
+            .iter()
+            .map(|hit| hit.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![401],
+    );
+    // A single-term phrase degrades to an ordinary match.
+    let mut single = request(true);
+    if let Some(lexical) = single.lexical.as_mut() {
+        lexical.query = "rust".into();
+    }
+    let single = product.search_collection(binding.collection, &single, 7)?;
+    assert_eq!(single.hits.len(), 2);
+    // Phrase excludes fuzzy.
+    let mut conflicted = request(true);
+    if let Some(lexical) = conflicted.lexical.as_mut() {
+        lexical.fuzzy = Some(1);
+    }
+    let error = product.search_collection(binding.collection, &conflicted, 7);
+    let Err(error) = error else {
+        return Err("phrase+fuzzy was admitted".into());
+    };
+    assert_eq!(
+        error.code(),
+        hyphae_native_product::ProductErrorCode::InvalidRequest
+    );
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())

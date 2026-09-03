@@ -3,7 +3,7 @@
   "schema": "hyphae-registry-publish-authority-v1",
   "repository": "Hyphae-Research-Foundation/hyphae",
   "branch": "main",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "tag": "release-v2.2.0-crates",
   "tag_kind": "annotated",
   "tag_signature": {

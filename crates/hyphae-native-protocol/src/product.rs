@@ -22,18 +22,19 @@ use hyphae_native_product::{
     ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
     ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
-    ProductHybridExplanation, ProductHybridVectorStrategy, ProductIntegratedSearchHit,
-    ProductLexicalBranch, ProductLimits, ProductListSide, ProductMissingPlacement,
-    ProductNamedAggregation, ProductNamedAggregationValue, ProductOperation, ProductPermission,
-    ProductPhysicalObservation, ProductPreparedHandle, ProductRead, ProductResponse,
-    ProductRollbackReceipt, ProductScope, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
-    ProductSearchFilter, ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductSearchOperator, ProductSearchRequest, ProductSearchResult, ProductSearchResults,
-    ProductSearchSort, ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource,
-    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductHashScanStop, ProductHybridExplanation, ProductHybridVectorStrategy,
+    ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
+    ProductMissingPlacement, ProductNamedAggregation, ProductNamedAggregationValue,
+    ProductOperation, ProductPermission, ProductPhysicalObservation, ProductPreparedHandle,
+    ProductRead, ProductResponse, ProductRollbackReceipt, ProductScope, ProductScoreBound,
+    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
+    ProductSearchHit, ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchOperator,
+    ProductSearchRequest, ProductSearchResult, ProductSearchResults, ProductSearchSort,
+    ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
     ProductTransactionVectorMutation, ProductTtl, ProductValue, ProductVectorBranch,
     ProductVectorBranchReceipt, ProductVectorExecution, ProductVectorStrategy, RestoreRequest,
@@ -1082,6 +1083,7 @@ fn doc_value_required_minor(value: &ProductDocValue) -> u16 {
         | ProductDocValue::Integer(_)
         | ProductDocValue::String(_)
         | ProductDocValue::Bytes(_) => 0,
+        ProductDocValue::Float(_) => 6,
     }
 }
 
@@ -1139,6 +1141,7 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     let fusion = match request.fusion {
         None => 0,
         Some(hyphae_native_product::ProductFusionMethod::WeightedScore) => 4,
+        Some(hyphae_native_product::ProductFusionMethod::RelativeScore) => 6,
     };
     let dedupe = if request.parent_dedupe.is_some() {
         4
@@ -1147,11 +1150,54 @@ fn search_request_required_minor(request: &ProductSearchRequest) -> u16 {
     };
     let rerank = if request.rerank.is_some() { 4 } else { 0 };
     let highlight = if request.highlight.is_some() { 5 } else { 0 };
+    let autocut = if request.autocut.is_some() { 6 } else { 0 };
+    let offset = if request.offset > 0 { 6 } else { 0 };
+    let cutoff = if request
+        .vectors
+        .iter()
+        .any(|branch| branch.max_distance.is_some())
+    {
+        6
+    } else {
+        0
+    };
+    let operator = if request.lexical.as_ref().is_some_and(|lexical| {
+        lexical.operator.is_some()
+            || lexical.prefix
+            || !lexical.fields.is_empty()
+            || lexical.fuzzy.is_some()
+            || lexical.phrase
+    }) {
+        6
+    } else {
+        0
+    };
+    let range_facets = if request.range_facets.is_empty() {
+        0
+    } else {
+        6
+    };
+    let average = if request.aggregations.iter().any(|aggregation| {
+        matches!(
+            aggregation.aggregation,
+            hyphae_native_product::ProductAggregation::Average(_)
+        )
+    }) {
+        6
+    } else {
+        0
+    };
     filter_required_minor(&request.filter)
         .max(fusion)
         .max(dedupe)
         .max(rerank)
         .max(highlight)
+        .max(autocut)
+        .max(offset)
+        .max(average)
+        .max(range_facets)
+        .max(cutoff)
+        .max(operator)
 }
 
 fn ensure_operation_minor(
@@ -1202,6 +1248,24 @@ fn ensure_operation_minor(
         ProductOperation::SearchDocumentUpdate { update, .. } => {
             document_required_minor(&update.document)
         }
+        ProductOperation::StructureRead(
+            ProductStructureReadRequest::SortedSetScoreRange { .. }
+            | ProductStructureReadRequest::HashScanReverse { .. }
+            | ProductStructureReadRequest::HashScanMatch { .. }
+            | ProductStructureReadRequest::KeyScanMatch { .. }
+            | ProductStructureReadRequest::StringRange { .. }
+            | ProductStructureReadRequest::SetRandomMembers { .. },
+        ) => 6,
+        ProductOperation::StructureMutate { mutations }
+            if mutations.iter().any(structure_mutation_requires_minor_six) =>
+        {
+            6
+        }
+        ProductOperation::TransactionStageStructure { mutation, .. }
+            if structure_mutation_requires_minor_six(mutation) =>
+        {
+            6
+        }
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1245,8 +1309,21 @@ fn ensure_response_minor(
             } else {
                 0
             };
-            values.max(fragments)
+            let range_facets = if result.range_facets.is_empty() { 0 } else { 6 };
+            values.max(fragments).max(range_facets)
         }
+        ProductResponse::StructureRead(read) => match &read.value {
+            ProductStructureReadResult::HashPage { .. }
+            | ProductStructureReadResult::KeyPage { .. } => 6,
+            _ => 0,
+        },
+        ProductResponse::TransactionStaged(receipt) => match &receipt.result {
+            ProductTransactionStageResult::Structure(
+                ProductStructureMutationResult::Score(_)
+                | ProductStructureMutationResult::PoppedEntry(_),
+            ) => 6,
+            _ => 0,
+        },
         _ => 0,
     };
     if negotiated_minor < required_minor {
@@ -1254,6 +1331,19 @@ fn ensure_response_minor(
     } else {
         Ok(())
     }
+}
+
+fn structure_mutation_requires_minor_six(mutation: &ProductStructureMutation) -> bool {
+    matches!(
+        mutation,
+        ProductStructureMutation::SortedSetIncrement { .. }
+            | ProductStructureMutation::SortedSetPop { .. }
+            | ProductStructureMutation::StringSetConditional { .. }
+            | ProductStructureMutation::StringAppend { .. }
+            | ProductStructureMutation::StringSetRange { .. }
+            | ProductStructureMutation::HashSetIfAbsent { .. }
+            | ProductStructureMutation::SetPop { .. }
+    )
 }
 
 fn operation_requires_idempotency(operation: &ProductOperation) -> bool {
@@ -3621,6 +3711,51 @@ fn encode_structure_mutation(
             encode_structure_key(encoded, key)?;
             put_bytes(encoded, member)?;
         }
+        ProductStructureMutation::SortedSetIncrement { key, delta, member } => {
+            encoded.push(17);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&delta.bits().to_le_bytes());
+            put_bytes(encoded, member)?;
+        }
+        ProductStructureMutation::SortedSetPop { key, highest } => {
+            encoded.push(18);
+            encode_structure_key(encoded, key)?;
+            encoded.push(u8::from(*highest));
+        }
+        ProductStructureMutation::StringSetConditional {
+            key,
+            value,
+            expires_at_micros,
+            if_present,
+        } => {
+            encoded.push(19);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, value)?;
+            encode_optional_i64(encoded, *expires_at_micros);
+            encoded.push(u8::from(*if_present));
+        }
+        ProductStructureMutation::StringAppend { key, suffix } => {
+            encoded.push(20);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, suffix)?;
+        }
+        ProductStructureMutation::StringSetRange { key, offset, patch } => {
+            encoded.push(21);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&offset.to_le_bytes());
+            put_bytes(encoded, patch)?;
+        }
+        ProductStructureMutation::HashSetIfAbsent { key, field, value } => {
+            encoded.push(22);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, field)?;
+            put_bytes(encoded, value)?;
+        }
+        ProductStructureMutation::SetPop { key, seed } => {
+            encoded.push(23);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&seed.to_le_bytes());
+        }
         ProductStructureMutation::StreamAdd { key, fields } => {
             encoded.push(16);
             encode_structure_key(encoded, key)?;
@@ -3724,6 +3859,69 @@ fn decode_structure_mutation(
             }
             ProductStructureMutation::StreamAdd { key, fields }
         }
+        tag @ (17 | 18) => decode_sorted_set_value_mutation(decoder, tag)?,
+        tag @ 19..=23 => decode_conditional_value_mutation(decoder, tag)?,
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes the minor-6 conditional and range mutations (tags 19-23).
+fn decode_conditional_value_mutation(
+    decoder: &mut Decoder<'_>,
+    tag: u8,
+) -> Result<ProductStructureMutation, ProductCodecError> {
+    Ok(match tag {
+        19 => ProductStructureMutation::StringSetConditional {
+            key: decode_structure_key(decoder)?,
+            value: decoder.owned_bytes()?,
+            expires_at_micros: decode_optional_i64(decoder)?,
+            if_present: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProductCodecError::InvalidValue),
+            },
+        },
+        20 => ProductStructureMutation::StringAppend {
+            key: decode_structure_key(decoder)?,
+            suffix: decoder.owned_bytes()?,
+        },
+        21 => ProductStructureMutation::StringSetRange {
+            key: decode_structure_key(decoder)?,
+            offset: decoder.u32()?,
+            patch: decoder.owned_bytes()?,
+        },
+        22 => ProductStructureMutation::HashSetIfAbsent {
+            key: decode_structure_key(decoder)?,
+            field: decoder.owned_bytes()?,
+            value: decoder.owned_bytes()?,
+        },
+        23 => ProductStructureMutation::SetPop {
+            key: decode_structure_key(decoder)?,
+            seed: decoder.u64()?,
+        },
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes the minor-6 sorted-set mutations that return typed values.
+fn decode_sorted_set_value_mutation(
+    decoder: &mut Decoder<'_>,
+    tag: u8,
+) -> Result<ProductStructureMutation, ProductCodecError> {
+    Ok(match tag {
+        17 => ProductStructureMutation::SortedSetIncrement {
+            key: decode_structure_key(decoder)?,
+            delta: hyphae_native_product::CanonicalF64::new(f64::from_bits(decoder.u64()?)),
+            member: decoder.owned_bytes()?,
+        },
+        18 => ProductStructureMutation::SortedSetPop {
+            key: decode_structure_key(decoder)?,
+            highest: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProductCodecError::InvalidValue),
+            },
+        },
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -4164,6 +4362,85 @@ fn encode_structure_read_request(
             encoded.extend_from_slice(&end.to_le_bytes());
             put_u64(encoded, *limit)?;
         }
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => {
+            encoded.push(18);
+            encode_structure_key(encoded, key)?;
+            encode_score_bound(encoded, *lower)?;
+            encode_score_bound(encoded, *upper)?;
+            put_u64(encoded, *offset)?;
+            put_u64(encoded, *limit)?;
+            encoded.push(sorted_order_tag(*order));
+        }
+        ProductStructureReadRequest::HashScanReverse {
+            key,
+            start_before,
+            limit,
+        } => {
+            encoded.push(19);
+            encode_structure_key(encoded, key)?;
+            encoded.push(u8::from(start_before.is_some()));
+            if let Some(cursor) = start_before {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *limit)?;
+        }
+        ProductStructureReadRequest::HashScanMatch {
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => {
+            encoded.push(20);
+            encode_structure_key(encoded, key)?;
+            put_bytes(encoded, pattern)?;
+            encoded.push(u8::from(start_after.is_some()));
+            if let Some(cursor) = start_after {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *output_limit)?;
+            put_u64(encoded, *visit_limit)?;
+            put_u64(encoded, *match_step_limit)?;
+        }
+        ProductStructureReadRequest::KeyScanMatch {
+            keyspace,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => {
+            encoded.push(21);
+            encoded.extend_from_slice(&keyspace.get().to_le_bytes());
+            put_bytes(encoded, pattern)?;
+            encoded.push(u8::from(start_after.is_some()));
+            if let Some(cursor) = start_after {
+                put_bytes(encoded, cursor)?;
+            }
+            put_u64(encoded, *output_limit)?;
+            put_u64(encoded, *visit_limit)?;
+            put_u64(encoded, *match_step_limit)?;
+        }
+        ProductStructureReadRequest::StringRange { key, start, end } => {
+            encoded.push(22);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&start.to_le_bytes());
+            encoded.extend_from_slice(&end.to_le_bytes());
+        }
+        ProductStructureReadRequest::SetRandomMembers { key, seed, count } => {
+            encoded.push(23);
+            encode_structure_key(encoded, key)?;
+            encoded.extend_from_slice(&seed.to_le_bytes());
+            put_u64(encoded, *count)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4276,6 +4553,110 @@ fn decode_structure_read_request(
             end: decoder.u64()?,
             limit: decoder.usize()?,
         },
+        18 => ProductStructureReadRequest::SortedSetScoreRange {
+            key: decode_structure_key(decoder)?,
+            lower: decode_score_bound(decoder)?,
+            upper: decode_score_bound(decoder)?,
+            offset: decoder.usize()?,
+            limit: decoder.usize()?,
+            order: decode_sorted_order(decoder.u8()?)?,
+        },
+        19 => ProductStructureReadRequest::HashScanReverse {
+            key: decode_structure_key(decoder)?,
+            start_before: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            limit: decoder.usize()?,
+        },
+        20 => ProductStructureReadRequest::HashScanMatch {
+            key: decode_structure_key(decoder)?,
+            pattern: decoder.owned_bytes()?,
+            start_after: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            output_limit: decoder.usize()?,
+            visit_limit: decoder.usize()?,
+            match_step_limit: decoder.usize()?,
+        },
+        21 => ProductStructureReadRequest::KeyScanMatch {
+            keyspace: ObjectId::new(decoder.u128()?)
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+            pattern: decoder.owned_bytes()?,
+            start_after: if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            },
+            output_limit: decoder.usize()?,
+            visit_limit: decoder.usize()?,
+            match_step_limit: decoder.usize()?,
+        },
+        22 => ProductStructureReadRequest::StringRange {
+            key: decode_structure_key(decoder)?,
+            start: decoder.i64()?,
+            end: decoder.i64()?,
+        },
+        23 => ProductStructureReadRequest::SetRandomMembers {
+            key: decode_structure_key(decoder)?,
+            seed: decoder.u64()?,
+            count: decoder.usize()?,
+        },
+        _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+fn encode_optional_canonical_float(
+    encoded: &mut Vec<u8>,
+    value: Option<hyphae_native_product::CanonicalF64>,
+) {
+    encoded.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        encoded.extend_from_slice(&value.bits().to_le_bytes());
+    }
+}
+
+fn decode_optional_canonical_float(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<hyphae_native_product::CanonicalF64>, ProductCodecError> {
+    if !decoder.boolean()? {
+        return Ok(None);
+    }
+    let bits = decoder.u64()?;
+    let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+    if float.bits() != bits {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok(Some(float))
+}
+
+fn encode_score_bound(
+    encoded: &mut Vec<u8>,
+    bound: ProductScoreBound,
+) -> Result<(), ProductCodecError> {
+    match bound {
+        ProductScoreBound::Unbounded => encoded.push(0),
+        ProductScoreBound::Inclusive(score) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&score.to_bits().to_le_bytes());
+        }
+        ProductScoreBound::Exclusive(score) => {
+            encoded.push(2);
+            encoded.extend_from_slice(&score.to_bits().to_le_bytes());
+        }
+        _ => return Err(ProductCodecError::Unsupported),
+    }
+    Ok(())
+}
+
+fn decode_score_bound(decoder: &mut Decoder<'_>) -> Result<ProductScoreBound, ProductCodecError> {
+    Ok(match decoder.u8()? {
+        0 => ProductScoreBound::Unbounded,
+        1 => ProductScoreBound::Inclusive(f64::from_bits(decoder.u64()?)),
+        2 => ProductScoreBound::Exclusive(f64::from_bits(decoder.u64()?)),
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }
@@ -4295,6 +4676,8 @@ fn decode_sorted_order(value: u8) -> Result<ProductSortedSetOrder, ProductCodecE
     }
 }
 
+// Exhaustive result dispatch: one arm per result shape, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn encode_structure_read_result(
     encoded: &mut Vec<u8>,
     result: &ProductStructureReadResult,
@@ -4374,6 +4757,58 @@ fn encode_structure_read_result(
                 }
             }
         }
+        ProductStructureReadResult::HashPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => {
+            encoded.push(12);
+            put_u32(encoded, entries.len())?;
+            for entry in entries {
+                put_bytes(encoded, &entry.field)?;
+                put_bytes(encoded, &entry.value)?;
+            }
+            encoded.push(u8::from(continuation.is_some()));
+            if let Some(cursor) = continuation {
+                put_bytes(encoded, cursor)?;
+            }
+            encoded.push(match stop {
+                ProductHashScanStop::Exhausted => 0,
+                ProductHashScanStop::OutputLimit => 1,
+                ProductHashScanStop::VisitLimit => 2,
+                _ => return Err(ProductCodecError::Unsupported),
+            });
+            put_u64(encoded, *visited)?;
+            put_u64(encoded, *match_steps)?;
+        }
+        ProductStructureReadResult::KeyPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => {
+            encoded.push(13);
+            put_u32(encoded, entries.len())?;
+            for entry in entries {
+                put_bytes(encoded, &entry.key)?;
+                encoded.push(entry.family as u8);
+            }
+            encoded.push(u8::from(continuation.is_some()));
+            if let Some(cursor) = continuation {
+                put_bytes(encoded, cursor)?;
+            }
+            encoded.push(match stop {
+                ProductHashScanStop::Exhausted => 0,
+                ProductHashScanStop::OutputLimit => 1,
+                ProductHashScanStop::VisitLimit => 2,
+                _ => return Err(ProductCodecError::Unsupported),
+            });
+            put_u64(encoded, *visited)?;
+            put_u64(encoded, *match_steps)?;
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4448,7 +4883,67 @@ fn decode_structure_read_result(
             }
             ProductStructureReadResult::StreamEntries(entries)
         }
+        12 => {
+            let count = decoder.usize_u32()?;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push(ProductHashEntry {
+                    field: decoder.owned_bytes()?,
+                    value: decoder.owned_bytes()?,
+                });
+            }
+            let continuation = if decoder.boolean()? {
+                Some(decoder.owned_bytes()?)
+            } else {
+                None
+            };
+            let stop = match decoder.u8()? {
+                0 => ProductHashScanStop::Exhausted,
+                1 => ProductHashScanStop::OutputLimit,
+                2 => ProductHashScanStop::VisitLimit,
+                _ => return Err(ProductCodecError::InvalidValue),
+            };
+            ProductStructureReadResult::HashPage {
+                entries,
+                continuation,
+                stop,
+                visited: decoder.usize()?,
+                match_steps: decoder.usize()?,
+            }
+        }
+        13 => decode_key_page(decoder)?,
         _ => return Err(ProductCodecError::InvalidValue),
+    })
+}
+
+/// Decodes one bounded cross-family key glob page (result tag 13).
+fn decode_key_page(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductStructureReadResult, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(hyphae_native_product::ProductKeyEntry {
+            key: decoder.owned_bytes()?,
+            family: decode_structure_kind(decoder.u8()?)?,
+        });
+    }
+    let continuation = decoder
+        .boolean()?
+        .then(|| decoder.owned_bytes())
+        .transpose()?;
+    let stop = match decoder.u8()? {
+        0 => ProductHashScanStop::Exhausted,
+        1 => ProductHashScanStop::OutputLimit,
+        2 => ProductHashScanStop::VisitLimit,
+        _ => return Err(ProductCodecError::InvalidValue),
+    };
+    Ok(ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        visited: decoder.usize()?,
+        match_steps: decoder.usize()?,
     })
 }
 
@@ -4658,6 +5153,18 @@ fn encode_structure_mutation_result(
             encoded.push(5);
             encoded.extend_from_slice(&value.to_le_bytes());
         }
+        ProductStructureMutationResult::Score(value) => {
+            encoded.push(6);
+            encoded.extend_from_slice(&value.bits().to_le_bytes());
+        }
+        ProductStructureMutationResult::PoppedEntry(entry) => {
+            encoded.push(7);
+            encoded.push(u8::from(entry.is_some()));
+            if let Some(entry) = entry {
+                put_bytes(encoded, &entry.member)?;
+                encoded.extend_from_slice(&entry.score.bits().to_le_bytes());
+            }
+        }
         _ => return Err(ProductCodecError::Unsupported),
     }
     Ok(())
@@ -4678,6 +5185,22 @@ fn decode_structure_mutation_result(
                 .transpose()?,
         )),
         5 => Ok(ProductStructureMutationResult::StreamId(decoder.u64()?)),
+        6 => Ok(ProductStructureMutationResult::Score(
+            hyphae_native_product::CanonicalF64::new(f64::from_bits(decoder.u64()?)),
+        )),
+        7 => Ok(ProductStructureMutationResult::PoppedEntry(
+            decoder
+                .boolean()?
+                .then(|| -> Result<_, ProductCodecError> {
+                    Ok(hyphae_native_product::ProductSortedSetEntry {
+                        member: decoder.owned_bytes()?,
+                        score: hyphae_native_product::CanonicalF64::new(f64::from_bits(
+                            decoder.u64()?,
+                        )),
+                    })
+                })
+                .transpose()?,
+        )),
         _ => Err(ProductCodecError::InvalidValue),
     }
 }
@@ -4965,6 +5488,10 @@ fn encode_search_collection(
                 encoded.push(3);
                 put_text(encoded, field)?;
             }
+            hyphae_native_product::ProductAggregation::Average(field) => {
+                encoded.push(4);
+                put_text(encoded, field)?;
+            }
         }
     }
     put_u64(encoded, request.limit)?;
@@ -4974,6 +5501,7 @@ fn encode_search_collection(
         encoded.push(1);
         encoded.push(match fusion {
             hyphae_native_product::ProductFusionMethod::WeightedScore => 1,
+            hyphae_native_product::ProductFusionMethod::RelativeScore => 2,
         });
     }
     if let Some(dedupe) = &request.parent_dedupe {
@@ -4995,6 +5523,70 @@ fn encode_search_collection(
         put_u32(encoded, highlight.max_fragments)?;
         put_u32(encoded, highlight.fragment_bytes)?;
     }
+    if let Some(autocut) = request.autocut {
+        encoded.push(5);
+        put_u32(encoded, autocut)?;
+    }
+    if request.offset > 0 {
+        encoded.push(6);
+        put_u32(encoded, request.offset)?;
+    }
+    if !request.range_facets.is_empty() {
+        encoded.push(7);
+        put_u32(encoded, request.range_facets.len())?;
+        for range_facet in &request.range_facets {
+            put_text(encoded, &range_facet.field)?;
+            put_u32(encoded, range_facet.ranges.len())?;
+            for range in &range_facet.ranges {
+                encode_optional_canonical_float(encoded, range.lower);
+                encode_optional_canonical_float(encoded, range.upper);
+            }
+        }
+    }
+    let cutoffs: Vec<(usize, hyphae_native_product::CanonicalF64)> = request
+        .vectors
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, branch)| branch.max_distance.map(|cutoff| (ordinal, cutoff)))
+        .collect();
+    if !cutoffs.is_empty() {
+        encoded.push(8);
+        put_u32(encoded, cutoffs.len())?;
+        for (ordinal, cutoff) in cutoffs {
+            put_u32(encoded, ordinal)?;
+            encoded.extend_from_slice(&cutoff.bits().to_le_bytes());
+        }
+    }
+    if let Some(lexical) = request.lexical.as_ref() {
+        if let Some(operator) = lexical.operator {
+            encoded.push(9);
+            match operator {
+                hyphae_native_product::ProductLexicalOperator::And => encoded.push(0),
+                hyphae_native_product::ProductLexicalOperator::Or { minimum_match } => {
+                    encoded.push(1);
+                    put_u32(encoded, minimum_match)?;
+                }
+            }
+        } else if lexical.prefix {
+            encoded.push(9);
+            encoded.push(2);
+        } else if let Some(distance) = lexical.fuzzy {
+            encoded.push(9);
+            encoded.push(3);
+            put_u32(encoded, distance)?;
+        } else if lexical.phrase {
+            encoded.push(9);
+            encoded.push(4);
+        }
+        if !lexical.fields.is_empty() {
+            encoded.push(10);
+            put_u32(encoded, lexical.fields.len())?;
+            for boost in &lexical.fields {
+                put_text(encoded, &boost.field)?;
+                encoded.extend_from_slice(&boost.weight_micros.to_le_bytes());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5007,12 +5599,17 @@ fn decode_search_collection(
     if decoder.bytes(7)? != [0; 7] {
         return Err(ProductCodecError::Malformed);
     }
-    let lexical = has_lexical
+    let mut lexical = has_lexical
         .then(|| -> Result<ProductLexicalBranch, ProductCodecError> {
             Ok(ProductLexicalBranch {
                 query: decoder.text()?,
                 candidate_limit: decoder.usize()?,
                 weight: decoder.u32()?,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             })
         })
         .transpose()?;
@@ -5075,6 +5672,7 @@ fn decode_search_collection(
             candidate_limit,
             weight,
             execution,
+            max_distance: None,
         });
     }
     let filter = decode_search_filter(decoder, 0)?;
@@ -5128,6 +5726,7 @@ fn decode_search_collection(
             1 => hyphae_native_product::ProductAggregation::Sum(decoder.text()?),
             2 => hyphae_native_product::ProductAggregation::Min(decoder.text()?),
             3 => hyphae_native_product::ProductAggregation::Max(decoder.text()?),
+            4 => hyphae_native_product::ProductAggregation::Average(decoder.text()?),
             _ => return Err(ProductCodecError::InvalidValue),
         };
         aggregations.push(ProductNamedAggregation { name, aggregation });
@@ -5137,6 +5736,9 @@ fn decode_search_collection(
     let mut parent_dedupe = None;
     let mut rerank = None;
     let mut highlight = None;
+    let mut autocut = None;
+    let mut offset = 0_usize;
+    let mut range_facets = Vec::new();
     let mut previous = 0_u8;
     while decoder.has_remaining() {
         let tag = decoder.u8()?;
@@ -5148,6 +5750,7 @@ fn decode_search_collection(
             1 => {
                 fusion = Some(match decoder.u8()? {
                     1 => hyphae_native_product::ProductFusionMethod::WeightedScore,
+                    2 => hyphae_native_product::ProductFusionMethod::RelativeScore,
                     _ => return Err(ProductCodecError::InvalidValue),
                 });
             }
@@ -5202,6 +5805,115 @@ fn decode_search_collection(
                     fragment_bytes,
                 });
             }
+            5 => {
+                let steepness = decoder.usize_u32()?;
+                if !(1..=hyphae_native_product::MAX_AUTOCUT_STEEPNESS).contains(&steepness) {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                autocut = Some(steepness);
+            }
+            6 => {
+                offset = decoder.usize_u32()?;
+                if offset == 0 {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+            }
+            7 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let range_count = decoder.usize_u32()?;
+                    if range_count == 0
+                        || range_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES
+                    {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    let mut ranges = Vec::with_capacity(range_count);
+                    for _ in 0..range_count {
+                        ranges.push(hyphae_native_product::ProductFacetRange {
+                            lower: decode_optional_canonical_float(decoder)?,
+                            upper: decode_optional_canonical_float(decoder)?,
+                        });
+                    }
+                    range_facets
+                        .push(hyphae_native_product::ProductRangeFacetRequest { field, ranges });
+                }
+            }
+            8 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let ordinal = decoder.usize_u32()?;
+                    let bits = decoder.u64()?;
+                    let cutoff = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+                    if cutoff.bits() != bits || !cutoff.get().is_finite() || cutoff.get() < 0.0 {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    vectors
+                        .get_mut(ordinal)
+                        .ok_or(ProductCodecError::InvalidValue)?
+                        .max_distance = Some(cutoff);
+                }
+            }
+            9 => {
+                let branch = lexical.as_mut().ok_or(ProductCodecError::InvalidValue)?;
+                match decoder.u8()? {
+                    0 => {
+                        branch.operator = Some(hyphae_native_product::ProductLexicalOperator::And);
+                    }
+                    1 => {
+                        let minimum_match = decoder.usize_u32()?;
+                        if !(1..=hyphae_native_product::MAX_LEXICAL_MINIMUM_MATCH)
+                            .contains(&minimum_match)
+                        {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        branch.operator = Some(hyphae_native_product::ProductLexicalOperator::Or {
+                            minimum_match,
+                        });
+                    }
+                    2 => branch.prefix = true,
+                    3 => {
+                        let distance = decoder.usize_u32()?;
+                        if !(1..=hyphae_native_product::MAX_LEXICAL_FUZZY_DISTANCE)
+                            .contains(&distance)
+                        {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        branch.fuzzy = Some(distance);
+                    }
+                    4 => branch.phrase = true,
+                    _ => return Err(ProductCodecError::InvalidValue),
+                }
+            }
+            10 => {
+                let branch = lexical.as_mut().ok_or(ProductCodecError::InvalidValue)?;
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let weight_micros = decoder.u32()?;
+                    if weight_micros == 0
+                        || weight_micros
+                            > hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS
+                    {
+                        return Err(ProductCodecError::InvalidValue);
+                    }
+                    branch
+                        .fields
+                        .push(hyphae_native_product::ProductLexicalFieldBoost {
+                            field,
+                            weight_micros,
+                        });
+                }
+            }
             _ => return Err(ProductCodecError::InvalidValue),
         }
     }
@@ -5213,12 +5925,15 @@ fn decode_search_collection(
             filter,
             sort,
             facets,
+            range_facets,
             aggregations,
             limit,
             fusion,
             parent_dedupe,
             rerank,
             highlight,
+            autocut,
+            offset,
         },
     ))
 }
@@ -5511,6 +6226,13 @@ fn encode_aggregation_value(
                 encode_doc_value(encoded, value)?;
             }
         }
+        hyphae_native_product::ProductAggregationValue::Float(value) => {
+            encoded.push(3);
+            encoded.push(u8::from(value.is_some()));
+            if let Some(value) = value {
+                encoded.extend_from_slice(&value.bits().to_le_bytes());
+            }
+        }
     }
     Ok(())
 }
@@ -5530,6 +6252,21 @@ fn decode_aggregation_value(
             let present = decoder.boolean()?;
             hyphae_native_product::ProductAggregationValue::Value(
                 present.then(|| decode_doc_value(decoder)).transpose()?,
+            )
+        }
+        3 => {
+            let present = decoder.boolean()?;
+            hyphae_native_product::ProductAggregationValue::Float(
+                present
+                    .then(|| -> Result<_, ProductCodecError> {
+                        let bits = decoder.u64()?;
+                        let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+                        if float.bits() != bits {
+                            return Err(ProductCodecError::InvalidValue);
+                        }
+                        Ok(float)
+                    })
+                    .transpose()?,
             )
         }
         _ => return Err(ProductCodecError::InvalidValue),
@@ -5601,6 +6338,18 @@ fn encode_integrated_search(
             put_u32(encoded, hit.fragments.len())?;
             for fragment in &hit.fragments {
                 put_text(encoded, fragment)?;
+            }
+        }
+    }
+    if !result.range_facets.is_empty() {
+        encoded.push(2);
+        put_u32(encoded, result.range_facets.len())?;
+        for facet in &result.range_facets {
+            put_text(encoded, &facet.field)?;
+            put_u32(encoded, facet.buckets.len())?;
+            for bucket in &facet.buckets {
+                encode_doc_value(encoded, &bucket.value)?;
+                encoded.extend_from_slice(&bucket.count.to_le_bytes());
             }
         }
     }
@@ -5714,35 +6463,66 @@ fn decode_integrated_search(
     let lexical_candidates = decoder.usize()?;
     let retrieval_candidates = decoder.usize()?;
     let matched_candidates = decoder.usize()?;
-    if decoder.has_remaining() {
-        if decoder.u8()? != 1 {
+    let mut range_facets = Vec::new();
+    let mut previous_tail = 0_u8;
+    while decoder.has_remaining() {
+        let tag = decoder.u8()?;
+        if tag <= previous_tail {
             return Err(ProductCodecError::InvalidValue);
         }
-        let mut any = false;
-        for hit in &mut hits {
-            let fragment_count = decoder.usize_u32()?;
-            if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
-                return Err(ProductCodecError::LimitExceeded);
-            }
-            let mut fragments = Vec::with_capacity(fragment_count);
-            for _ in 0..fragment_count {
-                let fragment = decoder.text()?;
-                if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
-                    return Err(ProductCodecError::LimitExceeded);
+        previous_tail = tag;
+        match tag {
+            1 => {
+                let mut any = false;
+                for hit in &mut hits {
+                    let fragment_count = decoder.usize_u32()?;
+                    if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
+                        return Err(ProductCodecError::LimitExceeded);
+                    }
+                    let mut fragments = Vec::with_capacity(fragment_count);
+                    for _ in 0..fragment_count {
+                        let fragment = decoder.text()?;
+                        if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
+                            return Err(ProductCodecError::LimitExceeded);
+                        }
+                        fragments.push(fragment);
+                    }
+                    any |= !fragments.is_empty();
+                    hit.fragments = fragments;
                 }
-                fragments.push(fragment);
+                if !any {
+                    return Err(ProductCodecError::InvalidValue);
+                }
             }
-            any |= !fragments.is_empty();
-            hit.fragments = fragments;
-        }
-        if !any {
-            return Err(ProductCodecError::InvalidValue);
+            2 => {
+                let count = decoder.usize_u32()?;
+                if count == 0 || count > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS {
+                    return Err(ProductCodecError::InvalidValue);
+                }
+                for _ in 0..count {
+                    let field = decoder.text()?;
+                    let bucket_count = decoder.usize_u32()?;
+                    if bucket_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES {
+                        return Err(ProductCodecError::LimitExceeded);
+                    }
+                    let mut buckets = Vec::with_capacity(bucket_count);
+                    for _ in 0..bucket_count {
+                        buckets.push(hyphae_native_product::ProductFacetBucket {
+                            value: decode_doc_value(decoder)?,
+                            count: decoder.u64()?,
+                        });
+                    }
+                    range_facets.push(hyphae_native_product::ProductFacetResult { field, buckets });
+                }
+            }
+            _ => return Err(ProductCodecError::InvalidValue),
         }
     }
     Ok(ProductSearchResult {
         snapshot,
         hits,
         facets,
+        range_facets,
         aggregations,
         vector_branches,
         approximate,
@@ -5775,6 +6555,10 @@ fn encode_doc_value(
             encoded.push(3);
             put_bytes(encoded, value)?;
         }
+        ProductDocValue::Float(value) => {
+            encoded.push(4);
+            encoded.extend_from_slice(&value.bits().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -5785,6 +6569,14 @@ fn decode_doc_value(decoder: &mut Decoder<'_>) -> Result<ProductDocValue, Produc
         1 => Ok(ProductDocValue::Integer(decoder.i64()?)),
         2 => Ok(ProductDocValue::String(decoder.text()?)),
         3 => Ok(ProductDocValue::Bytes(decoder.owned_bytes()?)),
+        4 => {
+            let bits = decoder.u64()?;
+            let float = hyphae_native_product::CanonicalF64::new(f64::from_bits(bits));
+            if float.bits() != bits {
+                return Err(ProductCodecError::InvalidValue);
+            }
+            Ok(ProductDocValue::Float(float))
+        }
         _ => Err(ProductCodecError::InvalidValue),
     }
 }

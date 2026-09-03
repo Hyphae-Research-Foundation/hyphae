@@ -1425,6 +1425,7 @@ pub(super) fn load_structure_state_v3(
 
 pub(super) fn apply_structure_mutations_v3(
     pages: &mut PageStore,
+    pool: &BufferPool,
     mut tree: BTree,
     creating_csn: Csn,
     transaction_id: TransactionId,
@@ -1437,7 +1438,14 @@ pub(super) fn apply_structure_mutations_v3(
         }
         tree = match mutation.opcode {
             Opcode::SetValue | Opcode::ExpireValue | Opcode::DeleteValue => {
-                apply_scalar_mutation_v3(pages, tree, creating_csn, mutation, blob_references)?
+                apply_scalar_mutation_v3(
+                    pages,
+                    pool,
+                    tree,
+                    creating_csn,
+                    mutation,
+                    blob_references,
+                )?
             }
             Opcode::CreateHash
             | Opcode::SetHashField
@@ -1511,12 +1519,13 @@ pub(super) fn apply_structure_mutations_v3(
 
 fn apply_scalar_mutation_v3(
     pages: &mut PageStore,
+    pool: &BufferPool,
     tree: BTree,
     creating_csn: Csn,
     mutation: &Mutation,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<BTree, NativeRuntimeError> {
-    ensure_v3_scalar_key_has_no_live_collection(pages, tree, &mutation.key)?;
+    ensure_v3_scalar_key_has_no_live_collection(pages, pool, tree, &mutation.key)?;
     let entry_key = structure_key(&mutation.key);
     let previous = tree.get(pages, &entry_key)?;
     let previous_live = previous
@@ -1585,41 +1594,41 @@ fn apply_scalar_mutation_v3(
 
 fn ensure_v3_scalar_key_has_no_live_collection(
     pages: &PageStore,
+    pool: &BufferPool,
     tree: BTree,
     key: &[u8],
 ) -> Result<(), NativeRuntimeError> {
+    // Buffer-pool descents: committed pages and pages appended earlier in
+    // this commit are immutable and never truncated (only unpublished tails
+    // roll back, and their boundary never crosses previously appended
+    // pages), so cached frames remain valid.
     if tree
-        .get(pages, &structure_hash_meta_key(key))?
-        .as_deref()
-        .map(decode_live_hash_metadata_v3)
+        .get_cached_pinned(pages, pool, &structure_hash_meta_key(key))?
+        .map(|pinned| decode_live_hash_metadata_v3(pinned.bytes()))
         .transpose()?
         .flatten()
         .is_some()
         || tree
-            .get(pages, &structure_set_meta_key(key))?
-            .as_deref()
-            .map(decode_live_set_metadata_v3)
+            .get_cached_pinned(pages, pool, &structure_set_meta_key(key))?
+            .map(|pinned| decode_live_set_metadata_v3(pinned.bytes()))
             .transpose()?
             .flatten()
             .is_some()
         || tree
-            .get(pages, &structure_list_meta_key(key)?)?
-            .as_deref()
-            .map(decode_live_list_metadata_v3)
+            .get_cached_pinned(pages, pool, &structure_list_meta_key(key)?)?
+            .map(|pinned| decode_live_list_metadata_v3(pinned.bytes()))
             .transpose()?
             .flatten()
             .is_some()
         || tree
-            .get(pages, &structure_stream_meta_key(key)?)?
-            .as_deref()
-            .map(decode_live_stream_metadata_v3)
+            .get_cached_pinned(pages, pool, &structure_stream_meta_key(key)?)?
+            .map(|pinned| decode_live_stream_metadata_v3(pinned.bytes()))
             .transpose()?
             .flatten()
             .is_some()
         || tree
-            .get(pages, &structure_sorted_set_meta_key(key)?)?
-            .as_deref()
-            .map(decode_live_sorted_set_metadata_v3)
+            .get_cached_pinned(pages, pool, &structure_sorted_set_meta_key(key)?)?
+            .map(|pinned| decode_live_sorted_set_metadata_v3(pinned.bytes()))
             .transpose()?
             .flatten()
             .is_some()
@@ -10610,6 +10619,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let temporary = TestDirectory::create()?;
         let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
         let blob_references = BTreeMap::new();
         let mut tree = BTree::empty()
             .upsert(
@@ -10621,6 +10631,7 @@ mod tests {
             .tree;
         tree = apply_scalar_mutation_v3(
             &mut pages,
+            &pool,
             tree,
             Csn::new(2)?,
             &Mutation {
@@ -10639,6 +10650,7 @@ mod tests {
         assert!(matches!(
             apply_scalar_mutation_v3(
                 &mut pages,
+                &pool,
                 tree,
                 Csn::new(3)?,
                 &Mutation {
@@ -10669,6 +10681,7 @@ mod tests {
         assert!(matches!(
             apply_scalar_mutation_v3(
                 &mut pages,
+                &pool,
                 corrupt,
                 Csn::new(5)?,
                 &Mutation {
@@ -10693,6 +10706,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let temporary = TestDirectory::create()?;
         let mut pages = PageStore::create(temporary.page_file())?;
+        let pool = BufferPool::new(32, 4)?;
         let blob_references = BTreeMap::new();
         let mut tree = BTree::empty()
             .upsert(
@@ -10707,6 +10721,7 @@ mod tests {
         assert!(matches!(
             apply_scalar_mutation_v3(
                 &mut pages,
+                &pool,
                 tree,
                 Csn::new(2)?,
                 &Mutation {
@@ -10735,6 +10750,7 @@ mod tests {
         assert!(matches!(
             apply_scalar_mutation_v3(
                 &mut pages,
+                &pool,
                 tree,
                 Csn::new(4)?,
                 &Mutation {

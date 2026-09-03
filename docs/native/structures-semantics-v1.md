@@ -750,11 +750,168 @@ class; they are not evicted. Cache objects may choose no-eviction, LRU, LFU,
 TTL-priority, random, or size policy. Every eviction is a committed tombstone
 or an explicitly non-durable memory-class event recorded in telemetry.
 
+## Keyspace key scan
+
+`KEY_SCAN_MATCH(pattern, start_after?, output_limit, visit_limit,
+match_step_limit)` scans visible top-level keys across every structure
+family of one keyspace in ascending exact key-byte order, filtered by the
+same bounded binary glob as `HSCAN_MATCH` (identical pattern grammar,
+bounds, and match-step budget). Each returned entry is the key plus its
+structure family. The continuation is the last physically visited key
+(exclusive), so progress is reported even when a page matches nothing;
+the stop reason is `exhausted`, `output_limit`, or `visit_limit`. A key
+counts one visit regardless of family, logically expired keys are skipped
+without charging the output limit, and a leading literal pattern prefix
+prunes the visited range per family. Keys in the reserved internal
+namespace are never visited.
+
+## Conditional and range string writes
+
+`SET_IF_ABSENT(key, value, expiry?)` / `SET_IF_PRESENT(key, value,
+expiry?)` apply one scalar write only when the key currently has no
+unexpired visible value / has one, and report whether the write applied.
+A rejected condition stages nothing. Concurrent absent-key writers may
+both prepare; first-committer-wins admits one publication.
+
+`APPEND(key, suffix)` concatenates `suffix` after the current visible
+value and returns the resulting length in bytes. A missing or expired key
+starts from the empty value; an existing key keeps its expiry unchanged.
+
+`SETRANGE(key, offset, patch)` overwrites `patch` at byte `offset`,
+zero-filling any gap between the current length and `offset`, and returns
+the resulting length. A missing or expired key starts from the empty
+value; an existing key keeps its expiry unchanged.
+
+Both `APPEND` and `SETRANGE` reject, without staging, any operation whose
+resulting length would exceed the declared string mutation bound of
+8 MiB (`MAX_STRUCTURE_STRING_BYTES`). All four operations reject keys
+owned by another structure family.
+
+`GETRANGE(key, start, end)` reads the inclusive byte range of one scalar
+value with Valkey-affine indices: negative positions count from the end,
+out-of-range positions clamp, and an inverted or fully out-of-range
+request returns the empty value. A missing or expired key reads as
+absent.
+
+## Conditional hash writes
+
+`HSETNX(key, field, value)` writes one hash field only when the field has
+no unexpired visible value, and reports whether the write applied. The
+hash itself must already exist: families are created explicitly in this
+engine, so `HSETNX` on a missing or expired hash is an error rather than
+an implicit create (a deliberate divergence from Valkey).
+
+## Seeded set pop and sampling
+
+Set selection is deterministic under an explicit caller seed; the engine
+never draws hidden randomness.
+
+`SPOP(key, seed)` removes and returns the member at rank
+`splitmix64(seed) mod cardinality` in exact ascending member-byte order.
+Popping from an empty set returns an absent result without mutating; a
+missing or expired set is an error.
+
+`SRANDMEMBER(key, seed, count)` returns `min(count, cardinality)`
+distinct members without mutating: the walk starts at the seed-derived
+rank above and continues in ascending member-byte order, wrapping once at
+the end. `count` must be at least one; a missing or expired set is an
+error and an empty set returns no members.
+
+`splitmix64` is the public canonical finalizer (`z ^= z >> 30` multiply
+`0xBF58_476D_1CE4_E5B9`, `z ^= z >> 27` multiply `0x94D0_49BB_1331_11EB`,
+`z ^= z >> 31` over `seed + 0x9E37_79B9_7F4A_7C15`), so any client can
+predict the selected rank.
+
+## Sorted-set increment and pop
+
+`ZINCRBY(key, delta, member)` adds a canonical binary64 delta to one
+member's score, treating a missing member as score `0.0` before the
+addition, and returns the new score. A non-finite delta or a non-finite
+resulting score is rejected without mutating. The member's rank moves
+under the ordinary score/member total order.
+
+`ZPOPMIN(key)` / `ZPOPMAX(key)` remove and return the member with the
+lowest / highest `(score, member-bytes)` position — the deterministic
+first and last of the canonical total order, with exact member bytes as
+the tie-breaker. Popping from a missing or empty sorted set returns an
+absent result without mutating. Both forms return the removed member and
+its score.
+
+## Product read surface
+
+The typed product structure read (`StructureRead`) exposes, in addition to
+the original eighteen request shapes, three bounded reads that surface the
+already-contracted runtime operations above (native protocol minor 6):
+
+- `SortedSetScoreRange`: `ZRANGE_BY_SCORE`/`ZREVRANGE_BY_SCORE` with
+  independently inclusive, exclusive, or unbounded canonical score bounds,
+  nonnegative `offset`, mandatory `limit`, and an explicit direction.
+  Results are `SortedSetEntries` in the requested direction with the exact
+  semantics of the runtime operations, including `NaN` rejection and
+  zero-limit validation.
+- `HashScanReverse`: `HSCAN_REVERSE` with an optional exclusive
+  `start_before` cursor and mandatory `limit`; results are `HashEntries`
+  in descending exact field-byte order.
+- `HashScanMatch`: `HSCAN_MATCH` with a bounded binary-glob `pattern`
+  (`*`, `?`, `[set]`, `\\` escape; at most 512 pattern bytes), optional
+  exclusive `start_after` cursor, and separate `output_limit`,
+  `visit_limit`, and `match_step_limit` bounds. The result is the new
+  `HashPage`: matched entries in ascending field-byte order, the optional
+  physical continuation cursor (progress even when a page matches
+  nothing), the stop reason (`exhausted`, `output_limit`, `visit_limit`),
+  and the visited/match-step counters.
+- `KeyScanMatch`: `KEY_SCAN_MATCH` above, with the same glob grammar and
+  bounds as `HashScanMatch`. The result is the new `KeyPage`: matched
+  keys with their structure family in ascending key-byte order, the
+  optional physical continuation, the stop reason, and the
+  visited/match-step counters.
+
+The typed product structure mutation additionally admits (minor 6):
+
+- `SortedSetIncrement`: `ZINCRBY` above; the result is the new canonical
+  score (`Score`). Non-finite deltas or results are rejected as invalid
+  without staging a mutation.
+- `SortedSetPop`: `ZPOPMIN`/`ZPOPMAX` above behind an explicit end
+  selector; the result is the optional popped `(member, score)` pair
+  (`PoppedEntry`).
+- `StringSetConditional`: `SET_IF_ABSENT`/`SET_IF_PRESENT` above behind
+  an explicit condition selector; the result is `Boolean` (whether the
+  write applied).
+- `StringAppend`: `APPEND` above; the result is `Count` (the resulting
+  length in bytes).
+- `StringSetRange`: `SETRANGE` above with a `u32` offset; the result is
+  `Count` (the resulting length in bytes). Oversized results are
+  rejected as limit-exceeded without staging.
+- `HashSetIfAbsent`: `HSETNX` above; the result is `Boolean` (whether
+  the field was written).
+- `SetPop`: `SPOP` above with a mandatory `u64` seed; the result is the
+  optional popped member (`Value`).
+
+The typed product structure read additionally admits (minor 6):
+
+- `StringRange`: `GETRANGE` above with signed inclusive positions; the
+  result is `Value` (absent for a missing key, possibly empty bytes).
+- `SetRandomMembers`: `SRANDMEMBER` above with a mandatory `u64` seed
+  and a `count` of at least one; the result is `Values` in walk order.
+
+All three inherit the `structure.read` registry entry (`data.read`,
+request-object scope) and every transport bound of the existing read
+family; a request decoded at a negotiated minor below 6 is rejected as
+unsupported before dispatch.
+
 ## Blocking and streams
 
 Blocking operations wait on version publication, support deadlines and
 cancellation, and never occupy an engine owner thread. Stream consumer state
 is ordinary versioned structure data.
+
+## Keyspace no-goals
+
+The keyspace engine deliberately does not implement Valkey pub/sub,
+Lua/functions, cluster slots, key notifications, bitmaps/bitfields,
+HyperLogLog, geo commands, or client-side blocking list/stream pops.
+These are either transport concerns owned by other Hyphae surfaces or
+probabilistic/scripting features outside the bounded fail-closed model.
 
 ## Relational access
 

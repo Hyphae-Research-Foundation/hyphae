@@ -47,6 +47,8 @@ const SEMANTICS_VERSION: u16 = 2;
 const SEMANTICS_VERSION_OPERATORS: u16 = 3;
 /// Semantics version required by requests carrying a highlight budget.
 const SEMANTICS_VERSION_HIGHLIGHT: u16 = 4;
+/// Semantics version required by requests carrying an autocut stage.
+const SEMANTICS_VERSION_AUTOCUT: u16 = 5;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -74,7 +76,7 @@ enum SemanticOperation {
     },
     SearchCollection {
         collection: ObjectId,
-        request: ProductSearchRequest,
+        request: Box<ProductSearchRequest>,
         logical_time_micros: i64,
     },
     CatalogList(CatalogListRequest),
@@ -447,7 +449,7 @@ fn capture_execution(
         ) => (
             SemanticOperation::SearchCollection {
                 collection: *collection,
-                request: resolve_proof_search_request(product, *collection, request)?,
+                request: Box::new(resolve_proof_search_request(product, *collection, request)?),
                 logical_time_micros: context.logical_time_micros,
             },
             integrated_kind(request, result)?,
@@ -806,6 +808,20 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
     };
+    let autocut = matches!(
+        operation,
+        SemanticOperation::SearchCollection { request, .. }
+            if request.autocut.is_some()
+                || request.offset > 0
+                || !request.range_facets.is_empty()
+                || request.lexical.as_ref().is_some_and(|lexical| {
+                    lexical.operator.is_some()
+                        || lexical.prefix
+                        || !lexical.fields.is_empty()
+                        || lexical.fuzzy.is_some()
+                        || lexical.phrase
+                })
+    );
     let highlighted = matches!(
         operation,
         SemanticOperation::SearchCollection { request, .. }
@@ -818,7 +834,9 @@ fn required_semantics_version(operation: &SemanticOperation) -> u16 {
                 || request.parent_dedupe.is_some()
                 || request.rerank.is_some()
     );
-    if highlighted {
+    if autocut {
+        SEMANTICS_VERSION_AUTOCUT
+    } else if highlighted {
         SEMANTICS_VERSION_HIGHLIGHT
     } else if extended || filter.is_some_and(filter_requires_operator_semantics) {
         SEMANTICS_VERSION_OPERATORS
@@ -893,7 +911,10 @@ fn decode_semantic_operation(
     if !magic_ok
         || !matches!(
             semantics_version,
-            SEMANTICS_VERSION | SEMANTICS_VERSION_OPERATORS | SEMANTICS_VERSION_HIGHLIGHT
+            SEMANTICS_VERSION
+                | SEMANTICS_VERSION_OPERATORS
+                | SEMANTICS_VERSION_HIGHLIGHT
+                | SEMANTICS_VERSION_AUTOCUT
         )
         || decoder.u16()? != ORDERING_VERSION
     {
@@ -933,7 +954,11 @@ fn decode_semantic_operation(
         OP_SEARCH_COLLECTION => SemanticOperation::SearchCollection {
             logical_time_micros: i64::from_le_bytes(decoder.array()?),
             collection: object_id(decoder.u128()?)?,
-            request: decode_integrated_request(&mut decoder, limits, semantics_version)?,
+            request: Box::new(decode_integrated_request(
+                &mut decoder,
+                limits,
+                semantics_version,
+            )?),
         },
         OP_CATALOG_LIST => {
             SemanticOperation::CatalogList(decode_catalog_list_request(&mut decoder)?)
@@ -1363,6 +1388,7 @@ fn hybrid_metadata(
         fusion_method: match request.fusion {
             None => HybridFusionMethod::WeightedReciprocalRank,
             Some(crate::ProductFusionMethod::WeightedScore) => HybridFusionMethod::WeightedScore,
+            Some(crate::ProductFusionMethod::RelativeScore) => HybridFusionMethod::RelativeScore,
         },
         duplicate_policy: HybridDuplicatePolicy::MergeByObjectId,
     }))
@@ -1670,6 +1696,7 @@ fn encode_integrated_request(
             encoded.byte(1);
             encoded.byte(match fusion {
                 crate::ProductFusionMethod::WeightedScore => 1,
+                crate::ProductFusionMethod::RelativeScore => 2,
             });
         }
         if let Some(dedupe) = &request.parent_dedupe {
@@ -1694,6 +1721,7 @@ fn encode_integrated_request(
             put_usize(encoded, highlight.max_fragments)?;
             put_usize(encoded, highlight.fragment_bytes)?;
         }
+        encode_autocut_sections(encoded, request, semantics_version)?;
     }
     Ok(())
 }
@@ -1704,12 +1732,17 @@ fn decode_integrated_request(
     limits: &NativeVerificationLimits,
     semantics_version: u16,
 ) -> Result<ProductSearchRequest, NativeProofError> {
-    let lexical = match decoder.byte()? {
+    let mut lexical = match decoder.byte()? {
         0 => None,
         1 => Some(ProductLexicalBranch {
             query: text(decoder, limits.max_reexecution_bytes)?,
             candidate_limit: usize_value(decoder)?,
             weight: decoder.u32()?,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         _ => return Err(NativeProofError::Invalid("invalid lexical presence tag")),
     };
@@ -1729,6 +1762,7 @@ fn decode_integrated_request(
             candidate_limit: usize_value(decoder)?,
             weight: decoder.u32()?,
             execution: Some(decode_vector_execution(decoder)?),
+            max_distance: None,
         });
     }
     let filter = decode_filter(decoder, 0, limits)?;
@@ -1785,6 +1819,9 @@ fn decode_integrated_request(
     let mut parent_dedupe = None;
     let mut rerank = None;
     let mut highlight = None;
+    let mut autocut = None;
+    let mut offset = 0_usize;
+    let mut range_facets = Vec::new();
     if semantics_version >= SEMANTICS_VERSION_OPERATORS {
         let mut previous = 0_u8;
         while decoder.has_remaining() {
@@ -1797,6 +1834,7 @@ fn decode_integrated_request(
                 1 => {
                     fusion = Some(match decoder.byte()? {
                         1 => crate::ProductFusionMethod::WeightedScore,
+                        2 => crate::ProductFusionMethod::RelativeScore,
                         _ => return Err(NativeProofError::Invalid("invalid fusion selector")),
                     });
                 }
@@ -1833,6 +1871,89 @@ fn decode_integrated_request(
                         fragment_bytes: usize_value(decoder)?,
                     });
                 }
+                5 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    autocut = Some(usize_value(decoder)?);
+                }
+                6 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    offset = usize_value(decoder)?;
+                }
+                7 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let count = bounded_count(
+                        decoder,
+                        hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS,
+                        "range facets",
+                    )?;
+                    for _ in 0..count {
+                        let field = text(decoder, limits.max_reexecution_bytes)?;
+                        let range_count = bounded_count(
+                            decoder,
+                            hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES,
+                            "facet ranges",
+                        )?;
+                        let mut ranges = Vec::with_capacity(range_count);
+                        for _ in 0..range_count {
+                            ranges.push(crate::ProductFacetRange {
+                                lower: decode_optional_float(decoder)?,
+                                upper: decode_optional_float(decoder)?,
+                            });
+                        }
+                        range_facets.push(crate::ProductRangeFacetRequest { field, ranges });
+                    }
+                }
+                8 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let count = bounded_count(
+                        decoder,
+                        crate::MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
+                        "distance cutoffs",
+                    )?;
+                    for _ in 0..count {
+                        let ordinal = usize_value(decoder)?;
+                        let bits = u64::from_le_bytes(decoder.array()?);
+                        let cutoff = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+                        if cutoff.bits() != bits {
+                            return Err(NativeProofError::Invalid("noncanonical distance cutoff"));
+                        }
+                        vectors
+                            .get_mut(ordinal)
+                            .ok_or(NativeProofError::Invalid("cutoff ordinal out of range"))?
+                            .max_distance = Some(cutoff);
+                    }
+                }
+                9 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let branch = lexical
+                        .as_mut()
+                        .ok_or(NativeProofError::Invalid("operator without lexical branch"))?;
+                    match decoder.byte()? {
+                        0 => branch.operator = Some(crate::ProductLexicalOperator::And),
+                        1 => {
+                            branch.operator = Some(crate::ProductLexicalOperator::Or {
+                                minimum_match: usize_value(decoder)?,
+                            });
+                        }
+                        2 => branch.prefix = true,
+                        3 => branch.fuzzy = Some(usize_value(decoder)?),
+                        4 => branch.phrase = true,
+                        _ => {
+                            return Err(NativeProofError::Invalid("invalid lexical operator"));
+                        }
+                    }
+                }
+                10 if semantics_version >= SEMANTICS_VERSION_AUTOCUT => {
+                    let branch = lexical.as_mut().ok_or(NativeProofError::Invalid(
+                        "field boosts without lexical branch",
+                    ))?;
+                    let count = bounded_count(
+                        decoder,
+                        hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS,
+                        "field boosts",
+                    )?;
+                    for _ in 0..count {
+                        branch.fields.push(crate::ProductLexicalFieldBoost {
+                            field: text(decoder, limits.max_reexecution_bytes)?,
+                            weight_micros: decoder.u32()?,
+                        });
+                    }
+                }
                 _ => return Err(NativeProofError::Invalid("unknown request section")),
             }
         }
@@ -1843,12 +1964,15 @@ fn decode_integrated_request(
         filter,
         sort,
         facets,
+        range_facets,
         aggregations,
         limit,
         fusion,
         parent_dedupe,
         rerank,
         highlight,
+        autocut,
+        offset,
     })
 }
 
@@ -2046,6 +2170,10 @@ fn encode_aggregation(
             encoded.byte(4);
             put_text(encoded, field)?;
         }
+        DocValueAggregation::Average(field) => {
+            encoded.byte(5);
+            put_text(encoded, field)?;
+        }
     }
     Ok(())
 }
@@ -2059,6 +2187,7 @@ fn decode_aggregation(
         2 => DocValueAggregation::Sum(text(decoder, limits.max_reexecution_bytes)?),
         3 => DocValueAggregation::Min(text(decoder, limits.max_reexecution_bytes)?),
         4 => DocValueAggregation::Max(text(decoder, limits.max_reexecution_bytes)?),
+        5 => DocValueAggregation::Average(text(decoder, limits.max_reexecution_bytes)?),
         _ => return Err(NativeProofError::Invalid("invalid aggregation tag")),
     })
 }
@@ -2108,6 +2237,103 @@ fn encode_vector_receipt(
     Ok(())
 }
 
+/// Encodes the semantics-v5 tagged sections (autocut, offset, ranges).
+fn encode_autocut_sections(
+    encoded: &mut Encoder,
+    request: &ProductSearchRequest,
+    semantics_version: u16,
+) -> Result<(), NativeProofError> {
+    if semantics_version < SEMANTICS_VERSION_AUTOCUT {
+        return Ok(());
+    }
+    if let Some(autocut) = request.autocut {
+        encoded.byte(5);
+        put_usize(encoded, autocut)?;
+    }
+    if request.offset > 0 {
+        encoded.byte(6);
+        put_usize(encoded, request.offset)?;
+    }
+    if !request.range_facets.is_empty() {
+        encoded.byte(7);
+        put_count(encoded, request.range_facets.len())?;
+        for range_facet in &request.range_facets {
+            put_text(encoded, &range_facet.field)?;
+            put_count(encoded, range_facet.ranges.len())?;
+            for range in &range_facet.ranges {
+                encode_optional_float(encoded, range.lower);
+                encode_optional_float(encoded, range.upper);
+            }
+        }
+    }
+    let cutoffs: Vec<(usize, hyphae_native_types::CanonicalF64)> = request
+        .vectors
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, branch)| branch.max_distance.map(|cutoff| (ordinal, cutoff)))
+        .collect();
+    if !cutoffs.is_empty() {
+        encoded.byte(8);
+        put_count(encoded, cutoffs.len())?;
+        for (ordinal, cutoff) in cutoffs {
+            put_usize(encoded, ordinal)?;
+            encoded.extend(&cutoff.bits().to_le_bytes());
+        }
+    }
+    if let Some(lexical) = request.lexical.as_ref() {
+        if let Some(operator) = lexical.operator {
+            encoded.byte(9);
+            match operator {
+                crate::ProductLexicalOperator::And => encoded.byte(0),
+                crate::ProductLexicalOperator::Or { minimum_match } => {
+                    encoded.byte(1);
+                    put_usize(encoded, minimum_match)?;
+                }
+            }
+        } else if lexical.prefix {
+            encoded.byte(9);
+            encoded.byte(2);
+        } else if let Some(distance) = lexical.fuzzy {
+            encoded.byte(9);
+            encoded.byte(3);
+            put_usize(encoded, distance)?;
+        } else if lexical.phrase {
+            encoded.byte(9);
+            encoded.byte(4);
+        }
+        if !lexical.fields.is_empty() {
+            encoded.byte(10);
+            put_count(encoded, lexical.fields.len())?;
+            for boost in &lexical.fields {
+                put_text(encoded, &boost.field)?;
+                encoded.u32(boost.weight_micros);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_optional_float(encoded: &mut Encoder, value: Option<hyphae_native_types::CanonicalF64>) {
+    encoded.byte(u8::from(value.is_some()));
+    if let Some(value) = value {
+        encoded.extend(&value.bits().to_le_bytes());
+    }
+}
+
+fn decode_optional_float(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<hyphae_native_types::CanonicalF64>, NativeProofError> {
+    if !boolean(decoder)? {
+        return Ok(None);
+    }
+    let bits = u64::from_le_bytes(decoder.array()?);
+    let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+    if float.bits() != bits {
+        return Err(NativeProofError::Invalid("noncanonical facet range bound"));
+    }
+    Ok(Some(float))
+}
+
 fn encode_named_aggregation_value(
     encoded: &mut Encoder,
     aggregation: &ProductNamedAggregationValue,
@@ -2130,6 +2356,13 @@ fn encode_named_aggregation_value(
             encoded.byte(u8::from(value.is_some()));
             if let Some(value) = value {
                 encode_doc_value(encoded, value)?;
+            }
+        }
+        ProductAggregationValue::Float(value) => {
+            encoded.byte(4);
+            encoded.byte(u8::from(value.is_some()));
+            if let Some(value) = value {
+                encoded.extend(&value.bits().to_le_bytes());
             }
         }
     }
@@ -2169,6 +2402,10 @@ fn encode_doc_value(
             encoded.byte(4);
             put_bytes(encoded, value)?;
         }
+        ProductDocValue::Float(value) => {
+            encoded.byte(5);
+            encoded.extend(&value.bits().to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -2182,6 +2419,14 @@ fn decode_doc_value(
         2 => ProductDocValue::Integer(i64::from_le_bytes(decoder.array()?)),
         3 => ProductDocValue::String(text(decoder, limits.max_reexecution_bytes)?),
         4 => ProductDocValue::Bytes(bytes(decoder, limits.max_reexecution_bytes)?),
+        5 => {
+            let bits = u64::from_le_bytes(decoder.array()?);
+            let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+            if float.bits() != bits {
+                return Err(NativeProofError::Invalid("noncanonical float doc value"));
+            }
+            ProductDocValue::Float(float)
+        }
         _ => return Err(NativeProofError::Invalid("invalid doc-value tag")),
     })
 }

@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+use hyphae_native_types::CanonicalF64;
 use thiserror::Error;
 
 /// Maximum candidates admitted by the default policy.
@@ -39,6 +40,9 @@ pub enum DocValue {
     Boolean(bool),
     /// Signed 64-bit integer scalar.
     Integer(i64),
+    /// Canonical IEEE-754 binary64 scalar under the deterministic total
+    /// order; `NaN` payloads and signed zero are collapsed on ingest.
+    Float(CanonicalF64),
     /// UTF-8 scalar.
     String(String),
     /// Opaque binary scalar.
@@ -199,6 +203,30 @@ pub struct FacetRequest {
     pub limit: usize,
 }
 
+/// Maximum range facets in one request.
+pub const MAX_DOC_VALUE_RANGE_FACETS: usize = 8;
+/// Maximum ranges in one range facet.
+pub const MAX_DOC_VALUE_FACET_RANGES: usize = 64;
+
+/// One half-open numeric interval `[lower, upper)` with independently
+/// optional canonical-float bounds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetRange {
+    /// Inclusive lower bound; absent means unbounded below.
+    pub lower: Option<CanonicalF64>,
+    /// Exclusive upper bound; absent means unbounded above.
+    pub upper: Option<CanonicalF64>,
+}
+
+/// One complete range-facet request over a numeric field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeFacetRequest {
+    /// Exact doc-value field.
+    pub field: String,
+    /// Declared intervals, at most [`MAX_DOC_VALUE_FACET_RANGES`].
+    pub ranges: Vec<FacetRange>,
+}
+
 /// One aggregate calculation over the complete filtered set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocValueAggregation {
@@ -210,6 +238,8 @@ pub enum DocValueAggregation {
     Min(String),
     /// Maximum present scalar under the canonical total order.
     Max(String),
+    /// Arithmetic mean of present numeric scalars as a canonical float.
+    Average(String),
 }
 
 /// One named aggregate calculation.
@@ -232,6 +262,8 @@ pub struct DocValueRequest {
     pub limit: usize,
     /// Terms facets evaluated over every filtered candidate.
     pub facets: Vec<FacetRequest>,
+    /// Range facets evaluated over every filtered candidate.
+    pub range_facets: Vec<RangeFacetRequest>,
     /// Aggregations evaluated over every filtered candidate.
     pub aggregations: Vec<NamedDocValueAggregation>,
 }
@@ -307,6 +339,8 @@ pub enum DocValueAggregationValue {
     Count(u64),
     /// Checked sum; `None` means no present inputs.
     Integer(Option<i128>),
+    /// Finite-guarded float sum; `None` means no present inputs.
+    Float(Option<CanonicalF64>),
     /// Minimum or maximum; `None` means no present inputs.
     Value(Option<DocValue>),
 }
@@ -327,6 +361,8 @@ pub struct DocValueResult {
     pub hits: Vec<DocValueCandidate>,
     /// Facets in request order.
     pub facets: Vec<FacetResult>,
+    /// Range facets in request order, one bucket per declared range.
+    pub range_facets: Vec<FacetResult>,
     /// Aggregations in request order.
     pub aggregations: Vec<NamedDocValueAggregationValue>,
     /// Number of candidates inspected.
@@ -460,6 +496,7 @@ pub fn execute_doc_values(
     }
 
     let facets = evaluate_facets(&matched, &request.facets, limits.max_facet_terms)?;
+    let range_facets = evaluate_range_facets(&matched, &request.range_facets)?;
     let aggregations = evaluate_aggregations(&matched, &request.aggregations)?;
     matched.sort_by(|left, right| compare_candidates(left, right, &request.sort));
     let matched_candidates = matched.len();
@@ -467,6 +504,7 @@ pub fn execute_doc_values(
     Ok(DocValueResult {
         hits,
         facets,
+        range_facets,
         aggregations,
         scanned_candidates: candidates.len(),
         matched_candidates,
@@ -485,6 +523,35 @@ fn validate_request(
     }
     check_shape("sort", request.sort.len(), limits.max_sorts)?;
     check_shape("facet", request.facets.len(), limits.max_facets)?;
+    check_shape(
+        "range facet",
+        request.range_facets.len(),
+        MAX_DOC_VALUE_RANGE_FACETS,
+    )?;
+    for range_facet in &request.range_facets {
+        validate_name(&range_facet.field, limits.max_value_bytes)?;
+        if range_facet.ranges.is_empty() || range_facet.ranges.len() > MAX_DOC_VALUE_FACET_RANGES {
+            return Err(DocValueError::ShapeLimit {
+                kind: "facet range",
+                actual: range_facet.ranges.len(),
+                maximum: MAX_DOC_VALUE_FACET_RANGES,
+            });
+        }
+        for range in &range_facet.ranges {
+            let lower = range.lower.map(CanonicalF64::get);
+            let upper = range.upper.map(CanonicalF64::get);
+            if lower.is_some_and(f64::is_nan)
+                || upper.is_some_and(f64::is_nan)
+                || matches!((lower, upper), (Some(low), Some(high)) if low >= high)
+            {
+                return Err(DocValueError::ShapeLimit {
+                    kind: "facet range bound",
+                    actual: 0,
+                    maximum: 0,
+                });
+            }
+        }
+    }
     check_shape(
         "aggregation",
         request.aggregations.len(),
@@ -526,7 +593,8 @@ fn validate_request(
         }
         if let DocValueAggregation::Sum(field)
         | DocValueAggregation::Min(field)
-        | DocValueAggregation::Max(field) = &aggregation.aggregation
+        | DocValueAggregation::Max(field)
+        | DocValueAggregation::Average(field) = &aggregation.aggregation
         {
             validate_name(field, limits.max_value_bytes)?;
         }
@@ -554,7 +622,7 @@ fn validate_candidate(
         let length = match value {
             DocValue::String(value) => value.len(),
             DocValue::Bytes(value) => value.len(),
-            DocValue::Boolean(_) | DocValue::Integer(_) => 0,
+            DocValue::Boolean(_) | DocValue::Integer(_) | DocValue::Float(_) => 0,
         };
         if length > limits.max_value_bytes {
             return Err(DocValueError::ValueTooLarge {
@@ -777,6 +845,110 @@ fn compare_optional_values(
     }
 }
 
+/// Sums one field across matched candidates: integers under checked
+/// 128-bit accumulation, floats under finite-guarded binary64
+/// accumulation. Mixed types or a non-finite float sum fail closed.
+fn evaluate_sum(
+    matched: &[&DocValueCandidate],
+    field: &str,
+    name: &str,
+) -> Result<DocValueAggregationValue, DocValueError> {
+    let mut integer_sum = None::<i128>;
+    let mut float_sum = None::<f64>;
+    for candidate in matched {
+        let Some(value) = candidate.values.get(field) else {
+            continue;
+        };
+        match value {
+            DocValue::Integer(value) if float_sum.is_none() => {
+                integer_sum = Some(
+                    integer_sum
+                        .unwrap_or_default()
+                        .checked_add(i128::from(*value))
+                        .ok_or(DocValueError::AggregationOverflow {
+                            name: name.to_owned(),
+                        })?,
+                );
+            }
+            DocValue::Float(value) if integer_sum.is_none() => {
+                let updated = float_sum.unwrap_or_default() + value.get();
+                if !updated.is_finite() {
+                    return Err(DocValueError::AggregationOverflow {
+                        name: name.to_owned(),
+                    });
+                }
+                float_sum = Some(updated);
+            }
+            _ => {
+                return Err(DocValueError::AggregationType {
+                    name: name.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(match float_sum {
+        Some(sum) => DocValueAggregationValue::Float(Some(CanonicalF64::new(sum))),
+        None => DocValueAggregationValue::Integer(integer_sum),
+    })
+}
+
+/// Arithmetic mean of present numeric scalars: the checked sum divided
+/// by the present-value count, always as a canonical float. No present
+/// values yield an absent aggregate; a non-finite mean fails closed.
+fn evaluate_average(
+    matched: &[&DocValueCandidate],
+    field: &str,
+    name: &str,
+) -> Result<DocValueAggregationValue, DocValueError> {
+    let count = matched
+        .iter()
+        .filter(|candidate| candidate.values.contains_key(field))
+        .count();
+    let Ok(count) = u32::try_from(count) else {
+        return Err(DocValueError::AggregationOverflow {
+            name: name.to_owned(),
+        });
+    };
+    if count == 0 {
+        return Ok(DocValueAggregationValue::Float(None));
+    }
+    let sum = match evaluate_sum(matched, field, name)? {
+        DocValueAggregationValue::Integer(Some(sum)) => integer_sum_as_f64(sum),
+        DocValueAggregationValue::Float(Some(sum)) => sum.get(),
+        _ => return Ok(DocValueAggregationValue::Float(None)),
+    };
+    let mean = sum / f64::from(count);
+    if !mean.is_finite() {
+        return Err(DocValueError::AggregationOverflow {
+            name: name.to_owned(),
+        });
+    }
+    Ok(DocValueAggregationValue::Float(Some(CanonicalF64::new(
+        mean,
+    ))))
+}
+
+/// Deterministic i128 -> f64 conversion via two u64 halves (IEEE
+/// round-to-nearest on canonical inputs; avoids the lossy direct cast).
+fn integer_sum_as_f64(sum: i128) -> f64 {
+    let negative = sum < 0;
+    let magnitude = sum.unsigned_abs();
+    let high = u64::try_from(magnitude >> 64).unwrap_or(u64::MAX);
+    let low = u64::try_from(magnitude & u128::from(u64::MAX)).unwrap_or(u64::MAX);
+    let mut value = high_to_f64(high) * 18_446_744_073_709_551_616.0 + high_to_f64(low);
+    if negative {
+        value = -value;
+    }
+    value
+}
+
+/// Lossless-enough u64 -> f64 through two u32 halves.
+fn high_to_f64(value: u64) -> f64 {
+    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(upper) * 4_294_967_296.0 + f64::from(lower)
+}
+
 fn evaluate_facets(
     matched: &[&DocValueCandidate],
     requests: &[FacetRequest],
@@ -821,6 +993,62 @@ fn evaluate_facets(
     Ok(results)
 }
 
+/// Buckets numeric values into declared half-open intervals, one bucket
+/// per range in request order with the range ordinal as the value.
+fn evaluate_range_facets(
+    matched: &[&DocValueCandidate],
+    requests: &[RangeFacetRequest],
+) -> Result<Vec<FacetResult>, DocValueError> {
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        let mut counts = vec![0_u64; request.ranges.len()];
+        for candidate in matched {
+            let Some(value) = candidate.values.get(&request.field) else {
+                continue;
+            };
+            let numeric = match value {
+                DocValue::Integer(value) => integer_sum_as_f64(i128::from(*value)),
+                DocValue::Float(value) => value.get(),
+                _ => continue,
+            };
+            for (ordinal, range) in request.ranges.iter().enumerate() {
+                let above = range.lower.is_none_or(|lower| numeric >= lower.get());
+                let below = range.upper.is_none_or(|upper| numeric < upper.get());
+                if above && below {
+                    counts[ordinal] =
+                        counts[ordinal]
+                            .checked_add(1)
+                            .ok_or(DocValueError::ShapeLimit {
+                                kind: "range facet count",
+                                actual: usize::MAX,
+                                maximum: usize::MAX - 1,
+                            })?;
+                }
+            }
+        }
+        results.push(FacetResult {
+            field: request.field.clone(),
+            buckets: counts
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, count)| {
+                    Ok(FacetBucket {
+                        value: DocValue::Integer(i64::try_from(ordinal).map_err(|_| {
+                            DocValueError::ShapeLimit {
+                                kind: "range ordinal",
+                                actual: ordinal,
+                                maximum: MAX_DOC_VALUE_FACET_RANGES,
+                            }
+                        })?),
+                        count,
+                    })
+                })
+                .collect::<Result<Vec<_>, DocValueError>>()?,
+        });
+    }
+    Ok(results)
+}
+
 fn evaluate_aggregations(
     matched: &[&DocValueCandidate],
     requests: &[NamedDocValueAggregation],
@@ -837,26 +1065,9 @@ fn evaluate_aggregations(
                             maximum: usize::MAX,
                         })?,
                     ),
-                    DocValueAggregation::Sum(field) => {
-                        let mut sum = None::<i128>;
-                        for candidate in matched {
-                            let Some(value) = candidate.values.get(field) else {
-                                continue;
-                            };
-                            let DocValue::Integer(value) = value else {
-                                return Err(DocValueError::AggregationType {
-                                    name: request.name.clone(),
-                                });
-                            };
-                            sum = Some(
-                                sum.unwrap_or_default()
-                                    .checked_add(i128::from(*value))
-                                    .ok_or(DocValueError::AggregationOverflow {
-                                        name: request.name.clone(),
-                                    })?,
-                            );
-                        }
-                        DocValueAggregationValue::Integer(sum)
+                    DocValueAggregation::Sum(field) => evaluate_sum(matched, field, &request.name)?,
+                    DocValueAggregation::Average(field) => {
+                        evaluate_average(matched, field, &request.name)?
                     }
                     DocValueAggregation::Min(field) => DocValueAggregationValue::Value(
                         matched

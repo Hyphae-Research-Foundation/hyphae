@@ -1,0 +1,28 @@
+Linux ip-172-31-38-100 7.0.0-1011-aws #11~24.04.1-Ubuntu SMP PREEMPT Mon Aug 10 15:20:57 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+CPU(s):                                  96
+On-line CPU(s) list:                     0-95
+Model name:                              INTEL(R) XEON(R) PLATINUM 8559C
+BIOS Model name:                         INTEL(R) XEON(R) PLATINUM 8559C  CPU @ 2.4GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      48
+Socket(s):                               1
+CPU(s) scaling MHz:                      34%
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-95
+               total        used        free      shared  buff/cache   available
+Mem:             755           5         752           0           0         749
+Swap:              0           0           0
+hypervisor flag count: 0
+loop0        29777920 loop /snap/amazon-ssm-agent/13349
+loop1        77586432 loop /snap/core22/2437
+loop2        52535296 loop /snap/snapd/27710
+nvme0n1  322122547200 disk 
+nvme1n1 3750000000000 disk 
+nvme2n1 3750000000000 disk 
+nvme4n1 3750000000000 disk 
+nvme6n1 3750000000000 disk 
+nvme3n1 3750000000000 disk 
+nvme5n1 3750000000000 disk 
+performance
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme6n1    3.4T   36K  3.2T   1% /mnt/nvme

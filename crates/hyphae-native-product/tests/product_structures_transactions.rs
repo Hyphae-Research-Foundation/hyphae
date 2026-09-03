@@ -580,3 +580,904 @@ fn unknown_explicit_commit_resolves_after_reopen() -> Result<(), Box<dyn std::er
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_reads_surface_runtime_score_ranges_and_glob_scans()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{ProductHashScanStop, ProductScoreBound, ProductSortedSetOrder};
+
+    let path = temporary("minor-six-reads");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(4, "boards", StructureKind::SortedSet)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(5, "profiles", StructureKind::Hash)?,
+    ))?;
+    seed.create_sorted_set(b"board".to_vec())?;
+    for (member, score) in [
+        (&b"alpha"[..], 1.0),
+        (b"bravo", 2.5),
+        (b"charlie", 2.5),
+        (b"delta", 9.0),
+    ] {
+        seed.zadd(b"board".to_vec(), score, member.to_vec())?;
+    }
+    seed.create_hash(b"profile".to_vec())?;
+    for (field, value) in [
+        (&b"user:1"[..], &b"ana"[..]),
+        (b"user:2", b"bruno"),
+        (b"user:10", b"carla"),
+        (b"admin:1", b"root"),
+    ] {
+        seed.hset(b"profile".to_vec(), field.to_vec(), value.to_vec())?;
+    }
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+
+    // Ascending score range with an exclusive lower bound and offset.
+    let read = {
+        let request_context = context(&session, 1);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Exclusive(1.0),
+                upper: ProductScoreBound::Inclusive(9.0),
+                offset: 1,
+                limit: 10,
+                order: ProductSortedSetOrder::Ascending,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("score range did not read".into());
+    };
+    let ProductStructureReadResult::SortedSetEntries(entries) = read.value else {
+        return Err("score range result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.member.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"charlie"[..], b"delta"],
+    );
+
+    // Descending direction reverses traversal before offset/limit.
+    let read = {
+        let request_context = context(&session, 2);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Unbounded,
+                upper: ProductScoreBound::Unbounded,
+                offset: 0,
+                limit: 2,
+                order: ProductSortedSetOrder::Descending,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("descending range did not read".into());
+    };
+    let ProductStructureReadResult::SortedSetEntries(entries) = read.value else {
+        return Err("descending result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.member.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"delta"[..], b"charlie"],
+    );
+
+    // NaN bounds fail closed.
+    let error = {
+        let request_context = context(&session, 3);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SortedSetScoreRange {
+                key: key(4, b"board")?,
+                lower: ProductScoreBound::Inclusive(f64::NAN),
+                upper: ProductScoreBound::Unbounded,
+                offset: 0,
+                limit: 1,
+                order: ProductSortedSetOrder::Ascending,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("NaN bound was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    // Reverse hash scan pages descending with an exclusive cursor.
+    let read = {
+        let request_context = context(&session, 4);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanReverse {
+                key: key(5, b"profile")?,
+                start_before: Some(b"user:2".to_vec()),
+                limit: 2,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("reverse scan did not read".into());
+    };
+    let ProductStructureReadResult::HashEntries(entries) = read.value else {
+        return Err("reverse scan result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.field.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"user:10"[..], b"user:1"],
+    );
+
+    // Glob scan matches user:* only and reports progress.
+    let read = {
+        let request_context = context(&session, 5);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanMatch {
+                key: key(5, b"profile")?,
+                pattern: b"user:*".to_vec(),
+                start_after: None,
+                output_limit: 8,
+                visit_limit: 8,
+                match_step_limit: 512,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("glob scan did not read".into());
+    };
+    let ProductStructureReadResult::HashPage {
+        entries,
+        continuation,
+        stop,
+        visited,
+        ..
+    } = read.value
+    else {
+        return Err("glob scan result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.field.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"user:1"[..], b"user:10", b"user:2"],
+    );
+    assert_eq!(continuation, None);
+    assert_eq!(stop, ProductHashScanStop::Exhausted);
+    // The leading literal prefix prunes the physical range to user:*,
+    // so admin:1 is never a candidate.
+    assert_eq!(visited, 3);
+
+    // Malformed pattern fails closed.
+    let error = {
+        let request_context = context(&session, 6);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::HashScanMatch {
+                key: key(5, b"profile")?,
+                pattern: b"user:[".to_vec(),
+                start_after: None,
+                output_limit: 8,
+                visit_limit: 8,
+                match_step_limit: 512,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("malformed glob was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_key_scans_and_sorted_set_increment_pop() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{ProductHashScanStop, ProductKeyEntry};
+
+    let path = temporary("minor-six-kv2");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(6, "space", StructureKind::String)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(7, "boards", StructureKind::SortedSet)?,
+    ))?;
+    seed.set(b"app:flag".to_vec(), b"on".to_vec(), None)?;
+    seed.create_hash(b"app:profile".to_vec())?;
+    seed.hset(b"app:profile".to_vec(), b"user".to_vec(), b"ana".to_vec())?;
+    seed.create_set(b"app:tags".to_vec())?;
+    seed.sadd(b"app:tags".to_vec(), b"rust".to_vec())?;
+    seed.create_list(b"app:queue".to_vec())?;
+    seed.rpush(b"app:queue".to_vec(), b"job".to_vec())?;
+    seed.create_sorted_set(b"app:board".to_vec())?;
+    seed.zadd(b"app:board".to_vec(), 1.5, b"alpha".to_vec())?;
+    seed.zadd(b"app:board".to_vec(), 1.5, b"bravo".to_vec())?;
+    seed.zadd(b"app:board".to_vec(), 7.0, b"delta".to_vec())?;
+    seed.set(b"other:flag".to_vec(), b"off".to_vec(), None)?;
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+
+    // Cross-family key scan matches app:* over all five families.
+    let read = {
+        let request_context = context(&session, 1);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::KeyScanMatch {
+                keyspace: ObjectId::new(6)?,
+                pattern: b"app:*".to_vec(),
+                start_after: None,
+                output_limit: 16,
+                visit_limit: 16,
+                match_step_limit: 4096,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("key scan did not read".into());
+    };
+    let ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        visited,
+        ..
+    } = read.value
+    else {
+        return Err("key scan result shape".into());
+    };
+    assert_eq!(
+        entries,
+        vec![
+            ProductKeyEntry {
+                key: b"app:board".to_vec(),
+                family: StructureKind::SortedSet,
+            },
+            ProductKeyEntry {
+                key: b"app:flag".to_vec(),
+                family: StructureKind::String,
+            },
+            ProductKeyEntry {
+                key: b"app:profile".to_vec(),
+                family: StructureKind::Hash,
+            },
+            ProductKeyEntry {
+                key: b"app:queue".to_vec(),
+                family: StructureKind::List,
+            },
+            ProductKeyEntry {
+                key: b"app:tags".to_vec(),
+                family: StructureKind::Set,
+            },
+        ],
+    );
+    assert_eq!(continuation, None);
+    assert_eq!(stop, ProductHashScanStop::Exhausted);
+    // The literal prefix prunes other:flag out of the physical walk.
+    assert_eq!(visited, 5);
+
+    // A tight output limit stops early with a physical continuation.
+    let read = {
+        let request_context = context(&session, 2);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::KeyScanMatch {
+                keyspace: ObjectId::new(6)?,
+                pattern: b"app:*".to_vec(),
+                start_after: None,
+                output_limit: 2,
+                visit_limit: 16,
+                match_step_limit: 4096,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("limited key scan did not read".into());
+    };
+    let ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        ..
+    } = read.value
+    else {
+        return Err("limited key scan result shape".into());
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(continuation, Some(b"app:flag".to_vec()));
+    assert_eq!(stop, ProductHashScanStop::OutputLimit);
+
+    // Resuming after the continuation yields the remaining keys.
+    let read = {
+        let request_context = context(&session, 3);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::KeyScanMatch {
+                keyspace: ObjectId::new(6)?,
+                pattern: b"app:*".to_vec(),
+                start_after: Some(b"app:flag".to_vec()),
+                output_limit: 16,
+                visit_limit: 16,
+                match_step_limit: 4096,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("resumed key scan did not read".into());
+    };
+    let ProductStructureReadResult::KeyPage { entries, .. } = read.value else {
+        return Err("resumed key scan result shape".into());
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.key.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&b"app:profile"[..], b"app:queue", b"app:tags"],
+    );
+
+    // An internal-namespace cursor fails closed.
+    let error = {
+        let request_context = context(&session, 4);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::KeyScanMatch {
+                keyspace: ObjectId::new(6)?,
+                pattern: b"*".to_vec(),
+                start_after: Some(b"\0hyphae.internal".to_vec()),
+                output_limit: 16,
+                visit_limit: 16,
+                match_step_limit: 4096,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("internal cursor was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    // ZINCRBY on an existing member returns the staged new score.
+    let begin_context = context(&session, 5);
+    let begin = product.dispatch(
+        &mut session,
+        &begin_context,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+    let stage_context = context(&session, 6);
+    let staged = product.dispatch(
+        &mut session,
+        &stage_context,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::SortedSetIncrement {
+                key: key(7, b"app:board")?,
+                member: b"alpha".to_vec(),
+                delta: hyphae_native_product::CanonicalF64::new(2.5),
+            },
+        },
+    )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Score(
+                        hyphae_native_product::CanonicalF64::new(4.0)
+                    )
+                )
+    ));
+
+    // ZPOPMIN pops the lowest (score, member): bravo at 1.5 after the
+    // increment moved alpha to 4.0.
+    let pop_context = context(&session, 7);
+    let staged = product.dispatch(
+        &mut session,
+        &pop_context,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::SortedSetPop {
+                key: key(7, b"app:board")?,
+                highest: false,
+            },
+        },
+    )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::PoppedEntry(Some(
+                        hyphae_native_product::ProductSortedSetEntry {
+                            member: b"bravo".to_vec(),
+                            score: hyphae_native_product::CanonicalF64::new(1.5),
+                        }
+                    ))
+                )
+    ));
+
+    // ZPOPMAX pops delta at 7.0.
+    let pop_context = context(&session, 8);
+    let staged = product.dispatch(
+        &mut session,
+        &pop_context,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::SortedSetPop {
+                key: key(7, b"app:board")?,
+                highest: true,
+            },
+        },
+    )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::PoppedEntry(Some(
+                        hyphae_native_product::ProductSortedSetEntry {
+                            member: b"delta".to_vec(),
+                            score: hyphae_native_product::CanonicalF64::new(7.0),
+                        }
+                    ))
+                )
+    ));
+
+    // A non-finite delta fails closed without staging.
+    let bad_context = context(&session, 9);
+    let error = product.dispatch(
+        &mut session,
+        &bad_context,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::SortedSetIncrement {
+                key: key(7, b"app:board")?,
+                member: b"alpha".to_vec(),
+                delta: hyphae_native_product::CanonicalF64::new(f64::INFINITY),
+            },
+        },
+    );
+    let Err(error) = error else {
+        return Err("non-finite delta was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    let rollback_context = context(&session, 10);
+    product.dispatch(
+        &mut session,
+        &rollback_context,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+
+    // Popping an empty sorted set returns an absent entry: commit both
+    // pops, then pop a third time in a fresh transaction.
+    let begin_context = context(&session, 11);
+    let begin = product.dispatch(
+        &mut session,
+        &begin_context,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = begin
+    else {
+        return Err("drain transaction did not begin".into());
+    };
+    for ordinal in 0..3_u128 {
+        let drain_context = context(&session, 12 + ordinal);
+        product.dispatch(
+            &mut session,
+            &drain_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::SortedSetPop {
+                    key: key(7, b"app:board")?,
+                    highest: false,
+                },
+            },
+        )?;
+    }
+    let empty_context = context(&session, 15);
+    let staged = product.dispatch(
+        &mut session,
+        &empty_context,
+        ProductOperation::TransactionStageStructure {
+            handle,
+            mutation: ProductStructureMutation::SortedSetPop {
+                key: key(7, b"app:board")?,
+                highest: false,
+            },
+        },
+    )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::PoppedEntry(None)
+                )
+    ));
+    let rollback_context = context(&session, 16);
+    product.dispatch(
+        &mut session,
+        &rollback_context,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_conditional_range_and_seeded_operations() -> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("minor-six-kv2b");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(8, "strings", StructureKind::String)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(9, "profiles", StructureKind::Hash)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(10, "tags", StructureKind::Set)?,
+    ))?;
+    seed.set(b"greeting".to_vec(), b"hello".to_vec(), None)?;
+    seed.create_hash(b"profile".to_vec())?;
+    seed.hset(b"profile".to_vec(), b"user".to_vec(), b"ana".to_vec())?;
+    seed.create_set(b"tags".to_vec())?;
+    for member in [&b"alpha"[..], b"bravo", b"charlie", b"delta"] {
+        seed.sadd(b"tags".to_vec(), member.to_vec())?;
+    }
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+
+    // GETRANGE with negative positions clamps Valkey-style.
+    let read = {
+        let request_context = context(&session, 1);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::StringRange {
+                key: key(8, b"greeting")?,
+                start: 1,
+                end: -2,
+            }),
+        )?
+    };
+    assert!(matches!(
+        read,
+        ProductResponse::StructureRead(read)
+            if read.value == ProductStructureReadResult::Value(Some(b"ell".to_vec()))
+    ));
+
+    // A missing key reads as absent; an inverted range reads empty.
+    let read = {
+        let request_context = context(&session, 2);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::StringRange {
+                key: key(8, b"missing")?,
+                start: 0,
+                end: -1,
+            }),
+        )?
+    };
+    assert!(matches!(
+        read,
+        ProductResponse::StructureRead(read)
+            if read.value == ProductStructureReadResult::Value(None)
+    ));
+    let read = {
+        let request_context = context(&session, 3);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::StringRange {
+                key: key(8, b"greeting")?,
+                start: 4,
+                end: 1,
+            }),
+        )?
+    };
+    assert!(matches!(
+        read,
+        ProductResponse::StructureRead(read)
+            if read.value == ProductStructureReadResult::Value(Some(Vec::new()))
+    ));
+
+    // SRANDMEMBER is deterministic under the documented splitmix64 rank
+    // and wraps ascending: seed 7 -> splitmix64(7) % 4 == rank, walk 3.
+    let expected_start =
+        usize::try_from(hyphae_native_runtime::splitmix64(7) % 4).unwrap_or_default();
+    let members = [&b"alpha"[..], b"bravo", b"charlie", b"delta"];
+    let expected: Vec<&[u8]> = (0..3).map(|i| members[(expected_start + i) % 4]).collect();
+    let read = {
+        let request_context = context(&session, 4);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SetRandomMembers {
+                key: key(10, b"tags")?,
+                seed: 7,
+                count: 3,
+            }),
+        )?
+    };
+    let ProductResponse::StructureRead(read) = read else {
+        return Err("srandmember did not read".into());
+    };
+    let ProductStructureReadResult::Values(values) = read.value else {
+        return Err("srandmember result shape".into());
+    };
+    assert_eq!(
+        values.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        expected,
+    );
+
+    // Zero count fails closed.
+    let error = {
+        let request_context = context(&session, 5);
+        product.dispatch(
+            &mut session,
+            &request_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::SetRandomMembers {
+                key: key(10, b"tags")?,
+                seed: 7,
+                count: 0,
+            }),
+        )
+    };
+    let Err(error) = error else {
+        return Err("zero count was admitted".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    // Mutations run staged: SETNX applies once, APPEND/SETRANGE report
+    // lengths, HSETNX applies once, SPOP is seed-deterministic.
+    let begin_context = context(&session, 6);
+    let begin = product.dispatch(
+        &mut session,
+        &begin_context,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+
+    // SET_IF_ABSENT on an existing key does not apply.
+    let staged = {
+        let stage_context = context(&session, 7);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::StringSetConditional {
+                    key: key(8, b"greeting")?,
+                    value: b"other".to_vec(),
+                    expires_at_micros: None,
+                    if_present: false,
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Boolean(false)
+                )
+    ));
+
+    // SET_IF_ABSENT on a missing key applies.
+    let staged = {
+        let stage_context = context(&session, 8);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::StringSetConditional {
+                    key: key(8, b"fresh")?,
+                    value: b"born".to_vec(),
+                    expires_at_micros: None,
+                    if_present: false,
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Boolean(true)
+                )
+    ));
+
+    // APPEND returns the resulting length.
+    let staged = {
+        let stage_context = context(&session, 9);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::StringAppend {
+                    key: key(8, b"greeting")?,
+                    suffix: b" world".to_vec(),
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Count(11)
+                )
+    ));
+
+    // SETRANGE zero-fills the gap and returns the resulting length.
+    let staged = {
+        let stage_context = context(&session, 10);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::StringSetRange {
+                    key: key(8, b"padded")?,
+                    offset: 4,
+                    patch: b"tail".to_vec(),
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Count(8)
+                )
+    ));
+
+    // HSETNX applies only on the absent field.
+    let staged = {
+        let stage_context = context(&session, 11);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::HashSetIfAbsent {
+                    key: key(9, b"profile")?,
+                    field: b"user".to_vec(),
+                    value: b"bruno".to_vec(),
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Boolean(false)
+                )
+    ));
+    let staged = {
+        let stage_context = context(&session, 12);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::HashSetIfAbsent {
+                    key: key(9, b"profile")?,
+                    field: b"city".to_vec(),
+                    value: b"lima".to_vec(),
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Boolean(true)
+                )
+    ));
+
+    // SPOP removes exactly the seed-selected member.
+    let expected_pop = members[expected_start].to_vec();
+    let staged = {
+        let stage_context = context(&session, 13);
+        product.dispatch(
+            &mut session,
+            &stage_context,
+            ProductOperation::TransactionStageStructure {
+                handle,
+                mutation: ProductStructureMutation::SetPop {
+                    key: key(10, b"tags")?,
+                    seed: 7,
+                },
+            },
+        )?
+    };
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.result
+                == ProductTransactionStageResult::Structure(
+                    hyphae_native_product::ProductStructureMutationResult::Value(Some(
+                        expected_pop.clone()
+                    ))
+                )
+    ));
+
+    let rollback_context = context(&session, 14);
+    product.dispatch(
+        &mut session,
+        &rollback_context,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}

@@ -27,6 +27,7 @@ mod operation;
 /// Canonical, bounded native proof and directory-witness artifacts.
 pub mod proof;
 mod search;
+mod search_manifest;
 mod service;
 mod session;
 mod structures;
@@ -61,6 +62,9 @@ pub use hyphae_native_types::{
 pub use limits::*;
 pub use operation::*;
 pub use search::*;
+pub use search_manifest::{
+    MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES, MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS,
+};
 pub use service::*;
 pub use session::*;
 pub use structures::*;
@@ -225,6 +229,34 @@ pub struct ProductSnapshot {
 }
 
 impl ProductSnapshot {
+    /// Times the retained-model scorer alone. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_for_diagnostics(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<usize, ProductError> {
+        self.match_text_hits_for_diagnostics(index, query, limit)
+            .map(|hits| hits.len())
+    }
+
+    /// Returns the retained-model scorer's ranked hits so the evidence
+    /// harness can compare them bit-for-bit against the durable scorer.
+    /// Diagnostic surface; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_hits_for_diagnostics(
+        &self,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
+        self.inner
+            .match_text(index, query, limit)
+            .map_err(ProductError::from)
+    }
+
     /// Returns snapshot identity shared by all engines.
     pub fn identity(&self) -> SnapshotIdentity {
         SnapshotIdentity {
@@ -282,18 +314,20 @@ impl ProductSnapshot {
     /// Returns visible internal scalar keys inside `[start, end)`, ascending,
     /// or `None` fail-closed above `limit`. Both bounds must carry the
     /// reserved internal prefix; anything else returns no keys.
-    pub(crate) fn structure_keys_in_range_internal(
+    pub(crate) fn visit_structure_keys_in_range_internal(
         &self,
         start: &[u8],
         end: &[u8],
         limit: usize,
-    ) -> Option<Vec<Vec<u8>>> {
+        visitor: impl FnMut(&[u8]),
+    ) -> Option<()> {
         if !start.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
             || !end.starts_with(INTERNAL_STRUCTURE_KEY_PREFIX)
         {
-            return Some(Vec::new());
+            return Some(());
         }
-        self.inner.structure_keys_in_range(start, end, limit)
+        self.inner
+            .visit_structure_keys_in_range(start, end, limit, visitor)
     }
 
     pub(crate) fn structure_get_internal(&self, key: &[u8]) -> Option<&[u8]> {

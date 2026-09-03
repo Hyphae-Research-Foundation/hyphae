@@ -50,9 +50,19 @@ identity.
 The first executable kernel is `hyphae-native-ann`. V1 bounds `M` to 2 through
 64, requires `ef_construction >= M`, derives each node level from BLAKE3 over
 the index-definition digest and object ID, and retains at most `M` directed
-neighbors per layer. Neighbor selection uses exact metric distance followed by
-object ID. Foreground update and delete do not rebuild this graph. They replace
-one object-keyed delta record above it.
+neighbors per layer. Neighbor selection uses the deterministic diversity
+heuristic (HNSW paper Algorithm 4 without candidate extension or pruned
+backfill): candidates ordered by exact metric distance then object ID are
+accepted only while strictly closer to the anchor node than to every
+already-accepted neighbor, so retained edges spread across directions
+instead of clustering; a node may therefore retain fewer than `M`
+neighbors. The same rule selects insertion links from the
+`ef_construction` frontier and re-prunes overflowing backlinks. The build
+identity hashes a version tag (`2` for this rule; `1` was plain
+truncate-to-`M`), so graphs persisted under the previous rule fail closed
+as corrupt rather than validating against the wrong canonical form.
+Foreground update and delete do not rebuild this graph. They replace one
+object-keyed delta record above it.
 
 `IndexSnapshot` exports definition, vectors with creating CSNs, graph nodes,
 entry point, maximum level and build identity. Restore reconstructs the graph
@@ -186,6 +196,29 @@ may report bounded fallback honestly.
 A proof can attest to execution, inputs, graph identity, candidates and exact
 reranking. It cannot claim global nearest-neighbor optimality unless the query
 used the exact oracle.
+
+## Scalar quantization primitive
+
+`Sq8Quantizer` is the audited compression primitive for a future
+compressed traversal mode. Training folds the exact global minimum
+(`b`) and range (`a`) over the training vectors in input order;
+training data whose range is zero or non-finite fails closed. Encoding
+maps each component to `clamp(floor((x − b) · 255 / a), 0, 255)` and
+retains the code sum and squared-code sum, so asymmetric distances
+never decode:
+
+- squared L2 ≈ `a2 · Σ(cx − cy)²`;
+- dot ≈ `a2 · Σ cx·cy + ab · (Σcx + Σcy) + ib2`; and
+- cosine derives both norms from the retained sums via
+  `norm² ≈ a2 · Σc² + 2·ab · Σc + ib2`, rejecting zero norms,
+
+with `a2 = a²/255²`, `ab = a·b/255`, `ib2 = b²·dimension`. All
+arithmetic is f64 in deterministic input order. The V1 quality gate
+requires that compressed top-`3k` candidates rescored with exact
+distances recover recall@k ≥ 0.95 against the exact oracle on the
+bounded deterministic corpus, per metric. The primitive is not yet
+wired into the durable index format; graphs continue to persist exact
+`f32` vectors.
 
 ## Quality gates
 

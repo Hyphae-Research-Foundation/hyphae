@@ -1,0 +1,1 @@
+bound lifted to 1_000_000 for blocks 06-09 (measurement host only)

@@ -11,7 +11,13 @@ experimentally. The first catalog-bound scalar literal slice is also
 implemented for `SELECT` filters and exact-primary-key DML. One exact indexed
 `INNER JOIN` shape, bounded composite primary-key left-prefix scans,
 prefix-plus-next-component range scans, and ordered secondary-index range
-scans are implemented experimentally as described below.
+scans are implemented experimentally as described below. Multi-row
+named-column `INSERT ... VALUES (...), (...)`, the bounded total-aggregate
+projection slice (`COUNT(*)`, `COUNT(column)`, `SUM`, `MIN`, `MAX`, `AVG`),
+streaming `GROUP BY` over a primary-key left prefix, residual `[NOT] LIKE`
+and `[NOT] IN (list)` predicates, and descending primary-key scans
+(`ORDER BY <complete primary key> DESC LIMIT n`) are implemented
+experimentally as described below.
 
 ## G2 bounded closure profile
 
@@ -161,8 +167,147 @@ The current implementation slice accepts catalog-typed primitive columns,
 inline or table-level ordered primary keys, explicit nullability, named-column
 `INSERT`, `SELECT *` or named projection, conjunctions covering exactly the
 primary key, a strict composite primary-key left prefix, or one complete
-secondary-index key, and catalog-bound prepared point lookup. It also accepts
-bounded no-predicate scans:
+secondary-index key, and catalog-bound prepared point lookup.
+
+`INSERT` accepts one or more parenthesized row groups after `VALUES`, each
+binding the same named columns in order, up to an explicit ceiling of 1,024
+row groups per statement (`HYSQL020` past the ceiling). Rows apply in
+statement order inside the surrounding transaction: constraint failure on any
+row fails the complete statement, and the delta staging surface admits only
+the single-row form (multi-row stays on the materialized path).
+
+The bounded total-aggregate projection slice accepts:
+
+```text
+SELECT <aggregate> [, <aggregate> ...]
+FROM <table>
+[WHERE <admitted-filter>]
+```
+
+where `<aggregate>` is `COUNT(*)`, `COUNT(column)`, `SUM(column)`,
+`MIN(column)`, `MAX(column)`, or `AVG(column)`. The statement emits exactly
+one row. `SUM`/`AVG` require a numeric column (`HYSQL021` otherwise); `AVG`
+emits `Float64`; `SUM` overflow past the checked 128-bit accumulator is
+`HYSQL022`; NULL inputs are ignored (`COUNT(column)` counts non-null values,
+empty inputs emit NULL for `SUM`/`MIN`/`MAX`/`AVG` and zero for counts).
+Aggregation folds the same bounded access paths as plain `SELECT` — the
+filterless form folds the bounded table scan and the explicit scan-candidate
+ceiling (`HYSQL019`) is the work bound, never a partial result. `ORDER BY`
+and `LIMIT` on the total form, joins, CTE inputs, and mixed aggregate/plain
+projections remain fail-closed non-claims of this slice.
+
+The streaming grouped form is:
+
+```text
+SELECT <aggregate> [, <aggregate> ...]
+FROM <table>
+[WHERE <admitted-filter>]
+GROUP BY <primary-key-left-prefix-in-catalog-order>
+LIMIT <positive-integer>
+```
+
+Group keys that form a left prefix of the primary key in catalog order keep
+the streaming path: the primary-key-ordered physical walk emits each group as
+one contiguous run folded in O(1) memory per group, and groups arrive in
+ascending key order.
+
+Group keys over arbitrary admitted columns take the bounded ordered-grouped
+path: the same bounded access materializes rows, group keys fold through an
+order-preserving composite encoding into an accumulator table that never
+holds more than `LIMIT` groups (the largest key evicts first; a key outside
+the current smallest-`LIMIT` set can never re-enter it, so eviction is
+exact), and the smallest `LIMIT` groups emit in ascending key order. `LIMIT`
+is mandatory and at most 65,536 on this path (`HYSQL021` otherwise). NULL
+group keys form one group, ordered before every non-null key. The underlying
+walk still charges the scan-candidate ceiling in both paths.
+
+In both grouped paths the key values are emitted ahead of the accumulator
+outputs, and `LIMIT` is mandatory.
+
+The grouped form additionally admits `HAVING` and `ORDER BY`:
+
+```text
+SELECT <keys and aggregates, with optional AS aliases>
+FROM <table>
+[WHERE <admitted-filter>]
+GROUP BY <admitted-group-keys>
+[HAVING <group-predicate>]
+[ORDER BY <output-or-aggregate> [ASC|DESC] [, ...]]
+LIMIT <positive-integer>
+```
+
+- The `HAVING` predicate is a bounded `AND`/`OR`/`NOT` tree of
+  comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) whose left side names a
+  group-key column, a projected alias, or an aggregate call (which need
+  not be projected), and whose right side is a literal. Parameters inside
+  `HAVING` remain fail-closed. A comparison involving SQL null is unknown
+  and the group is filtered out.
+- `ORDER BY` terms name a group-key column, a projected alias, an
+  aggregate output name, or an aggregate call (which need not be
+  projected); each term carries its own `ASC`/`DESC`. Ordering compares
+  canonical ordered encodings, so SQL null orders first ascending and
+  last descending, and ties preserve ascending group-key order.
+- Aggregates referenced only by `HAVING`/`ORDER BY` fold as hidden
+  accumulators and never appear in the result columns.
+- With `HAVING` or `ORDER BY` present the fold is complete before
+  filtering and ordering: every distinct group folds first, the group
+  ceiling (65,536) applies to both grouped paths as a fail-closed work
+  bound (`HYSQL021` past it), and `LIMIT` bounds the rows emitted after
+  filter and sort.
+
+Index-ordered grouped walks remain a fail-closed non-claim.
+
+Three further PostgreSQL-affinity forms are admitted:
+
+- `SELECT DISTINCT` over a plain (non-aggregate, ungrouped) projection
+  deduplicates projected rows by their canonical ordered encodings,
+  preserving first-seen order, with `LIMIT` mandatory as the emission
+  bound; the underlying access charges the explicit scan ceiling because
+  duplicate density is unbounded ahead of deduplication. `DISTINCT` with
+  aggregates or `GROUP BY` stays fail-closed.
+- `OFFSET <n>` (plain and grouped selects) skips `n` shaped rows before
+  `LIMIT` bounds the emission; `LIMIT` is mandatory with `OFFSET`, and on
+  plain selects the bounded access widens by exactly the skipped rows.
+- `<column> [NOT] BETWEEN <scalar> AND <scalar>` desugars to the admitted
+  comparison pair (`>= AND <=`; negated `< OR >`), inheriting comparison
+  and three-valued NULL semantics unchanged, including parameters.
+
+The grouped projection may name the group-key columns explicitly ahead of
+the aggregates in PostgreSQL style — `SELECT kind, COUNT(*) FROM t GROUP BY
+kind LIMIT n` — provided the named plain columns are exactly the `GROUP BY`
+columns in `GROUP BY` order (`HYSQL021` otherwise). The implicit form
+without named key columns remains admitted with unchanged output shape.
+
+Every projection item — plain column, aggregate, and window output — admits
+one optional `AS <identifier>` alias renaming its output column. Aliases
+bind output names only: they are not referenceable from `WHERE`, `GROUP
+BY`, or `ORDER BY` in this slice, and a duplicated alias fails closed with
+`HYSQL005`.
+
+Residual predicates extend the admitted filter grammar without ever binding
+an access path on their own:
+
+- `column [NOT] LIKE '<pattern>'` over a `TEXT` column with a bounded
+  literal pattern (1..=256 bytes; `_` matches one character, `%` any run,
+  no escape syntax; parameters are not admitted as patterns). A NULL input
+  is unknown under three-valued logic.
+- `column [NOT] IN (<scalar> [, ...])` over at most 256 members, each a
+  literal, parameter, or NULL of the column's type. NULL semantics follow
+  SQL: an unmatched list containing NULL is unknown, so `NOT IN` with a
+  NULL member matches nothing.
+
+Both shapes evaluate only as residual filters over an already-admitted
+bounded access path; a query whose only predicates are `LIKE`/`IN` fails
+closed with no access path.
+
+Descending order is admitted over exactly two shapes: the bounded
+no-predicate scan and the complete-primary-key range scan, as
+`ORDER BY <complete-primary-key-in-catalog-order> DESC LIMIT n`. The
+physical execution is the serial reverse B+tree walk (descending scans do
+not enter the parallel vectorized path). `DESC` over point lookups, prefix
+scans, secondary indexes, joins, windows, or CTE outer selects remains
+fail-closed. `ASC` is accepted explicitly and remains the default. It also
+accepts bounded no-predicate scans:
 
 ```text
 SELECT <projection>

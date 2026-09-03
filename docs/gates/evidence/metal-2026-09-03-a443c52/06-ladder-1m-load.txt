@@ -1,0 +1,7 @@
+maintenance vacuum_seconds=64.3 vacuum_applied=true checkpoint_retain_seconds=0.1
+documents=1000000 ingest_seconds=274.9 docs_per_second=3638
+scenario=bm25 hits=10 p50_ms=23.4 p95_ms=17036.8
+scenario=filtered+facet hits=10 p50_ms=44.2 p95_ms=55.0
+scenario=phrase hits=10 p50_ms=24.2 p95_ms=26.1
+scenario=fuzzy1 hits=10 p50_ms=54.4 p95_ms=84.9
+1012218522	/mnt/nvme/ladder/1000000

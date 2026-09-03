@@ -101,6 +101,49 @@ pub enum ProductStructureMutation {
         member: Vec<u8>,
         score: CanonicalF64,
     },
+    /// Add a canonical delta to one member's score (minor 6).
+    SortedSetIncrement {
+        key: ProductStructureKey,
+        member: Vec<u8>,
+        delta: CanonicalF64,
+    },
+    /// Remove and return the lowest/highest member (minor 6).
+    SortedSetPop {
+        key: ProductStructureKey,
+        /// False pops the lowest `(score, member)`; true the highest.
+        highest: bool,
+    },
+    /// Conditionally set one scalar (minor 6).
+    StringSetConditional {
+        key: ProductStructureKey,
+        value: Vec<u8>,
+        expires_at_micros: Option<i64>,
+        /// False applies only when absent; true only when present.
+        if_present: bool,
+    },
+    /// Append bytes after the current scalar value (minor 6).
+    StringAppend {
+        key: ProductStructureKey,
+        suffix: Vec<u8>,
+    },
+    /// Overwrite bytes at one offset, zero-filling any gap (minor 6).
+    StringSetRange {
+        key: ProductStructureKey,
+        offset: u32,
+        patch: Vec<u8>,
+    },
+    /// Write one hash field only when the field is absent (minor 6).
+    HashSetIfAbsent {
+        key: ProductStructureKey,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Remove and return the seed-selected member (minor 6).
+    SetPop {
+        key: ProductStructureKey,
+        /// Explicit caller seed for the deterministic rank.
+        seed: u64,
+    },
     /// Remove one exact sorted-set member.
     SortedSetRemove {
         key: ProductStructureKey,
@@ -200,6 +243,65 @@ pub enum ProductStructureReadRequest {
         end: u64,
         limit: usize,
     },
+    /// Read one bounded canonical score range (native protocol minor 6).
+    SortedSetScoreRange {
+        key: ProductStructureKey,
+        lower: ProductScoreBound,
+        upper: ProductScoreBound,
+        offset: usize,
+        limit: usize,
+        order: ProductSortedSetOrder,
+    },
+    /// Scan hash fields in descending exact-byte order (minor 6).
+    HashScanReverse {
+        key: ProductStructureKey,
+        start_before: Option<Vec<u8>>,
+        limit: usize,
+    },
+    /// Scan one bounded binary-glob page of hash fields (minor 6).
+    HashScanMatch {
+        key: ProductStructureKey,
+        pattern: Vec<u8>,
+        start_after: Option<Vec<u8>>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+    /// Scan one bounded binary-glob page of visible top-level keys across
+    /// every structure family of one keyspace (minor 6).
+    KeyScanMatch {
+        keyspace: ObjectId,
+        pattern: Vec<u8>,
+        start_after: Option<Vec<u8>>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+    /// Read one inclusive byte range of a scalar value (minor 6).
+    StringRange {
+        key: ProductStructureKey,
+        start: i64,
+        end: i64,
+    },
+    /// Sample bounded distinct set members under an explicit seed
+    /// (minor 6).
+    SetRandomMembers {
+        key: ProductStructureKey,
+        seed: u64,
+        count: usize,
+    },
+}
+
+/// One canonical sorted-set score endpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ProductScoreBound {
+    /// No bound on this endpoint.
+    Unbounded,
+    /// Endpoint included in the interval.
+    Inclusive(f64),
+    /// Endpoint excluded from the interval.
+    Exclusive(f64),
 }
 
 /// Snapshot-bound result of one product structure read.
@@ -236,6 +338,45 @@ pub enum ProductStructureReadResult {
     SortedSetEntries(Vec<ProductSortedSetEntry>),
     /// Stream entries in ascending ID order.
     StreamEntries(Vec<ProductStreamEntry>),
+    /// One bounded key glob-scan page across families (minor 6).
+    KeyPage {
+        /// Matched keys with their family, ascending by key bytes.
+        entries: Vec<ProductKeyEntry>,
+        /// Exclusive physical continuation when more candidates remain.
+        continuation: Option<Vec<u8>>,
+        /// Why the page stopped.
+        stop: ProductHashScanStop,
+        /// Physical candidates visited.
+        visited: usize,
+        /// Matcher steps consumed.
+        match_steps: usize,
+    },
+    /// One bounded glob-scan page with physical progress (minor 6).
+    HashPage {
+        /// Matched fields in ascending exact-byte order.
+        entries: Vec<ProductHashEntry>,
+        /// Exclusive physical continuation, present when more candidates
+        /// remain even if this page matched nothing.
+        continuation: Option<Vec<u8>>,
+        /// Why the page stopped.
+        stop: ProductHashScanStop,
+        /// Physical candidates visited.
+        visited: usize,
+        /// Matcher steps consumed.
+        match_steps: usize,
+    },
+}
+
+/// Stop reason for one bounded glob-scan page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProductHashScanStop {
+    /// The selected physical range has no later candidate.
+    Exhausted,
+    /// The page emitted its requested live-match count.
+    OutputLimit,
+    /// The page consumed its requested physical candidate count.
+    VisitLimit,
 }
 
 /// Typed result returned while staging one structure mutation.
@@ -254,6 +395,19 @@ pub enum ProductStructureMutationResult {
     Value(Option<Vec<u8>>),
     /// Stable appended stream identity.
     StreamId(u64),
+    /// New canonical sorted-set score (minor 6).
+    Score(CanonicalF64),
+    /// Optional popped sorted-set member and score (minor 6).
+    PoppedEntry(Option<ProductSortedSetEntry>),
+}
+
+/// One scanned key with its structure family.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductKeyEntry {
+    /// Exact binary key.
+    pub key: Vec<u8>,
+    /// Structure family owning the key.
+    pub family: StructureKind,
 }
 
 /// Side selected by one list push or pop.

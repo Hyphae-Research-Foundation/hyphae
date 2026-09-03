@@ -47,6 +47,7 @@ fn request() -> DocValueRequest {
             field: "group".to_owned(),
             limit: 8,
         }],
+        range_facets: Vec::new(),
         aggregations: vec![
             NamedDocValueAggregation {
                 name: "count".to_owned(),

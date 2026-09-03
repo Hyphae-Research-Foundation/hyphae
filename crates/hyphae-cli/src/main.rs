@@ -1045,6 +1045,10 @@ enum StructureCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "clap subcommands are constructed once"
+)]
 enum SearchCommand {
     /// Provision catalog-owned physical search storage for one logical collection.
     Provision {
@@ -1112,6 +1116,36 @@ enum SearchCommand {
         /// Normalized-text byte budget per fragment (16..=512).
         #[arg(long, default_value_t = 128, requires = "highlight_fragments")]
         highlight_bytes: usize,
+        /// Knee-detection autocut steepness (1..=16).
+        #[arg(long)]
+        autocut: Option<usize>,
+        /// Leading hits skipped before the limit window.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Finite nonnegative vector distance cutoff for the branch.
+        #[arg(long, requires = "vector_target")]
+        max_distance: Option<f64>,
+        /// JSON array of `{field,ranges:[{lower?,upper?}]}` range facets.
+        #[arg(long)]
+        range_facets_json: Option<String>,
+        /// Lexical term operator: every analyzed term must match.
+        #[arg(long, conflicts_with = "minimum_match")]
+        lexical_and: bool,
+        /// Minimum distinct analyzed terms a candidate must contain.
+        #[arg(long)]
+        minimum_match: Option<usize>,
+        /// Expand the final analyzed query term as a bounded prefix.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match"])]
+        lexical_prefix: bool,
+        /// JSON array of `{field,weight_micros}` BM25F boosts.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix"])]
+        field_boosts_json: Option<String>,
+        /// Levenshtein edit distance (1..=2) expanding every query term.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix", "field_boosts_json"])]
+        fuzzy: Option<usize>,
+        /// Require the exact consecutive analyzed phrase.
+        #[arg(long, conflicts_with_all = ["lexical_and", "minimum_match", "lexical_prefix", "field_boosts_json", "fuzzy"])]
+        phrase: bool,
     },
     /// Consolidates every vector index of one collection into a fresh
     /// generation, draining accumulated deltas.
@@ -1280,11 +1314,69 @@ enum StructureMutationInput {
         key: String,
         member: String,
     },
+    SortedSetIncrement {
+        keyspace: JsonU128,
+        key: String,
+        member: String,
+        delta: f64,
+    },
+    SortedSetPop {
+        keyspace: JsonU128,
+        key: String,
+        #[serde(default)]
+        end: SortedSetEndInput,
+    },
+    StringSetConditional {
+        keyspace: JsonU128,
+        key: String,
+        value: String,
+        expires_at_micros: Option<i64>,
+        #[serde(default)]
+        condition: SetConditionInput,
+    },
+    StringAppend {
+        keyspace: JsonU128,
+        key: String,
+        suffix: String,
+    },
+    StringSetRange {
+        keyspace: JsonU128,
+        key: String,
+        offset: u32,
+        patch: String,
+    },
+    HashSetIfAbsent {
+        keyspace: JsonU128,
+        key: String,
+        field: String,
+        value: String,
+    },
+    SetPop {
+        keyspace: JsonU128,
+        key: String,
+        seed: u64,
+    },
     StreamAdd {
         keyspace: JsonU128,
         key: String,
         fields: BTreeMap<String, String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SetConditionInput {
+    #[default]
+    IfAbsent,
+    IfPresent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SortedSetEndInput {
+    #[default]
+    Lowest,
+    Highest,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1399,6 +1491,67 @@ enum StructureReadInput {
         start: u64,
         end: u64,
         limit: usize,
+    },
+    SortedSetScoreRange {
+        keyspace: JsonU128,
+        key: String,
+        #[serde(default)]
+        lower: ScoreBoundInput,
+        #[serde(default)]
+        upper: ScoreBoundInput,
+        #[serde(default)]
+        offset: usize,
+        limit: usize,
+        order: SortOrderInput,
+    },
+    HashScanReverse {
+        keyspace: JsonU128,
+        key: String,
+        start_before: Option<String>,
+        limit: usize,
+    },
+    HashScanMatch {
+        keyspace: JsonU128,
+        key: String,
+        pattern: String,
+        start_after: Option<String>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+    KeyScanMatch {
+        keyspace: JsonU128,
+        pattern: String,
+        start_after: Option<String>,
+        output_limit: usize,
+        visit_limit: usize,
+        match_step_limit: usize,
+    },
+    StringRange {
+        keyspace: JsonU128,
+        key: String,
+        start: i64,
+        end: i64,
+    },
+    SetRandomMembers {
+        keyspace: JsonU128,
+        key: String,
+        seed: u64,
+        count: usize,
+    },
+}
+
+/// One canonical score endpoint: unbounded by default.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScoreBoundInput {
+    #[default]
+    Unbounded,
+    #[serde(untagged)]
+    Bounded {
+        #[serde(default)]
+        exclusive: bool,
+        score: f64,
     },
 }
 
@@ -1735,6 +1888,8 @@ enum McpProfile {
 enum FusionMethodInput {
     /// Normalized weighted score blend across branches.
     WeightedScore,
+    /// Min-max relative-score blend per branch.
+    RelativeScore,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -3274,6 +3429,13 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                                 analyzer: None,
                                 options: doc_value_options(),
                             });
+                            fields.push(SearchFieldDefinitionV2 {
+                                id: field_id(14)?,
+                                name: catalog_name("rating")?,
+                                logical_type: LogicalType::Float64,
+                                analyzer: None,
+                                options: doc_value_options(),
+                            });
                         }
                         fields
                     },
@@ -3558,7 +3720,24 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
             dedupe_first_k,
             highlight_fragments,
             highlight_bytes,
+            autocut,
+            offset,
+            max_distance,
+            range_facets_json,
+            lexical_and,
+            minimum_match,
+            lexical_prefix,
+            field_boosts_json,
+            fuzzy,
+            phrase,
         } => {
+            let field_boosts = field_boosts_json
+                .map(|value| serde_json::from_str::<Vec<Value>>(&value))
+                .transpose()?
+                .unwrap_or_default()
+                .into_iter()
+                .map(product_field_boost)
+                .collect::<Result<Vec<_>, _>>()?;
             let vectors = match vector_target {
                 Some(target) => vec![ProductVectorBranch {
                     target,
@@ -3577,6 +3756,7 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             exact_rerank: Some(candidate_limit),
                         },
                     }),
+                    max_distance: max_distance.map(hyphae_native_product::CanonicalF64::new),
                 }],
                 None if vector.is_empty() => Vec::new(),
                 None => return Err(CliFailure::invalid()),
@@ -3590,6 +3770,19 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             query,
                             candidate_limit,
                             weight: 1,
+                            operator: if lexical_and {
+                                Some(hyphae_native_product::ProductLexicalOperator::And)
+                            } else {
+                                minimum_match.map(|minimum_match| {
+                                    hyphae_native_product::ProductLexicalOperator::Or {
+                                        minimum_match,
+                                    }
+                                })
+                            },
+                            prefix: lexical_prefix,
+                            fields: field_boosts.clone(),
+                            fuzzy,
+                            phrase,
                         }),
                         vectors,
                         filter: filter_json
@@ -3612,6 +3805,13 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                             .into_iter()
                             .map(product_facet)
                             .collect::<Result<_, _>>()?,
+                        range_facets: range_facets_json
+                            .map(|value| serde_json::from_str::<Vec<Value>>(&value))
+                            .transpose()?
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(product_range_facet)
+                            .collect::<Result<_, _>>()?,
                         aggregations: metrics_json
                             .map(|value| serde_json::from_str::<Vec<Value>>(&value))
                             .transpose()?
@@ -3623,6 +3823,9 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                         fusion: fusion.map(|method| match method {
                             FusionMethodInput::WeightedScore => {
                                 hyphae_native_product::ProductFusionMethod::WeightedScore
+                            }
+                            FusionMethodInput::RelativeScore => {
+                                hyphae_native_product::ProductFusionMethod::RelativeScore
                             }
                         }),
                         parent_dedupe: match (dedupe_field, dedupe_first_k) {
@@ -3638,6 +3841,8 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
                                 fragment_bytes: highlight_bytes,
                             }
                         }),
+                        autocut,
+                        offset,
                     },
                 },
             )
@@ -5113,6 +5318,13 @@ fn response_json(response: ProductResponse) -> Value {
                     "count": bucket.count,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
+            "range_facets": result.range_facets.into_iter().map(|facet| json!({
+                "field": facet.field,
+                "buckets": facet.buckets.into_iter().map(|bucket| json!({
+                    "range_ordinal": doc_value_json(bucket.value),
+                    "count": bucket.count,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
             "aggregations": result.aggregations.into_iter().map(|aggregation| json!({
                 "name": aggregation.name,
                 "value": aggregation_value_json(aggregation.value),
@@ -5420,7 +5632,74 @@ fn structure_read_json(result: ProductStructureReadResult) -> Value {
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
+        ProductStructureReadResult::HashPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps,
+        } => json!({
+            "type": "hash_page",
+            "entries": entries.into_iter().map(|entry| json!({
+                "field_hex": encode_hex(&entry.field),
+                "field": std::str::from_utf8(&entry.field).ok(),
+                "value_hex": encode_hex(&entry.value),
+                "value": std::str::from_utf8(&entry.value).ok(),
+            })).collect::<Vec<_>>(),
+            "continuation_hex": continuation.map(|cursor| encode_hex(&cursor)),
+            "stop": match stop {
+                hyphae_native_product::ProductHashScanStop::Exhausted => "exhausted",
+                hyphae_native_product::ProductHashScanStop::OutputLimit => "output_limit",
+                hyphae_native_product::ProductHashScanStop::VisitLimit => "visit_limit",
+                _ => "unknown",
+            },
+            "visited": visited,
+            "match_steps": match_steps,
+        }),
+        result @ ProductStructureReadResult::KeyPage { .. } => key_page_json(result),
         _ => json!({ "type": "unsupported" }),
+    }
+}
+
+fn key_page_json(result: ProductStructureReadResult) -> Value {
+    let ProductStructureReadResult::KeyPage {
+        entries,
+        continuation,
+        stop,
+        visited,
+        match_steps,
+    } = result
+    else {
+        return json!({ "type": "unsupported" });
+    };
+    json!({
+        "type": "key_page",
+        "entries": entries.into_iter().map(|entry| json!({
+            "key_hex": encode_hex(&entry.key),
+            "key": std::str::from_utf8(&entry.key).ok(),
+            "family": structure_family_name(entry.family),
+        })).collect::<Vec<_>>(),
+        "continuation_hex": continuation.map(|cursor| encode_hex(&cursor)),
+        "stop": match stop {
+            hyphae_native_product::ProductHashScanStop::Exhausted => "exhausted",
+            hyphae_native_product::ProductHashScanStop::OutputLimit => "output_limit",
+            hyphae_native_product::ProductHashScanStop::VisitLimit => "visit_limit",
+            _ => "unknown",
+        },
+        "visited": visited,
+        "match_steps": match_steps,
+    })
+}
+
+const fn structure_family_name(family: hyphae_native_product::StructureKind) -> &'static str {
+    match family {
+        hyphae_native_product::StructureKind::String => "string",
+        hyphae_native_product::StructureKind::Counter => "counter",
+        hyphae_native_product::StructureKind::Hash => "hash",
+        hyphae_native_product::StructureKind::List => "list",
+        hyphae_native_product::StructureKind::Set => "set",
+        hyphae_native_product::StructureKind::SortedSet => "sorted_set",
+        hyphae_native_product::StructureKind::Stream => "stream",
     }
 }
 
@@ -5506,6 +5785,18 @@ fn structure_mutation_result_json(result: ProductStructureMutationResult) -> Val
         ProductStructureMutationResult::StreamId(value) => {
             json!({ "type": "stream_id", "value": value })
         }
+        ProductStructureMutationResult::Score(value) => {
+            json!({ "type": "score", "value": value.get() })
+        }
+        ProductStructureMutationResult::PoppedEntry(entry) => json!({
+            "type": "popped_entry",
+            "found": entry.is_some(),
+            "member": entry
+                .as_ref()
+                .and_then(|entry| std::str::from_utf8(&entry.member).ok()),
+            "member_hex": entry.as_ref().map(|entry| encode_hex(&entry.member)),
+            "score": entry.map(|entry| entry.score.get()),
+        }),
         _ => json!({ "type": "unsupported" }),
     }
 }
@@ -5756,6 +6047,70 @@ fn structure_mutation(
             key: structure_key(keyspace, key)?,
             member: member.into_bytes(),
         },
+        StructureMutationInput::SortedSetIncrement {
+            keyspace,
+            key,
+            member,
+            delta,
+        } => ProductStructureMutation::SortedSetIncrement {
+            key: structure_key(keyspace, key)?,
+            member: member.into_bytes(),
+            delta: hyphae_native_product::CanonicalF64::new(delta),
+        },
+        StructureMutationInput::SortedSetPop { keyspace, key, end } => {
+            ProductStructureMutation::SortedSetPop {
+                key: structure_key(keyspace, key)?,
+                highest: matches!(end, SortedSetEndInput::Highest),
+            }
+        }
+        StructureMutationInput::StringSetConditional {
+            keyspace,
+            key,
+            value,
+            expires_at_micros,
+            condition,
+        } => ProductStructureMutation::StringSetConditional {
+            key: structure_key(keyspace, key)?,
+            value: value.into_bytes(),
+            expires_at_micros,
+            if_present: matches!(condition, SetConditionInput::IfPresent),
+        },
+        StructureMutationInput::StringAppend {
+            keyspace,
+            key,
+            suffix,
+        } => ProductStructureMutation::StringAppend {
+            key: structure_key(keyspace, key)?,
+            suffix: suffix.into_bytes(),
+        },
+        StructureMutationInput::StringSetRange {
+            keyspace,
+            key,
+            offset,
+            patch,
+        } => ProductStructureMutation::StringSetRange {
+            key: structure_key(keyspace, key)?,
+            offset,
+            patch: patch.into_bytes(),
+        },
+        StructureMutationInput::HashSetIfAbsent {
+            keyspace,
+            key,
+            field,
+            value,
+        } => ProductStructureMutation::HashSetIfAbsent {
+            key: structure_key(keyspace, key)?,
+            field: field.into_bytes(),
+            value: value.into_bytes(),
+        },
+        StructureMutationInput::SetPop {
+            keyspace,
+            key,
+            seed,
+        } => ProductStructureMutation::SetPop {
+            key: structure_key(keyspace, key)?,
+            seed,
+        },
         StructureMutationInput::StreamAdd {
             keyspace,
             key,
@@ -5925,7 +6280,98 @@ fn structure_read(input: StructureReadInput) -> Result<ProductStructureReadReque
             end,
             limit,
         },
+        StructureReadInput::SortedSetScoreRange {
+            keyspace,
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => ProductStructureReadRequest::SortedSetScoreRange {
+            key: structure_key(keyspace, key)?,
+            lower: score_bound_input(lower),
+            upper: score_bound_input(upper),
+            offset,
+            limit,
+            order: sorted_set_order(order),
+        },
+        StructureReadInput::HashScanReverse {
+            keyspace,
+            key,
+            start_before,
+            limit,
+        } => ProductStructureReadRequest::HashScanReverse {
+            key: structure_key(keyspace, key)?,
+            start_before: start_before.map(String::into_bytes),
+            limit,
+        },
+        StructureReadInput::HashScanMatch {
+            keyspace,
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => ProductStructureReadRequest::HashScanMatch {
+            key: structure_key(keyspace, key)?,
+            pattern: pattern.into_bytes(),
+            start_after: start_after.map(String::into_bytes),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        },
+        StructureReadInput::KeyScanMatch {
+            keyspace,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => ProductStructureReadRequest::KeyScanMatch {
+            keyspace: object_id(keyspace.0)?,
+            pattern: pattern.into_bytes(),
+            start_after: start_after.map(String::into_bytes),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        },
+        StructureReadInput::StringRange {
+            keyspace,
+            key,
+            start,
+            end,
+        } => ProductStructureReadRequest::StringRange {
+            key: structure_key(keyspace, key)?,
+            start,
+            end,
+        },
+        StructureReadInput::SetRandomMembers {
+            keyspace,
+            key,
+            seed,
+            count,
+        } => ProductStructureReadRequest::SetRandomMembers {
+            key: structure_key(keyspace, key)?,
+            seed,
+            count,
+        },
     })
+}
+
+const fn score_bound_input(input: ScoreBoundInput) -> hyphae_native_product::ProductScoreBound {
+    match input {
+        ScoreBoundInput::Unbounded => hyphae_native_product::ProductScoreBound::Unbounded,
+        ScoreBoundInput::Bounded {
+            exclusive: false,
+            score,
+        } => hyphae_native_product::ProductScoreBound::Inclusive(score),
+        ScoreBoundInput::Bounded {
+            exclusive: true,
+            score,
+        } => hyphae_native_product::ProductScoreBound::Exclusive(score),
+    }
 }
 
 const fn sorted_set_order(order: SortOrderInput) -> hyphae_native_product::ProductSortedSetOrder {
@@ -5938,10 +6384,18 @@ const fn sorted_set_order(order: SortOrderInput) -> hyphae_native_product::Produ
 fn product_doc_value(value: Value) -> Result<ProductDocValue, CliFailure> {
     match value {
         Value::Bool(value) => Ok(ProductDocValue::Boolean(value)),
-        Value::Number(value) => value
-            .as_i64()
-            .map(ProductDocValue::Integer)
-            .ok_or_else(CliFailure::invalid),
+        Value::Number(value) => value.as_i64().map(ProductDocValue::Integer).map_or_else(
+            || {
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .map(|value| {
+                        ProductDocValue::Float(hyphae_native_product::CanonicalF64::new(value))
+                    })
+                    .ok_or_else(CliFailure::invalid)
+            },
+            Ok,
+        ),
         Value::String(value) => Ok(ProductDocValue::String(value)),
         Value::Object(mut object) if object.len() == 1 && object.contains_key("bytes_hex") => {
             let encoded = object
@@ -6057,6 +6511,70 @@ fn product_facet(value: Value) -> Result<ProductFacetRequest, CliFailure> {
     Ok(ProductFacetRequest { field, limit })
 }
 
+fn product_range_facet(
+    value: Value,
+) -> Result<hyphae_native_product::ProductRangeFacetRequest, CliFailure> {
+    let Value::Object(mut object) = value else {
+        return Err(CliFailure::invalid());
+    };
+    let field = take_string(&mut object, "field")?;
+    let Some(Value::Array(ranges)) = object.remove("ranges") else {
+        return Err(CliFailure::invalid());
+    };
+    if !object.is_empty() {
+        return Err(CliFailure::invalid());
+    }
+    let ranges = ranges
+        .into_iter()
+        .map(|range| {
+            let Value::Object(mut object) = range else {
+                return Err(CliFailure::invalid());
+            };
+            let bound = |value: Option<Value>| -> Result<
+                Option<hyphae_native_product::CanonicalF64>,
+                CliFailure,
+            > {
+                match value {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(value) => value
+                        .as_f64()
+                        .map(hyphae_native_product::CanonicalF64::new)
+                        .map(Some)
+                        .ok_or_else(CliFailure::invalid),
+                }
+            };
+            let lower = bound(object.remove("lower"))?;
+            let upper = bound(object.remove("upper"))?;
+            if !object.is_empty() {
+                return Err(CliFailure::invalid());
+            }
+            Ok(hyphae_native_product::ProductFacetRange { lower, upper })
+        })
+        .collect::<Result<Vec<_>, CliFailure>>()?;
+    Ok(hyphae_native_product::ProductRangeFacetRequest { field, ranges })
+}
+
+fn product_field_boost(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalFieldBoost, CliFailure> {
+    let Value::Object(mut object) = value else {
+        return Err(CliFailure::invalid());
+    };
+    let field = take_string(&mut object, "field")?;
+    let weight_micros = object
+        .remove("weight_micros")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(CliFailure::invalid)?;
+    if !object.is_empty() {
+        return Err(CliFailure::invalid());
+    }
+    Ok(hyphae_native_product::ProductLexicalFieldBoost {
+        field,
+        weight_micros,
+    })
+}
+
 fn product_aggregation(value: Value) -> Result<ProductNamedAggregation, CliFailure> {
     let Value::Object(mut object) = value else {
         return Err(CliFailure::invalid());
@@ -6067,6 +6585,7 @@ fn product_aggregation(value: Value) -> Result<ProductNamedAggregation, CliFailu
         "sum" => ProductAggregation::Sum(take_string(&mut object, "field")?),
         "min" => ProductAggregation::Min(take_string(&mut object, "field")?),
         "max" => ProductAggregation::Max(take_string(&mut object, "field")?),
+        "average" => ProductAggregation::Average(take_string(&mut object, "field")?),
         _ => return Err(CliFailure::invalid()),
     };
     if !object.is_empty() {
@@ -6257,6 +6776,7 @@ fn doc_value_json(value: ProductDocValue) -> Value {
     match value {
         ProductDocValue::Boolean(value) => json!(value),
         ProductDocValue::Integer(value) => json!(value),
+        ProductDocValue::Float(value) => json!(value.get()),
         ProductDocValue::String(value) => json!(value),
         ProductDocValue::Bytes(value) => json!({ "bytes_hex": encode_hex(&value) }),
     }
@@ -6270,6 +6790,9 @@ fn aggregation_value_json(value: hyphae_native_product::ProductAggregationValue)
         }
         hyphae_native_product::ProductAggregationValue::Value(value) => {
             value.map_or(Value::Null, doc_value_json)
+        }
+        hyphae_native_product::ProductAggregationValue::Float(value) => {
+            value.map_or(Value::Null, |value| json!(value.get()))
         }
     }
 }

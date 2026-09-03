@@ -1,0 +1,552 @@
+{
+  "benchmark": "longmemeval",
+  "claims": [],
+  "clock_observations": {
+    "attribution_note": "independent telemetry aggregates are not subtracted from end-to-end latency",
+    "retrieval_durability": {
+      "reason": "retrieval is read-only; strict ingest is reported separately",
+      "status": "not-applicable"
+    },
+    "server_telemetry_delta": {
+      "hyphae.product.timing.admission_us": {
+        "buckets": [
+          19921,
+          147,
+          157,
+          502,
+          4,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 20732,
+        "sum_micros": 168332
+      },
+      "hyphae.product.timing.durability_us": {
+        "buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          308,
+          12193,
+          4666,
+          1859,
+          858
+        ],
+        "count": 19884,
+        "sum_micros": 2986623399
+      },
+      "hyphae.product.timing.engine_execution_us": {
+        "buckets": [
+          10,
+          0,
+          0,
+          78,
+          418,
+          342,
+          0,
+          298,
+          11888,
+          6458,
+          1240
+        ],
+        "count": 20732,
+        "sum_micros": 5949085227
+      },
+      "hyphae.product.timing.page_synchronization_us": {
+        "buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          6193,
+          5067,
+          4407,
+          2087,
+          2107,
+          23
+        ],
+        "count": 19884,
+        "sum_micros": 1419611351
+      },
+      "hyphae.product.timing.planning_us": {
+        "buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 0,
+        "sum_micros": 0
+      },
+      "hyphae.product.timing.queueing_us": {
+        "buckets": [
+          2,
+          785,
+          116,
+          19829,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 20732,
+        "sum_micros": 2348707
+      },
+      "hyphae.product.timing.request_decoding_us": {
+        "buckets": [
+          20308,
+          236,
+          183,
+          5,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 20732,
+        "sum_micros": 40055
+      },
+      "hyphae.product.timing.result_encoding_us": {
+        "buckets": [
+          17891,
+          1696,
+          720,
+          425,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 20732,
+        "sum_micros": 222435
+      },
+      "hyphae.product.timing.transport_us": {
+        "buckets": [
+          7960,
+          12772,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 20732,
+        "sum_micros": 243796
+      },
+      "hyphae.product.timing.wal_append_us": {
+        "buckets": [
+          0,
+          56,
+          16347,
+          634,
+          1476,
+          262,
+          104,
+          225,
+          780,
+          0,
+          0
+        ],
+        "count": 19884,
+        "sum_micros": 97108274
+      },
+      "hyphae.product.timing.wal_synchronization_us": {
+        "buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          14918,
+          1003,
+          1848,
+          507,
+          1608,
+          0
+        ],
+        "count": 19884,
+        "sum_micros": 871490854
+      }
+    }
+  },
+  "closure_declared": false,
+  "correctness": {
+    "changed_rankings_on_repeat": 0,
+    "evaluated_queries": 419,
+    "query_corpus_ingest_commits": 419,
+    "ranking_sha256": "eaa97e33229de4379564b693adf4bd46f295c061a36efe02892bfc4d62035b93",
+    "skipped_queries": {
+      "abstention": 30,
+      "no-positive-user-target": 51
+    }
+  },
+  "dataset": {
+    "abstention_questions_excluded": 30,
+    "duplicate_session_occurrences": 13,
+    "evaluated_questions": 419,
+    "external_input_not_redistributed": true,
+    "license": "MIT",
+    "questions": 500,
+    "questions_by_type": {
+      "knowledge-update": 78,
+      "multi-session": 133,
+      "single-session-assistant": 56,
+      "single-session-preference": 30,
+      "single-session-user": 70,
+      "temporal-reasoning": 133
+    },
+    "questions_without_positive_user_target_excluded": 51,
+    "sessions": 23867,
+    "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+    "upstream": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned",
+    "upstream_commit": "98d7416c24c778c2fee6e6f3006e7a073259d48f",
+    "user_turns": 122416
+  },
+  "engine": {
+    "api_version": "v1",
+    "disk_format_version": 2,
+    "engine_version": "2.2.0",
+    "native_directory_format": 1,
+    "product": "hyphae",
+    "product_api_version": 1
+  },
+  "evidence_class": "local-diagnostic",
+  "host": {
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8559C",
+    "machine": "x86_64",
+    "platform": "Linux-7.0.0-1011-aws-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "preparation": {
+    "documents": 23867,
+    "ingest_commits": 0,
+    "ingest_durability": "strict",
+    "ingest_wall_nanos": 6918,
+    "maintenance_wall_nanos": 626204100,
+    "query_corpus_ingest_commits": 419
+  },
+  "protocol": {
+    "analyzer_english_stem": true,
+    "analyzer_english_stop": true,
+    "bm25_b_micros": null,
+    "bm25_k1_micros": null,
+    "branch": "lexical-bm25",
+    "candidate_limit": 1000,
+    "chunk_query_limits": [
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50
+    ],
+    "cutoffs": [
+      1,
+      3,
+      5,
+      10,
+      30,
+      50
+    ],
+    "document_granularity": "session",
+    "document_text": "official flat-bm25 user-only session concatenation",
+    "identity_scope": "question_id/session_id",
+    "models_executed": false,
+    "network_used_during_execution": false,
+    "offline_execution": true,
+    "parallel_chunks": 10,
+    "primary_metrics": "official recall_all and ndcg_any",
+    "qrel_mode": "audited-v2",
+    "qrel_semantics": "stable first-occurrence deduplication before scoring",
+    "query_denominator": "official non-abstention questions with positive user evidence",
+    "query_limit": null,
+    "repetitions": 1,
+    "session_cover": 0,
+    "slice_b": false,
+    "slice_b_quota_only": false,
+    "storage_scope": "one disposable per-question corpus, matching the released baseline",
+    "trace_digest_canonicalization": "sha256-canonical-json-utf8-v1",
+    "trace_enabled": true,
+    "trace_protocol_schema": "hyphae-long-term-memory-retrieval-protocol-v2",
+    "trace_protocol_sha256": "a760a54cfc027d2a6818dbefc7e4081e1552c6afc4bdcfbb87c39c95fa04b217",
+    "trace_query_schema": "hyphae-long-term-memory-query-result-v2",
+    "trace_schema": "hyphae-long-term-memory-query-trace-v2",
+    "transport": "native-local",
+    "warmup_per_query": 1
+  },
+  "publication": {
+    "authorized": false,
+    "reason": "local diagnostic only; publication requires explicit review and approval"
+  },
+  "qa": null,
+  "retrieval": {
+    "by_segment": {
+      "knowledge-update": {
+        "latency": {
+          "maximum_nanos": 22008747,
+          "mean_nanos": 11959007.292,
+          "p50_nanos": 12012991,
+          "p95_nanos": 13532027,
+          "p999_nanos": 22008747,
+          "p99_nanos": 22008747,
+          "queries_per_second": 83.619,
+          "samples": 72,
+          "total_nanos": 861048525
+        },
+        "ndcg_any@1": 0.972222,
+        "ndcg_any@10": 0.971601,
+        "ndcg_any@3": 0.96197,
+        "ndcg_any@30": 0.973379,
+        "ndcg_any@5": 0.968915,
+        "ndcg_any@50": 0.973379,
+        "query_count": 72,
+        "recall_all@1": 0.027778,
+        "recall_all@10": 0.986111,
+        "recall_all@3": 0.944444,
+        "recall_all@30": 1.0,
+        "recall_all@5": 0.972222,
+        "recall_all@50": 1.0,
+        "recall_any@1": 0.972222,
+        "recall_any@10": 1.0,
+        "recall_any@3": 1.0,
+        "recall_any@30": 1.0,
+        "recall_any@5": 1.0,
+        "recall_any@50": 1.0
+      },
+      "multi-session": {
+        "latency": {
+          "maximum_nanos": 19702633,
+          "mean_nanos": 11980768.62,
+          "p50_nanos": 11948614,
+          "p95_nanos": 13170331,
+          "p999_nanos": 19702633,
+          "p99_nanos": 18792547,
+          "queries_per_second": 83.467,
+          "samples": 121,
+          "total_nanos": 1449673003
+        },
+        "ndcg_any@1": 0.909091,
+        "ndcg_any@10": 0.883265,
+        "ndcg_any@3": 0.844652,
+        "ndcg_any@30": 0.893647,
+        "ndcg_any@5": 0.863291,
+        "ndcg_any@50": 0.897154,
+        "query_count": 121,
+        "recall_all@1": 0.0,
+        "recall_all@10": 0.884298,
+        "recall_all@3": 0.628099,
+        "recall_all@30": 0.966942,
+        "recall_all@5": 0.768595,
+        "recall_all@50": 1.0,
+        "recall_any@1": 0.909091,
+        "recall_any@10": 0.991736,
+        "recall_any@3": 0.975207,
+        "recall_any@30": 1.0,
+        "recall_any@5": 0.983471,
+        "recall_any@50": 1.0
+      },
+      "single-session-assistant": {
+        "latency": {
+          "maximum_nanos": 14187796,
+          "mean_nanos": 12991171.2,
+          "p50_nanos": 13203225,
+          "p95_nanos": 14187796,
+          "p999_nanos": 14187796,
+          "p99_nanos": 14187796,
+          "queries_per_second": 76.975,
+          "samples": 5,
+          "total_nanos": 64955856
+        },
+        "ndcg_any@1": 1.0,
+        "ndcg_any@10": 1.0,
+        "ndcg_any@3": 1.0,
+        "ndcg_any@30": 1.0,
+        "ndcg_any@5": 1.0,
+        "ndcg_any@50": 1.0,
+        "query_count": 5,
+        "recall_all@1": 1.0,
+        "recall_all@10": 1.0,
+        "recall_all@3": 1.0,
+        "recall_all@30": 1.0,
+        "recall_all@5": 1.0,
+        "recall_all@50": 1.0,
+        "recall_any@1": 1.0,
+        "recall_any@10": 1.0,
+        "recall_any@3": 1.0,
+        "recall_any@30": 1.0,
+        "recall_any@5": 1.0,
+        "recall_any@50": 1.0
+      },
+      "single-session-preference": {
+        "latency": {
+          "maximum_nanos": 13961030,
+          "mean_nanos": 12070634.567,
+          "p50_nanos": 11965611,
+          "p95_nanos": 13308491,
+          "p999_nanos": 13961030,
+          "p99_nanos": 13961030,
+          "queries_per_second": 82.846,
+          "samples": 30,
+          "total_nanos": 362119037
+        },
+        "ndcg_any@1": 0.433333,
+        "ndcg_any@10": 0.676168,
+        "ndcg_any@3": 0.596426,
+        "ndcg_any@30": 0.715997,
+        "ndcg_any@5": 0.627449,
+        "ndcg_any@50": 0.715997,
+        "query_count": 30,
+        "recall_all@1": 0.433333,
+        "recall_all@10": 0.833333,
+        "recall_all@3": 0.633333,
+        "recall_all@30": 1.0,
+        "recall_all@5": 0.7,
+        "recall_all@50": 1.0,
+        "recall_any@1": 0.433333,
+        "recall_any@10": 0.833333,
+        "recall_any@3": 0.633333,
+        "recall_any@30": 1.0,
+        "recall_any@5": 0.7,
+        "recall_any@50": 1.0
+      },
+      "single-session-user": {
+        "latency": {
+          "maximum_nanos": 13749015,
+          "mean_nanos": 11502955.734,
+          "p50_nanos": 11603357,
+          "p95_nanos": 12976601,
+          "p999_nanos": 13749015,
+          "p99_nanos": 13749015,
+          "queries_per_second": 86.934,
+          "samples": 64,
+          "total_nanos": 736189167
+        },
+        "ndcg_any@1": 0.96875,
+        "ndcg_any@10": 0.994233,
+        "ndcg_any@3": 0.994233,
+        "ndcg_any@30": 0.994233,
+        "ndcg_any@5": 0.994233,
+        "ndcg_any@50": 0.994233,
+        "query_count": 64,
+        "recall_all@1": 0.96875,
+        "recall_all@10": 1.0,
+        "recall_all@3": 1.0,
+        "recall_all@30": 1.0,
+        "recall_all@5": 1.0,
+        "recall_all@50": 1.0,
+        "recall_any@1": 0.96875,
+        "recall_any@10": 1.0,
+        "recall_any@3": 1.0,
+        "recall_any@30": 1.0,
+        "recall_any@5": 1.0,
+        "recall_any@50": 1.0
+      },
+      "temporal-reasoning": {
+        "latency": {
+          "maximum_nanos": 14944525,
+          "mean_nanos": 11814681.087,
+          "p50_nanos": 12002321,
+          "p95_nanos": 13849460,
+          "p999_nanos": 14944525,
+          "p99_nanos": 14446527,
+          "queries_per_second": 84.64,
+          "samples": 127,
+          "total_nanos": 1500464498
+        },
+        "ndcg_any@1": 0.779528,
+        "ndcg_any@10": 0.871413,
+        "ndcg_any@3": 0.840061,
+        "ndcg_any@30": 0.888251,
+        "ndcg_any@5": 0.860976,
+        "ndcg_any@50": 0.888845,
+        "query_count": 127,
+        "recall_all@1": 0.094488,
+        "recall_all@10": 0.905512,
+        "recall_all@3": 0.80315,
+        "recall_all@30": 0.992126,
+        "recall_all@5": 0.850394,
+        "recall_all@50": 1.0,
+        "recall_any@1": 0.779528,
+        "recall_any@10": 0.952756,
+        "recall_any@3": 0.889764,
+        "recall_any@30": 1.0,
+        "recall_any@5": 0.937008,
+        "recall_any@50": 1.0
+      }
+    },
+    "overall": {
+      "latency": {
+        "maximum_nanos": 22008747,
+        "mean_nanos": 11872195.909,
+        "p50_nanos": 11928679,
+        "p95_nanos": 13592235,
+        "p999_nanos": 22008747,
+        "p99_nanos": 14446527,
+        "queries_per_second": 84.23,
+        "samples": 419,
+        "total_nanos": 4974450086
+      },
+      "ndcg_any@1": 0.856802,
+      "ndcg_any@10": 0.898367,
+      "ndcg_any@3": 0.870349,
+      "ndcg_any@30": 0.909626,
+      "ndcg_any@5": 0.885486,
+      "ndcg_any@50": 0.910819,
+      "query_count": 419,
+      "recall_all@1": 0.224344,
+      "recall_all@10": 0.923628,
+      "recall_all@3": 0.797136,
+      "recall_all@30": 0.988067,
+      "recall_all@5": 0.861575,
+      "recall_all@50": 1.0,
+      "recall_any@1": 0.856802,
+      "recall_any@10": 0.97136,
+      "recall_any@3": 0.933174,
+      "recall_any@30": 1.0,
+      "recall_any@5": 0.954654,
+      "recall_any@50": 1.0
+    }
+  },
+  "schema": "hyphae-long-term-memory-retrieval-receipt-v1",
+  "source": {
+    "binary_sha256": "e144af8be0a640397fdf83261cb6a5b0d9d310be946a6f534606dde2bdb3e368",
+    "clean": false,
+    "commit": "ddfaa1737fe4b957f58f0ec1c04b97d5a02c0bb1",
+    "harness_sha256": "edac4438429ae6e8cfe199af9dbae6e24c5de6bc7ad2ebdb04030a19bc3fc34b",
+    "source_mode": "integration",
+    "tree": "a18bdc2a2d504fc7a476acd6f52b20f285301952"
+  },
+  "status": "passed"
+}

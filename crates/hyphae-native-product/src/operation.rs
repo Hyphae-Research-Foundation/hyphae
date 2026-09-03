@@ -17,7 +17,7 @@ use hyphae_native_runtime::{
     NativeExecutionPool, NativeResourceGovernor, NativeTransaction, NativeWriteBatch,
     SetAlgebraRequest, SqlStatementClass, classify_sql_statement,
 };
-use hyphae_native_types::TransactionId;
+use hyphae_native_types::{CanonicalF64, TransactionId};
 
 pub use hyphae_native_runtime::CommitBoundary;
 
@@ -44,23 +44,23 @@ use crate::{
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
     ProductDurability, ProductError, ProductErrorCode, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
-    ProductHashEntry, ProductLimits, ProductListSide, ProductPermission, ProductPreparedHandle,
-    ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
-    ProductSearchIngestReceipt, ProductSearchRequest, ProductSearchResult, ProductSession,
-    ProductSessionId, ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult,
-    ProductStreamEntry, ProductStructureKey, ProductStructureMutation,
-    ProductStructureMutationResult, ProductStructureRead, ProductStructureReadRequest,
-    ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation,
-    ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
-    ProductTransactionVectorMutation, ProductTtl, ProductValue, ProgressControl, QualifiedName,
-    RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
-    SecurityAssignmentPage, SecurityAuditPage, SecurityAuditReadRequest, SecurityId,
-    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest,
-    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityRoleListRequest,
-    SecurityRolePage, SnapshotIdentity, StatusRequest, TelemetryEvent, TelemetryEventKind,
-    TelemetryRegistry, TimingClass,
+    ProductHashEntry, ProductHashScanStop, ProductKeyEntry, ProductLimits, ProductListSide,
+    ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
+    ProductRollbackReceipt, ProductScope, ProductScoreBound, ProductSearchDocumentDelete,
+    ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
+    ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
+    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureRead, ProductStructureReadRequest, ProductStructureReadResult,
+    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
+    ProductTransactionSqlMutation, ProductTransactionStageReceipt, ProductTransactionStageResult,
+    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
+    ProgressControl, QualifiedName, RestoreRequest, RoleAssignmentMutationReceipt,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditPage,
+    SecurityAuditReadRequest, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityPrincipalListRequest, SecurityPrincipalMutationReceipt, SecurityPrincipalPage,
+    SecurityRoleListRequest, SecurityRolePage, SnapshotIdentity, StatusRequest, TelemetryEvent,
+    TelemetryEventKind, TelemetryRegistry, TimingClass,
 };
 
 /// Product-owned durability policy applied to every mutation in one request.
@@ -2636,21 +2636,12 @@ pub(crate) fn apply_structure_mutation(
             key,
             family,
             expires_at_micros,
-        } => {
-            let updated = match family {
-                StructureKind::String | StructureKind::Counter => {
-                    transaction.expire_structure(key.key, expires_at_micros)?
-                }
-                StructureKind::Hash => transaction.expire_hash(key.key, expires_at_micros)?,
-                StructureKind::List => transaction.expire_list(key.key, expires_at_micros)?,
-                StructureKind::Set => transaction.expire_set(key.key, expires_at_micros)?,
-                StructureKind::SortedSet => {
-                    transaction.expire_sorted_set(key.key, expires_at_micros)?
-                }
-                StructureKind::Stream => transaction.expire_stream(key.key, expires_at_micros)?,
-            };
-            Ok(ProductStructureMutationResult::Boolean(updated))
-        }
+        } => Ok(ProductStructureMutationResult::Boolean(apply_expire(
+            transaction,
+            key,
+            family,
+            expires_at_micros,
+        )?)),
         ProductStructureMutation::HashSet { key, field, value } => {
             transaction.hset(key.key, field, value)?;
             Ok(ProductStructureMutationResult::Unit)
@@ -2694,22 +2685,42 @@ pub(crate) fn apply_structure_mutation(
             transaction.zadd(key.key, score.get(), member)?;
             Ok(ProductStructureMutationResult::Unit)
         }
+        mutation @ (ProductStructureMutation::SortedSetIncrement { .. }
+        | ProductStructureMutation::SortedSetPop { .. }) => {
+            apply_sorted_set_value_mutation(transaction, mutation)
+        }
+        mutation @ (ProductStructureMutation::StringSetConditional { .. }
+        | ProductStructureMutation::StringAppend { .. }
+        | ProductStructureMutation::StringSetRange { .. }
+        | ProductStructureMutation::HashSetIfAbsent { .. }
+        | ProductStructureMutation::SetPop { .. }) => {
+            apply_conditional_value_mutation(transaction, mutation)
+        }
         ProductStructureMutation::SortedSetRemove { key, member } => Ok(
             ProductStructureMutationResult::Boolean(transaction.zrem(key.key, member)?),
         ),
         ProductStructureMutation::StreamAdd { key, fields } => {
-            if fields.is_empty() || fields.len() > crate::MAX_PRODUCT_STREAM_FIELDS {
-                return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
-            }
-            let fields = fields
-                .into_iter()
-                .map(|entry| (entry.field, entry.value))
-                .collect::<Vec<_>>();
-            Ok(ProductStructureMutationResult::StreamId(
-                transaction.xadd(key.key, &fields)?,
-            ))
+            apply_stream_add(transaction, key, fields)
         }
     }
+}
+
+/// Applies one bounded stream append.
+fn apply_stream_add(
+    transaction: &mut NativeWriteBatch,
+    key: ProductStructureKey,
+    fields: Vec<ProductHashEntry>,
+) -> Result<ProductStructureMutationResult, ProductError> {
+    if fields.is_empty() || fields.len() > crate::MAX_PRODUCT_STREAM_FIELDS {
+        return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+    }
+    let fields = fields
+        .into_iter()
+        .map(|entry| (entry.field, entry.value))
+        .collect::<Vec<_>>();
+    Ok(ProductStructureMutationResult::StreamId(
+        transaction.xadd(key.key, &fields)?,
+    ))
 }
 
 fn create_structure(
@@ -2746,6 +2757,8 @@ fn delete_structure(
     Ok(ProductStructureMutationResult::Boolean(deleted))
 }
 
+// Exhaustive read dispatch: one arm per request shape, cohesive by design.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn read_structure(
     snapshot: &crate::ProductSnapshot,
     request: ProductStructureReadRequest,
@@ -2844,7 +2857,287 @@ pub(crate) fn read_structure(
             end,
             limit,
         } => read_stream_range(snapshot, &key.key, start, end, limit),
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key,
+            lower,
+            upper,
+            offset,
+            limit,
+            order,
+        } => read_sorted_set_score_range(snapshot, &key.key, lower, upper, offset, limit, order),
+        ProductStructureReadRequest::HashScanReverse {
+            key,
+            start_before,
+            limit,
+        } => snapshot
+            .inner
+            .hscan_reverse(&key.key, start_before.as_deref(), limit)
+            .map(|entries| {
+                ProductStructureReadResult::HashEntries(
+                    entries
+                        .into_iter()
+                        .map(|entry| ProductHashEntry {
+                            field: entry.field().to_vec(),
+                            value: entry.value().to_vec(),
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(Into::into),
+        ProductStructureReadRequest::HashScanMatch {
+            key,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => read_hash_scan_match(
+            snapshot,
+            &key.key,
+            &pattern,
+            start_after.as_deref(),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        ),
+        ProductStructureReadRequest::KeyScanMatch {
+            keyspace: _,
+            pattern,
+            start_after,
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        } => read_key_scan_match(
+            snapshot,
+            &pattern,
+            start_after.as_deref(),
+            output_limit,
+            visit_limit,
+            match_step_limit,
+        ),
+        ProductStructureReadRequest::StringRange { key, start, end } => Ok(
+            ProductStructureReadResult::Value(snapshot.inner.getrange(&key.key, start, end)),
+        ),
+        ProductStructureReadRequest::SetRandomMembers { key, seed, count } => snapshot
+            .inner
+            .srandmember(&key.key, seed, count)
+            .map(ProductStructureReadResult::Values)
+            .map_err(Into::into),
     }
+}
+
+/// Executes one bounded cross-family key glob scan, hiding the reserved
+/// internal namespace from visits, outputs, and continuations.
+fn read_key_scan_match(
+    snapshot: &crate::ProductSnapshot,
+    pattern: &[u8],
+    start_after: Option<&[u8]>,
+    output_limit: usize,
+    visit_limit: usize,
+    match_step_limit: usize,
+) -> Result<ProductStructureReadResult, ProductError> {
+    if pattern.starts_with(crate::INTERNAL_STRUCTURE_KEY_PREFIX)
+        || start_after
+            .is_some_and(|cursor| cursor.starts_with(crate::INTERNAL_STRUCTURE_KEY_PREFIX))
+    {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    }
+    let request = hyphae_native_runtime::HashPatternScanRequest::try_new(
+        pattern,
+        start_after.map(<[u8]>::to_vec),
+        output_limit,
+        visit_limit,
+        match_step_limit,
+    )
+    .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    let page = snapshot.inner.key_scan_match(&request)?;
+    let stop = match page.stop {
+        hyphae_native_runtime::HashPatternScanStop::Exhausted => ProductHashScanStop::Exhausted,
+        hyphae_native_runtime::HashPatternScanStop::OutputLimit => ProductHashScanStop::OutputLimit,
+        hyphae_native_runtime::HashPatternScanStop::VisitLimit => ProductHashScanStop::VisitLimit,
+    };
+    Ok(ProductStructureReadResult::KeyPage {
+        entries: page
+            .entries
+            .into_iter()
+            .filter(|(key, _)| !crate::is_internal_structure_key(key))
+            .map(|(key, family)| ProductKeyEntry { key, family })
+            .collect(),
+        continuation: page.continuation,
+        stop,
+        visited: page.visited,
+        match_steps: page.match_steps,
+    })
+}
+
+/// Applies the minor-6 sorted-set mutations that return typed values.
+fn apply_sorted_set_value_mutation(
+    transaction: &mut NativeWriteBatch,
+    mutation: ProductStructureMutation,
+) -> Result<ProductStructureMutationResult, ProductError> {
+    match mutation {
+        ProductStructureMutation::SortedSetIncrement { key, member, delta } => {
+            let score = transaction.zincrby(key.key, delta.get(), member)?;
+            Ok(ProductStructureMutationResult::Score(CanonicalF64::new(
+                score,
+            )))
+        }
+        ProductStructureMutation::SortedSetPop { key, highest } => {
+            let popped = transaction.zpop(key.key, highest)?;
+            Ok(ProductStructureMutationResult::PoppedEntry(popped.map(
+                |(member, score)| ProductSortedSetEntry {
+                    member,
+                    score: CanonicalF64::new(score),
+                },
+            )))
+        }
+        _ => Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
+    }
+}
+
+/// Replaces one top-level structure expiry for its declared family.
+fn apply_expire(
+    transaction: &mut NativeWriteBatch,
+    key: ProductStructureKey,
+    family: StructureKind,
+    expires_at_micros: i64,
+) -> Result<bool, ProductError> {
+    Ok(match family {
+        StructureKind::String | StructureKind::Counter => {
+            transaction.expire_structure(key.key, expires_at_micros)?
+        }
+        StructureKind::Hash => transaction.expire_hash(key.key, expires_at_micros)?,
+        StructureKind::List => transaction.expire_list(key.key, expires_at_micros)?,
+        StructureKind::Set => transaction.expire_set(key.key, expires_at_micros)?,
+        StructureKind::SortedSet => transaction.expire_sorted_set(key.key, expires_at_micros)?,
+        StructureKind::Stream => transaction.expire_stream(key.key, expires_at_micros)?,
+    })
+}
+
+/// Applies the minor-6 conditional and range string/hash/set mutations.
+fn apply_conditional_value_mutation(
+    transaction: &mut NativeWriteBatch,
+    mutation: ProductStructureMutation,
+) -> Result<ProductStructureMutationResult, ProductError> {
+    match mutation {
+        ProductStructureMutation::StringSetConditional {
+            key,
+            value,
+            expires_at_micros,
+            if_present,
+        } => {
+            let condition = if if_present {
+                hyphae_native_runtime::SetCondition::IfPresent
+            } else {
+                hyphae_native_runtime::SetCondition::IfAbsent
+            };
+            let outcome =
+                transaction.set_conditional(key.key, value, expires_at_micros, condition)?;
+            Ok(ProductStructureMutationResult::Boolean(matches!(
+                outcome,
+                hyphae_native_runtime::SetOutcome::Applied
+            )))
+        }
+        ProductStructureMutation::StringAppend { key, suffix } => Ok(
+            ProductStructureMutationResult::Count(transaction.append(key.key, &suffix)?),
+        ),
+        ProductStructureMutation::StringSetRange { key, offset, patch } => {
+            Ok(ProductStructureMutationResult::Count(
+                transaction.setrange(key.key, offset as usize, &patch)?,
+            ))
+        }
+        ProductStructureMutation::HashSetIfAbsent { key, field, value } => Ok(
+            ProductStructureMutationResult::Boolean(transaction.hsetnx(key.key, field, value)?),
+        ),
+        ProductStructureMutation::SetPop { key, seed } => Ok(
+            ProductStructureMutationResult::Value(transaction.spop(key.key, seed)?),
+        ),
+        _ => Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
+    }
+}
+
+/// Executes one bounded canonical score range in the requested direction.
+fn read_sorted_set_score_range(
+    snapshot: &crate::ProductSnapshot,
+    key: &[u8],
+    lower: ProductScoreBound,
+    upper: ProductScoreBound,
+    offset: usize,
+    limit: usize,
+    order: ProductSortedSetOrder,
+) -> Result<ProductStructureReadResult, ProductError> {
+    let lower = score_bound(lower)?;
+    let upper = score_bound(upper)?;
+    let entries = match order {
+        ProductSortedSetOrder::Ascending => snapshot
+            .inner
+            .zrange_by_score(key, lower, upper, offset, limit),
+        ProductSortedSetOrder::Descending => snapshot
+            .inner
+            .zrevrange_by_score(key, lower, upper, offset, limit),
+    }?;
+    Ok(ProductStructureReadResult::SortedSetEntries(
+        entries
+            .into_iter()
+            .map(|entry| ProductSortedSetEntry {
+                member: entry.member().to_vec(),
+                score: crate::CanonicalF64::new(entry.score()),
+            })
+            .collect(),
+    ))
+}
+
+/// Maps one product score endpoint onto the runtime bound, rejecting NaN.
+fn score_bound(bound: ProductScoreBound) -> Result<std::ops::Bound<f64>, ProductError> {
+    Ok(match bound {
+        ProductScoreBound::Unbounded => std::ops::Bound::Unbounded,
+        ProductScoreBound::Inclusive(score) if !score.is_nan() => std::ops::Bound::Included(score),
+        ProductScoreBound::Exclusive(score) if !score.is_nan() => std::ops::Bound::Excluded(score),
+        _ => return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)),
+    })
+}
+
+/// Executes one bounded binary-glob page over a hash.
+fn read_hash_scan_match(
+    snapshot: &crate::ProductSnapshot,
+    key: &[u8],
+    pattern: &[u8],
+    start_after: Option<&[u8]>,
+    output_limit: usize,
+    visit_limit: usize,
+    match_step_limit: usize,
+) -> Result<ProductStructureReadResult, ProductError> {
+    let request = hyphae_native_runtime::HashPatternScanRequest::try_new(
+        pattern,
+        start_after.map(<[u8]>::to_vec),
+        output_limit,
+        visit_limit,
+        match_step_limit,
+    )
+    .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    let page = snapshot.inner.hscan_match(key, &request)?;
+    let stop = match page.stop() {
+        hyphae_native_runtime::HashPatternScanStop::Exhausted => ProductHashScanStop::Exhausted,
+        hyphae_native_runtime::HashPatternScanStop::OutputLimit => ProductHashScanStop::OutputLimit,
+        hyphae_native_runtime::HashPatternScanStop::VisitLimit => ProductHashScanStop::VisitLimit,
+    };
+    let visited = page.visited();
+    let match_steps = page.match_steps();
+    let continuation = page.continuation().map(<[u8]>::to_vec);
+    Ok(ProductStructureReadResult::HashPage {
+        entries: page
+            .into_entries()
+            .into_iter()
+            .map(|entry| ProductHashEntry {
+                field: entry.field().to_vec(),
+                value: entry.value().to_vec(),
+            })
+            .collect(),
+        continuation,
+        stop,
+        visited,
+        match_steps,
+    })
 }
 
 fn read_sorted_set_rank(
@@ -2961,6 +3254,13 @@ impl ProductStructureMutation {
             | Self::SetAdd { key, .. }
             | Self::SetRemove { key, .. }
             | Self::SortedSetAdd { key, .. }
+            | Self::SortedSetIncrement { key, .. }
+            | Self::SortedSetPop { key, .. }
+            | Self::StringSetConditional { key, .. }
+            | Self::StringAppend { key, .. }
+            | Self::StringSetRange { key, .. }
+            | Self::HashSetIfAbsent { key, .. }
+            | Self::SetPop { key, .. }
             | Self::SortedSetRemove { key, .. }
             | Self::StreamAdd { key, .. } => key,
         }
@@ -2968,7 +3268,11 @@ impl ProductStructureMutation {
 
     fn family(&self) -> StructureKind {
         match self {
-            Self::StringSet { .. } | Self::StringDelete { .. } => StructureKind::String,
+            Self::StringSet { .. }
+            | Self::StringDelete { .. }
+            | Self::StringSetConditional { .. }
+            | Self::StringAppend { .. }
+            | Self::StringSetRange { .. } => StructureKind::String,
             Self::CounterAdd { .. } => StructureKind::Counter,
             Self::Create { family, .. }
             | Self::Delete { family, .. }
@@ -2976,10 +3280,16 @@ impl ProductStructureMutation {
             Self::HashSet { .. }
             | Self::HashDelete { .. }
             | Self::HashCounterAdd { .. }
-            | Self::HashExpireField { .. } => StructureKind::Hash,
+            | Self::HashExpireField { .. }
+            | Self::HashSetIfAbsent { .. } => StructureKind::Hash,
             Self::ListPush { .. } | Self::ListPop { .. } => StructureKind::List,
-            Self::SetAdd { .. } | Self::SetRemove { .. } => StructureKind::Set,
-            Self::SortedSetAdd { .. } | Self::SortedSetRemove { .. } => StructureKind::SortedSet,
+            Self::SetAdd { .. } | Self::SetRemove { .. } | Self::SetPop { .. } => {
+                StructureKind::Set
+            }
+            Self::SortedSetAdd { .. }
+            | Self::SortedSetIncrement { .. }
+            | Self::SortedSetPop { .. }
+            | Self::SortedSetRemove { .. } => StructureKind::SortedSet,
             Self::StreamAdd { .. } => StructureKind::Stream,
         }
     }
@@ -2999,7 +3309,7 @@ impl ProductStructureReadRequest {
 
     fn structure_key(&self) -> Option<&ProductStructureKey> {
         match self {
-            Self::SetAlgebra { .. } => None,
+            Self::SetAlgebra { .. } | Self::KeyScanMatch { .. } => None,
             Self::StringGet { key }
             | Self::CounterGet { key }
             | Self::Ttl { key, .. }
@@ -3012,38 +3322,51 @@ impl ProductStructureReadRequest {
             | Self::SetContains { key, .. }
             | Self::SetMembers { key, .. }
             | Self::SetCardinality { key }
+            | Self::StringRange { key, .. }
+            | Self::SetRandomMembers { key, .. }
             | Self::SortedSetScore { key, .. }
             | Self::SortedSetRank { key, .. }
             | Self::SortedSetRange { key, .. }
             | Self::SortedSetCardinality { key }
-            | Self::StreamRange { key, .. } => Some(key),
+            | Self::StreamRange { key, .. }
+            | Self::SortedSetScoreRange { key, .. }
+            | Self::HashScanReverse { key, .. }
+            | Self::HashScanMatch { key, .. } => Some(key),
         }
     }
 
     fn keyspace(&self) -> Option<ObjectId> {
         match self {
-            Self::SetAlgebra { keyspace, .. } => Some(*keyspace),
+            Self::SetAlgebra { keyspace, .. } | Self::KeyScanMatch { keyspace, .. } => {
+                Some(*keyspace)
+            }
             _ => self.structure_key().map(|key| key.keyspace),
         }
     }
 
     fn family(&self) -> StructureKind {
         match self {
-            Self::StringGet { .. } => StructureKind::String,
+            Self::StringGet { .. } | Self::KeyScanMatch { .. } | Self::StringRange { .. } => {
+                StructureKind::String
+            }
             Self::CounterGet { .. } => StructureKind::Counter,
             Self::Ttl { family, .. } => *family,
             Self::HashGet { .. }
             | Self::HashFieldTtl { .. }
             | Self::HashScan { .. }
+            | Self::HashScanReverse { .. }
+            | Self::HashScanMatch { .. }
             | Self::HashLength { .. } => StructureKind::Hash,
             Self::ListRange { .. } | Self::ListLength { .. } => StructureKind::List,
             Self::SetContains { .. }
             | Self::SetMembers { .. }
             | Self::SetCardinality { .. }
-            | Self::SetAlgebra { .. } => StructureKind::Set,
+            | Self::SetAlgebra { .. }
+            | Self::SetRandomMembers { .. } => StructureKind::Set,
             Self::SortedSetScore { .. }
             | Self::SortedSetRank { .. }
             | Self::SortedSetRange { .. }
+            | Self::SortedSetScoreRange { .. }
             | Self::SortedSetCardinality { .. } => StructureKind::SortedSet,
             Self::StreamRange { .. } => StructureKind::Stream,
         }
@@ -3220,8 +3543,12 @@ fn structure_mutation_result_wire_bytes(result: &ProductStructureMutationResult)
         ProductStructureMutationResult::Unit => 1,
         ProductStructureMutationResult::Integer(_)
         | ProductStructureMutationResult::Count(_)
-        | ProductStructureMutationResult::StreamId(_) => 9,
+        | ProductStructureMutationResult::StreamId(_)
+        | ProductStructureMutationResult::Score(_) => 9,
         ProductStructureMutationResult::Boolean(_) => 2,
+        ProductStructureMutationResult::PoppedEntry(entry) => entry
+            .as_ref()
+            .map_or(2, |entry| 14_usize.saturating_add(entry.member.len())),
         ProductStructureMutationResult::Value(value) => value
             .as_ref()
             .map_or(2, |value| 6_usize.saturating_add(value.len())),

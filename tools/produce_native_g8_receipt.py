@@ -34,8 +34,8 @@ CHECKPOINT_BOUNDARIES = {
 SNAPSHOT_PIN_BOUNDARIES = {"record-synchronized", "record-published"}
 PROMOTION_BOUNDARIES = {"before-rename", "marker-renamed", "parent-synchronized"}
 SOFTWARE_LICENSE = "Apache-2.0"
-FIRST_PARTY_ARTIFACT_COUNT = 79
-FIRST_PARTY_IDENTITY_COUNT = 33
+FIRST_PARTY_ARTIFACT_COUNT = 91
+FIRST_PARTY_IDENTITY_COUNT = 34
 
 
 def is_hyphae_component(name: object) -> bool:

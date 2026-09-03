@@ -369,6 +369,7 @@ EXPECTED_RULES = [
         "prefix",
         (
             "docs/api/",
+            "docs/formal/",
             "docs/native/",
             "docs/performance/",
             "docs/provenance/",
@@ -427,6 +428,7 @@ EXPECTED_RULES = [
         (
             ".agents/",
             ".claude-plugin/",
+            "benchmarks/",
             "compatibility/",
             "config/",
             "conformance/",

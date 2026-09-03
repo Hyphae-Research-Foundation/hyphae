@@ -217,13 +217,14 @@ pub use native_hybrid::{
 pub use search_doc_values::{
     DocValue, DocValueAggregation, DocValueAggregationValue, DocValueCandidate, DocValueError,
     DocValueFilter, DocValueLimits, DocValueOperator, DocValueRequest, DocValueResult,
-    DocValueSort, DocValueSortDirection, DocValueSortSource, FacetBucket, FacetRequest,
+    DocValueSort, DocValueSortDirection, DocValueSortSource, FacetBucket, FacetRange, FacetRequest,
     FacetResult, MAX_DOC_VALUE_AGGREGATIONS, MAX_DOC_VALUE_BYTES, MAX_DOC_VALUE_CANDIDATES,
-    MAX_DOC_VALUE_FACET_TERMS, MAX_DOC_VALUE_FACETS, MAX_DOC_VALUE_FILTER_DEPTH,
-    MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS, MAX_DOC_VALUE_IN_MEMBERS,
-    MAX_DOC_VALUE_LIKE_PATTERN_BYTES, MAX_DOC_VALUE_MATCHES, MAX_DOC_VALUE_SORTS,
-    MAX_DOC_VALUES_PER_CANDIDATE, MissingPlacement, NamedDocValueAggregation,
-    NamedDocValueAggregationValue, execute_doc_values, like_matches,
+    MAX_DOC_VALUE_FACET_RANGES, MAX_DOC_VALUE_FACET_TERMS, MAX_DOC_VALUE_FACETS,
+    MAX_DOC_VALUE_FILTER_DEPTH, MAX_DOC_VALUE_FILTER_NODES, MAX_DOC_VALUE_HITS,
+    MAX_DOC_VALUE_IN_MEMBERS, MAX_DOC_VALUE_LIKE_PATTERN_BYTES, MAX_DOC_VALUE_MATCHES,
+    MAX_DOC_VALUE_RANGE_FACETS, MAX_DOC_VALUE_SORTS, MAX_DOC_VALUES_PER_CANDIDATE,
+    MissingPlacement, NamedDocValueAggregation, NamedDocValueAggregationValue, RangeFacetRequest,
+    execute_doc_values, like_matches,
 };
 pub use set_algebra::{
     MAX_SET_ALGEBRA_KEYS, MAX_SET_ALGEBRA_OUTPUT_MEMBERS, MAX_SET_ALGEBRA_VISITS, SetAlgebraError,
@@ -231,7 +232,8 @@ pub use set_algebra::{
 };
 pub use snapshot_pins::{SnapshotPinError, SnapshotPinId};
 pub use sql::{
-    BoundSqlStatement, MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
+    BoundSqlStatement, MAX_SQL_IN_MEMBERS, MAX_SQL_INSERT_ROWS, MAX_SQL_JOIN_CANDIDATES,
+    MAX_SQL_LIKE_PATTERN_BYTES, MAX_SQL_SCAN_CANDIDATES, NativeSqlExecutionPath,
     NativeSqlExecutionReceipt, PreparedStatement, SqlError, SqlResult, SqlStatementClass, SqlValue,
     classify_sql_statement,
 };
@@ -261,7 +263,7 @@ use hyphae_native_catalog::{
     ColumnCheckOperator, ColumnDefinition, DependencyDirection, DependencyEdge, DependencyKind,
     IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeader, QualifiedName,
     RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
-    SecondaryIndexDefinition, VectorMetric as CatalogVectorMetric,
+    SecondaryIndexDefinition, StructureKind, VectorMetric as CatalogVectorMetric,
 };
 use hyphae_native_manifest::{
     ManifestError, ManifestPruneReceipt, ManifestRecovery, RootManifest, RootManifestStore,
@@ -291,6 +293,10 @@ use thiserror::Error;
 #[cfg(test)]
 thread_local! {
     static FAIL_FULL_STATE_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Complete-state loads performed on this thread; deterministic under
+    /// the parallel test harness where the process-wide counter is not.
+    static THREAD_FULL_STATE_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WRITE_LEGACY_POSTINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_FULL_CATALOG_STATE_LOAD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FAIL_FULL_STRUCTURE_STATE_LOAD: std::cell::Cell<bool> =
@@ -324,10 +330,10 @@ use crate::{
     hash_pattern::HashPatternMatchBudget,
     model::{
         CatalogState, HashPatternModelPage, HashPatternModelRequest, HashPatternModelStop, ListPop,
-        ModelError, RelationState, SearchState, SecondaryIndexLayout, SortedSetDirection,
-        SortedSetMemberState, SortedSetRankState, SortedSetScore, StructureEntry, StructureState,
-        TtlValue, analyze, bm25_idf, bm25_term_score, normalize_list_range,
-        sorted_set_score_range_is_empty,
+        ModelError, RelationState, SearchState, SecondaryIndexLayout, SetPopState,
+        SortedSetDirection, SortedSetMemberState, SortedSetPopState, SortedSetRankState,
+        SortedSetScore, StructureEntry, StructureState, TtlValue, analyze, bm25_idf,
+        bm25_term_score, normalize_list_range, sorted_set_score_range_is_empty,
     },
     set_algebra::{SetAlgebraExecution, evaluate_materialized_set_algebra},
     snapshot_pins::{SnapshotPin, SnapshotPinStore},
@@ -403,8 +409,16 @@ fn segmented_result_memory_bytes(physical_entries: usize) -> u64 {
 }
 
 fn default_buffer_pool() -> Result<Arc<BufferPool>, BufferPoolError> {
+    // `HYPHAE_BUFFER_POOL_FRAMES` overrides the default frame count for
+    // operators sizing the cache to their working set. Invalid or absent
+    // values keep the shipped default; the partition count is unchanged.
+    let frames = std::env::var("HYPHAE_BUFFER_POOL_FRAMES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|frames| *frames >= DEFAULT_BUFFER_POOL_PARTITIONS)
+        .unwrap_or(DEFAULT_BUFFER_POOL_FRAMES);
     Ok(Arc::new(BufferPool::new(
-        DEFAULT_BUFFER_POOL_FRAMES,
+        frames,
         DEFAULT_BUFFER_POOL_PARTITIONS,
     )?))
 }
@@ -508,6 +522,8 @@ pub const MAX_HASH_FIELD_BATCH_SIZE: usize = 4_096;
 /// Maximum member positions admitted by one native set multi-member call.
 pub const MAX_SET_MEMBER_BATCH_SIZE: usize = 4_096;
 const STRUCTURE_INLINE_VALUE_LIMIT: usize = 8_192;
+/// Hard byte bound of one scalar value produced by `APPEND`/`SETRANGE`.
+pub const MAX_STRUCTURE_STRING_BYTES: usize = 8 * 1_024 * 1_024;
 const SEARCH_FORMAT_KEY: &[u8] = b"\x00";
 type SearchTermFrequencies = BTreeMap<Vec<u8>, u32>;
 const SEARCH_FORMAT_VALUE_V1: &[u8] = b"HYSEABT1";
@@ -524,6 +540,9 @@ const SEARCH_POSTING_MAGIC: &[u8; 8] = b"HYPOST01";
 const SEARCH_DOCUMENT_TOMBSTONE: &[u8; 8] = b"HYDOCT01";
 const SEARCH_TERM_META_TOMBSTONE: &[u8; 8] = b"HYTERMT1";
 const SEARCH_POSTING_TOMBSTONE: &[u8; 8] = b"HYPOSTT1";
+/// Self-describing posting: term frequency plus the owning document's
+/// analyzed token count, so scoring needs no document-header side lookup.
+const SEARCH_POSTING_MAGIC_V2: &[u8; 8] = b"HYPOST02";
 const ANN_CREATION_MAGIC: &[u8; 8] = b"HYANNCF1";
 type PhysicalStructureEntries = Vec<(Vec<u8>, Vec<u8>)>;
 const SEARCH_INDEX_META_SIZE: usize = 24;
@@ -533,7 +552,11 @@ const SEARCH_POSTING_SIZE: usize = 16;
 const SEARCH_DOCUMENT_INLINE: u8 = 0;
 const SEARCH_DOCUMENT_BLOB: u8 = 1;
 const SEARCH_INLINE_VALUE_LIMIT: usize = 8_192;
-const DEFAULT_BUFFER_POOL_FRAMES: usize = 1_024;
+/// Verified 16 KiB page frames the shared buffer pool may hold (a 128 MiB
+/// ceiling, populated lazily). Sized so the posting segments of a two-term
+/// query over a 1,000,000-document collection stay resident between queries;
+/// see `docs/performance/native-segmented-substrate-v1.md`.
+const DEFAULT_BUFFER_POOL_FRAMES: usize = 8_192;
 const DEFAULT_BUFFER_POOL_PARTITIONS: usize = 16;
 /// Maximum number of independent transactions sharing one native durability flush.
 pub const MAX_GROUP_COMMIT_BATCH_SIZE: usize = 256;
@@ -862,6 +885,12 @@ pub enum NativeRuntimeError {
         /// Rejected caller-supplied field-position count.
         requested: usize,
     },
+    /// One string mutation would produce a value above its byte bound.
+    #[error("native string mutation result exceeds {MAX_STRUCTURE_STRING_BYTES} bytes")]
+    StructureStringTooLarge,
+    /// One seeded set sample requested zero members.
+    #[error("native set sample count must be at least one")]
+    InvalidSetSampleCount,
     /// One hash mutation batch contains the same exact field more than once.
     #[error("native hash field mutation batch contains a duplicate field")]
     DuplicateHashField,
@@ -1656,6 +1685,218 @@ fn hash_field_entries(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<HashFieldEntry> {
         .collect()
 }
 
+/// Result of one bounded analyzed term-prefix expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TermPrefixExpansion {
+    /// The lexical index does not exist.
+    UnknownIndex,
+    /// More distinct terms matched than the caller's bound admits.
+    Overflow,
+    /// Every distinct matching term, ascending.
+    Terms(Vec<String>),
+}
+
+/// One bounded glob page of visible top-level keys across families.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyScanPage {
+    /// Matched keys with their structure family, ascending by key bytes.
+    pub entries: Vec<(Vec<u8>, StructureKind)>,
+    /// Last physically visited key (exclusive) when the page stopped early.
+    pub continuation: Option<Vec<u8>>,
+    /// Why the page stopped.
+    pub stop: HashPatternScanStop,
+    /// Physical candidates visited.
+    pub visited: usize,
+    /// Matcher steps consumed.
+    pub match_steps: usize,
+}
+
+/// One inclusive Valkey-affine byte range of a value slice.
+fn byte_range_slice(value: &[u8], start: i64, end: i64) -> Vec<u8> {
+    let length = i128::try_from(value.len()).unwrap_or(i128::MAX);
+    if length == 0 {
+        return Vec::new();
+    }
+    let normalize = |index: i64| {
+        let index = i128::from(index);
+        if index < 0 { length + index } else { index }
+    };
+    let start = normalize(start).max(0);
+    let end = normalize(end).min(length - 1);
+    if start > end || start >= length || end < 0 {
+        return Vec::new();
+    }
+    let Ok(start) = usize::try_from(start) else {
+        return Vec::new();
+    };
+    let Ok(end) = usize::try_from(end) else {
+        return Vec::new();
+    };
+    value[start..=end].to_vec()
+}
+
+/// Public canonical splitmix64 finalizer used for seeded set selection.
+#[must_use]
+pub const fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Walks `min(count, len)` distinct members from the seeded start rank,
+/// ascending with one wrap.
+fn seeded_member_walk(members: &[Vec<u8>], seed: u64, count: usize) -> Vec<Vec<u8>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let take = count.min(members.len());
+    let start = usize::try_from(splitmix64(seed) % (members.len() as u64)).unwrap_or(0);
+    (0..take)
+        .map(|offset| members[(start + offset) % members.len()].clone())
+        .collect()
+}
+
+/// Whether two character sequences are within `max_distance` Levenshtein
+/// edits, using the banded early-exit dynamic program.
+fn bounded_levenshtein(left: &[char], right: &[char], max_distance: usize) -> bool {
+    BoundedLevenshtein::new(right.len()).within(left, right, max_distance)
+}
+
+/// Reusable two-row Levenshtein workspace so a dictionary walk does not
+/// allocate per candidate. `within` is bit-identical to the free function.
+struct BoundedLevenshtein {
+    previous: Vec<usize>,
+    current: Vec<usize>,
+}
+
+impl BoundedLevenshtein {
+    fn new(capacity: usize) -> Self {
+        Self {
+            previous: Vec::with_capacity(capacity + 1),
+            current: Vec::with_capacity(capacity + 1),
+        }
+    }
+
+    fn within(&mut self, left: &[char], right: &[char], max_distance: usize) -> bool {
+        self.previous.clear();
+        self.previous.extend(0..=right.len());
+        self.current.clear();
+        self.current.resize(right.len() + 1, 0);
+        for (left_index, left_character) in left.iter().enumerate() {
+            self.current[0] = left_index + 1;
+            let mut row_minimum = self.current[0];
+            for (right_index, right_character) in right.iter().enumerate() {
+                self.current[right_index + 1] = (self.previous[right_index + 1] + 1)
+                    .min(self.current[right_index] + 1)
+                    .min(
+                        self.previous[right_index] + usize::from(left_character != right_character),
+                    );
+                row_minimum = row_minimum.min(self.current[right_index + 1]);
+            }
+            if row_minimum > max_distance {
+                return false;
+            }
+            std::mem::swap(&mut self.previous, &mut self.current);
+        }
+        self.previous[right.len()] <= max_distance
+    }
+}
+
+/// Exclusive upper bound of a literal binary prefix, `None` when unbounded.
+fn binary_prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut upper = prefix.to_vec();
+    let index = upper.iter().rposition(|byte| *byte != u8::MAX)?;
+    upper[index] += 1;
+    upper.truncate(index + 1);
+    Some(upper)
+}
+
+/// Collects `(key, family, visible)` candidates across every structure
+/// family inside the bounded range, ascending by exact key bytes.
+fn key_scan_candidates(
+    structures: &StructureState,
+    logical_time_micros: i64,
+    start: &Bound<Vec<u8>>,
+    upper: Option<&[u8]>,
+) -> Vec<(Vec<u8>, StructureKind, bool)> {
+    let mut candidates: Vec<(Vec<u8>, StructureKind, bool)> = Vec::new();
+    for (key, entry) in &structures.entries {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        let visible = entry
+            .expires_at_micros
+            .is_none_or(|expiry| expiry > logical_time_micros);
+        candidates.push((key.clone(), StructureKind::String, visible));
+    }
+    for key in structures.hashes.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Hash,
+            structures.hash_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.sets.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Set,
+            structures.set_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.lists.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::List,
+            structures.list_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.sorted_sets.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::SortedSet,
+            structures.sorted_set_is_visible(key, logical_time_micros),
+        ));
+    }
+    for key in structures.streams.keys() {
+        if !range_contains(start, upper, key) {
+            continue;
+        }
+        candidates.push((
+            key.clone(),
+            StructureKind::Stream,
+            structures.stream_is_visible(key, logical_time_micros),
+        ));
+    }
+    candidates.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+    candidates
+}
+
+/// Range membership under one start bound and optional exclusive upper.
+fn range_contains(start: &Bound<Vec<u8>>, upper: Option<&[u8]>, key: &[u8]) -> bool {
+    let after_start = match start {
+        Bound::Unbounded => true,
+        Bound::Included(bound) => key >= bound.as_slice(),
+        Bound::Excluded(bound) => key > bound.as_slice(),
+    };
+    after_start && upper.is_none_or(|bound| key < bound)
+}
+
 fn hash_pattern_scan_page(page: HashPatternModelPage, match_steps: usize) -> HashPatternScanPage {
     let stop = match page.stop {
         HashPatternModelStop::Exhausted => HashPatternScanStop::Exhausted,
@@ -1915,6 +2156,20 @@ pub struct CatalogSnapshotIdentity {
     pub root_digest: [u8; 32],
 }
 
+/// Exact immutable identity of one committed all-engine root set, captured
+/// without materializing any engine state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSnapshotIdentity {
+    /// Latest commit visible to every engine, absent for an empty directory.
+    pub visible_csn: Option<Csn>,
+    /// Catalog version bound to the root set.
+    pub catalog_version: CatalogVersion,
+    /// Digest of the complete immutable all-engine root set.
+    pub root_digest: [u8; 32],
+    /// Logical time the caller bound to this identity.
+    pub logical_time_micros: i64,
+}
+
 /// Lightweight immutable catalog-only snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeCatalogSnapshot {
@@ -2112,6 +2367,20 @@ pub struct CommitReceipt {
     pub page_synchronization_time: Duration,
     /// WAL synchronization time.
     pub wal_synchronization_time: Duration,
+}
+
+impl CommitReceipt {
+    /// Returns commit execution time excluding physical synchronization.
+    ///
+    /// `execution_time` spans the complete commit walk and therefore
+    /// contains `page_synchronization_time` and `wal_synchronization_time`;
+    /// this accessor reports the disjoint logical component so durability
+    /// classes can be compared without double-counting fsync.
+    pub fn logical_execution_time(&self) -> Duration {
+        self.execution_time
+            .saturating_sub(self.page_synchronization_time)
+            .saturating_sub(self.wal_synchronization_time)
+    }
 }
 
 /// Durable transaction outcome retained by the native WAL authority.
@@ -3258,10 +3527,63 @@ struct LexicalSegmentWork {
     segment: BTreeSegment,
 }
 
+/// Scored postings from one planned leaf segment.
+///
+/// Document ids live back-to-back in `ids`; each contribution names its id
+/// by `(offset, length)` so the merge sorts, folds, and ranks without
+/// touching the allocator, and only the final `limit` hits copy their id.
 struct LexicalPostingBatch {
     term_index: usize,
     live_postings: u64,
-    contributions: Vec<(Vec<u8>, f64)>,
+    ids: Vec<u8>,
+    contributions: Vec<LexicalContribution>,
+}
+
+#[derive(Clone, Copy)]
+struct LexicalContribution {
+    id_offset: u32,
+    id_length: u32,
+    score: f64,
+}
+
+impl LexicalPostingBatch {
+    fn new(term_index: usize, capacity: usize) -> Self {
+        Self {
+            term_index,
+            live_postings: 0,
+            ids: Vec::with_capacity(capacity.saturating_mul(16)),
+            contributions: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, document_id: &[u8], score: f64) -> Result<(), NativeRuntimeError> {
+        let id_offset =
+            u32::try_from(self.ids.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        let id_length =
+            u32::try_from(document_id.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        id_offset
+            .checked_add(id_length)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        self.ids.extend_from_slice(document_id);
+        self.contributions.push(LexicalContribution {
+            id_offset,
+            id_length,
+            score,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn from_pairs(term_index: usize, live_postings: u64, pairs: &[(&[u8], f64)]) -> Self {
+        let mut batch = Self::new(term_index, pairs.len());
+        batch.live_postings = live_postings;
+        for (document_id, score) in pairs {
+            batch
+                .push(document_id, *score)
+                .unwrap_or_else(|_| unreachable!("test ids fit u32"));
+        }
+        batch
+    }
 }
 
 struct LexicalExecutionPlan {
@@ -3277,6 +3599,34 @@ struct LexicalExecutionPlan {
     expected_document_frequencies: Vec<u64>,
     work: Vec<LexicalSegmentWork>,
     planning: Option<NativeEngineWorkReceipt>,
+    document_lengths: Option<Arc<LazyDocumentLengths>>,
+}
+
+/// Document-length map resolved at most once per query, and only when a
+/// legacy posting without a carried length is actually scored.
+struct LazyDocumentLengths {
+    lengths: std::sync::OnceLock<BTreeMap<Vec<u8>, f64>>,
+}
+
+impl LazyDocumentLengths {
+    const fn new() -> Self {
+        Self {
+            lengths: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Resolves the map on first use. A failed scan is not cached: the
+    /// error propagates and the whole query fails closed.
+    fn get_or_scan(
+        &self,
+        scan: impl FnOnce() -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError>,
+    ) -> Result<&BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
+        if let Some(lengths) = self.lengths.get() {
+            return Ok(lengths);
+        }
+        let scanned = scan()?;
+        Ok(self.lengths.get_or_init(|| scanned))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3612,6 +3962,71 @@ impl NativeSnapshot {
     }
 
     /// Returns the exact retained source text for one physical lexical index.
+    /// Expands one analyzed term prefix to every distinct indexed term of
+    /// the collection, ascending, bounded by `limit`.
+    pub fn search_expand_term_prefix(
+        &self,
+        index: ObjectId,
+        prefix: &str,
+        limit: usize,
+    ) -> TermPrefixExpansion {
+        let Some(documents) = self.state.search.documents(index) else {
+            return TermPrefixExpansion::UnknownIndex;
+        };
+        let mut terms = BTreeSet::new();
+        for text in documents.values() {
+            let analysis = CanonicalAnalyzer::analyze(text);
+            for token in &analysis.tokens {
+                if token.term.starts_with(prefix) && !terms.contains(&token.term) {
+                    if terms.len() == limit {
+                        return TermPrefixExpansion::Overflow;
+                    }
+                    terms.insert(token.term.clone());
+                }
+            }
+        }
+        TermPrefixExpansion::Terms(terms.into_iter().collect())
+    }
+
+    /// Expands one analyzed term to every distinct indexed term within
+    /// the Levenshtein character-edit distance, ascending, bounded by
+    /// `limit` alongside previously collected terms.
+    pub fn search_expand_term_fuzzy(
+        &self,
+        index: ObjectId,
+        term: &str,
+        max_distance: usize,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> TermPrefixExpansion {
+        let Some(documents) = self.state.search.documents(index) else {
+            return TermPrefixExpansion::UnknownIndex;
+        };
+        let query: Vec<char> = term.chars().collect();
+        let mut added = Vec::new();
+        for text in documents.values() {
+            let analysis = CanonicalAnalyzer::analyze(text);
+            for token in &analysis.tokens {
+                if collected.contains(&token.term) {
+                    continue;
+                }
+                let candidate: Vec<char> = token.term.chars().collect();
+                if query.len().abs_diff(candidate.len()) > max_distance {
+                    continue;
+                }
+                if bounded_levenshtein(&query, &candidate, max_distance) {
+                    if collected.len() == limit {
+                        return TermPrefixExpansion::Overflow;
+                    }
+                    collected.insert(token.term.clone());
+                    added.push(token.term.clone());
+                }
+            }
+        }
+        TermPrefixExpansion::Terms(added)
+    }
+
+    /// Returns every retained document of one lexical index.
     pub fn search_documents(&self, index: ObjectId) -> Option<Vec<(Vec<u8>, String)>> {
         self.state.search.documents(index).map(|documents| {
             documents
@@ -3671,6 +4086,26 @@ impl NativeSnapshot {
         )
     }
 
+    /// Visits the visible scalar keys inside `[start, end)` in ascending
+    /// order without copying them, or returns `None` fail-closed once more
+    /// than `limit` keys are visible. Same semantics as
+    /// [`Self::structure_keys_in_range`].
+    pub fn visit_structure_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        visitor: impl FnMut(&[u8]),
+    ) -> Option<()> {
+        self.state.structures.visit_visible_keys_in_range(
+            start,
+            end,
+            self.metadata.logical_time_micros,
+            limit,
+            visitor,
+        )
+    }
+
     /// Returns the key's TTL state at snapshot logical time.
     pub fn ttl(&self, key: &[u8]) -> Ttl {
         match self
@@ -3682,6 +4117,56 @@ impl NativeSnapshot {
             Some(TtlValue::Persistent) => Ttl::Persistent,
             Some(TtlValue::Remaining(value)) => Ttl::RemainingMicros(value),
         }
+    }
+
+    /// Reads one inclusive byte range of a visible scalar value.
+    ///
+    /// Negative positions count from the end, out-of-range positions
+    /// clamp, and an inverted or fully out-of-range request returns the
+    /// empty value. A missing or expired key reads as absent.
+    pub fn getrange(&self, key: &[u8], start: i64, end: i64) -> Option<Vec<u8>> {
+        let value = self
+            .state
+            .structures
+            .get(key, self.metadata.logical_time_micros)?;
+        Some(byte_range_slice(value, start, end))
+    }
+
+    /// Returns bounded distinct set members under an explicit caller seed.
+    ///
+    /// The walk starts at rank `splitmix64(seed) % cardinality` in exact
+    /// ascending member-byte order and wraps once. An empty set returns no
+    /// members; `count` must be at least one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero count, another structure kind, or a
+    /// missing or expired set.
+    pub fn srandmember(
+        &self,
+        key: &[u8],
+        seed: u64,
+        count: usize,
+    ) -> Result<Vec<Vec<u8>>, NativeRuntimeError> {
+        if count == 0 {
+            return Err(NativeRuntimeError::InvalidSetSampleCount);
+        }
+        if self.state.structures.entries.contains_key(key)
+            || self
+                .state
+                .structures
+                .hash_is_visible(key, self.metadata.logical_time_micros)
+            || self.state.structures.lists.contains_key(key)
+            || self.state.structures.sorted_sets.contains_key(key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let members = self
+            .state
+            .structures
+            .set_members_at(key, self.metadata.logical_time_micros)
+            .ok_or(NativeRuntimeError::UnknownStructureSet)?;
+        Ok(seeded_member_walk(&members, seed, count))
     }
 
     /// Returns one bounded inclusive stream-ID range from this retained snapshot.
@@ -3958,6 +4443,70 @@ impl NativeSnapshot {
             )?
             .ok_or(NativeRuntimeError::UnknownStructureHash)?;
         Ok(hash_pattern_scan_page(page, budget.used()))
+    }
+
+    /// Scans one bounded binary-glob page of visible top-level keys across
+    /// every structure family in this snapshot, in ascending exact
+    /// key-byte order.
+    ///
+    /// The continuation is the last physically visited key (exclusive), so
+    /// progress is reported even when a page matches nothing. Logically
+    /// expired keys are skipped without charging the output limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only for an exhausted matcher budget.
+    pub fn key_scan_match(
+        &self,
+        request: &HashPatternScanRequest,
+    ) -> Result<KeyScanPage, NativeRuntimeError> {
+        let prefix = request.compiled().leading_literal_prefix();
+        let upper = binary_prefix_upper_bound(prefix);
+        let start: Bound<Vec<u8>> = match request.start_after() {
+            Some(cursor) => Bound::Excluded(cursor.to_vec()),
+            None if prefix.is_empty() => Bound::Unbounded,
+            None => Bound::Included(prefix.to_vec()),
+        };
+        let candidates = key_scan_candidates(
+            &self.state.structures,
+            self.metadata.logical_time_micros,
+            &start,
+            upper.as_deref(),
+        );
+        let mut budget = HashPatternMatchBudget::new(request.match_step_limit());
+        let mut entries: Vec<(Vec<u8>, StructureKind)> = Vec::new();
+        let mut visited = 0_usize;
+        let mut last_visited: Option<Vec<u8>> = None;
+        let mut stop = HashPatternScanStop::Exhausted;
+        for (key, family, visible) in candidates {
+            if visited == request.visit_limit() {
+                stop = HashPatternScanStop::VisitLimit;
+                break;
+            }
+            visited += 1;
+            last_visited = Some(key.clone());
+            if !visible {
+                continue;
+            }
+            if request.compiled().matches(&key, &mut budget)? {
+                entries.push((key, family));
+                if entries.len() == request.output_limit() {
+                    stop = HashPatternScanStop::OutputLimit;
+                    break;
+                }
+            }
+        }
+        let continuation = match stop {
+            HashPatternScanStop::Exhausted => None,
+            _ => last_visited,
+        };
+        Ok(KeyScanPage {
+            entries,
+            continuation,
+            stop,
+            visited,
+            match_steps: budget.used(),
+        })
     }
 
     /// Tests exact membership in an existing native set in this snapshot.
@@ -7194,6 +7743,48 @@ impl NativeDatabase {
         self.snapshot_unadmitted(logical_time_micros)
     }
 
+    /// Captures the exact immutable identity of the current committed root
+    /// set without materializing any engine state.
+    ///
+    /// Receipts and point-resolved routes use this instead of
+    /// [`Self::snapshot`] so their cost scales with the touched keys rather
+    /// than the total corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for admission or snapshot coordination failure.
+    pub fn snapshot_identity(
+        &self,
+        logical_time_micros: i64,
+    ) -> Result<NativeSnapshotIdentity, NativeRuntimeError> {
+        let _permit = self.admit_foreground_point()?;
+        let snapshot = self.coordinator.snapshot(logical_time_micros)?;
+        Ok(NativeSnapshotIdentity {
+            visible_csn: snapshot.visible_csn,
+            catalog_version: snapshot.catalog_version,
+            root_digest: snapshot.roots().digest(),
+            logical_time_micros: snapshot.logical_time_micros,
+        })
+    }
+
+    /// Returns the runtime transaction identity the next singleton commit on
+    /// this handle will publish under.
+    ///
+    /// The database owns one serialized writer, so a caller that stages a
+    /// detached batch and commits it immediately on the same handle may
+    /// record this identity inside the batch (for example as an idempotency
+    /// marker). The value is not reserved: another commit in between consumes
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeRuntimeError::TransactionIdExhausted`] when the
+    /// identity space is exhausted.
+    pub fn next_transaction_id(&self) -> Result<TransactionId, NativeRuntimeError> {
+        TransactionId::new(self.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)
+    }
+
     fn snapshot_unadmitted(
         &self,
         logical_time_micros: i64,
@@ -8042,8 +8633,9 @@ impl NativeDatabase {
             }
             bound => bound,
         };
-        let segments = tree.plan_range_segments(
+        let segments = tree.plan_range_segments_cached(
             &self.pages,
+            &self.buffer_pool,
             bound_as_slice(&planned_lower),
             bound_as_slice(&planned_upper),
         )?;
@@ -8209,6 +8801,70 @@ impl NativeDatabase {
         let mut failure = None;
         let _outcome = tree
             .visit_prefix_range_cached(
+                &self.pages,
+                &self.buffer_pool,
+                &prefix,
+                bound_as_slice(&lower),
+                bound_as_slice(&upper),
+                |physical_key, encoded| {
+                    let Some(primary_key) = physical_key.get(prefix.len()..) else {
+                        failure = Some(RelationalVisitError::Runtime(
+                            NativeRuntimeError::InvalidRelationalTree,
+                        ));
+                        return ControlFlow::Break(());
+                    };
+                    match decode_relational_value_cached(&context, table, primary_key, encoded) {
+                        Ok(Some(row)) => match visitor(primary_key, &row) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                failure = Some(RelationalVisitError::Visitor(error));
+                                ControlFlow::Break(())
+                            }
+                        },
+                        Ok(None) => ControlFlow::Continue(()),
+                        Err(error) => {
+                            failure = Some(RelationalVisitError::Runtime(error));
+                            ControlFlow::Break(())
+                        }
+                    }
+                },
+            )
+            .map_err(NativeRuntimeError::from)
+            .map_err(RelationalVisitError::Runtime)?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Visits committed relational rows in descending primary-key order.
+    ///
+    /// The physical mirror of [`Self::visit_relational_range_at`] over the
+    /// reverse B+tree walk; visibility, decoding, and failure classes are
+    /// identical.
+    pub(crate) fn visit_relational_range_at_reverse<E>(
+        &self,
+        snapshot: &Snapshot,
+        table: ObjectId,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        mut visitor: impl FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, E>,
+    ) -> Result<(), RelationalVisitError<E>> {
+        let (tree, prefix) = self
+            .relational_table_tree_at(snapshot, table)
+            .map_err(RelationalVisitError::Runtime)?;
+        let lower = map_primary_key_bound(table, lower);
+        let upper = map_primary_key_bound(table, upper);
+        let context = RelationalReadContext {
+            pages: &self.pages,
+            pool: &self.buffer_pool,
+            blobs: &self.blobs,
+            format: self.relational_format,
+            visible_csn: snapshot.visible_csn,
+        };
+        let mut failure = None;
+        let _outcome = tree
+            .visit_prefix_range_cached_reverse(
                 &self.pages,
                 &self.buffer_pool,
                 &prefix,
@@ -9179,7 +9835,7 @@ impl NativeDatabase {
         let catalog = load_catalog_state(&self.pages, &self.blobs, snapshot.roots())?;
         ann_store::load(&self.pages, Some(root), &catalog)?;
         let reachable_pages_before = BTree::from_root(root).reachable_page_count(&self.pages)?;
-        if plan.dropped_tombstones == 0 {
+        if !plan.changes_root() {
             return Ok(SearchCompactionReceipt {
                 scanned_entries: plan.scanned_entries,
                 retained_entries: plan.retained_entries.len(),
@@ -15617,6 +16273,223 @@ impl NativeDatabase {
         Ok(receipt.hits)
     }
 
+    /// Expands one analyzed term prefix over the durable live term
+    /// dictionary of the index at the snapshot's root — a prefix walk
+    /// bounded by the literal prefix, tombstoned terms skipped — without
+    /// touching document texts. `limit` bounds distinct terms counting
+    /// those already in `collected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an inline-format directory, a stale snapshot
+    /// page generation, or a corrupt term dictionary.
+    pub fn search_expand_term_prefix_at_snapshot(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        prefix: &str,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> Result<TermPrefixExpansion, NativeRuntimeError> {
+        let Some(tree) = self.durable_search_tree(snapshot, index)? else {
+            return Ok(snapshot.search_expand_term_prefix(index, prefix, limit));
+        };
+        let mut key_prefix = search_term_meta_key(index, prefix.as_bytes())
+            .or_else(|_| search_term_meta_key(index, b"\0"))?;
+        if prefix.is_empty() {
+            key_prefix.truncate(17);
+        }
+        let mut added = Vec::new();
+        let mut outcome: Result<Option<TermPrefixExpansion>, NativeRuntimeError> = Ok(None);
+        // The control flow is folded into `outcome`; an early break either
+        // carries an error or the overflow marker.
+        let _flow = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &key_prefix,
+            None,
+            |key, value| {
+                if is_search_term_metadata_tombstone(value) {
+                    return ControlFlow::Continue(());
+                }
+                let term = match decode_search_object_key(key, SEARCH_TERM_META_PREFIX).and_then(
+                    |(_, term)| {
+                        std::str::from_utf8(term).map_err(|_| NativeRuntimeError::InvalidSearchTree)
+                    },
+                ) {
+                    Ok(term) => term,
+                    Err(error) => {
+                        outcome = Err(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if collected.contains(term) {
+                    return ControlFlow::Continue(());
+                }
+                if collected.len() == limit {
+                    outcome = Ok(Some(TermPrefixExpansion::Overflow));
+                    return ControlFlow::Break(());
+                }
+                collected.insert(term.to_owned());
+                added.push(term.to_owned());
+                ControlFlow::Continue(())
+            },
+        )?;
+        match outcome? {
+            Some(overflow) => Ok(overflow),
+            None => Ok(TermPrefixExpansion::Terms(added)),
+        }
+    }
+
+    /// Expands one analyzed term over the durable live term dictionary
+    /// to every term within the Levenshtein distance, without touching
+    /// document texts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::search_expand_term_prefix_at_snapshot`].
+    pub fn search_expand_term_fuzzy_at_snapshot(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        term: &str,
+        max_distance: usize,
+        limit: usize,
+        collected: &mut BTreeSet<String>,
+    ) -> Result<TermPrefixExpansion, NativeRuntimeError> {
+        let Some(tree) = self.durable_search_tree(snapshot, index)? else {
+            return Ok(snapshot.search_expand_term_fuzzy(
+                index,
+                term,
+                max_distance,
+                limit,
+                collected,
+            ));
+        };
+        let mut key_prefix = Vec::with_capacity(17);
+        key_prefix.push(SEARCH_TERM_META_PREFIX);
+        key_prefix.extend_from_slice(&index.get().to_be_bytes());
+        let query: Vec<char> = term.chars().collect();
+        let mut added = Vec::new();
+        let mut candidate_chars: Vec<char> = Vec::with_capacity(query.len() + max_distance);
+        let mut matcher = BoundedLevenshtein::new(query.len() + max_distance);
+        let mut outcome: Result<Option<TermPrefixExpansion>, NativeRuntimeError> = Ok(None);
+        // The control flow is folded into `outcome`; an early break either
+        // carries an error or the overflow marker.
+        let _flow = tree.visit_prefix_cached(
+            &self.pages,
+            &self.buffer_pool,
+            &key_prefix,
+            None,
+            |key, value| {
+                if is_search_term_metadata_tombstone(value) {
+                    return ControlFlow::Continue(());
+                }
+                let candidate = match decode_search_object_key(key, SEARCH_TERM_META_PREFIX)
+                    .and_then(|(_, candidate)| {
+                        std::str::from_utf8(candidate)
+                            .map_err(|_| NativeRuntimeError::InvalidSearchTree)
+                    }) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        outcome = Err(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                // Byte length bounds character count from above, so a
+                // candidate that is too short in bytes needs no decode; a
+                // long one is cut by the character-count check below.
+                if candidate.len() + max_distance < query.len() {
+                    return ControlFlow::Continue(());
+                }
+                candidate_chars.clear();
+                candidate_chars.extend(candidate.chars());
+                if query.len().abs_diff(candidate_chars.len()) > max_distance
+                    || !matcher.within(&query, &candidate_chars, max_distance)
+                {
+                    return ControlFlow::Continue(());
+                }
+                if collected.contains(candidate) {
+                    return ControlFlow::Continue(());
+                }
+                if collected.len() == limit {
+                    outcome = Ok(Some(TermPrefixExpansion::Overflow));
+                    return ControlFlow::Break(());
+                }
+                collected.insert(candidate.to_owned());
+                added.push(candidate.to_owned());
+                ControlFlow::Continue(())
+            },
+        )?;
+        match outcome? {
+            Some(overflow) => Ok(overflow),
+            None => Ok(TermPrefixExpansion::Terms(added)),
+        }
+    }
+
+    /// The durable search tree at the snapshot's root when the directory
+    /// uses the inverted B+tree format and the snapshot is current;
+    /// `None` on the inline-state format (callers fall back to the model).
+    fn durable_search_tree(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+    ) -> Result<Option<BTree>, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return Ok(None);
+        }
+        let current = self.coordinator.snapshot(0)?;
+        if snapshot.metadata.roots().page_generation() != current.roots().page_generation() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        let catalog_root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_CATALOG)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        match self.catalog_object_at_root(catalog_root, index)? {
+            Some(CatalogObject::Search(_)) => {}
+            _ => return Err(ModelError::UnknownObject.into()),
+        }
+        let root = snapshot
+            .metadata
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        Ok(Some(BTree::from_root(root)))
+    }
+
+    /// Durable posting scorer returning the complete execution receipt.
+    /// Diagnostic surface for the cap-ladder evidence harness; not a
+    /// public contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::match_text_at_snapshot`].
+    #[doc(hidden)]
+    pub fn match_text_at_snapshot_with_receipt(
+        &self,
+        snapshot: &NativeSnapshot,
+        index: ObjectId,
+        query: &str,
+        limit: usize,
+        parameters: model::Bm25ScoreParameters,
+    ) -> Result<NativeLexicalSearchExecutionReceipt, NativeRuntimeError> {
+        if self.search_format == SearchFormat::InlineStateV1 {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let planning_permit = self.admit_foreground_bounded()?;
+        self.match_btree_text_profiled(
+            &snapshot.metadata,
+            index,
+            query,
+            limit,
+            parameters,
+            planning_permit,
+        )
+    }
+
     fn match_btree_text_profiled(
         &self,
         snapshot: &hyphae_native_mvcc::Snapshot,
@@ -15674,6 +16547,29 @@ impl NativeDatabase {
             document_count,
             document_count_f64,
         )?;
+        // Dense queries (planned postings within one quarter of the
+        // corpus) replace per-posting document descents with one shared
+        // sequential header scan: each posting then costs a map lookup
+        // instead of a full tree descent, which dominated the
+        // 100k-document profile.
+        let planned_posting_total = term_plans
+            .iter()
+            .map(|plan| plan.document_frequency)
+            .try_fold(0_u64, |total, plan| {
+                total
+                    .checked_add(plan)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)
+            })?;
+        // Self-describing HYPOST02 postings carry their length, so the
+        // shared header prescan is only worth paying when a dense query
+        // meets legacy HYPOST01 postings. It is therefore resolved lazily
+        // by the executor the first time a posting without a carried
+        // length appears, and only for dense queries.
+        let document_lengths = if planned_posting_total >= document_count / 4 {
+            Some(Arc::new(LazyDocumentLengths::new()))
+        } else {
+            None
+        };
         let planned_terms = term_plans.len();
         let planned_segments = term_plans.iter().try_fold(0_usize, |total, plan| {
             total
@@ -15705,6 +16601,7 @@ impl NativeDatabase {
                 expected_document_frequencies,
                 work,
                 planning,
+                document_lengths,
             },
             limit,
         )
@@ -15735,6 +16632,7 @@ impl NativeDatabase {
                     plan.work,
                     execution_pool,
                     permit.permit(),
+                    plan.document_lengths.clone(),
                 )?,
             _ => (
                 self.scan_lexical_segments_serial(
@@ -15744,6 +16642,7 @@ impl NativeDatabase {
                     plan.average_length,
                     plan.parameters,
                     &plan.work,
+                    plan.document_lengths.as_deref(),
                 )?,
                 0,
             ),
@@ -15811,7 +16710,9 @@ impl NativeDatabase {
                 live_postings = live_postings
                     .checked_add(1)
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                let document_length = if let Some(length) = document_lengths.get(&document_id) {
+                let document_length = if let Some(length) = term_frequency.document_length {
+                    u64::from(length)
+                } else if let Some(length) = document_lengths.get(&document_id) {
                     *length
                 } else {
                     let document = tree
@@ -15830,7 +16731,7 @@ impl NativeDatabase {
                 };
                 *scores.entry(document_id).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     parameters,
@@ -15840,7 +16741,7 @@ impl NativeDatabase {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
         }
-        Ok(rank_match_hits(scores, limit))
+        Ok(rank_match_hits(scores.into_iter().collect(), limit))
     }
 
     fn plan_lexical_term_segments(
@@ -15890,6 +16791,7 @@ impl NativeDatabase {
         Ok(plans)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_lexical_segments_serial(
         &self,
         tree: BTree,
@@ -15898,6 +16800,7 @@ impl NativeDatabase {
         average_length: f64,
         parameters: model::Bm25ScoreParameters,
         work: &[LexicalSegmentWork],
+        document_lengths: Option<&LazyDocumentLengths>,
     ) -> Result<Vec<LexicalPostingBatch>, NativeRuntimeError> {
         work.iter()
             .map(|work| {
@@ -15910,6 +16813,7 @@ impl NativeDatabase {
                     average_length,
                     parameters,
                     work,
+                    document_lengths,
                 )
             })
             .collect()
@@ -15927,6 +16831,7 @@ impl NativeDatabase {
         work: Vec<LexicalSegmentWork>,
         execution_pool: &NativeExecutionPool,
         permit: &OwnedGovernorPermit,
+        document_lengths: Option<Arc<LazyDocumentLengths>>,
     ) -> Result<(Vec<LexicalPostingBatch>, usize), NativeRuntimeError> {
         let pages = Arc::new(self.pages.read_handle()?);
         let pool = Arc::clone(&self.buffer_pool);
@@ -15949,6 +16854,7 @@ impl NativeDatabase {
                         average_length,
                         parameters,
                         &work,
+                        document_lengths.as_deref(),
                     )
                 },
             )?;
@@ -17153,7 +18059,7 @@ impl NativeDatabase {
                 .saturating_add(DELTA_ENGINE_CONTAINER_OVERHEAD),
         )
         .map_err(SqlError::from)?;
-        let dml = sql::TransactionDml::parse(statement)?;
+        let dml = sql::TransactionDml::parse_single_row(statement)?;
         let relation_rollback = self
             .hydrate_delta_relation(batch, dml.relation_name()?)
             .map_err(SqlError::from)?;
@@ -21622,6 +22528,150 @@ impl NativeWriteBatch {
         Ok(true)
     }
 
+    /// Appends `suffix` after the current visible scalar value and
+    /// returns the resulting length. Missing or expired keys start empty;
+    /// existing keys keep their expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a collection key or an oversized result.
+    pub fn append(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        suffix: &[u8],
+    ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        let key = key.into();
+        if self.private_collection_is_visible(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let current = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros);
+        let expires_at_micros = current.and_then(|entry| entry.expires_at_micros);
+        let existing = current.map_or(&[][..], |entry| entry.value.as_slice());
+        let length = existing
+            .len()
+            .checked_add(suffix.len())
+            .filter(|length| *length <= MAX_STRUCTURE_STRING_BYTES)
+            .ok_or(NativeRuntimeError::StructureStringTooLarge)?;
+        let mut value = Vec::with_capacity(length);
+        value.extend_from_slice(existing);
+        value.extend_from_slice(suffix);
+        self.set(key, value, expires_at_micros)?;
+        Ok(length)
+    }
+
+    /// Overwrites `patch` at byte `offset`, zero-filling any gap, and
+    /// returns the resulting length. Missing or expired keys start empty;
+    /// existing keys keep their expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a collection key or an oversized result.
+    pub fn setrange(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        offset: usize,
+        patch: &[u8],
+    ) -> Result<usize, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        let key = key.into();
+        if self.private_collection_is_visible(&key) {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let current = self
+            .state
+            .structures
+            .visible_entry(&key, self.snapshot.logical_time_micros);
+        let expires_at_micros = current.and_then(|entry| entry.expires_at_micros);
+        let existing = current.map_or(&[][..], |entry| entry.value.as_slice());
+        let patch_end = offset
+            .checked_add(patch.len())
+            .filter(|end| *end <= MAX_STRUCTURE_STRING_BYTES)
+            .ok_or(NativeRuntimeError::StructureStringTooLarge)?;
+        let length = existing.len().max(patch_end);
+        let mut value = vec![0_u8; length];
+        value[..existing.len()].copy_from_slice(existing);
+        value[offset..patch_end].copy_from_slice(patch);
+        self.set(key, value, expires_at_micros)?;
+        Ok(length)
+    }
+
+    /// Writes one hash field only when it has no unexpired visible value,
+    /// and reports whether the write applied. The hash must exist: this
+    /// engine creates families explicitly, so a missing hash is an error
+    /// rather than an implicit create.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, an invalid
+    /// identity, or a missing or expired hash.
+    pub fn hsetnx(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        field: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<bool, NativeRuntimeError> {
+        let key = key.into();
+        let field = field.into();
+        if self.hget(&key, &field)?.is_some() {
+            return Ok(false);
+        }
+        self.hset(key, field, value)?;
+        Ok(true)
+    }
+
+    /// Removes and returns the member at the seed-derived rank
+    /// (`splitmix64(seed) % cardinality`, ascending byte order) of one
+    /// visible set. An empty set returns absence without mutating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy storage, another family, or a missing
+    /// or expired set.
+    pub fn spop(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        seed: u64,
+    ) -> Result<Option<Vec<u8>>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.lists.contains_key(&key)
+            || self.state.structures.sorted_sets.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let member = match self.state.structures.spop_at_rank(
+            &key,
+            |cardinality| usize::try_from(splitmix64(seed) % (cardinality as u64)).unwrap_or(0),
+            self.snapshot.logical_time_micros,
+        ) {
+            SetPopState::MissingSet => return Err(NativeRuntimeError::UnknownStructureSet),
+            SetPopState::Empty => return Ok(None),
+            SetPopState::Popped(member) => member,
+        };
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSetMember,
+            target: None,
+            key: set_member_identity(&key, &member)?,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(Some(member))
+    }
+
     fn delete_expired_structure(
         &mut self,
         key: impl Into<Vec<u8>>,
@@ -23768,6 +24818,81 @@ impl NativeWriteBatch {
         });
         self.dirty[2] = true;
         Ok(true)
+    }
+
+    /// Adds a canonical binary64 delta to one member's score, treating a
+    /// missing member as `0.0`, and returns the new score.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family, a missing sorted set, or a
+    /// non-finite delta or resulting score.
+    pub fn zincrby(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        delta: f64,
+        member: impl Into<Vec<u8>>,
+    ) -> Result<f64, NativeRuntimeError> {
+        if !delta.is_finite() {
+            return Err(NativeRuntimeError::StructureScoreNotCanonical);
+        }
+        let key = key.into();
+        let member = member.into();
+        let current = self.zscore(&key, &member)?.unwrap_or(0.0);
+        let updated = current + delta;
+        if !updated.is_finite() {
+            return Err(NativeRuntimeError::StructureScoreNotCanonical);
+        }
+        self.zadd(key, updated, member)?;
+        Ok(updated)
+    }
+
+    /// Removes and returns the extreme `(member, score)` of the canonical
+    /// `(score, member-bytes)` total order: the lowest when `highest` is
+    /// false, the highest otherwise. An empty set returns `None` without
+    /// mutating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another family or a missing sorted set.
+    pub fn zpop(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        highest: bool,
+    ) -> Result<Option<(Vec<u8>, f64)>, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        if !self
+            .structure_format
+            .supports_materialized_collection_writes()
+        {
+            return Err(NativeRuntimeError::LegacyStructureFamilyUnsupported);
+        }
+        let key = key.into();
+        if self.state.structures.entries.contains_key(&key)
+            || self.private_hash_is_visible(&key)
+            || self.state.structures.sets.contains_key(&key)
+            || self.state.structures.lists.contains_key(&key)
+        {
+            return Err(NativeRuntimeError::StructureKindMismatch);
+        }
+        let (member, score) = match self.state.structures.zpop_extreme(&key, highest) {
+            SortedSetPopState::MissingSet => {
+                return Err(NativeRuntimeError::UnknownStructureSortedSet);
+            }
+            SortedSetPopState::Empty => return Ok(None),
+            SortedSetPopState::Popped(member, score) => (member, score),
+        };
+        let identity = sorted_set_member_identity(&key, &member)?;
+        self.mutations.push(Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::DeleteSortedSetMember,
+            target: None,
+            key: identity,
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        self.dirty[2] = true;
+        Ok(Some((member, score.value())))
     }
 
     /// Returns the current private exact sorted-set cardinality.
@@ -29935,19 +31060,39 @@ fn decode_live_search_term_metadata(
     Ok(Some(document_frequency))
 }
 
-fn encode_search_posting(term_frequency: u32) -> Vec<u8> {
+/// One decoded live posting: term frequency plus the carried document
+/// token count when the posting is self-describing (`HYPOST02`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedPosting {
+    term_frequency: u32,
+    document_length: Option<u32>,
+}
+
+/// Encodes a self-describing `HYPOST02` posting.
+fn encode_search_posting(term_frequency: u32, document_length: u64) -> Vec<u8> {
+    #[cfg(test)]
+    if WRITE_LEGACY_POSTINGS.get() {
+        let mut encoded = Vec::with_capacity(SEARCH_POSTING_SIZE);
+        encoded.extend_from_slice(SEARCH_POSTING_MAGIC);
+        encoded.extend_from_slice(&term_frequency.to_le_bytes());
+        encoded.extend_from_slice(&[0; 4]);
+        return encoded;
+    }
     let mut encoded = Vec::with_capacity(SEARCH_POSTING_SIZE);
-    encoded.extend_from_slice(SEARCH_POSTING_MAGIC);
+    encoded.extend_from_slice(SEARCH_POSTING_MAGIC_V2);
     encoded.extend_from_slice(&term_frequency.to_le_bytes());
-    encoded.extend_from_slice(&[0; 4]);
+    // Token counts above u32 are impossible under the key and text bounds;
+    // saturate defensively so the encoding never panics.
+    encoded.extend_from_slice(
+        &u32::try_from(document_length)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     encoded
 }
 
-fn decode_search_posting(encoded: &[u8]) -> Result<u32, NativeRuntimeError> {
-    if encoded.len() != SEARCH_POSTING_SIZE
-        || encoded.get(..8) != Some(SEARCH_POSTING_MAGIC.as_slice())
-        || encoded[12..16].iter().any(|byte| *byte != 0)
-    {
+fn decode_search_posting(encoded: &[u8]) -> Result<DecodedPosting, NativeRuntimeError> {
+    if encoded.len() != SEARCH_POSTING_SIZE {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
     let mut term_frequency = [0_u8; 4];
@@ -29956,7 +31101,30 @@ fn decode_search_posting(encoded: &[u8]) -> Result<u32, NativeRuntimeError> {
     if term_frequency == 0 {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
-    Ok(term_frequency)
+    let mut tail = [0_u8; 4];
+    tail.copy_from_slice(&encoded[12..16]);
+    match &encoded[..8] {
+        magic if magic == SEARCH_POSTING_MAGIC => {
+            if tail != [0; 4] {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Ok(DecodedPosting {
+                term_frequency,
+                document_length: None,
+            })
+        }
+        magic if magic == SEARCH_POSTING_MAGIC_V2 => {
+            let document_length = u32::from_le_bytes(tail);
+            if document_length == 0 || document_length < term_frequency {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Ok(DecodedPosting {
+                term_frequency,
+                document_length: Some(document_length),
+            })
+        }
+        _ => Err(NativeRuntimeError::InvalidSearchTree),
+    }
 }
 
 fn is_search_posting_tombstone(encoded: &[u8]) -> bool {
@@ -29966,7 +31134,7 @@ fn is_search_posting_tombstone(encoded: &[u8]) -> bool {
 fn decode_live_search_posting(
     encoded: &[u8],
     format: PhysicalSearchFormat,
-) -> Result<Option<u32>, NativeRuntimeError> {
+) -> Result<Option<DecodedPosting>, NativeRuntimeError> {
     if is_search_posting_tombstone(encoded) {
         return if format.admits_tombstones() {
             Ok(None)
@@ -29983,19 +31151,26 @@ fn search_count_f64(value: u64) -> Result<f64, NativeRuntimeError> {
         .map_err(|_| NativeRuntimeError::InvalidSearchTree)
 }
 
-fn rank_match_hits(scores: BTreeMap<Vec<u8>, f64>, limit: usize) -> Vec<MatchHit> {
+fn rank_match_hits(scores: Vec<(Vec<u8>, f64)>, limit: usize) -> Vec<MatchHit> {
     let mut hits = scores
         .into_iter()
         .filter(|(_, score)| *score > 0.0)
         .map(|(document_id, score)| MatchHit { document_id, score })
         .collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
+    let order = |left: &MatchHit, right: &MatchHit| {
         right
             .score
             .total_cmp(&left.score)
             .then_with(|| left.document_id.cmp(&right.document_id))
-    });
-    hits.truncate(limit);
+    };
+    // The comparator is a total order (total_cmp then unique ids), so
+    // partitioning the top `limit` and sorting only that prefix yields
+    // exactly the ranking a full sort would, in O(n + k log k).
+    if limit < hits.len() {
+        hits.select_nth_unstable_by(limit, order);
+        hits.truncate(limit);
+    }
+    hits.sort_by(order);
     hits
 }
 
@@ -30051,6 +31226,50 @@ fn lexical_segment_work(plans: Vec<LexicalTermSegmentPlan>) -> Vec<LexicalSegmen
         .collect()
 }
 
+/// One sequential scan of every live document header of the index,
+/// keyed by document id. Tombstones are skipped; the map is bounded by
+/// the collection document ceiling.
+fn scan_document_lengths_in_tree(
+    tree: BTree,
+    pages: &PageStore,
+    pool: &BufferPool,
+    format: PhysicalSearchFormat,
+    index: ObjectId,
+) -> Result<BTreeMap<Vec<u8>, f64>, NativeRuntimeError> {
+    let mut prefix = Vec::with_capacity(17);
+    prefix.push(SEARCH_DOCUMENT_PREFIX);
+    prefix.extend_from_slice(&index.get().to_be_bytes());
+    let successor = byte_prefix_successor(&prefix);
+    let upper = successor
+        .as_deref()
+        .map_or(Bound::Unbounded, Bound::Excluded);
+    let plan =
+        tree.plan_range_segments_cached(pages, pool, Bound::Included(prefix.as_slice()), upper)?;
+    let mut lengths = BTreeMap::new();
+    for segment in &plan {
+        tree.visit_planned_segment_cached(
+            pages,
+            pool,
+            segment,
+            |key, value| -> Result<(), NativeRuntimeError> {
+                let document_id = key
+                    .strip_prefix(prefix.as_slice())
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                if is_search_document_tombstone(value) {
+                    if format.admits_tombstones() {
+                        return Ok(());
+                    }
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let (document_length, _, _) = decode_search_document_header(value)?;
+                lengths.insert(document_id.to_vec(), search_count_f64(document_length)?);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(lengths)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_lexical_segment(
     tree: BTree,
@@ -30061,43 +31280,63 @@ fn decode_lexical_segment(
     average_length: f64,
     parameters: model::Bm25ScoreParameters,
     work: &LexicalSegmentWork,
+    document_lengths: Option<&LazyDocumentLengths>,
 ) -> Result<LexicalPostingBatch, NativeRuntimeError> {
-    let mut live_postings = 0_u64;
-    let mut contributions = Vec::with_capacity(work.segment.entry_count());
-    for (key, encoded_frequency) in tree.scan_planned_segment(pages, &work.segment)? {
-        let document_id = key
-            .strip_prefix(work.posting_prefix.as_slice())
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?
-            .to_vec();
-        let Some(term_frequency) = decode_live_search_posting(&encoded_frequency, format)? else {
-            continue;
-        };
-        live_postings = live_postings
-            .checked_add(1)
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        let document = tree
-            .get_cached_pinned(pages, pool, &search_document_key(index, &document_id)?)?
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        if is_search_document_tombstone(document.bytes()) {
-            return Err(NativeRuntimeError::InvalidSearchTree);
-        }
-        let (document_length, _, _) = decode_search_document_header(document.bytes())?;
-        contributions.push((
-            document_id,
-            bm25_term_score(
-                work.idf,
-                f64::from(term_frequency),
-                search_count_f64(document_length)?,
-                average_length,
-                parameters,
-            ),
-        ));
-    }
-    Ok(LexicalPostingBatch {
-        term_index: work.term_index,
-        live_postings,
-        contributions,
-    })
+    let mut batch = LexicalPostingBatch::new(work.term_index, work.segment.entry_count());
+    // Borrow each posting from the verified leaf frame: only the matched
+    // document id is appended to the batch arena, so a wide segment costs
+    // its live postings rather than one allocation per stored entry.
+    tree.visit_planned_segment_cached(
+        pages,
+        pool,
+        &work.segment,
+        |key, encoded_frequency| -> Result<(), NativeRuntimeError> {
+            let document_id = key
+                .strip_prefix(work.posting_prefix.as_slice())
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let Some(term_frequency) = decode_live_search_posting(encoded_frequency, format)?
+            else {
+                return Ok(());
+            };
+            batch.live_postings = batch
+                .live_postings
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            // Dense queries pre-scan every live document header once; a
+            // posting for an id absent from that complete map is corruption.
+            // Sparse queries keep the direct per-posting descent.
+            let document_length = if let Some(length) = term_frequency.document_length {
+                f64::from(length)
+            } else if let Some(lengths) = document_lengths {
+                *lengths
+                    .get_or_scan(|| {
+                        scan_document_lengths_in_tree(tree, pages, pool, format, index)
+                    })?
+                    .get(document_id)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?
+            } else {
+                let document = tree
+                    .get_cached_pinned(pages, pool, &search_document_key(index, document_id)?)?
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                if is_search_document_tombstone(document.bytes()) {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                let (document_length, _, _) = decode_search_document_header(document.bytes())?;
+                search_count_f64(document_length)?
+            };
+            batch.push(
+                document_id,
+                bm25_term_score(
+                    work.idf,
+                    f64::from(term_frequency.term_frequency),
+                    document_length,
+                    average_length,
+                    parameters,
+                ),
+            )
+        },
+    )?;
+    Ok(batch)
 }
 
 fn finalize_lexical_batches(
@@ -30106,8 +31345,13 @@ fn finalize_lexical_batches(
     limit: usize,
 ) -> Result<Vec<MatchHit>, NativeRuntimeError> {
     let mut live_postings = vec![0_u64; expected_document_frequencies.len()];
-    let mut scores = BTreeMap::<Vec<u8>, f64>::new();
     let mut previous_term = None;
+    // Concatenate every batch arena once; contributions are rebased onto
+    // the shared arena so the merge below never allocates per id.
+    let total_ids: usize = batches.iter().map(|batch| batch.ids.len()).sum();
+    let total_contributions: usize = batches.iter().map(|batch| batch.contributions.len()).sum();
+    let mut ids = Vec::with_capacity(total_ids);
+    let mut contributions = Vec::with_capacity(total_contributions);
     for batch in batches {
         if batch.term_index >= live_postings.len()
             || previous_term.is_some_and(|previous| previous > batch.term_index)
@@ -30118,14 +31362,58 @@ fn finalize_lexical_batches(
         live_postings[batch.term_index] = live_postings[batch.term_index]
             .checked_add(batch.live_postings)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        for (document_id, score) in batch.contributions {
-            *scores.entry(document_id).or_default() += score;
+        let base = u32::try_from(ids.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        ids.extend_from_slice(&batch.ids);
+        for contribution in batch.contributions {
+            let id_offset = base
+                .checked_add(contribution.id_offset)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            contributions.push(LexicalContribution {
+                id_offset,
+                ..contribution
+            });
         }
     }
     if live_postings != expected_document_frequencies {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
-    Ok(rank_match_hits(scores, limit))
+    let id_of = |contribution: &LexicalContribution| -> &[u8] {
+        let start = contribution.id_offset as usize;
+        let end = start.saturating_add(contribution.id_length as usize);
+        ids.get(start..end).unwrap_or(&[])
+    };
+    // Sort once by document id and fold adjacent contributions. Batches
+    // are ordered by term then document id, so the stable sort keeps
+    // each document's per-term additions in term order — bit-identical
+    // to the previous BTreeMap accumulation, without per-id allocation.
+    contributions.sort_by(|left, right| id_of(left).cmp(id_of(right)));
+    let mut scores = Vec::<LexicalContribution>::with_capacity(contributions.len());
+    for contribution in contributions {
+        match scores.last_mut() {
+            Some(last) if id_of(last) == id_of(&contribution) => last.score += contribution.score,
+            _ => scores.push(contribution),
+        }
+    }
+    // Rank on the arena and copy only the retained ids.
+    scores.retain(|contribution| contribution.score > 0.0);
+    let order = |left: &LexicalContribution, right: &LexicalContribution| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| id_of(left).cmp(id_of(right)))
+    };
+    if limit < scores.len() {
+        scores.select_nth_unstable_by(limit, order);
+        scores.truncate(limit);
+    }
+    scores.sort_by(order);
+    Ok(scores
+        .into_iter()
+        .map(|contribution| MatchHit {
+            document_id: id_of(&contribution).to_vec(),
+            score: contribution.score,
+        })
+        .collect())
 }
 
 fn parse_canonical_i64(value: &[u8]) -> Result<i64, NativeRuntimeError> {
@@ -31562,6 +32850,7 @@ fn pop_list_in_tree(
 
 fn structure_tree_after_mutations(
     pages: &mut PageStore,
+    pool: &BufferPool,
     root: Option<PageId>,
     format: StructureFormat,
     creating_csn: Csn,
@@ -31582,20 +32871,145 @@ fn structure_tree_after_mutations(
             )?
             .tree;
     }
-    for mutation in mutations
+    let structure_mutations: Vec<&Mutation> = mutations
         .iter()
         .filter(|mutation| mutation.engine == EngineKind::Structure)
-    {
-        tree = apply_structure_tree_mutation(
-            pages,
-            tree,
-            format,
-            creating_csn,
-            mutation,
-            blob_references,
-        )?;
+        .collect();
+    // Consecutive persistent scalar `SET`s over distinct keys coalesce into
+    // one copy-on-write batch: every touched leaf and internal path is
+    // rewritten once per run instead of once per key. Each key keeps the
+    // exact sequential guards (no live collection under the key, prior
+    // expiry-index maintenance) and the logical tree contents are identical.
+    let mut cursor = 0;
+    while cursor < structure_mutations.len() {
+        let mutation = structure_mutations[cursor];
+        if coalescable_scalar_set(mutation) {
+            let mut end = cursor + 1;
+            let mut keys = BTreeSet::from([mutation.key.as_slice()]);
+            while end < structure_mutations.len()
+                && coalescable_scalar_set(structure_mutations[end])
+                && keys.insert(structure_mutations[end].key.as_slice())
+            {
+                end += 1;
+            }
+            tree = upsert_scalar_set_run(
+                pages,
+                pool,
+                tree,
+                format.uses_ordered_expiry_index(),
+                creating_csn,
+                &structure_mutations[cursor..end],
+                blob_references,
+            )?;
+            cursor = end;
+        } else {
+            tree = apply_structure_tree_mutation(
+                pages,
+                tree,
+                format,
+                creating_csn,
+                mutation,
+                blob_references,
+            )?;
+            cursor += 1;
+        }
     }
     Ok(tree)
+}
+
+fn coalescable_scalar_set(mutation: &Mutation) -> bool {
+    mutation.opcode == Opcode::SetValue
+        && mutation.target.is_none()
+        && mutation.expires_at_micros.is_none()
+}
+
+/// Rejects a scalar write under a key that currently owns a live collection.
+///
+/// Descends through the verified buffer pool: committed pages and pages
+/// appended earlier in this commit are immutable, so cached frames stay
+/// valid for the whole root construction.
+fn ensure_scalar_key_has_no_live_collection(
+    pages: &PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    key: &[u8],
+) -> Result<(), NativeRuntimeError> {
+    if tree
+        .get_cached_pinned(pages, pool, &structure_hash_meta_key(key))?
+        .map(|value| decode_live_hash_metadata(value.bytes()))
+        .transpose()?
+        .flatten()
+        .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_set_meta_key(key))?
+            .map(|value| decode_live_set_metadata(value.bytes()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_list_meta_key(key)?)?
+            .map(|value| decode_live_list_metadata(value.bytes()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_stream_meta_key(key)?)?
+            .filter(|value| !is_structure_tombstone(value.bytes()))
+            .map(|value| decode_stream_metadata(value.bytes()))
+            .transpose()?
+            .is_some()
+        || tree
+            .get_cached_pinned(pages, pool, &structure_sorted_set_meta_key(key)?)?
+            .filter(|value| !is_structure_tombstone(value.bytes()))
+            .map(|value| decode_sorted_set_metadata_state(value.bytes()))
+            .transpose()?
+            .is_some()
+    {
+        return Err(NativeRuntimeError::InvalidStructureTree);
+    }
+    Ok(())
+}
+
+/// Applies one run of persistent scalar `SET`s over distinct keys as a
+/// single sorted batch. Semantically identical to applying
+/// [`upsert_scalar_structure_mutation`] to each mutation in order.
+fn upsert_scalar_set_run(
+    pages: &mut PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    maintain_expiry_index: bool,
+    creating_csn: Csn,
+    mutations: &[&Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for mutation in mutations {
+        if !coalescable_scalar_set(mutation) {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+        ensure_scalar_key_has_no_live_collection(pages, pool, tree, &mutation.key)?;
+        let entry_key = structure_key(&mutation.key);
+        if maintain_expiry_index
+            && let Some(prior_expiry) = tree
+                .get_cached_pinned(pages, pool, &entry_key)?
+                .map(|encoded| structure_value_expiry(encoded.bytes()))
+                .transpose()?
+                .flatten()
+        {
+            // The new value is persistent, so a prior expiry entry retires.
+            entries.insert(
+                structure_expiry_key(prior_expiry, &mutation.key)?,
+                vec![STRUCTURE_EXPIRY_TOMBSTONE],
+            );
+        }
+        let value = structure_storage_value(&mutation.value, None, blob_references)?;
+        if entries.insert(entry_key, value).is_some() {
+            return Err(NativeRuntimeError::InvalidStructureTree);
+        }
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
 }
 
 fn apply_structure_tree_mutation(
@@ -31852,6 +33266,7 @@ fn structure_root_after_mutations(
         )?)),
         StructureFormat::BTreeV1 | StructureFormat::BTreeV2 => Ok(structure_tree_after_mutations(
             pages,
+            context.buffer_pool,
             root,
             context.format,
             creating_csn,
@@ -31861,6 +33276,7 @@ fn structure_root_after_mutations(
         .root()),
         StructureFormat::BTreeV3 => Ok(structure_v3::apply_structure_mutations_v3(
             pages,
+            context.buffer_pool,
             BTree::from_root(root.ok_or(NativeRuntimeError::InvalidStructureTree)?),
             creating_csn,
             context.transaction_id,
@@ -32273,6 +33689,15 @@ struct SearchCompactionPlan {
     scanned_entries: usize,
     retained_entries: Vec<(Vec<u8>, Vec<u8>)>,
     dropped_tombstones: usize,
+    /// Legacy `HYPOST01` postings rewritten as self-describing `HYPOST02`.
+    upgraded_postings: usize,
+}
+
+impl SearchCompactionPlan {
+    /// Whether compaction would publish a physically different root.
+    const fn changes_root(&self) -> bool {
+        self.dropped_tombstones > 0 || self.upgraded_postings > 0
+    }
 }
 
 fn plan_search_compaction(
@@ -32285,22 +33710,53 @@ fn plan_search_compaction(
     let format = physical_search_format(pages, tree)?;
     let entries = tree.scan(pages)?;
     let scanned_entries = entries.len();
+    // Live document token counts, so legacy postings can be upgraded to
+    // the self-describing layout from validated header data.
+    let mut token_counts = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
+    for (key, value) in &entries {
+        if key.first().copied() == Some(SEARCH_DOCUMENT_PREFIX)
+            && !is_search_document_tombstone(value)
+        {
+            let (index, document_id) = decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
+            let (token_count, _, _) = decode_search_document_header(value)?;
+            token_counts.insert((index, document_id.to_vec()), token_count);
+        }
+    }
     let mut retained_entries = Vec::with_capacity(scanned_entries);
     let mut dropped_tombstones = 0_usize;
+    let mut upgraded_postings = 0_usize;
     for (key, value) in entries {
         if compactable_search_tombstone(format, &key, &value) {
             dropped_tombstones = dropped_tombstones
                 .checked_add(1)
                 .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        } else {
-            retained_entries.push((key, value));
+            continue;
         }
+        if key.first().copied() == Some(SEARCH_POSTING_PREFIX)
+            && value.get(..8) == Some(SEARCH_POSTING_MAGIC.as_slice())
+        {
+            let (index, _, document_id) = decode_search_posting_key(&key)?;
+            let posting = decode_search_posting(&value)?;
+            let token_count = token_counts
+                .get(&(index, document_id.to_vec()))
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            retained_entries.push((
+                key,
+                encode_search_posting(posting.term_frequency, *token_count),
+            ));
+            upgraded_postings = upgraded_postings
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            continue;
+        }
+        retained_entries.push((key, value));
     }
     Ok(SearchCompactionPlan {
         state,
         scanned_entries,
         retained_entries,
         dropped_tombstones,
+        upgraded_postings,
     })
 }
 
@@ -32324,7 +33780,7 @@ fn compact_search_tree(
 ) -> Result<BTree, NativeRuntimeError> {
     let root = root.ok_or(NativeRuntimeError::InvalidSearchTree)?;
     let plan = plan_search_compaction(pages, blobs, root)?;
-    if plan.dropped_tombstones == 0 {
+    if !plan.changes_root() {
         return Ok(BTree::from_root(root));
     }
     let compacted = BTree::empty()
@@ -32342,13 +33798,15 @@ fn compact_search_tree(
 
 fn search_tree_after_mutations(
     pages: &mut PageStore,
-    blobs: &BlobStore,
     root: Option<PageId>,
     creating_csn: Csn,
-    catalog: &CatalogState,
-    mutations: &[Mutation],
-    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+    context: &SearchMutationContext<'_>,
 ) -> Result<BTree, NativeRuntimeError> {
+    let pool = context.buffer_pool;
+    let blobs = context.blobs;
+    let catalog = context.catalog;
+    let mutations = context.mutations;
+    let blob_references = context.blob_references;
     let mut tree = root.map_or_else(BTree::empty, BTree::from_root);
     if tree.root().is_none() {
         tree = tree
@@ -32360,24 +33818,55 @@ fn search_tree_after_mutations(
             )?
             .tree;
     }
-    for mutation in mutations.iter().filter(|mutation| {
-        mutation.engine == EngineKind::Search
-            && matches!(
-                mutation.opcode,
-                Opcode::CreateIndex
-                    | Opcode::IndexDocument
-                    | Opcode::ReplaceDocument
-                    | Opcode::DeleteDocument
-            )
-    }) {
-        tree = apply_search_tree_mutation(
-            pages,
-            blobs,
-            tree,
-            creating_csn,
-            mutation,
-            blob_references,
-        )?;
+    let search_mutations: Vec<&Mutation> = mutations
+        .iter()
+        .filter(|mutation| {
+            mutation.engine == EngineKind::Search
+                && matches!(
+                    mutation.opcode,
+                    Opcode::CreateIndex
+                        | Opcode::IndexDocument
+                        | Opcode::ReplaceDocument
+                        | Opcode::DeleteDocument
+                )
+        })
+        .collect();
+    // Consecutive document insertions coalesce into one copy-on-write batch:
+    // every touched leaf and internal path is rewritten once per run instead
+    // of once per document, which removes the dominant ingest write
+    // amplification while preserving the exact logical tree contents and the
+    // fail-closed per-document validations in order.
+    let mut cursor = 0;
+    while cursor < search_mutations.len() {
+        let mutation = search_mutations[cursor];
+        if mutation.opcode == Opcode::IndexDocument && mutation.expires_at_micros.is_none() {
+            let mut end = cursor + 1;
+            while end < search_mutations.len()
+                && search_mutations[end].opcode == Opcode::IndexDocument
+                && search_mutations[end].expires_at_micros.is_none()
+            {
+                end += 1;
+            }
+            tree = index_documents_batch_in_search_tree(
+                pages,
+                pool,
+                tree,
+                creating_csn,
+                &search_mutations[cursor..end],
+                blob_references,
+            )?;
+            cursor = end;
+        } else {
+            tree = apply_search_tree_mutation(
+                pages,
+                blobs,
+                tree,
+                creating_csn,
+                mutation,
+                blob_references,
+            )?;
+            cursor += 1;
+        }
     }
     ann_store::apply_tree_mutations(pages, tree, creating_csn, catalog, mutations)
 }
@@ -32449,6 +33938,107 @@ fn apply_search_tree_mutation(
     }
 }
 
+/// Applies one run of document insertions as a single copy-on-write batch.
+///
+/// Per-document validation order, admitted states, and failure classes are
+/// identical to [`index_document_in_search_tree`]; a run of length one
+/// produces exactly that function's entry set. Runs may span multiple search
+/// indexes. Duplicate document identities inside one run fail closed exactly
+/// like a sequential reinsertion would.
+fn index_documents_batch_in_search_tree(
+    pages: &mut PageStore,
+    pool: &BufferPool,
+    tree: BTree,
+    creating_csn: Csn,
+    mutations: &[&Mutation],
+    blob_references: &BTreeMap<[u8; 32], BlobReference>,
+) -> Result<BTree, NativeRuntimeError> {
+    // Buffer-pool descents: the tree is immutable for the whole run (every
+    // read precedes the single copy-on-write batch), so cached frames stay
+    // valid and repeated term/posting probes stop re-reading root paths.
+    let format = physical_search_format(pages, tree)?;
+    let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    // (document_count, total_document_terms) accumulated per index.
+    let mut index_metadata: BTreeMap<ObjectId, (u64, u64)> = BTreeMap::new();
+    // Document frequency accumulated per term key across the run.
+    let mut term_frequencies: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for mutation in mutations {
+        let index = mutation
+            .target
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let text = std::str::from_utf8(&mutation.value)
+            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        validate_search_document_identity(&mutation.key, text)?;
+        if let std::collections::btree_map::Entry::Vacant(vacant) = index_metadata.entry(index) {
+            let metadata = tree
+                .get_cached_pinned(pages, pool, &search_index_meta_key(index))?
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            vacant.insert(decode_search_index_metadata(metadata.bytes())?);
+        }
+        let document_key = search_document_key(index, &mutation.key)?;
+        if entries.contains_key(&document_key) {
+            // Same identity twice in one run: a sequential application would
+            // observe the first insertion and fail closed.
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        if let Some(existing) = tree.get_cached_pinned(pages, pool, &document_key)?
+            && (!format.admits_tombstones() || !is_search_document_tombstone(existing.bytes()))
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let (token_count, frequencies) = search_term_frequencies(text)?;
+        entries.insert(
+            document_key,
+            search_document_storage_value(&mutation.value, token_count, blob_references)?,
+        );
+        for (term, term_frequency) in frequencies {
+            let term_key = search_term_meta_key(index, &term)?;
+            let accumulated = if let Some(previous) = term_frequencies.get(&term_key) {
+                *previous
+            } else {
+                tree.get_cached_pinned(pages, pool, &term_key)?
+                    .map(|encoded| decode_live_search_term_metadata(encoded.bytes(), format))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(0)
+            };
+            let document_frequency = accumulated
+                .checked_add(1)
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let posting_key = search_posting_key(index, &term, &mutation.key)?;
+            if let Some(encoded) = tree.get_cached_pinned(pages, pool, &posting_key)?
+                && decode_live_search_posting(encoded.bytes(), format)?.is_some()
+            {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            term_frequencies.insert(term_key.clone(), document_frequency);
+            entries.insert(term_key, encode_search_term_metadata(document_frequency));
+            entries.insert(
+                posting_key,
+                encode_search_posting(term_frequency, token_count),
+            );
+        }
+        let (document_count, total_document_terms) = index_metadata
+            .get_mut(&index)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        *document_count = document_count
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        *total_document_terms = total_document_terms
+            .checked_add(token_count)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    }
+    for (index, (document_count, total_document_terms)) in index_metadata {
+        entries.insert(
+            search_index_meta_key(index),
+            encode_search_index_metadata(document_count, total_document_terms),
+        );
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
+}
+
 fn index_document_in_search_tree(
     pages: &mut PageStore,
     tree: BTree,
@@ -32495,7 +34085,10 @@ fn index_document_in_search_tree(
             return Err(NativeRuntimeError::InvalidSearchTree);
         }
         entries.insert(term_key, encode_search_term_metadata(document_frequency));
-        entries.insert(posting_key, encode_search_posting(term_frequency));
+        entries.insert(
+            posting_key,
+            encode_search_posting(term_frequency, token_count),
+        );
     }
     entries.insert(
         metadata_key,
@@ -32581,6 +34174,7 @@ fn lifecycle_document_in_search_tree(
         format,
         index,
         &mutation.key,
+        new_token_count,
         (&old_frequencies, &new_frequencies),
         &mut entries,
     )?;
@@ -32589,12 +34183,14 @@ fn lifecycle_document_in_search_tree(
         .tree)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_search_lifecycle_term_entries(
     pages: &PageStore,
     tree: BTree,
     format: PhysicalSearchFormat,
     index: ObjectId,
     document_id: &[u8],
+    new_token_count: u64,
     frequencies: (&SearchTermFrequencies, &SearchTermFrequencies),
     entries: &mut BTreeMap<Vec<u8>, Vec<u8>>,
 ) -> Result<(), NativeRuntimeError> {
@@ -32618,13 +34214,14 @@ fn append_search_lifecycle_term_entries(
             .get(pages, &posting_key)?
             .map(|encoded| decode_live_search_posting(&encoded, format))
             .transpose()?
-            .flatten();
+            .flatten()
+            .map(|posting| posting.term_frequency);
         let next_document_frequency = match (old_frequency, new_frequency) {
             (Some(old), Some(new)) => {
                 if current_term_frequency != Some(old) {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
-                entries.insert(posting_key, encode_search_posting(new));
+                entries.insert(posting_key, encode_search_posting(new, new_token_count));
                 current_document_frequency.ok_or(NativeRuntimeError::InvalidSearchTree)?
             }
             (Some(old), None) => {
@@ -32641,7 +34238,7 @@ fn append_search_lifecycle_term_entries(
                 if current_term_frequency.is_some() {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
-                entries.insert(posting_key, encode_search_posting(new));
+                entries.insert(posting_key, encode_search_posting(new, new_token_count));
                 current_document_frequency
                     .unwrap_or(0)
                     .checked_add(1)
@@ -32761,16 +34358,9 @@ fn search_root_after_mutations(
                 context.state.encode()?,
             )?))
         }
-        SearchFormat::InvertedBTreeV1 => Ok(search_tree_after_mutations(
-            pages,
-            context.blobs,
-            root,
-            creating_csn,
-            context.catalog,
-            context.mutations,
-            context.blob_references,
-        )?
-        .root()),
+        SearchFormat::InvertedBTreeV1 => {
+            Ok(search_tree_after_mutations(pages, root, creating_csn, context)?.root())
+        }
     }
 }
 
@@ -34648,9 +36238,22 @@ fn recover_committed_roots(
         {
             return Err(NativeRuntimeError::InvalidCommittedRoot);
         }
-        validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+        // The retained base root is the current root when no suffix commit
+        // follows; a suffix commit supersedes it below. Either way it is
+        // validated once, at the depth its final role requires.
+        if commits
+            .iter()
+            .all(|recovered| recovered.manifest.commit_csn < storage.retention_floor_csn)
+        {
+            validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+        } else {
+            validate_root_structure(storage.pages, root, visible_csn)?;
+        }
         committed_roots.insert(visible_csn, root.clone());
     }
+    let latest_commit_csn = commits
+        .last()
+        .map(|recovered| recovered.manifest.commit_csn);
     for recovered in commits {
         let anchor_digest = digest_for_lsn(wal_recovery, recovered.commit_lsn)?;
         let root = RootSet::committed_with_storage(
@@ -34669,12 +36272,21 @@ fn recover_committed_roots(
             if recovered.manifest.page_generation != storage.active_generation {
                 return Err(NativeRuntimeError::NoncontiguousCommitSequence);
             }
-            validate_roots(
-                storage.pages,
-                storage.blobs,
-                &root,
-                recovered.manifest.commit_csn,
-            )?;
+            // Every retained root is structurally verified: page kinds,
+            // creating CSNs, and complete reachable-tree shape. Only the root
+            // that becomes current is additionally decoded into complete
+            // logical state; a superseded root is reachable to readers only
+            // through a snapshot pin, which performs that decode when used.
+            if Some(recovered.manifest.commit_csn) == latest_commit_csn {
+                validate_roots(
+                    storage.pages,
+                    storage.blobs,
+                    &root,
+                    recovered.manifest.commit_csn,
+                )?;
+            } else {
+                validate_root_structure(storage.pages, &root, recovered.manifest.commit_csn)?;
+            }
         }
         committed_roots.insert(recovered.manifest.commit_csn, root.clone());
         latest_root = Some(root);
@@ -34753,9 +36365,30 @@ fn digest_for_lsn(
         .ok_or(NativeRuntimeError::InvalidCommittedRoot)
 }
 
+/// Structurally verifies one committed root set and decodes its complete
+/// logical state.
+///
+/// This is the full open-time and maintenance validation for the root a
+/// reader will observe: the current root, a snapshot-pin root, a vacuum
+/// candidate, and the blob-collection root.
 fn validate_roots(
     pages: &PageStore,
     blobs: &BlobStore,
+    roots: &RootSet,
+    visible_csn: Csn,
+) -> Result<(), NativeRuntimeError> {
+    validate_root_structure(pages, roots, visible_csn)?;
+    load_state(pages, blobs, roots)?;
+    Ok(())
+}
+
+/// Structurally verifies one committed root set without decoding its
+/// logical state: every engine root has an admitted page kind and a
+/// creating CSN at or below `visible_csn`, and every B+tree root reaches a
+/// complete, acyclic, canonically ordered, balanced tree whose pages are all
+/// visible at that CSN.
+fn validate_root_structure(
+    pages: &PageStore,
     roots: &RootSet,
     visible_csn: Csn,
 ) -> Result<(), NativeRuntimeError> {
@@ -34843,7 +36476,6 @@ fn validate_roots(
     ) {
         BTree::from_root(search_root).validate_visible(pages, visible_csn)?;
     }
-    load_state(pages, blobs, roots)?;
     Ok(())
 }
 
@@ -34853,6 +36485,8 @@ fn load_state(
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
     FULL_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_FULL_STATE_LOADS.with(|count| count.set(count.get() + 1));
     #[cfg(test)]
     if FAIL_FULL_STATE_LOAD.get() {
         return Err(NativeRuntimeError::UnexpectedFullStateLoad);
@@ -36160,6 +37794,8 @@ fn load_search_state_root(
     let mut index_metadata = BTreeMap::<ObjectId, (u64, u64)>::new();
     let mut term_metadata = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
     let mut postings = BTreeMap::<(ObjectId, Vec<u8>, Vec<u8>), u32>::new();
+    let mut document_token_counts = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
+    let mut carried_lengths = Vec::<((ObjectId, Vec<u8>), u32)>::new();
     for (key, value) in iterator {
         match key.first().copied() {
             Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
@@ -36180,7 +37816,8 @@ fn load_search_state_root(
                     .ok_or(NativeRuntimeError::InvalidSearchTree)?;
                 validate_search_document_identity(document_id, "")
                     .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-                let Some((text, _)) = decode_live_search_document(&value, blobs, format)? else {
+                let Some((text, token_count)) = decode_live_search_document(&value, blobs, format)?
+                else {
                     continue;
                 };
                 validate_search_document_identity(document_id, &text)
@@ -36188,6 +37825,7 @@ fn load_search_state_root(
                 if documents.insert(document_id.to_vec(), text).is_some() {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
+                document_token_counts.insert((index, document_id.to_vec()), token_count);
             }
             Some(SEARCH_TERM_META_PREFIX) => {
                 let (index, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
@@ -36206,32 +37844,74 @@ fn load_search_state_root(
                 }
             }
             Some(SEARCH_POSTING_PREFIX) => {
-                let (index, term, document_id) = decode_search_posting_key(&key)?;
-                if !indexes.contains_key(&index)
-                    || !is_canonical_search_term(term)
-                    || validate_search_document_identity(document_id, "").is_err()
-                {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-                let Some(term_frequency) = decode_live_search_posting(&value, format)? else {
-                    continue;
-                };
-                if !indexes
-                    .get(&index)
-                    .is_some_and(|documents| documents.contains_key(document_id))
-                    || postings
-                        .insert((index, term.to_vec(), document_id.to_vec()), term_frequency)
-                        .is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
+                load_search_posting_entry(
+                    &key,
+                    &value,
+                    format,
+                    &indexes,
+                    &mut postings,
+                    &mut carried_lengths,
+                )?;
             }
             _ if ann_store::is_ann_physical_key(&key) => {}
             _ => return Err(NativeRuntimeError::InvalidSearchTree),
         }
     }
+    validate_carried_posting_lengths(&document_token_counts, &carried_lengths)?;
     validate_search_projection(&indexes, &index_metadata, &term_metadata, &postings)?;
     Ok(SearchState { indexes })
+}
+
+/// Loads one live posting entry into the projection, recording any
+/// carried document length for the cross-check against document headers.
+fn load_search_posting_entry(
+    key: &[u8],
+    value: &[u8],
+    format: PhysicalSearchFormat,
+    indexes: &BTreeMap<ObjectId, BTreeMap<Vec<u8>, String>>,
+    postings: &mut BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), u32>,
+    carried_lengths: &mut Vec<((ObjectId, Vec<u8>), u32)>,
+) -> Result<(), NativeRuntimeError> {
+    let (index, term, document_id) = decode_search_posting_key(key)?;
+    if !indexes.contains_key(&index)
+        || !is_canonical_search_term(term)
+        || validate_search_document_identity(document_id, "").is_err()
+    {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    let Some(posting) = decode_live_search_posting(value, format)? else {
+        return Ok(());
+    };
+    if !indexes
+        .get(&index)
+        .is_some_and(|documents| documents.contains_key(document_id))
+        || postings
+            .insert(
+                (index, term.to_vec(), document_id.to_vec()),
+                posting.term_frequency,
+            )
+            .is_some()
+    {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    if let Some(length) = posting.document_length {
+        carried_lengths.push(((index, document_id.to_vec()), length));
+    }
+    Ok(())
+}
+
+/// A self-describing posting must carry exactly its document's header
+/// token count; any drift is corruption, never a silent rescore.
+fn validate_carried_posting_lengths(
+    document_token_counts: &BTreeMap<(ObjectId, Vec<u8>), u64>,
+    carried_lengths: &[((ObjectId, Vec<u8>), u32)],
+) -> Result<(), NativeRuntimeError> {
+    for (document, length) in carried_lengths {
+        if document_token_counts.get(document) != Some(&u64::from(*length)) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+    }
+    Ok(())
 }
 
 fn validate_search_projection(
@@ -36764,19 +38444,118 @@ mod tests {
     }
 
     #[test]
+    fn compaction_upgrades_legacy_postings_and_stays_noop_when_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let index = ObjectId::new(100)?;
+        let mut database = NativeDatabase::create(directory.path())?;
+        // Seed under the legacy encoder: every posting lands as HYPOST01.
+        super::WRITE_LEGACY_POSTINGS.set(true);
+        let seeded = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut seed = database.begin(1, DurabilityClass::Strict)?;
+            seed.create_search_index(index, "documents")?;
+            seed.index_document(index, b"doc-a".to_vec(), "alpha shared")?;
+            seed.index_document(index, b"doc-b".to_vec(), "beta shared twice shared")?;
+            seed.commit()?;
+            Ok(())
+        })();
+        super::WRITE_LEGACY_POSTINGS.set(false);
+        seeded?;
+        let before = database.match_latest_text(index, "shared", 10)?;
+        assert_eq!(before.len(), 2);
+
+        // Compaction rewrites the legacy postings even without tombstones.
+        let compacted = database.compact_search(DurabilityClass::Strict)?;
+        assert!(compacted.commit.is_some());
+        assert_eq!(compacted.dropped_tombstones, 0);
+        assert_eq!(database.match_latest_text(index, "shared", 10)?, before);
+
+        // The compacted root carries only self-describing postings with
+        // the exact header lengths, and a second compaction is a no-op.
+        let snapshot = database.snapshot(0)?;
+        let root = snapshot
+            .metadata
+            .roots()
+            .root(super::SLOT_SEARCH)
+            .ok_or("missing search root")?;
+        let entries = BTree::from_root(root).scan(&database.pages)?;
+        let mut lengths = BTreeMap::new();
+        for (key, value) in &entries {
+            if key.first() == Some(&super::SEARCH_DOCUMENT_PREFIX) {
+                let (_, document_id) =
+                    super::decode_search_object_key(key, super::SEARCH_DOCUMENT_PREFIX)?;
+                let (count, _, _) = super::decode_search_document_header(value)?;
+                lengths.insert(document_id.to_vec(), count);
+            }
+        }
+        let mut postings = 0;
+        for (key, value) in &entries {
+            if key.first() == Some(&super::SEARCH_POSTING_PREFIX) {
+                assert_eq!(&value[..8], super::SEARCH_POSTING_MAGIC_V2);
+                let (_, _, document_id) = super::decode_search_posting_key(key)?;
+                let posting = super::decode_search_posting(value)?;
+                assert_eq!(
+                    posting.document_length.map(u64::from),
+                    lengths.get(document_id).copied()
+                );
+                postings += 1;
+            }
+        }
+        assert!(postings >= 4);
+        let noop = database.compact_search(DurabilityClass::Strict)?;
+        assert!(noop.commit.is_none());
+        drop(database);
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.match_latest_text(index, "shared", 10)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn posting_codec_writes_self_describing_v2_and_reads_legacy_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // New postings carry the document length and decode both fields.
+        let encoded = super::encode_search_posting(3, 17);
+        assert_eq!(encoded.len(), super::SEARCH_POSTING_SIZE);
+        assert_eq!(&encoded[..8], super::SEARCH_POSTING_MAGIC_V2);
+        let decoded = super::decode_search_posting(&encoded)?;
+        assert_eq!(decoded.term_frequency, 3);
+        assert_eq!(decoded.document_length, Some(17));
+
+        // Legacy v1 postings (zero reserved tail) still decode without a
+        // carried length, so historical roots stay readable.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(super::SEARCH_POSTING_MAGIC);
+        legacy.extend_from_slice(&3_u32.to_le_bytes());
+        legacy.extend_from_slice(&[0; 4]);
+        let decoded = super::decode_search_posting(&legacy)?;
+        assert_eq!(decoded.term_frequency, 3);
+        assert_eq!(decoded.document_length, None);
+
+        // A v1 posting with a nonzero reserved tail is malformed.
+        legacy[12] = 1;
+        assert!(super::decode_search_posting(&legacy).is_err());
+        // A v2 posting whose length is zero or below its term frequency is
+        // malformed: a document cannot contain a term more often than it
+        // has tokens.
+        let zero_length = super::encode_search_posting(3, 0);
+        assert!(super::decode_search_posting(&zero_length).is_err());
+        let short_length = super::encode_search_posting(5, 4);
+        assert!(super::decode_search_posting(&short_length).is_err());
+        // Zero term frequency and unknown magics are malformed.
+        let zero_frequency = super::encode_search_posting(0, 4);
+        assert!(super::decode_search_posting(&zero_frequency).is_err());
+        let mut unknown = super::encode_search_posting(3, 17);
+        unknown[7] = b'9';
+        assert!(super::decode_search_posting(&unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn lexical_batch_merge_preserves_order_and_fails_closed_on_cardinality()
     -> Result<(), Box<dyn std::error::Error>> {
         let ordered = vec![
-            super::LexicalPostingBatch {
-                term_index: 0,
-                live_postings: 1,
-                contributions: vec![(b"a".to_vec(), 1.0)],
-            },
-            super::LexicalPostingBatch {
-                term_index: 1,
-                live_postings: 1,
-                contributions: vec![(b"a".to_vec(), 2.0), (b"b".to_vec(), 2.5)],
-            },
+            super::LexicalPostingBatch::from_pairs(0, 1, &[(b"a", 1.0)]),
+            super::LexicalPostingBatch::from_pairs(1, 1, &[(b"a", 2.0), (b"b", 2.5)]),
         ];
         assert_eq!(
             super::finalize_lexical_batches(ordered, &[1, 1], 2)?,
@@ -36793,11 +38572,7 @@ mod tests {
         );
         assert!(matches!(
             super::finalize_lexical_batches(
-                vec![super::LexicalPostingBatch {
-                    term_index: 0,
-                    live_postings: 1,
-                    contributions: Vec::new(),
-                }],
+                vec![super::LexicalPostingBatch::from_pairs(0, 1, &[])],
                 &[2],
                 1,
             ),
@@ -36806,22 +38581,39 @@ mod tests {
         assert!(matches!(
             super::finalize_lexical_batches(
                 vec![
-                    super::LexicalPostingBatch {
-                        term_index: 1,
-                        live_postings: 1,
-                        contributions: Vec::new(),
-                    },
-                    super::LexicalPostingBatch {
-                        term_index: 0,
-                        live_postings: 1,
-                        contributions: Vec::new(),
-                    },
+                    super::LexicalPostingBatch::from_pairs(1, 1, &[]),
+                    super::LexicalPostingBatch::from_pairs(0, 1, &[]),
                 ],
                 &[1, 1],
                 1,
             ),
             Err(NativeRuntimeError::InvalidSearchTree)
         ));
+        // Ranking on the shared arena: ties break on id, zero scores drop,
+        // and top-k truncation matches a full sort.
+        let ranked = super::finalize_lexical_batches(
+            vec![
+                super::LexicalPostingBatch::from_pairs(
+                    0,
+                    4,
+                    &[(b"a", 1.0), (b"b", 3.0), (b"c", 3.0), (b"d", 0.0)],
+                ),
+                super::LexicalPostingBatch::from_pairs(1, 2, &[(b"a", 0.5), (b"zz", 1.0)]),
+            ],
+            &[4, 2],
+            3,
+        )?;
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|hit| (hit.document_id.as_slice(), hit.score))
+                .collect::<Vec<_>>(),
+            [
+                (b"b".as_slice(), 3.0),
+                (b"c".as_slice(), 3.0),
+                (b"a".as_slice(), 1.5)
+            ]
+        );
         Ok(())
     }
 
@@ -57234,6 +59026,82 @@ mod tests {
         Ok(())
     }
 
+    /// Open decodes complete logical state once, for the root that becomes
+    /// current, regardless of how many superseded commits remain retained;
+    /// every retained root is still structurally verified, so a future page
+    /// planted under a superseded root is rejected before visibility.
+    #[test]
+    fn open_decodes_complete_state_once_and_still_verifies_superseded_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        stage_vertical(&mut database)?.commit()?;
+        let table = ObjectId::new(1)?;
+        for index in 0_u8..24 {
+            let mut commit = database.begin(200 + i64::from(index), DurabilityClass::Strict)?;
+            commit.insert(table, vec![b'k', index], b"v".to_vec())?;
+            commit.set(vec![b's', index], b"v".to_vec(), None)?;
+            commit.commit()?;
+        }
+        let superseded_root = database
+            .coordinator
+            .snapshot(150)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        drop(database);
+
+        let before = super::THREAD_FULL_STATE_LOADS.with(std::cell::Cell::get);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let after = super::THREAD_FULL_STATE_LOADS.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            1,
+            "open performed {} complete-state loads for 25 retained commits",
+            after - before
+        );
+        assert_eq!(reopened.snapshot(300)?.get(b"s\x17"), Some(b"v".as_slice()));
+        assert_eq!(reopened.recovery_report().replayed_transactions, 25);
+        drop(reopened);
+
+        // Re-encode the superseded structure root with a creating CSN from
+        // the future. Only superseded roots reach that page now; the
+        // structural pass over retained roots must still reject it.
+        let page_path = temporary.path().join(PAGE_FILE);
+        let store = PageStore::open(&page_path)?;
+        let page = store.read(superseded_root)?;
+        let forged = hyphae_native_pages::Page::new(
+            page.id(),
+            page.kind(),
+            Some(Csn::new(u64::MAX / 2)?),
+            page.next(),
+            page.payload().to_vec(),
+        )?
+        .encode();
+        drop(store);
+        let mut page_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(page_path)?;
+        let offset = superseded_root
+            .get()
+            .checked_sub(1)
+            .and_then(|page| page.checked_mul(u64::try_from(hyphae_native_pages::PAGE_SIZE).ok()?))
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        page_file.seek(SeekFrom::Start(offset))?;
+        page_file.write_all(&forged)?;
+        page_file.sync_data()?;
+        let outcome = NativeDatabase::open(temporary.path());
+        assert!(
+            matches!(
+                outcome,
+                Err(NativeRuntimeError::FuturePage | NativeRuntimeError::BTree(_))
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        Ok(())
+    }
+
     fn ann_config() -> Result<HnswConfig, NativeRuntimeError> {
         Ok(HnswConfig::new(4, 16, 8, 32, 0x4859_5048_4145)?)
     }
@@ -60793,6 +62661,191 @@ mod tests {
 
     fn scalar_reuse_collection_keys() -> [&'static [u8]; 5] {
         [b"hash", b"set", b"list", b"stream", b"sorted"]
+    }
+
+    type LogicalEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// A coalesced run of persistent scalar `SET`s must produce exactly the
+    /// logical tree contents of applying each mutation in order, including
+    /// expiry-index retirement for keys that previously carried a TTL, and
+    /// must keep the per-key live-collection guard.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn coalesced_scalar_set_run_matches_sequential_v2_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"ttl".to_vec(), b"old".to_vec(), Some(500))?;
+        seed.set(b"plain".to_vec(), b"old".to_vec(), None)?;
+        seed.create_hash(b"owned".to_vec())?;
+        seed.commit()?;
+
+        // Run: overwrite a TTL key persistently, overwrite a plain key,
+        // insert fresh keys, and touch one key twice (splits the run).
+        let mut run = database.begin(20, DurabilityClass::Strict)?;
+        run.set(b"ttl".to_vec(), b"new".to_vec(), None)?;
+        run.set(b"plain".to_vec(), b"new".to_vec(), None)?;
+        for index in 0_u8..64 {
+            run.set(vec![b'k', index], vec![index], None)?;
+        }
+        run.set(b"plain".to_vec(), b"newer".to_vec(), None)?;
+        run.set(b"mixed".to_vec(), b"ttl".to_vec(), Some(900))?;
+        run.set(b"after".to_vec(), b"value".to_vec(), None)?;
+        run.commit()?;
+
+        // Reference: the same logical writes applied one commit at a time,
+        // which never enters the coalesced path.
+        let reference = TestDirectory::new();
+        let mut expected = NativeDatabase::create(reference.path())?;
+        let mut seed = expected.begin(10, DurabilityClass::Strict)?;
+        seed.set(b"ttl".to_vec(), b"old".to_vec(), Some(500))?;
+        seed.set(b"plain".to_vec(), b"old".to_vec(), None)?;
+        seed.create_hash(b"owned".to_vec())?;
+        seed.commit()?;
+        let mut writes: Vec<(Vec<u8>, Vec<u8>, Option<i64>)> = vec![
+            (b"ttl".to_vec(), b"new".to_vec(), None),
+            (b"plain".to_vec(), b"new".to_vec(), None),
+        ];
+        for index in 0_u8..64 {
+            writes.push((vec![b'k', index], vec![index], None));
+        }
+        writes.push((b"plain".to_vec(), b"newer".to_vec(), None));
+        writes.push((b"mixed".to_vec(), b"ttl".to_vec(), Some(900)));
+        writes.push((b"after".to_vec(), b"value".to_vec(), None));
+        for (key, value, expiry) in writes {
+            let mut one = expected.begin(20, DurabilityClass::Strict)?;
+            one.set(key, value, expiry)?;
+            one.commit()?;
+        }
+
+        let logical = |database: &NativeDatabase| -> Result<LogicalEntries, NativeRuntimeError> {
+            let root = database
+                .coordinator
+                .snapshot(20)?
+                .roots()
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            // Compare live logical entries (value + expiry) and the live
+            // expiry index rather than raw pages, since the reference
+            // spends many CSNs.
+            let state = super::load_structure_state_root(&database.pages, &database.blobs, root)?;
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = state
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    let mut value = entry.value.clone();
+                    value.extend_from_slice(
+                        &entry.expires_at_micros.unwrap_or(i64::MIN).to_le_bytes(),
+                    );
+                    (key.clone(), value)
+                })
+                .collect();
+            let expiry_index: Vec<(Vec<u8>, Vec<u8>)> = BTree::from_root(root)
+                .scan(&database.pages)?
+                .into_iter()
+                .filter(|(key, value)| {
+                    key.first() == Some(&super::STRUCTURE_EXPIRY_PREFIX)
+                        && value.as_slice() == [super::STRUCTURE_EXPIRY_LIVE]
+                })
+                .collect();
+            entries.extend(expiry_index);
+            Ok(entries)
+        };
+        assert_eq!(logical(&database)?, logical(&expected)?);
+        let snapshot = database.snapshot(20)?;
+        assert_eq!(snapshot.get(b"ttl"), Some(b"new".as_slice()));
+        assert_eq!(snapshot.get(b"plain"), Some(b"newer".as_slice()));
+        assert_eq!(snapshot.get(b"k\x3f"), Some([63_u8].as_slice()));
+        assert_eq!(
+            database.ttl_latest_structure(b"ttl", 20)?,
+            super::Ttl::Persistent
+        );
+        assert_eq!(
+            database.ttl_latest_structure(b"mixed", 20)?,
+            super::Ttl::RemainingMicros(880)
+        );
+
+        // Failure path: the root-construction guard rejects a run that
+        // reaches a key owning a live collection, independent of the model
+        // check that normally stops such a `set` earlier. Nothing publishes:
+        // the rejected pages are an unpublished tail.
+        let before = database.coordinator.snapshot(20)?.roots().digest();
+        let root = database
+            .coordinator
+            .snapshot(20)?
+            .roots()
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let fresh = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"fresh".to_vec(),
+            value: b"value".to_vec(),
+            expires_at_micros: None,
+        };
+        let over_hash = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: b"owned".to_vec(),
+            value: b"scalar-over-hash".to_vec(),
+            expires_at_micros: None,
+        };
+        let pages_before = database.pages.page_count();
+        let outcome = super::upsert_scalar_set_run(
+            &mut database.pages,
+            &database.buffer_pool,
+            BTree::from_root(root),
+            true,
+            Csn::new(99)?,
+            &[&fresh, &over_hash],
+            &BTreeMap::new(),
+        );
+        assert!(
+            matches!(outcome, Err(NativeRuntimeError::InvalidStructureTree)),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            database.pages.page_count(),
+            pages_before,
+            "rejected run appended pages"
+        );
+        assert_eq!(database.coordinator.snapshot(20)?.roots().digest(), before);
+        // A run must not carry an expiring or targeted mutation.
+        let expiring = Mutation {
+            expires_at_micros: Some(1_000),
+            ..fresh.clone()
+        };
+        let outcome = super::upsert_scalar_set_run(
+            &mut database.pages,
+            &database.buffer_pool,
+            BTree::from_root(root),
+            true,
+            Csn::new(99)?,
+            &[&expiring],
+            &BTreeMap::new(),
+        );
+        assert!(matches!(
+            outcome,
+            Err(NativeRuntimeError::InvalidStructureTree)
+        ));
+        // The public path still rejects a scalar over a live hash at the
+        // model boundary.
+        let mut public = database.begin(30, DurabilityClass::Strict)?;
+        assert!(matches!(
+            public.set(b"owned".to_vec(), b"x".to_vec(), None),
+            Err(NativeRuntimeError::StructureKindMismatch)
+        ));
+        drop(public);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let snapshot = reopened.snapshot(20)?;
+        assert_eq!(snapshot.get(b"after"), Some(b"value".as_slice()));
+        assert_eq!(snapshot.get(b"k\x00"), Some([0_u8].as_slice()));
+        Ok(())
     }
 
     fn stage_structure_v3_scalar_mutations<'database>(

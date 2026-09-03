@@ -443,6 +443,21 @@ struct LexicalBranchInput {
     candidate_limit: usize,
     #[serde(default = "default_branch_weight")]
     weight: u32,
+    /// `"and"` or `{"minimum_match": N}`.
+    #[serde(default)]
+    operator: Option<Value>,
+    /// Expand the final analyzed term as a bounded prefix.
+    #[serde(default)]
+    prefix: bool,
+    /// Levenshtein edit distance (1..=2) expanding every query term.
+    #[serde(default)]
+    fuzzy: Option<usize>,
+    /// Require the exact consecutive analyzed phrase.
+    #[serde(default)]
+    phrase: bool,
+    /// BM25F boosts: array of `{"field": name, "weight_micros": N}`.
+    #[serde(default)]
+    fields: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1608,6 +1623,7 @@ async fn memory_store(
 /// lifecycle key still lives — expired or forgotten memories never return.
 /// With `prove`, the retrieval itself is sealed and the artifacts ride the
 /// response; the lifecycle filter is applied after the proved search.
+#[allow(clippy::too_many_lines)]
 async fn memory_recall(
     client: &HyphaeClient,
     input: MemoryRecallInput,
@@ -1622,17 +1638,25 @@ async fn memory_recall(
             query: input.query,
             candidate_limit: 1_000,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: input.limit,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let (result, proof) = if input.prove {
         let response = client
@@ -2029,17 +2053,25 @@ async fn profile_memory_recall(
             query: input.query,
             candidate_limit: 1_000,
             weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
         }),
         vectors: Vec::new(),
         filter: ProductSearchFilter::All(clauses),
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
         limit: input.limit,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let (result, proof) = if input.prove {
         let response = client
@@ -2402,6 +2434,7 @@ async fn profile_memory_status(
         filter: ProductSearchFilter::MatchAll,
         sort: Vec::new(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: vec![hyphae_native_product::ProductNamedAggregation {
             name: "memories".to_owned(),
             aggregation: hyphae_native_product::ProductAggregation::Count,
@@ -2411,6 +2444,8 @@ async fn profile_memory_status(
         parent_dedupe: None,
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     };
     let response = client
         .search_collection(collection_id, request, options)
@@ -2489,15 +2524,77 @@ async fn memory_forget(
     Ok(json!({"status": "forgotten", "id": identity.to_string()}))
 }
 
+fn lexical_operator_input(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalOperator, Box<ProductError>> {
+    match value {
+        Value::String(kind) if kind == "and" => {
+            Ok(hyphae_native_product::ProductLexicalOperator::And)
+        }
+        Value::Object(mut object) => {
+            let minimum_match = object
+                .remove("minimum_match")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(invalid_request)?;
+            if !object.is_empty() {
+                return Err(invalid_request());
+            }
+            Ok(hyphae_native_product::ProductLexicalOperator::Or { minimum_match })
+        }
+        _ => Err(invalid_request()),
+    }
+}
+
+fn lexical_field_boost_input(
+    value: Value,
+) -> Result<hyphae_native_product::ProductLexicalFieldBoost, Box<ProductError>> {
+    let Value::Object(mut object) = value else {
+        return Err(invalid_request());
+    };
+    let field = object
+        .remove("field")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(invalid_request)?;
+    let weight_micros = object
+        .remove("weight_micros")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(invalid_request)?;
+    if !object.is_empty() {
+        return Err(invalid_request());
+    }
+    Ok(hyphae_native_product::ProductLexicalFieldBoost {
+        field,
+        weight_micros,
+    })
+}
+
 pub(crate) fn collection_search_request(
     input: CollectionSearchInput,
 ) -> Result<ProductSearchRequest, Box<ProductError>> {
     Ok(ProductSearchRequest {
-        lexical: input.lexical.map(|branch| ProductLexicalBranch {
-            query: branch.query,
-            candidate_limit: branch.candidate_limit,
-            weight: branch.weight,
-        }),
+        lexical: input
+            .lexical
+            .map(
+                |branch| -> Result<ProductLexicalBranch, Box<ProductError>> {
+                    Ok(ProductLexicalBranch {
+                        query: branch.query,
+                        candidate_limit: branch.candidate_limit,
+                        weight: branch.weight,
+                        operator: branch.operator.map(lexical_operator_input).transpose()?,
+                        prefix: branch.prefix,
+                        fields: branch
+                            .fields
+                            .into_iter()
+                            .map(lexical_field_boost_input)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        fuzzy: branch.fuzzy,
+                        phrase: branch.phrase,
+                    })
+                },
+            )
+            .transpose()?,
         vectors: input
             .vectors
             .into_iter()
@@ -2508,6 +2605,7 @@ pub(crate) fn collection_search_request(
                     candidate_limit: branch.candidate_limit,
                     weight: branch.weight,
                     execution: None,
+                    max_distance: None,
                 })
             })
             .collect::<Result<_, Box<ProductError>>>()?,
@@ -2526,6 +2624,7 @@ pub(crate) fn collection_search_request(
             .into_iter()
             .map(|value| crate::product_facet(value).map_err(|_| invalid_request()))
             .collect::<Result<_, _>>()?,
+        range_facets: Vec::new(),
         aggregations: input
             .aggregations
             .into_iter()
@@ -2545,6 +2644,8 @@ pub(crate) fn collection_search_request(
         }),
         rerank: None,
         highlight: None,
+        autocut: None,
+        offset: 0,
     })
 }
 

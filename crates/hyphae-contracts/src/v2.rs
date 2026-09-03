@@ -19,11 +19,11 @@ pub const SESSION_ID_HEADER_V2: &str = "x-hyphae-session-id";
 /// echoed by servers.
 pub const PROTOCOL_MINOR_HEADER_V2: &str = "x-hyphae-protocol-minor";
 /// Highest Native HTTP v2 protocol minor this build serves.
-pub const PROTOCOL_MINOR_VALUE_V2: &str = "5";
+pub const PROTOCOL_MINOR_VALUE_V2: &str = "6";
 /// Every Native HTTP v2 protocol minor this build serves, ascending. The
 /// server selects the highest member the client also offers and echoes the
 /// selection; an offer with no supported member fails closed.
-pub const PROTOCOL_MINORS_SUPPORTED_V2: &[u16] = &[3, 4, 5];
+pub const PROTOCOL_MINORS_SUPPORTED_V2: &[u16] = &[3, 4, 5, 6];
 
 /// Typed configured-limit evidence in a Native product error.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

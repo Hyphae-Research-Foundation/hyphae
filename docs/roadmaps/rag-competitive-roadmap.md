@@ -10,21 +10,23 @@ published, zero new dependencies in the proof-bearing core.
 
 ## Thesis
 
-Weaviate wins on breadth and scale-out. It cannot win on verifiability,
-determinism, local cost, or its OSS/cloud feature split — those are
-structural properties of its architecture and business, not features it can
-ship. The strategy: close the six disqualifying RAG gaps (collection cap,
-lexical maturity, fusion options, filter operators, embeddings, framework
-integrations), leapfrog on four fronts nobody holds (proof-carrying RAG,
-deterministic chunking with provenance, MCP proof tools, migration receipts
-out of Weaviate), and refuse the rest loudly with counter-positioning. Fight
-head-on at up to one million documents; above that, concede the category
-argument on purpose.
+Weaviate leads on breadth and scale-out; those remain its strengths and
+this roadmap does not contest them. Hyphae differentiates on
+verifiability, determinism, local cost, and a fully local feature set —
+structural properties of Hyphae's architecture, not judgments about
+anyone else's. The strategy: close the six disqualifying RAG gaps
+(collection cap, lexical maturity, fusion options, filter operators,
+embeddings, framework integrations), invest in four differentiators no
+local engine ships today (proof-carrying RAG, deterministic chunking with
+provenance, MCP proof tools, migration receipts), and explicitly defer
+the rest. Compete directly at up to one million documents; above that,
+concede the category argument on purpose.
 
-The adopted positioning ("Weaviate, Milvus, Qdrant: a category argument, not
-a benchmark one") is sharpened, not abandoned: it still holds for scale-out.
-At local RAG scale it becomes: we fight head-on and win on proof,
-determinism, memory, and price.
+The adopted positioning ("Weaviate, Milvus, Qdrant: a category argument,
+not a benchmark one") is sharpened, not abandoned: it still holds for
+scale-out. At local RAG scale, Hyphae competes directly on proof,
+determinism, memory, and price, with every comparative number bound to a
+same-host receipt under the claims policy.
 
 ## Gap matrix
 
@@ -45,45 +47,45 @@ boundary — single node, local-first, one process, one directory).
 | 8 | Generative search (retrieve + LLM in one call) | 15+ providers, per-query selection | none | IMPORTANT | COUNTER — an LLM call never enters the engine; compose above it and bind the retrieved context with a proof |
 | 9 | MCP server | GA, four tools (query, upsert, config, tenants) | three admin-only tools | IMPORTANT | MATCH AND BEAT — M track adds a proof tool nobody has |
 | 10 | Quantization (PQ/BQ/SQ/RQ, multi-vector) | mature | none | IMPORTANT (memory optics) | DEFERRED — adopted stance stands (opt-in, never default, receipted); counter now with recall-risk honesty and measured RSS |
-| 11 | Query Agent (cloud test-time compute) | GA, cloud-only | none | IMPORTANT | COUNTER — local attested rerank plus published harness numbers; attack the cloud-only split |
+| 11 | Query Agent (cloud test-time compute) | GA, cloud-only | none | IMPORTANT | COUNTER — local attested rerank plus published harness numbers; position on the fully local alternative |
 | 12 | Multi-vector / late interaction (ColBERT, MUVERA) | GA | 16 named-vector branches, no late interaction | NICE at local scale | DEFER (revisit after F and E tracks) |
 | 13 | Native chunking | absent (delegated to frameworks) | absent | IMPORTANT | LEAPFROG — C track: deterministic chunking with provenance in the proof |
 | 14 | Highlighting | yes | no (positions already re-derived under budget) | NICE | MATCH small — L4 |
 | 15 | Disk-based billion-vector indexes | GA | no | n/a at local scale | NOT-COMPETE |
 | 16 | Sharding / replication / consensus | yes | single node | n/a | NOT-COMPETE (post-G8 non-goal stands) |
 | 17 | Native multi-tenancy with tiered offload | yes | explicit non-goal | n/a | NOT-COMPETE — tenancy by directory |
-| 18 | Managed cloud (embeddings, agents, memory service) | yes | no | n/a | NOT-COMPETE — this is the attack surface |
+| 18 | Managed cloud (embeddings, agents, memory service) | yes | no | n/a | NOT-COMPETE — Hyphae positions on the fully local alternative |
 | 19 | GraphQL API | yes | typed SDKs, SQL, local protocol | none | NOT-COMPETE |
 
-## Attack vectors
+## Differentiators
 
-Each pairs a structural Weaviate weakness with the Hyphae capability that
-lands the punch and the claim it unlocks. A claim ships only with its
-measurement.
+Each pairs a capability the local-RAG market does not ship today with the
+Hyphae capability that provides it and the claim it unlocks. A claim
+ships only with its measurement, names no competitor deficiency, and
+follows the [claims policy](../product/claims.md).
 
-1. No verifiability story → offline-verifiable native proofs for lexical,
-   exact-vector, ANN, and hybrid operations, extended by the Phase 4 Proof
-   of Retrieval. Claim: your retrieval ran exactly this, provable offline,
-   without trusting the operator.
-2. No determinism → deterministic HNSW (definition-pinned seed, digest-
-   derived levels, byte-identical rebuilds) against index builds that drift
-   across restarts and replicas. Claim: same corpus, same query, same
-   result — run it twice and diff.
-3. Memory and operational burden (out-of-memory defaults, cache-tuning
-   surface, dedicated operations staffing) → one static binary, bounded
-   budgets, fail-closed limits, no tuning surface. Claim ships only with a
-   measured side-by-side RSS protocol.
-4. OSS/cloud feature split (agents, managed embeddings, and memory service
-   are cloud-only) → everything Hyphae ships is Apache-2.0 and runs
-   locally. Claim: no feature behind a subscription.
-5. Cost curve at managed scale → zero-cost local operation at the
-   10^5–10^6-chunk scale where most private RAG lives.
-6. Chunking not native → deterministic chunker with provenance digests
-   bound into proofs.
-7. Four MCP tools, none about evidence → an MCP surface with search,
-   ingest, and proof tools.
-8. Lock-in with no exit accounting → a Weaviate importer with sealed G10
-   fidelity receipts. Claim: leave Weaviate with a receipt.
+1. Offline verifiability → offline-verifiable native proofs for lexical,
+   exact-vector, ANN, and hybrid operations, extended by the Phase 4
+   Proof of Retrieval. Claim: your retrieval ran exactly this, provable
+   offline, without trusting the operator.
+2. Determinism → deterministic HNSW (definition-pinned seed,
+   digest-derived levels, byte-identical rebuilds). Claim: same corpus,
+   same query, same result — run it twice and diff.
+3. Operational simplicity → one static binary, bounded budgets,
+   fail-closed limits, no tuning surface. Any memory comparison ships
+   only with a measured side-by-side RSS protocol.
+4. Fully local feature set → everything Hyphae ships is Apache-2.0 and
+   runs locally, including agents-facing memory and attested embeddings.
+   Claim: no Hyphae feature is behind a subscription.
+5. Local cost → zero-cost local operation at the 10^5–10^6-chunk scale
+   where most private RAG lives.
+6. Native chunking → deterministic chunker with provenance digests bound
+   into proofs.
+7. Evidence-bearing MCP → an MCP surface with search, ingest, and proof
+   tools.
+8. Exit accounting → importers with sealed G10 fidelity receipts, so
+   migration in either direction is verifiable. Claim: migrate with a
+   receipt.
 
 ## Model integration: two routes, both shipped, one flagship
 
@@ -135,7 +137,7 @@ proceed as adopted and are orthogonal.
   cannot discover the collection cap or hit cap).
 - **L1** Tunable BM25 `k1`/`b` per lexical index, bound into the proof.
 
-### Wave 2 — kill the 10,000-document cap; lexical and fusion parity
+### Wave 2 — raise the 10,000-document cap; lexical and fusion parity
 
 - **R1** Relevance harness: NDCG@10, recall@k, MRR over local-scale public
   datasets with pinned digests, seeds, and hardware declaration — the G7
@@ -158,9 +160,19 @@ proceed as adopted and are orthogonal.
   in the product search path is deleted. Evidence: filtered recall/latency
   at 100k documents across a selectivity sweep, all recall-risk labels
   exercised.
-- **R5** Staged collection-cap raise: 10k → 100k on R4 evidence, → 1M on
-  measured consolidation cost and RSS at 1M×768-dim. The cap moves only
-  when the receipt exists.
+- **R5** Staged collection-cap raise: 10k → 100k on R4 evidence; → 250k on
+  the [2026-09-02 rung receipt](../gates/evidence/collection-cap-250k-2026-09-02.md)
+  (point-resolved batch ingest 48 → 949–1,261 docs/s, open decoding
+  complete state once, borrowed-leaf durable scorer 73 → 26 ms bm25 p50 at
+  100k and 63 ms at 250k, bit-identical model/durable scorer hits at both
+  rungs); → 1M on measured consolidation cost and RSS at 1M×768-dim plus a
+  manifest that no longer rewrites 16 bytes per document per batch. The
+  manifest condition is met by the chunked `HYPSMAN2` manifest
+  ([2026-09-03 receipt](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md):
+  1,014 docs/s flat from 250k to 1M, bm25 p50 24 ms at 250k and 172 ms at
+  1M, reopen 25 s / 107 s); the two vector conditions wait on an ANN delta
+  stage, since a vector-carrying batch still takes the materialized ingest
+  transaction. The cap moves only when the receipt exists.
 - **R6** Filter operators In / ContainsAny / ContainsAll / bounded Like /
   IsNull and doc-value types Float, Date (canonical epoch integer), Array —
   product model, SQL surface, proof binding, SDKs. Decided ordering story:

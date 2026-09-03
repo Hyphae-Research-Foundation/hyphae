@@ -550,6 +550,11 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
                 query: "rust".to_owned(),
                 candidate_limit: 8,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::All(vec![
@@ -570,12 +575,15 @@ fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn s
             ]),
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
             parent_dedupe: None,
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
     });
     let encoded = encode_product_request_for_minor(&request, 0)?;
@@ -636,12 +644,15 @@ fn membership_null_and_pattern_operators_require_minor_four()
                 filter,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
+                offset: 0,
             },
         });
         assert!(matches!(
@@ -672,17 +683,25 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion,
                 parent_dedupe: None,
                 rerank: None,
                 highlight: None,
+                autocut: None,
+                offset: 0,
             },
         })
     };
@@ -718,11 +737,17 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: Some(hyphae_native_product::ProductFusionMethod::WeightedScore),
@@ -732,6 +757,8 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
             }),
             rerank: None,
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -763,11 +790,17 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 query: "rust".to_owned(),
                 candidate_limit: 4,
                 weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
             }),
             vectors: Vec::new(),
             filter: ProductSearchFilter::MatchAll,
             sort: Vec::new(),
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             limit: 4,
             fusion: None,
@@ -777,6 +810,8 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
                 scores: vec![(ObjectId::new(201)?, 0.75), (ObjectId::new(202)?, 0.25)],
             }),
             highlight: None,
+            autocut: None,
+            offset: 0,
         },
     });
     assert!(matches!(
@@ -800,6 +835,7 @@ fn weighted_score_fusion_requires_minor_four_and_default_bytes_are_unchanged()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
 -> Result<(), Box<dyn std::error::Error>> {
     let collection = ObjectId::new(13)?;
@@ -811,17 +847,25 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                     query: "rust".to_owned(),
                     candidate_limit: 4,
                     weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
                 }),
                 vectors: Vec::new(),
                 filter: ProductSearchFilter::MatchAll,
                 sort: Vec::new(),
                 facets: Vec::new(),
+                range_facets: Vec::new(),
                 aggregations: Vec::new(),
                 limit: 4,
                 fusion: None,
                 parent_dedupe: None,
                 rerank: None,
                 highlight,
+                autocut: None,
+                offset: 0,
             },
         })
     };
@@ -875,6 +919,7 @@ fn budgeted_highlighting_requires_minor_five_and_default_bytes_are_unchanged()
                 fragments,
             }],
             facets: Vec::new(),
+            range_facets: Vec::new(),
             aggregations: Vec::new(),
             vector_branches: Vec::new(),
             approximate: false,
@@ -1251,7 +1296,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
+fn protocol_minor_negotiation_preserves_1_0_through_1_5_and_selects_1_6()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1329,6 +1374,21 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
         .minor,
         4
     );
+    let minor_five = Hello {
+        maximum_minor: 5,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_five,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        5
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -1338,12 +1398,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_4_and_selects_1_5()
             1
         )?
         .minor,
-        5
+        6
     );
 
     let incompatible = Hello {
-        minimum_minor: 6,
-        maximum_minor: 6,
+        minimum_minor: 7,
+        maximum_minor: 7,
         ..Hello::default()
     };
     assert_eq!(
@@ -1902,5 +1962,1080 @@ async fn negotiated_frame_payload_bounds_send_and_receive() -> Result<(), Box<dy
     let (mut writer, mut reader) = tokio::io::duplex(oversized.len());
     writer.write_all(&oversized).await?;
     assert!(codec.receive(&mut reader).await.is_err());
+    Ok(())
+}
+
+#[test]
+fn minor_six_structure_reads_gate_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        ProductHashScanStop, ProductRead, ProductScoreBound, ProductSortedSetOrder,
+        ProductStructureKey, ProductStructureReadRequest, ProductStructureReadResult,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+    let requests = [
+        ProductStructureReadRequest::SortedSetScoreRange {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            lower: ProductScoreBound::Exclusive(1.5),
+            upper: ProductScoreBound::Unbounded,
+            offset: 2,
+            limit: 16,
+            order: ProductSortedSetOrder::Descending,
+        },
+        ProductStructureReadRequest::HashScanReverse {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"profile".to_vec(),
+            },
+            start_before: Some(b"user:2".to_vec()),
+            limit: 8,
+        },
+        ProductStructureReadRequest::HashScanMatch {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"profile".to_vec(),
+            },
+            pattern: b"user:*".to_vec(),
+            start_after: None,
+            output_limit: 8,
+            visit_limit: 32,
+            match_step_limit: 256,
+        },
+    ];
+    for request in requests {
+        let wire = security_wire_request(ProductOperation::StructureRead(request));
+        // Below minor 6 the request is unsupported on both directions.
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        let ProductOperation::StructureRead(decoded_read) = decoded.operation else {
+            return Err("decoded operation is not a structure read".into());
+        };
+        let ProductOperation::StructureRead(original_read) = wire.operation else {
+            return Err("original operation is not a structure read".into());
+        };
+        assert_eq!(format!("{decoded_read:?}"), format!("{original_read:?}"));
+    }
+
+    // HashPage response gates identically and round-trips.
+    let response = ProductResponse::StructureRead(ProductRead {
+        snapshot: SnapshotIdentity {
+            directory_lineage: [7; 24],
+            visible_csn: hyphae_native_product::Csn::new(3).ok(),
+            catalog_version: hyphae_native_product::CatalogVersion::new(2)?,
+            root_digest: [9; 32],
+            logical_time_micros: 10,
+        },
+        value: ProductStructureReadResult::HashPage {
+            entries: vec![hyphae_native_product::ProductHashEntry {
+                field: b"user:1".to_vec(),
+                value: b"ana".to_vec(),
+            }],
+            continuation: Some(b"user:1".to_vec()),
+            stop: ProductHashScanStop::VisitLimit,
+            visited: 3,
+            match_steps: 12,
+        },
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&response, 6)?;
+    assert!(matches!(
+        decode_product_response_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_response_for_minor(&encoded, 6)?;
+    assert_eq!(decoded, response);
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn minor_six_key_scan_and_sorted_set_mutations_gate_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        CanonicalF64, ProductHashScanStop, ProductRead, ProductStructureKey,
+        ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+        ProductStructureReadResult, ProductTransactionHandle, ProductTransactionStageReceipt,
+        ProductTransactionStageResult, StructureKind,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+
+    // KeyScanMatch request gates below minor 6 and round-trips at 6.
+    let request = ProductStructureReadRequest::KeyScanMatch {
+        keyspace,
+        pattern: b"app:*".to_vec(),
+        start_after: Some(b"app:flag".to_vec()),
+        output_limit: 8,
+        visit_limit: 32,
+        match_step_limit: 256,
+    };
+    let wire = security_wire_request(ProductOperation::StructureRead(request));
+    assert!(matches!(
+        encode_product_request_for_minor(&wire, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&wire, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert_eq!(
+        format!("{:?}", decoded.operation),
+        format!("{:?}", wire.operation),
+    );
+
+    // SortedSetIncrement / SortedSetPop mutations gate on both surfaces.
+    let mutations = [
+        ProductStructureMutation::SortedSetIncrement {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            member: b"alpha".to_vec(),
+            delta: CanonicalF64::new(2.5),
+        },
+        ProductStructureMutation::SortedSetPop {
+            key: ProductStructureKey {
+                keyspace,
+                key: b"board".to_vec(),
+            },
+            highest: true,
+        },
+    ];
+    for mutation in mutations {
+        let wire = security_wire_request(ProductOperation::StructureMutate {
+            mutations: vec![mutation],
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+
+    // KeyPage response gates and round-trips with families intact.
+    let response = ProductResponse::StructureRead(ProductRead {
+        snapshot: SnapshotIdentity {
+            directory_lineage: [7; 24],
+            visible_csn: hyphae_native_product::Csn::new(3).ok(),
+            catalog_version: hyphae_native_product::CatalogVersion::new(2)?,
+            root_digest: [9; 32],
+            logical_time_micros: 10,
+        },
+        value: ProductStructureReadResult::KeyPage {
+            entries: vec![
+                hyphae_native_product::ProductKeyEntry {
+                    key: b"app:board".to_vec(),
+                    family: StructureKind::SortedSet,
+                },
+                hyphae_native_product::ProductKeyEntry {
+                    key: b"app:flag".to_vec(),
+                    family: StructureKind::String,
+                },
+            ],
+            continuation: Some(b"app:flag".to_vec()),
+            stop: ProductHashScanStop::OutputLimit,
+            visited: 2,
+            match_steps: 9,
+        },
+    });
+    assert!(matches!(
+        encode_product_response_for_minor(&response, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_response_for_minor(&response, 6)?;
+    assert!(matches!(
+        decode_product_response_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_response_for_minor(&encoded, 6)?;
+    assert_eq!(decoded, response);
+
+    // Staged Score and PoppedEntry results gate and round-trip.
+    let handle = ProductTransactionHandle::new(4).ok_or("handle")?;
+    let staged_results = [
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::Score(
+            CanonicalF64::new(4.0),
+        )),
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::PoppedEntry(
+            Some(hyphae_native_product::ProductSortedSetEntry {
+                member: b"bravo".to_vec(),
+                score: CanonicalF64::new(1.5),
+            }),
+        )),
+        ProductTransactionStageResult::Structure(ProductStructureMutationResult::PoppedEntry(None)),
+    ];
+    for result in staged_results {
+        let response = ProductResponse::TransactionStaged(ProductTransactionStageReceipt {
+            handle,
+            operation_ordinal: 1,
+            changed: true,
+            result,
+        });
+        assert!(matches!(
+            encode_product_response_for_minor(&response, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_response_for_minor(&response, 6)?;
+        assert!(matches!(
+            decode_product_response_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_response_for_minor(&encoded, 6)?;
+        assert_eq!(decoded, response);
+    }
+    Ok(())
+}
+
+#[test]
+fn minor_six_conditional_and_seeded_tags_gate_and_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::{
+        ProductStructureKey, ProductStructureMutation, ProductStructureReadRequest,
+    };
+
+    let keyspace = ObjectId::new(9)?;
+    let key = |name: &[u8]| ProductStructureKey {
+        keyspace,
+        key: name.to_vec(),
+    };
+
+    // New reads gate below minor 6 and round-trip at 6.
+    let requests = [
+        ProductStructureReadRequest::StringRange {
+            key: key(b"greeting"),
+            start: -5,
+            end: -1,
+        },
+        ProductStructureReadRequest::SetRandomMembers {
+            key: key(b"tags"),
+            seed: 42,
+            count: 3,
+        },
+    ];
+    for request in requests {
+        let wire = security_wire_request(ProductOperation::StructureRead(request));
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+
+    // New mutations gate identically on both surfaces.
+    let mutations = [
+        ProductStructureMutation::StringSetConditional {
+            key: key(b"greeting"),
+            value: b"hello".to_vec(),
+            expires_at_micros: Some(99),
+            if_present: true,
+        },
+        ProductStructureMutation::StringAppend {
+            key: key(b"greeting"),
+            suffix: b" world".to_vec(),
+        },
+        ProductStructureMutation::StringSetRange {
+            key: key(b"padded"),
+            offset: 4,
+            patch: b"tail".to_vec(),
+        },
+        ProductStructureMutation::HashSetIfAbsent {
+            key: key(b"profile"),
+            field: b"city".to_vec(),
+            value: b"lima".to_vec(),
+        },
+        ProductStructureMutation::SetPop {
+            key: key(b"tags"),
+            seed: 42,
+        },
+    ];
+    for mutation in mutations {
+        let wire = security_wire_request(ProductOperation::StructureMutate {
+            mutations: vec![mutation],
+        });
+        assert!(matches!(
+            encode_product_request_for_minor(&wire, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&wire, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert_eq!(
+            format!("{:?}", decoded.operation),
+            format!("{:?}", wire.operation),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn relative_score_fusion_requires_minor_six_and_round_trips()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: Some(hyphae_native_product::ProductFusionMethod::RelativeScore),
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.fusion
+                == Some(hyphae_native_product::ProductFusionMethod::RelativeScore)
+    ));
+    Ok(())
+}
+
+#[test]
+fn autocut_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |autocut| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut,
+                offset: 0,
+            },
+        })
+    };
+    // Absent autocut keeps the exact historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.autocut.is_none()
+    ));
+    let cut = request(Some(2));
+    assert!(matches!(
+        encode_product_request_for_minor(&cut, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&cut, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. } if request.autocut == Some(2)
+    ));
+    // A zero steepness fails closed at decode.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn float_doc_values_require_minor_six_and_reject_noncanonical_bits()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust".to_owned(),
+                candidate_limit: 4,
+                weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::Compare {
+                field: "rating".to_owned(),
+                operator: hyphae_native_product::ProductSearchOperator::GreaterOrEqual,
+                value: hyphae_native_product::ProductDocValue::Float(CanonicalF64::new(4.0)),
+            },
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if matches!(
+                &request.filter,
+                ProductSearchFilter::Compare { value, .. }
+                    if *value == hyphae_native_product::ProductDocValue::Float(
+                        CanonicalF64::new(4.0)
+                    )
+            )
+    ));
+    // Non-canonical float bits (negative zero) fail closed at decode.
+    let canonical = CanonicalF64::new(4.0).bits().to_le_bytes();
+    let position = encoded
+        .windows(8)
+        .position(|window| window == canonical)
+        .ok_or("float bits not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 8].copy_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn offset_requires_minor_six_and_rejects_zero_section() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |offset| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset,
+            },
+        })
+    };
+    // A zero offset keeps the exact historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(0), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. } if request.offset == 0
+    ));
+    let paged = request(8);
+    assert!(matches!(
+        encode_product_request_for_minor(&paged, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&paged, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. } if request.offset == 8
+    ));
+    // A forged explicit zero-offset section fails closed.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn average_aggregation_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: vec![hyphae_native_product::ProductNamedAggregation {
+                name: "mean".to_owned(),
+                aggregation: hyphae_native_product::ProductAggregation::Average("price".to_owned()),
+            }],
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if matches!(
+                request.aggregations.first().map(|aggregation| &aggregation.aggregation),
+                Some(hyphae_native_product::ProductAggregation::Average(field)) if field == "price"
+            )
+    ));
+    Ok(())
+}
+
+#[test]
+fn range_facets_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: vec![hyphae_native_product::ProductRangeFacetRequest {
+                field: "price".to_owned(),
+                ranges: vec![
+                    hyphae_native_product::ProductFacetRange {
+                        lower: None,
+                        upper: Some(CanonicalF64::new(15.0)),
+                    },
+                    hyphae_native_product::ProductFacetRange {
+                        lower: Some(CanonicalF64::new(15.0)),
+                        upper: None,
+                    },
+                ],
+            }],
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.range_facets.len() == 1
+                && request.range_facets[0].ranges.len() == 2
+    ));
+    Ok(())
+}
+
+#[test]
+fn vector_distance_cutoff_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::CanonicalF64;
+
+    let collection = ObjectId::new(13)?;
+    let request = security_wire_request(ProductOperation::SearchCollection {
+        collection,
+        request: ProductSearchRequest {
+            lexical: None,
+            vectors: vec![hyphae_native_product::ProductVectorBranch {
+                target: "image".to_owned(),
+                query: hyphae_native_product::ProductVector::new([0.0, 0.0])?,
+                candidate_limit: 4,
+                weight: 1,
+                execution: Some(hyphae_native_product::ProductVectorExecution::Exact),
+                max_distance: Some(CanonicalF64::new(4.0)),
+            }],
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 4,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+    });
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.vectors[0].max_distance == Some(CanonicalF64::new(4.0))
+    ));
+    // A forged negative cutoff fails closed at decode.
+    let canonical = CanonicalF64::new(4.0).bits().to_le_bytes();
+    let position = encoded
+        .windows(8)
+        .rposition(|window| window == canonical)
+        .ok_or("cutoff bits not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 8].copy_from_slice(&(-1.0_f64).to_bits().to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn lexical_operator_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |operator| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust database".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    // Absent operator keeps historical bytes at minor 3.
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.operator.is_none())
+    ));
+    for operator in [
+        hyphae_native_product::ProductLexicalOperator::And,
+        hyphae_native_product::ProductLexicalOperator::Or { minimum_match: 2 },
+    ] {
+        let gated = request(Some(operator));
+        assert!(matches!(
+            encode_product_request_for_minor(&gated, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let encoded = encode_product_request_for_minor(&gated, 6)?;
+        assert!(matches!(
+            decode_product_request_for_minor(&encoded, 5),
+            Err(ProductCodecError::Unsupported)
+        ));
+        let decoded = decode_product_request_for_minor(&encoded, 6)?;
+        assert!(matches!(
+            decoded.operation,
+            ProductOperation::SearchCollection { request, .. }
+                if request.lexical.as_ref().and_then(|lexical| lexical.operator)
+                    == Some(operator)
+        ));
+    }
+    // A zero minimum_match fails closed at decode.
+    let gated = request(Some(hyphae_native_product::ProductLexicalOperator::Or {
+        minimum_match: 2,
+    }));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn lexical_prefix_requires_minor_six_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |prefix| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust dat".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(false), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| !lexical.prefix)
+    ));
+    let gated = request(true);
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.prefix)
+    ));
+    Ok(())
+}
+
+#[test]
+fn field_boosts_require_minor_six_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |fields| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields,
+                    fuzzy: None,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(Vec::new()), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fields.is_empty())
+    ));
+    let boosts = vec![
+        hyphae_native_product::ProductLexicalFieldBoost {
+            field: "category".to_owned(),
+            weight_micros: 5_000_000,
+        },
+        hyphae_native_product::ProductLexicalFieldBoost {
+            field: "body".to_owned(),
+            weight_micros: 1_000_000,
+        },
+    ];
+    let gated = request(boosts.clone());
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fields == boosts)
+    ));
+    // A forged zero weight fails closed at decode.
+    let weight = 1_000_000_u32.to_le_bytes();
+    let position = encoded
+        .windows(4)
+        .rposition(|window| window == weight)
+        .ok_or("weight bytes not found")?;
+    let mut forged = encoded.clone();
+    forged[position..position + 4].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn fuzzy_expansion_requires_minor_six_and_rejects_invalid_distances()
+-> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |fuzzy| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "datbase".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy,
+                    phrase: false,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(None), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.fuzzy.is_none())
+    ));
+    let gated = request(Some(2));
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().and_then(|lexical| lexical.fuzzy) == Some(2)
+    ));
+    // A forged zero distance fails closed at decode.
+    let mut forged = encoded.clone();
+    let length = forged.len();
+    forged[length - 4..].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_product_request_for_minor(&forged, 6).is_err());
+    Ok(())
+}
+
+#[test]
+fn phrase_matching_requires_minor_six() -> Result<(), Box<dyn std::error::Error>> {
+    let collection = ObjectId::new(13)?;
+    let request = |phrase| {
+        security_wire_request(ProductOperation::SearchCollection {
+            collection,
+            request: ProductSearchRequest {
+                lexical: Some(ProductLexicalBranch {
+                    query: "rust database".to_owned(),
+                    candidate_limit: 4,
+                    weight: 1,
+                    operator: None,
+                    prefix: false,
+                    fields: Vec::new(),
+                    fuzzy: None,
+                    phrase,
+                }),
+                vectors: Vec::new(),
+                filter: ProductSearchFilter::MatchAll,
+                sort: Vec::new(),
+                facets: Vec::new(),
+                range_facets: Vec::new(),
+                aggregations: Vec::new(),
+                limit: 4,
+                fusion: None,
+                parent_dedupe: None,
+                rerank: None,
+                highlight: None,
+                autocut: None,
+                offset: 0,
+            },
+        })
+    };
+    let default_encoded = encode_product_request_for_minor(&request(false), 3)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&default_encoded, 3)?.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| !lexical.phrase)
+    ));
+    let gated = request(true);
+    assert!(matches!(
+        encode_product_request_for_minor(&gated, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&gated, 6)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 5),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 6)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::SearchCollection { request, .. }
+            if request.lexical.as_ref().is_some_and(|lexical| lexical.phrase)
+    ));
     Ok(())
 }

@@ -1,0 +1,5 @@
+commit=a443c52e68a5c5c69cd62455c04ad313bc8d7dc3
+a443c52 Bind relicensing evidence to the 3.0.0 tree
+rustc=rustc 1.96.0 (ac68faa20 2026-05-25)
+spec_sha256_tla=b13cfc83454e01ad87c8eeeba74c35b71a1c3a2ebb075380a6f011c4994c9728
+spec_sha256_cfg=7dfeb0c5c573fb898611dee0598459ded66ddfea431a1df63b72bbd1e5c02ecc

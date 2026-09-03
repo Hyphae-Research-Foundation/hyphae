@@ -58,7 +58,7 @@ in one immutable copy-on-write native B+tree. It stores:
 | `0x01` | collection `ObjectId` | `HYIDX001` document count and total analyzed terms |
 | `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
 | `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
-| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01` or v2 `HYPOSTT1` tombstone |
+| `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01`/`HYPOST02` or v2 `HYPOSTT1` tombstone |
 | `0x05` | vector-index `ObjectId` | legacy `HYANNM01` or current `HYANNM02` selected base-plus-delta metadata |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
@@ -134,7 +134,17 @@ surface additionally accepts a per-request fusion selector: the default is
 deterministic weighted reciprocal-rank fusion (`k = 60`), and
 `weighted_score` blends each branch's weight with its normalized score — a
 lexical candidate contributes `weight × score / branch_top_score` and a
-vector candidate contributes `weight × 1 / (1 + distance)`. An optional
+vector candidate contributes `weight × 1 / (1 + distance)`.
+`relative_score` min-max normalizes each branch over its admitted
+candidates before weighting: a lexical candidate contributes
+`weight × (score − branch_min) / (branch_max − branch_min)` and a vector
+candidate contributes `weight × (branch_max_distance − distance) /
+(branch_max_distance − branch_min_distance)`, so the best admitted
+candidate of every branch contributes exactly its weight and the worst
+contributes zero regardless of the branch's score scale. A branch whose
+admitted candidates all share one score contributes the full weight for
+each. Candidates excluded by the eligibility filter never participate in
+a branch's normalization bounds. An optional
 first-k-per-parent deduplication runs over the complete bounded ranking
 before the final limit: hits group by the exact typed value of one
 doc-value field, at most `k` (1..=100) survive per group in rank order,
@@ -145,9 +155,101 @@ or a declared provider, always accompanied by their canonical attestation
 envelope — sort their hits by score descending with stable-identity ties,
 unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
-deterministically; it never runs a model. Wildcard,
-highlighting, persistent multi-field doc-value columns and unrestricted query
-language remain non-claims.
+deterministically; it never runs a model.
+
+The lexical branch may declare weighted field boosts: an ordered list of
+`(field, weight)` pairs (weights in micros, `1..=1_000_000_000`; at most
+64 fields) switches the branch from single-field BM25 to versioned BM25F
+over the bounded committed corpus. The reserved field name `body` scores
+the canonical indexed source text; any other name scores the exact
+string doc value of that field (a missing or non-string value reads as
+the empty field). Per-field statistics (document frequency, field
+length, average field length) follow the legacy-equivalent BM25F
+reference with fixed `k1 = 1.2`, `b = 0.75`, nano-quantized scores and
+bytewise document-key tie-breaks. The boosted branch participates in
+fusion exactly like the ordinary branch (scores map to
+`score_nanos / 1e9`). Field boosts are mutually exclusive with the term
+operator and prefix expansion; duplicate field names, unknown non-`body`
+names, zero weights, or an empty analyzed query fail closed.
+
+The lexical branch may declare phrase matching: candidates score
+ordinary BM25 over the analyzed query terms, then admission requires
+the exact consecutive analyzed-position sequence to occur in the
+candidate's canonical indexed text (positions from the canonical
+analyzer, including gaps left by discarded oversized tokens — a
+discarded token therefore breaks adjacency, deterministically).
+Verification re-analyzes only the BM25 candidates, never the whole
+corpus. A query with fewer than two analyzed terms is an ordinary
+match. Phrase matching is pairwise mutually exclusive with the term
+operator, prefix expansion, fuzzy expansion, and field boosts.
+
+The lexical branch may declare fuzzy expansion: each analyzed query
+term expands to every distinct indexed term within the declared
+Levenshtein character-edit distance (`1..=2`), then the branch scores
+ordinary BM25 over the union of expanded terms. Expansion walks the
+same bounded committed vocabulary as prefix expansion — the durable
+live term dictionary of the index (namespace `0x03`), never the
+document texts — and admits at
+most 64 distinct expanded terms across the whole query
+(`MAX_LEXICAL_PREFIX_TERMS`); overflow fails closed as limit-exceeded.
+Terms whose expansion is empty contribute nothing. Fuzzy expansion,
+prefix expansion, field boosts, and the term operator are pairwise
+mutually exclusive in one request.
+
+The lexical branch may declare prefix expansion: the final analyzed
+query term is treated as a prefix and expands to every distinct indexed
+term starting with it, then the branch scores ordinary BM25 over the
+expanded OR of terms (earlier query terms stay exact). Expansion scans
+the durable live term dictionary of the index (namespace `0x03`; a
+prefix walk bounded by the literal prefix, tombstoned terms skipped)
+and admits at most 64 distinct expanded terms
+(`MAX_LEXICAL_PREFIX_TERMS`); more distinct matches fail closed as
+limit-exceeded rather than answering from a truncated vocabulary. A
+prefix with no expansion leaves the branch empty. Prefix expansion and
+the term operator are mutually exclusive in one request.
+
+The lexical branch may declare an optional term operator. The default
+(absent) keeps pure OR semantics: any analyzed query term admits a
+candidate. `And` admits only candidates containing every distinct
+analyzed query term; `Or { minimum_match }` admits candidates containing
+at least `minimum_match` distinct analyzed terms (`1..=64`; a
+`minimum_match` above the distinct-term count admits nothing). BM25
+scores are unchanged — the operator filters admission, never scoring.
+Membership is verified against complete bounded per-term posting sets:
+each distinct term's full match set must fit the branch candidate bound
+(10,000), and a term whose set reaches that bound fails closed as
+limit-exceeded rather than answering from a truncated set. A query whose
+analysis yields no terms leaves the branch empty as before.
+
+A vector branch may declare an optional `max_distance` cutoff: hits at
+a canonical metric distance strictly greater than the cutoff are
+discarded before fusion, so garbage matches never earn a reciprocal
+rank or a normalized score. The cutoff must be a finite nonnegative
+canonical float; it never widens a branch (the candidate limit still
+applies first) and exact and approximate strategies honor it
+identically. Branch receipts keep reporting pre-cutoff candidate
+counts, so recall risk stays observable.
+
+An optional nonnegative `offset` skips that many leading hits of the
+final ranking before the `limit` window, after every other stage
+(fusion, filter, sort, rerank, deduplication, autocut). `offset + limit`
+must stay within the bounded ranking ceiling (1,024 hits), so deep
+paging cannot silently degrade; facets, aggregations, and counters keep
+describing the complete filtered candidate set, not the window.
+
+An optional autocut stage truncates the final score-ordered ranking at
+the first steep quality drop instead of a fixed count. With hit scores
+`s_0 >= s_1 >= … >= s_{n-1}` mapped to `x_i = i/(n-1)` and
+`y_i = (s_i − s_0)/(s_{n-1} − s_0)`, the deviation `d_i = y_i − x_i`
+measures how far the score curve sits above uniform linear decay; the
+ranking is cut immediately before the `N`-th strict local maximum of
+`d` (`N` in `1..=16`). A ranking with one hit, equal extreme scores, or
+fewer than `N` such maxima is returned whole. Autocut runs after
+reranking and parent deduplication and before the final `limit`; it is
+deterministic, needs no score threshold tuning, and composes best with
+`relative_score` fusion whose normalized magnitudes it inspects.
+Wildcard, persistent multi-field doc-value columns and unrestricted
+query language remain non-claims.
 
 ## Lexical scoring
 
@@ -180,6 +282,15 @@ materialized reference scorer remains the oracle: tests require physical
 posting traversal to return exactly the same scores and order. A dedicated
 quality/golden corpus remains pending.
 
+The durable scorer's cost scales with the live postings of the query terms.
+Segment planning reads only each leaf's verified boundary keys and entry
+count; posting scans borrow keys and values from the verified buffer-pool
+frame and append only the matched document id to a per-segment arena; the
+merge sorts, folds, and ranks arena offsets and copies ids only for the
+returned `limit` hits. Every borrowed decode performs the same preamble,
+count, length-consumption, key-order, and key-size checks as the owned
+decode, so a malformed leaf is rejected identically on either path.
+
 ## Transactional visibility
 
 The commit coordinator installs the search delta root with the same CSN as
@@ -188,6 +299,36 @@ transaction observes them without refresh or CDC.
 
 Segment merging and analyzer shadow builds preserve the logical snapshot and
 publish a new generation atomically.
+
+## Doc-value types
+
+Doc values are typed scalars: boolean, signed 64-bit integer, canonical
+IEEE-754 binary64 float, UTF-8 string, and binary bytes. Floats are
+canonicalized on ingest (`NaN` payloads collapse to one canonical `NaN`,
+signed zero collapses to `+0`) and order under the deterministic total
+order (`-NaN < -inf < … < -0=+0 < … < +inf < +NaN` via canonical-bit
+comparison), so filters, sort, `IN`, facets and min/max aggregations
+treat them exactly like every other comparable scalar across hosts.
+Float doc values bind to `Float32`/`Float64` catalog field types. `Sum`
+aggregates integers with checked 128-bit accumulation or floats with
+finite-guarded binary64 accumulation; a non-finite float sum fails
+closed. `Average` divides the same checked sum by the count of present
+values and always yields a canonical float aggregate (absent when no
+value is present); a non-finite intermediate fails closed. Comparisons
+between different scalar types never match, as before.
+
+Range facets bucket numeric doc values into caller-declared half-open
+intervals `[lower, upper)` with independently optional canonical-float
+bounds (`NaN` bounds are rejected; an absent bound is unbounded on that
+side; `lower < upper` when both are present). Each request admits at
+most 8 range facets of at most 64 ranges each. Buckets return exactly
+one per declared range in request order — never count-sorted — with the
+zero-based range ordinal as an `Integer` bucket value and the count of
+filtered candidates whose integer or float value falls inside the
+interval (integers convert through deterministic exact-halved binary64
+conversion). Missing fields and non-numeric values never count.
+Overlapping ranges are legal and count independently. Terms facets are
+unchanged and continue to reject non-scalar shapes.
 
 ## Aggregations and memory
 

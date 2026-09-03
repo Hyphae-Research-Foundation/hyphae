@@ -199,7 +199,7 @@ fn structured_corruption_matrix_has_zero_silent_acceptance_or_partial_writes()
         },
         CorruptionCase {
             name: "lexical posting",
-            persisted_magic: b"HYPOST01",
+            persisted_magic: b"HYPOST02",
         },
         CorruptionCase {
             name: "ANN metadata V4",
@@ -249,5 +249,40 @@ fn structured_corruption_matrix_has_zero_silent_acceptance_or_partial_writes()
     assert_eq!(metrics.rejected_cases, metrics.attempted_cases);
     assert_eq!(metrics.silent_acceptances, 0);
     assert_eq!(metrics.partial_writes, 0);
+    Ok(())
+}
+
+/// A structurally valid `HYPOST02` whose carried document length drifts
+/// from the document header must fail closed on open: the length is a
+/// scoring input, so silent acceptance would silently rescore.
+#[test]
+fn drifted_self_describing_posting_length_fails_closed() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("drifted-length");
+    let (lexical, _) = seed_search_database(&data)?;
+    let page_path = data.join(PAGE_FILE);
+    let mut bytes = fs::read(&page_path)?;
+    let offsets = bytes
+        .windows(8)
+        .enumerate()
+        .filter_map(|(offset, window)| (window == b"HYPOST02").then_some(offset))
+        .collect::<Vec<_>>();
+    assert!(!offsets.is_empty(), "seed wrote no v2 postings");
+    // Bump every carried length (bytes 12..16 after the magic) by one so
+    // each posting stays well-formed (nonzero, >= term frequency) but
+    // disagrees with its document header.
+    for offset in offsets {
+        let length_offset = offset + 12;
+        let mut length = [0_u8; 4];
+        length.copy_from_slice(&bytes[length_offset..length_offset + 4]);
+        let bumped = u32::from_le_bytes(length).saturating_add(1);
+        bytes[length_offset..length_offset + 4].copy_from_slice(&bumped.to_le_bytes());
+    }
+    fs::write(&page_path, bytes)?;
+    let rejected = match NativeDatabase::open(&data) {
+        Err(_) => true,
+        Ok(database) => database.match_latest_text(lexical, "shared", 10).is_err(),
+    };
+    assert!(rejected, "drifted posting length was silently accepted");
     Ok(())
 }

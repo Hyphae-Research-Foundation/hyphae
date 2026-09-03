@@ -704,6 +704,8 @@ pub enum ProductLimitKind {
     SetMemberBatchItems,
     /// Keys admitted by one expiry sweep.
     ExpirySweepKeys,
+    /// Bytes of one scalar string mutation result.
+    StringValueBytes,
     /// Transactions admitted by one group commit.
     GroupCommitTransactions,
     /// A future bounded limit not recognized by this build.
@@ -724,6 +726,7 @@ impl ProductLimitKind {
             Self::HashFieldBatchItems => "hash_field_batch_items",
             Self::SetMemberBatchItems => "set_member_batch_items",
             Self::ExpirySweepKeys => "expiry_sweep_keys",
+            Self::StringValueBytes => "string_value_bytes",
             Self::GroupCommitTransactions => "group_commit_transactions",
             Self::Unknown(raw) => raw.as_str(),
         }
@@ -747,6 +750,7 @@ impl ProductLimitKind {
             "hash_field_batch_items" => Self::HashFieldBatchItems,
             "set_member_batch_items" => Self::SetMemberBatchItems,
             "expiry_sweep_keys" => Self::ExpirySweepKeys,
+            "string_value_bytes" => Self::StringValueBytes,
             "group_commit_transactions" => Self::GroupCommitTransactions,
             _ => Self::Unknown(ProductErrorIdentifier::new(raw)?),
         })
@@ -860,6 +864,12 @@ pub enum ProductSqlSubcode {
     Hysql018,
     /// `HYSQL019`: bounded scan candidate budget exhausted.
     Hysql019,
+    /// `HYSQL020`: multi-row INSERT row budget exhausted.
+    Hysql020,
+    /// `HYSQL021`: invalid aggregate binding.
+    Hysql021,
+    /// `HYSQL022`: aggregate accumulator overflow.
+    Hysql022,
 }
 
 impl ProductSqlSubcode {
@@ -885,6 +895,9 @@ impl ProductSqlSubcode {
             Self::Hysql017 => "HYSQL017",
             Self::Hysql018 => "HYSQL018",
             Self::Hysql019 => "HYSQL019",
+            Self::Hysql020 => "HYSQL020",
+            Self::Hysql021 => "HYSQL021",
+            Self::Hysql022 => "HYSQL022",
         }
     }
 
@@ -909,6 +922,9 @@ impl ProductSqlSubcode {
             b"HYSQL017" => Some(Self::Hysql017),
             b"HYSQL018" => Some(Self::Hysql018),
             b"HYSQL019" => Some(Self::Hysql019),
+            b"HYSQL020" => Some(Self::Hysql020),
+            b"HYSQL021" => Some(Self::Hysql021),
+            b"HYSQL022" => Some(Self::Hysql022),
             _ => None,
         }
     }
@@ -1424,6 +1440,11 @@ impl From<NativeRuntimeError> for ProductError {
                 hyphae_native_runtime::MAX_HASH_FIELD_BATCH_SIZE,
                 requested,
             ),
+            NativeRuntimeError::StructureStringTooLarge => Self::limit_exceeded(
+                ProductLimitKind::StringValueBytes,
+                hyphae_native_runtime::MAX_STRUCTURE_STRING_BYTES,
+                hyphae_native_runtime::MAX_STRUCTURE_STRING_BYTES.saturating_add(1),
+            ),
             NativeRuntimeError::SetMemberBatchTooLarge { requested } => Self::limit_exceeded(
                 ProductLimitKind::SetMemberBatchItems,
                 hyphae_native_runtime::MAX_SET_MEMBER_BATCH_SIZE,
@@ -1463,6 +1484,7 @@ impl From<NativeRuntimeError> for ProductError {
             | NativeRuntimeError::StructureKindMismatch
             | NativeRuntimeError::StructureStreamEntryNotCanonical
             | NativeRuntimeError::StructureScoreNotCanonical
+            | NativeRuntimeError::InvalidSetSampleCount
             | NativeRuntimeError::DuplicateHashField
             | NativeRuntimeError::DuplicateSetMember
             | NativeRuntimeError::LegacyStructureFamilyUnsupported
@@ -1496,6 +1518,7 @@ fn io_retry(kind: io::ErrorKind) -> ProductRetry {
 }
 
 impl From<SqlError> for ProductError {
+    #[allow(clippy::too_many_lines)]
     fn from(source: SqlError) -> Self {
         match source {
             SqlError::InvalidSyntax => Self::sql(
@@ -1582,6 +1605,23 @@ impl From<SqlError> for ProductError {
                     ),
                 )
             }
+            SqlError::InsertRowBudgetExceeded => {
+                Self::sql(ProductErrorCode::LimitExceeded, ProductSqlSubcode::Hysql020).with_limit(
+                    ProductLimit::new(
+                        ProductLimitKind::SqlStatementBytes,
+                        usize_to_u64(hyphae_native_runtime::MAX_SQL_INSERT_ROWS),
+                        usize_to_u64(hyphae_native_runtime::MAX_SQL_INSERT_ROWS.saturating_add(1)),
+                    ),
+                )
+            }
+            SqlError::InvalidAggregate => Self::sql(
+                ProductErrorCode::SqlInvalidSyntax,
+                ProductSqlSubcode::Hysql021,
+            ),
+            SqlError::AggregateOverflow => Self::sql(
+                ProductErrorCode::SqlInvalidValue,
+                ProductSqlSubcode::Hysql022,
+            ),
             SqlError::ExecutionInterrupted => Self::from_code(ProductErrorCode::Cancelled),
             SqlError::Runtime(source) => source.into(),
         }

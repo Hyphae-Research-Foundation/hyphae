@@ -85,11 +85,11 @@
     },
     {
       "reference": "docs/native/http-v2.md",
-      "sha256": "56620d50bfe265f8fbd762d99b8a07889ee88ef17eba9e31d870d3736a0c7651"
+      "sha256": "6dd9917bb29b3e0f6a97be6e7b5dd92270632b8407bc71ab17b08d2532073a7a"
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "3d1796c90e3fd1228172e1c5c3069bffbc813f27fb87b5715074db7cee98573b"
+      "sha256": "6e42a45f895f89a04521a3c5c229124096024c25bf576bd161aa45d5e28973b8"
     },
     {
       "reference": "docs/native/catalog-v1.md",
@@ -97,11 +97,11 @@
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "0b018082fd5e78a4517d561cbfcac1317ff7c4e164f1607218e0793323703240"
+      "sha256": "41fb37f4274d14034539b12a16d0cba8a54cab774c874de5ee654662a6139644"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",
-      "sha256": "46e926738b599da635dbaf96243bab8bfec6862bdd3280b1419a4675e14be6b9"
+      "sha256": "ec3ef197b353c9e54e859c62dba14a447858210b22624e8172fe64205688adf8"
     },
     {
       "reference": "docs/native/native-backup-v1.md",

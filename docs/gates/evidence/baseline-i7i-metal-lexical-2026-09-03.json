@@ -1,0 +1,92 @@
+{
+  "benchmark": "hyphae-baseline-harness-v1",
+  "environment": {
+    "arch": "x86_64",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8559C",
+    "hypervisor_flag": false,
+    "kernel": "7.0.0-1011-aws",
+    "logical_cpus": 96,
+    "os": "linux",
+    "scaling_governor": "performance"
+  },
+  "results": {
+    "lexical": {
+      "hyphae": {
+        "engine": "hyphae-native-lexical",
+        "hits_total": 100000,
+        "ingest": {
+          "label": "ingest_batch_1000",
+          "latency_nanos": {
+            "max": 2909692511,
+            "mean": 2021165575,
+            "p50": 2190315106,
+            "p95": 2857070444,
+            "p99": 2893268639,
+            "p999": 2909692511
+          },
+          "operations": 100,
+          "ops_per_second": 0.4947639585327629,
+          "wall_nanos": 202116581605
+        },
+        "path": "match_latest_text (physical posting ranges)",
+        "query_top10": {
+          "label": "bm25_top10",
+          "latency_nanos": {
+            "max": 1122886,
+            "mean": 316502,
+            "p50": 255427,
+            "p95": 650827,
+            "p99": 856366,
+            "p999": 1030197
+          },
+          "operations": 10000,
+          "ops_per_second": 3158.3655670306443,
+          "wall_nanos": 3166194599
+        }
+      },
+      "tantivy": {
+        "engine": "tantivy",
+        "hits_total": 100000,
+        "ingest": {
+          "label": "ingest_batch_1000",
+          "latency_nanos": {
+            "max": 47552622,
+            "mean": 29272659,
+            "p50": 29143950,
+            "p95": 40047871,
+            "p99": 43132159,
+            "p999": 47552622
+          },
+          "operations": 100,
+          "ops_per_second": 34.16130234411926,
+          "wall_nanos": 2927288866
+        },
+        "query_top10": {
+          "label": "bm25_top10",
+          "latency_nanos": {
+            "max": 238697,
+            "mean": 77690,
+            "p50": 77552,
+            "p95": 80334,
+            "p99": 83080,
+            "p999": 101822
+          },
+          "operations": 10000,
+          "ops_per_second": 12637.994626670967,
+          "wall_nanos": 791264777
+        },
+        "segments": 30,
+        "version": "tantivy v0.25.0, index_format v7"
+      },
+      "workload": {
+        "documents": 100000,
+        "queries": 10000,
+        "seed": 6840158756763402241,
+        "top_k": 10,
+        "vocabulary": 50000
+      }
+    }
+  },
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "source_commit": "2ff8a4b995f4b08c3be1c6ff6b05d8e0b1099456"
+}

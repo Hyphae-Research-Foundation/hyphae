@@ -52,8 +52,16 @@ canonical dedicated-hardware latency, interference, or bare-metal claim.
 
 ## What Hyphae does
 
-- Executes bounded SQL DDL, DML, prepared queries, secondary-index reads, and
-  transactions over a Hyphae-owned relational engine.
+The [canonical claims and non-claims](docs/product/claims.md) page is the
+wording authority for every capability statement below.
+
+- Executes bounded SQL DDL, DML, prepared queries, secondary-index reads,
+  multi-row inserts, total and primary-key-prefix grouped aggregates,
+  descending primary-key scans, residual LIKE/IN predicates, and
+  transactions over a Hyphae-owned indexed, fail-closed relational core.
+  The admitted grammar is versioned and bounded: no subqueries, outer
+  joins, HAVING, or expression arithmetic; unsupported shapes fail closed
+  rather than scan.
 - Provides native strings, counters, hashes, lists, sets, sorted sets, streams,
   TTL, scans, algebra, and atomic structure batches.
 - Owns lexical, exact-vector, incremental ANN, filtered, faceted, metric, and
@@ -366,6 +374,13 @@ structures, lexical search, and ANN under one durable authority. G0 through G8
 are closed for their bounded contracts. G7 is an operational-scale C-60
 authority with the explicit hardware and latency non-claims above; G8 protects
 the exact release commit.
+
+Isolation is snapshot isolation with first-committer-wins; serializable
+execution is not implemented and is never implied. The complete wording
+authority for capability, isolation, topology, durability, and performance
+statements is [docs/product/claims.md](docs/product/claims.md); the
+cross-engine commit protocol additionally carries a machine-checked TLA+
+model under [docs/formal/](docs/formal/README.md).
 
 Hyphae is not Mycelium, Hyphae Network, Celiums Network, an AI cognition
 runtime, a hosted SaaS, or a framework-specific data layer. The retained

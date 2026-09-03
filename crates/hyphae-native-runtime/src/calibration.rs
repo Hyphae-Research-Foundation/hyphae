@@ -1388,20 +1388,23 @@ fn measure_posting_decode(
     measurements: &mut Vec<CalibrationMeasurement>,
     policy: CalibrationPolicy,
 ) {
-    let encoded = crate::encode_search_posting(17);
+    let encoded = crate::encode_search_posting(17, 42);
     let reference = u64::from(u32::from_le_bytes(
         encoded[8..12].try_into().unwrap_or([0; 4]),
     ));
     measurements.push(measure_u64(
         &MeasurementSpec::new(
             "posting-decode",
-            "native-search-posting-v1",
+            "native-search-posting-v2",
             encoded.len(),
             "bytes",
             encoded.len(),
         ),
         policy,
-        || crate::decode_search_posting(&encoded).map_or(u64::MAX, u64::from),
+        || {
+            crate::decode_search_posting(&encoded)
+                .map_or(u64::MAX, |posting| u64::from(posting.term_frequency))
+        },
         reference,
     ));
 }

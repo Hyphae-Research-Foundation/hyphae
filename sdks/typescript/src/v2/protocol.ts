@@ -185,7 +185,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 5) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 6) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +212,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 5,
+  maximumMinor = 6,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -266,6 +266,11 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "structure_read") {
+    const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
+    const kind = String(request.kind ?? "");
+    if (kind === "sorted_set_score_range" || kind === "hash_scan_reverse" || kind === "hash_scan_match") return 6;
+  }
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
     const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
@@ -1084,6 +1089,8 @@ function decodeStructureMutationResult(reader: Reader): Readonly<Record<string, 
   if (tag === 3) return { kind: "count", value: reader.u64() };
   if (tag === 4) return { kind: "value", value: reader.boolean() ? reader.bytes() : undefined };
   if (tag === 5) return { kind: "stream_id", value: reader.u64() };
+  if (tag === 6) return { kind: "score", value: reader.f64() };
+  if (tag === 7) return { kind: "popped_entry", entry: reader.boolean() ? { member: reader.bytes(), score: reader.f64() } : undefined };
   throw new ClientError("structure mutation result is malformed");
 }
 
@@ -1514,11 +1521,79 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     u64(BigInt(request.limit as number)),
     // Content-derived tagged sections in ascending tag order: an absent
     // section is the default and keeps the exact historical bytes.
-    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
+    ...(request.fusion === undefined ? [] : request.fusion === "weighted_score" ? [Uint8Array.of(1, 1)] : request.fusion === "relative_score" ? [Uint8Array.of(1, 2)] : (() => { throw new ClientError("integrated fusion method is invalid"); })()),
     ...encodeParentDedupe(request.parent_dedupe),
     ...encodeRerank(request.rerank),
     ...encodeHighlight(request.highlight),
+    ...(request.autocut === undefined || request.autocut === null ? [] : [join(Uint8Array.of(5), u32(Number(request.autocut)))]),
+    ...(request.offset === undefined || request.offset === null || Number(request.offset) === 0 ? [] : [join(Uint8Array.of(6), u32(Number(request.offset)))]),
+    ...encodeRangeFacets(request.range_facets),
+    ...encodeDistanceCutoffs(request.vectors as ReadonlyArray<Readonly<Record<string, unknown>>>),
+    ...encodeLexicalOperator(lexical),
+    ...encodeFieldBoosts(lexical),
   );
+}
+
+function encodeFieldBoosts(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {
+  const fields = lexical?.fields as ReadonlyArray<Readonly<Record<string, unknown>>> | undefined;
+  if (fields === undefined || fields === null || fields.length === 0) return [];
+  return [join(
+    Uint8Array.of(10),
+    u32(fields.length),
+    ...fields.flatMap((boost) => [
+      bytes(new TextEncoder().encode(String(boost.field))),
+      u32(Number(boost.weight_micros)),
+    ]),
+  )];
+}
+
+function encodeLexicalOperator(lexical: Readonly<Record<string, unknown>> | undefined): Uint8Array[] {
+  const operator = lexical?.operator as Readonly<Record<string, unknown>> | string | undefined;
+  if (operator === undefined || operator === null) {
+    if (lexical?.prefix === true) return [Uint8Array.of(9, 2)];
+    return [];
+  }
+  if (lexical?.prefix === true) throw new ClientError("lexical prefix excludes the operator");
+  if (operator === "and") return [Uint8Array.of(9, 0)];
+  if (typeof operator === "object" && typeof operator.minimum_match === "number") {
+    return [join(Uint8Array.of(9, 1), u32(Number(operator.minimum_match)))];
+  }
+  throw new ClientError("lexical operator is invalid");
+}
+
+function encodeDistanceCutoffs(vectors: ReadonlyArray<Readonly<Record<string, unknown>>>): Uint8Array[] {
+  const cutoffs = vectors
+    .map((branch, ordinal) => [ordinal, branch.max_distance] as const)
+    .filter(([, cutoff]) => cutoff !== undefined && cutoff !== null);
+  if (cutoffs.length === 0) return [];
+  return [join(
+    Uint8Array.of(8),
+    u32(cutoffs.length),
+    ...cutoffs.flatMap(([ordinal, cutoff]) => [u32(ordinal), f64(Number(cutoff))]),
+  )];
+}
+
+function encodeRangeFacets(raw: unknown): Uint8Array[] {
+  if (raw === undefined || raw === null) return [];
+  const facets = raw as ReadonlyArray<Readonly<Record<string, unknown>>>;
+  if (!Array.isArray(facets) || facets.length === 0) return [];
+  const bound = (value: unknown): Uint8Array => {
+    if (value === undefined || value === null) return Uint8Array.of(0);
+    return join(Uint8Array.of(1), f64(Number(value)));
+  };
+  return [join(
+    Uint8Array.of(7),
+    u32(facets.length),
+    ...facets.flatMap((facet) => {
+      const ranges = facet.ranges as ReadonlyArray<Readonly<Record<string, unknown>>>;
+      if (!Array.isArray(ranges) || ranges.length === 0) throw new ClientError("range facet needs ranges");
+      return [
+        bytes(new TextEncoder().encode(String(facet.field))),
+        u32(ranges.length),
+        ...ranges.flatMap((range) => [bound(range.lower), bound(range.upper)]),
+      ];
+    }),
+  )];
 }
 
 function encodeHighlight(value: unknown): Uint8Array[] {
@@ -1655,9 +1730,19 @@ function encodeDocValue(value: unknown): Uint8Array {
   if (typeof value === "boolean") return Uint8Array.of(0, Number(value));
   if (typeof value === "bigint") return join(Uint8Array.of(1), i64(value));
   if (typeof value === "number" && Number.isSafeInteger(value)) return join(Uint8Array.of(1), i64(BigInt(value)));
+  if (typeof value === "number" && Number.isFinite(value)) return join(Uint8Array.of(4), f64(canonicalFloat(value)));
+  if (typeof value === "object" && value !== null && typeof (value as { float?: unknown }).float === "number") {
+    return join(Uint8Array.of(4), f64(canonicalFloat((value as { float: number }).float)));
+  }
   if (typeof value === "string") return join(Uint8Array.of(2), bytes(new TextEncoder().encode(value)));
   if (value instanceof Uint8Array) return join(Uint8Array.of(3), bytes(value));
   throw new ClientError("integrated doc value is invalid");
+}
+
+/** Collapses NaN payloads and signed zero to the canonical forms. */
+function canonicalFloat(value: number): number {
+  if (Number.isNaN(value)) return Number.NaN;
+  return value === 0 ? 0 : value;
 }
 
 function decodeDocValue(reader: Reader): unknown {
@@ -1666,6 +1751,7 @@ function decodeDocValue(reader: Reader): unknown {
   if (tag === 1) return reader.i64();
   if (tag === 2) return reader.text();
   if (tag === 3) return reader.bytes();
+  if (tag === 4) return reader.f64();
   throw new ClientError("integrated doc value is invalid");
 }
 
@@ -1688,7 +1774,7 @@ function encodeFacets(facets: ReadonlyArray<Readonly<Record<string, unknown>>>):
 
 function encodeAggregations(aggregations: ReadonlyArray<Readonly<Record<string, unknown>>>): Uint8Array {
   return join(u32(aggregations.length), ...aggregations.map((aggregation) => {
-    const kind = ["count", "sum", "min", "max"].indexOf(String(aggregation.kind));
+    const kind = ["count", "sum", "min", "max", "average"].indexOf(String(aggregation.kind));
     if (kind < 0) throw new ClientError("integrated aggregation is invalid");
     return join(bytes(new TextEncoder().encode(String(aggregation.name))), Uint8Array.of(kind),
       ...(kind === 0 ? [] : [bytes(new TextEncoder().encode(String(aggregation.field)))]));
@@ -1700,6 +1786,7 @@ function decodeAggregationValue(reader: Reader): Readonly<Record<string, unknown
   if (tag === 0) return { kind: "count", value: reader.u64() };
   if (tag === 1) return { kind: "integer", value: reader.boolean() ? reader.i128() : undefined };
   if (tag === 2) return { kind: "value", value: reader.boolean() ? decodeDocValue(reader) : undefined };
+  if (tag === 3) return { kind: "float", value: reader.boolean() ? reader.f64() : undefined };
   throw new ClientError("integrated aggregation value is invalid");
 }
 
@@ -1733,6 +1820,13 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
     sorted_set_add: 14,
     sorted_set_remove: 15,
     stream_add: 16,
+    sorted_set_increment: 17,
+    sorted_set_pop: 18,
+    string_set_conditional: 19,
+    string_append: 20,
+    string_set_range: 21,
+    hash_set_if_absent: 22,
+    set_pop: 23,
   };
   const originalKind = String(value.kind);
   const [kind, implied] = aliases[originalKind] ?? [originalKind, undefined];
@@ -1755,6 +1849,18 @@ function encodeStructureMutation(raw: unknown): Uint8Array {
   else if (kind === "list_pop") parts.push(Uint8Array.of(listSideTag(value.side)));
   else if (kind === "set_add" || kind === "set_remove" || kind === "sorted_set_remove") parts.push(bytes(requireBytes(value.member)));
   else if (kind === "sorted_set_add") parts.push(f64(Number(value.score)), bytes(requireBytes(value.member)));
+  else if (kind === "sorted_set_increment") parts.push(f64(Number(value.delta)), bytes(requireBytes(value.member)));
+  else if (kind === "sorted_set_pop") parts.push(Uint8Array.of(sortedSetEndTag(value.end ?? "lowest")));
+  else if (kind === "string_set_conditional") {
+    const expiry = value.expires_at_micros;
+    parts.push(bytes(requireBytes(value.value)), Uint8Array.of(expiry === undefined || expiry === null ? 0 : 1));
+    if (expiry !== undefined && expiry !== null) parts.push(i64(BigInt(expiry as bigint | number)));
+    parts.push(Uint8Array.of(setConditionTag(value.condition ?? "if_absent")));
+  }
+  else if (kind === "string_append") parts.push(bytes(requireBytes(value.suffix)));
+  else if (kind === "string_set_range") parts.push(u32(Number(value.offset)), bytes(requireBytes(value.patch)));
+  else if (kind === "hash_set_if_absent") parts.push(bytes(requireBytes(value.field)), bytes(requireBytes(value.value)));
+  else if (kind === "set_pop") parts.push(u64(BigInt(value.seed as bigint | number)));
   else if (kind === "stream_add") {
     const fields = value.fields;
     if (!Array.isArray(fields) || fields.length === 0 || fields.length > 4096) throw new ClientError("stream fields must be a nonempty bounded array");
@@ -1771,6 +1877,18 @@ function structureFamilyTag(raw: unknown): number {
   const tag = families[String(raw)];
   if (tag === undefined) throw new ClientError("structure family is invalid");
   return tag;
+}
+
+function setConditionTag(raw: unknown): number {
+  if (raw === "if_absent") return 0;
+  if (raw === "if_present") return 1;
+  throw new ClientError("string set condition is invalid");
+}
+
+function sortedSetEndTag(raw: unknown): number {
+  if (raw === "lowest") return 0;
+  if (raw === "highest") return 1;
+  throw new ClientError("sorted-set pop end is invalid");
 }
 
 function listSideTag(raw: unknown): number {
@@ -1816,6 +1934,8 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     hash_scan: 5, hash_length: 6, list_range: 7, list_length: 8, set_contains: 9,
     set_members: 10, set_cardinality: 11, set_algebra: 12, sorted_set_score: 13,
     sorted_set_rank: 14, sorted_set_range: 15, sorted_set_cardinality: 16, stream_range: 17,
+    sorted_set_score_range: 18, hash_scan_reverse: 19, hash_scan_match: 20,
+    key_scan_match: 21, string_range: 22, set_random_members: 23,
   };
   const kind = String(value.kind);
   const tag = tags[kind];
@@ -1829,6 +1949,18 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     return join(Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), Uint8Array.of(operation),
       u32(keys.length), ...keys.map((key) => bytes(requireBytes(key))),
       u64(BigInt(value.output_member_limit as number)), u64(BigInt(value.visit_limit as number)));
+  }
+  if (kind === "key_scan_match") {
+    const parts = [Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), bytes(requireBytes(value.pattern))];
+    const cursor = value.start_after;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(
+      u64(BigInt(value.output_limit as number)),
+      u64(BigInt(value.visit_limit as number)),
+      u64(BigInt(value.match_step_limit as number)),
+    );
+    return join(...parts);
   }
   const parts = [Uint8Array.of(tag), encodeStructureKey(value.key)];
   if (kind === "ttl") parts.push(Uint8Array.of(structureFamilyTag(value.family)));
@@ -1845,7 +1977,52 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     if (kind === "sorted_set_range") parts.push(Uint8Array.of(sortedOrderTag(value.order ?? "ascending")));
   }
   else if (kind === "stream_range") parts.push(u64(BigInt(value.start as bigint | number)), u64(BigInt(value.end as bigint | number)), u64(BigInt(value.limit as number)));
+  else if (kind === "string_range") parts.push(i64(BigInt(value.start as bigint | number)), i64(BigInt(value.end as bigint | number)));
+  else if (kind === "set_random_members") parts.push(u64(BigInt(value.seed as bigint | number)), u64(BigInt(value.count as number)));
+  else if (kind === "sorted_set_score_range") {
+    parts.push(
+      encodeScoreBound(value.lower),
+      encodeScoreBound(value.upper),
+      u64(BigInt(value.offset as number ?? 0)),
+      u64(BigInt(value.limit as number)),
+      Uint8Array.of(sortedOrderTag(value.order ?? "ascending")),
+    );
+  } else if (kind === "hash_scan_reverse") {
+    const cursor = value.start_before;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(u64(BigInt(value.limit as number)));
+  } else if (kind === "hash_scan_match") {
+    parts.push(bytes(requireBytes(value.pattern)));
+    const cursor = value.start_after;
+    parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
+    if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
+    parts.push(
+      u64(BigInt(value.output_limit as number)),
+      u64(BigInt(value.visit_limit as number)),
+      u64(BigInt(value.match_step_limit as number)),
+    );
+  }
   return join(...parts);
+}
+
+/** Encodes one canonical score endpoint: unbounded, or ±inclusive f64. */
+function encodeScoreBound(raw: unknown): Uint8Array {
+  if (raw === undefined || raw === null) return Uint8Array.of(0);
+  const bound = raw as { inclusive?: number; exclusive?: number };
+  if (typeof bound.inclusive === "number") {
+    const encoded = new Uint8Array(9);
+    encoded[0] = 1;
+    new DataView(encoded.buffer).setFloat64(1, bound.inclusive, true);
+    return encoded;
+  }
+  if (typeof bound.exclusive === "number") {
+    const encoded = new Uint8Array(9);
+    encoded[0] = 2;
+    new DataView(encoded.buffer).setFloat64(1, bound.exclusive, true);
+    return encoded;
+  }
+  throw new ClientError("sorted-set score bound is invalid");
 }
 
 function sortedOrderTag(raw: unknown): number {
@@ -1878,6 +2055,26 @@ function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> 
   if (tag === 9) return { kind: "sorted_set_rank", value: reader.boolean() ? reader.u64() : undefined };
   if (tag === 10) return { kind: "sorted_set_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "sorted-set entry") }, () => ({ member: reader.bytes(), score: reader.f64() })) };
   if (tag === 11) return { kind: "stream_entries", entries: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 12, "stream entry") }, () => ({ id: reader.u64(), fields: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "stream field") }, () => [reader.bytes(), reader.bytes()]) })) };
+  if (tag === 12) {
+    const entries = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "hash entry") }, () => ({ field: reader.bytes(), value: reader.bytes() }));
+    const continuation = reader.boolean() ? reader.bytes() : undefined;
+    const stop = ["exhausted", "output_limit", "visit_limit"][reader.u8()];
+    if (stop === undefined) throw new ClientError("hash page stop reason is invalid");
+    return { kind: "hash_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
+  }
+  if (tag === 13) {
+    const families: readonly string[] = ["", "string", "counter", "hash", "list", "set", "sorted_set", "stream"];
+    const entries = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 5, "key entry") }, () => {
+      const key = reader.bytes();
+      const family = families[reader.u8()];
+      if (family === undefined || family === "") throw new ClientError("key page family is invalid");
+      return { key, family };
+    });
+    const continuation = reader.boolean() ? reader.bytes() : undefined;
+    const stop = ["exhausted", "output_limit", "visit_limit"][reader.u8()];
+    if (stop === undefined) throw new ClientError("key page stop reason is invalid");
+    return { kind: "key_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
+  }
   throw new ClientError("structure read response is invalid");
 }
 
@@ -1894,7 +2091,7 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
     for (let index = 0; index < valueCount; index += 1) {
       const name = reader.text();
       const tag = reader.u8();
-      docValues[name] = tag === 0 ? reader.boolean() : tag === 1 ? reader.i64() : tag === 2 ? reader.text() : tag === 3 ? reader.bytes() : undefined;
+      docValues[name] = tag === 0 ? reader.boolean() : tag === 1 ? reader.i64() : tag === 2 ? reader.text() : tag === 3 ? reader.bytes() : tag === 4 ? reader.f64() : undefined;
       if (docValues[name] === undefined) throw new ClientError("integrated doc value is invalid");
     }
     return { objectId, score, docValues };
@@ -1921,20 +2118,38 @@ function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown
   const lexicalCandidates = reader.u64();
   const retrievalCandidates = reader.u64();
   const matchedCandidates = reader.u64();
-  if (reader.remaining > 0) {
-    // Content-derived response tail: per-hit highlight fragments.
-    if (reader.u8() !== 1) throw new ClientError("integrated response section is invalid");
-    for (const hit of hits) {
-      const fragmentCount = reader.u32();
-      if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
-      const fragments = Array.from({ length: fragmentCount }, () => reader.text());
-      if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
-        throw new ClientError("integrated highlight fragments are unbounded");
+  const rangeFacets: Array<Readonly<Record<string, unknown>>> = [];
+  let previousTail = 0;
+  while (reader.remaining > 0) {
+    // Content-derived response tail in ascending tag order.
+    const tag = reader.u8();
+    if (tag <= previousTail) throw new ClientError("integrated response section is invalid");
+    previousTail = tag;
+    if (tag === 1) {
+      for (const hit of hits) {
+        const fragmentCount = reader.u32();
+        if (fragmentCount > 4) throw new ClientError("integrated highlight fragments are unbounded");
+        const fragments = Array.from({ length: fragmentCount }, () => reader.text());
+        if (fragments.some((fragment) => new TextEncoder().encode(fragment).byteLength > 512)) {
+          throw new ClientError("integrated highlight fragments are unbounded");
+        }
+        (hit as Record<string, unknown>).fragments = fragments;
       }
-      (hit as Record<string, unknown>).fragments = fragments;
+    } else if (tag === 2) {
+      const facetCount = reader.u32();
+      if (facetCount === 0 || facetCount > 8) throw new ClientError("integrated range facets are unbounded");
+      for (let index = 0; index < facetCount; index += 1) {
+        const field = reader.text();
+        const bucketCount = reader.u32();
+        if (bucketCount > 64) throw new ClientError("integrated range facets are unbounded");
+        const buckets = Array.from({ length: bucketCount }, () => ({ value: decodeDocValue(reader), count: reader.u64() }));
+        rangeFacets.push({ field, buckets });
+      }
+    } else {
+      throw new ClientError("integrated response section is invalid");
     }
   }
-  return { snapshot, hits, facets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
+  return { snapshot, hits, facets, rangeFacets, aggregations, vectorBranches, approximate, totalDocuments, eligibleDocuments,
     lexicalCandidates, retrievalCandidates, matchedCandidates };
 }
 

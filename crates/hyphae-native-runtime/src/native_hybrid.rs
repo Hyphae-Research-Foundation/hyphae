@@ -445,7 +445,7 @@ impl NativeLexicalReadView {
                     decode_search_document_header(&posting.encoded_document_header)?;
                 *scores.entry(posting.document_id.clone()).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     crate::model::Bm25ScoreParameters::default(),
@@ -461,7 +461,7 @@ impl NativeLexicalReadView {
                 return Err(NativeRuntimeError::InvalidSearchTree);
             }
         }
-        let hits = rank_match_hits(scores, self.inner.state.limit);
+        let hits = rank_match_hits(scores.into_iter().collect(), self.inner.state.limit);
         let execution_sequence = self
             .inner
             .sequence
@@ -610,14 +610,17 @@ impl NativeFilteredLexicalReadView {
                     decode_search_document_header(&posting.encoded_document_header)?;
                 *scores.entry(posting.document_id.clone()).or_default() += bm25_term_score(
                     idf,
-                    f64::from(term_frequency),
+                    f64::from(term_frequency.term_frequency),
                     search_count_f64(document_length)?,
                     average_length,
                     crate::model::Bm25ScoreParameters::default(),
                 );
             }
         }
-        let hits = rank_match_hits(scores, self.inner.lexical.inner.state.limit);
+        let hits = rank_match_hits(
+            scores.into_iter().collect(),
+            self.inner.lexical.inner.state.limit,
+        );
         if cancellation.is_some_and(crate::GovernorCancellation::is_cancelled) {
             return Err(NativeRuntimeError::ResourceQueue(
                 crate::GovernorQueueError::Cancelled,

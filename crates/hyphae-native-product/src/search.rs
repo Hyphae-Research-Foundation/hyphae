@@ -12,8 +12,12 @@ use hyphae_native_runtime::{
     AnnSearchOptions, HnswConfig, NativeRuntimeError, VectorHit,
     VectorMetric as RuntimeVectorMetric, execute_doc_values,
 };
-use hyphae_native_types::{LogicalType, TransactionId};
+use hyphae_native_types::{CanonicalF64, LogicalType, TransactionId};
 
+use crate::search_manifest::{
+    ManifestHeader, ManifestMutations, ManifestRead, ManifestState, ManifestView, ManifestWrite,
+    apply_manifest_mutations, encode_manifest_header, manifest_chunk_key,
+};
 use crate::{
     NativeProduct, ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode,
     ProductSnapshot, SnapshotIdentity,
@@ -24,13 +28,14 @@ pub use hyphae_native_runtime::{
     DocValueAggregationValue as ProductAggregationValue, DocValueFilter as ProductSearchFilter,
     DocValueOperator as ProductSearchOperator, DocValueSort as ProductSearchSort,
     DocValueSortDirection as ProductSortDirection, DocValueSortSource as ProductSortSource,
-    FacetBucket as ProductFacetBucket, FacetRequest as ProductFacetRequest,
-    FacetResult as ProductFacetResult, MissingPlacement as ProductMissingPlacement,
+    FacetBucket as ProductFacetBucket, FacetRange as ProductFacetRange,
+    FacetRequest as ProductFacetRequest, FacetResult as ProductFacetResult,
+    MissingPlacement as ProductMissingPlacement,
     NamedDocValueAggregation as ProductNamedAggregation,
-    NamedDocValueAggregationValue as ProductNamedAggregationValue, Vector as ProductVector,
+    NamedDocValueAggregationValue as ProductNamedAggregationValue,
+    RangeFacetRequest as ProductRangeFacetRequest, Vector as ProductVector,
 };
 
-const MANIFEST_MAGIC: &[u8; 8] = b"HYPSMAN1";
 const BINDING_MAGIC: &[u8; 8] = b"HYPSBND1";
 const DOCUMENT_MAGIC: &[u8; 8] = b"HYPSDOC1";
 const IDEMPOTENCY_MAGIC: &[u8; 8] = b"HYPSIDM1";
@@ -44,14 +49,49 @@ pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
 /// Raised from 10,000 on the R-track evidence chain (posting-index
 /// eligibility, pinned posting scorer, cached snapshot state, and the
-/// sealed `FiQA` relevance receipt); the next rung is evidence-gated.
-pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 100_000;
+/// sealed `FiQA` relevance receipt), then to 250,000 on the
+/// point-resolved ingest, single-decode open, borrowed-leaf scorer, and
+/// bit-identical scorer-equivalence receipt
+/// (`docs/gates/evidence/collection-cap-250k-2026-09-02.md`). The manifest
+/// is chunked (`search_manifest`), so a batch rewrites the header and the
+/// chunks it touches rather than 16 bytes per document; the next rung is
+/// still evidence-gated on the ladder receipt.
+pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 250_000;
 /// Maximum named vector targets in one collection or request.
 pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
 /// Maximum retrieval candidates requested from one native branch.
 pub const MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES: usize = 10_000;
 /// Maximum result hits returned by the integrated surface.
 pub const MAX_PRODUCT_SEARCH_HITS: usize = hyphae_native_runtime::MAX_DOC_VALUE_HITS;
+
+/// One durable manifest record as `(key, value)`.
+#[doc(hidden)]
+pub type ManifestRecord = (Vec<u8>, Vec<u8>);
+
+/// Manifest read costs observed by the scale harnesses on one snapshot.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestDiagnostics {
+    /// Whether the manifest is still a format-1 record.
+    pub legacy: bool,
+    /// Durable documents in the collection.
+    pub total: usize,
+    /// Chunk records owned by a format-2 manifest.
+    pub chunk_count: usize,
+    /// Encoded bytes of the header record.
+    pub header_bytes: usize,
+    /// Encoded bytes of the largest chunk record.
+    pub largest_chunk_bytes: usize,
+    /// Wall time to read and decode the header.
+    pub header_decode_micros: u128,
+    /// Wall time to decode every chunk into an ordered set.
+    pub materialize_micros: u128,
+    /// Wall time of one membership probe for the greatest identity.
+    pub contains_micros: u128,
+    /// Whether the probed identity was found (always true on a non-empty
+    /// consistent manifest).
+    pub probe_present: bool,
+}
 
 /// One physical named-vector target owned by a logical Catalog V2 collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +187,58 @@ pub struct ProductLexicalBranch {
     pub candidate_limit: usize,
     /// Positive deterministic RRF weight.
     pub weight: u32,
+    /// Optional term-admission operator. Absent keeps pure OR semantics.
+    pub operator: Option<ProductLexicalOperator>,
+    /// Treat the final analyzed query term as a prefix and expand it to
+    /// every distinct indexed term starting with it (bounded). Mutually
+    /// exclusive with `operator`.
+    pub prefix: bool,
+    /// Ordered weighted field boosts switching the branch to versioned
+    /// BM25F. Empty keeps single-field BM25. Mutually exclusive with
+    /// `operator` and `prefix`.
+    pub fields: Vec<ProductLexicalFieldBoost>,
+    /// Optional Levenshtein character-edit distance (`1..=2`) expanding
+    /// every analyzed query term over the bounded committed vocabulary.
+    /// Mutually exclusive with `operator`, `prefix`, and `fields`.
+    pub fuzzy: Option<usize>,
+    /// Require the exact consecutive analyzed-position sequence in the
+    /// candidate's canonical indexed text. Mutually exclusive with every
+    /// other lexical mode.
+    pub phrase: bool,
+}
+
+/// Maximum Levenshtein distance one fuzzy expansion may declare.
+pub const MAX_LEXICAL_FUZZY_DISTANCE: usize = 2;
+
+/// One weighted BM25F field boost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductLexicalFieldBoost {
+    /// `body` for the canonical indexed text, or a string doc-value field.
+    pub field: String,
+    /// Positive weight in micros; one million is a whole weight.
+    pub weight_micros: u32,
+}
+
+/// Reserved field name scoring the canonical indexed source text.
+pub const LEXICAL_BODY_FIELD: &str = "body";
+
+/// Maximum distinct terms one prefix may expand to.
+pub const MAX_LEXICAL_PREFIX_TERMS: usize = 64;
+
+/// Maximum `minimum_match` distinct terms in one lexical operator.
+pub const MAX_LEXICAL_MINIMUM_MATCH: usize = 64;
+
+/// Term-admission operator over the analyzed query terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductLexicalOperator {
+    /// Admit only candidates containing every distinct analyzed term.
+    And,
+    /// Admit candidates containing at least this many distinct analyzed
+    /// terms (`1..=64`).
+    Or {
+        /// Minimum distinct-term matches required.
+        minimum_match: usize,
+    },
 }
 
 /// Exact, approximate, or adaptive vector execution requested by the product.
@@ -187,6 +279,9 @@ pub struct ProductVectorBranch {
     /// A supplied strategy must agree with the catalog policy and cannot alter
     /// its adaptive threshold or exceed its `ef_search_max`.
     pub execution: Option<ProductVectorExecution>,
+    /// Optional finite nonnegative distance cutoff: hits strictly farther
+    /// than this canonical metric distance are discarded before fusion.
+    pub max_distance: Option<CanonicalF64>,
 }
 
 /// Branch-combination method for the fused relevance score.
@@ -197,6 +292,13 @@ pub enum ProductFusionMethod {
     /// vector candidate contributes its branch weight times the bounded
     /// similarity `1 / (1 + distance)`.
     WeightedScore,
+    /// Min-max relative-score blend: each branch normalizes its admitted
+    /// candidates to `[0, 1]` over that branch's own score range before
+    /// weighting, so the best admitted candidate contributes exactly the
+    /// branch weight and the worst contributes zero regardless of scale.
+    /// A branch whose candidates all share one score contributes the full
+    /// weight for each.
+    RelativeScore,
 }
 
 /// Bounded first-k-per-parent deduplication over the final ranking.
@@ -264,6 +366,8 @@ pub struct ProductSearchRequest {
     pub sort: Vec<ProductSearchSort>,
     /// Complete candidate-set facets.
     pub facets: Vec<ProductFacetRequest>,
+    /// Complete candidate-set range facets over numeric fields.
+    pub range_facets: Vec<ProductRangeFacetRequest>,
     /// Complete candidate-set metric aggregations.
     pub aggregations: Vec<ProductNamedAggregation>,
     /// Maximum final hits.
@@ -277,7 +381,19 @@ pub struct ProductSearchRequest {
     pub rerank: Option<ProductRerankStage>,
     /// Optional budgeted highlighting over the final hits.
     pub highlight: Option<ProductHighlight>,
+    /// Optional knee-detection truncation of the score-ordered ranking:
+    /// cut immediately before the N-th strict local maximum of the
+    /// normalized score curve's deviation from uniform linear decay.
+    /// Runs after reranking/deduplication and before the final limit.
+    pub autocut: Option<usize>,
+    /// Leading hits skipped from the final ranking before the limit
+    /// window. `offset + limit` must stay within the bounded ranking
+    /// ceiling.
+    pub offset: usize,
 }
+
+/// Maximum autocut extremum count in one request.
+pub const MAX_AUTOCUT_STEEPNESS: usize = 16;
 
 /// Physical vector strategy that actually ran.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +449,8 @@ pub struct ProductSearchResult {
     pub hits: Vec<ProductIntegratedSearchHit>,
     /// Facets over the complete fused candidate set after the typed filter.
     pub facets: Vec<ProductFacetResult>,
+    /// Range facets in request order, one bucket per declared range.
+    pub range_facets: Vec<ProductFacetResult>,
     /// Named metric aggregations over the same set.
     pub aggregations: Vec<ProductNamedAggregationValue>,
     /// Per-target vector strategy evidence.
@@ -557,7 +675,11 @@ impl NativeProduct {
             .set(binding_key(collection), encode_binding(&binding)?, None)
             .map_err(map_runtime_error)?;
         transaction
-            .set(manifest_key(collection), MANIFEST_MAGIC.to_vec(), None)
+            .set(
+                manifest_key(collection),
+                encode_manifest_header(&ManifestHeader::default())?,
+                None,
+            )
             .map_err(map_runtime_error)?;
         let commit = transaction.commit().map_err(map_runtime_error)?;
         self.observe_commit(&commit);
@@ -572,11 +694,17 @@ impl NativeProduct {
 
     /// Validates and atomically ingests one bounded cross-engine document batch.
     ///
+    /// Cost scales with the batch: the idempotency marker, binding, and
+    /// manifest resolve through durable point reads, and a batch whose
+    /// documents carry no named vectors stages through the physical delta
+    /// batch, so neither `BEGIN`, staging, nor the receipt materializes the
+    /// complete all-engine state. A batch that carries vectors keeps the
+    /// materialized transaction until the ANN store gains a delta stage.
+    ///
     /// # Errors
     ///
     /// Returns without publication for any invalid document, exhausted bound,
     /// duplicate document, unknown target, or native commit failure.
-    #[allow(clippy::too_many_lines)]
     pub fn ingest_search_batch(
         &mut self,
         collection: crate::ObjectId,
@@ -589,52 +717,189 @@ impl NativeProduct {
         validate_documents(&definition, &binding, batch)?;
         let digest = ingest_digest(batch)?;
         let marker_key = idempotency_key(collection, batch.idempotency_id);
-        let current = self.snapshot_bounded(logical_time_micros)?;
-        if let Some(encoded) = current.structure_get_internal(&marker_key) {
-            let marker = decode_idempotency(encoded)?;
+        if let Some(encoded) = self.structure_point_read(&marker_key, logical_time_micros)? {
+            let marker = decode_idempotency(&encoded)?;
             if marker.digest != digest {
                 return Err(idempotency_conflict());
             }
             return Ok(ProductSearchIngestReceipt {
-                snapshot: current.identity(),
+                snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
                 commit: Some(self.original_search_receipt(marker.transaction_id)?),
                 documents: marker.documents,
                 idempotent_replay: true,
             });
         }
+        let catalog = self.catalog_snapshot()?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            self.catalog_describe(&catalog, id).ok().flatten()
+        })?;
+        let plan = IngestPlan {
+            collection,
+            binding: &binding,
+            batch,
+            digest,
+            marker_key,
+            transform,
+            logical_time_micros,
+            durability,
+        };
+        let carries_vectors = batch
+            .documents
+            .iter()
+            .any(|document| !document.vectors.is_empty());
+        let commit = if carries_vectors {
+            self.ingest_search_batch_materialized(&plan)?
+        } else {
+            self.ingest_search_batch_delta(&plan)?
+        };
+        self.observe_commit(&commit);
+        Ok(ProductSearchIngestReceipt {
+            snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
+            commit: Some(commit.into()),
+            documents: batch.documents.len(),
+            idempotent_replay: false,
+        })
+    }
 
-        let manifest_key = manifest_key(collection);
-        let mut transaction = self
+    /// Resolves the manifest for one ingest through the caller's point reads
+    /// and admits the batch against the collection bound and duplicate
+    /// identities. Returns the manifest writes to stage and whether the
+    /// collection held no document before this batch.
+    fn ingest_manifest(
+        collection: crate::ObjectId,
+        batch: &ProductSearchIngestBatch,
+        read: ManifestRead<'_>,
+    ) -> Result<(ManifestMutations, bool), ProductError> {
+        let mut manifest = ManifestState::open(collection, read)?;
+        let collection_was_empty = manifest.is_empty();
+        let identities: Vec<crate::ObjectId> = batch
+            .documents
+            .iter()
+            .map(|document| document.object_id)
+            .collect();
+        manifest.insert_batch(&identities, read)?;
+        Ok((manifest.finish()?, collection_was_empty))
+    }
+
+    /// Point-resolved ingest for a batch whose documents carry no vectors.
+    fn ingest_search_batch_delta(
+        &mut self,
+        plan: &IngestPlan<'_>,
+    ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
+        let (manifest_writes, collection_was_empty) =
+            Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
+                self.structure_point_read(key, plan.logical_time_micros)
+            })?;
+        let covered = collection_was_empty
+            || self
+                .structure_point_read(
+                    &posting_coverage_key(plan.collection),
+                    plan.logical_time_micros,
+                )?
+                .is_some();
+        let transaction_id = self
             .database
-            .begin(logical_time_micros, durability.into())
+            .next_transaction_id()
             .map_err(map_runtime_error)?;
-        let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
-        let mut identities = decode_manifest(existing_manifest)?;
-        let collection_was_empty = identities.is_empty();
-        if identities.len().saturating_add(batch.documents.len())
-            > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS
-        {
-            return Err(limit_exceeded());
-        }
-        for document in &batch.documents {
-            if !identities.insert(document.object_id) {
-                return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
+        let mut delta = self
+            .database
+            .begin_optimistic_delta(plan.logical_time_micros, plan.durability.into())
+            .map_err(map_runtime_error)?;
+        let mut set = |key: Vec<u8>, value: Vec<u8>| {
+            self.database
+                .stage_delta_set(&mut delta, key, value, None)
+                .map_err(map_runtime_error)
+        };
+        for document in &plan.batch.documents {
+            set(
+                document_key(plan.collection, document.object_id),
+                encode_document(document)?,
+            )?;
+            if covered {
+                let (keys, oversized) = document_posting_keys(
+                    plan.collection,
+                    document.object_id,
+                    &document.doc_values,
+                )?;
+                for key in keys {
+                    set(key, vec![1])?;
+                }
+                for field in oversized {
+                    set(unindexed_field_key(plan.collection, &field), vec![1])?;
+                }
             }
         }
+        if collection_was_empty {
+            set(
+                posting_coverage_key(plan.collection),
+                POSTING_COVERAGE_MAGIC.to_vec(),
+            )?;
+        }
+        for (key, write) in manifest_writes.writes {
+            match write {
+                ManifestWrite::Set(value) => set(key, value)?,
+                // Inserts never delete a chunk key; the delta batch has no
+                // scalar delete to stage one with.
+                ManifestWrite::Delete => return Err(corruption()),
+            }
+        }
+        set(
+            plan.marker_key.clone(),
+            encode_idempotency(&IdempotencyMarker {
+                digest: plan.digest,
+                documents: plan.batch.documents.len(),
+                transaction_id: transaction_id.get(),
+            })?,
+        )?;
+        for document in &plan.batch.documents {
+            let text = match &plan.transform {
+                None => document.text.clone(),
+                Some(transform) => transform.apply(&document.text),
+            };
+            self.database
+                .stage_delta_index_document(
+                    &mut delta,
+                    plan.binding.lexical_index,
+                    document.object_id.get().to_be_bytes().to_vec(),
+                    text,
+                )
+                .map_err(map_runtime_error)?;
+        }
+        let commit = self
+            .database
+            .commit_optimistic(delta)
+            .map_err(map_runtime_error)?;
+        if commit.transaction_id != transaction_id {
+            // The serialized writer published under another identity: the
+            // durable marker would point at a foreign receipt.
+            return Err(corruption());
+        }
+        Ok(commit)
+    }
 
-        let transform = collection_lexical_transform(&definition, |id| {
-            current.inner.logical_catalog_object(id).cloned()
-        })?;
-        for document in &batch.documents {
+    /// Materialized ingest for a batch that carries named vectors.
+    fn ingest_search_batch_materialized(
+        &mut self,
+        plan: &IngestPlan<'_>,
+    ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
+        let mut transaction = self
+            .database
+            .begin(plan.logical_time_micros, plan.durability.into())
+            .map_err(map_runtime_error)?;
+        let (manifest_writes, collection_was_empty) =
+            Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
+                Ok(transaction.get(key).map(<[u8]>::to_vec))
+            })?;
+        for document in &plan.batch.documents {
             let object_bytes = document.object_id.get().to_be_bytes().to_vec();
-            let text = match &transform {
+            let text = match &plan.transform {
                 None => document.text.clone(),
                 Some(transform) => transform.apply(&document.text),
             };
             transaction
-                .index_document(binding.lexical_index, object_bytes, text)
+                .index_document(plan.binding.lexical_index, object_bytes, text)
                 .map_err(map_runtime_error)?;
-            for vector_binding in &binding.vectors {
+            for vector_binding in &plan.binding.vectors {
                 if let Some(vector) = document.vectors.get(&vector_binding.name) {
                     transaction
                         .upsert_vector(vector_binding.index, document.object_id, vector.clone())
@@ -643,51 +908,72 @@ impl NativeProduct {
             }
             transaction
                 .set(
-                    document_key(collection, document.object_id),
+                    document_key(plan.collection, document.object_id),
                     encode_document(document)?,
                     None,
                 )
                 .map_err(map_runtime_error)?;
         }
         let (covered, newly_covered) =
-            posting_coverage(&transaction, collection, collection_was_empty);
+            posting_coverage(&transaction, plan.collection, collection_was_empty);
         if covered {
-            for document in &batch.documents {
-                write_document_postings(&mut transaction, collection, document)?;
+            for document in &plan.batch.documents {
+                write_document_postings(&mut transaction, plan.collection, document)?;
             }
         }
         if newly_covered {
             transaction
                 .set(
-                    posting_coverage_key(collection),
+                    posting_coverage_key(plan.collection),
                     POSTING_COVERAGE_MAGIC.to_vec(),
                     None,
                 )
                 .map_err(map_runtime_error)?;
         }
-        transaction
-            .set(manifest_key, encode_manifest(&identities)?, None)
-            .map_err(map_runtime_error)?;
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
-                marker_key,
+                plan.marker_key.clone(),
                 encode_idempotency(&IdempotencyMarker {
-                    digest,
-                    documents: batch.documents.len(),
+                    digest: plan.digest,
+                    documents: plan.batch.documents.len(),
                     transaction_id,
                 })?,
                 None,
             )
             .map_err(map_runtime_error)?;
-        let commit = transaction.commit().map_err(map_runtime_error)?;
-        self.observe_commit(&commit);
-        let snapshot = self.snapshot_bounded(logical_time_micros)?.identity();
-        Ok(ProductSearchIngestReceipt {
-            snapshot,
-            commit: Some(commit.into()),
-            documents: batch.documents.len(),
-            idempotent_replay: false,
+        transaction.commit().map_err(map_runtime_error)
+    }
+
+    /// Reads one current structure value through its physical root without
+    /// materializing engine state.
+    fn structure_point_read(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Result<Option<Vec<u8>>, ProductError> {
+        self.database
+            .get_latest_structure(key, logical_time_micros)
+            .map_err(map_runtime_error)
+    }
+
+    /// Captures the current committed root identity without materializing
+    /// engine state.
+    fn snapshot_identity_bounded(
+        &self,
+        logical_time_micros: i64,
+    ) -> Result<SnapshotIdentity, ProductError> {
+        let identity = self
+            .database
+            .snapshot_identity(logical_time_micros)
+            .map_err(map_runtime_error)?;
+        Ok(SnapshotIdentity {
+            directory_lineage: self.database.directory_identity().lineage().encode(),
+            visible_csn: identity.visible_csn,
+            catalog_version: identity.catalog_version,
+            root_digest: identity.root_digest,
+            logical_time_micros: identity.logical_time_micros,
         })
     }
 
@@ -714,16 +1000,16 @@ impl NativeProduct {
             documents: vec![document.clone()],
         };
         validate_documents(&definition, &binding, &batch_shape)?;
-        let manifest_key = manifest_key(collection);
-        let existing = batch.get(&manifest_key).ok_or_else(corruption)?;
-        let mut identities = decode_manifest(existing)?;
-        if identities.len().saturating_add(1) > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-            return Err(limit_exceeded());
-        }
-        let replace = identities.contains(&document.object_id);
-        if !replace && !identities.insert(document.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(batch.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            let replace = manifest.contains(document.object_id, &read)?;
+            if !replace {
+                manifest.insert_batch(&[document.object_id], &read)?;
+            }
+            (manifest.finish()?, replace)
+        };
+        let (manifest_writes, replace) = manifest_writes;
         let object_bytes = document.object_id.get().to_be_bytes().to_vec();
         let transform = collection_lexical_transform(&definition, |id| {
             batch.logical_catalog_object(id).cloned()
@@ -762,10 +1048,7 @@ impl NativeProduct {
             )
             .map_err(map_runtime_error)?;
         write_document_postings(batch, collection, document)?;
-        batch
-            .set(manifest_key, encode_manifest(&identities)?, None)
-            .map_err(map_runtime_error)?;
-        Ok(())
+        apply_manifest_mutations(batch, manifest_writes)
     }
 
     /// Atomically replaces one existing integrated document across lexical,
@@ -811,15 +1094,17 @@ impl NativeProduct {
             .database
             .begin(logical_time_micros, durability.into())
             .map_err(map_runtime_error)?;
-        let manifest = decode_manifest(
-            transaction
-                .get(&manifest_key(collection))
-                .ok_or_else(corruption)?,
-        )?;
-        if !manifest.contains(&update.document.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
-                .with_object_id(update.document.object_id));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            if !manifest.contains(update.document.object_id, &read)? {
+                return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
+                    .with_object_id(update.document.object_id));
+            }
+            // A format-2 manifest yields no write here; a legacy one upgrades.
+            manifest.finish()?
+        };
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let (postings_covered, _) = posting_coverage(&transaction, collection, false);
         if postings_covered {
             let previous = transaction
@@ -922,12 +1207,15 @@ impl NativeProduct {
             .database
             .begin(logical_time_micros, durability.into())
             .map_err(map_runtime_error)?;
-        let manifest_key = manifest_key(collection);
-        let mut manifest = decode_manifest(transaction.get(&manifest_key).ok_or_else(corruption)?)?;
-        if !manifest.remove(&delete.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
-                .with_object_id(delete.object_id));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            if !manifest.remove(delete.object_id, &read)? {
+                return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
+                    .with_object_id(delete.object_id));
+            }
+            manifest.finish()?
+        };
         let (postings_covered, _) = posting_coverage(&transaction, collection, false);
         if postings_covered {
             let previous = transaction
@@ -950,9 +1238,7 @@ impl NativeProduct {
         transaction
             .delete_structure(document_key(collection, delete.object_id))
             .map_err(map_runtime_error)?;
-        transaction
-            .set(manifest_key, encode_manifest(&manifest)?, None)
-            .map_err(map_runtime_error)?;
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
@@ -1019,6 +1305,109 @@ impl NativeProduct {
         self.original_search_receipt(transaction_id)
     }
 
+    /// Every durable manifest record of `collection` — the header and, for a
+    /// format-2 manifest, each chunk — as `(key, value)` in ascending key
+    /// order at the bounded snapshot for `logical_time_micros`.
+    #[doc(hidden)]
+    pub fn manifest_records_for_test(
+        &self,
+        collection: crate::ObjectId,
+        logical_time_micros: i64,
+    ) -> Result<Vec<ManifestRecord>, ProductError> {
+        let snapshot = self.snapshot_bounded(logical_time_micros)?;
+        let view = ManifestView::open(&snapshot, collection)?;
+        let mut keys = vec![manifest_key(collection)];
+        if let Some(header) = view.header() {
+            keys.extend(
+                header
+                    .chunks
+                    .iter()
+                    .map(|chunk| manifest_chunk_key(collection, chunk.floor)),
+            );
+        }
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                let value = snapshot
+                    .structure_get_internal(&key)
+                    .ok_or_else(corruption)?
+                    .to_vec();
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    /// Rewrites the manifest of `collection` in its format-1 encoding in one
+    /// strict transaction, so tests can exercise the legacy read path and the
+    /// first-mutation upgrade on a real directory.
+    #[doc(hidden)]
+    pub fn rewrite_manifest_as_legacy_for_test(
+        &mut self,
+        collection: crate::ObjectId,
+        logical_time_micros: i64,
+    ) -> Result<(), ProductError> {
+        let mut transaction = self
+            .database
+            .begin(logical_time_micros, ProductDurability::Strict.into())
+            .map_err(map_runtime_error)?;
+        let writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            ManifestState::open(collection, &read)?.legacy_rewrite(&read)?
+        };
+        apply_manifest_mutations(&mut transaction, writes)?;
+        let commit = transaction.commit().map_err(map_runtime_error)?;
+        self.observe_commit(&commit);
+        Ok(())
+    }
+
+    /// Measures the manifest read costs of `collection` on one snapshot for
+    /// the scale harnesses: header decode, complete materialization, and one
+    /// membership probe of the greatest identity.
+    #[doc(hidden)]
+    pub fn manifest_diagnostics(
+        snapshot: &ProductSnapshot,
+        collection: crate::ObjectId,
+    ) -> Result<ManifestDiagnostics, ProductError> {
+        let started = std::time::Instant::now();
+        let view = ManifestView::open(snapshot, collection)?;
+        let header_decode_micros = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let identities = view.materialize()?;
+        let materialize_micros = started.elapsed().as_micros();
+        let probe = identities.last().copied();
+        let started = std::time::Instant::now();
+        let probe_present = match probe {
+            Some(probe) => view.contains(probe)?,
+            None => false,
+        };
+        let contains_micros = started.elapsed().as_micros();
+        let header_bytes = snapshot
+            .structure_get_internal(&manifest_key(collection))
+            .map_or(0, <[u8]>::len);
+        let largest_chunk_bytes = view.header().map_or(0, |header| {
+            header
+                .chunks
+                .iter()
+                .filter_map(|chunk| {
+                    snapshot.structure_get_internal(&manifest_chunk_key(collection, chunk.floor))
+                })
+                .map(<[u8]>::len)
+                .max()
+                .unwrap_or(0)
+        });
+        Ok(ManifestDiagnostics {
+            legacy: view.is_legacy(),
+            total: view.total(),
+            chunk_count: view.header().map_or(0, |header| header.chunks.len()),
+            header_bytes,
+            largest_chunk_bytes,
+            header_decode_micros,
+            materialize_micros,
+            contains_micros,
+            probe_present,
+        })
+    }
+
     /// Executes BM25, named exact/ANN/adaptive vectors, deterministic RRF, and
     /// typed doc-value semantics on one all-engine snapshot.
     ///
@@ -1052,13 +1441,8 @@ impl NativeProduct {
             return Err(limit_exceeded());
         }
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
-        let manifest = load_manifest_ids(snapshot, collection)?;
-        let mut selected = manifest
-            .iter()
-            .copied()
-            .filter(|object_id| start_after.is_none_or(|start| *object_id > start))
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>();
+        let mut selected = ManifestView::open(snapshot, collection)?
+            .ids_after(start_after, limit.saturating_add(1))?;
         let continuation = (selected.len() > limit)
             .then(|| selected.get(limit.saturating_sub(1)).copied())
             .flatten();
@@ -1116,6 +1500,53 @@ impl NativeProduct {
         })
     }
 
+    /// Durable posting scorer receipt. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns runtime errors mapped to product errors.
+    #[doc(hidden)]
+    pub fn match_text_receipt_for_diagnostics(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        index: crate::ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<hyphae_native_runtime::NativeLexicalSearchExecutionReceipt, ProductError> {
+        self.database
+            .match_text_at_snapshot_with_receipt(
+                &snapshot.inner,
+                index,
+                query,
+                limit,
+                hyphae_native_runtime::Bm25ScoreParameters::default(),
+            )
+            .map_err(map_runtime_error)
+    }
+
+    /// Times the durable posting scorer alone. Diagnostic surface for the
+    /// cap-ladder evidence harness; not a public contract.
+    #[doc(hidden)]
+    pub fn match_text_at_snapshot_for_diagnostics(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        index: crate::ObjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<usize, ProductError> {
+        self.database
+            .match_text_at_snapshot(
+                &snapshot.inner,
+                index,
+                query,
+                limit,
+                hyphae_native_runtime::Bm25ScoreParameters::default(),
+            )
+            .map(|hits| hits.len())
+            .map_err(map_runtime_error)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,
@@ -1129,13 +1560,13 @@ impl NativeProduct {
         let definition = self.search_definition(collection)?;
         validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let manifest_ids = load_manifest_ids(&snapshot, collection)?;
-        let total_documents = manifest_ids.len();
+        let manifest = ManifestView::open(&snapshot, collection)?;
+        let total_documents = manifest.total();
         let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
             &snapshot,
             collection,
             &request.filter,
-            &manifest_ids,
+            &manifest,
             &mut checkpoint,
         )?;
         let transform = collection_lexical_transform(&definition, |id| {
@@ -1145,6 +1576,8 @@ impl NativeProduct {
         let lexical_candidates = execute_lexical_branch(
             &self.database,
             &snapshot,
+            collection,
+            &source,
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
@@ -1166,9 +1599,9 @@ impl NativeProduct {
         )?;
 
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for object_id in &eligible_ids {
+            for object_id in eligible_ids.sorted_ids()? {
                 checkpoint()?;
-                fused.insert(*object_id, 0.0);
+                fused.insert(object_id, 0.0);
             }
         }
         let mut candidates = Vec::with_capacity(fused.len());
@@ -1189,26 +1622,42 @@ impl NativeProduct {
                 // ranking before the final truncation.
                 hyphae_native_runtime::MAX_DOC_VALUE_HITS
             } else {
-                request.limit
+                request.offset.saturating_add(request.limit)
             },
             facets: request.facets.clone(),
+            range_facets: request.range_facets.clone(),
             aggregations: request.aggregations.clone(),
         };
         let mut result = execute_doc_values(&candidates, &doc_request, &doc_value_limits())
             .map_err(|error| map_doc_value_error(&error))?;
+        let window = request.offset.saturating_add(request.limit);
         if let Some(stage) = &request.rerank {
             apply_rerank(&mut result.hits, stage)?;
         }
         if let Some(dedupe) = &request.parent_dedupe {
-            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
+            result.hits = apply_parent_dedupe(result.hits, dedupe, window)?;
         } else if request.rerank.is_some() {
-            result.hits.truncate(request.limit);
+            result.hits.truncate(window);
         }
+        if let Some(steepness) = request.autocut
+            && request.sort.is_empty()
+        {
+            let cut = autocut_extremum(
+                &result.hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+                steepness,
+            );
+            result.hits.truncate(cut);
+        }
+        if request.offset > 0 {
+            result.hits = result.hits.split_off(request.offset.min(result.hits.len()));
+        }
+        result.hits.truncate(request.limit);
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
             hits: integrated_hits(
+                &self.database,
                 result.hits,
                 &snapshot,
                 binding.lexical_index,
@@ -1216,6 +1665,7 @@ impl NativeProduct {
                 transform.as_ref(),
             )?,
             facets: result.facets,
+            range_facets: result.range_facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
             approximate,
@@ -1236,6 +1686,7 @@ impl NativeProduct {
     ///
     /// Returns an error for an invalid binding/request, missing durable side
     /// record, exhausted bound, or native lexical/vector execution failure.
+    #[allow(clippy::too_many_lines)]
     pub fn search_collection_at_snapshot(
         product: &Self,
         snapshot: &crate::ProductSnapshot,
@@ -1245,13 +1696,13 @@ impl NativeProduct {
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
         let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
         validate_search_request(&definition, &binding, request)?;
-        let manifest_ids = load_manifest_ids(snapshot, collection)?;
-        let total_documents = manifest_ids.len();
+        let manifest = ManifestView::open(snapshot, collection)?;
+        let total_documents = manifest.total();
         let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
             snapshot,
             collection,
             &request.filter,
-            &manifest_ids,
+            &manifest,
             &mut || Ok(()),
         )?;
         let transform = collection_lexical_transform(&definition, |id| {
@@ -1261,6 +1712,8 @@ impl NativeProduct {
         let lexical_candidates = execute_lexical_branch(
             &product.database,
             snapshot,
+            collection,
+            &source,
             binding.lexical_index,
             request.lexical.as_ref(),
             collection_bm25_parameters(&definition),
@@ -1281,8 +1734,8 @@ impl NativeProduct {
             &mut || Ok(()),
         )?;
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for object_id in &eligible_ids {
-                fused.insert(*object_id, 0.0);
+            for object_id in eligible_ids.sorted_ids()? {
+                fused.insert(object_id, 0.0);
             }
         }
         let candidates = fused
@@ -1306,6 +1759,7 @@ impl NativeProduct {
                     request.limit
                 },
                 facets: request.facets.clone(),
+                range_facets: Vec::new(),
                 aggregations: request.aggregations.clone(),
             },
             &doc_value_limits(),
@@ -1322,6 +1776,7 @@ impl NativeProduct {
         Ok(ProductSearchResult {
             snapshot: snapshot.identity(),
             hits: integrated_hits(
+                &product.database,
                 result.hits,
                 snapshot,
                 binding.lexical_index,
@@ -1329,6 +1784,7 @@ impl NativeProduct {
                 transform.as_ref(),
             )?,
             facets: result.facets,
+            range_facets: result.range_facets,
             aggregations: result.aggregations,
             vector_branches: vector_receipts,
             approximate: false,
@@ -1390,29 +1846,326 @@ impl NativeProduct {
         collection: crate::ObjectId,
         logical_time_micros: i64,
     ) -> Result<ProductSearchCollectionBinding, ProductError> {
-        let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let encoded = snapshot
-            .structure_get_internal(&binding_key(collection))
+        let encoded = self
+            .structure_point_read(&binding_key(collection), logical_time_micros)?
             .ok_or_else(|| {
                 ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
             })?;
-        let binding = decode_binding(encoded)?;
+        let binding = decode_binding(&encoded)?;
         let definition = self.search_definition(collection)?;
         validate_binding_definition(&definition, &binding)?;
         Ok(binding)
     }
 }
 
+/// Scores the boosted branch with versioned BM25F over the bounded
+/// committed corpus: `body` reads the canonical indexed text, every
+/// other declared field reads its exact string doc value (missing or
+/// non-string reads as the empty field). Nano scores map to
+/// `score_nanos / 1e9` so fusion sees ordinary nonnegative floats.
+fn execute_bm25f_branch(
+    snapshot: &ProductSnapshot,
+    collection: crate::ObjectId,
+    source: &DocumentSource,
+    index: crate::ObjectId,
+    lexical: &ProductLexicalBranch,
+    query: &str,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
+    let corpus = snapshot
+        .inner
+        .search_documents(index)
+        .ok_or_else(invalid_request)?;
+    let mut documents = Vec::with_capacity(corpus.len());
+    for (document_id, body) in corpus {
+        checkpoint()?;
+        let object_id = decode_object_id(&document_id)?;
+        let values = source.values_of(snapshot, collection, object_id)?;
+        let fields = lexical
+            .fields
+            .iter()
+            .map(|boost| {
+                if boost.field == LEXICAL_BODY_FIELD {
+                    body.clone()
+                } else {
+                    match values.get(&boost.field) {
+                        Some(ProductDocValue::String(value)) => value.clone(),
+                        _ => String::new(),
+                    }
+                }
+            })
+            .collect();
+        documents.push(hyphae_native_runtime::bm25f::Bm25fDocument {
+            key: document_id,
+            fields,
+        });
+    }
+    let fields = lexical
+        .fields
+        .iter()
+        .map(|boost| hyphae_native_runtime::bm25f::Bm25fField {
+            weight_micros: boost.weight_micros,
+        })
+        .collect::<Vec<_>>();
+    if hyphae_native_runtime::CanonicalAnalyzer::analyze(query)
+        .tokens
+        .is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let matches = hyphae_native_runtime::bm25f::score_bm25f(
+        &documents,
+        &fields,
+        query,
+        lexical.candidate_limit,
+    )
+    .map_err(|_| invalid_request())?;
+    Ok(matches
+        .into_iter()
+        .map(|entry| hyphae_native_runtime::MatchHit {
+            document_id: entry.key,
+            score: integer_nanos_as_f64(entry.score_nanos),
+        })
+        .collect())
+}
+
+/// Deterministic nanos -> f64 through halved integer arithmetic.
+fn integer_nanos_as_f64(nanos: i64) -> f64 {
+    let negative = nanos < 0;
+    let magnitude = nanos.unsigned_abs();
+    let upper = u32::try_from(magnitude >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(magnitude & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    let mut value = f64::from(upper) * 4_294_967_296.0 + f64::from(lower);
+    if negative {
+        value = -value;
+    }
+    value / 1_000_000_000.0
+}
+
+/// Rewrites the final analyzed query term as its bounded prefix
+/// expansion; earlier terms stay exact. No expansion leaves the branch
+/// query empty (scoring nothing); overflow fails closed.
+fn expand_prefix_query(
+    database: &hyphae_native_runtime::NativeDatabase,
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+) -> Result<String, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let Some(last) = analysis.tokens.last() else {
+        return Ok(String::new());
+    };
+    // The durable term dictionary is authoritative; a reclaimed page
+    // generation falls open to the retained model, never to a different
+    // vocabulary.
+    let mut collected = BTreeSet::new();
+    let expansion = database
+        .search_expand_term_prefix_at_snapshot(
+            &snapshot.inner,
+            index,
+            &last.term,
+            MAX_LEXICAL_PREFIX_TERMS,
+            &mut collected,
+        )
+        .unwrap_or_else(|_| {
+            snapshot
+                .inner
+                .search_expand_term_prefix(index, &last.term, MAX_LEXICAL_PREFIX_TERMS)
+        });
+    let expansion = match expansion {
+        hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
+            return Err(invalid_request());
+        }
+        hyphae_native_runtime::TermPrefixExpansion::Overflow => return Err(limit_exceeded()),
+        hyphae_native_runtime::TermPrefixExpansion::Terms(terms) => terms,
+    };
+    let mut terms: Vec<&str> = analysis.tokens[..analysis.tokens.len() - 1]
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    terms.extend(expansion.iter().map(String::as_str));
+    Ok(terms.join(" "))
+}
+
+/// Rewrites every analyzed query term as its bounded fuzzy expansion
+/// over the committed vocabulary; empty expansions contribute nothing.
+fn expand_fuzzy_query(
+    database: &hyphae_native_runtime::NativeDatabase,
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    max_distance: usize,
+) -> Result<String, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let mut collected = BTreeSet::new();
+    for token in &analysis.tokens {
+        let expansion = match database.search_expand_term_fuzzy_at_snapshot(
+            &snapshot.inner,
+            index,
+            &token.term,
+            max_distance,
+            MAX_LEXICAL_PREFIX_TERMS,
+            &mut collected,
+        ) {
+            Ok(expansion) => expansion,
+            Err(_) => snapshot.inner.search_expand_term_fuzzy(
+                index,
+                &token.term,
+                max_distance,
+                MAX_LEXICAL_PREFIX_TERMS,
+                &mut collected,
+            ),
+        };
+        match expansion {
+            hyphae_native_runtime::TermPrefixExpansion::UnknownIndex => {
+                return Err(invalid_request());
+            }
+            hyphae_native_runtime::TermPrefixExpansion::Overflow => {
+                return Err(limit_exceeded());
+            }
+            hyphae_native_runtime::TermPrefixExpansion::Terms(_) => {}
+        }
+    }
+    Ok(collected.into_iter().collect::<Vec<_>>().join(" "))
+}
+
+/// Retains only BM25 candidates whose canonical indexed text contains
+/// the exact consecutive analyzed-position sequence of the query.
+/// Queries with fewer than two analyzed terms pass every hit through.
+fn filter_phrase_hits(
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    hits: Vec<hyphae_native_runtime::MatchHit>,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Vec<hyphae_native_runtime::MatchHit>, ProductError> {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    if analysis.tokens.len() < 2 {
+        return Ok(hits);
+    }
+    let sequence: Vec<&str> = analysis
+        .tokens
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    let mut retained = Vec::with_capacity(hits.len());
+    for hit in hits {
+        checkpoint()?;
+        let Some(text) = snapshot.inner.search_document_text(index, &hit.document_id) else {
+            continue;
+        };
+        if phrase_occurs(text, &sequence) {
+            retained.push(hit);
+        }
+    }
+    Ok(retained)
+}
+
+/// Whether the exact consecutive analyzed-position sequence occurs in
+/// the text. Discarded oversized tokens leave position gaps that break
+/// adjacency, deterministically.
+fn phrase_occurs(text: &str, sequence: &[&str]) -> bool {
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(text);
+    let tokens = &analysis.tokens;
+    'starts: for start in 0..tokens.len() {
+        if tokens[start].term != sequence[0] {
+            continue;
+        }
+        let base = tokens[start].position;
+        let mut cursor = start;
+        for (offset, term) in sequence.iter().enumerate().skip(1) {
+            cursor += 1;
+            let Some(token) = tokens.get(cursor) else {
+                continue 'starts;
+            };
+            if token.position != base + offset || token.term != *term {
+                continue 'starts;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Per-term membership sets and the required distinct-match minimum.
+type LexicalMembership = (Vec<BTreeSet<crate::ObjectId>>, usize);
+
+/// Complete bounded per-term membership sets for the lexical operator.
+///
+/// `None` when no operator applies. Each distinct analyzed term's full
+/// match set must fit the branch candidate bound; a set that reaches the
+/// bound fails closed as limit-exceeded rather than answering from a
+/// truncated set.
+fn lexical_operator_membership(
+    database: &hyphae_native_runtime::NativeDatabase,
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
+    query: &str,
+    operator: Option<ProductLexicalOperator>,
+    parameters: hyphae_native_runtime::Bm25ScoreParameters,
+    checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
+) -> Result<Option<LexicalMembership>, ProductError> {
+    let Some(operator) = operator else {
+        return Ok(None);
+    };
+    let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(query);
+    let terms: BTreeSet<&str> = analysis
+        .tokens
+        .iter()
+        .map(|token| token.term.as_str())
+        .collect();
+    if terms.is_empty() {
+        return Ok(Some((Vec::new(), usize::from(!terms.is_empty()))));
+    }
+    let minimum = match operator {
+        ProductLexicalOperator::And => terms.len(),
+        ProductLexicalOperator::Or { minimum_match } => minimum_match,
+    };
+    let mut memberships = Vec::with_capacity(terms.len());
+    for term in terms {
+        checkpoint()?;
+        let hits = match database.match_text_at_snapshot(
+            &snapshot.inner,
+            index,
+            term,
+            MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES,
+            parameters,
+        ) {
+            Ok(hits) => hits,
+            Err(_) => snapshot
+                .inner
+                .match_text_with_parameters(
+                    index,
+                    term,
+                    MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES,
+                    parameters,
+                )
+                .map_err(map_runtime_error)?,
+        };
+        if hits.len() >= MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES {
+            return Err(limit_exceeded());
+        }
+        let members = hits
+            .into_iter()
+            .map(|hit| decode_object_id(&hit.document_id))
+            .collect::<Result<BTreeSet<_>, ProductError>>()?;
+        memberships.push(members);
+    }
+    Ok(Some((memberships, minimum)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_lexical_branch(
     database: &hyphae_native_runtime::NativeDatabase,
     snapshot: &ProductSnapshot,
+    collection: crate::ObjectId,
+    source: &DocumentSource,
     index: crate::ObjectId,
     lexical: Option<&ProductLexicalBranch>,
     parameters: hyphae_native_runtime::Bm25ScoreParameters,
     fusion: Option<ProductFusionMethod>,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
-    eligible: &BTreeSet<crate::ObjectId>,
+    eligible: &Eligibility<'_>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<usize, ProductError> {
@@ -1423,44 +2176,112 @@ fn execute_lexical_branch(
         None => lexical.query.clone(),
         Some(transform) => transform.apply(&lexical.query),
     };
+    let query = if lexical.prefix {
+        expand_prefix_query(database, snapshot, index, &query)?
+    } else if let Some(distance) = lexical.fuzzy {
+        expand_fuzzy_query(database, snapshot, index, &query, distance)?
+    } else {
+        query
+    };
     let query = query.as_str();
     // The durable posting scorer is bit-identical to the retained model; a
     // reclaimed page generation or inline-format directory falls open to
     // the model, never to a different answer.
-    let hits = match database.match_text_at_snapshot(
-        &snapshot.inner,
+    let hits = if lexical.fields.is_empty() {
+        match database.match_text_at_snapshot(
+            &snapshot.inner,
+            index,
+            query,
+            lexical.candidate_limit,
+            parameters,
+        ) {
+            Ok(hits) => hits,
+            Err(_) => snapshot
+                .inner
+                .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
+                .map_err(map_runtime_error)?,
+        }
+    } else {
+        execute_bm25f_branch(
+            snapshot, collection, source, index, lexical, query, checkpoint,
+        )?
+    };
+    let hits = if lexical.phrase {
+        filter_phrase_hits(snapshot, index, query, hits, checkpoint)?
+    } else {
+        hits
+    };
+    let required = lexical_operator_membership(
+        database,
+        snapshot,
         index,
         query,
-        lexical.candidate_limit,
+        lexical.operator,
         parameters,
-    ) {
-        Ok(hits) => hits,
-        Err(_) => snapshot
-            .inner
-            .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
-            .map_err(map_runtime_error)?,
-    };
-    let mut admitted = 0;
-    let top_score = hits.first().map_or(0.0, |hit| hit.score);
+        checkpoint,
+    )?;
+    let mut admitted_hits = Vec::new();
     for (rank, hit) in hits.into_iter().enumerate() {
         checkpoint()?;
         let object_id = decode_object_id(&hit.document_id)?;
-        if eligible.contains(&object_id) {
-            match fusion {
-                None => add_rrf(fused, object_id, lexical.weight, rank)?,
-                Some(ProductFusionMethod::WeightedScore) => {
-                    let normalized = if top_score > 0.0 && hit.score >= 0.0 {
-                        hit.score / top_score
-                    } else {
-                        0.0
-                    };
-                    add_weighted_score(fused, object_id, lexical.weight, normalized)?;
-                }
+        let operator_admits = match &required {
+            None => true,
+            Some((memberships, minimum)) => {
+                memberships
+                    .iter()
+                    .filter(|members| members.contains(&object_id))
+                    .count()
+                    >= *minimum
             }
-            admitted += 1;
+        };
+        if operator_admits && eligible.contains(object_id)? {
+            admitted_hits.push((rank, object_id, hit.score));
+        }
+    }
+    let admitted = admitted_hits.len();
+    let top_score = admitted_hits.first().map_or(0.0, |(_, _, score)| *score);
+    let (branch_min, branch_max) = score_bounds(admitted_hits.iter().map(|(_, _, score)| *score));
+    for (rank, object_id, score) in admitted_hits {
+        checkpoint()?;
+        match fusion {
+            None => add_rrf(fused, object_id, lexical.weight, rank)?,
+            Some(ProductFusionMethod::WeightedScore) => {
+                let normalized = if top_score > 0.0 && score >= 0.0 {
+                    score / top_score
+                } else {
+                    0.0
+                };
+                add_weighted_score(fused, object_id, lexical.weight, normalized)?;
+            }
+            Some(ProductFusionMethod::RelativeScore) => {
+                let normalized = min_max_normalized(score, branch_min, branch_max);
+                add_weighted_score(fused, object_id, lexical.weight, normalized)?;
+            }
         }
     }
     Ok(admitted)
+}
+
+/// Finite `(min, max)` bounds over one branch's admitted scores.
+fn score_bounds(scores: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut bounds: Option<(f64, f64)> = None;
+    for score in scores {
+        bounds = Some(match bounds {
+            None => (score, score),
+            Some((low, high)) => (low.min(score), high.max(score)),
+        });
+    }
+    bounds.unwrap_or((0.0, 0.0))
+}
+
+/// Min-max normalization to `[0, 1]`; a degenerate range contributes `1.0`
+/// so an all-equal branch still contributes its full weight.
+fn min_max_normalized(score: f64, min: f64, max: f64) -> f64 {
+    if max > min {
+        ((score - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1470,11 +2291,17 @@ fn execute_vector_branches(
     definition: &SearchCollectionDefinitionV2,
     branches: &[ProductVectorBranch],
     fusion: Option<ProductFusionMethod>,
-    eligible: &BTreeSet<crate::ObjectId>,
+    eligible: &Eligibility<'_>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<Vec<ProductVectorBranchReceipt>, ProductError> {
     let mut receipts = Vec::with_capacity(branches.len());
+    if branches.is_empty() {
+        return Ok(receipts);
+    }
+    // The runtime vector searches take an explicit allowlist, so the
+    // universe is materialized once here, never per branch.
+    let allowlist = eligible.allowlist()?;
     for branch in branches {
         checkpoint()?;
         let vector_binding = binding
@@ -1487,18 +2314,31 @@ fn execute_vector_branches(
             .iter()
             .find(|vector| vector.name.lookup() == branch.target)
             .ok_or_else(invalid_request)?;
-        let (hits, receipt) =
-            execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
+        let (mut hits, receipt) =
+            execute_vector_branch(snapshot, vector_binding, vector.policy, branch, &allowlist)?;
+        if hits
+            .iter()
+            .any(|hit| !hit.distance.is_finite() || hit.distance < 0.0)
+        {
+            return Err(invalid_request());
+        }
+        if let Some(cutoff) = branch.max_distance {
+            hits.retain(|hit| hit.distance <= cutoff.get());
+        }
+        let (branch_min, branch_max) = score_bounds(hits.iter().map(|hit| hit.distance));
         for (rank, hit) in hits.into_iter().enumerate() {
             checkpoint()?;
             match fusion {
                 None => add_rrf(fused, hit.object_id, branch.weight, rank)?,
                 Some(ProductFusionMethod::WeightedScore) => {
-                    let normalized = if hit.distance.is_finite() && hit.distance >= 0.0 {
-                        1.0 / (1.0 + hit.distance)
-                    } else {
-                        return Err(invalid_request());
-                    };
+                    let normalized = 1.0 / (1.0 + hit.distance);
+                    add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
+                }
+                Some(ProductFusionMethod::RelativeScore) => {
+                    // Distances rank ascending: the nearest admitted hit
+                    // contributes the full weight, the farthest zero.
+                    let normalized =
+                        min_max_normalized(branch_max - hit.distance, 0.0, branch_max - branch_min);
                     add_weighted_score(fused, hit.object_id, branch.weight, normalized)?;
                 }
             }
@@ -1758,6 +2598,7 @@ fn validate_documents(
         sort: Vec::new(),
         limit: batch.documents.len(),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
     };
     execute_doc_values(&candidates, &validation_request, &doc_value_limits())
@@ -1832,6 +2673,15 @@ fn validate_rerank(request: &ProductSearchRequest) -> Result<(), ProductError> {
     Ok(())
 }
 
+fn validate_autocut(request: &ProductSearchRequest) -> Result<(), ProductError> {
+    if let Some(steepness) = request.autocut
+        && !(1..=MAX_AUTOCUT_STEEPNESS).contains(&steepness)
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
 fn validate_highlight(request: &ProductSearchRequest) -> Result<(), ProductError> {
     if let Some(highlight) = &request.highlight
         && (!(1..=MAX_HIGHLIGHT_FRAGMENTS).contains(&highlight.max_fragments)
@@ -1855,6 +2705,53 @@ fn validate_parent_dedupe(request: &ProductSearchRequest) -> Result<(), ProductE
     Ok(())
 }
 
+/// Validates the lexical branch's bounds and mode exclusivity.
+fn validate_lexical_branch(
+    definition: &SearchCollectionDefinitionV2,
+    request: &ProductSearchRequest,
+) -> Result<(), ProductError> {
+    if let Some(lexical) = &request.lexical {
+        let boosted = !lexical.fields.is_empty();
+        let fuzzy = lexical.fuzzy.is_some();
+        let modes = usize::from(lexical.prefix)
+            + usize::from(lexical.operator.is_some())
+            + usize::from(boosted)
+            + usize::from(fuzzy)
+            + usize::from(lexical.phrase);
+        let mut boost_names = BTreeSet::new();
+        if !(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
+            || lexical.weight == 0
+            || modes > 1
+            || matches!(
+                lexical.fuzzy,
+                Some(distance) if !(1..=MAX_LEXICAL_FUZZY_DISTANCE).contains(&distance)
+            )
+            || (lexical.prefix && lexical.operator.is_some())
+            || (boosted && (lexical.prefix || lexical.operator.is_some()))
+            || lexical.fields.len() > hyphae_native_runtime::bm25f::MAX_BM25F_FIELDS
+            || lexical.fields.iter().any(|boost| {
+                boost.field.is_empty()
+                    || !(1..=hyphae_native_runtime::bm25f::MAX_BM25F_FIELD_WEIGHT_MICROS)
+                        .contains(&boost.weight_micros)
+                    || !boost_names.insert(boost.field.as_str())
+                    || (boost.field != LEXICAL_BODY_FIELD
+                        && !definition.fields.iter().any(|field| {
+                            field.name.lookup() == boost.field
+                                && field.logical_type == LogicalType::Text
+                        }))
+            })
+            || matches!(
+                lexical.operator,
+                Some(ProductLexicalOperator::Or { minimum_match })
+                    if !(1..=MAX_LEXICAL_MINIMUM_MATCH).contains(&minimum_match)
+            )
+        {
+            return Err(invalid_request());
+        }
+    }
+    Ok(())
+}
+
 fn validate_search_request(
     definition: &SearchCollectionDefinitionV2,
     binding: &ProductSearchCollectionBinding,
@@ -1863,19 +2760,33 @@ fn validate_search_request(
     validate_parent_dedupe(request)?;
     validate_rerank(request)?;
     validate_highlight(request)?;
+    validate_autocut(request)?;
+    if request.range_facets.len() > hyphae_native_runtime::MAX_DOC_VALUE_RANGE_FACETS
+        || request.range_facets.iter().any(|facet| {
+            facet.field.is_empty()
+                || facet.ranges.is_empty()
+                || facet.ranges.len() > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES
+        })
+    {
+        return Err(invalid_request());
+    }
     if !(1..=MAX_PRODUCT_SEARCH_HITS).contains(&request.limit)
+        || request
+            .offset
+            .checked_add(request.limit)
+            .is_none_or(|window| window > MAX_PRODUCT_SEARCH_HITS)
         || request.vectors.len() > MAX_PRODUCT_SEARCH_VECTOR_TARGETS
     {
         return Err(limit_exceeded());
     }
-    if let Some(lexical) = &request.lexical
-        && (!(1..=MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES).contains(&lexical.candidate_limit)
-            || lexical.weight == 0)
-    {
-        return Err(invalid_request());
-    }
+    validate_lexical_branch(definition, request)?;
     let mut targets = BTreeSet::new();
     for branch in &request.vectors {
+        if let Some(cutoff) = branch.max_distance
+            && (!cutoff.get().is_finite() || cutoff.get() < 0.0)
+        {
+            return Err(invalid_request());
+        }
         let vector = definition
             .vectors
             .iter()
@@ -1912,6 +2823,7 @@ fn validate_search_request(
         sort: request.sort.clone(),
         limit: request.limit,
         facets: request.facets.clone(),
+        range_facets: Vec::new(),
         aggregations: request.aggregations.clone(),
     };
     execute_doc_values(&empty, &validation, &doc_value_limits())
@@ -1932,6 +2844,7 @@ pub fn conformance_validate_integrated_request(
         sort: request.sort.clone(),
         limit: request.limit,
         facets: request.facets.clone(),
+        range_facets: Vec::new(),
         aggregations: request.aggregations.clone(),
     };
     execute_doc_values(&empty, &validation, &doc_value_limits())
@@ -1944,13 +2857,7 @@ fn load_documents_with_checkpoint(
     collection: crate::ObjectId,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    let manifest = snapshot
-        .structure_get_internal(&manifest_key(collection))
-        .ok_or_else(corruption)?;
-    let identities = decode_manifest(manifest)?;
-    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-        return Err(corruption());
-    }
+    let identities = ManifestView::open(snapshot, collection)?.sorted_ids()?;
     let mut documents = Vec::with_capacity(identities.len());
     for object_id in identities {
         checkpoint()?;
@@ -1977,6 +2884,7 @@ fn filter_documents_with_checkpoint(
         sort: Vec::new(),
         limit: documents.len().max(1),
         facets: Vec::new(),
+        range_facets: Vec::new(),
         aggregations: Vec::new(),
     };
     let result = execute_doc_values(documents, &request, &doc_value_limits())
@@ -2001,6 +2909,10 @@ fn doc_value_matches_type(value: &ProductDocValue, logical: &LogicalType) -> boo
             | (
                 ProductDocValue::Integer(_),
                 LogicalType::Signed(_) | LogicalType::Date | LogicalType::Timestamp
+            )
+            | (
+                ProductDocValue::Float(_),
+                LogicalType::Float32 | LogicalType::Float64
             )
             | (ProductDocValue::String(_), LogicalType::Text)
             | (ProductDocValue::Bytes(_), LogicalType::Binary)
@@ -2084,13 +2996,25 @@ fn batch_logical_bytes(batch: &ProductSearchIngestBatch) -> Result<usize, Produc
 const fn doc_value_bytes(value: &ProductDocValue) -> usize {
     match value {
         ProductDocValue::Boolean(_) => 1,
-        ProductDocValue::Integer(_) => 8,
+        ProductDocValue::Integer(_) | ProductDocValue::Float(_) => 8,
         ProductDocValue::String(value) => value.len(),
         ProductDocValue::Bytes(value) => value.len(),
     }
 }
 
-fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {
+/// Validated inputs shared by the delta and materialized ingest paths.
+struct IngestPlan<'a> {
+    collection: crate::ObjectId,
+    binding: &'a ProductSearchCollectionBinding,
+    batch: &'a ProductSearchIngestBatch,
+    digest: [u8; 32],
+    marker_key: Vec<u8>,
+    transform: Option<crate::lexical_analyzer::LexicalTransform>,
+    logical_time_micros: i64,
+    durability: ProductDurability,
+}
+
+pub(crate) fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {
     storage_key(b'M', collection, None)
 }
 
@@ -2106,7 +3030,11 @@ fn idempotency_key(collection: crate::ObjectId, idempotency_id: u128) -> Vec<u8>
     storage_key(b'I', collection, Some(idempotency_id.to_be_bytes()))
 }
 
-fn storage_key(kind: u8, collection: crate::ObjectId, suffix: Option<[u8; 16]>) -> Vec<u8> {
+pub(crate) fn storage_key(
+    kind: u8,
+    collection: crate::ObjectId,
+    suffix: Option<[u8; 16]>,
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(STORAGE_PREFIX.len() + 33);
     key.extend_from_slice(STORAGE_PREFIX);
     key.push(kind);
@@ -2149,13 +3077,14 @@ fn unindexed_field_key(collection: crate::ObjectId, field: &str) -> Vec<u8> {
 /// highlight fragments when the request carries a budget. Both search
 /// twins share this exact mapping.
 fn integrated_hits(
+    database: &hyphae_native_runtime::NativeDatabase,
     hits: Vec<hyphae_native_runtime::DocValueCandidate>,
     snapshot: &ProductSnapshot,
     lexical_index: crate::ObjectId,
     request: &ProductSearchRequest,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
 ) -> Result<Vec<ProductIntegratedSearchHit>, ProductError> {
-    let terms = highlight_terms(request, transform);
+    let terms = highlight_terms(database, snapshot, lexical_index, request, transform);
     hits.into_iter()
         .map(|hit| {
             let fragments = match (&terms, &request.highlight) {
@@ -2178,6 +3107,9 @@ fn integrated_hits(
 /// Analyzed query terms for highlighting, derived from exactly the
 /// transformed query string the lexical branch scores with.
 fn highlight_terms(
+    database: &hyphae_native_runtime::NativeDatabase,
+    snapshot: &ProductSnapshot,
+    index: crate::ObjectId,
     request: &ProductSearchRequest,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
 ) -> Option<BTreeSet<String>> {
@@ -2186,6 +3118,17 @@ fn highlight_terms(
     let query = match transform {
         None => lexical.query.clone(),
         Some(transform) => transform.apply(&lexical.query),
+    };
+    // Re-run the deterministic expansion the scoring branch used, so
+    // expanded terms highlight exactly like exact ones. Expansion
+    // failures fall back to the unexpanded terms rather than dropping
+    // highlights outright.
+    let query = if lexical.prefix {
+        expand_prefix_query(database, snapshot, index, &query).unwrap_or(query)
+    } else if let Some(distance) = lexical.fuzzy {
+        expand_fuzzy_query(database, snapshot, index, &query, distance).unwrap_or(query)
+    } else {
+        query
     };
     let analysis = hyphae_native_runtime::CanonicalAnalyzer::analyze(&query);
     Some(
@@ -2242,6 +3185,52 @@ fn extract_fragments(
     fragments
 }
 
+/// Knee-detection cut point over a descending score curve: normalize
+/// scores to `[0, 1]` against uniform linear decay and cut immediately
+/// before the `steepness`-th strict local maximum of the deviation.
+/// Degenerate inputs (one hit, equal extremes) return the whole length.
+fn autocut_extremum(scores: &[f64], steepness: usize) -> usize {
+    if scores.len() <= 1 {
+        return scores.len();
+    }
+    let first = scores[0];
+    let last = scores[scores.len() - 1];
+    let range = last - first;
+    if range == 0.0 || !range.is_finite() {
+        return scores.len();
+    }
+    let count = scores.len();
+    // Hit counts are bounded far below 2^32; the lossless u32->f64 path
+    // keeps the normalization exact.
+    let denominator = f64::from(u32::try_from(count - 1).unwrap_or(u32::MAX));
+    let step = 1.0 / denominator;
+    let deviation: Vec<f64> = scores
+        .iter()
+        .enumerate()
+        .map(|(index, score)| {
+            let position = f64::from(u32::try_from(index).unwrap_or(u32::MAX));
+            (score - first) / range - position * step
+        })
+        .collect();
+    let mut extrema = 0_usize;
+    for index in 1..count {
+        let is_maximum = if index == count - 1 {
+            count > 2
+                && deviation[index] > deviation[index - 1]
+                && deviation[index] > deviation[index - 2]
+        } else {
+            deviation[index] > deviation[index - 1] && deviation[index] > deviation[index + 1]
+        };
+        if is_maximum {
+            extrema += 1;
+            if extrema >= steepness {
+                return index;
+            }
+        }
+    }
+    count
+}
+
 fn apply_parent_dedupe(
     hits: Vec<hyphae_native_runtime::DocValueCandidate>,
     dedupe: &ProductParentDedupe,
@@ -2287,6 +3276,18 @@ fn posting_component(value: &ProductDocValue) -> Result<(u8, Vec<u8>), ProductEr
             4,
             hyphae_native_types::encode_memcomparable_bytes(value).map_err(|_| limit_exceeded())?,
         ),
+        ProductDocValue::Float(value) => {
+            // Sign-flip trick maps the IEEE total order onto unsigned
+            // byte order: non-negative values flip the sign bit, negative
+            // values flip every bit.
+            let bits = value.bits();
+            let ordered = if bits & (1 << 63) == 0 {
+                bits ^ (1 << 63)
+            } else {
+                !bits
+            };
+            (5, ordered.to_be_bytes().to_vec())
+        }
     })
 }
 
@@ -2379,30 +3380,162 @@ fn posting_scan(
     start: &[u8],
     end: &[u8],
 ) -> Option<BTreeSet<crate::ObjectId>> {
-    let keys = snapshot.structure_keys_in_range_internal(
+    // Posting keys for one (field, value) range are ordered by value then
+    // object id, so a single-value range yields ids in ascending order and a
+    // multi-value range yields runs of ascending ids. Collect the ids
+    // without copying keys, sort once (already-sorted runs are cheap for the
+    // stable sort), and bulk-build the set from sorted unique input.
+    let mut identities = Vec::new();
+    let mut malformed = false;
+    snapshot.visit_structure_keys_in_range_internal(
         start,
         end,
         MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS.saturating_mul(2),
+        |key| match posting_object_id(key) {
+            Ok(object_id) => identities.push(object_id),
+            Err(_) => malformed = true,
+        },
     )?;
-    let mut identities = BTreeSet::new();
-    for key in keys {
-        identities.insert(posting_object_id(&key).ok()?);
+    if malformed {
+        return None;
     }
-    Some(identities)
+    identities.sort_unstable();
+    identities.dedup();
+    Some(identities.into_iter().collect())
+}
+
+/// The documents a filter admits on one snapshot: every document in the
+/// manifest, answered by chunk probes without materializing the set, or an
+/// explicit ordered set.
+enum Eligibility<'v> {
+    Universe(&'v ManifestView<'v>),
+    Set(BTreeSet<crate::ObjectId>),
+}
+
+impl Eligibility<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Universe(manifest) => manifest.total(),
+            Self::Set(ids) => ids.len(),
+        }
+    }
+
+    fn contains(&self, object_id: crate::ObjectId) -> Result<bool, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.contains(object_id),
+            Self::Set(ids) => Ok(ids.contains(&object_id)),
+        }
+    }
+
+    /// The complete set, materialized only for the universe. Vector branches
+    /// need it as an allowlist.
+    fn allowlist(&self) -> Result<std::borrow::Cow<'_, BTreeSet<crate::ObjectId>>, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.materialize().map(std::borrow::Cow::Owned),
+            Self::Set(ids) => Ok(std::borrow::Cow::Borrowed(ids)),
+        }
+    }
+
+    fn sorted_ids(&self) -> Result<Vec<crate::ObjectId>, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.sorted_ids(),
+            Self::Set(ids) => Ok(ids.iter().copied().collect()),
+        }
+    }
 }
 
 /// Evaluates one filter against the posting index, producing exactly the
 /// eligible set the linear scan would produce, or `None` when any node
 /// cannot be answered from postings (the caller falls back fail-open to the
-/// scan, never to a wrong answer).
-fn posting_filter_ids(
+/// scan, never to a wrong answer). `MatchAll` and composites that reduce to
+/// it stay the universe: nothing copies the manifest to say "everything".
+fn posting_filter_ids<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest: &BTreeSet<crate::ObjectId>,
+    manifest: &'v ManifestView<'v>,
+) -> Result<Option<Eligibility<'v>>, ProductError> {
+    match filter {
+        ProductSearchFilter::MatchAll => Ok(Some(Eligibility::Universe(manifest))),
+        ProductSearchFilter::All(children) => {
+            // `None` here means "no child has narrowed the universe yet".
+            let mut narrowed: Option<BTreeSet<crate::ObjectId>> = None;
+            for child in children {
+                let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)?
+                else {
+                    return Ok(None);
+                };
+                if let Eligibility::Set(ids) = child_ids {
+                    narrowed = Some(match narrowed {
+                        None => ids,
+                        Some(current) => current.intersection(&ids).copied().collect(),
+                    });
+                }
+            }
+            Ok(Some(
+                narrowed.map_or(Eligibility::Universe(manifest), Eligibility::Set),
+            ))
+        }
+        ProductSearchFilter::Any(children) => {
+            let mut result = BTreeSet::new();
+            let mut universe = false;
+            for child in children {
+                let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)?
+                else {
+                    return Ok(None);
+                };
+                match child_ids {
+                    Eligibility::Universe(_) => universe = true,
+                    Eligibility::Set(ids) => result.extend(ids),
+                }
+            }
+            Ok(Some(if universe {
+                Eligibility::Universe(manifest)
+            } else {
+                Eligibility::Set(result)
+            }))
+        }
+        ProductSearchFilter::Not(child) => {
+            let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)? else {
+                return Ok(None);
+            };
+            Ok(Some(Eligibility::Set(match child_ids {
+                Eligibility::Universe(_) => BTreeSet::new(),
+                Eligibility::Set(ids) => {
+                    manifest.materialize()?.difference(&ids).copied().collect()
+                }
+            })))
+        }
+        // Missing-field membership is the manifest minus every posting for
+        // the field, mirroring the reference's negated Exists exactly.
+        ProductSearchFilter::IsNull(field) => {
+            let start = posting_field_prefix(collection, field);
+            let Some(end) = prefix_successor(&start) else {
+                return Ok(None);
+            };
+            let Some(present) = posting_scan(snapshot, &start, &end) else {
+                return Ok(None);
+            };
+            Ok(Some(Eligibility::Set(
+                manifest
+                    .materialize()?
+                    .difference(&present)
+                    .copied()
+                    .collect(),
+            )))
+        }
+        leaf => Ok(posting_leaf_ids(snapshot, collection, leaf).map(Eligibility::Set)),
+    }
+}
+
+/// Filter leaves answered from postings alone, or `None` when the shape
+/// cannot be (substring `Like`).
+fn posting_leaf_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
 ) -> Option<BTreeSet<crate::ObjectId>> {
     match filter {
-        ProductSearchFilter::MatchAll => Some(manifest.clone()),
         ProductSearchFilter::Exists(field) => {
             let start = posting_field_prefix(collection, field);
             let end = prefix_successor(&start)?;
@@ -2438,26 +3571,6 @@ fn posting_filter_ids(
                 }
             }
         }
-        ProductSearchFilter::All(children) => {
-            let mut result = manifest.clone();
-            for child in children {
-                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-                result = result.intersection(&ids).copied().collect();
-            }
-            Some(result)
-        }
-        ProductSearchFilter::Any(children) => {
-            let mut result = BTreeSet::new();
-            for child in children {
-                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-                result.extend(ids);
-            }
-            Some(result)
-        }
-        ProductSearchFilter::Not(child) => {
-            let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-            Some(manifest.difference(&ids).copied().collect())
-        }
         // A bounded membership set is the union of its members' point scans.
         ProductSearchFilter::In { field, values } => {
             let field_start = posting_field_prefix(collection, field);
@@ -2472,31 +3585,31 @@ fn posting_filter_ids(
             }
             Some(result)
         }
-        // Missing-field membership is the manifest minus every posting for
-        // the field, mirroring the reference's negated Exists exactly.
-        ProductSearchFilter::IsNull(field) => {
-            let start = posting_field_prefix(collection, field);
-            let end = prefix_successor(&start)?;
-            let present = posting_scan(snapshot, &start, &end)?;
-            Some(manifest.difference(&present).copied().collect())
-        }
         // Substring shapes cannot be answered from ordered postings; the
-        // caller falls back fail-open to the exact scan.
-        ProductSearchFilter::Like { .. } => None,
+        // caller falls back fail-open to the exact scan. Composites are
+        // resolved by `posting_filter_ids`.
+        ProductSearchFilter::Like { .. }
+        | ProductSearchFilter::MatchAll
+        | ProductSearchFilter::All(_)
+        | ProductSearchFilter::Any(_)
+        | ProductSearchFilter::Not(_)
+        | ProductSearchFilter::IsNull(_) => None,
     }
 }
 
 /// Answers eligibility from the posting index when the collection is
 /// posting-covered and every referenced field is fully indexed.
-fn posting_eligible_ids(
+fn posting_eligible_ids<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest: &BTreeSet<crate::ObjectId>,
-) -> Option<BTreeSet<crate::ObjectId>> {
-    let coverage = snapshot.structure_get_internal(&posting_coverage_key(collection))?;
+    manifest: &'v ManifestView<'v>,
+) -> Result<Option<Eligibility<'v>>, ProductError> {
+    let Some(coverage) = snapshot.structure_get_internal(&posting_coverage_key(collection)) else {
+        return Ok(None);
+    };
     if coverage != POSTING_COVERAGE_MAGIC {
-        return None;
+        return Ok(None);
     }
     let mut fields = BTreeSet::new();
     filter_fields(filter, &mut fields);
@@ -2505,7 +3618,7 @@ fn posting_eligible_ids(
             .structure_get_internal(&unindexed_field_key(collection, field))
             .is_some()
         {
-            return None;
+            return Ok(None);
         }
     }
     posting_filter_ids(snapshot, collection, filter, manifest)
@@ -2591,14 +3704,14 @@ impl DocumentSource {
 
 /// Resolves eligibility from postings when possible, otherwise through the
 /// materializing linear scan, preserving byte-identical semantics.
-fn resolve_eligibility_with_checkpoint(
+fn resolve_eligibility_with_checkpoint<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest_ids: &BTreeSet<crate::ObjectId>,
+    manifest: &'v ManifestView<'v>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
-) -> Result<(BTreeSet<crate::ObjectId>, DocumentSource), ProductError> {
-    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest_ids) {
+) -> Result<(Eligibility<'v>, DocumentSource), ProductError> {
+    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest)? {
         checkpoint()?;
         return Ok((eligible, DocumentSource::Postings));
     }
@@ -2614,7 +3727,7 @@ fn resolve_eligibility_with_checkpoint(
         checkpoint()?;
         by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
     }
-    Ok((eligible_ids, DocumentSource::Scan(by_id)))
+    Ok((Eligibility::Set(eligible_ids), DocumentSource::Scan(by_id)))
 }
 
 /// Loads the collection manifest identities under the read-side cap.
@@ -2658,59 +3771,6 @@ fn collection_bm25_parameters(
             b_micros: bm25.b_micros,
         },
     )
-}
-
-fn load_manifest_ids(
-    snapshot: &crate::ProductSnapshot,
-    collection: crate::ObjectId,
-) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
-    let identities = decode_manifest(
-        snapshot
-            .structure_get_internal(&manifest_key(collection))
-            .ok_or_else(corruption)?,
-    )?;
-    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-        return Err(corruption());
-    }
-    Ok(identities)
-}
-
-fn encode_manifest(identities: &BTreeSet<crate::ObjectId>) -> Result<Vec<u8>, ProductError> {
-    let count = u32::try_from(identities.len()).map_err(|_| limit_exceeded())?;
-    let mut encoded = Vec::with_capacity(12 + identities.len().saturating_mul(16));
-    encoded.extend_from_slice(MANIFEST_MAGIC);
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for object_id in identities {
-        encoded.extend_from_slice(&object_id.get().to_be_bytes());
-    }
-    Ok(encoded)
-}
-
-fn decode_manifest(encoded: &[u8]) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
-    if encoded == MANIFEST_MAGIC {
-        return Ok(BTreeSet::new());
-    }
-    if encoded.len() < 12 || encoded.get(..8) != Some(MANIFEST_MAGIC.as_slice()) {
-        return Err(corruption());
-    }
-    let count = usize::try_from(u32::from_le_bytes(
-        encoded[8..12].try_into().map_err(|_| corruption())?,
-    ))
-    .map_err(|_| corruption())?;
-    if encoded.len() != 12_usize.saturating_add(count.saturating_mul(16)) {
-        return Err(corruption());
-    }
-    let mut identities = BTreeSet::new();
-    for chunk in encoded[12..].chunks_exact(16) {
-        let object_id = crate::ObjectId::new(u128::from_be_bytes(
-            chunk.try_into().map_err(|_| corruption())?,
-        ))
-        .map_err(|_| corruption())?;
-        if !identities.insert(object_id) {
-            return Err(corruption());
-        }
-    }
-    Ok(identities)
 }
 
 fn encode_binding(binding: &ProductSearchCollectionBinding) -> Result<Vec<u8>, ProductError> {
@@ -2801,6 +3861,10 @@ fn encode_document(document: &ProductDocument) -> Result<Vec<u8>, ProductError> 
                 encoded.push(4);
                 put_bytes(&mut encoded, value)?;
             }
+            ProductDocValue::Float(value) => {
+                encoded.push(5);
+                put_bytes(&mut encoded, &value.bits().to_le_bytes())?;
+            }
         }
     }
     Ok(encoded)
@@ -2841,6 +3905,14 @@ fn decode_document(
                 String::from_utf8(value.to_vec()).map_err(|_| corruption())?,
             ),
             4 => ProductDocValue::Bytes(value.to_vec()),
+            5 if value.len() == 8 => {
+                let bits = u64::from_le_bytes(value.try_into().map_err(|_| corruption())?);
+                let float = hyphae_native_types::CanonicalF64::new(f64::from_bits(bits));
+                if float.bits() != bits {
+                    return Err(corruption());
+                }
+                ProductDocValue::Float(float)
+            }
             _ => return Err(corruption()),
         };
         if name.is_empty() || values.insert(name, value).is_some() {
@@ -2977,7 +4049,7 @@ fn map_doc_value_error(error: &hyphae_native_runtime::DocValueError) -> ProductE
     }
 }
 
-fn map_runtime_error(error: NativeRuntimeError) -> ProductError {
+pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> ProductError {
     match error {
         NativeRuntimeError::Ann(_)
         | NativeRuntimeError::Model(_)
@@ -2990,7 +4062,7 @@ fn invalid_request() -> ProductError {
     ProductError::from_code(ProductErrorCode::InvalidRequest)
 }
 
-fn limit_exceeded() -> ProductError {
+pub(crate) fn limit_exceeded() -> ProductError {
     ProductError::from_code(ProductErrorCode::LimitExceeded)
 }
 
@@ -2998,6 +4070,160 @@ fn idempotency_conflict() -> ProductError {
     ProductError::from_code(ProductErrorCode::IdempotencyConflict)
 }
 
-fn corruption() -> ProductError {
+pub(crate) fn corruption() -> ProductError {
     ProductError::from_code(ProductErrorCode::Corruption)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search_manifest::{
+        MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES, MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS,
+        decode_manifest_header,
+    };
+
+    fn document(id: u128) -> ProductDocument {
+        ProductDocument {
+            object_id: crate::ObjectId::new(id).unwrap_or_else(|_| unreachable!("nonzero id")),
+            text: "bound".to_owned(),
+            doc_values: BTreeMap::new(),
+            vectors: BTreeMap::new(),
+        }
+    }
+
+    fn collection() -> Result<crate::ObjectId, ProductError> {
+        crate::ObjectId::new(52).map_err(|_| corruption())
+    }
+
+    /// In-memory manifest records holding identities `1..=count`.
+    struct Records(BTreeMap<Vec<u8>, Vec<u8>>);
+
+    impl Records {
+        fn with(count: usize) -> Result<Self, ProductError> {
+            let identities = (1..=count)
+                .map(|id| crate::ObjectId::new(u128::try_from(id).unwrap_or(1)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| corruption())?;
+            let mut records = Self(BTreeMap::new());
+            records.apply(ManifestState::pack_sorted(collection()?, &identities).finish()?);
+            Ok(records)
+        }
+
+        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+
+        fn apply(&mut self, mutations: ManifestMutations) {
+            for (key, write) in mutations.writes {
+                match write {
+                    ManifestWrite::Set(value) => {
+                        self.0.insert(key, value);
+                    }
+                    ManifestWrite::Delete => {
+                        self.0.remove(&key);
+                    }
+                }
+            }
+        }
+
+        fn ingest(
+            &self,
+            batch: &ProductSearchIngestBatch,
+        ) -> Result<(ManifestMutations, bool), ProductError> {
+            NativeProduct::ingest_manifest(collection()?, batch, &|key: &[u8]| Ok(self.read(key)))
+        }
+
+        fn header(&self) -> Result<ManifestHeader, ProductError> {
+            decode_manifest_header(
+                self.0
+                    .get(&manifest_key(collection()?))
+                    .ok_or_else(corruption)?,
+            )
+        }
+    }
+
+    fn largest_set(mutations: &ManifestMutations) -> usize {
+        mutations
+            .writes
+            .iter()
+            .map(|(_, write)| match write {
+                ManifestWrite::Set(value) => value.len(),
+                ManifestWrite::Delete => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The collection bound admits exactly `MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS`
+    /// identities, rejects the first document past it before any mutation,
+    /// and the per-batch manifest write stays bounded independently of the
+    /// collection size.
+    #[test]
+    fn collection_bound_is_exact_and_fails_closed() -> Result<(), ProductError> {
+        assert_eq!(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS, 250_000);
+        let mut full_minus_one = Records::with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
+        let last = ProductSearchIngestBatch {
+            idempotency_id: 1,
+            documents: vec![document(
+                u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS).unwrap_or(1),
+            )],
+        };
+        let (mutations, was_empty) = full_minus_one.ingest(&last)?;
+        assert!(!was_empty);
+        let header_bound = 16 + 20 * MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS;
+        let chunk_bound = 28 + 16 * MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES;
+        assert!(
+            largest_set(&mutations) <= header_bound.max(chunk_bound),
+            "one batch writes at most the header and the chunks it touches"
+        );
+        full_minus_one.apply(mutations);
+        let full = full_minus_one;
+        let header = full.header()?;
+        assert_eq!(header.total, MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS);
+        assert!(header.chunks.len() <= MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS);
+        assert_eq!(
+            full.0.get(&manifest_key(collection()?)).map(Vec::len),
+            Some(16 + 20 * header.chunks.len()),
+            "header is 16 bytes plus 20 per chunk"
+        );
+        assert_eq!(
+            full.0.len(),
+            header.chunks.len() + 1,
+            "header plus one key per chunk"
+        );
+
+        let one_more = ProductSearchIngestBatch {
+            idempotency_id: 2,
+            documents: vec![document(
+                u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1),
+            )],
+        };
+        let error = full.ingest(&one_more).err().ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+
+        // A batch that would cross the bound is rejected as a whole even when
+        // part of it would fit.
+        let full_minus_one = Records::with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
+        let two = ProductSearchIngestBatch {
+            idempotency_id: 3,
+            documents: vec![
+                document(u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS).unwrap_or(1)),
+                document(u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1)),
+            ],
+        };
+        let error = full_minus_one.ingest(&two).err().ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+
+        // Duplicate identities fail closed under the bound.
+        let duplicate = ProductSearchIngestBatch {
+            idempotency_id: 4,
+            documents: vec![document(1)],
+        };
+        let error = full_minus_one
+            .ingest(&duplicate)
+            .err()
+            .ok_or_else(corruption)?;
+        assert_eq!(error.code(), ProductErrorCode::CatalogConflict);
+        Ok(())
+    }
 }

@@ -1,0 +1,91 @@
+{
+  "cost": {
+    "cold_start_ready_seconds": 8.05,
+    "ingest_seconds": 3.53,
+    "query_seconds": 91.08,
+    "rss_bytes_after_ingest": null,
+    "rss_bytes_after_queries": null
+  },
+  "dataset": {
+    "archive_sha256": "efe5be03f8c5b86a5870102d0599d227c8c6e2484328e68c6522560385671b0b",
+    "documents": 3633,
+    "name": "nfcorpus",
+    "qrels": "qrels/test.tsv",
+    "queries_evaluated": 323
+  },
+  "engine": {
+    "modules": [
+      "generative-anthropic",
+      "generative-anyscale",
+      "generative-aws",
+      "generative-cohere",
+      "generative-contextualai",
+      "generative-databricks",
+      "generative-deepseek",
+      "generative-friendliai",
+      "generative-google",
+      "generative-mistral",
+      "generative-nvidia",
+      "generative-octoai",
+      "generative-openai",
+      "generative-xai",
+      "multi2multivec-jinaai",
+      "multi2multivec-weaviate",
+      "multi2vec-aws",
+      "multi2vec-cohere",
+      "multi2vec-google",
+      "multi2vec-jinaai",
+      "multi2vec-nvidia",
+      "multi2vec-twelvelabs",
+      "multi2vec-voyageai",
+      "reranker-cohere",
+      "reranker-contextualai",
+      "reranker-jinaai",
+      "reranker-nvidia",
+      "reranker-voyageai",
+      "text2multivec-jinaai",
+      "text2vec-aws",
+      "text2vec-cohere",
+      "text2vec-databricks",
+      "text2vec-digitalocean",
+      "text2vec-google",
+      "text2vec-huggingface",
+      "text2vec-jinaai",
+      "text2vec-mistral",
+      "text2vec-morph",
+      "text2vec-nvidia",
+      "text2vec-octoai",
+      "text2vec-openai",
+      "text2vec-voyageai",
+      "text2vec-weaviate"
+    ],
+    "server": "weaviate",
+    "version": "1.39.0"
+  },
+  "host": {
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8280 CPU @ 2.70GHz",
+    "machine": "x86_64",
+    "platform": "Linux-6.8.0-124-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  },
+  "metrics": {
+    "mrr@10": 0.560735,
+    "ndcg@10": 0.362407,
+    "recall@10": 0.177063
+  },
+  "protocol": {
+    "alpha": 0.75,
+    "branches": "hybrid",
+    "class": "RagEval",
+    "ingest_batch_objects": 100,
+    "ingest_order": "sorted-corpus-id",
+    "k": 10,
+    "transport": "rest+graphql",
+    "vector_source": "attested-local-embedder"
+  },
+  "schema": "hyphae-weaviate-baseline-receipt-v1",
+  "stability": {
+    "changed_rankings": 0,
+    "rerun_queries": 323
+  }
+}

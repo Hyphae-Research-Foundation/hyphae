@@ -848,6 +848,28 @@ pub(crate) enum SortedSetMemberState {
     Present(SortedSetScore),
 }
 
+/// Result of popping one seeded rank from a set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SetPopState {
+    /// No visible set exists under the key.
+    MissingSet,
+    /// The set exists but has no members.
+    Empty,
+    /// The removed member.
+    Popped(Vec<u8>),
+}
+
+/// Result of popping one canonical extreme from a sorted set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SortedSetPopState {
+    /// No sorted set exists under the key.
+    MissingSet,
+    /// The sorted set exists but has no members.
+    Empty,
+    /// The removed member and its score.
+    Popped(Vec<u8>, SortedSetScore),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SortedSetRankState {
     MissingSet,
@@ -1009,6 +1031,24 @@ impl StructureState {
         limit: usize,
     ) -> Option<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
+        self.visit_visible_keys_in_range(start, end, logical_time_micros, limit, |key| {
+            keys.push(key.to_vec());
+        })?;
+        Some(keys)
+    }
+
+    /// Visits the visible scalar keys inside `[start, end)` in ascending
+    /// order without copying them, or returns `None` fail-closed once more
+    /// than `limit` keys are visible.
+    pub(crate) fn visit_visible_keys_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        logical_time_micros: i64,
+        limit: usize,
+        mut visitor: impl FnMut(&[u8]),
+    ) -> Option<()> {
+        let mut visited = 0_usize;
         for (key, entry) in self.entries.range(start.to_vec()..end.to_vec()) {
             let expired = entry
                 .expires_at_micros
@@ -1016,12 +1056,13 @@ impl StructureState {
             if expired {
                 continue;
             }
-            if keys.len() >= limit {
+            if visited >= limit {
                 return None;
             }
-            keys.push(key.clone());
+            visited += 1;
+            visitor(key);
         }
-        Some(keys)
+        Some(())
     }
 
     pub(crate) fn visible_entry(
@@ -1672,6 +1713,45 @@ impl StructureState {
         })
     }
 
+    /// Every member of one visible set in exact ascending byte order.
+    pub(crate) fn set_members_at(
+        &self,
+        key: &[u8],
+        logical_time_micros: i64,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return None;
+        }
+        self.sets
+            .get(key)
+            .map(|members| members.iter().cloned().collect())
+    }
+
+    /// Removes and returns the member at `rank` (ascending byte order) of
+    /// one visible set.
+    pub(crate) fn spop_at_rank(
+        &mut self,
+        key: &[u8],
+        rank_of: impl FnOnce(usize) -> usize,
+        logical_time_micros: i64,
+    ) -> SetPopState {
+        if !self.set_is_visible(key, logical_time_micros) {
+            return SetPopState::MissingSet;
+        }
+        let Some(members) = self.sets.get_mut(key) else {
+            return SetPopState::MissingSet;
+        };
+        if members.is_empty() {
+            return SetPopState::Empty;
+        }
+        let rank = rank_of(members.len()).min(members.len() - 1);
+        let Some(member) = members.iter().nth(rank).cloned() else {
+            return SetPopState::Empty;
+        };
+        members.remove(&member);
+        SetPopState::Popped(member)
+    }
+
     pub(crate) fn create_list(&mut self, key: Vec<u8>) -> bool {
         if self.entries.contains_key(&key)
             || self.hashes.contains_key(&key)
@@ -1917,6 +1997,30 @@ impl StructureState {
             SortedSetMemberState::MissingMember,
             SortedSetMemberState::Present,
         )
+    }
+
+    /// Removes and returns the extreme `(score, member)` of the canonical
+    /// total order: lowest when `highest` is false, highest otherwise.
+    pub(crate) fn zpop_extreme(&mut self, key: &[u8], highest: bool) -> SortedSetPopState {
+        let Some(members) = self.sorted_sets.get_mut(key) else {
+            return SortedSetPopState::MissingSet;
+        };
+        let extreme = members
+            .iter()
+            .map(|(member, score)| (*score, member.clone()))
+            .reduce(|current, candidate| {
+                let keep_candidate = if highest {
+                    candidate > current
+                } else {
+                    candidate < current
+                };
+                if keep_candidate { candidate } else { current }
+            });
+        let Some((score, member)) = extreme else {
+            return SortedSetPopState::Empty;
+        };
+        members.remove(&member);
+        SortedSetPopState::Popped(member, score)
     }
 
     pub(crate) fn zcard(&self, key: &[u8]) -> Option<usize> {

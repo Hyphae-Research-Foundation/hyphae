@@ -1098,7 +1098,12 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             query: "rust".into(),
             candidate_limit: 8,
             weight: 1,
-        }
+                    operator: None,
+                            prefix: false,
+                                            fields: Vec::new(),
+                                                                    fuzzy: None,
+                                                                                                            phrase: false,
+                                                                }
     });
     let targets: &[&str] = match mode {
         "exact" => &["exact"],

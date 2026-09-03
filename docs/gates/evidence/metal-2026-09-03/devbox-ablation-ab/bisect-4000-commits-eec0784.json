@@ -1,0 +1,180 @@
+{
+  "benchmark": "hyphae-baseline-harness-v1",
+  "environment": {
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz",
+    "hypervisor_flag": true,
+    "kernel": "6.8.0-124-generic",
+    "logical_cpus": 16,
+    "os": "linux",
+    "scaling_governor": null
+  },
+  "results": {
+    "ablation": {
+      "commits_per_phase": 4000,
+      "durability": {
+        "group_8_producers": {
+          "end_to_end": {
+            "label": "group",
+            "latency_nanos": {
+              "p50": 24895186,
+              "p95": 37713043,
+              "p99": 40893396
+            },
+            "operations": 4000,
+            "ops_per_second": 289.7158648934247,
+            "wall_nanos": 13806630857
+          }
+        },
+        "memory": {
+          "end_to_end": {
+            "label": "memory",
+            "latency_nanos": {
+              "max": 10133202,
+              "mean": 3944276,
+              "p50": 3759366,
+              "p95": 7953238,
+              "p99": 9536796,
+              "p999": 10007438
+            },
+            "operations": 4000,
+            "ops_per_second": 251.62439492044524,
+            "wall_nanos": 15896709861
+          },
+          "receipt_clocks": {
+            "execution_nanos": {
+              "p50": 631370,
+              "p99": 993638
+            },
+            "page_sync_nanos": {
+              "p50": 0,
+              "p99": 0
+            },
+            "wal_append_nanos": {
+              "p50": 95702,
+              "p99": 145835
+            },
+            "wal_sync_nanos": {
+              "p50": 0,
+              "p99": 0
+            }
+          }
+        },
+        "strict": {
+          "end_to_end": {
+            "label": "strict",
+            "latency_nanos": {
+              "max": 29637006,
+              "mean": 8054377,
+              "p50": 7834643,
+              "p95": 12153987,
+              "p99": 13380898,
+              "p999": 18285656
+            },
+            "operations": 4000,
+            "ops_per_second": 123.75921789242726,
+            "wall_nanos": 32320824809
+          },
+          "receipt_clocks": {
+            "execution_nanos": {
+              "p50": 4058957,
+              "p99": 6212713
+            },
+            "page_sync_nanos": {
+              "p50": 1661016,
+              "p99": 2796198
+            },
+            "wal_append_nanos": {
+              "p50": 132194,
+              "p99": 214402
+            },
+            "wal_sync_nanos": {
+              "p50": 1653415,
+              "p99": 2928536
+            }
+          }
+        }
+      },
+      "engine_composition": {
+        "durability": "memory (isolates root construction from fsync)",
+        "path": "delta staging (point-resolved hot write path)",
+        "sql_only": {
+          "label": "sql_only",
+          "latency_nanos": {
+            "max": 1166942,
+            "mean": 481525,
+            "p50": 456220,
+            "p95": 601214,
+            "p99": 804688,
+            "p999": 1100251
+          },
+          "operations": 4000,
+          "ops_per_second": 2076.410910286427,
+          "wall_nanos": 1926400974
+        },
+        "sql_plus_structure": {
+          "label": "sql_plus_structure",
+          "latency_nanos": {
+            "max": 1900786,
+            "mean": 1082023,
+            "p50": 1103640,
+            "p95": 1348133,
+            "p99": 1703038,
+            "p999": 1858228
+          },
+          "operations": 4000,
+          "ops_per_second": 924.09800509657,
+          "wall_nanos": 4328545217
+        },
+        "sql_plus_structure_plus_search": {
+          "label": "sql_plus_structure_plus_search",
+          "latency_nanos": {
+            "max": 4447996,
+            "mean": 2866632,
+            "p50": 2923067,
+            "p95": 3447932,
+            "p99": 3795878,
+            "p999": 3990139
+          },
+          "operations": 4000,
+          "ops_per_second": 348.82491172342895,
+          "wall_nanos": 11467070916
+        }
+      },
+      "transaction_shape": {
+        "delta": {
+          "label": "all_engine_delta_batch",
+          "latency_nanos": {
+            "max": 3859812,
+            "mean": 2744144,
+            "p50": 2692747,
+            "p95": 3343533,
+            "p99": 3687175,
+            "p999": 3841557
+          },
+          "operations": 2000,
+          "ops_per_second": 364.39692202636337,
+          "wall_nanos": 5488520564
+        },
+        "durability": "memory (isolates preparation cost from fsync)",
+        "materialized": {
+          "label": "all_engine_materialized_batch",
+          "latency_nanos": {
+            "max": 257978044,
+            "mean": 122055544,
+            "p50": 119350674,
+            "p95": 227094312,
+            "p99": 243740813,
+            "p999": 252873833
+          },
+          "operations": 2000,
+          "ops_per_second": 8.192967913959508,
+          "wall_nanos": 244111782324
+        },
+        "operations_per_transaction": "1 SQL INSERT + 1 SET + 1 index_document"
+      }
+    }
+  },
+  "rustc": "unknown",
+  "source_commit": "uncommitted"
+}

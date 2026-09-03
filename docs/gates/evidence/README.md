@@ -38,6 +38,24 @@ own commit as the evaluated source.
 - [Native G5 exact-SHA closure](closures/native-g5-b7cf651.json)
 - [Native G6 exact-SHA local-product closure](closures/native-g6-c57cc07.json)
 - [Native G7 C-60 operational-scale closure](closures/native-g7-ff188af.json)
+- [Collection document cap 250k rung](collection-cap-250k-2026-09-02.md)
+- [Chunked collection manifest — 250k re-measurement and the 1M ladder](collection-manifest-chunked-1m-ladder-2026-09-03.md)
+  records the `HYPSMAN2` manifest (per-batch write bounded by header plus
+  touched chunks), lazy eligibility, and the first complete lexical ladder
+  at 1,000,000 documents; the bound stays 250,000 pending the R5 vector
+  conditions
+- [Hyphae 3.0.0 on dedicated hardware after the B+tree split fix and the buffer-pool bound — `a443c52`](hyphae-3.0-metal-a443c52-2026-09-03.md)
+  same host class eight hours later: materialized single-SET commit back to
+  4.39 ms (from 35.5), 1M ladder linear (bm25 23 ms, 3.7× the 250k stage),
+  BM25 top-10 111 µs against Tantivy's 78 µs, embedded GET 2.2 µs, and the
+  1,024 vs 8,192-frame pool comparison on one directory
+- [Hyphae 3.0 re-measurement on dedicated hardware — `2ff8a4b`](baseline-i7i-metal-2026-09-03.md)
+  class-3 `i7i.metal-24xl` receipt on a committed SHA: TLC reproduced with
+  spec digest, SQL/keyspace/lexical baselines (lexical query 16× and ingest
+  7.6× faster than 2026-08-30), delta sweeps flat across version depth,
+  the 250k/1M ladder, the 1M scorer-equivalence oracle (`bit_identical`),
+  the scorer `perf` profile (44 % page verification), and the bisected
+  materialized-path regression from `93dc3d3` with its root cause
 - [Native G8 exact-SHA release closure](closures/native-g8-e88f2ea.json)
 
 ### Source-bound observations
@@ -771,3 +789,29 @@ detectable.
   commit. Staging remains in the microsecond domain; memory and strict commit
   remain in milliseconds. The receipt exposes that deficit and is not a
   regression threshold or G0/G1/G5/G6/G7 closure.
+
+## 2026-08-30/31 dedicated-hardware, optimization, memory, and rerun series
+
+Five narrative documents with their raw-receipt directories. Every raw
+receipt is verbatim harness output (`local-diagnostic`, no publication
+authority); the narratives carry the scope, environment class, and honest
+non-claims.
+
+- [`baseline-i7i-metal-2026-08-30.md`](baseline-i7i-metal-2026-08-30.md):
+  first dedicated-hardware baselines (SQLite/DuckDB/Redis/Tantivy) plus the
+  TLC model-checking run of the commit protocol; raw suite receipts are the
+  sibling `baseline-i7i-metal-*.json` files.
+- [`phase1-optimization-2026-08-30.md`](phase1-optimization-2026-08-30.md):
+  hot-path optimization before/after with the interleaved B-A-B-A series;
+  raw receipts in [`phase1/`](phase1/).
+- [`agent-memory-sweep-2026-08-30.md`](agent-memory-sweep-2026-08-30.md):
+  LoCoMo candidate sweep with nested LOCO-CV selection and the LongMemEval
+  official-denominator run; raw receipts in
+  [`memory-2026-08-30/`](memory-2026-08-30/).
+- [`weaviate-139-lexical-rerun-2026-08-30.md`](weaviate-139-lexical-rerun-2026-08-30.md)
+  and
+  [`weaviate-139-hybrid-rerun-2026-08-31.md`](weaviate-139-hybrid-rerun-2026-08-31.md):
+  same-host reruns against Weaviate 1.39.0, recording that its 1.39 BM25
+  rework substantially improved the lexical scores measured on 1.38 and
+  superseding the earlier lexical comparison; raw receipts in
+  [`memory-2026-08-30/`](memory-2026-08-30/).

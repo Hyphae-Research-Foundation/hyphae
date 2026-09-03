@@ -14,6 +14,8 @@ fn scalar_text(value: &SqlValue) -> String {
         SqlValue::Signed(value) => value.to_string(),
         SqlValue::Unsigned(value) => value.to_string(),
         SqlValue::Text(value) => value.clone(),
+        SqlValue::Decimal(value) => value.to_string(),
+        SqlValue::Float64(value) => format!("{:.3}", value.get()),
         other => format!("{other:?}"),
     }
 }

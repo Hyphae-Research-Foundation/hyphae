@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::{Bound, ControlFlow},
 };
 
@@ -29,6 +29,12 @@ pub(crate) const SQL_VECTOR_PATH_THRESHOLD: usize = 256;
 pub const MAX_SQL_JOIN_CANDIDATES: usize = 1_048_576;
 /// Hard upper bound on physical candidates consumed by one bounded SQL scan.
 pub const MAX_SQL_SCAN_CANDIDATES: usize = 1_048_576;
+/// Hard upper bound on row groups accepted by one multi-row `INSERT`.
+pub const MAX_SQL_INSERT_ROWS: usize = 1_024;
+/// Hard upper bound on UTF-8 bytes accepted by one SQL `LIKE` pattern.
+pub const MAX_SQL_LIKE_PATTERN_BYTES: usize = 256;
+/// Hard upper bound on members accepted by one SQL `IN` list.
+pub const MAX_SQL_IN_MEMBERS: usize = 256;
 
 /// Value accepted or returned by native SQL.
 pub type SqlValue = ScalarValue;
@@ -185,6 +191,15 @@ pub enum SqlError {
     /// A bounded scan exhausted its explicit engine work ceiling.
     #[error("HYSQL019 native SQL bounded scan candidate budget exceeded")]
     ScanCandidateBudgetExceeded,
+    /// A multi-row `INSERT` exceeded its explicit row-group ceiling.
+    #[error("HYSQL020 native SQL multi-row INSERT row budget exceeded")]
+    InsertRowBudgetExceeded,
+    /// An aggregate projection is malformed or outside the bounded profile.
+    #[error("HYSQL021 native SQL aggregate binding is invalid")]
+    InvalidAggregate,
+    /// An aggregate accumulator overflowed its checked numeric domain.
+    #[error("HYSQL022 native SQL aggregate accumulator overflowed")]
+    AggregateOverflow,
     /// A caller-owned cooperative checkpoint interrupted execution.
     #[error("native SQL execution was interrupted")]
     ExecutionInterrupted,
@@ -361,6 +376,7 @@ enum PreparedPlan {
         output_columns: Vec<String>,
         limit: usize,
         legacy_binary: bool,
+        descending: bool,
     },
     PrimaryKeyPrefixScan {
         table: ObjectId,
@@ -395,6 +411,7 @@ enum PreparedPlan {
         range: PrimaryKeyRange,
         limit: usize,
         legacy_binary: bool,
+        descending: bool,
     },
     IndexedInnerJoin {
         left_table: ObjectId,
@@ -408,6 +425,33 @@ enum PreparedPlan {
         projection: Vec<JoinProjection>,
         parameter_count: usize,
         output_columns: Vec<String>,
+    },
+    /// Total aggregation folding the complete bounded inner plan into
+    /// exactly one output row, or one row per contiguous primary-key-prefix
+    /// group when `group_columns` is nonempty.
+    Aggregate {
+        input: Box<PreparedPlan>,
+        aggregates: Vec<BoundAggregate>,
+        output_columns: Vec<String>,
+        group_columns: Vec<usize>,
+        /// Logical types of the group-key columns, in order.
+        group_types: Vec<LogicalType>,
+        /// Maximum emitted groups (parser-mandatory for grouped selects).
+        group_limit: Option<usize>,
+        /// Primary-key-prefix contiguous-run fold vs bounded ordered fold.
+        streaming_groups: bool,
+        /// Post-fold `HAVING`/`ORDER BY`/trim shaping.
+        group_shape: Option<BoundGroupShape>,
+    },
+    /// Post-access row shaping for plain selects: `DISTINCT` dedupe by
+    /// ordered encoding and/or `OFFSET` skip, then `LIMIT`.
+    RowShape {
+        input: Box<PreparedPlan>,
+        /// Ordered-encoding types of the projected columns (dedupe key).
+        projected_types: Vec<LogicalType>,
+        distinct: bool,
+        offset: Option<usize>,
+        limit: Option<usize>,
     },
 }
 
@@ -495,6 +539,9 @@ impl PreparedPlan {
                     referenced.insert(*index);
                 }
             }
+            Self::Aggregate { input, .. } | Self::RowShape { input, .. } => {
+                referenced.extend(input.referenced_object_ids());
+            }
         }
         referenced
     }
@@ -528,12 +575,14 @@ impl PreparedPlan {
             | Self::IndexedInnerJoin {
                 parameter_count, ..
             } => *parameter_count,
+            Self::Aggregate { input, .. } | Self::RowShape { input, .. } => input.parameter_count(),
         }
     }
 
     fn maximum_result_rows(&self) -> Option<usize> {
         match self {
             Self::PrimaryKeyLookup { .. } => Some(1),
+            Self::Aggregate { group_limit, .. } => Some(group_limit.unwrap_or(1)),
             Self::SecondaryIndexLookup {
                 index_definition,
                 limit,
@@ -557,6 +606,11 @@ impl PreparedPlan {
                 }
                 JoinLeftAccess::BoundedSecondaryIndex { limit, .. }
                 | JoinLeftAccess::BoundedPrimaryKeyScan { limit, .. } => Some(*limit),
+            },
+            Self::RowShape { input, limit, .. } => match (limit, input.maximum_result_rows()) {
+                (Some(limit), Some(inner)) => Some((*limit).min(inner)),
+                (Some(limit), None) => Some(*limit),
+                (None, inner) => inner,
             },
         }
     }
@@ -618,8 +672,578 @@ impl PreparedPlan {
                 output_columns,
                 ..
             } => join_projected_schema(left_relation, right_relation, projection, output_columns),
+            Self::Aggregate {
+                input,
+                aggregates,
+                output_columns,
+                group_columns,
+                ..
+            } => {
+                let mut schema = Vec::with_capacity(output_columns.len());
+                let inner = input.result_schema()?;
+                for (position, column) in group_columns.iter().enumerate() {
+                    let (_, logical_type) = inner.get(*column).ok_or(SqlError::InvalidAggregate)?;
+                    let name = output_columns
+                        .get(position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    schema.push((name.clone(), logical_type.clone()));
+                }
+                // Hidden HAVING/ORDER accumulators fold but never emit:
+                // the schema covers only the visible aggregate prefix.
+                let visible = output_columns
+                    .len()
+                    .checked_sub(group_columns.len())
+                    .ok_or(SqlError::InvalidAggregate)?;
+                schema.extend(aggregate_schema(
+                    aggregates
+                        .get(..visible)
+                        .ok_or(SqlError::InvalidAggregate)?,
+                    output_columns
+                        .get(group_columns.len()..)
+                        .ok_or(SqlError::InvalidAggregate)?,
+                )?);
+                Ok(schema)
+            }
+            Self::RowShape { input, .. } => input.result_schema(),
         }
     }
+}
+
+/// Folds ordered complete rows into aggregate output rows.
+///
+/// Explicit ceiling on emitted groups for the ordered-grouped fold.
+const MAX_SQL_ORDERED_GROUPS: usize = 65_536;
+
+/// With empty `group_columns` this emits exactly one total row. With group
+/// columns over a primary-key prefix (`streaming_groups`) it emits one row
+/// per contiguous group-key run bounded by `group_limit`. With arbitrary
+/// group columns it folds through an order-preserving encoded key table
+/// that never holds more than `group_limit` groups (largest key evicts
+/// first, so the retained set is exactly the smallest `group_limit` keys)
+/// and emits them in ascending key order.
+fn fold_aggregate_rows(
+    rows: &[Vec<SqlValue>],
+    aggregates: &[BoundAggregate],
+    group_columns: &[usize],
+    group_types: &[LogicalType],
+    group_limit: Option<usize>,
+    streaming_groups: bool,
+    complete: bool,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if group_columns.is_empty() {
+        let mut state = AggregateState::new(aggregates);
+        for row in rows {
+            state.fold(row)?;
+        }
+        return Ok(vec![state.finish()?]);
+    }
+    if !streaming_groups {
+        return fold_ordered_grouped_rows(
+            rows,
+            aggregates,
+            group_columns,
+            group_types,
+            group_limit,
+            complete,
+        );
+    }
+    let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
+    let mut output: Vec<Vec<SqlValue>> = Vec::new();
+    let mut current_key: Option<Vec<SqlValue>> = None;
+    let mut state = AggregateState::new(aggregates);
+    for row in rows {
+        let key = group_columns
+            .iter()
+            .map(|column| row.get(*column).cloned().ok_or(SqlError::InvalidAggregate))
+            .collect::<Result<Vec<_>, _>>()?;
+        match &current_key {
+            Some(previous) if *previous == key => {}
+            Some(previous) => {
+                let mut emitted = previous.clone();
+                emitted.extend(
+                    std::mem::replace(&mut state, AggregateState::new(aggregates)).finish()?,
+                );
+                output.push(emitted);
+                if output.len() == limit {
+                    return Ok(output);
+                }
+                current_key = Some(key);
+            }
+            None => current_key = Some(key),
+        }
+        state.fold(row)?;
+    }
+    if let Some(previous) = current_key
+        && output.len() < limit
+    {
+        let mut emitted = previous;
+        emitted.extend(state.finish()?);
+        output.push(emitted);
+    }
+    Ok(output)
+}
+
+/// Bounded ordered-grouped fold over arbitrary group columns.
+///
+/// Keys fold through their canonical order-preserving encoding into a
+/// `BTreeMap` capped at `group_limit` entries: once full, a key greater
+/// than the current maximum is skipped (it can never enter the smallest-
+/// `limit` set), and inserting a smaller key evicts the current maximum.
+/// The retained set is therefore exactly the smallest `limit` distinct
+/// keys, emitted in ascending encoded order. NULL encodes ahead of every
+/// non-null value and forms one group.
+fn fold_ordered_grouped_rows(
+    rows: &[Vec<SqlValue>],
+    aggregates: &[BoundAggregate],
+    group_columns: &[usize],
+    group_types: &[LogicalType],
+    group_limit: Option<usize>,
+    complete: bool,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
+    if limit == 0 || limit > MAX_SQL_ORDERED_GROUPS {
+        return Err(SqlError::InvalidAggregate);
+    }
+    let mut groups: BTreeMap<Vec<u8>, (Vec<SqlValue>, AggregateState)> = BTreeMap::new();
+    for row in rows {
+        let mut key_values = Vec::with_capacity(group_columns.len());
+        let mut encoded = Vec::new();
+        for (position, column) in group_columns.iter().enumerate() {
+            let value = row.get(*column).ok_or(SqlError::InvalidAggregate)?;
+            let logical_type = group_types
+                .get(position)
+                .ok_or(SqlError::InvalidAggregate)?;
+            // The canonical ordered component already sorts null first via
+            // its leading marker byte and preserves the type's total order.
+            let component = value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::InvalidStoredRow)?;
+            // Each ordered component is prefix-free (fixed width, or
+            // memcomparable with its own terminator), so plain
+            // concatenation preserves composite lexicographic order.
+            encoded.extend_from_slice(&component);
+            key_values.push(value.clone());
+        }
+        if let Some((_, state)) = groups.get_mut(&encoded) {
+            state.fold(row)?;
+            continue;
+        }
+        if groups.len() == limit {
+            if complete {
+                // A complete fold (HAVING/ORDER BY) past the group ceiling
+                // fails closed rather than shaping a partial group set.
+                return Err(SqlError::InvalidAggregate);
+            }
+            // Full: only a key below the current maximum may enter.
+            let Some(maximum) = groups.keys().next_back().cloned() else {
+                return Err(SqlError::InvalidAggregate);
+            };
+            if encoded >= maximum {
+                continue;
+            }
+            groups.remove(&maximum);
+        }
+        let mut state = AggregateState::new(aggregates);
+        state.fold(row)?;
+        groups.insert(encoded, (key_values, state));
+    }
+    groups
+        .into_values()
+        .map(|(key_values, state)| {
+            let mut emitted = key_values;
+            emitted.extend(state.finish()?);
+            Ok(emitted)
+        })
+        .collect()
+}
+
+/// Synthetic result schema for one aggregate output row.
+fn aggregate_schema(
+    aggregates: &[BoundAggregate],
+    output_columns: &[String],
+) -> Result<Vec<(String, LogicalType)>, SqlError> {
+    if aggregates.len() != output_columns.len() {
+        return Err(SqlError::InvalidAggregate);
+    }
+    aggregates
+        .iter()
+        .zip(output_columns)
+        .map(|(aggregate, output)| {
+            let logical_type = match aggregate.function {
+                AggregateFunction::Count => LogicalType::Unsigned(IntegerWidth::Bits64),
+                AggregateFunction::Avg => LogicalType::Float64,
+                AggregateFunction::Sum => match &aggregate.logical_type {
+                    Some(LogicalType::Float32 | LogicalType::Float64) => LogicalType::Float64,
+                    Some(LogicalType::Decimal(decimal)) => LogicalType::Decimal(*decimal),
+                    Some(LogicalType::Unsigned(_)) => LogicalType::Unsigned(IntegerWidth::Bits64),
+                    _ => LogicalType::Signed(IntegerWidth::Bits64),
+                },
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    aggregate
+                        .logical_type
+                        .clone()
+                        .ok_or(SqlError::InvalidAggregate)?
+                }
+            };
+            Ok((output.clone(), logical_type))
+        })
+        .collect()
+}
+
+/// Result type of one aggregate output, shared by schema and shaping.
+fn aggregate_output_type(aggregate: &BoundAggregate) -> Result<LogicalType, SqlError> {
+    Ok(match aggregate.function {
+        AggregateFunction::Count => LogicalType::Unsigned(IntegerWidth::Bits64),
+        AggregateFunction::Avg => LogicalType::Float64,
+        AggregateFunction::Sum => match &aggregate.logical_type {
+            Some(LogicalType::Float32 | LogicalType::Float64) => LogicalType::Float64,
+            Some(LogicalType::Decimal(decimal)) => LogicalType::Decimal(*decimal),
+            Some(LogicalType::Unsigned(_)) => LogicalType::Unsigned(IntegerWidth::Bits64),
+            _ => LogicalType::Signed(IntegerWidth::Bits64),
+        },
+        AggregateFunction::Min | AggregateFunction::Max => aggregate
+            .logical_type
+            .clone()
+            .ok_or(SqlError::InvalidAggregate)?,
+    })
+}
+
+/// Resolves one `HAVING`/grouped-`ORDER BY` operand to a fold-row index,
+/// appending a hidden accumulator when the aggregate is not projected.
+///
+/// Fold rows are `[keys.., projected aggregates.., hidden aggregates..]`.
+fn resolve_group_operand(
+    definition: &RelationDefinition,
+    operand: &GroupOperand,
+    group_by: &[String],
+    aggregate_items: &[AggregateItem],
+    key_aliases: &[Option<String>],
+    bound_aggregates: &mut Vec<BoundAggregate>,
+    hidden_items: &mut Vec<AggregateItem>,
+) -> Result<(usize, LogicalType), SqlError> {
+    let keys = group_by.len();
+    match operand {
+        GroupOperand::Name(name) => {
+            // 1. Group-key column name or its alias.
+            for (position, key) in group_by.iter().enumerate() {
+                let alias = key_aliases.get(position).and_then(|alias| alias.as_ref());
+                if key.eq_ignore_ascii_case(name)
+                    || alias.is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                {
+                    let index = column_index(&definition.columns, key)?;
+                    let logical_type = definition
+                        .columns
+                        .get(index)
+                        .ok_or(SqlError::InvalidCatalogObject)?
+                        .logical_type
+                        .clone();
+                    return Ok((position, logical_type));
+                }
+            }
+            // 2. Projected aggregate alias or output name.
+            for (position, item) in aggregate_items.iter().enumerate() {
+                let output = match (&item.alias, &item.column) {
+                    (Some(alias), _) => alias.clone(),
+                    (None, None) => format!("{}(*)", item.function.keyword()),
+                    (None, Some(column)) => format!("{}({column})", item.function.keyword()),
+                };
+                if output.eq_ignore_ascii_case(name) {
+                    let aggregate = bound_aggregates
+                        .get(position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((keys + position, aggregate_output_type(aggregate)?));
+                }
+            }
+            Err(SqlError::UnknownColumn)
+        }
+        GroupOperand::Aggregate { function, column } => {
+            // Match a projected aggregate by shape first.
+            for (position, item) in aggregate_items.iter().enumerate() {
+                if item.function == *function && item.column == *column {
+                    let aggregate = bound_aggregates
+                        .get(position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((keys + position, aggregate_output_type(aggregate)?));
+                }
+            }
+            // Reuse an already-added hidden accumulator when repeated.
+            for (position, item) in hidden_items.iter().enumerate() {
+                if item.function == *function && item.column == *column {
+                    let aggregate = bound_aggregates
+                        .get(aggregate_items.len() + position)
+                        .ok_or(SqlError::InvalidAggregate)?;
+                    return Ok((
+                        keys + aggregate_items.len() + position,
+                        aggregate_output_type(aggregate)?,
+                    ));
+                }
+            }
+            // Bind one hidden accumulator.
+            let item = AggregateItem {
+                function: *function,
+                column: column.clone(),
+                alias: None,
+            };
+            let (bound, _) = bind_aggregates(definition, std::slice::from_ref(&item))?;
+            let aggregate = bound.into_iter().next().ok_or(SqlError::InvalidAggregate)?;
+            let logical_type = aggregate_output_type(&aggregate)?;
+            let index = keys + bound_aggregates.len();
+            bound_aggregates.push(aggregate);
+            hidden_items.push(item);
+            Ok((index, logical_type))
+        }
+    }
+}
+
+/// Binds the grouped `HAVING` tree against resolved fold-row indexes.
+fn bind_having_expression(
+    definition: &RelationDefinition,
+    expression: &HavingExpression,
+    group_by: &[String],
+    aggregate_items: &[AggregateItem],
+    key_aliases: &[Option<String>],
+    bound_aggregates: &mut Vec<BoundAggregate>,
+    hidden_items: &mut Vec<AggregateItem>,
+) -> Result<BoundHavingExpression, SqlError> {
+    match expression {
+        HavingExpression::Comparison {
+            operand,
+            operator,
+            value,
+        } => {
+            let (index, logical_type) = resolve_group_operand(
+                definition,
+                operand,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?;
+            let value = bind_having_literal(value, &logical_type)?;
+            Ok(BoundHavingExpression::Comparison {
+                index,
+                logical_type,
+                operator: *operator,
+                value,
+            })
+        }
+        HavingExpression::And(left, right) => Ok(BoundHavingExpression::And(
+            Box::new(bind_having_expression(
+                definition,
+                left,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+            Box::new(bind_having_expression(
+                definition,
+                right,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+        )),
+        HavingExpression::Or(left, right) => Ok(BoundHavingExpression::Or(
+            Box::new(bind_having_expression(
+                definition,
+                left,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+            Box::new(bind_having_expression(
+                definition,
+                right,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?),
+        )),
+        HavingExpression::Not(inner) => Ok(BoundHavingExpression::Not(Box::new(
+            bind_having_expression(
+                definition,
+                inner,
+                group_by,
+                aggregate_items,
+                key_aliases,
+                bound_aggregates,
+                hidden_items,
+            )?,
+        ))),
+    }
+}
+
+/// Coerces one `HAVING` literal to the compared output's logical type.
+fn bind_having_literal(
+    value: &ScalarOperand,
+    logical_type: &LogicalType,
+) -> Result<SqlValue, SqlError> {
+    let value = match value {
+        ScalarOperand::Parameter(_) => return Err(SqlError::InvalidAggregate),
+        ScalarOperand::Null => SqlValue::Null,
+        ScalarOperand::Boolean(boolean) => SqlValue::Boolean(*boolean),
+        ScalarOperand::Integer(text) => match logical_type {
+            LogicalType::Unsigned(_) => {
+                SqlValue::Unsigned(text.parse::<u64>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            LogicalType::Float32 | LogicalType::Float64 => {
+                SqlValue::Float64(hyphae_native_types::CanonicalF64::new(
+                    text.parse::<f64>().map_err(|_| SqlError::TypeMismatch)?,
+                ))
+            }
+            LogicalType::Decimal(_) => {
+                SqlValue::Decimal(text.parse::<i128>().map_err(|_| SqlError::TypeMismatch)?)
+            }
+            _ => SqlValue::Signed(text.parse::<i64>().map_err(|_| SqlError::TypeMismatch)?),
+        },
+        ScalarOperand::Text(text) => SqlValue::Text(text.clone()),
+    };
+    Ok(value)
+}
+
+/// Evaluates one bound `HAVING` tree over a complete fold row using
+/// three-valued logic; unknown filters the group out.
+fn evaluate_having(
+    expression: &BoundHavingExpression,
+    row: &[SqlValue],
+) -> Result<TruthValue, SqlError> {
+    match expression {
+        BoundHavingExpression::Comparison {
+            index,
+            logical_type,
+            operator,
+            value,
+        } => {
+            let output = row.get(*index).ok_or(SqlError::InvalidAggregate)?;
+            let Some(ordering) = compare_sql_values(logical_type, output, value)? else {
+                return Ok(TruthValue::Unknown);
+            };
+            let matched = match operator {
+                ComparisonOperator::Equal => ordering == Ordering::Equal,
+                ComparisonOperator::NotEqual => ordering != Ordering::Equal,
+                ComparisonOperator::Less => ordering == Ordering::Less,
+                ComparisonOperator::LessOrEqual => ordering != Ordering::Greater,
+                ComparisonOperator::Greater => ordering == Ordering::Greater,
+                ComparisonOperator::GreaterOrEqual => ordering != Ordering::Less,
+            };
+            Ok(truth(matched))
+        }
+        BoundHavingExpression::And(left, right) => {
+            Ok(evaluate_having(left, row)?.and(evaluate_having(right, row)?))
+        }
+        BoundHavingExpression::Or(left, right) => {
+            Ok(evaluate_having(left, row)?.or(evaluate_having(right, row)?))
+        }
+        BoundHavingExpression::Not(inner) => Ok(evaluate_having(inner, row)?.not()),
+    }
+}
+
+/// Applies `HAVING`, grouped `ORDER BY`, `LIMIT`, and hidden-column
+/// trimming to complete fold rows.
+fn shape_grouped_rows(
+    mut rows: Vec<Vec<SqlValue>>,
+    shape: &BoundGroupShape,
+    limit: usize,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if let Some(having) = &shape.having {
+        let mut filtered = Vec::with_capacity(rows.len());
+        for row in rows {
+            if evaluate_having(having, &row)? == TruthValue::True {
+                filtered.push(row);
+            }
+        }
+        rows = filtered;
+    }
+    if !shape.order.is_empty() {
+        // Precompute ordered encodings per row and term; ties keep the
+        // fold's ascending group-key order (stable sort).
+        let mut keyed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut keys = Vec::with_capacity(shape.order.len());
+            for term in &shape.order {
+                let value = row.get(term.index).ok_or(SqlError::InvalidAggregate)?;
+                let encoded = value
+                    .encode_ordered_component(&term.logical_type)
+                    .map_err(|_| SqlError::InvalidStoredRow)?;
+                keys.push(encoded);
+            }
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|(left, _), (right, _)| {
+            for (term, (left_key, right_key)) in shape.order.iter().zip(left.iter().zip(right)) {
+                let ordering = left_key.cmp(right_key);
+                if ordering != Ordering::Equal {
+                    return if term.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            Ordering::Equal
+        });
+        rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    rows.truncate(limit);
+    for row in &mut rows {
+        row.truncate(shape.visible_width);
+    }
+    Ok(rows)
+}
+
+/// Deduplicates projected rows by canonical ordered encoding, preserving
+/// first-seen order, bounded by `limit` emitted rows.
+fn distinct_rows(
+    rows: Vec<Vec<SqlValue>>,
+    projected_types: &[LogicalType],
+    limit: usize,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut output = Vec::new();
+    for row in rows {
+        if row.len() != projected_types.len() {
+            return Err(SqlError::InvalidStoredRow);
+        }
+        let mut encoded = Vec::new();
+        for (value, logical_type) in row.iter().zip(projected_types) {
+            let component = value
+                .encode_ordered_component(logical_type)
+                .map_err(|_| SqlError::InvalidStoredRow)?;
+            encoded.extend_from_slice(&component);
+        }
+        if seen.insert(encoded) {
+            output.push(row);
+            if output.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Applies `OFFSET` (skip) then re-applies `LIMIT` to shaped rows.
+fn apply_offset(
+    rows: &mut Vec<Vec<SqlValue>>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<(), SqlError> {
+    let limit = limit.ok_or(SqlError::InvalidSyntax)?;
+    if offset >= rows.len() {
+        rows.clear();
+        return Ok(());
+    }
+    rows.drain(..offset);
+    rows.truncate(limit);
+    Ok(())
 }
 
 fn projected_schema(
@@ -702,6 +1326,9 @@ enum Statement {
     Insert {
         name: String,
         values: Vec<ColumnOperand>,
+        /// Additional `VALUES` row groups beyond the first, in statement
+        /// order. Each group binds the same named columns as `values`.
+        additional_rows: Vec<Vec<ColumnOperand>>,
         parameter_count: usize,
     },
     Update {
@@ -720,16 +1347,35 @@ enum Statement {
         projection: Projection,
         filter: Option<FilterExpression>,
         parameter_count: usize,
+        /// `GROUP BY` columns: a primary-key left prefix (streaming) or
+        /// arbitrary admitted columns (bounded ordered fold).
+        group_by: Vec<String>,
         order_by: Vec<String>,
+        /// `ORDER BY ... DESC` over the complete primary key.
+        descending: bool,
+        /// Grouped `HAVING` predicate (grouped selects only).
+        having: Option<HavingExpression>,
+        /// Grouped `ORDER BY` terms (grouped selects only).
+        group_order: Vec<GroupOrderTerm>,
+        /// `SELECT DISTINCT` over a plain projection (LIMIT mandatory).
+        distinct: bool,
         limit: Option<usize>,
+        /// `OFFSET` rows skipped after shaping (LIMIT mandatory).
+        offset: Option<usize>,
     },
     ExplainSelect {
         name: String,
         projection: Projection,
         filter: Option<FilterExpression>,
         parameter_count: usize,
+        group_by: Vec<String>,
         order_by: Vec<String>,
+        descending: bool,
+        having: Option<HavingExpression>,
+        group_order: Vec<GroupOrderTerm>,
+        distinct: bool,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     SelectJoin(ParsedInnerJoin),
     ExplainSelectJoin(ParsedInnerJoin),
@@ -857,6 +1503,102 @@ struct BoundUpdateAssignment {
 enum Projection {
     All,
     Columns(Vec<String>),
+    /// Total aggregation over the bounded access path: the statement
+    /// produces exactly one row of accumulator outputs.
+    Aggregates(Vec<AggregateItem>),
+    /// Aliased and/or PostgreSQL-style mixed projection: plain columns
+    /// (each with an optional `AS` alias) optionally followed by
+    /// aggregates. With aggregates present the binder requires the named
+    /// columns to equal the `GROUP BY` list in order.
+    Named {
+        columns: Vec<NamedColumn>,
+        aggregates: Vec<AggregateItem>,
+    },
+}
+
+/// One parsed aggregate projection item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AggregateItem {
+    function: AggregateFunction,
+    /// `None` is `COUNT(*)`; every other function names one column.
+    column: Option<String>,
+    /// Optional `AS <identifier>` output alias.
+    alias: Option<String>,
+}
+
+/// One plain projected column with its optional `AS` output alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamedColumn {
+    name: String,
+    /// Optional `AS <identifier>` output alias.
+    alias: Option<String>,
+}
+
+/// One `HAVING`/grouped-`ORDER BY` operand: a group-key column, a
+/// projected alias, or an aggregate call (projected or hidden).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupOperand {
+    /// Bare identifier: group-key column name, projected alias, or an
+    /// aggregate output name (resolved at bind time in that order).
+    Name(String),
+    /// Explicit aggregate call, e.g. `COUNT(*)` or `SUM(amount)`.
+    Aggregate {
+        function: AggregateFunction,
+        column: Option<String>,
+    },
+}
+
+/// Bounded `HAVING` predicate tree over group outputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HavingExpression {
+    Comparison {
+        operand: GroupOperand,
+        operator: ComparisonOperator,
+        value: ScalarOperand,
+    },
+    And(Box<HavingExpression>, Box<HavingExpression>),
+    Or(Box<HavingExpression>, Box<HavingExpression>),
+    Not(Box<HavingExpression>),
+}
+
+/// One grouped `ORDER BY` term with its own direction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupOrderTerm {
+    operand: GroupOperand,
+    descending: bool,
+}
+
+/// Total aggregate functions admitted by the bounded V1 slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateFunction {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggregateFunction {
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::Sum => "SUM",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::Avg => "AVG",
+        }
+    }
+
+    fn from_keyword(word: &str) -> Option<Self> {
+        match word.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(Self::Count),
+            "SUM" => Some(Self::Sum),
+            "MIN" => Some(Self::Min),
+            "MAX" => Some(Self::Max),
+            "AVG" => Some(Self::Avg),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -880,6 +1622,19 @@ enum FilterExpression {
         column: String,
         negated: bool,
     },
+    /// Anchored `LIKE` over a text column with a bounded literal pattern.
+    Like {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
+    /// Membership over a bounded scalar list. Residual by design: `IN`
+    /// never binds an access path in this slice.
+    In {
+        column: String,
+        members: Vec<ScalarOperand>,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
     Not(Box<Self>),
@@ -894,6 +1649,16 @@ enum BoundFilterExpression {
     },
     IsNull {
         column: usize,
+        negated: bool,
+    },
+    Like {
+        column: usize,
+        pattern: String,
+        negated: bool,
+    },
+    In {
+        column: usize,
+        members: Vec<BoundScalarOperand>,
         negated: bool,
     },
     And(Box<Self>, Box<Self>),
@@ -1014,6 +1779,75 @@ struct BoundSelect {
     residual: bool,
     output_columns: Vec<String>,
     access: SelectAccess,
+    /// Bound total aggregates; when present the select emits exactly one
+    /// row folded from the bounded access path (or one row per group when
+    /// `group_columns` is nonempty).
+    aggregates: Option<Vec<BoundAggregate>>,
+    /// Group-key column indexes (primary-key prefix or arbitrary).
+    group_columns: Vec<usize>,
+    /// Logical types of the group-key columns, in `group_columns` order.
+    group_types: Vec<LogicalType>,
+    /// True when group keys are a primary-key left prefix (contiguous
+    /// runs); false takes the bounded ordered-grouped fold.
+    streaming_groups: bool,
+    /// Post-fold group shaping (`HAVING`, grouped `ORDER BY`, hidden
+    /// accumulator trimming); `None` for plain grouped selects.
+    group_shape: Option<BoundGroupShape>,
+    /// `SELECT DISTINCT`: deduplicate projected rows before LIMIT.
+    distinct: bool,
+    /// Rows skipped after shaping; `LIMIT` bounds emitted rows after it.
+    offset: Option<usize>,
+}
+
+/// Bound post-fold shaping of grouped output rows.
+///
+/// Group rows fold as `[keys.., visible aggregates.., hidden aggregates..]`;
+/// `visible_width` is the emitted prefix after `HAVING` filtering and
+/// `ORDER BY` sorting run over the complete row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundGroupShape {
+    /// Emitted columns: group keys plus projected aggregates.
+    visible_width: usize,
+    /// Bound `HAVING` predicate over the complete fold row.
+    having: Option<BoundHavingExpression>,
+    /// Bound grouped `ORDER BY` terms over the complete fold row.
+    order: Vec<BoundGroupOrderTerm>,
+}
+
+/// One bound `HAVING` comparison tree node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoundHavingExpression {
+    Comparison {
+        /// Fold-row index of the compared output.
+        index: usize,
+        /// Ordered-encoding type of that output.
+        logical_type: LogicalType,
+        operator: ComparisonOperator,
+        value: SqlValue,
+    },
+    And(Box<BoundHavingExpression>, Box<BoundHavingExpression>),
+    Or(Box<BoundHavingExpression>, Box<BoundHavingExpression>),
+    Not(Box<BoundHavingExpression>),
+}
+
+/// One bound grouped `ORDER BY` term.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundGroupOrderTerm {
+    /// Fold-row index of the sorted output.
+    index: usize,
+    /// Ordered-encoding type of that output.
+    logical_type: LogicalType,
+    descending: bool,
+}
+
+/// One catalog-bound total aggregate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundAggregate {
+    function: AggregateFunction,
+    /// Index into the inner projection row; `None` is `COUNT(*)`.
+    input: Option<usize>,
+    /// Logical type of the aggregated column (validated for SUM/AVG).
+    logical_type: Option<LogicalType>,
 }
 
 #[derive(Clone, Copy)]
@@ -1022,8 +1856,14 @@ struct SelectQuery<'query> {
     projection: &'query Projection,
     filter: Option<&'query FilterExpression>,
     parameter_count: usize,
+    group_by: &'query [String],
     order_by: &'query [String],
+    descending: bool,
+    having: Option<&'query HavingExpression>,
+    group_order: &'query [GroupOrderTerm],
+    distinct: bool,
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 enum SelectAccess {
@@ -1048,6 +1888,7 @@ enum SelectAccess {
     PrimaryKeyScan {
         limit: usize,
         legacy_binary: bool,
+        descending: bool,
     },
     PrimaryKeyPrefixScan {
         prefix: KeyBinding,
@@ -1061,6 +1902,7 @@ enum SelectAccess {
         range: PrimaryKeyRange,
         limit: usize,
         legacy_binary: bool,
+        descending: bool,
     },
 }
 
@@ -1111,8 +1953,14 @@ fn prepare_parsed_catalog(
             projection,
             filter,
             parameter_count,
+            group_by,
             order_by,
+            descending,
+            having,
+            group_order,
+            distinct,
             limit,
+            offset,
         } => prepare_select_plan(
             catalog,
             SelectQuery {
@@ -1120,8 +1968,14 @@ fn prepare_parsed_catalog(
                 projection: &projection,
                 filter: filter.as_ref(),
                 parameter_count,
+                group_by: &group_by,
                 order_by: &order_by,
+                descending,
+                having: having.as_ref(),
+                group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             ordered_secondary_indexes,
         )?,
@@ -1238,9 +2092,27 @@ fn prepare_select_plan(
     query: SelectQuery<'_>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<PreparedPlan, SqlError> {
-    let bound = bind_select(catalog, query, ordered_secondary_indexes)?;
+    let mut bound = bind_select(catalog, query, ordered_secondary_indexes)?;
+    let aggregates = bound.aggregates.take();
+    let group_columns = std::mem::take(&mut bound.group_columns);
+    let group_types = std::mem::take(&mut bound.group_types);
+    let streaming_groups = bound.streaming_groups;
+    let group_shape = bound.group_shape.take();
+    let group_limit = (!group_columns.is_empty()).then_some(query.limit).flatten();
+    let aggregate_columns = aggregates
+        .is_some()
+        .then(|| std::mem::take(&mut bound.output_columns));
+    if aggregates.is_some() {
+        // The inner plan materializes the complete catalog row for the fold.
+        let relation = relation_by_id(catalog, bound.table)?;
+        bound.output_columns = relation
+            .columns
+            .iter()
+            .map(|column| column.name.to_string())
+            .collect();
+    }
     let relation = relation_by_id(catalog, bound.table)?.clone();
-    Ok(match bound.access {
+    let inner = match bound.access {
         SelectAccess::PrimaryKey { key, legacy_binary } => PreparedPlan::PrimaryKeyLookup {
             table: bound.table,
             relation: Box::new(relation),
@@ -1307,6 +2179,7 @@ fn prepare_select_plan(
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary,
+            descending,
         } => PreparedPlan::PrimaryKeyScan {
             table: bound.table,
             relation: Box::new(relation),
@@ -1317,6 +2190,7 @@ fn prepare_select_plan(
             output_columns: bound.output_columns,
             limit,
             legacy_binary,
+            descending,
         },
         SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => {
             PreparedPlan::PrimaryKeyPrefixScan {
@@ -1348,6 +2222,7 @@ fn prepare_select_plan(
             range,
             limit,
             legacy_binary,
+            descending,
         } => PreparedPlan::PrimaryKeyRangeScan {
             table: bound.table,
             relation: Box::new(relation),
@@ -1359,8 +2234,43 @@ fn prepare_select_plan(
             range,
             limit,
             legacy_binary,
+            descending,
         },
-    })
+    };
+    let plan = match (aggregates, aggregate_columns) {
+        (Some(aggregates), Some(output_columns)) => PreparedPlan::Aggregate {
+            input: Box::new(inner),
+            aggregates,
+            output_columns,
+            group_columns,
+            group_types,
+            group_limit,
+            streaming_groups,
+            group_shape,
+        },
+        _ => inner,
+    };
+    if bound.distinct || bound.offset.is_some() {
+        if matches!(plan, PreparedPlan::Aggregate { .. }) && bound.distinct {
+            return Err(SqlError::InvalidSyntax);
+        }
+        let projected_types = if bound.distinct {
+            plan.result_schema()?
+                .into_iter()
+                .map(|(_, logical_type)| logical_type)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(PreparedPlan::RowShape {
+            input: Box::new(plan),
+            projected_types,
+            distinct: bound.distinct,
+            offset: bound.offset,
+            limit: query.limit,
+        });
+    }
+    Ok(plan)
 }
 
 pub(crate) fn execute_prepared(
@@ -1423,7 +2333,9 @@ pub(crate) fn execute_prepared_binary<'snapshot>(
         | PreparedPlan::PrimaryKeyPrefixScan { .. }
         | PreparedPlan::PrimaryKeyPrefixRangeScan { .. }
         | PreparedPlan::PrimaryKeyRangeScan { .. }
-        | PreparedPlan::IndexedInnerJoin { .. } => Err(SqlError::ParameterMismatch),
+        | PreparedPlan::IndexedInnerJoin { .. }
+        | PreparedPlan::Aggregate { .. }
+        | PreparedPlan::RowShape { .. } => Err(SqlError::ParameterMismatch),
     }
 }
 
@@ -1474,11 +2386,13 @@ pub(crate) fn execute_transaction(
         Statement::Insert {
             name,
             values,
+            additional_rows,
             parameter_count,
         } => execute_insert(
             transaction,
             &name,
             &values,
+            &additional_rows,
             parameter_count,
             parameters,
             &mut || true,
@@ -1514,8 +2428,14 @@ pub(crate) fn execute_transaction(
             projection,
             filter,
             parameter_count,
+            group_by,
             order_by,
+            descending,
+            having,
+            group_order,
+            distinct,
             limit,
+            offset,
         } => execute_select(
             transaction,
             SelectQuery {
@@ -1523,8 +2443,14 @@ pub(crate) fn execute_transaction(
                 projection: &projection,
                 filter: filter.as_ref(),
                 parameter_count,
+                group_by: &group_by,
                 order_by: &order_by,
+                descending,
+                having: having.as_ref(),
+                group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             parameters,
             &mut || true,
@@ -1534,8 +2460,14 @@ pub(crate) fn execute_transaction(
             projection,
             filter,
             parameter_count,
+            group_by,
             order_by,
+            descending,
+            having,
+            group_order,
+            distinct,
             limit,
+            offset,
         } => execute_explain(
             transaction,
             SelectQuery {
@@ -1543,8 +2475,14 @@ pub(crate) fn execute_transaction(
                 projection: &projection,
                 filter: filter.as_ref(),
                 parameter_count,
+                group_by: &group_by,
                 order_by: &order_by,
+                descending,
+                having: having.as_ref(),
+                group_order: &group_order,
+                distinct,
                 limit,
+                offset,
             },
             parameters,
         ),
@@ -1640,11 +2578,13 @@ fn execute_parsed_bound_transaction(
         Statement::Insert {
             name,
             values,
+            additional_rows,
             parameter_count,
         } => execute_insert(
             transaction,
             name,
             values,
+            additional_rows,
             *parameter_count,
             parameters,
             checkpoint,
@@ -1684,6 +2624,8 @@ fn execute_parsed_bound_transaction(
     }
 }
 
+// Statement dispatch over every window shape: cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_window_select(
     transaction: &mut NativeWriteBatch,
     window: &ParsedWindowSelect,
@@ -1727,12 +2669,27 @@ fn execute_window_select(
         projection,
         filter,
         parameter_count,
+        group_by,
         order_by,
+        descending,
+        having,
+        group_order,
+        distinct,
         limit,
+        offset,
     } = parse(&query)?
     else {
         return Err(SqlError::InvalidSyntax);
     };
+    if descending
+        || !group_by.is_empty()
+        || having.is_some()
+        || !group_order.is_empty()
+        || distinct
+        || offset.is_some()
+    {
+        return Err(SqlError::InvalidSyntax);
+    }
     let SqlResult::Rows { columns: _, rows } = execute_select(
         transaction,
         SelectQuery {
@@ -1740,8 +2697,14 @@ fn execute_window_select(
             projection: &projection,
             filter: filter.as_ref(),
             parameter_count,
+            group_by: &[],
             order_by: &order_by,
+            descending: false,
+            having: None,
+            group_order: &[],
+            distinct: false,
             limit,
+            offset: None,
         },
         &[],
         checkpoint,
@@ -1797,8 +2760,14 @@ fn execute_cte_select(
         projection,
         filter,
         parameter_count,
+        group_by,
         order_by,
+        descending,
+        having,
+        group_order,
+        distinct,
         limit,
+        offset,
     } = cte.outer.as_ref()
     else {
         return Err(SqlError::InvalidSyntax);
@@ -1807,6 +2776,12 @@ fn execute_cte_select(
         || filter.is_some()
         || *parameter_count != outer_parameters.len()
         || !order_by.is_empty()
+        || !group_by.is_empty()
+        || *descending
+        || having.is_some()
+        || !group_order.is_empty()
+        || *distinct
+        || offset.is_some()
     {
         return Err(SqlError::InvalidSyntax);
     }
@@ -1822,6 +2797,11 @@ fn execute_cte_select(
                     .ok_or(SqlError::UnknownColumn)
             })
             .collect::<Result<Vec<_>, _>>()?,
+        // Aggregates and aliased/mixed projections over a materialized
+        // CTE are not in the bounded slice.
+        Projection::Aggregates(_) | Projection::Named { .. } => {
+            return Err(SqlError::InvalidAggregate);
+        }
     };
     let output_columns = projection
         .iter()
@@ -1866,8 +2846,14 @@ fn execute_parsed_transaction(
             projection,
             filter,
             parameter_count,
+            group_by,
             order_by,
+            descending,
+            having,
+            group_order,
+            distinct,
             limit,
+            offset,
         } => execute_select(
             transaction,
             SelectQuery {
@@ -1875,8 +2861,14 @@ fn execute_parsed_transaction(
                 projection,
                 filter: filter.as_ref(),
                 parameter_count: *parameter_count,
+                group_by,
                 order_by,
+                descending: *descending,
+                having: having.as_ref(),
+                group_order,
+                distinct: *distinct,
                 limit: *limit,
+                offset: *offset,
             },
             parameters,
             checkpoint,
@@ -1892,12 +2884,28 @@ pub(crate) struct TransactionDml {
 impl TransactionDml {
     pub(crate) fn parse(statement: &str) -> Result<Self, SqlError> {
         let statement = parse(statement)?;
-        match statement {
+        match &statement {
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
                 Ok(Self { statement })
             }
             _ => Err(SqlError::InvalidSyntax),
         }
+    }
+
+    /// Parses one DML statement for the delta staging path, which hydrates
+    /// exactly one primary key per statement. Multi-row `INSERT` stays on
+    /// the materialized path and fails closed here instead of staging a
+    /// partial row group.
+    pub(crate) fn parse_single_row(statement: &str) -> Result<Self, SqlError> {
+        let parsed = Self::parse(statement)?;
+        if let Statement::Insert {
+            additional_rows, ..
+        } = &parsed.statement
+            && !additional_rows.is_empty()
+        {
+            return Err(SqlError::InvalidSyntax);
+        }
+        Ok(parsed)
     }
 
     pub(crate) fn relation_name(&self) -> Result<&str, SqlError> {
@@ -1918,6 +2926,7 @@ impl TransactionDml {
             Statement::Insert {
                 name,
                 values,
+                additional_rows: _,
                 parameter_count,
             } => {
                 let (table, definition) = relation_named(&transaction.state.catalog, name)?;
@@ -1967,6 +2976,7 @@ impl TransactionDml {
             Statement::Insert {
                 name,
                 values,
+                additional_rows: _,
                 parameter_count,
             } => {
                 let (_, definition) = relation_named(&transaction.state.catalog, name)?;
@@ -2006,11 +3016,13 @@ impl TransactionDml {
             Statement::Insert {
                 name,
                 values,
+                additional_rows,
                 parameter_count,
             } => execute_insert(
                 transaction,
                 name,
                 values,
+                additional_rows,
                 *parameter_count,
                 parameters,
                 &mut || true,
@@ -2089,6 +3101,29 @@ pub(crate) fn execute_transaction_dml(
     TransactionDml::parse(statement)?.execute(transaction, parameters)
 }
 
+/// Applies one `PreparedPlan::RowShape` to its inner result.
+fn shape_plain_rows(
+    result: SqlResult,
+    projected_types: &[LogicalType],
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<SqlResult, SqlError> {
+    let SqlResult::Rows { columns, mut rows } = result else {
+        return Err(SqlError::InvalidSyntax);
+    };
+    if distinct {
+        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        rows = distinct_rows(rows, projected_types, bound)?;
+    }
+    if let Some(offset) = offset {
+        apply_offset(&mut rows, offset, limit)?;
+    }
+    Ok(SqlResult::Rows { columns, rows })
+}
+
+// Exhaustive plan dispatch: one arm per plan variant, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_bound_snapshot(
     snapshot: &NativeSnapshot,
     plan: &PreparedPlan,
@@ -2156,9 +3191,85 @@ fn execute_bound_snapshot(
         PreparedPlan::IndexedInnerJoin { .. } => {
             execute_indexed_join_snapshot(snapshot, plan, parameters)
         }
+        PreparedPlan::RowShape {
+            input,
+            projected_types,
+            distinct,
+            offset,
+            limit,
+        } => shape_plain_rows(
+            execute_bound_snapshot(snapshot, input, parameters)?,
+            projected_types,
+            *distinct,
+            *offset,
+            *limit,
+        ),
+        PreparedPlan::Aggregate {
+            input,
+            aggregates,
+            output_columns,
+            group_columns,
+            group_types,
+            group_limit,
+            streaming_groups,
+            group_shape,
+        } => {
+            let SqlResult::Rows { rows, .. } = execute_bound_snapshot(snapshot, input, parameters)?
+            else {
+                return Err(SqlError::InvalidAggregate);
+            };
+            execute_aggregate_plan(
+                &rows,
+                aggregates,
+                output_columns,
+                group_columns,
+                group_types,
+                *group_limit,
+                *streaming_groups,
+                group_shape.as_ref(),
+            )
+        }
     }
 }
 
+/// Executes one `PreparedPlan::Aggregate`: fold, then optional shaping.
+#[allow(clippy::too_many_arguments)]
+fn execute_aggregate_plan(
+    rows: &[Vec<SqlValue>],
+    aggregates: &[BoundAggregate],
+    output_columns: &[String],
+    group_columns: &[usize],
+    group_types: &[LogicalType],
+    group_limit: Option<usize>,
+    streaming_groups: bool,
+    group_shape: Option<&BoundGroupShape>,
+) -> Result<SqlResult, SqlError> {
+    let fold_limit = if group_shape.is_some() {
+        Some(MAX_SQL_ORDERED_GROUPS)
+    } else {
+        group_limit
+    };
+    let mut grouped = fold_aggregate_rows(
+        rows,
+        aggregates,
+        group_columns,
+        group_types,
+        fold_limit,
+        streaming_groups && group_shape.is_none(),
+        group_shape.is_some(),
+    )?;
+    if let Some(shape) = group_shape {
+        let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
+        grouped = shape_grouped_rows(grouped, shape, limit)?;
+    }
+    Ok(SqlResult::Rows {
+        columns: output_columns.to_vec(),
+        rows: grouped,
+    })
+}
+
+// Exhaustive plan dispatch: one arm per plan variant, cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_bound_latest(
     database: &NativeDatabase,
     snapshot: &Snapshot,
@@ -2236,6 +3347,49 @@ fn execute_bound_latest(
         ),
         PreparedPlan::IndexedInnerJoin { .. } => {
             execute_indexed_join_latest(database, snapshot, plan, parameters, checkpoint, profile)
+        }
+        PreparedPlan::RowShape {
+            input,
+            projected_types,
+            distinct,
+            offset,
+            limit,
+        } => shape_plain_rows(
+            execute_bound_latest(
+                database, snapshot, input, parameters, permit, checkpoint, profile,
+            )?,
+            projected_types,
+            *distinct,
+            *offset,
+            *limit,
+        ),
+        PreparedPlan::Aggregate {
+            input,
+            aggregates,
+            output_columns,
+            group_columns,
+            group_types,
+            group_limit,
+            streaming_groups,
+            group_shape,
+        } => {
+            let SqlResult::Rows { rows, .. } = execute_bound_latest(
+                database, snapshot, input, parameters, permit, checkpoint, profile,
+            )?
+            else {
+                return Err(SqlError::InvalidAggregate);
+            };
+            execution_checkpoint(checkpoint)?;
+            execute_aggregate_plan(
+                &rows,
+                aggregates,
+                output_columns,
+                group_columns,
+                group_types,
+                *group_limit,
+                *streaming_groups,
+                group_shape.as_ref(),
+            )
         }
     }
 }
@@ -3906,6 +5060,7 @@ fn execute_snapshot_scan(
         output_columns,
         limit,
         legacy_binary,
+        descending,
         ..
     } = plan
     else {
@@ -3926,7 +5081,12 @@ fn execute_snapshot_scan(
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
     let mut candidates = 0;
-    for (primary_key, stored) in stored_rows {
+    let ordered: Box<dyn Iterator<Item = (&Vec<u8>, &Vec<u8>)>> = if *descending {
+        Box::new(stored_rows.iter().rev())
+    } else {
+        Box::new(stored_rows.iter())
+    };
+    for (primary_key, stored) in ordered {
         consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
@@ -3967,6 +5127,7 @@ fn execute_latest_scan(
         output_columns,
         limit,
         legacy_binary,
+        descending,
         ..
     } = plan
     else {
@@ -3980,7 +5141,9 @@ fn execute_latest_scan(
             rows: Vec::new(),
         });
     }
-    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+    // Descending scans stay on the serial reverse walk: the vectorized
+    // parallel path is forward-segmented.
+    if !*descending && *limit > SQL_VECTOR_PATH_THRESHOLD {
         let rows = execute_latest_vectorized_range(
             database,
             snapshot,
@@ -4004,37 +5167,47 @@ fn execute_latest_scan(
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
     let mut candidates = 0;
-    database
-        .visit_relational_range_at(
+    let mut visit = |primary_key: &[u8], stored: &[u8]| -> Result<ControlFlow<()>, SqlError> {
+        execution_checkpoint(checkpoint)?;
+        consume_scan_candidates(&mut candidates, 1)?;
+        profile.candidate_rows = candidates;
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            *legacy_binary,
+            primary_key,
+            stored,
+            filter.as_ref(),
+            parameters,
+        )? {
+            rows.push(row);
+            if rows.len() == *limit {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    };
+    let outcome = if *descending {
+        database.visit_relational_range_at_reverse(
             snapshot,
             *table,
             Bound::Unbounded,
             Bound::Unbounded,
-            |primary_key, stored| {
-                execution_checkpoint(checkpoint)?;
-                consume_scan_candidates(&mut candidates, 1)?;
-                profile.candidate_rows = candidates;
-                if let Some(row) = materialize_filtered_row(
-                    relation,
-                    projection,
-                    *legacy_binary,
-                    primary_key,
-                    stored,
-                    filter.as_ref(),
-                    parameters,
-                )? {
-                    rows.push(row);
-                    if rows.len() == *limit {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            },
+            &mut visit,
         )
-        .map_err(|error| match error {
-            crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
-            crate::RelationalVisitError::Visitor(error) => error,
-        })?;
+    } else {
+        database.visit_relational_range_at(
+            snapshot,
+            *table,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            &mut visit,
+        )
+    };
+    outcome.map_err(|error| match error {
+        crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
+        crate::RelationalVisitError::Visitor(error) => error,
+    })?;
     Ok(SqlResult::Rows {
         columns: output_columns.clone(),
         rows,
@@ -4330,6 +5503,7 @@ fn execute_snapshot_range_scan(
         range,
         limit,
         legacy_binary,
+        descending,
         ..
     } = plan
     else {
@@ -4351,7 +5525,12 @@ fn execute_snapshot_range_scan(
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
     let mut candidates = 0;
-    for (primary_key, stored) in stored_rows.range((lower, upper)) {
+    let ordered: Box<dyn Iterator<Item = (&Vec<u8>, &Vec<u8>)>> = if *descending {
+        Box::new(stored_rows.range((lower, upper)).rev())
+    } else {
+        Box::new(stored_rows.range((lower, upper)))
+    };
+    for (primary_key, stored) in ordered {
         consume_scan_candidates(&mut candidates, 1)?;
         if let Some(row) = materialize_filtered_row(
             relation,
@@ -4374,6 +5553,7 @@ fn execute_snapshot_range_scan(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_latest_range_scan(
     database: &NativeDatabase,
     snapshot: &Snapshot,
@@ -4393,6 +5573,7 @@ fn execute_latest_range_scan(
         range,
         limit,
         legacy_binary,
+        descending,
         ..
     } = plan
     else {
@@ -4419,7 +5600,7 @@ fn execute_latest_range_scan(
             rows: Vec::new(),
         });
     }
-    if *limit > SQL_VECTOR_PATH_THRESHOLD {
+    if !*descending && *limit > SQL_VECTOR_PATH_THRESHOLD {
         let rows = execute_latest_vectorized_range(
             database,
             snapshot,
@@ -4443,37 +5624,47 @@ fn execute_latest_range_scan(
     }
     let mut rows = Vec::with_capacity((*limit).min(256));
     let mut candidates = 0;
-    database
-        .visit_relational_range_at(
+    let mut visit = |primary_key: &[u8], stored: &[u8]| -> Result<ControlFlow<()>, SqlError> {
+        execution_checkpoint(checkpoint)?;
+        consume_scan_candidates(&mut candidates, 1)?;
+        profile.candidate_rows = candidates;
+        if let Some(row) = materialize_filtered_row(
+            relation,
+            projection,
+            *legacy_binary,
+            primary_key,
+            stored,
+            Some(filter),
+            parameters,
+        )? {
+            rows.push(row);
+            if rows.len() == *limit {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    };
+    let outcome = if *descending {
+        database.visit_relational_range_at_reverse(
             snapshot,
             *table,
             crate::bound_as_slice(&lower),
             crate::bound_as_slice(&upper),
-            |primary_key, stored| {
-                execution_checkpoint(checkpoint)?;
-                consume_scan_candidates(&mut candidates, 1)?;
-                profile.candidate_rows = candidates;
-                if let Some(row) = materialize_filtered_row(
-                    relation,
-                    projection,
-                    *legacy_binary,
-                    primary_key,
-                    stored,
-                    Some(filter),
-                    parameters,
-                )? {
-                    rows.push(row);
-                    if rows.len() == *limit {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            },
+            &mut visit,
         )
-        .map_err(|error| match error {
-            crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
-            crate::RelationalVisitError::Visitor(error) => error,
-        })?;
+    } else {
+        database.visit_relational_range_at(
+            snapshot,
+            *table,
+            crate::bound_as_slice(&lower),
+            crate::bound_as_slice(&upper),
+            &mut visit,
+        )
+    };
+    outcome.map_err(|error| match error {
+        crate::RelationalVisitError::Runtime(error) => SqlError::Runtime(error),
+        crate::RelationalVisitError::Visitor(error) => error,
+    })?;
     Ok(SqlResult::Rows {
         columns: output_columns.clone(),
         rows,
@@ -5096,31 +6287,40 @@ fn execute_insert(
     transaction: &mut NativeWriteBatch,
     name: &str,
     supplied_values: &[ColumnOperand],
+    additional_rows: &[Vec<ColumnOperand>],
     parameter_count: usize,
     parameters: &[SqlValue],
     checkpoint: &mut dyn FnMut() -> bool,
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
-    let resolved =
-        resolve_mutation_operands(&definition, supplied_values, parameter_count, parameters)?;
-    let values = bind_insert_values(&definition, supplied_values, &resolved)?;
-    validate_foreign_keys(transaction, &definition, &values, checkpoint)?;
-    if is_legacy_binary_relation(&definition) {
-        let primary_key = legacy_binary_value(values[0], false)?;
-        let row = legacy_binary_value(values[1], false)?;
-        transaction
-            .insert_with_checkpoint(table, primary_key, row, checkpoint)
-            .map_err(map_runtime_error)?;
-    } else {
-        let primary_key = encode_primary_key(&definition, &values)?;
-        let tuple = encode_tuple(&definition, &values)?;
-        transaction
-            .insert_with_checkpoint(table, primary_key, tuple, checkpoint)
-            .map_err(map_runtime_error)?;
+    let mut rows_affected = 0_u64;
+    for row_operands in
+        std::iter::once(supplied_values).chain(additional_rows.iter().map(Vec::as_slice))
+    {
+        let resolved =
+            resolve_mutation_operands(&definition, row_operands, parameter_count, parameters)?;
+        let values = bind_insert_values(&definition, row_operands, &resolved)?;
+        validate_foreign_keys(transaction, &definition, &values, checkpoint)?;
+        if is_legacy_binary_relation(&definition) {
+            let primary_key = legacy_binary_value(values[0], false)?;
+            let row = legacy_binary_value(values[1], false)?;
+            transaction
+                .insert_with_checkpoint(table, primary_key, row, checkpoint)
+                .map_err(map_runtime_error)?;
+        } else {
+            let primary_key = encode_primary_key(&definition, &values)?;
+            let tuple = encode_tuple(&definition, &values)?;
+            transaction
+                .insert_with_checkpoint(table, primary_key, tuple, checkpoint)
+                .map_err(map_runtime_error)?;
+        }
+        rows_affected = rows_affected
+            .checked_add(1)
+            .ok_or(SqlError::InsertRowBudgetExceeded)?;
     }
     Ok(SqlResult::Command {
-        rows_affected: 1,
+        rows_affected,
         object_id: None,
     })
 }
@@ -5282,6 +6482,8 @@ fn command_result(rows_affected: u64) -> SqlResult {
     }
 }
 
+// Access dispatch plus aggregate/plain shaping: cohesive by design.
+#[allow(clippy::too_many_lines)]
 fn execute_select(
     transaction: &NativeWriteBatch,
     query: SelectQuery<'_>,
@@ -5302,6 +6504,13 @@ fn execute_select(
         residual,
         output_columns,
         access,
+        aggregates,
+        group_columns,
+        group_types,
+        streaming_groups,
+        group_shape,
+        distinct,
+        offset,
     } = bound;
     let definition = relation_by_id(&transaction.state.catalog, table)?;
     validate_filter_parameters(definition, filter.as_ref(), parameter_count, parameters)?;
@@ -5333,7 +6542,8 @@ fn execute_select(
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary,
-        } => context.scan_rows(limit, legacy_binary)?,
+            descending,
+        } => context.scan_rows(limit, legacy_binary, descending)?,
         SelectAccess::PrimaryKeyPrefixScan { prefix, limit } => {
             context.prefix_rows(&prefix, limit)?
         }
@@ -5344,18 +6554,80 @@ fn execute_select(
             range,
             limit,
             legacy_binary,
+            descending,
         } => context.range_rows(
             &range,
             ScanExecution {
                 limit,
                 legacy_binary,
             },
+            descending,
         )?,
     };
+    if let Some(aggregates) = aggregates {
+        let fold_limit = if group_shape.is_some() {
+            // Complete fold before HAVING/ORDER: the ordered-group ceiling
+            // is the work bound; LIMIT applies after shaping.
+            Some(MAX_SQL_ORDERED_GROUPS)
+        } else {
+            query.limit
+        };
+        let mut grouped = fold_aggregate_rows(
+            &rows,
+            &aggregates,
+            &group_columns,
+            &group_types,
+            fold_limit,
+            streaming_groups && group_shape.is_none(),
+            group_shape.is_some(),
+        )?;
+        if let Some(shape) = &group_shape {
+            let limit = query.limit.ok_or(SqlError::InvalidAggregate)?;
+            grouped = shape_grouped_rows(grouped, shape, limit)?;
+        }
+        if let Some(offset) = offset {
+            apply_offset(&mut grouped, offset, query.limit)?;
+        }
+        return Ok(SqlResult::Rows {
+            columns: output_columns,
+            rows: grouped,
+        });
+    }
+    let rows =
+        shape_transaction_plain_rows(definition, &projection, rows, distinct, offset, query.limit)?;
     Ok(SqlResult::Rows {
         columns: output_columns,
         rows,
     })
+}
+
+/// Applies `DISTINCT`/`OFFSET` shaping to plain transactional rows.
+fn shape_transaction_plain_rows(
+    definition: &RelationDefinition,
+    projection: &[usize],
+    mut rows: Vec<Vec<SqlValue>>,
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if distinct {
+        let projected_types = projection
+            .iter()
+            .map(|column| {
+                definition
+                    .columns
+                    .get(*column)
+                    .map(|column| column.logical_type.clone())
+                    .ok_or(SqlError::InvalidCatalogObject)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        rows = distinct_rows(rows, &projected_types, bound)?;
+    }
+    if let Some(offset) = offset {
+        apply_offset(&mut rows, offset, limit)?;
+    }
+    Ok(rows)
 }
 
 pub(crate) fn transaction_ordered_secondary_indexes(
@@ -5594,6 +6866,7 @@ impl TransactionSelectContext<'_> {
         &mut self,
         limit: usize,
         legacy_binary: bool,
+        descending: bool,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -5605,7 +6878,11 @@ impl TransactionSelectContext<'_> {
             .tables
             .get(&self.table)
             .ok_or(SqlError::InvalidStoredRow)?;
-        self.collect_rows(stored_rows, limit, legacy_binary)
+        if descending {
+            self.collect_rows(stored_rows.iter().rev(), limit, legacy_binary)
+        } else {
+            self.collect_rows(stored_rows, limit, legacy_binary)
+        }
     }
 
     fn prefix_rows(
@@ -5661,6 +6938,7 @@ impl TransactionSelectContext<'_> {
         &mut self,
         range: &PrimaryKeyRange,
         execution: ScanExecution,
+        descending: bool,
     ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
         let (lower, upper) = bind_primary_key_range(self.definition, range, self.parameters)?;
         let stored_rows = self
@@ -5673,11 +6951,19 @@ impl TransactionSelectContext<'_> {
         if key_range_is_empty(&lower, &upper) || execution.limit == 0 {
             return Ok(Vec::new());
         }
-        self.collect_rows(
-            stored_rows.range((lower, upper)),
-            execution.limit,
-            execution.legacy_binary,
-        )
+        if descending {
+            self.collect_rows(
+                stored_rows.range((lower, upper)).rev(),
+                execution.limit,
+                execution.legacy_binary,
+            )
+        } else {
+            self.collect_rows(
+                stored_rows.range((lower, upper)),
+                execution.limit,
+                execution.legacy_binary,
+            )
+        }
     }
 
     fn collect_rows<'row>(
@@ -5710,37 +6996,537 @@ impl TransactionSelectContext<'_> {
     }
 }
 
+/// Binds one select projection: aggregates (with optional named group
+/// keys and aliases), aliased plain columns, or the legacy plain shapes.
+#[allow(clippy::type_complexity)]
+fn bind_select_projection(
+    definition: &RelationDefinition,
+    projection: &Projection,
+    group_columns: &[usize],
+) -> Result<(Vec<usize>, Option<Vec<BoundAggregate>>, Vec<String>), SqlError> {
+    // Split into aggregate items (when any) plus the aliases attached to
+    // explicitly named group-key columns.
+    let (aggregate_items, key_aliases): (Option<&[AggregateItem]>, Vec<Option<String>>) =
+        match projection {
+            Projection::Aggregates(items) => (Some(items), Vec::new()),
+            Projection::Named {
+                columns,
+                aggregates,
+            } if !aggregates.is_empty() => (
+                Some(aggregates),
+                columns.iter().map(|column| column.alias.clone()).collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+    if let Some(items) = aggregate_items {
+        let (bound, columns) = bind_aggregates(definition, items)?;
+        let mut output = Vec::with_capacity(group_columns.len() + columns.len());
+        for (position, column) in group_columns.iter().enumerate() {
+            let alias = key_aliases.get(position).cloned().flatten();
+            output.push(match alias {
+                Some(alias) => alias,
+                None => definition
+                    .columns
+                    .get(*column)
+                    .ok_or(SqlError::InvalidCatalogObject)?
+                    .name
+                    .to_string(),
+            });
+        }
+        output.extend(columns);
+        // The inner row materializes the complete catalog row so every
+        // aggregate input index is a plain column index.
+        return Ok(((0..definition.columns.len()).collect(), Some(bound), output));
+    }
+    if let Projection::Named { columns, .. } = projection {
+        // Plain aliased projection: bind by name, rename outputs.
+        let bound = columns
+            .iter()
+            .map(|column| column_index(&definition.columns, &column.name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = columns
+            .iter()
+            .zip(&bound)
+            .map(|(column, index)| match &column.alias {
+                Some(alias) => alias.clone(),
+                None => definition.columns[*index].name.display().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        for name in &output {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(SqlError::DuplicateColumn);
+            }
+        }
+        return Ok((bound, None, output));
+    }
+    let bound = bind_projection(definition, projection)?;
+    let columns = projection_output_columns(definition, &bound);
+    Ok((bound, None, columns))
+}
+
+/// Binds the grouped `HAVING`/`ORDER BY` shape when present, appending
+/// hidden accumulators for aggregates that are not projected.
+fn bind_group_shape(
+    definition: &RelationDefinition,
+    query: &SelectQuery<'_>,
+    group_columns: &[usize],
+    aggregates: Option<&mut Vec<BoundAggregate>>,
+) -> Result<Option<BoundGroupShape>, SqlError> {
+    if query.having.is_none() && query.group_order.is_empty() {
+        return Ok(None);
+    }
+    if group_columns.is_empty() {
+        return Err(SqlError::InvalidAggregate);
+    }
+    let bound_aggregates = aggregates.ok_or(SqlError::InvalidAggregate)?;
+    let (aggregate_items, key_aliases): (&[AggregateItem], Vec<Option<String>>) =
+        match query.projection {
+            Projection::Aggregates(items) => (items, vec![None; group_columns.len()]),
+            Projection::Named {
+                columns,
+                aggregates,
+            } => (
+                aggregates,
+                columns.iter().map(|column| column.alias.clone()).collect(),
+            ),
+            _ => return Err(SqlError::InvalidAggregate),
+        };
+    let visible_width = group_columns.len() + aggregate_items.len();
+    let mut hidden_items = Vec::new();
+    let having = query
+        .having
+        .map(|expression| {
+            bind_having_expression(
+                definition,
+                expression,
+                query.group_by,
+                aggregate_items,
+                &key_aliases,
+                bound_aggregates,
+                &mut hidden_items,
+            )
+        })
+        .transpose()?;
+    let order = query
+        .group_order
+        .iter()
+        .map(|term| {
+            let (index, logical_type) = resolve_group_operand(
+                definition,
+                &term.operand,
+                query.group_by,
+                aggregate_items,
+                &key_aliases,
+                bound_aggregates,
+                &mut hidden_items,
+            )?;
+            Ok(BoundGroupOrderTerm {
+                index,
+                logical_type,
+                descending: term.descending,
+            })
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    Ok(Some(BoundGroupShape {
+        visible_width,
+        having,
+        order,
+    }))
+}
+
 fn bind_select(
     catalog: &crate::model::CatalogState,
     query: SelectQuery<'_>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<BoundSelect, SqlError> {
     let (table, definition) = relation_named(catalog, query.name)?;
-    let projection = bind_projection(definition, query.projection)?;
+    let (group_columns, streaming_groups) = if query.group_by.is_empty() {
+        (Vec::new(), true)
+    } else {
+        let expected_primary_key = primary_key_indices(definition)?;
+        let group_columns = query
+            .group_by
+            .iter()
+            .map(|name| column_index(&definition.columns, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        if group_columns.is_empty() {
+            return Err(SqlError::InvalidAggregate);
+        }
+        // Streaming GROUP BY: keys form a left prefix of the primary key in
+        // catalog order, so the physical walk emits groups contiguously.
+        // Any other admitted key set takes the bounded ordered-grouped path.
+        let streaming = group_columns.len() <= expected_primary_key.len()
+            && group_columns.as_slice() == &expected_primary_key[..group_columns.len()];
+        (group_columns, streaming)
+    };
+    let group_types = group_columns
+        .iter()
+        .map(|column| {
+            definition
+                .columns
+                .get(*column)
+                .map(|definition| definition.logical_type.clone())
+                .ok_or(SqlError::InvalidCatalogObject)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (projection, mut aggregates, output_columns) =
+        bind_select_projection(definition, query.projection, &group_columns)?;
+    let group_shape = bind_group_shape(definition, &query, &group_columns, aggregates.as_mut())?;
     let filter = query
         .filter
         .map(|expression| bind_filter_expression(definition, expression))
         .transpose()?;
     let total_terms = filter.as_ref().map_or(0, filter_term_count);
+    // Aggregates fold the complete bounded access path: the inner access
+    // binds with the explicit engine work ceiling as its limit, and the
+    // scan-candidate budget fails closed past it.
+    let access_query = if aggregates.is_some() {
+        SelectQuery {
+            limit: Some(MAX_SQL_SCAN_CANDIDATES),
+            ..query
+        }
+    } else if query.offset.is_some() || query.distinct {
+        // OFFSET skips shaped rows and DISTINCT deduplicates them: the
+        // access path must materialize enough input first. OFFSET widens
+        // the bound by the skipped rows; DISTINCT charges the explicit
+        // scan ceiling because duplicates are unbounded ahead of dedupe.
+        let widened = if query.distinct {
+            Some(MAX_SQL_SCAN_CANDIDATES)
+        } else {
+            query
+                .limit
+                .and_then(|limit| limit.checked_add(query.offset.unwrap_or(0)))
+        };
+        SelectQuery {
+            limit: widened,
+            ..query
+        }
+    } else {
+        query
+    };
     let (access, used_terms) = bind_select_access(
         catalog,
         table,
         definition,
-        query,
+        access_query,
         filter.as_ref(),
         ordered_secondary_indexes,
     )?;
     Ok(BoundSelect {
         table,
-        output_columns: projection_output_columns(definition, &projection),
+        output_columns,
         projection,
         filter,
         parameter_count: query.parameter_count,
         residual: total_terms > used_terms,
         access,
+        aggregates,
+        group_columns,
+        group_types,
+        streaming_groups,
+        group_shape,
+        distinct: query.distinct,
+        offset: query.offset,
     })
 }
 
+/// Binds parsed aggregate items against the relation definition.
+fn bind_aggregates(
+    definition: &RelationDefinition,
+    items: &[AggregateItem],
+) -> Result<(Vec<BoundAggregate>, Vec<String>), SqlError> {
+    if items.is_empty() {
+        return Err(SqlError::InvalidAggregate);
+    }
+    let mut bound = Vec::with_capacity(items.len());
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let (input, logical_type) = match &item.column {
+            None => (None, None),
+            Some(name) => {
+                let index = column_index(&definition.columns, name)?;
+                let column = definition
+                    .columns
+                    .get(index)
+                    .ok_or(SqlError::InvalidCatalogObject)?;
+                if matches!(
+                    item.function,
+                    AggregateFunction::Sum | AggregateFunction::Avg
+                ) && !matches!(
+                    column.logical_type,
+                    LogicalType::Signed(_)
+                        | LogicalType::Unsigned(_)
+                        | LogicalType::Decimal(_)
+                        | LogicalType::Float32
+                        | LogicalType::Float64
+                ) {
+                    return Err(SqlError::InvalidAggregate);
+                }
+                (Some(index), Some(column.logical_type.clone()))
+            }
+        };
+        names.push(match (&item.alias, &item.column) {
+            (Some(alias), _) => alias.clone(),
+            (None, None) => format!("{}(*)", item.function.keyword()),
+            (None, Some(column)) => format!("{}({column})", item.function.keyword()),
+        });
+        bound.push(BoundAggregate {
+            function: item.function,
+            input,
+            logical_type,
+        });
+    }
+    Ok((bound, names))
+}
+
+/// Streaming accumulator state for one bound aggregate list.
+struct AggregateState {
+    accumulators: Vec<Accumulator>,
+}
+
+enum Accumulator {
+    Count {
+        input: Option<usize>,
+        count: u64,
+    },
+    Sum {
+        input: usize,
+        state: NumericSum,
+    },
+    MinMax {
+        input: usize,
+        maximum: bool,
+        logical_type: LogicalType,
+        current: Option<SqlValue>,
+    },
+    Avg {
+        input: usize,
+        state: NumericSum,
+        count: u64,
+    },
+}
+
+/// Checked numeric accumulator over the closed set of aggregatable types.
+enum NumericSum {
+    Signed(i128),
+    Unsigned(u128),
+    Decimal(i128),
+    Float(f64),
+    /// No non-null input observed yet; resolves on first value.
+    Empty,
+}
+
+impl NumericSum {
+    fn add(&mut self, value: &SqlValue) -> Result<(), SqlError> {
+        if matches!(self, Self::Empty) {
+            *self = match value {
+                SqlValue::Signed(_) => Self::Signed(0),
+                SqlValue::Unsigned(_) => Self::Unsigned(0),
+                SqlValue::Decimal(_) => Self::Decimal(0),
+                SqlValue::Float32(_) | SqlValue::Float64(_) => Self::Float(0.0),
+                _ => return Err(SqlError::InvalidAggregate),
+            };
+        }
+        match (self, value) {
+            (Self::Signed(total), SqlValue::Signed(value)) => {
+                *total = total
+                    .checked_add(i128::from(*value))
+                    .ok_or(SqlError::AggregateOverflow)?;
+            }
+            (Self::Unsigned(total), SqlValue::Unsigned(value)) => {
+                *total = total
+                    .checked_add(u128::from(*value))
+                    .ok_or(SqlError::AggregateOverflow)?;
+            }
+            (Self::Decimal(total), SqlValue::Decimal(value)) => {
+                *total = total
+                    .checked_add(*value)
+                    .ok_or(SqlError::AggregateOverflow)?;
+            }
+            (Self::Float(total), SqlValue::Float32(value)) => {
+                *total += f64::from(value.get());
+            }
+            (Self::Float(total), SqlValue::Float64(value)) => {
+                *total += value.get();
+            }
+            _ => return Err(SqlError::InvalidAggregate),
+        }
+        Ok(())
+    }
+
+    fn emit_sum(&self) -> Result<SqlValue, SqlError> {
+        match self {
+            Self::Empty => Ok(SqlValue::Null),
+            Self::Signed(total) => {
+                Ok(i64::try_from(*total).map_or(SqlValue::Decimal(*total), SqlValue::Signed))
+            }
+            Self::Unsigned(total) => match u64::try_from(*total) {
+                Ok(value) => Ok(SqlValue::Unsigned(value)),
+                Err(_) => i128::try_from(*total)
+                    .map(SqlValue::Decimal)
+                    .map_err(|_| SqlError::AggregateOverflow),
+            },
+            Self::Decimal(total) => Ok(SqlValue::Decimal(*total)),
+            Self::Float(total) => Ok(SqlValue::Float64(hyphae_native_types::CanonicalF64::new(
+                *total,
+            ))),
+        }
+    }
+
+    fn emit_avg(&self, count: u64) -> Result<SqlValue, SqlError> {
+        if count == 0 {
+            return Ok(SqlValue::Null);
+        }
+        // The scan-candidate budget bounds count far below 2^32, so the
+        // conversion is exact.
+        let count_f64 = u32::try_from(count)
+            .map(f64::from)
+            .map_err(|_| SqlError::AggregateOverflow)?;
+        let numerator = match self {
+            Self::Empty => return Ok(SqlValue::Null),
+            Self::Signed(total) | Self::Decimal(total) => approximate_i128(*total),
+            Self::Unsigned(total) => approximate_u128(*total),
+            Self::Float(total) => *total,
+        };
+        Ok(SqlValue::Float64(hyphae_native_types::CanonicalF64::new(
+            numerator / count_f64,
+        )))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn approximate_i128(value: i128) -> f64 {
+    // Lossy by contract: AVG emits Float64.
+    value as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn approximate_u128(value: u128) -> f64 {
+    // Lossy by contract: AVG emits Float64.
+    value as f64
+}
+
+impl AggregateState {
+    fn new(aggregates: &[BoundAggregate]) -> Self {
+        Self {
+            accumulators: aggregates
+                .iter()
+                .map(|aggregate| match aggregate.function {
+                    AggregateFunction::Count => Accumulator::Count {
+                        input: aggregate.input,
+                        count: 0,
+                    },
+                    AggregateFunction::Sum => Accumulator::Sum {
+                        input: aggregate.input.unwrap_or_default(),
+                        state: NumericSum::Empty,
+                    },
+                    AggregateFunction::Min => Accumulator::MinMax {
+                        input: aggregate.input.unwrap_or_default(),
+                        maximum: false,
+                        logical_type: aggregate
+                            .logical_type
+                            .clone()
+                            .unwrap_or(LogicalType::Signed(IntegerWidth::Bits64)),
+                        current: None,
+                    },
+                    AggregateFunction::Max => Accumulator::MinMax {
+                        input: aggregate.input.unwrap_or_default(),
+                        maximum: true,
+                        logical_type: aggregate
+                            .logical_type
+                            .clone()
+                            .unwrap_or(LogicalType::Signed(IntegerWidth::Bits64)),
+                        current: None,
+                    },
+                    AggregateFunction::Avg => Accumulator::Avg {
+                        input: aggregate.input.unwrap_or_default(),
+                        state: NumericSum::Empty,
+                        count: 0,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// Folds one complete catalog-ordered row into every accumulator.
+    fn fold(&mut self, row: &[SqlValue]) -> Result<(), SqlError> {
+        for accumulator in &mut self.accumulators {
+            match accumulator {
+                Accumulator::Count { input, count } => {
+                    let counted = match input {
+                        None => true,
+                        Some(index) => !matches!(
+                            row.get(*index).ok_or(SqlError::InvalidAggregate)?,
+                            SqlValue::Null
+                        ),
+                    };
+                    if counted {
+                        *count = count.checked_add(1).ok_or(SqlError::AggregateOverflow)?;
+                    }
+                }
+                Accumulator::Sum { input, state } => {
+                    let value = row.get(*input).ok_or(SqlError::InvalidAggregate)?;
+                    if !matches!(value, SqlValue::Null) {
+                        state.add(value)?;
+                    }
+                }
+                Accumulator::MinMax {
+                    input,
+                    maximum,
+                    logical_type,
+                    current,
+                } => {
+                    let value = row.get(*input).ok_or(SqlError::InvalidAggregate)?;
+                    if !matches!(value, SqlValue::Null) {
+                        let replace = match current.as_ref() {
+                            None => true,
+                            Some(existing) => {
+                                let ordering = compare_sql_values(logical_type, existing, value)?
+                                    .ok_or(SqlError::InvalidAggregate)?;
+                                if *maximum {
+                                    ordering == std::cmp::Ordering::Less
+                                } else {
+                                    ordering == std::cmp::Ordering::Greater
+                                }
+                            }
+                        };
+                        if replace {
+                            *current = Some(value.clone());
+                        }
+                    }
+                }
+                Accumulator::Avg {
+                    input,
+                    state,
+                    count,
+                } => {
+                    let value = row.get(*input).ok_or(SqlError::InvalidAggregate)?;
+                    if !matches!(value, SqlValue::Null) {
+                        state.add(value)?;
+                        *count = count.checked_add(1).ok_or(SqlError::AggregateOverflow)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits the single aggregate output row.
+    fn finish(self) -> Result<Vec<SqlValue>, SqlError> {
+        self.accumulators
+            .into_iter()
+            .map(|accumulator| match accumulator {
+                Accumulator::Count { count, .. } => Ok(SqlValue::Unsigned(count)),
+                Accumulator::Sum { state, .. } => state.emit_sum(),
+                Accumulator::MinMax { current, .. } => Ok(current.unwrap_or(SqlValue::Null)),
+                Accumulator::Avg { state, count, .. } => state.emit_avg(count),
+            })
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn bind_select_access(
     catalog: &crate::model::CatalogState,
     table: ObjectId,
@@ -5762,6 +7548,12 @@ fn bind_select_access(
             &secondary_range_columns,
         )?;
     }
+    // Descending order is admitted only over the complete primary key of a
+    // bounded table scan or full-key range scan; every other access shape
+    // fails closed on DESC below.
+    if query.descending && query.order_by.is_empty() {
+        return Err(SqlError::InvalidSyntax);
+    }
     let (access, used_terms) = if filter.is_none() {
         let limit = query.limit.ok_or(SqlError::InvalidSyntax)?;
         validate_primary_key_order(definition, query.order_by, &expected_primary_key)?;
@@ -5769,6 +7561,7 @@ fn bind_select_access(
             SelectAccess::PrimaryKeyScan {
                 limit,
                 legacy_binary,
+                descending: query.descending,
             },
             0,
         )
@@ -5797,6 +7590,7 @@ fn bind_select_access(
                 range,
                 limit,
                 legacy_binary,
+                descending: query.descending,
             },
             range_terms,
         )
@@ -5836,6 +7630,28 @@ fn bind_select_access(
             legacy_binary,
         )?
     };
+    if query.descending
+        && !matches!(
+            access,
+            SelectAccess::PrimaryKeyScan { .. } | SelectAccess::PrimaryKeyRangeScan { .. }
+        )
+    {
+        return Err(SqlError::InvalidSyntax);
+    }
+    // Streaming GROUP BY emits one row per contiguous key-prefix run, so the
+    // physical walk must be primary-key ordered; index-ordered paths fail
+    // closed.
+    if !query.group_by.is_empty()
+        && !matches!(
+            access,
+            SelectAccess::PrimaryKeyScan { .. }
+                | SelectAccess::PrimaryKeyRangeScan { .. }
+                | SelectAccess::PrimaryKeyPrefixScan { .. }
+                | SelectAccess::PrimaryKeyPrefixRangeScan { .. }
+        )
+    {
+        return Err(SqlError::InvalidAggregate);
+    }
     Ok((access, used_terms))
 }
 
@@ -5900,6 +7716,7 @@ fn bind_primary_scan_fallback(
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary,
+            descending: false,
         },
         0,
     ))
@@ -5922,6 +7739,9 @@ fn bind_projection(
             .iter()
             .map(|name| column_index(&definition.columns, name))
             .collect(),
+        // Aggregate projections bind through bind_aggregates; aliased
+        // projections bind inline in bind_select. Neither reaches here.
+        Projection::Aggregates(_) | Projection::Named { .. } => Err(SqlError::InvalidAggregate),
     }
 }
 
@@ -5938,8 +7758,14 @@ fn bind_indexed_inner_join(
             projection: &all_columns,
             filter: parsed.filter.as_ref(),
             parameter_count: parsed.parameter_count,
+            group_by: &[],
             order_by: &parsed.order_by,
+            descending: false,
+            having: None,
+            group_order: &[],
+            distinct: false,
             limit: parsed.limit,
+            offset: None,
         },
         ordered_secondary_indexes,
     )?;
@@ -6024,6 +7850,7 @@ fn bind_join_left_access(
         SelectAccess::PrimaryKeyScan {
             limit,
             legacy_binary: false,
+            descending: false,
         } => JoinLeftAccess::BoundedPrimaryKeyScan { range: None, limit },
         SelectAccess::PrimaryKeyPrefixScan { limit, .. }
         | SelectAccess::PrimaryKeyPrefixRangeScan { limit, .. } => {
@@ -6033,6 +7860,7 @@ fn bind_join_left_access(
             range,
             limit,
             legacy_binary: false,
+            descending: false,
         } => JoinLeftAccess::BoundedPrimaryKeyScan {
             range: Some(range),
             limit,
@@ -6242,6 +8070,48 @@ fn bind_filter_expression(
             column: column_index(&definition.columns, column)?,
             negated: *negated,
         }),
+        FilterExpression::Like {
+            column,
+            pattern,
+            negated,
+        } => {
+            let column = column_index(&definition.columns, column)?;
+            if definition
+                .columns
+                .get(column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type
+                != LogicalType::Text
+            {
+                return Err(SqlError::TypeMismatch);
+            }
+            Ok(BoundFilterExpression::Like {
+                column,
+                pattern: pattern.clone(),
+                negated: *negated,
+            })
+        }
+        FilterExpression::In {
+            column,
+            members,
+            negated,
+        } => {
+            let column = column_index(&definition.columns, column)?;
+            let logical_type = &definition
+                .columns
+                .get(column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type;
+            let members = members
+                .iter()
+                .map(|member| bind_scalar_operand(logical_type, member))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundFilterExpression::In {
+                column,
+                members,
+                negated: *negated,
+            })
+        }
         FilterExpression::And(left, right) => Ok(BoundFilterExpression::And(
             Box::new(bind_filter_expression(definition, left)?),
             Box::new(bind_filter_expression(definition, right)?),
@@ -6303,6 +8173,8 @@ fn collect_top_level_comparisons<'filter>(
         }
         BoundFilterExpression::Comparison { .. } => comparisons.push(expression),
         BoundFilterExpression::IsNull { .. }
+        | BoundFilterExpression::Like { .. }
+        | BoundFilterExpression::In { .. }
         | BoundFilterExpression::Or(_, _)
         | BoundFilterExpression::Not(_) => {}
     }
@@ -6346,7 +8218,10 @@ fn validate_row_comparison_shapes(
 
 fn filter_term_count(expression: &BoundFilterExpression) -> usize {
     match expression {
-        BoundFilterExpression::Comparison { .. } | BoundFilterExpression::IsNull { .. } => 1,
+        BoundFilterExpression::Comparison { .. }
+        | BoundFilterExpression::IsNull { .. }
+        | BoundFilterExpression::Like { .. }
+        | BoundFilterExpression::In { .. } => 1,
         BoundFilterExpression::And(left, right) | BoundFilterExpression::Or(left, right) => {
             filter_term_count(left).saturating_add(filter_term_count(right))
         }
@@ -6987,12 +8862,21 @@ fn bind_data_mutation(
         Statement::Insert {
             name,
             values,
+            additional_rows,
             parameter_count,
         } => {
             let (table, definition) = relation_named(catalog, name)?;
-            let resolved =
-                resolve_mutation_operands(definition, values, *parameter_count, parameters)?;
-            let _ = bind_insert_values(definition, values, &resolved)?;
+            for row_operands in
+                std::iter::once(values.as_slice()).chain(additional_rows.iter().map(Vec::as_slice))
+            {
+                let resolved = resolve_mutation_operands(
+                    definition,
+                    row_operands,
+                    *parameter_count,
+                    parameters,
+                )?;
+                let _ = bind_insert_values(definition, row_operands, &resolved)?;
+            }
             (table, definition)
         }
         Statement::Update {
@@ -8095,11 +9979,31 @@ fn validate_filter_parameter_types(
             }
             Ok(())
         }
-        BoundFilterExpression::IsNull { column, .. } => {
+        BoundFilterExpression::IsNull { column, .. }
+        | BoundFilterExpression::Like { column, .. } => {
             definition
                 .columns
                 .get(*column)
                 .ok_or(SqlError::InvalidCatalogObject)?;
+            Ok(())
+        }
+        BoundFilterExpression::In {
+            column, members, ..
+        } => {
+            let logical_type = &definition
+                .columns
+                .get(*column)
+                .ok_or(SqlError::InvalidCatalogObject)?
+                .logical_type;
+            for member in members {
+                let value = resolve_operand(member, parameters)?;
+                if matches!(value, SqlValue::Null) {
+                    continue;
+                }
+                value
+                    .encode_ordered_component(logical_type)
+                    .map_err(|_| SqlError::TypeMismatch)?;
+            }
             Ok(())
         }
         BoundFilterExpression::And(left, right) | BoundFilterExpression::Or(left, right) => {
@@ -8133,6 +10037,59 @@ fn evaluate_filter(
                 TruthValue::False
             } else {
                 TruthValue::True
+            })
+        }
+        BoundFilterExpression::Like {
+            column,
+            pattern,
+            negated,
+        } => match row.get(*column).ok_or(SqlError::InvalidStoredRow)? {
+            SqlValue::Null => Ok(TruthValue::Unknown),
+            SqlValue::Text(text) => {
+                let matched = crate::search_doc_values::like_matches(pattern, text);
+                Ok(if matched == *negated {
+                    TruthValue::False
+                } else {
+                    TruthValue::True
+                })
+            }
+            _ => Err(SqlError::TypeMismatch),
+        },
+        BoundFilterExpression::In {
+            column,
+            members,
+            negated,
+        } => {
+            let value = row.get(*column).ok_or(SqlError::InvalidStoredRow)?;
+            if matches!(value, SqlValue::Null) {
+                return Ok(TruthValue::Unknown);
+            }
+            let logical_type = &definition
+                .columns
+                .get(*column)
+                .ok_or(SqlError::InvalidStoredRow)?
+                .logical_type;
+            let mut matched = false;
+            let mut saw_null = false;
+            for member in members {
+                let member = resolve_operand(member, parameters)?;
+                if matches!(member, SqlValue::Null) {
+                    saw_null = true;
+                    continue;
+                }
+                if compare_sql_values(logical_type, value, member)?
+                    == Some(std::cmp::Ordering::Equal)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            // SQL three-valued IN: an unmatched list containing NULL is
+            // unknown, not false; NOT IN inverts through the same logic.
+            Ok(match (matched, saw_null, *negated) {
+                (true, _, false) | (false, false, true) => TruthValue::True,
+                (true, _, true) | (false, false, false) => TruthValue::False,
+                (false, true, _) => TruthValue::Unknown,
             })
         }
         BoundFilterExpression::And(left, right) => {
@@ -8657,15 +10614,27 @@ fn parse(statement: &str) -> Result<Statement, SqlError> {
                 projection,
                 filter,
                 parameter_count,
+                group_by,
                 order_by,
+                descending,
+                having,
+                group_order,
+                distinct,
                 limit,
+                offset,
             } => Statement::ExplainSelect {
                 name,
                 projection,
                 filter,
                 parameter_count,
+                group_by,
                 order_by,
+                descending,
+                having,
+                group_order,
+                distinct,
                 limit,
+                offset,
             },
             Statement::SelectJoin(join) => Statement::ExplainSelectJoin(join),
             _ => return Err(SqlError::InvalidSyntax),
@@ -8856,22 +10825,36 @@ fn parse_insert(parser: &mut Parser) -> Result<Statement, SqlError> {
     parser.expect_symbol('(')?;
     let columns = parser.identifier_list(')')?;
     parser.expect_keyword("VALUES")?;
-    parser.expect_symbol('(')?;
     let mut parameter_count = 0_usize;
-    let mut values = Vec::with_capacity(columns.len());
-    for (index, column) in columns.into_iter().enumerate() {
-        if index != 0 {
-            parser.expect_symbol(',')?;
+    let parse_row = |parser: &mut Parser,
+                     parameter_count: &mut usize|
+     -> Result<Vec<ColumnOperand>, SqlError> {
+        parser.expect_symbol('(')?;
+        let mut row = Vec::with_capacity(columns.len());
+        for (index, column) in columns.iter().enumerate() {
+            if index != 0 {
+                parser.expect_symbol(',')?;
+            }
+            row.push(ColumnOperand {
+                column: column.clone(),
+                operand: parser.scalar_operand(parameter_count)?,
+            });
         }
-        values.push(ColumnOperand {
-            column,
-            operand: parser.scalar_operand(&mut parameter_count)?,
-        });
+        parser.expect_symbol(')')?;
+        Ok(row)
+    };
+    let values = parse_row(parser, &mut parameter_count)?;
+    let mut additional_rows = Vec::new();
+    while parser.consume_symbol(',') {
+        if additional_rows.len() + 1 >= MAX_SQL_INSERT_ROWS {
+            return Err(SqlError::InsertRowBudgetExceeded);
+        }
+        additional_rows.push(parse_row(parser, &mut parameter_count)?);
     }
-    parser.expect_symbol(')')?;
     Ok(Statement::Insert {
         name,
         values,
+        additional_rows,
         parameter_count,
     })
 }
@@ -8985,18 +10968,89 @@ fn parse_window_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     }))
 }
 
+/// Parses the optional `ORDER BY` tail: plain-column list with one
+/// trailing direction (ungrouped), or per-term directed group operands.
+fn parse_select_order(
+    parser: &mut Parser,
+    ungrouped: bool,
+) -> Result<(Vec<String>, bool, Vec<GroupOrderTerm>), SqlError> {
+    if !parser.consume_keyword("ORDER") {
+        return Ok((Vec::new(), false, Vec::new()));
+    }
+    parser.expect_keyword("BY")?;
+    if ungrouped {
+        let mut columns = vec![parser.identifier()?];
+        while parser.consume_symbol(',') {
+            columns.push(parser.identifier()?);
+        }
+        let descending = if parser.consume_keyword("DESC") {
+            true
+        } else {
+            parser.consume_keyword("ASC");
+            false
+        };
+        return Ok((columns, descending, Vec::new()));
+    }
+    // Grouped ORDER BY: each term is a group output or aggregate call
+    // with its own direction.
+    let mut terms = vec![parser.group_order_term()?];
+    while parser.consume_symbol(',') {
+        terms.push(parser.group_order_term()?);
+    }
+    Ok((Vec::new(), false, terms))
+}
+
+/// Parses the optional `OFFSET` tail (LIMIT mandatory alongside it).
+fn parse_select_offset(
+    parser: &mut Parser,
+    limit: Option<usize>,
+) -> Result<Option<usize>, SqlError> {
+    if !parser.consume_keyword("OFFSET") {
+        return Ok(None);
+    }
+    // OFFSET without LIMIT has no bounded meaning in this dialect.
+    if limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    parser.number_usize().map(Some)
+}
+
+/// `DISTINCT` admits plain projections only, ungrouped, with LIMIT.
+fn validate_distinct_shape(
+    distinct: bool,
+    projection: &Projection,
+    group_by: &[String],
+    limit: Option<usize>,
+) -> Result<(), SqlError> {
+    if !distinct {
+        return Ok(());
+    }
+    let plain = matches!(projection, Projection::All | Projection::Columns(_))
+        || matches!(projection, Projection::Named { aggregates, .. } if aggregates.is_empty());
+    if !plain || !group_by.is_empty() || limit.is_none() {
+        return Err(SqlError::InvalidSyntax);
+    }
+    Ok(())
+}
+
 fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     if parser.looks_like_window_select() {
         return parse_window_select(parser);
     }
+    let distinct = parser.consume_keyword("DISTINCT");
     let projection = if parser.consume_symbol('*') {
         Projection::All
+    } else if parser.looks_like_aggregate_projection() {
+        Projection::Aggregates(parser.aggregate_list_until_keyword("FROM")?)
     } else {
-        Projection::Columns(parser.identifier_list_until_keyword("FROM")?)
+        parser.projection_list_until_from()?
     };
     parser.expect_keyword("FROM")?;
     let name = parser.identifier()?;
     if parser.consume_keyword("INNER") {
+        if matches!(projection, Projection::Aggregates(_)) {
+            return Err(SqlError::InvalidAggregate);
+        }
         return parse_inner_join(parser, name, projection);
     }
     let mut parameter_count = 0_usize;
@@ -9005,7 +11059,7 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         None
     };
-    let order_by = if parser.consume_keyword("ORDER") {
+    let group_by = if parser.consume_keyword("GROUP") {
         parser.expect_keyword("BY")?;
         let mut columns = vec![parser.identifier()?];
         while parser.consume_symbol(',') {
@@ -9015,28 +11069,79 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
     } else {
         Vec::new()
     };
+    let having = if parser.consume_keyword("HAVING") {
+        if group_by.is_empty() {
+            return Err(SqlError::InvalidAggregate);
+        }
+        Some(parse_having_expression(parser)?)
+    } else {
+        None
+    };
+    let (order_by, descending, group_order) = parse_select_order(parser, group_by.is_empty())?;
     let limit = if parser.consume_keyword("LIMIT") {
         Some(parser.number_usize()?)
     } else {
         None
     };
-    if filter.is_none() && limit.is_none() {
-        return Err(SqlError::InvalidSyntax);
-    }
-    if filter
-        .as_ref()
-        .is_some_and(|expression| !has_top_level_scalar_equality(expression))
-        && limit.is_none()
-    {
-        return Err(SqlError::InvalidSyntax);
+    let offset = parse_select_offset(parser, limit)?;
+    validate_distinct_shape(distinct, &projection, &group_by, limit)?;
+    let has_aggregates = matches!(projection, Projection::Aggregates(_))
+        || matches!(&projection, Projection::Named { aggregates, .. } if !aggregates.is_empty());
+    if !group_by.is_empty() {
+        // Grouped selects require an aggregate projection — implicit-key
+        // (aggregates only) or PostgreSQL-style with the key columns named
+        // ahead of the aggregates. LIMIT (mandatory) bounds emitted rows.
+        if !has_aggregates || !order_by.is_empty() || descending || limit.is_none() {
+            return Err(SqlError::InvalidAggregate);
+        }
+        if let Projection::Named { columns, .. } = &projection {
+            // The named plain columns must be exactly the GROUP BY list in
+            // GROUP BY order.
+            if columns.len() != group_by.len()
+                || columns
+                    .iter()
+                    .zip(&group_by)
+                    .any(|(column, key)| !column.name.eq_ignore_ascii_case(key))
+            {
+                return Err(SqlError::InvalidAggregate);
+            }
+        }
+    } else if has_aggregates {
+        // Total aggregates emit exactly one bounded row; ORDER BY/LIMIT/
+        // HAVING have no admitted meaning and the scan-candidate budget is
+        // the work bound. Plain columns mixed into an ungrouped aggregate
+        // stay fail-closed.
+        if matches!(&projection, Projection::Named { columns, .. } if !columns.is_empty()) {
+            return Err(SqlError::InvalidAggregate);
+        }
+        if !order_by.is_empty() || limit.is_some() || having.is_some() {
+            return Err(SqlError::InvalidAggregate);
+        }
+    } else {
+        if filter.is_none() && limit.is_none() {
+            return Err(SqlError::InvalidSyntax);
+        }
+        if filter
+            .as_ref()
+            .is_some_and(|expression| !has_top_level_scalar_equality(expression))
+            && limit.is_none()
+        {
+            return Err(SqlError::InvalidSyntax);
+        }
     }
     Ok(Statement::Select {
         name,
         projection,
         filter,
         parameter_count,
+        group_by,
         order_by,
+        descending,
+        having,
+        group_order,
+        distinct,
         limit,
+        offset,
     })
 }
 
@@ -9100,6 +11205,53 @@ fn parse_inner_join(
     }))
 }
 
+/// Parses one bounded `HAVING` predicate: `AND`/`OR`/`NOT` over
+/// comparisons of a group operand against a literal.
+fn parse_having_expression(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    let mut expression = parse_having_term(parser)?;
+    while parser.consume_keyword("OR") {
+        expression =
+            HavingExpression::Or(Box::new(expression), Box::new(parse_having_term(parser)?));
+    }
+    Ok(expression)
+}
+
+fn parse_having_term(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    let mut expression = parse_having_factor(parser)?;
+    while parser.consume_keyword("AND") {
+        expression =
+            HavingExpression::And(Box::new(expression), Box::new(parse_having_factor(parser)?));
+    }
+    Ok(expression)
+}
+
+fn parse_having_factor(parser: &mut Parser) -> Result<HavingExpression, SqlError> {
+    if parser.consume_keyword("NOT") {
+        return Ok(HavingExpression::Not(Box::new(parse_having_factor(
+            parser,
+        )?)));
+    }
+    if parser.consume_symbol('(') {
+        let expression = parse_having_expression(parser)?;
+        parser.expect_symbol(')')?;
+        return Ok(expression);
+    }
+    let operand = parser.group_operand()?;
+    let operator = parser.comparison_operator()?;
+    // HAVING literals only: parameters inside HAVING stay fail-closed so
+    // prepared-plan parameter binding remains purely filter-owned.
+    let mut no_parameters = 0_usize;
+    let value = parser.scalar_operand(&mut no_parameters)?;
+    if no_parameters != 0 || matches!(value, ScalarOperand::Parameter(_)) {
+        return Err(SqlError::InvalidAggregate);
+    }
+    Ok(HavingExpression::Comparison {
+        operand,
+        operator,
+        value,
+    })
+}
+
 fn parse_filter_expression(
     parser: &mut Parser,
     parameter_count: &mut usize,
@@ -9149,6 +11301,42 @@ fn parse_filter_factor(
     parse_filter_predicate(parser, parameter_count)
 }
 
+/// Desugars `x [NOT] BETWEEN a AND b` to the admitted comparison pair
+/// (`>= AND <=`; negated `< OR >`), inheriting comparison semantics.
+fn parse_between(
+    parser: &mut Parser,
+    parameter_count: &mut usize,
+    column: String,
+    negated: bool,
+) -> Result<FilterExpression, SqlError> {
+    let low = parser.scalar_operand(parameter_count)?;
+    parser.expect_keyword("AND")?;
+    let high = parser.scalar_operand(parameter_count)?;
+    let lower = FilterExpression::Comparison {
+        columns: vec![column.clone()],
+        operator: if negated {
+            ComparisonOperator::Less
+        } else {
+            ComparisonOperator::GreaterOrEqual
+        },
+        operands: vec![low],
+    };
+    let upper = FilterExpression::Comparison {
+        columns: vec![column],
+        operator: if negated {
+            ComparisonOperator::Greater
+        } else {
+            ComparisonOperator::LessOrEqual
+        },
+        operands: vec![high],
+    };
+    Ok(if negated {
+        FilterExpression::Or(Box::new(lower), Box::new(upper))
+    } else {
+        FilterExpression::And(Box::new(lower), Box::new(upper))
+    })
+}
+
 fn parse_filter_predicate(
     parser: &mut Parser,
     parameter_count: &mut usize,
@@ -9170,6 +11358,46 @@ fn parse_filter_predicate(
             column: columns.into_iter().next().ok_or(SqlError::InvalidSyntax)?,
             negated,
         });
+    }
+    if !row_value {
+        let negated = parser.consume_keyword("NOT");
+        if parser.consume_keyword("LIKE") {
+            let Some(Token::String(pattern)) = parser.tokens.get(parser.offset).cloned() else {
+                return Err(SqlError::InvalidSyntax);
+            };
+            parser.offset += 1;
+            if pattern.is_empty() || pattern.len() > MAX_SQL_LIKE_PATTERN_BYTES {
+                return Err(SqlError::InvalidSyntax);
+            }
+            return Ok(FilterExpression::Like {
+                column: columns.into_iter().next().ok_or(SqlError::InvalidSyntax)?,
+                pattern,
+                negated,
+            });
+        }
+        if parser.consume_keyword("IN") {
+            parser.expect_symbol('(')?;
+            let mut members = vec![parser.scalar_operand(parameter_count)?];
+            while parser.consume_symbol(',') {
+                if members.len() >= MAX_SQL_IN_MEMBERS {
+                    return Err(SqlError::InvalidSyntax);
+                }
+                members.push(parser.scalar_operand(parameter_count)?);
+            }
+            parser.expect_symbol(')')?;
+            return Ok(FilterExpression::In {
+                column: columns.into_iter().next().ok_or(SqlError::InvalidSyntax)?,
+                members,
+                negated,
+            });
+        }
+        if parser.consume_keyword("BETWEEN") {
+            let column = columns.into_iter().next().ok_or(SqlError::InvalidSyntax)?;
+            return parse_between(parser, parameter_count, column, negated);
+        }
+        if negated {
+            return Err(SqlError::InvalidSyntax);
+        }
     }
     let operator = parser.comparison_operator()?;
     let operands = if row_value {
@@ -9201,9 +11429,11 @@ fn has_top_level_scalar_equality(expression: &FilterExpression) -> bool {
         FilterExpression::And(left, right) => {
             has_top_level_scalar_equality(left) || has_top_level_scalar_equality(right)
         }
-        FilterExpression::IsNull { .. } | FilterExpression::Or(_, _) | FilterExpression::Not(_) => {
-            false
-        }
+        FilterExpression::IsNull { .. }
+        | FilterExpression::Like { .. }
+        | FilterExpression::In { .. }
+        | FilterExpression::Or(_, _)
+        | FilterExpression::Not(_) => false,
     }
 }
 
@@ -9481,15 +11711,141 @@ impl Parser {
         Ok(identifiers)
     }
 
-    fn identifier_list_until_keyword(&mut self, terminator: &str) -> Result<Vec<String>, SqlError> {
-        let mut identifiers = vec![self.identifier()?];
+    /// Returns whether the projection starts with `<aggregate-keyword> (`.
+    fn looks_like_aggregate_projection(&self) -> bool {
+        matches!(
+            self.tokens.get(self.offset),
+            Some(Token::Word(word)) if AggregateFunction::from_keyword(word).is_some()
+        ) && self.tokens.get(self.offset + 1) == Some(&Token::Symbol('('))
+    }
+
+    fn aggregate_item(&mut self) -> Result<AggregateItem, SqlError> {
+        let Some(Token::Word(word)) = self.tokens.get(self.offset) else {
+            return Err(SqlError::InvalidAggregate);
+        };
+        let function = AggregateFunction::from_keyword(word).ok_or(SqlError::InvalidAggregate)?;
+        self.offset += 1;
+        self.expect_symbol('(')?;
+        let column = if self.consume_symbol('*') {
+            if function != AggregateFunction::Count {
+                return Err(SqlError::InvalidAggregate);
+            }
+            None
+        } else {
+            Some(self.identifier()?)
+        };
+        self.expect_symbol(')')?;
+        let alias = self.optional_alias()?;
+        Ok(AggregateItem {
+            function,
+            column,
+            alias,
+        })
+    }
+
+    /// Consumes one optional `AS <identifier>` projection alias.
+    fn optional_alias(&mut self) -> Result<Option<String>, SqlError> {
+        if !self.consume_keyword("AS") {
+            return Ok(None);
+        }
+        self.identifier().map(Some)
+    }
+
+    /// Parses one `HAVING`/grouped-`ORDER BY` operand: an aggregate call
+    /// or a bare identifier (group key, alias, or aggregate output name).
+    fn group_operand(&mut self) -> Result<GroupOperand, SqlError> {
+        if self.at_aggregate_item() {
+            let item = self.aggregate_item()?;
+            if item.alias.is_some() {
+                return Err(SqlError::InvalidAggregate);
+            }
+            return Ok(GroupOperand::Aggregate {
+                function: item.function,
+                column: item.column,
+            });
+        }
+        self.identifier().map(GroupOperand::Name)
+    }
+
+    /// Parses one grouped `ORDER BY` term with its own direction.
+    fn group_order_term(&mut self) -> Result<GroupOrderTerm, SqlError> {
+        let operand = self.group_operand()?;
+        let descending = if self.consume_keyword("DESC") {
+            true
+        } else {
+            self.consume_keyword("ASC");
+            false
+        };
+        Ok(GroupOrderTerm {
+            operand,
+            descending,
+        })
+    }
+
+    /// Returns whether the next projection item is `<aggregate> (`.
+    fn at_aggregate_item(&self) -> bool {
+        matches!(
+            self.tokens.get(self.offset),
+            Some(Token::Word(word)) if AggregateFunction::from_keyword(word).is_some()
+        ) && self.tokens.get(self.offset + 1) == Some(&Token::Symbol('('))
+    }
+
+    fn aggregate_list_until_keyword(
+        &mut self,
+        terminator: &str,
+    ) -> Result<Vec<AggregateItem>, SqlError> {
+        let mut items = vec![self.aggregate_item()?];
         while !self.tokens.get(self.offset).is_some_and(
             |token| matches!(token, Token::Word(value) if value.eq_ignore_ascii_case(terminator)),
         ) {
             self.expect_symbol(',')?;
-            identifiers.push(self.identifier()?);
+            items.push(self.aggregate_item()?);
         }
-        Ok(identifiers)
+        Ok(items)
+    }
+
+    /// Parses the general projection list up to `FROM`: named columns
+    /// (each with an optional alias) optionally followed by aggregates.
+    /// Plain columns after the first aggregate stay fail-closed.
+    fn projection_list_until_from(&mut self) -> Result<Projection, SqlError> {
+        let mut keys: Vec<NamedColumn> = Vec::new();
+        let mut aggregates: Vec<AggregateItem> = Vec::new();
+        loop {
+            if self.at_aggregate_item() {
+                aggregates.push(self.aggregate_item()?);
+            } else {
+                if !aggregates.is_empty() {
+                    // Plain column after an aggregate: outside the slice.
+                    return Err(SqlError::InvalidAggregate);
+                }
+                let name = self.identifier()?;
+                let alias = self.optional_alias()?;
+                keys.push(NamedColumn { name, alias });
+            }
+            if self.tokens.get(self.offset).is_some_and(
+                |token| matches!(token, Token::Word(value) if value.eq_ignore_ascii_case("FROM")),
+            ) {
+                break;
+            }
+            self.expect_symbol(',')?;
+        }
+        match (keys.is_empty(), aggregates.is_empty()) {
+            // Pure unaliased column list keeps the plain legacy shape so
+            // every existing consumer (joins, CTE binding) is untouched.
+            (false, true) if keys.iter().all(|column| column.alias.is_none()) => Ok(
+                Projection::Columns(keys.into_iter().map(|column| column.name).collect()),
+            ),
+            (false, true) => Ok(Projection::Named {
+                columns: keys,
+                aggregates: Vec::new(),
+            }),
+            (true, false) => Ok(Projection::Aggregates(aggregates)),
+            (false, false) => Ok(Projection::Named {
+                columns: keys,
+                aggregates,
+            }),
+            (true, true) => Err(SqlError::InvalidSyntax),
+        }
     }
 
     fn logical_type(&mut self) -> Result<LogicalType, SqlError> {

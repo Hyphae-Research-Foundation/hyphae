@@ -777,9 +777,6 @@ def execute_query(
         execute_collection_query(client, collection, query["text"], candidate_limit, candidate_limit)
         for collection in collections
     ]
-    session_values: list[dict[int, str]] | None = (
-        [session_lookup_from_hits(hits) for hits in branches] if session_cover else None
-    )
     if slice_b and query.get("slice_b"):
         context = query["slice_b"]
         if (
@@ -810,6 +807,11 @@ def execute_query(
     weights = list(query.get("rrf_weights") or [1] * len(collections))
     while len(weights) < len(branches):
         weights.append(1)
+    # Session lookups cover every fused branch, including slice-b branches
+    # appended above, so the alignment invariant holds for all flag shapes.
+    session_values: list[dict[int, str]] | None = (
+        [session_lookup_from_hits(hits) for hits in branches] if session_cover else None
+    )
     return fuse_rrf_hits(
         branches, limit, weights, session_values, session_cover,
     )

@@ -1,0 +1,102 @@
+--- self
+    12.56%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::decode_lexical_segment
+    12.39%  scale_stage_dia  scale_stage_diagnostic  [.] core::slice::sort::stable::drift::sort
+     9.69%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_btree::BorrowedLeaf::decode
+     8.37%  scale_stage_dia  scale_stage_diagnostic  [.] core::slice::sort::unstable::quicksort::partition
+     7.62%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::NativeDatabase::execute_lexical_plan
+     6.46%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_btree::BorrowedLeaf::entries::{{closure}}
+     5.48%  scale_stage_dia  scale_stage_diagnostic  [.] core::ptr::drop_in_place<hyphae_native_runtime::NativeRuntimeError>
+     3.28%  scale_stage_dia  libc.so.6               [.] 0x000000000019851e
+     2.73%  scale_stage_dia  libc.so.6               [.] 0x0000000000198518
+     2.24%  scale_stage_dia  libc.so.6               [.] 0x000000000019850f
+     1.85%  scale_stage_dia  libc.so.6               [.] 0x0000000000198533
+     1.75%  scale_stage_dia  libc.so.6               [.] 0x00000000001a1852
+     1.57%  scale_stage_dia  libc.so.6               [.] 0x000000000019852b
+     1.28%  scale_stage_dia  libc.so.6               [.] 0x000000000019853d
+     1.28%  scale_stage_dia  libc.so.6               [.] 0x000000000019853b
+     0.97%  scale_stage_dia  libc.so.6               [.] cfree
+     0.91%  scale_stage_dia  libc.so.6               [.] 0x00000000000a9bd7
+     0.84%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_pages::BufferPool::get_or_load
+     0.78%  scale_stage_dia  libc.so.6               [.] 0x00000000000a9d3d
+     0.76%  scale_stage_dia  libc.so.6               [.] 0x0000000000198530
+     0.69%  scale_stage_dia  libc.so.6               [.] 0x00000000000a9bdd
+     0.69%  scale_stage_dia  libc.so.6               [.] 0x0000000000198508
+     0.69%  scale_stage_dia  libc.so.6               [.] 0x0000000000198525
+     0.65%  scale_stage_dia  libc.so.6               [.] 0x00000000001987f6
+     0.60%  scale_stage_dia  libc.so.6               [.] 0x000000000019854d
+     0.57%  scale_stage_dia  libc.so.6               [.] 0x00000000000ab2fc
+     0.56%  scale_stage_dia  scale_stage_diagnostic  [.] core::ptr::drop_in_place<hyphae_native_runtime::model::StructureState>
+     0.53%  scale_stage_dia  libc.so.6               [.] 0x00000000000abf4c
+     0.53%  scale_stage_dia  libc.so.6               [.] 0x00000000001987d1
+     0.52%  scale_stage_dia  libc.so.6               [.] 0x00000000001987d7
+     0.47%  scale_stage_dia  libc.so.6               [.] 0x00000000001987fd
+     0.47%  scale_stage_dia  libc.so.6               [.] 0x0000000000198559
+     0.44%  scale_stage_dia  libc.so.6               [.] 0x0000000000198540
+     0.41%  scale_stage_dia  libc.so.6               [.] 0x00000000001a14cb
+     0.40%  scale_stage_dia  libc.so.6               [.] 0x00000000001a1554
+     0.39%  scale_stage_dia  libc.so.6               [.] 0x00000000001a1518
+     0.39%  scale_stage_dia  libc.so.6               [.] 0x000000000019852d
+     0.35%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_product::search::posting_scan
+     0.34%  scale_stage_dia  libc.so.6               [.] 0x00000000001a154e
+     0.32%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::BoundedLevenshtein::within
+--- inclusive (hyphae symbols)
+    21.87%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] sort<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+    18.06%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] logical_merge<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+    18.06%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] merge<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+    17.28%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] driftsort_main<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>, alloc::vec::Vec<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global>> (inlined)
+    17.10%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] merge_down<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+    16.64%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] visit_planned_segment_cached<hyphae_native_runtime::decode_lexical_segment::{closure_env#0}, hyphae_native_runtime::NativeRuntimeError> (inlined)
+    15.31%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}> (inlined)
+    12.56%    12.56%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::decode_lexical_segment
+    10.78%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] partition<hyphae_native_runtime::LexicalContribution, core::slice::{impl#0}::select_nth_unstable_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#7}>> (inlined)
+    10.78%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] partition_lomuto_branchless_cyclic<hyphae_native_runtime::LexicalContribution, core::slice::{impl#0}::select_nth_unstable_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#7}>> (inlined)
+    10.27%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<hyphae_native_runtime::LexicalContribution, core::slice::{impl#0}::select_nth_unstable_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#7}>> (inlined)
+     9.69%     9.69%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_btree::BorrowedLeaf::decode
+     8.81%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#7}> (inlined)
+     7.62%     7.62%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::NativeDatabase::execute_lexical_plan
+     7.19%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] then_with<hyphae_native_runtime::finalize_lexical_batches::{closure#7}::{closure_env#0}> (inlined)
+     6.73%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] is_some_and<&[u8], hyphae_native_btree::{impl#10}::decode::{closure_env#3}> (inlined)
+     6.46%     6.46%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_btree::BorrowedLeaf::entries::{{closure}}
+     5.49%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] drop_in_place<hyphae_native_runtime::NativeRuntimeError> (inlined)
+     5.48%     5.48%  scale_stage_dia  scale_stage_diagnostic  [.] core::ptr::drop_in_place<hyphae_native_runtime::NativeRuntimeError>
+     3.89%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] copy_nonoverlapping<hyphae_native_runtime::LexicalContribution> (inlined)
+     3.81%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] create_run<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+     3.81%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] find_existing_run<hyphae_native_runtime::LexicalContribution, alloc::slice::{impl#0}::sort_by::{closure_env#0}<hyphae_native_runtime::LexicalContribution, hyphae_native_runtime::finalize_lexical_batches::{closure_env#5}>> (inlined)
+     2.51%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] next<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>> (inlined)
+     2.50%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] try_for_each<core::iter::adapters::GenericShunt<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>>, fn(hyphae_native_runtime::LexicalPostingBatch) -> core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>> (inlined)
+     2.50%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] try_fold<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>, (), core::iter::traits::iterator::Iterator::try_for_each::call::{closure_env#0}<hyphae_native_runtime::LexicalPostingBatch, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, fn(hyphae_native_runtime::LexicalPostingBatch) -> core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>> (inlined)
+     2.50%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] try_fold<core::result::Result<hyphae_native_runtime::LexicalPostingBatch, hyphae_native_runtime::NativeRuntimeError>, core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}, (), core::iter::adapters::{impl#0}::try_fold::{closure_env#0}<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>, (), core::iter::traits::iterator::Iterator::try_for_each::call::{closure_env#0}<hyphae_native_runtime::LexicalPostingBatch, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, fn(hyphae_native_runtime::LexicalPostingBatch) -> core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>, core::ops::control_flow::ControlFlow<core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, ()>> (inlined)
+     2.50%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] try_fold<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, (), core::iter::adapters::map::map_try_fold::{closure_env#0}<&hyphae_native_runtime::LexicalSegmentWork, core::result::Result<hyphae_native_runtime::LexicalPostingBatch, hyphae_native_runtime::NativeRuntimeError>, (), core::ops::control_flow::ControlFlow<core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, ()>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}, core::iter::adapters::{impl#0}::try_fold::{closure_env#0}<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>, (), core::iter::traits::iterator::Iterator::try_for_each::call::{closure_env#0}<hyphae_native_runtime::LexicalPostingBatch, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, fn(hyphae_native_runtime::LexicalPostingBatch) -> core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>>, core::ops::control_flow::ControlFlow<core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, ()>> (inlined)
+     2.47%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<&hyphae_native_runtime::LexicalSegmentWork, core::result::Result<hyphae_native_runtime::LexicalPostingBatch, hyphae_native_runtime::NativeRuntimeError>, (), core::ops::control_flow::ControlFlow<core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, ()>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}, core::iter::adapters::{impl#0}::try_fold::{closure_env#0}<core::iter::adapters::map::Map<core::slice::iter::Iter<hyphae_native_runtime::LexicalSegmentWork>, hyphae_native_runtime::{impl#27}::scan_lexical_segments_serial::{closure_env#0}>, core::result::Result<core::convert::Infallible, hyphae_native_runtime::NativeRuntimeError>, (), core::iter::traits::iterator::Iterator::try_for_each::call::{closure_env#0}<hyphae_native_runtime::LexicalPostingBatch, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>, fn(hyphae_native_runtime::LexicalPostingBatch) -> core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>, core::ops::control_flow::ControlFlow<hyphae_native_runtime::LexicalPostingBatch, ()>>> (inlined)
+     1.79%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] next<(&[u8], &[u8]), core::ops::range::Range<usize>, hyphae_native_btree::{impl#10}::entries::{closure_env#0}> (inlined)
+     1.42%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] push<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global> (inlined)
+     1.42%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] push_mut<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global> (inlined)
+     1.17%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] map<usize, (&[u8], &[u8]), &mut hyphae_native_btree::{impl#10}::entries::{closure_env#0}> (inlined)
+     0.99%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] next<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global> (inlined)
+     0.99%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] push<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global> (inlined)
+     0.99%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] push_mut<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global> (inlined)
+     0.86%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] ok_or<u32, hyphae_native_runtime::NativeRuntimeError> (inlined)
+     0.84%     0.84%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_pages::BufferPool::get_or_load
+     0.75%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] copy<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.70%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] call_once<(usize), hyphae_native_btree::{impl#10}::entries::{closure_env#0}> (inlined)
+     0.61%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] write<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.58%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] retain<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global, hyphae_native_runtime::finalize_lexical_batches::{closure_env#6}> (inlined)
+     0.58%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] retain_mut<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global, alloc::vec::{impl#1}::retain::{closure_env#0}<hyphae_native_runtime::LexicalContribution, alloc::alloc::Global, hyphae_native_runtime::finalize_lexical_batches::{closure_env#6}>> (inlined)
+     0.56%     0.56%  scale_stage_dia  scale_stage_diagnostic  [.] core::ptr::drop_in_place<hyphae_native_runtime::model::StructureState>
+     0.48%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] ok_or<u32, hyphae_native_runtime::NativeRuntimeError> (inlined)
+     0.45%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] ok_or<u64, hyphae_native_runtime::NativeRuntimeError> (inlined)
+     0.43%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] sub<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.40%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] drop_in_place<alloc::vec::Vec<hyphae_native_runtime::LexicalSegmentWork, alloc::alloc::Global>> (inlined)
+     0.40%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] drop<hyphae_native_runtime::LexicalSegmentWork, alloc::alloc::Global> (inlined)
+     0.38%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] add<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.36%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] ok_or<&[u8], hyphae_native_runtime::NativeRuntimeError> (inlined)
+     0.35%     0.35%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_product::search::posting_scan
+     0.34%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] write<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.34%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] get<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>, std::hash::random::RandomState, alloc::alloc::Global, (hyphae_native_types::PageGeneration, hyphae_native_types::PageId)> (inlined)
+     0.34%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] get<((hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>), alloc::alloc::Global, hashbrown::map::equivalent_key::{closure_env#0}<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), (hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>>> (inlined)
+     0.34%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] find<((hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>), alloc::alloc::Global, hashbrown::map::equivalent_key::{closure_env#0}<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), (hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>>> (inlined)
+     0.32%     0.32%  scale_stage_dia  scale_stage_diagnostic  [.] hyphae_native_runtime::BoundedLevenshtein::within
+     0.31%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] eq<hyphae_native_runtime::LexicalContribution> (inlined)
+     0.29%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<((hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>), alloc::alloc::Global, hashbrown::map::equivalent_key::{closure_env#0}<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), (hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>>> (inlined)
+     0.27%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] {closure#0}<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), (hyphae_native_types::PageGeneration, hyphae_native_types::PageId), alloc::sync::Arc<hyphae_native_pages::PageFrame, alloc::alloc::Global>> (inlined)
+     0.27%     0.00%  scale_stage_dia  scale_stage_diagnostic  [.] equivalent<(hyphae_native_types::PageGeneration, hyphae_native_types::PageId), (hyphae_native_types::PageGeneration, hyphae_native_types::PageId)> (inlined)
