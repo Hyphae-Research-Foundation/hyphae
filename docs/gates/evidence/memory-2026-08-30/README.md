@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
 # Raw receipts — Agent Memory sweep and Weaviate 1.39 reruns (2026-08-30/31)
 
 Verbatim harness output backing three narrative evidence documents. Nothing

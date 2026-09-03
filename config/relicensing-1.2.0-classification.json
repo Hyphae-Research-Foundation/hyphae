@@ -183,6 +183,7 @@
           "kind": "prefix",
           "paths": [
             "docs/api/",
+            "docs/formal/",
             "docs/native/",
             "docs/performance/",
             "docs/provenance/",

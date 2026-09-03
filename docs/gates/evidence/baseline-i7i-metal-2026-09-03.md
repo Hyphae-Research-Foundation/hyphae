@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
 # Evidence — Hyphae 3.0 re-measurement on dedicated hardware (`2ff8a4b`)
 
 - Date: 2026-09-03

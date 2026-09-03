@@ -275,11 +275,11 @@
       "runtime_dependency_count": 0
     },
     "rust": {
-      "canonical_sha256": "352ab7d575bca7e09029ceb2aa16d8fe1f476d3a74dfc125ca51b8e72c8944ea",
+      "canonical_sha256": "ae0fa1dc4fdf5fe46390fa8b8fd7432bb9d710adc4e621de5314dc79ae5f3871",
       "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "b4277beab026d21d37a35bb910f14b1212ab504cb8997790a4080bd59e4f4f61"
+      "sha256": "14bc4013988f49c352f73117d2a5c2c6170fa65a2268692c16c7d595e1530841"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "96dee4a3441de3a4de56c9d045b023f85be56b83",
+      "commit": "50a75e1574f549c8b8c336d8f6fa24a09d4cf9cb",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "272ffe296eb6ae23ca9563645241f949ce60a352"
+      "tree": "d99e5d292061509aaaa943590b45b7ee0bc8bbda"
     }
   },
   "target_release": "1.2.0"

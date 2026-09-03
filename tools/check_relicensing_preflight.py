@@ -369,6 +369,7 @@ EXPECTED_RULES = [
         "prefix",
         (
             "docs/api/",
+            "docs/formal/",
             "docs/native/",
             "docs/performance/",
             "docs/provenance/",

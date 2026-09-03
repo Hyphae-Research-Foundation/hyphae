@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
 # Evidence — Weaviate 1.39.0 lexical head-to-head rerun
 
 - Date: 2026-08-30
