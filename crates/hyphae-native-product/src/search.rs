@@ -1560,13 +1560,13 @@ impl NativeProduct {
         let definition = self.search_definition(collection)?;
         validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let manifest_ids = load_manifest_ids(&snapshot, collection)?;
-        let total_documents = manifest_ids.len();
+        let manifest = ManifestView::open(&snapshot, collection)?;
+        let total_documents = manifest.total();
         let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
             &snapshot,
             collection,
             &request.filter,
-            &manifest_ids,
+            &manifest,
             &mut checkpoint,
         )?;
         let transform = collection_lexical_transform(&definition, |id| {
@@ -1599,9 +1599,9 @@ impl NativeProduct {
         )?;
 
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for object_id in &eligible_ids {
+            for object_id in eligible_ids.sorted_ids()? {
                 checkpoint()?;
-                fused.insert(*object_id, 0.0);
+                fused.insert(object_id, 0.0);
             }
         }
         let mut candidates = Vec::with_capacity(fused.len());
@@ -1696,13 +1696,13 @@ impl NativeProduct {
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
         let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
         validate_search_request(&definition, &binding, request)?;
-        let manifest_ids = load_manifest_ids(snapshot, collection)?;
-        let total_documents = manifest_ids.len();
+        let manifest = ManifestView::open(snapshot, collection)?;
+        let total_documents = manifest.total();
         let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
             snapshot,
             collection,
             &request.filter,
-            &manifest_ids,
+            &manifest,
             &mut || Ok(()),
         )?;
         let transform = collection_lexical_transform(&definition, |id| {
@@ -1734,8 +1734,8 @@ impl NativeProduct {
             &mut || Ok(()),
         )?;
         if request.lexical.is_none() && request.vectors.is_empty() {
-            for object_id in &eligible_ids {
-                fused.insert(*object_id, 0.0);
+            for object_id in eligible_ids.sorted_ids()? {
+                fused.insert(object_id, 0.0);
             }
         }
         let candidates = fused
@@ -2165,7 +2165,7 @@ fn execute_lexical_branch(
     parameters: hyphae_native_runtime::Bm25ScoreParameters,
     fusion: Option<ProductFusionMethod>,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
-    eligible: &BTreeSet<crate::ObjectId>,
+    eligible: &Eligibility<'_>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<usize, ProductError> {
@@ -2234,7 +2234,7 @@ fn execute_lexical_branch(
                     >= *minimum
             }
         };
-        if operator_admits && eligible.contains(&object_id) {
+        if operator_admits && eligible.contains(object_id)? {
             admitted_hits.push((rank, object_id, hit.score));
         }
     }
@@ -2291,11 +2291,17 @@ fn execute_vector_branches(
     definition: &SearchCollectionDefinitionV2,
     branches: &[ProductVectorBranch],
     fusion: Option<ProductFusionMethod>,
-    eligible: &BTreeSet<crate::ObjectId>,
+    eligible: &Eligibility<'_>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<Vec<ProductVectorBranchReceipt>, ProductError> {
     let mut receipts = Vec::with_capacity(branches.len());
+    if branches.is_empty() {
+        return Ok(receipts);
+    }
+    // The runtime vector searches take an explicit allowlist, so the
+    // universe is materialized once here, never per branch.
+    let allowlist = eligible.allowlist()?;
     for branch in branches {
         checkpoint()?;
         let vector_binding = binding
@@ -2309,7 +2315,7 @@ fn execute_vector_branches(
             .find(|vector| vector.name.lookup() == branch.target)
             .ok_or_else(invalid_request)?;
         let (mut hits, receipt) =
-            execute_vector_branch(snapshot, vector_binding, vector.policy, branch, eligible)?;
+            execute_vector_branch(snapshot, vector_binding, vector.policy, branch, &allowlist)?;
         if hits
             .iter()
             .any(|hit| !hit.distance.is_finite() || hit.distance < 0.0)
@@ -3398,18 +3404,138 @@ fn posting_scan(
     Some(identities.into_iter().collect())
 }
 
+/// The documents a filter admits on one snapshot: every document in the
+/// manifest, answered by chunk probes without materializing the set, or an
+/// explicit ordered set.
+enum Eligibility<'v> {
+    Universe(&'v ManifestView<'v>),
+    Set(BTreeSet<crate::ObjectId>),
+}
+
+impl Eligibility<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Universe(manifest) => manifest.total(),
+            Self::Set(ids) => ids.len(),
+        }
+    }
+
+    fn contains(&self, object_id: crate::ObjectId) -> Result<bool, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.contains(object_id),
+            Self::Set(ids) => Ok(ids.contains(&object_id)),
+        }
+    }
+
+    /// The complete set, materialized only for the universe. Vector branches
+    /// need it as an allowlist.
+    fn allowlist(&self) -> Result<std::borrow::Cow<'_, BTreeSet<crate::ObjectId>>, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.materialize().map(std::borrow::Cow::Owned),
+            Self::Set(ids) => Ok(std::borrow::Cow::Borrowed(ids)),
+        }
+    }
+
+    fn sorted_ids(&self) -> Result<Vec<crate::ObjectId>, ProductError> {
+        match self {
+            Self::Universe(manifest) => manifest.sorted_ids(),
+            Self::Set(ids) => Ok(ids.iter().copied().collect()),
+        }
+    }
+}
+
 /// Evaluates one filter against the posting index, producing exactly the
 /// eligible set the linear scan would produce, or `None` when any node
 /// cannot be answered from postings (the caller falls back fail-open to the
-/// scan, never to a wrong answer).
-fn posting_filter_ids(
+/// scan, never to a wrong answer). `MatchAll` and composites that reduce to
+/// it stay the universe: nothing copies the manifest to say "everything".
+fn posting_filter_ids<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest: &BTreeSet<crate::ObjectId>,
+    manifest: &'v ManifestView<'v>,
+) -> Result<Option<Eligibility<'v>>, ProductError> {
+    match filter {
+        ProductSearchFilter::MatchAll => Ok(Some(Eligibility::Universe(manifest))),
+        ProductSearchFilter::All(children) => {
+            // `None` here means "no child has narrowed the universe yet".
+            let mut narrowed: Option<BTreeSet<crate::ObjectId>> = None;
+            for child in children {
+                let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)?
+                else {
+                    return Ok(None);
+                };
+                if let Eligibility::Set(ids) = child_ids {
+                    narrowed = Some(match narrowed {
+                        None => ids,
+                        Some(current) => current.intersection(&ids).copied().collect(),
+                    });
+                }
+            }
+            Ok(Some(
+                narrowed.map_or(Eligibility::Universe(manifest), Eligibility::Set),
+            ))
+        }
+        ProductSearchFilter::Any(children) => {
+            let mut result = BTreeSet::new();
+            let mut universe = false;
+            for child in children {
+                let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)?
+                else {
+                    return Ok(None);
+                };
+                match child_ids {
+                    Eligibility::Universe(_) => universe = true,
+                    Eligibility::Set(ids) => result.extend(ids),
+                }
+            }
+            Ok(Some(if universe {
+                Eligibility::Universe(manifest)
+            } else {
+                Eligibility::Set(result)
+            }))
+        }
+        ProductSearchFilter::Not(child) => {
+            let Some(child_ids) = posting_filter_ids(snapshot, collection, child, manifest)? else {
+                return Ok(None);
+            };
+            Ok(Some(Eligibility::Set(match child_ids {
+                Eligibility::Universe(_) => BTreeSet::new(),
+                Eligibility::Set(ids) => {
+                    manifest.materialize()?.difference(&ids).copied().collect()
+                }
+            })))
+        }
+        // Missing-field membership is the manifest minus every posting for
+        // the field, mirroring the reference's negated Exists exactly.
+        ProductSearchFilter::IsNull(field) => {
+            let start = posting_field_prefix(collection, field);
+            let Some(end) = prefix_successor(&start) else {
+                return Ok(None);
+            };
+            let Some(present) = posting_scan(snapshot, &start, &end) else {
+                return Ok(None);
+            };
+            Ok(Some(Eligibility::Set(
+                manifest
+                    .materialize()?
+                    .difference(&present)
+                    .copied()
+                    .collect(),
+            )))
+        }
+        leaf => Ok(posting_leaf_ids(snapshot, collection, leaf).map(Eligibility::Set)),
+    }
+}
+
+/// Filter leaves answered from postings alone, or `None` when the shape
+/// cannot be (substring `Like`).
+fn posting_leaf_ids(
+    snapshot: &crate::ProductSnapshot,
+    collection: crate::ObjectId,
+    filter: &ProductSearchFilter,
 ) -> Option<BTreeSet<crate::ObjectId>> {
     match filter {
-        ProductSearchFilter::MatchAll => Some(manifest.clone()),
         ProductSearchFilter::Exists(field) => {
             let start = posting_field_prefix(collection, field);
             let end = prefix_successor(&start)?;
@@ -3445,26 +3571,6 @@ fn posting_filter_ids(
                 }
             }
         }
-        ProductSearchFilter::All(children) => {
-            let mut result = manifest.clone();
-            for child in children {
-                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-                result = result.intersection(&ids).copied().collect();
-            }
-            Some(result)
-        }
-        ProductSearchFilter::Any(children) => {
-            let mut result = BTreeSet::new();
-            for child in children {
-                let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-                result.extend(ids);
-            }
-            Some(result)
-        }
-        ProductSearchFilter::Not(child) => {
-            let ids = posting_filter_ids(snapshot, collection, child, manifest)?;
-            Some(manifest.difference(&ids).copied().collect())
-        }
         // A bounded membership set is the union of its members' point scans.
         ProductSearchFilter::In { field, values } => {
             let field_start = posting_field_prefix(collection, field);
@@ -3479,31 +3585,31 @@ fn posting_filter_ids(
             }
             Some(result)
         }
-        // Missing-field membership is the manifest minus every posting for
-        // the field, mirroring the reference's negated Exists exactly.
-        ProductSearchFilter::IsNull(field) => {
-            let start = posting_field_prefix(collection, field);
-            let end = prefix_successor(&start)?;
-            let present = posting_scan(snapshot, &start, &end)?;
-            Some(manifest.difference(&present).copied().collect())
-        }
         // Substring shapes cannot be answered from ordered postings; the
-        // caller falls back fail-open to the exact scan.
-        ProductSearchFilter::Like { .. } => None,
+        // caller falls back fail-open to the exact scan. Composites are
+        // resolved by `posting_filter_ids`.
+        ProductSearchFilter::Like { .. }
+        | ProductSearchFilter::MatchAll
+        | ProductSearchFilter::All(_)
+        | ProductSearchFilter::Any(_)
+        | ProductSearchFilter::Not(_)
+        | ProductSearchFilter::IsNull(_) => None,
     }
 }
 
 /// Answers eligibility from the posting index when the collection is
 /// posting-covered and every referenced field is fully indexed.
-fn posting_eligible_ids(
+fn posting_eligible_ids<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest: &BTreeSet<crate::ObjectId>,
-) -> Option<BTreeSet<crate::ObjectId>> {
-    let coverage = snapshot.structure_get_internal(&posting_coverage_key(collection))?;
+    manifest: &'v ManifestView<'v>,
+) -> Result<Option<Eligibility<'v>>, ProductError> {
+    let Some(coverage) = snapshot.structure_get_internal(&posting_coverage_key(collection)) else {
+        return Ok(None);
+    };
     if coverage != POSTING_COVERAGE_MAGIC {
-        return None;
+        return Ok(None);
     }
     let mut fields = BTreeSet::new();
     filter_fields(filter, &mut fields);
@@ -3512,7 +3618,7 @@ fn posting_eligible_ids(
             .structure_get_internal(&unindexed_field_key(collection, field))
             .is_some()
         {
-            return None;
+            return Ok(None);
         }
     }
     posting_filter_ids(snapshot, collection, filter, manifest)
@@ -3598,14 +3704,14 @@ impl DocumentSource {
 
 /// Resolves eligibility from postings when possible, otherwise through the
 /// materializing linear scan, preserving byte-identical semantics.
-fn resolve_eligibility_with_checkpoint(
+fn resolve_eligibility_with_checkpoint<'v>(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
     filter: &ProductSearchFilter,
-    manifest_ids: &BTreeSet<crate::ObjectId>,
+    manifest: &'v ManifestView<'v>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
-) -> Result<(BTreeSet<crate::ObjectId>, DocumentSource), ProductError> {
-    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest_ids) {
+) -> Result<(Eligibility<'v>, DocumentSource), ProductError> {
+    if let Some(eligible) = posting_eligible_ids(snapshot, collection, filter, manifest)? {
         checkpoint()?;
         return Ok((eligible, DocumentSource::Postings));
     }
@@ -3621,7 +3727,7 @@ fn resolve_eligibility_with_checkpoint(
         checkpoint()?;
         by_id.insert(decode_object_id(&candidate.document_id)?, candidate);
     }
-    Ok((eligible_ids, DocumentSource::Scan(by_id)))
+    Ok((Eligibility::Set(eligible_ids), DocumentSource::Scan(by_id)))
 }
 
 /// Loads the collection manifest identities under the read-side cap.
@@ -3665,13 +3771,6 @@ fn collection_bm25_parameters(
             b_micros: bm25.b_micros,
         },
     )
-}
-
-fn load_manifest_ids(
-    snapshot: &crate::ProductSnapshot,
-    collection: crate::ObjectId,
-) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
-    ManifestView::open(snapshot, collection)?.materialize()
 }
 
 fn encode_binding(binding: &ProductSearchCollectionBinding) -> Result<Vec<u8>, ProductError> {

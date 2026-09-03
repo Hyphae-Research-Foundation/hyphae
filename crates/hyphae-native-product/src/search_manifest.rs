@@ -72,7 +72,10 @@
 //! identities into format 2 inside the same transaction, so a directory is
 //! either wholly format 1 or wholly format 2 for a given collection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use hyphae_native_runtime::NativeWriteBatch;
 
@@ -725,12 +728,14 @@ enum ViewLayout {
 }
 
 /// Read-only manifest over one immutable product snapshot. Chunks decode on
-/// demand and are never cached across calls, so every answer is verified
-/// against the snapshot bytes.
+/// demand; membership probes keep the chunks they decoded for the life of
+/// the view (one query), so a probe pays one chunk decode per distinct
+/// chunk it touches rather than a full materialization.
 pub(crate) struct ManifestView<'s> {
     snapshot: &'s ProductSnapshot,
     collection: ObjectId,
     layout: ViewLayout,
+    probed: RefCell<BTreeMap<u128, Vec<ObjectId>>>,
 }
 
 impl<'s> ManifestView<'s> {
@@ -750,6 +755,7 @@ impl<'s> ManifestView<'s> {
             snapshot,
             collection,
             layout,
+            probed: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -807,7 +813,8 @@ impl<'s> ManifestView<'s> {
         Ok(self.sorted_ids()?.into_iter().collect())
     }
 
-    /// Whether `object_id` is a member, decoding at most one chunk.
+    /// Whether `object_id` is a member, decoding at most one chunk and
+    /// keeping it for later probes on this view.
     pub(crate) fn contains(&self, object_id: ObjectId) -> Result<bool, ProductError> {
         match &self.layout {
             ViewLayout::Legacy(identities) => Ok(identities.binary_search(&object_id).is_ok()),
@@ -818,7 +825,15 @@ impl<'s> ManifestView<'s> {
                 let Some(index) = position.checked_sub(1) else {
                     return Ok(false);
                 };
-                Ok(self.chunk(header, index)?.binary_search(&object_id).is_ok())
+                let floor = header.chunks.get(index).ok_or_else(corruption)?.floor;
+                let mut probed = self.probed.borrow_mut();
+                let identities = match probed.entry(floor) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(self.chunk(header, index)?)
+                    }
+                };
+                Ok(identities.binary_search(&object_id).is_ok())
             }
         }
     }
