@@ -14,6 +14,10 @@ use hyphae_native_runtime::{
 };
 use hyphae_native_types::{CanonicalF64, LogicalType, TransactionId};
 
+use crate::search_manifest::{
+    ManifestHeader, ManifestMutations, ManifestRead, ManifestState, ManifestView, ManifestWrite,
+    apply_manifest_mutations, encode_manifest_header, manifest_chunk_key,
+};
 use crate::{
     NativeProduct, ProductCommitReceipt, ProductDurability, ProductError, ProductErrorCode,
     ProductSnapshot, SnapshotIdentity,
@@ -32,7 +36,6 @@ pub use hyphae_native_runtime::{
     RangeFacetRequest as ProductRangeFacetRequest, Vector as ProductVector,
 };
 
-const MANIFEST_MAGIC: &[u8; 8] = b"HYPSMAN1";
 const BINDING_MAGIC: &[u8; 8] = b"HYPSBND1";
 const DOCUMENT_MAGIC: &[u8; 8] = b"HYPSDOC1";
 const IDEMPOTENCY_MAGIC: &[u8; 8] = b"HYPSIDM1";
@@ -49,9 +52,10 @@ pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// sealed `FiQA` relevance receipt), then to 250,000 on the
 /// point-resolved ingest, single-decode open, borrowed-leaf scorer, and
 /// bit-identical scorer-equivalence receipt
-/// (`docs/gates/evidence/collection-cap-250k-2026-09-02.md`). The next
-/// rung is evidence-gated; the manifest rewrite per batch (16 bytes per
-/// document) must be re-measured or restructured before 1,000,000.
+/// (`docs/gates/evidence/collection-cap-250k-2026-09-02.md`). The manifest
+/// is chunked (`search_manifest`), so a batch rewrites the header and the
+/// chunks it touches rather than 16 bytes per document; the next rung is
+/// still evidence-gated on the ladder receipt.
 pub const MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS: usize = 250_000;
 /// Maximum named vector targets in one collection or request.
 pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
@@ -59,6 +63,35 @@ pub const MAX_PRODUCT_SEARCH_VECTOR_TARGETS: usize = 16;
 pub const MAX_PRODUCT_SEARCH_BRANCH_CANDIDATES: usize = 10_000;
 /// Maximum result hits returned by the integrated surface.
 pub const MAX_PRODUCT_SEARCH_HITS: usize = hyphae_native_runtime::MAX_DOC_VALUE_HITS;
+
+/// One durable manifest record as `(key, value)`.
+#[doc(hidden)]
+pub type ManifestRecord = (Vec<u8>, Vec<u8>);
+
+/// Manifest read costs observed by the scale harnesses on one snapshot.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestDiagnostics {
+    /// Whether the manifest is still a format-1 record.
+    pub legacy: bool,
+    /// Durable documents in the collection.
+    pub total: usize,
+    /// Chunk records owned by a format-2 manifest.
+    pub chunk_count: usize,
+    /// Encoded bytes of the header record.
+    pub header_bytes: usize,
+    /// Encoded bytes of the largest chunk record.
+    pub largest_chunk_bytes: usize,
+    /// Wall time to read and decode the header.
+    pub header_decode_micros: u128,
+    /// Wall time to decode every chunk into an ordered set.
+    pub materialize_micros: u128,
+    /// Wall time of one membership probe for the greatest identity.
+    pub contains_micros: u128,
+    /// Whether the probed identity was found (always true on a non-empty
+    /// consistent manifest).
+    pub probe_present: bool,
+}
 
 /// One physical named-vector target owned by a logical Catalog V2 collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -642,7 +675,11 @@ impl NativeProduct {
             .set(binding_key(collection), encode_binding(&binding)?, None)
             .map_err(map_runtime_error)?;
         transaction
-            .set(manifest_key(collection), MANIFEST_MAGIC.to_vec(), None)
+            .set(
+                manifest_key(collection),
+                encode_manifest_header(&ManifestHeader::default())?,
+                None,
+            )
             .map_err(map_runtime_error)?;
         let commit = transaction.commit().map_err(map_runtime_error)?;
         self.observe_commit(&commit);
@@ -724,25 +761,24 @@ impl NativeProduct {
         })
     }
 
-    /// Resolves the manifest for one ingest and admits the batch against the
-    /// collection bound and duplicate identities.
+    /// Resolves the manifest for one ingest through the caller's point reads
+    /// and admits the batch against the collection bound and duplicate
+    /// identities. Returns the manifest writes to stage and whether the
+    /// collection held no document before this batch.
     fn ingest_manifest(
-        existing: &[u8],
+        collection: crate::ObjectId,
         batch: &ProductSearchIngestBatch,
-    ) -> Result<(BTreeSet<crate::ObjectId>, bool), ProductError> {
-        let mut identities = decode_manifest(existing)?;
-        let collection_was_empty = identities.is_empty();
-        if identities.len().saturating_add(batch.documents.len())
-            > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS
-        {
-            return Err(limit_exceeded());
-        }
-        for document in &batch.documents {
-            if !identities.insert(document.object_id) {
-                return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
-            }
-        }
-        Ok((identities, collection_was_empty))
+        read: ManifestRead<'_>,
+    ) -> Result<(ManifestMutations, bool), ProductError> {
+        let mut manifest = ManifestState::open(collection, read)?;
+        let collection_was_empty = manifest.is_empty();
+        let identities: Vec<crate::ObjectId> = batch
+            .documents
+            .iter()
+            .map(|document| document.object_id)
+            .collect();
+        manifest.insert_batch(&identities, read)?;
+        Ok((manifest.finish()?, collection_was_empty))
     }
 
     /// Point-resolved ingest for a batch whose documents carry no vectors.
@@ -750,11 +786,10 @@ impl NativeProduct {
         &mut self,
         plan: &IngestPlan<'_>,
     ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
-        let manifest_key = manifest_key(plan.collection);
-        let existing = self
-            .structure_point_read(&manifest_key, plan.logical_time_micros)?
-            .ok_or_else(corruption)?;
-        let (identities, collection_was_empty) = Self::ingest_manifest(&existing, plan.batch)?;
+        let (manifest_writes, collection_was_empty) =
+            Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
+                self.structure_point_read(key, plan.logical_time_micros)
+            })?;
         let covered = collection_was_empty
             || self
                 .structure_point_read(
@@ -800,7 +835,14 @@ impl NativeProduct {
                 POSTING_COVERAGE_MAGIC.to_vec(),
             )?;
         }
-        set(manifest_key, encode_manifest(&identities)?)?;
+        for (key, write) in manifest_writes.writes {
+            match write {
+                ManifestWrite::Set(value) => set(key, value)?,
+                // Inserts never delete a chunk key; the delta batch has no
+                // scalar delete to stage one with.
+                ManifestWrite::Delete => return Err(corruption()),
+            }
+        }
         set(
             plan.marker_key.clone(),
             encode_idempotency(&IdempotencyMarker {
@@ -840,14 +882,14 @@ impl NativeProduct {
         &mut self,
         plan: &IngestPlan<'_>,
     ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
-        let manifest_key = manifest_key(plan.collection);
         let mut transaction = self
             .database
             .begin(plan.logical_time_micros, plan.durability.into())
             .map_err(map_runtime_error)?;
-        let existing_manifest = transaction.get(&manifest_key).ok_or_else(corruption)?;
-        let (identities, collection_was_empty) =
-            Self::ingest_manifest(existing_manifest, plan.batch)?;
+        let (manifest_writes, collection_was_empty) =
+            Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
+                Ok(transaction.get(key).map(<[u8]>::to_vec))
+            })?;
         for document in &plan.batch.documents {
             let object_bytes = document.object_id.get().to_be_bytes().to_vec();
             let text = match &plan.transform {
@@ -888,9 +930,7 @@ impl NativeProduct {
                 )
                 .map_err(map_runtime_error)?;
         }
-        transaction
-            .set(manifest_key, encode_manifest(&identities)?, None)
-            .map_err(map_runtime_error)?;
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
@@ -960,16 +1000,16 @@ impl NativeProduct {
             documents: vec![document.clone()],
         };
         validate_documents(&definition, &binding, &batch_shape)?;
-        let manifest_key = manifest_key(collection);
-        let existing = batch.get(&manifest_key).ok_or_else(corruption)?;
-        let mut identities = decode_manifest(existing)?;
-        if identities.len().saturating_add(1) > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-            return Err(limit_exceeded());
-        }
-        let replace = identities.contains(&document.object_id);
-        if !replace && !identities.insert(document.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::CatalogConflict));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(batch.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            let replace = manifest.contains(document.object_id, &read)?;
+            if !replace {
+                manifest.insert_batch(&[document.object_id], &read)?;
+            }
+            (manifest.finish()?, replace)
+        };
+        let (manifest_writes, replace) = manifest_writes;
         let object_bytes = document.object_id.get().to_be_bytes().to_vec();
         let transform = collection_lexical_transform(&definition, |id| {
             batch.logical_catalog_object(id).cloned()
@@ -1008,10 +1048,7 @@ impl NativeProduct {
             )
             .map_err(map_runtime_error)?;
         write_document_postings(batch, collection, document)?;
-        batch
-            .set(manifest_key, encode_manifest(&identities)?, None)
-            .map_err(map_runtime_error)?;
-        Ok(())
+        apply_manifest_mutations(batch, manifest_writes)
     }
 
     /// Atomically replaces one existing integrated document across lexical,
@@ -1057,15 +1094,17 @@ impl NativeProduct {
             .database
             .begin(logical_time_micros, durability.into())
             .map_err(map_runtime_error)?;
-        let manifest = decode_manifest(
-            transaction
-                .get(&manifest_key(collection))
-                .ok_or_else(corruption)?,
-        )?;
-        if !manifest.contains(&update.document.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
-                .with_object_id(update.document.object_id));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            if !manifest.contains(update.document.object_id, &read)? {
+                return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
+                    .with_object_id(update.document.object_id));
+            }
+            // A format-2 manifest yields no write here; a legacy one upgrades.
+            manifest.finish()?
+        };
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let (postings_covered, _) = posting_coverage(&transaction, collection, false);
         if postings_covered {
             let previous = transaction
@@ -1168,12 +1207,15 @@ impl NativeProduct {
             .database
             .begin(logical_time_micros, durability.into())
             .map_err(map_runtime_error)?;
-        let manifest_key = manifest_key(collection);
-        let mut manifest = decode_manifest(transaction.get(&manifest_key).ok_or_else(corruption)?)?;
-        if !manifest.remove(&delete.object_id) {
-            return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
-                .with_object_id(delete.object_id));
-        }
+        let manifest_writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            let mut manifest = ManifestState::open(collection, &read)?;
+            if !manifest.remove(delete.object_id, &read)? {
+                return Err(ProductError::from_code(ProductErrorCode::ObjectNotFound)
+                    .with_object_id(delete.object_id));
+            }
+            manifest.finish()?
+        };
         let (postings_covered, _) = posting_coverage(&transaction, collection, false);
         if postings_covered {
             let previous = transaction
@@ -1196,9 +1238,7 @@ impl NativeProduct {
         transaction
             .delete_structure(document_key(collection, delete.object_id))
             .map_err(map_runtime_error)?;
-        transaction
-            .set(manifest_key, encode_manifest(&manifest)?, None)
-            .map_err(map_runtime_error)?;
+        apply_manifest_mutations(&mut transaction, manifest_writes)?;
         let transaction_id = transaction.transaction_id().get();
         transaction
             .set(
@@ -1265,6 +1305,109 @@ impl NativeProduct {
         self.original_search_receipt(transaction_id)
     }
 
+    /// Every durable manifest record of `collection` — the header and, for a
+    /// format-2 manifest, each chunk — as `(key, value)` in ascending key
+    /// order at the bounded snapshot for `logical_time_micros`.
+    #[doc(hidden)]
+    pub fn manifest_records_for_test(
+        &self,
+        collection: crate::ObjectId,
+        logical_time_micros: i64,
+    ) -> Result<Vec<ManifestRecord>, ProductError> {
+        let snapshot = self.snapshot_bounded(logical_time_micros)?;
+        let view = ManifestView::open(&snapshot, collection)?;
+        let mut keys = vec![manifest_key(collection)];
+        if let Some(header) = view.header() {
+            keys.extend(
+                header
+                    .chunks
+                    .iter()
+                    .map(|chunk| manifest_chunk_key(collection, chunk.floor)),
+            );
+        }
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                let value = snapshot
+                    .structure_get_internal(&key)
+                    .ok_or_else(corruption)?
+                    .to_vec();
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    /// Rewrites the manifest of `collection` in its format-1 encoding in one
+    /// strict transaction, so tests can exercise the legacy read path and the
+    /// first-mutation upgrade on a real directory.
+    #[doc(hidden)]
+    pub fn rewrite_manifest_as_legacy_for_test(
+        &mut self,
+        collection: crate::ObjectId,
+        logical_time_micros: i64,
+    ) -> Result<(), ProductError> {
+        let mut transaction = self
+            .database
+            .begin(logical_time_micros, ProductDurability::Strict.into())
+            .map_err(map_runtime_error)?;
+        let writes = {
+            let read = |key: &[u8]| Ok(transaction.get(key).map(<[u8]>::to_vec));
+            ManifestState::open(collection, &read)?.legacy_rewrite(&read)?
+        };
+        apply_manifest_mutations(&mut transaction, writes)?;
+        let commit = transaction.commit().map_err(map_runtime_error)?;
+        self.observe_commit(&commit);
+        Ok(())
+    }
+
+    /// Measures the manifest read costs of `collection` on one snapshot for
+    /// the scale harnesses: header decode, complete materialization, and one
+    /// membership probe of the greatest identity.
+    #[doc(hidden)]
+    pub fn manifest_diagnostics(
+        snapshot: &ProductSnapshot,
+        collection: crate::ObjectId,
+    ) -> Result<ManifestDiagnostics, ProductError> {
+        let started = std::time::Instant::now();
+        let view = ManifestView::open(snapshot, collection)?;
+        let header_decode_micros = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let identities = view.materialize()?;
+        let materialize_micros = started.elapsed().as_micros();
+        let probe = identities.last().copied();
+        let started = std::time::Instant::now();
+        let probe_present = match probe {
+            Some(probe) => view.contains(probe)?,
+            None => false,
+        };
+        let contains_micros = started.elapsed().as_micros();
+        let header_bytes = snapshot
+            .structure_get_internal(&manifest_key(collection))
+            .map_or(0, <[u8]>::len);
+        let largest_chunk_bytes = view.header().map_or(0, |header| {
+            header
+                .chunks
+                .iter()
+                .filter_map(|chunk| {
+                    snapshot.structure_get_internal(&manifest_chunk_key(collection, chunk.floor))
+                })
+                .map(<[u8]>::len)
+                .max()
+                .unwrap_or(0)
+        });
+        Ok(ManifestDiagnostics {
+            legacy: view.is_legacy(),
+            total: view.total(),
+            chunk_count: view.header().map_or(0, |header| header.chunks.len()),
+            header_bytes,
+            largest_chunk_bytes,
+            header_decode_micros,
+            materialize_micros,
+            contains_micros,
+            probe_present,
+        })
+    }
+
     /// Executes BM25, named exact/ANN/adaptive vectors, deterministic RRF, and
     /// typed doc-value semantics on one all-engine snapshot.
     ///
@@ -1298,13 +1441,8 @@ impl NativeProduct {
             return Err(limit_exceeded());
         }
         let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
-        let manifest = load_manifest_ids(snapshot, collection)?;
-        let mut selected = manifest
-            .iter()
-            .copied()
-            .filter(|object_id| start_after.is_none_or(|start| *object_id > start))
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>();
+        let mut selected = ManifestView::open(snapshot, collection)?
+            .ids_after(start_after, limit.saturating_add(1))?;
         let continuation = (selected.len() > limit)
             .then(|| selected.get(limit.saturating_sub(1)).copied())
             .flatten();
@@ -2713,13 +2851,7 @@ fn load_documents_with_checkpoint(
     collection: crate::ObjectId,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<Vec<hyphae_native_runtime::DocValueCandidate>, ProductError> {
-    let manifest = snapshot
-        .structure_get_internal(&manifest_key(collection))
-        .ok_or_else(corruption)?;
-    let identities = decode_manifest(manifest)?;
-    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-        return Err(corruption());
-    }
+    let identities = ManifestView::open(snapshot, collection)?.sorted_ids()?;
     let mut documents = Vec::with_capacity(identities.len());
     for object_id in identities {
         checkpoint()?;
@@ -2876,7 +3008,7 @@ struct IngestPlan<'a> {
     durability: ProductDurability,
 }
 
-fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {
+pub(crate) fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {
     storage_key(b'M', collection, None)
 }
 
@@ -2892,7 +3024,11 @@ fn idempotency_key(collection: crate::ObjectId, idempotency_id: u128) -> Vec<u8>
     storage_key(b'I', collection, Some(idempotency_id.to_be_bytes()))
 }
 
-fn storage_key(kind: u8, collection: crate::ObjectId, suffix: Option<[u8; 16]>) -> Vec<u8> {
+pub(crate) fn storage_key(
+    kind: u8,
+    collection: crate::ObjectId,
+    suffix: Option<[u8; 16]>,
+) -> Vec<u8> {
     let mut key = Vec::with_capacity(STORAGE_PREFIX.len() + 33);
     key.extend_from_slice(STORAGE_PREFIX);
     key.push(kind);
@@ -3535,59 +3671,7 @@ fn load_manifest_ids(
     snapshot: &crate::ProductSnapshot,
     collection: crate::ObjectId,
 ) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
-    let identities = decode_manifest(
-        snapshot
-            .structure_get_internal(&manifest_key(collection))
-            .ok_or_else(corruption)?,
-    )?;
-    if identities.len() > MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS {
-        return Err(corruption());
-    }
-    Ok(identities)
-}
-
-fn encode_manifest(identities: &BTreeSet<crate::ObjectId>) -> Result<Vec<u8>, ProductError> {
-    let count = u32::try_from(identities.len()).map_err(|_| limit_exceeded())?;
-    let mut encoded = Vec::with_capacity(12 + identities.len().saturating_mul(16));
-    encoded.extend_from_slice(MANIFEST_MAGIC);
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for object_id in identities {
-        encoded.extend_from_slice(&object_id.get().to_be_bytes());
-    }
-    Ok(encoded)
-}
-
-fn decode_manifest(encoded: &[u8]) -> Result<BTreeSet<crate::ObjectId>, ProductError> {
-    if encoded == MANIFEST_MAGIC {
-        return Ok(BTreeSet::new());
-    }
-    if encoded.len() < 12 || encoded.get(..8) != Some(MANIFEST_MAGIC.as_slice()) {
-        return Err(corruption());
-    }
-    let count = usize::try_from(u32::from_le_bytes(
-        encoded[8..12].try_into().map_err(|_| corruption())?,
-    ))
-    .map_err(|_| corruption())?;
-    if encoded.len() != 12_usize.saturating_add(count.saturating_mul(16)) {
-        return Err(corruption());
-    }
-    // The manifest is written from a `BTreeSet`, so a valid encoding is
-    // strictly ascending; verify that order while decoding and bulk-build
-    // the set from the sorted input instead of inserting one id at a time.
-    let mut identities = Vec::with_capacity(count);
-    let mut previous: Option<crate::ObjectId> = None;
-    for chunk in encoded[12..].chunks_exact(16) {
-        let object_id = crate::ObjectId::new(u128::from_be_bytes(
-            chunk.try_into().map_err(|_| corruption())?,
-        ))
-        .map_err(|_| corruption())?;
-        if previous.is_some_and(|previous| previous >= object_id) {
-            return Err(corruption());
-        }
-        previous = Some(object_id);
-        identities.push(object_id);
-    }
-    Ok(identities.into_iter().collect())
+    ManifestView::open(snapshot, collection)?.materialize()
 }
 
 fn encode_binding(binding: &ProductSearchCollectionBinding) -> Result<Vec<u8>, ProductError> {
@@ -3866,7 +3950,7 @@ fn map_doc_value_error(error: &hyphae_native_runtime::DocValueError) -> ProductE
     }
 }
 
-fn map_runtime_error(error: NativeRuntimeError) -> ProductError {
+pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> ProductError {
     match error {
         NativeRuntimeError::Ann(_)
         | NativeRuntimeError::Model(_)
@@ -3879,7 +3963,7 @@ fn invalid_request() -> ProductError {
     ProductError::from_code(ProductErrorCode::InvalidRequest)
 }
 
-fn limit_exceeded() -> ProductError {
+pub(crate) fn limit_exceeded() -> ProductError {
     ProductError::from_code(ProductErrorCode::LimitExceeded)
 }
 
@@ -3887,13 +3971,17 @@ fn idempotency_conflict() -> ProductError {
     ProductError::from_code(ProductErrorCode::IdempotencyConflict)
 }
 
-fn corruption() -> ProductError {
+pub(crate) fn corruption() -> ProductError {
     ProductError::from_code(ProductErrorCode::Corruption)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search_manifest::{
+        MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES, MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS,
+        decode_manifest_header,
+    };
 
     fn document(id: u128) -> ProductDocument {
         ProductDocument {
@@ -3904,37 +3992,106 @@ mod tests {
         }
     }
 
-    fn manifest_with(count: usize) -> Result<Vec<u8>, ProductError> {
-        let identities = (1..=count)
-            .map(|id| crate::ObjectId::new(u128::try_from(id).unwrap_or(1)))
-            .collect::<Result<BTreeSet<_>, _>>()
-            .map_err(|_| corruption())?;
-        encode_manifest(&identities)
+    fn collection() -> Result<crate::ObjectId, ProductError> {
+        crate::ObjectId::new(52).map_err(|_| corruption())
+    }
+
+    /// In-memory manifest records holding identities `1..=count`.
+    struct Records(BTreeMap<Vec<u8>, Vec<u8>>);
+
+    impl Records {
+        fn with(count: usize) -> Result<Self, ProductError> {
+            let identities = (1..=count)
+                .map(|id| crate::ObjectId::new(u128::try_from(id).unwrap_or(1)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| corruption())?;
+            let mut records = Self(BTreeMap::new());
+            records.apply(ManifestState::pack_sorted(collection()?, &identities).finish()?);
+            Ok(records)
+        }
+
+        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+
+        fn apply(&mut self, mutations: ManifestMutations) {
+            for (key, write) in mutations.writes {
+                match write {
+                    ManifestWrite::Set(value) => {
+                        self.0.insert(key, value);
+                    }
+                    ManifestWrite::Delete => {
+                        self.0.remove(&key);
+                    }
+                }
+            }
+        }
+
+        fn ingest(
+            &self,
+            batch: &ProductSearchIngestBatch,
+        ) -> Result<(ManifestMutations, bool), ProductError> {
+            NativeProduct::ingest_manifest(collection()?, batch, &|key: &[u8]| Ok(self.read(key)))
+        }
+
+        fn header(&self) -> Result<ManifestHeader, ProductError> {
+            decode_manifest_header(
+                self.0
+                    .get(&manifest_key(collection()?))
+                    .ok_or_else(corruption)?,
+            )
+        }
+    }
+
+    fn largest_set(mutations: &ManifestMutations) -> usize {
+        mutations
+            .writes
+            .iter()
+            .map(|(_, write)| match write {
+                ManifestWrite::Set(value) => value.len(),
+                ManifestWrite::Delete => 0,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The collection bound admits exactly `MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS`
     /// identities, rejects the first document past it before any mutation,
-    /// and the manifest round-trips at that size.
+    /// and the per-batch manifest write stays bounded independently of the
+    /// collection size.
     #[test]
     fn collection_bound_is_exact_and_fails_closed() -> Result<(), ProductError> {
         assert_eq!(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS, 250_000);
-        let full_minus_one = manifest_with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
+        let mut full_minus_one = Records::with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
         let last = ProductSearchIngestBatch {
             idempotency_id: 1,
             documents: vec![document(
                 u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS).unwrap_or(1),
             )],
         };
-        let (identities, was_empty) = NativeProduct::ingest_manifest(&full_minus_one, &last)?;
+        let (mutations, was_empty) = full_minus_one.ingest(&last)?;
         assert!(!was_empty);
-        assert_eq!(identities.len(), MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS);
-        let full = encode_manifest(&identities)?;
-        assert_eq!(
-            full.len(),
-            12 + MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS * 16,
-            "manifest is 16 bytes per identity plus header"
+        let header_bound = 16 + 20 * MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS;
+        let chunk_bound = 28 + 16 * MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES;
+        assert!(
+            largest_set(&mutations) <= header_bound.max(chunk_bound),
+            "one batch writes at most the header and the chunks it touches"
         );
-        assert_eq!(decode_manifest(&full)?, identities);
+        full_minus_one.apply(mutations);
+        let full = full_minus_one;
+        let header = full.header()?;
+        assert_eq!(header.total, MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS);
+        assert!(header.chunks.len() <= MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS);
+        assert_eq!(
+            full.0.get(&manifest_key(collection()?)).map(Vec::len),
+            Some(16 + 20 * header.chunks.len()),
+            "header is 16 bytes plus 20 per chunk"
+        );
+        assert_eq!(
+            full.0.len(),
+            header.chunks.len() + 1,
+            "header plus one key per chunk"
+        );
 
         let one_more = ProductSearchIngestBatch {
             idempotency_id: 2,
@@ -3942,13 +4099,12 @@ mod tests {
                 u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1),
             )],
         };
-        let error = NativeProduct::ingest_manifest(&full, &one_more)
-            .err()
-            .ok_or_else(corruption)?;
+        let error = full.ingest(&one_more).err().ok_or_else(corruption)?;
         assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
 
         // A batch that would cross the bound is rejected as a whole even when
         // part of it would fit.
+        let full_minus_one = Records::with(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS - 1)?;
         let two = ProductSearchIngestBatch {
             idempotency_id: 3,
             documents: vec![
@@ -3956,9 +4112,7 @@ mod tests {
                 document(u128::try_from(MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS + 1).unwrap_or(1)),
             ],
         };
-        let error = NativeProduct::ingest_manifest(&full_minus_one, &two)
-            .err()
-            .ok_or_else(corruption)?;
+        let error = full_minus_one.ingest(&two).err().ok_or_else(corruption)?;
         assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
 
         // Duplicate identities fail closed under the bound.
@@ -3966,7 +4120,8 @@ mod tests {
             idempotency_id: 4,
             documents: vec![document(1)],
         };
-        let error = NativeProduct::ingest_manifest(&full_minus_one, &duplicate)
+        let error = full_minus_one
+            .ingest(&duplicate)
             .err()
             .ok_or_else(corruption)?;
         assert_eq!(error.code(), ProductErrorCode::CatalogConflict);

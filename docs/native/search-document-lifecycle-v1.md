@@ -176,14 +176,14 @@ or posting materialization.
 The product batch ingest (`ingest_search_batch`) is a point-resolved route
 whose cost scales with the batch, not with the collection:
 
-- The idempotency marker, the physical binding, the document manifest, and
-  the posting-coverage flag resolve through durable point reads of the
-  current structure root. The replay receipt and the fresh receipt bind the
+- The idempotency marker, the physical binding, the document manifest header
+  and the manifest chunks the batch touches, and the posting-coverage flag
+  resolve through durable point reads of the current structure root. The replay receipt and the fresh receipt bind the
   committed root identity (`visible_csn`, `catalog_version`, `root_digest`)
   without materializing engine state.
 - A batch whose documents carry no named vectors stages every document
-  source, doc-value posting, manifest, coverage flag, and idempotency marker
-  through the physical delta batch and commits it as one all-engine
+  source, doc-value posting, manifest header and touched chunk, coverage
+  flag, and idempotency marker through the physical delta batch and commits it as one all-engine
   transaction. The marker records the transaction identity the serialized
   writer will publish under; a commit that publishes under any other identity
   is a fail-closed corruption error, never a silent foreign receipt.
@@ -203,9 +203,56 @@ retires in the expiry index) and the logical tree contents are identical to
 applying the mutations one at a time. The run splits on the first repeated
 key, expiring value, or non-scalar opcode.
 
-The manifest itself remains one bounded `HYPSMAN1` value of 16-byte identities
-under the collection document bound; raising that bound requires re-measuring
-the manifest rewrite alongside the ladder evidence.
+### Document manifest
+
+The collection manifest is the durable set of document identities the
+integrated surface reports as `total_documents`, tests for membership on
+every lifecycle mutation, and enumerates for pagination. It is chunked so a
+mutation rewrites the records holding the affected identities, not the whole
+set.
+
+- The header stays at the historical manifest key and is sealed by
+  `HYPSMAN2`: `magic(8) ++ u32 LE total_count ++ u32 LE chunk_count ++
+  chunk_count × (u128 BE floor ++ u32 LE entry_count)`. An empty collection is
+  exactly the 16-byte header and owns no chunk record.
+- Each chunk is one scalar value under its own key derived from its floor,
+  sealed by `HYPSCHK1`: `magic(8) ++ u128 BE floor ++ u32 LE count ++ count ×
+  u128 BE identity`. Identities are strictly ascending, nonzero, at or above
+  the chunk floor, and below the next chunk's floor.
+- Floors are immutable lower bounds, strictly ascending across the header; the
+  first chunk carries the sentinel floor `0`. An identity belongs to the chunk
+  with the greatest floor not above it. Every chunk holds between one and
+  `MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES` (1,024) identities; the header
+  total equals the sum of the chunk counts and never exceeds
+  `MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS`; the chunk count never exceeds
+  `MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS`, derived as `4 × collection bound /
+  chunk entries + 2`.
+- Inserting stages scalar `SET`s only: an identity joins the chunk that owns
+  it, and a chunk that exceeds the entry bound splits at its midpoint into a
+  fresh key whose floor is the upper half's first identity. This is what keeps
+  the delta ingest path, which has no scalar delete, able to write the
+  manifest; a delete emitted on that path is a fail-closed corruption error.
+- Deleting removes the identity, drops an emptied chunk key (the first chunk
+  absorbs its successor instead, keeping the sentinel floor), and merges one
+  adjacent pair whose combined count falls to half the entry bound. Maintenance
+  therefore keeps every adjacent pair above half the entry bound, which is
+  what bounds the chunk count; decoders enforce the derived chunk-count bound,
+  not the pair invariant.
+- The delta ingest, the materialized ingest, the operation-batch document
+  stage, document update, and document delete run one shared state machine
+  over their own point reads and stage exactly the writes it emits, so the
+  three write contexts leave byte-identical manifest records for the same
+  operation sequence. A document replace inside an operation batch writes no
+  manifest record.
+- Every header, chunk, and legacy decode fails closed as corruption on a
+  magic, length, order, floor, count, missing-chunk, or bound violation. Chunk
+  decoding validates the chunk against the header entry that names it.
+- `HYPSMAN1` values, including the bare 8-byte magic that provisioning wrote
+  for an empty collection, remain readable forever. Read paths serve them and
+  never write. The first accepted mutation that touches a legacy manifest
+  repacks it into `HYPSMAN2` records in the same transaction (full chunks in
+  identity order, remainder last); a rejected mutation publishes nothing and
+  leaves the manifest legacy.
 
 ## Verification gates
 
@@ -237,6 +284,20 @@ The slice requires:
   application, including expiry-index retirement, plus rejection of a run that
   reaches a live collection key or carries an expiring member without
   appending pages;
+- manifest header, chunk, and legacy codec round trips with fail-closed
+  rejection of every magic, length, order, floor, count, missing-chunk, and
+  bound violation; deterministic midpoint splits that stage only `SET`s;
+  merge and empty-chunk removal on delete; and the adjacent-pair invariant
+  with the derived chunk-count bound under a deterministic insert/delete
+  sequence;
+- byte-identical manifest records from the delta, materialized, and
+  operation-batch write paths across a chunk split, before and after reopen,
+  with `total_documents` and pagination unchanged;
+- `HYPSMAN1` read compatibility on a reopened directory, no rewrite by reads
+  or rejected mutations, and atomic first-accepted-mutation upgrade to
+  `HYPSMAN2`;
+- continuous pagination across chunk boundaries after deleting a chunk's
+  boundary identities, and a durable chunk-key delete when a chunk empties;
 - hosted Linux, macOS, Windows, fuzz, dependency, packaging, and release gates;
   and
 - direct-Linux stage, memory-commit, strict-commit, page/WAL, allocation, and

@@ -32,6 +32,13 @@
 //! offsets — the allocator (malloc/free/memcmp on per-entry `Vec<u8>`) was
 //! ~70% of scorer samples before it.
 //!
+//! The manifest stage isolates the collection manifest: at 250k the legacy
+//! `HYPSMAN1` value was one 4 MB record decoded and cloned on every
+//! `MatchAll` query and rewritten on every ingest batch; the chunked
+//! `HYPSMAN2` layout keeps the per-batch rewrite at the header plus the
+//! touched 16 KB chunks. Record the stage's `materialize_us` (the cost a
+//! full allowlist still pays) and `contains_us` (one chunk decode) per rung.
+//!
 //! Stage trace at the HYPOST02 rung: plan terms ~14 ms, scan 166 segments
 //! ~19 ms, finalize ~32 ms. The document-length side lookup that
 //! dominated the baseline is gone: self-describing postings carry it,
@@ -63,9 +70,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collection = ObjectId::new(52)?;
     let binding = product.resolve_search_collection_binding(collection, 1_000_000)?;
 
+    // Stage 0: the collection manifest on its own — header decode, complete
+    // materialization (what every ANN allowlist and `Not`/`IsNull` filter
+    // pays), and one membership probe (what a chunk-aware path pays per hit).
+    let snapshot = product.snapshot_bounded(1_000_001)?;
+    for round in 0..3 {
+        let diagnostics = NativeProduct::manifest_diagnostics(&snapshot, collection)?;
+        println!(
+            "stage=manifest round={round} format={} total={} chunks={} header_bytes={} largest_chunk_bytes={} header_us={} materialize_us={} contains_us={} probe_present={}",
+            if diagnostics.legacy {
+                "HYPSMAN1"
+            } else {
+                "HYPSMAN2"
+            },
+            diagnostics.total,
+            diagnostics.chunk_count,
+            diagnostics.header_bytes,
+            diagnostics.largest_chunk_bytes,
+            diagnostics.header_decode_micros,
+            diagnostics.materialize_micros,
+            diagnostics.contains_micros,
+            diagnostics.probe_present,
+        );
+    }
+
     // Stage 1: snapshot + raw durable posting scorer (bypasses the product
     // pipeline entirely).
-    let snapshot = product.snapshot_bounded(1_000_001)?;
     let scorer_rounds: u32 = std::env::var("HYPHAE_DIAG_SCORER_ROUNDS")
         .ok()
         .and_then(|value| value.parse().ok())

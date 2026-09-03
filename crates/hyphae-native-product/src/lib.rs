@@ -27,6 +27,7 @@ mod operation;
 /// Canonical, bounded native proof and directory-witness artifacts.
 pub mod proof;
 mod search;
+mod search_manifest;
 mod service;
 mod session;
 mod structures;
@@ -61,6 +62,9 @@ pub use hyphae_native_types::{
 pub use limits::*;
 pub use operation::*;
 pub use search::*;
+pub use search_manifest::{
+    MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES, MAX_PRODUCT_SEARCH_MANIFEST_CHUNKS,
+};
 pub use service::*;
 pub use session::*;
 pub use structures::*;

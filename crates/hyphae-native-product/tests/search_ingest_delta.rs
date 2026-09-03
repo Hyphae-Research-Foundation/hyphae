@@ -312,9 +312,16 @@ fn vectorless_ingest_is_point_resolved_and_semantically_identical()
     assert_eq!(filtered.hits[0].object_id.get(), 304);
 
     // Everything survives reopen: the delta path wrote the same durable
-    // records the materialized path writes.
+    // records the materialized path writes, manifest header and chunks
+    // included.
+    let manifest_records = product.manifest_records_for_test(binding.collection, 6)?;
+    assert_eq!(manifest_records.len(), 2, "one header and one chunk");
     drop(product);
     let mut reopened = NativeProduct::open(&path)?;
+    assert_eq!(
+        reopened.manifest_records_for_test(binding.collection, 6)?,
+        manifest_records
+    );
     let result = reopened.search_collection(binding.collection, &match_all(16), 6)?;
     assert_eq!(result.total_documents, 4);
     let replay =
