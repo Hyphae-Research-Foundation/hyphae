@@ -61,9 +61,11 @@ jobs:
           python tools/check_dependency_license_aggregate.py
           python tools/check_relicensing_preflight.py
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        # Installed from its own lockfile: an unlocked `cargo install` compiles
+        # whatever the registry serves that minute (tinyvec 1.13.0 broke it).
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
       - name: Enforce dependency policy
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:

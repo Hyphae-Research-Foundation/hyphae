@@ -7,7 +7,9 @@ from pathlib import Path
 
 from tools.check_crate_packages import validate_release_graph
 from tools.verify_crate_packages import (
+    locked_registry_packages,
     validate_local_resolution,
+    validate_locked_registry_resolution,
     verification_manifest,
 )
 
@@ -138,6 +140,36 @@ class ReleaseGraphTests(unittest.TestCase):
                 {"base": base, "product": product},
             )
         self.assertEqual(failures, ["product: verification resolved a registry package"])
+
+    def test_locked_resolution_rejects_versions_absent_from_the_lockfile(self) -> None:
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        with tempfile.TemporaryDirectory() as directory:
+            lockfile = Path(directory) / "Cargo.lock"
+            lockfile.write_text(
+                'version = 4\n\n'
+                '[[package]]\nname = "base"\nversion = "1.2.0"\n\n'
+                '[[package]]\nname = "tinyvec"\nversion = "1.12.0"\n'
+                f'source = "{registry}"\n',
+                encoding="utf-8",
+            )
+            locked = locked_registry_packages(lockfile)
+        self.assertEqual(locked, {("tinyvec", "1.12.0")})
+        metadata = {
+            "packages": [
+                {"name": "base", "version": "1.2.0", "source": None},
+                {"name": "tinyvec", "version": "1.12.0", "source": registry},
+                {"name": "tinyvec", "version": "1.13.0", "source": registry},
+                {"name": "vendored", "version": "0.1.0", "source": None},
+            ]
+        }
+        failures = validate_locked_registry_resolution(metadata, ("base",), locked)
+        self.assertEqual(
+            failures,
+            [
+                "tinyvec 1.13.0: verification resolved a registry copy absent from Cargo.lock",
+                "vendored: verification resolved a non-registry dependency",
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()
