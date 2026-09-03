@@ -469,7 +469,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$RELEASE_TAG" = "release-v2.2.0-crates"
+          test "$RELEASE_TAG" = "release-v3.0.0-crates"
           PYTHONPATH="$CONTROL_PACKAGING" python -c \
             'import os; from finalize_release import require_apache_release_version; require_apache_release_version(os.environ["RELEASE_TAG"].removeprefix("release-v").removesuffix("-crates"))'
           git fetch --force --no-tags origin \

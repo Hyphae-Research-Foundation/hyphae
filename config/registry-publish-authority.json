@@ -4,7 +4,7 @@
   "repository": "Hyphae-Research-Foundation/hyphae",
   "branch": "main",
   "version": "3.0.0",
-  "tag": "release-v2.2.0-crates",
+  "tag": "release-v3.0.0-crates",
   "tag_kind": "annotated",
   "tag_signature": {
     "required": false,
@@ -135,7 +135,7 @@
       "name": "Validate all exact-SHA G8 receipts",
       "workflow": ".github/workflows/native-g8-closure.yml",
       "event": "workflow_dispatch",
-      "head_branch": "release/fix/security-check-permission-merge-evidence",
+      "head_branch": "release/fix/release-readiness-semver-offline-merge-evidence",
       "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
     }
   ],
