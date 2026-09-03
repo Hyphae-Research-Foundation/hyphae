@@ -13,6 +13,9 @@
   earlier on a different physical machine
 - Source: `a443c52e68a5c5c69cd62455c04ad313bc8d7dc3` on
   `feat/sql-slice-2-and-evidence` (workspace version 3.0.0), clean tree.
+  The branch was later rewritten with DCO sign-offs before merge; the
+  measured tree (`0eadc82…`) is unchanged and is now commit
+  `0295656158d1b22cf499077e5a0a0df56f56ed3e`.
   Relative to `2ff8a4b` the measured code differs by `b53348e` (B+tree batch
   rewrites split an overflowing leaf evenly) and the buffer-pool bound
   (1,024 → 8,192 frames); everything else between the two SHAs is

@@ -9,7 +9,9 @@
   `us-east-2c`
 - Source: `2ff8a4b995f4b08c3be1c6ff6b05d8e0b1099456` on
   `feat/sql-slice-2-and-evidence`, clean tree (`.git` synced, `git status`
-  empty on the host). `run-metal.sh` ran with the disk-selection fix later
+  empty on the host). The branch was later rewritten with DCO sign-offs
+  before merge; the measured tree (`ccaa229…`) is unchanged and
+  is now commit `a18d3f255b4d5a8ab22bdeee76cc1d5c778f2f60`. `run-metal.sh` ran with the disk-selection fix later
   committed as `6de0d7d`; the fix does not touch any measured code.
 - Runbook: one detached script ran every block in sequence (04:15–08:27 UTC,
   instance terminated by the script after mirroring) and mirrored its

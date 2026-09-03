@@ -334,6 +334,35 @@ scorer equivalence run was started detached (`/root/equiv-1000000.log`);
 append its result to the receipt. Deleting `/root/scale-*` (41 GB) needs the
 user's explicit approval; the auto-mode classifier blocks it.
 
+### Commit identities after the DCO sign-off rewrite (2026-09-03)
+
+Before the merge the whole branch was rewritten with `git rebase --signoff`
+onto `origin/main` (`8aeb6ea`). Every tree is byte-identical; only the
+commit ids changed. Receipts and this document cite the ids as measured;
+the rewritten ids are:
+
+| cited | rewritten | tree |
+|---|---|---|
+| `17a841d` | `ddc1668` | `c6cd73b` |
+| `eec0784` | `786083b` | `7fbac6e` |
+| `93dc3d3` | `f36f7f1` | `64ee8bd` |
+| `0c5040b` | `347d919` | `62455b6` |
+| `c139b2d` | `9eccfbd` | `3c3941e` |
+| `1b2cc70` | `650e0ab` | `ee05374` |
+| `bda7e28` | `089c030` | `2d32220` |
+| `92f3c7a` | `d9b1f76` | `e1e28e8` |
+| `51d8fb0` | `6bbcf2e` | `45b2f13` |
+| `2ff8a4b` | `a18d3f2` | `ccaa229` |
+| `6de0d7d` | `10a2a11` | `5af52de` |
+| `b53348e` | `6df81f2` | `b0297b8` |
+| `f07ee6a` | `3208706` | `b059bbc` |
+| `d1e6309` | `f4a2f48` | `517aa29` |
+| `2e7c64d` | `645a359` | `7369e4c` |
+| `a443c52` | `0295656` | `0eadc82` |
+| `4590eb9` | `3cfc74f` | `dc77bd3` |
+
+The backup ref `backup/feat-sql-slice-2-before-signoff` holds the pre-rewrite history locally.
+
 ## Part 4 — Open items and next moves
 
 ### Engine, in priority order
