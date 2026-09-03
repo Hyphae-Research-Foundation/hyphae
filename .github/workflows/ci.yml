@@ -788,10 +788,17 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
+          # cargo-semver-checks resolves the current and baseline crates in
+          # placeholder projects without either Cargo.lock, so a broken
+          # registry release would fail this gate. Cache exactly the two
+          # locked dependency closures and resolve offline against them.
+          git worktree add --detach "$RUNNER_TEMP/semver-baseline" "$BASELINE_COMMIT"
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path "$RUNNER_TEMP/semver-baseline/Cargo.toml"
           while IFS= read -r package; do
-            "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
+            CARGO_NET_OFFLINE=true "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
               --package "$package" \
-              --baseline-rev "$BASELINE_COMMIT" \
+              --baseline-root "$RUNNER_TEMP/semver-baseline" \
               --release-type major \
               --all-features \
               --color never
