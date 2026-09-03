@@ -502,7 +502,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
-          path: dist/hyphae_sdk-2.2.0-py3-none-any.whl
+          path: dist/hyphae_sdk-3.0.0-py3-none-any.whl
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -554,7 +554,7 @@ jobs:
           python tools/run_python_managed_v2_conformance.py
           --binary target/debug/hyphae
           --fixture-binary target/debug/hyphae-v2-fixture
-          --wheel dist/hyphae_sdk-2.2.0-py3-none-any.whl
+          --wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl
           --startup-timeout-seconds 30
           --output python-managed-v2-conformance-${{ matrix.platform }}.json
       - name: Upload the platform receipt
@@ -632,14 +632,14 @@ jobs:
         run: |
           python -m unittest tools.test_check_python_windows_async_gate tools.test_run_python_windows_async_gate -v
           python tools/run_python_windows_async_gate.py \
-            --wheel dist/hyphae_sdk-2.2.0-py3-none-any.whl \
+            --wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl \
             --output python-windows-async-receipt.json \
             --transcript-output python-windows-async-transcript.json
           python tools/check_python_windows_async_gate.py \
             --receipt python-windows-async-receipt.json \
             --expected-source-commit "$(git rev-parse HEAD)" \
             --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
-            --expected-wheel dist/hyphae_sdk-2.2.0-py3-none-any.whl \
+            --expected-wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl \
             --expected-transcript python-windows-async-transcript.json
       - name: Upload the sanitized failure diagnostic
         if: failure()

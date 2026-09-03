@@ -34,7 +34,7 @@ members = [
 default-members = ["crates/hyphae-cli"]
 
 [workspace.package]
-version = "2.2.0"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Celiums Solutions LLC"]
@@ -60,28 +60,28 @@ futures-util = "0.3.31"
 getrandom = "0.3.4"
 http = "1.4.0"
 interprocess = { version = "2.4.3", features = ["tokio"] }
-hyphae-contracts = { path = "crates/hyphae-contracts", version = "=2.2.0" }
-hyphae-client = { path = "crates/hyphae-client", version = "=2.2.0" }
-hyphae-core = { path = "crates/hyphae-core", version = "=2.2.0" }
-hyphae-engine = { path = "crates/hyphae-engine", version = "=2.2.0" }
-hyphae-native-ann = { path = "crates/hyphae-native-ann", version = "=2.2.0" }
-hyphae-native-blobs = { path = "crates/hyphae-native-blobs", version = "=2.2.0" }
-hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=2.2.0" }
-hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=2.2.0" }
-hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=2.2.0" }
-hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=2.2.0" }
-hyphae-native-daemon = { path = "crates/hyphae-native-daemon", version = "=2.2.0" }
-hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=2.2.0" }
-hyphae-native-product = { path = "crates/hyphae-native-product", version = "=2.2.0" }
-hyphae-native-protocol = { path = "crates/hyphae-native-protocol", version = "=2.2.0" }
-hyphae-native-records = { path = "crates/hyphae-native-records", version = "=2.2.0" }
-hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=2.2.0" }
-hyphae-native-types = { path = "crates/hyphae-native-types", version = "=2.2.0" }
-hyphae-native-wal = { path = "crates/hyphae-native-wal", version = "=2.2.0" }
-hyphae-query = { path = "crates/hyphae-query", version = "=2.2.0" }
-hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=2.2.0" }
-hyphae-server = { path = "crates/hyphae-server", version = "=2.2.0" }
-hyphae-storage = { path = "crates/hyphae-storage", version = "=2.2.0" }
+hyphae-contracts = { path = "crates/hyphae-contracts", version = "=3.0.0" }
+hyphae-client = { path = "crates/hyphae-client", version = "=3.0.0" }
+hyphae-core = { path = "crates/hyphae-core", version = "=3.0.0" }
+hyphae-engine = { path = "crates/hyphae-engine", version = "=3.0.0" }
+hyphae-native-ann = { path = "crates/hyphae-native-ann", version = "=3.0.0" }
+hyphae-native-blobs = { path = "crates/hyphae-native-blobs", version = "=3.0.0" }
+hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=3.0.0" }
+hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=3.0.0" }
+hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=3.0.0" }
+hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=3.0.0" }
+hyphae-native-daemon = { path = "crates/hyphae-native-daemon", version = "=3.0.0" }
+hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=3.0.0" }
+hyphae-native-product = { path = "crates/hyphae-native-product", version = "=3.0.0" }
+hyphae-native-protocol = { path = "crates/hyphae-native-protocol", version = "=3.0.0" }
+hyphae-native-records = { path = "crates/hyphae-native-records", version = "=3.0.0" }
+hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=3.0.0" }
+hyphae-native-types = { path = "crates/hyphae-native-types", version = "=3.0.0" }
+hyphae-native-wal = { path = "crates/hyphae-native-wal", version = "=3.0.0" }
+hyphae-query = { path = "crates/hyphae-query", version = "=3.0.0" }
+hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=3.0.0" }
+hyphae-server = { path = "crates/hyphae-server", version = "=3.0.0" }
+hyphae-storage = { path = "crates/hyphae-storage", version = "=3.0.0" }
 libm = "0.2.16"
 libc = "0.2.186"
 nix = { version = "0.31.3", default-features = false, features = ["sched"] }
