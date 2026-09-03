@@ -427,6 +427,7 @@ EXPECTED_RULES = [
         (
             ".agents/",
             ".claude-plugin/",
+            "benchmarks/",
             "compatibility/",
             "config/",
             "conformance/",

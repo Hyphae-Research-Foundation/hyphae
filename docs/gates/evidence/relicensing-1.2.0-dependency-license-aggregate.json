@@ -250,18 +250,18 @@
         "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
       },
       {
-        "canonical_sha256": "6aa0b55f2c4353a0085828dfde3b65da3ef49800da20389a685710ccfbd98ff9",
+        "canonical_sha256": "9b37352206954eac59dd874983665e3b1b7a7510c49d91fb673a537123a21872",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 298,
         "result": "pass",
-        "sha256": "c76e1683211426efbe71121e1dc56ec90e65f8fd364bd4324777083e8bd03372"
+        "sha256": "659264732138ddb3185454765960dd81c63f58241100d5a450f45c8bcf6b5469"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
         "lock": "sdks/typescript/package-lock.json",
         "package_count": 4,
         "result": "pass",
-        "sha256": "235ae02b43f11d93c4725739551264e8352b4ef23cf3abe30d8fbce58c5507f3"
+        "sha256": "faca6c1a4b9223fc910c117a34bd61cf93fb0587db3825da80cb94b997298979"
       }
     ],
     "python": {
@@ -269,7 +269,7 @@
       "inventory": "sdks/python/build-dependencies.json",
       "inventory_sha256": "7108c1e86b957224038bb94be80f14fe7c0260726ee3e6b1d3cd2ef7e1ddea30",
       "manifest": "sdks/python/pyproject.toml",
-      "manifest_sha256": "055affdbe5492155f033639fdfb3a1a98579c4593da1bb70b2a0eec2557411d1",
+      "manifest_sha256": "a843b8283c64104e261a98208469d5ff704d9ae5cd29c6f17197744abcd4fdcd",
       "package_count": 1,
       "result": "pass",
       "runtime_dependency_count": 0
