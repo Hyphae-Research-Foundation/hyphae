@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Sync the working tree to the DigitalOcean devbox and run a command there.
 # Usage: tools/devbox.sh [command...]   (default: full check suite)
 # The devbox is a c-16 droplet; keep it deleted when idle (doctl compute
