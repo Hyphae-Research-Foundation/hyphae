@@ -140,7 +140,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "2.2.0",
+            "version": "3.0.0",
             "config": "config/crates-io-release.json",
         },
     }
@@ -156,7 +156,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "2.2.0",
+        "version": "3.0.0",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -175,7 +175,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             if "Apache publication authority differs" not in failure
         ]
         self.assertEqual(filtered, [])
-        self.assertEqual(EXPECTED_AUTHORITY["version"], "2.2.0")
+        self.assertEqual(EXPECTED_AUTHORITY["version"], "3.0.0")
         self.assertIn(
             ".github/workflows/registry-publish.yml",
             TRUSTED_MAIN_ONLY_CONTROL_FILES,
@@ -430,7 +430,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 2.2.0" in item for item in failures))
+        self.assertTrue(any("blocked until exact version 3.0.0" in item for item in failures))
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (
