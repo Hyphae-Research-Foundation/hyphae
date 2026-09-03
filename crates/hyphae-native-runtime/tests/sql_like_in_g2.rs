@@ -7,15 +7,21 @@ use hyphae_native_types::DurabilityClass;
 
 type TestError = Box<dyn std::error::Error>;
 
+static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct TemporaryDirectory(std::path::PathBuf);
 
 impl TemporaryDirectory {
     fn create() -> Result<Self, TestError> {
+        // Tests in this binary run in parallel; a clock alone collides on
+        // hosts whose timer resolution is coarser than a test start, so the
+        // name carries a process-wide sequence as well.
+        let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         Ok(Self(std::env::temp_dir().join(format!(
-            "hyphae-sql-like-in-{}-{nanos}",
+            "hyphae-sql-like-in-{}-{sequence}-{nanos}",
             std::process::id()
         ))))
     }
