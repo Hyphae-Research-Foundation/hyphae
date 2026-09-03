@@ -1615,7 +1615,7 @@ fn rewrite_node_batch(
     match read_node(store, page_id)? {
         Node::Leaf(entries) => {
             let merged = merge_leaf_updates(entries, updates);
-            append_leaf_level(store, creating_csn, merged)
+            append_leaf_level_balanced(store, creating_csn, merged)
         }
         Node::Internal { keys, children } => {
             let mut rewritten_children = Vec::with_capacity(children.len());
@@ -2160,6 +2160,62 @@ fn append_leaf_level<S: BTreePageWrite>(
         encoded_length = encoded_length
             .checked_add(entry_length)
             .ok_or(BTreeError::LengthOverflow)?;
+        page_entries.push(entry);
+    }
+    if !page_entries.is_empty() {
+        references.push(append_leaf_reference(store, creating_csn, page_entries)?);
+    }
+    Ok(references)
+}
+
+/// Rewrites one existing leaf's merged entries. A leaf that still fits stays
+/// one page; one that overflows is divided into the minimal number of pages
+/// with the encoded bytes shared evenly among them, so a random single-key
+/// upsert into a full leaf yields two half-full leaves — never a full leaf
+/// plus a one-entry remainder. Fill-to-capacity packing is right for bulk
+/// loading a fresh level (`append_leaf_level`) and wrong here: under random
+/// inserts it degenerates into one leaf per key, which multiplies the pages
+/// every complete-state load and open must read and verify.
+fn append_leaf_level_balanced<S: BTreePageWrite>(
+    store: &mut S,
+    creating_csn: Csn,
+    entries: Vec<LeafEntry>,
+) -> Result<Vec<ChildReference>, BTreeError> {
+    if entries.is_empty() {
+        return Err(BTreeError::InvalidCount);
+    }
+    let lengths = entries
+        .iter()
+        .map(leaf_entry_encoded_length)
+        .collect::<Result<Vec<_>, _>>()?;
+    let body = lengths
+        .iter()
+        .try_fold(0_usize, |total, length| total.checked_add(*length))
+        .ok_or(BTreeError::LengthOverflow)?;
+    let capacity = PAGE_PAYLOAD_SIZE
+        .checked_sub(LEAF_HEADER_SIZE)
+        .ok_or(BTreeError::LengthOverflow)?;
+    if body <= capacity {
+        return Ok(vec![append_leaf_reference(store, creating_csn, entries)?]);
+    }
+    let leaves = body.div_ceil(capacity).max(2);
+    let target = body.div_ceil(leaves);
+    let mut references = Vec::with_capacity(leaves);
+    let mut page_entries = Vec::new();
+    let mut used = 0_usize;
+    for (entry, length) in entries.into_iter().zip(lengths) {
+        let next = used.checked_add(length).ok_or(BTreeError::LengthOverflow)?;
+        let last_leaf = references.len() + 1 >= leaves;
+        let flush = !page_entries.is_empty() && (next > capacity || (!last_leaf && next > target));
+        if flush {
+            references.push(append_leaf_reference(
+                store,
+                creating_csn,
+                std::mem::take(&mut page_entries),
+            )?);
+            used = 0;
+        }
+        used = used.checked_add(length).ok_or(BTreeError::LengthOverflow)?;
         page_entries.push(entry);
     }
     if !page_entries.is_empty() {
@@ -3323,8 +3379,8 @@ mod tests {
     use hyphae_native_types::{Csn, PageId};
 
     use super::{
-        BTree, BTreeError, LeafEntry, Node, PREFIX_REPLACEMENT_APPENDED_PAGES,
-        PrefixReplacementBatch, PrefixReplacementStructuralLimits, encode_leaf,
+        BTree, BTreeError, LEAF_HEADER_SIZE, LeafEntry, Node, PREFIX_REPLACEMENT_APPENDED_PAGES,
+        PrefixReplacementBatch, PrefixReplacementStructuralLimits, encode_leaf, read_node,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -3355,6 +3411,59 @@ mod tests {
         fn drop(&mut self) {
             let _ignored = fs::remove_dir_all(self.path());
         }
+    }
+
+    fn leaf_pages(store: &PageStore, page: PageId) -> Result<usize, BTreeError> {
+        match read_node(store, page)? {
+            Node::Leaf(_) => Ok(1),
+            Node::Internal { children, .. } => {
+                children.into_iter().try_fold(0_usize, |total, child| {
+                    Ok(total + leaf_pages(store, child)?)
+                })
+            }
+        }
+    }
+
+    /// Random single-key batch upserts must split overflowing leaves evenly:
+    /// the fill-to-capacity packing that suits a fresh level would otherwise
+    /// leave a one-entry leaf behind every split and grow the tree to about
+    /// one leaf per key.
+    #[test]
+    fn batch_upserts_keep_leaves_at_least_half_full() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut tree = BTree::empty();
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut keys = std::collections::BTreeSet::new();
+        for step in 0..4_000_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let key = state.to_be_bytes().to_vec();
+            keys.insert(key.clone());
+            tree = tree
+                .upsert_sorted_batch(
+                    &mut store,
+                    Csn::new(step + 1)?,
+                    vec![(key, vec![u8::try_from(step % 251)?; 24])],
+                )?
+                .tree;
+        }
+        let root = tree.root().ok_or("empty tree")?;
+        let entries = tree.scan(&store)?;
+        assert_eq!(entries.len(), keys.len());
+        assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let leaves = leaf_pages(&store, root)?;
+        let per_entry = 8 + 8 + 24;
+        let capacity = (PAGE_PAYLOAD_SIZE - LEAF_HEADER_SIZE) / per_entry;
+        let minimal = keys.len().div_ceil(capacity);
+        assert!(
+            leaves <= 2 * minimal + 1,
+            "{leaves} leaves for {} entries; {minimal} would be full, so the average leaf is under half full",
+            keys.len()
+        );
+        assert_eq!(tree.validate(&store)?, keys.len());
+        Ok(())
     }
 
     #[test]
