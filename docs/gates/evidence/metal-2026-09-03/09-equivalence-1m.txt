@@ -1,0 +1,18 @@
+stage=open ms=34631.7
+stage=manifest round=0 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=131 materialize_us=38772 contains_us=6 probe_present=true
+stage=manifest round=1 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=499 materialize_us=14271 contains_us=3 probe_present=true
+stage=manifest round=2 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=485 materialize_us=6285 contains_us=3 probe_present=true
+stage=durable_scorer round=0 hits=1000 ms=57.5 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=model_scorer round=0 hits=1000 ms=12596531.2
+stage=scorer_equivalence hits=1000 bit_identical=true
+stage=integrated round=0 hits=10 ms=119.8
+stage=integrated round=1 hits=10 ms=54.1
+stage=integrated round=2 hits=10 ms=53.8
+stage=integrated_sparse round=0 hits=2 ms=0.4
+stage=integrated_sparse round=1 hits=2 ms=0.2
+stage=integrated_sparse round=2 hits=2 ms=0.2
+stage=integrated_equal_filter round=0 hits=10 ms=67.4
+stage=integrated_equal_filter round=1 hits=10 ms=62.4
+stage=integrated_equal_filter round=2 hits=10 ms=60.0
+stage=integrated_range_facet round=0 hits=10 eligible=500000 ms=81.3
+stage=integrated_fuzzy round=0 hits=10 ms=93.8

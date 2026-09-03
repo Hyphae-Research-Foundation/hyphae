@@ -1,0 +1,30 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 79 and seed 5794191082641265225 with 96 workers on 96 cores with 58254MB heap and 64MB offheap memory [pid: 17905] (Linux 7.0.0-1011-aws amd64, Ubuntu 21.0.12 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/hyphae/docs/formal/HyphaeCommit.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module HyphaeCommit
+Starting... (2026-09-03 04:12:21)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-03 04:12:21.
+Progress(10) at 2026-09-03 04:12:24: 2,000,328 states generated (2,000,328 s/min), 1,024,769 distinct states found (1,024,769 ds/min), 521,309 states left on queue.
+Progress(22) at 2026-09-03 04:13:24: 56,147,984 states generated (54,147,656 s/min), 29,762,518 distinct states found (28,737,749 ds/min), 4,209,458 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 8.4E-5
+  based on the actual fingerprints:  val = 8.9E-5
+79063806 states generated, 43885299 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 30.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 31 and the 95th percentile is 3).
+Finished in 01min 45s at (2026-09-03 04:14:05)
+
+real	1m46.457s
+user	26m36.427s
+sys	0m49.421s

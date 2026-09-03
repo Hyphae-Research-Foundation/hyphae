@@ -49,6 +49,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Phase-1 optimization raw receipts](gates/evidence/phase1/README.md)
 - [Collection document cap — 250k rung (2026-09-02)](gates/evidence/collection-cap-250k-2026-09-02.md)
 - [Chunked collection manifest — 250k re-measurement and the 1M ladder (2026-09-03)](gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md)
+- [Hyphae 3.0 re-measurement on dedicated hardware — 2ff8a4b (2026-09-03)](gates/evidence/baseline-i7i-metal-2026-09-03.md)
 
 ## Build and embed
 

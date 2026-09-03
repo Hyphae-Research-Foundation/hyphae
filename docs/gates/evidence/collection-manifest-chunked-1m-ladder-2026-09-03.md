@@ -65,6 +65,7 @@ chunks, and committed in 0.8 s.
 |------|--------|-------------|----------------------|--------------|-----------------------------|
 | 250k, legacy manifest (previous receipt) | 949 | 263 s | — | 48.1 s | 2.1 GB |
 | 250k, chunked manifest | 1,099 | 227 s | — | 50.6 s | 232 MB |
+| 250k, plus the B+tree split fix `b53348e` | 1,346 | 186 s | — | 41.7 s | 232 MB |
 | 1M, chunked manifest | 1,014 | 986 s | 9 rounds every 400 batches, 868 s | 185 s | 995 MB |
 
 `ingest wall` excludes windowed maintenance. The 1M load ran with
@@ -85,6 +86,7 @@ bulk of what vacuum could not reclaim before the format change.
 |------|--------------------------|
 | 250k, legacy manifest (previous receipt) | 35.6 s |
 | 250k, chunked manifest | 24.8 s |
+| 250k, plus the B+tree split fix `b53348e` | 22.5 s |
 | 1M, chunked manifest | 106.6 s |
 
 Open still scales with retained pages plus one complete-state decode; 1M
@@ -97,6 +99,7 @@ is 4.3× the 250k time for 4× the documents.
 | 250k, legacy manifest (previous receipt) | 39 ms | 46 ms | 42 ms | 61 ms |
 | 250k, chunked manifest, before lazy eligibility | 39.3 ms | 44.0 ms | 44.2 ms | 62.6 ms |
 | 250k, chunked manifest + lazy eligibility | 24.2 ms | 38.8 ms | 28.8 ms | 46.2 ms |
+| 250k, plus the B+tree split fix `b53348e` | 22.3 ms | 29.3 ms | 23.5 ms | 39.5 ms |
 | 1M, chunked manifest + lazy eligibility | 171.9 ms | 233.4 ms | 174.5 ms | 308.2 ms |
 | ratio 250k → 1M (4× documents) | 7.1× | 6.0× | 6.1× | 6.7× |
 
@@ -125,6 +128,19 @@ terms; the candidate causes are buffer-pool residency of the 1,562 posting
 segments and the parallel scorer path that never activates in the product
 surface (`workers=1`, handoff open item 3). Both are the next diagnostic
 targets, not this receipt's claim.
+
+### After the B+tree split fix (`b53348e`)
+
+The bare-metal receipt of the same day traced a materialized-path regression
+to `93dc3d3`: `upsert_sorted_batch` split an overflowing rewritten leaf
+full-plus-remainder, so every scalar `SET` — manifest chunks and doc-value
+postings included — degenerated the tree toward one leaf per key. With the
+even split, a fresh 250k load on this host ingests at 1,346 docs/s (from
+1,099), vacuums in 41.7 s (from 50.6), reopens in 22.5 s (from 24.8), and
+the durable scorer stage drops from 22–24 ms to 13.6 ms for the same 393
+segments and 93,702 entries because the posting leaves are dense again;
+the reopened ladder is in the table above. The 1M rows predate the fix and
+are pessimistic.
 
 ## Scorer equivalence
 

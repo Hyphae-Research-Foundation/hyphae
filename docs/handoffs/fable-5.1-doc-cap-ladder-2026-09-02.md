@@ -292,7 +292,22 @@ clippy `-D warnings`, 1,772 tests):
 | `51d8fb0` | **Lazy eligibility**: `Eligibility::Universe(&ManifestView)` probes the owning chunk instead of cloning the manifest; `All` seeds from its first narrowing child; vector branches materialize once | 250k reopened: bm25 39 → 24 ms, phrase 44 → 29, filtered+facet 44 → 39, fuzzy 63 → 46; sparse query 16 → 0.4 ms |
 | (this commit) | 1M ladder receipt, `HYPHAE_SCALE_MAINTENANCE_EVERY`, `HYPHAE_DIAG_MODEL_ROUNDS`, roadmap/claims/handoff updates | 1M: 1,014 docs/s, reopen 107 s, bm25 172 ms, filtered+facet 233, phrase 175, fuzzy 308; manifest 1,952 chunks / 39 KB header / 17 µs probe |
 
-Evidence: [`docs/gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md`](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md).
+| `6de0d7d` | `run-metal.sh` never formats a partitioned or pre-mounted disk (found orchestrating the bare-metal run) | — |
+| `b53348e` | **B+tree fix**: `upsert_sorted_batch` split an overflowing rewritten leaf full-plus-remainder, degenerating to one leaf per key under random single-key upserts (every scalar SET since `93dc3d3`); now splits evenly; occupancy test (904 → ≤ 21 leaves for 4,000 keys) | devbox ablation, materialized single SET: 86.6 / 81.7 ms → 13.9 / 10.5 ms (Strict / Memory), back to the `8aeb6ea` level |
+
+Evidence: [`collection-manifest-chunked-1m-ladder-2026-09-03.md`](../gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md) (c-16) and
+[`baseline-i7i-metal-2026-09-03.md`](../gates/evidence/baseline-i7i-metal-2026-09-03.md) — the **class-3 bare-metal re-measurement of `2ff8a4b`** on an
+`i7i.metal-24xl` (04:15–08:27 UTC, self-terminating runbook, raw outputs mirrored to
+`s3://hyphae-metal-receipts-598621/2ff8a4b-20260903T0415Z/`): TLC reproduced with spec
+digest; lexical query 4.09 ms → 255 µs and ingest 16.6 → 2.19 s per 1,000 docs vs
+2026-08-30; delta sweeps flat across version depth (194–197 µs); ladder 250k bm25 6.2 ms /
+reopen 7.7 s, 1M bm25 51.6 ms / reopen 34.5 s / ingest 3,755 docs/s; **1M scorer equivalence
+`bit_identical=true`** (model 3.5 h vs durable 57 ms); scorer `perf`: 44 % of the 1M scorer is
+page verification (BLAKE3 + CRC32C) — the 1,024-frame buffer pool does not keep the 1,562
+posting segments resident. The receipt also publishes the materialized-path regression
+(durability ablation 4.98 → 35.5 ms) that the bisect traced to `93dc3d3` and `b53348e` fixes;
+the metal numbers above were taken **before** the fix, so reopen and materialized-path rows
+are pessimistic and the ladder should be re-measured at `b53348e` or later.
 
 **The bound stays at 250,000.** R5 gates the 1M rung on the manifest (now
 met) *and* on ANN consolidation cost and RSS at 1M×768-dim, which cannot be
@@ -319,10 +334,19 @@ user's explicit approval; the auto-mode classifier blocks it.
    manifest-adjacent item: sequential inserts fill chunks to 50–100 % via
    midpoint splits (1,952 chunks at 1M instead of ~977); an append-aware
    split would halve the header, at the cost of a different invariant proof.
-1b. **Durable scorer superlinearity at 1M** (new): 22 ms → 160 ms for 4×
-   the postings. Suspects: buffer-pool residency of the posting segments,
-   and item 3 (the parallel scorer never activates). Profile with `perf`
-   (`--call-graph dwarf`) on `/root/ladder-1000000` before touching code.
+1b. **Durable scorer superlinearity at 1M** — profiled on bare metal:
+   44 % of scorer time is page verification (`_blake3_hash_many_avx512`
+   17 %, `_blake3_compress_in_place_avx512` 11 %, CRC32C 16 %) plus kernel
+   file reads: the shipped 1,024-frame verified buffer pool (16 MiB) cannot
+   hold the 1,562 posting segments of a two-term query at 1M, so every query
+   re-reads and re-verifies them. Next slice: frame budget from the memory
+   governor / a verified-once page cache per generation; then item 3.
+   Also cheap: `drop_in_place<NativeRuntimeError>` at 2.8 % is the fail-open
+   probe constructing errors on the hot path.
+1c. **Re-measure at `b53348e`**: the B+tree split fix changes the physical
+   layout of every scalar-SET tree (manifest chunks, doc-value postings,
+   keyspace); reopen, open-time and materialized-path numbers in both
+   2026-09-03 receipts predate it and are pessimistic.
 2. **Vector-carrying batches** still take the materialized ingest
    transaction (`ingest_search_batch_materialized`) because the ANN store has
    no delta stage. The ladder corpus has no vectors; that cost is unmeasured.

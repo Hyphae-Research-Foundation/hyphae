@@ -1,0 +1,142 @@
+{
+  "benchmark": "hyphae-baseline-harness-v1",
+  "environment": {
+    "arch": "x86_64",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8559C",
+    "hypervisor_flag": false,
+    "kernel": "7.0.0-1011-aws",
+    "logical_cpus": 96,
+    "os": "linux",
+    "scaling_governor": "performance"
+  },
+  "results": {
+    "keyspace": {
+      "hyphae": {
+        "engine": "hyphae-native-embedded",
+        "get": {
+          "label": "get_latest",
+          "latency_nanos": {
+            "max": 235122,
+            "mean": 9986,
+            "p50": 11139,
+            "p95": 12813,
+            "p99": 14089,
+            "p999": 17639
+          },
+          "operations": 500000,
+          "ops_per_second": 99324.8866595524,
+          "wall_nanos": 5033985105
+        },
+        "get_hits": 500000,
+        "set_memory": {
+          "label": "set_memory_no_fsync_ack",
+          "latency_nanos": {
+            "max": 1278442,
+            "mean": 355913,
+            "p50": 357241,
+            "p95": 368629,
+            "p99": 376025,
+            "p999": 397782
+          },
+          "operations": 200000,
+          "ops_per_second": 2809.437866261554,
+          "wall_nanos": 71188618336
+        },
+        "set_strict": {
+          "label": "set_strict_fsync_per_commit",
+          "latency_nanos": {
+            "max": 2693690,
+            "mean": 1801766,
+            "p50": 1821838,
+            "p95": 2354623,
+            "p99": 2502678,
+            "p999": 2601135
+          },
+          "operations": 10000,
+          "ops_per_second": 554.9728659880396,
+          "wall_nanos": 18018898964
+        },
+        "transport": "none (in-process library call)"
+      },
+      "redis_everysec": {
+        "connection_alive": true,
+        "engine": "redis-uds-appendfsync-everysec",
+        "get": {
+          "label": "get_uds",
+          "latency_nanos": {
+            "max": 1918857,
+            "mean": 7848,
+            "p50": 7893,
+            "p95": 8370,
+            "p99": 8757,
+            "p999": 10745
+          },
+          "operations": 500000,
+          "ops_per_second": 126202.03519954372,
+          "wall_nanos": 3961901242
+        },
+        "get_hits": 500000,
+        "set": {
+          "label": "set_uds",
+          "latency_nanos": {
+            "max": 26098,
+            "mean": 8735,
+            "p50": 8686,
+            "p95": 9588,
+            "p99": 10417,
+            "p999": 13925
+          },
+          "operations": 10000,
+          "ops_per_second": 110247.45703215609,
+          "wall_nanos": 90705040
+        },
+        "transport": "unix domain socket",
+        "version": "7.0.15"
+      },
+      "redis_strict": {
+        "connection_alive": true,
+        "engine": "redis-uds-appendfsync-always",
+        "get": {
+          "label": "get_uds",
+          "latency_nanos": {
+            "max": 330787,
+            "mean": 8053,
+            "p50": 8005,
+            "p95": 9193,
+            "p99": 9947,
+            "p999": 13715
+          },
+          "operations": 500000,
+          "ops_per_second": 123015.0318449431,
+          "wall_nanos": 4064543922
+        },
+        "get_hits": 500000,
+        "set": {
+          "label": "set_uds",
+          "latency_nanos": {
+            "max": 1292756,
+            "mean": 458537,
+            "p50": 508902,
+            "p95": 812678,
+            "p99": 944898,
+            "p999": 1072975
+          },
+          "operations": 10000,
+          "ops_per_second": 2169.589356576414,
+          "wall_nanos": 4609167154
+        },
+        "transport": "unix domain socket",
+        "version": "7.0.15"
+      },
+      "workload": {
+        "gets": 500000,
+        "keys": 1000000,
+        "relaxed_sets": 200000,
+        "seed": 6840158756763402241,
+        "strict_sets": 10000
+      }
+    }
+  },
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "source_commit": "2ff8a4b995f4b08c3be1c6ff6b05d8e0b1099456"
+}

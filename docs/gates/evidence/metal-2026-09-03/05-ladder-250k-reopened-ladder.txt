@@ -1,0 +1,5 @@
+documents=250000 ingest=reused
+scenario=bm25 hits=10 p50_ms=6.2 p95_ms=11.6
+scenario=filtered+facet hits=10 p50_ms=10.7 p95_ms=12.2
+scenario=phrase hits=10 p50_ms=7.2 p95_ms=7.7
+scenario=fuzzy1 hits=10 p50_ms=12.0 p95_ms=21.6

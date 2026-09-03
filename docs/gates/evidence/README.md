@@ -44,6 +44,13 @@ own commit as the evaluated source.
   touched chunks), lazy eligibility, and the first complete lexical ladder
   at 1,000,000 documents; the bound stays 250,000 pending the R5 vector
   conditions
+- [Hyphae 3.0 re-measurement on dedicated hardware — `2ff8a4b`](baseline-i7i-metal-2026-09-03.md)
+  class-3 `i7i.metal-24xl` receipt on a committed SHA: TLC reproduced with
+  spec digest, SQL/keyspace/lexical baselines (lexical query 16× and ingest
+  7.6× faster than 2026-08-30), delta sweeps flat across version depth,
+  the 250k/1M ladder, the 1M scorer-equivalence oracle (`bit_identical`),
+  the scorer `perf` profile (44 % page verification), and the bisected
+  materialized-path regression from `93dc3d3` with its root cause
 - [Native G8 exact-SHA release closure](closures/native-g8-e88f2ea.json)
 
 ### Source-bound observations
