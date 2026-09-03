@@ -153,6 +153,11 @@ The standalone group-commit smoke (`group_commit_benchmark`, 256 commits,
 
 ### 5a. Same-host A/B of the durability ablation: engine `8aeb6ea` vs `2ff8a4b`
 
+Raw receipts: [`metal-2026-09-03/devbox-ablation-ab/`](metal-2026-09-03/devbox-ablation-ab/)
+(full-scale runs for `8aeb6ea`, `2ff8a4b`, `b53348e`; 4,000-commit bisect
+runs for `8aeb6ea`, `17a841d`, `eec0784`, `93dc3d3`, `2ff8a4b`; the
+`8aeb6ea` bisect file is the 500-commit calibration).
+
 On the DigitalOcean `c-16` devbox (virtualized, environment class 2, relative
 same-host A/B only), the same harness source built against the two engines,
 `ablation --scale full`, one run each while a 1M scorer-equivalence job ran
