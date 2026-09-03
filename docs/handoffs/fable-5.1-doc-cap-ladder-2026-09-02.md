@@ -309,6 +309,14 @@ posting segments resident. The receipt also publishes the materialized-path regr
 the metal numbers above were taken **before** the fix, so reopen and materialized-path rows
 are pessimistic and the ladder should be re-measured at `b53348e` or later.
 
+**Second bare-metal run at `a443c52`** (3.0.0 tree: B+tree fix + 8,192-frame pool),
+[`hyphae-3.0-metal-a443c52-2026-09-03.md`](../gates/evidence/hyphae-3.0-metal-a443c52-2026-09-03.md):
+materialized single-SET commit 4.39 / 3.86 ms (regression closed, under 2.2.0); SQL point
+read 20 µs; keyspace GET 2.2 µs; BM25 top-10 111 µs / ingest 1.12 s; 1M ladder linear
+(bm25 23 ms, 3.7× the 250k stage); same-directory pool comparison 1,024 → 8,192 frames:
+scorer 51 → 22 ms; page verification gone from the scorer profile. Reopen unchanged on
+metal (34.6 s at 1M): open time is the next open-path item, not a layout effect.
+
 **The bound stays at 250,000.** R5 gates the 1M rung on the manifest (now
 met) *and* on ANN consolidation cost and RSS at 1M×768-dim, which cannot be
 measured until vector-carrying batches leave the materialized path (item 2

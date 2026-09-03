@@ -50,6 +50,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Collection document cap — 250k rung (2026-09-02)](gates/evidence/collection-cap-250k-2026-09-02.md)
 - [Chunked collection manifest — 250k re-measurement and the 1M ladder (2026-09-03)](gates/evidence/collection-manifest-chunked-1m-ladder-2026-09-03.md)
 - [Hyphae 3.0 re-measurement on dedicated hardware — 2ff8a4b (2026-09-03)](gates/evidence/baseline-i7i-metal-2026-09-03.md)
+- [Hyphae 3.0.0 on dedicated hardware after the B+tree fix and pool bound — a443c52 (2026-09-03)](gates/evidence/hyphae-3.0-metal-a443c52-2026-09-03.md)
 
 ## Build and embed
 

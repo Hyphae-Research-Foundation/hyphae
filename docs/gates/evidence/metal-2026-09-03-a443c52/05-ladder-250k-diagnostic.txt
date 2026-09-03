@@ -1,0 +1,28 @@
+stage=open ms=7705.9
+stage=manifest round=0 format=HYPSMAN2 total=250000 chunks=487 header_bytes=9756 largest_chunk_bytes=14636 header_us=58 materialize_us=3820 contains_us=3 probe_present=true
+stage=manifest round=1 format=HYPSMAN2 total=250000 chunks=487 header_bytes=9756 largest_chunk_bytes=14636 header_us=154 materialize_us=1380 contains_us=3 probe_present=true
+stage=manifest round=2 format=HYPSMAN2 total=250000 chunks=487 header_bytes=9756 largest_chunk_bytes=14636 header_us=137 materialize_us=1323 contains_us=2 probe_present=true
+stage=durable_scorer round=0 hits=1000 ms=9.5 terms=2 segments=393 physical_entries=93702 workers=1 batches=0
+stage=durable_scorer round=1 hits=1000 ms=5.3 terms=2 segments=393 physical_entries=93702 workers=1 batches=0
+stage=durable_scorer round=2 hits=1000 ms=5.2 terms=2 segments=393 physical_entries=93702 workers=1 batches=0
+stage=durable_scorer round=3 hits=1000 ms=5.2 terms=2 segments=393 physical_entries=93702 workers=1 batches=0
+stage=durable_scorer round=4 hits=1000 ms=5.2 terms=2 segments=393 physical_entries=93702 workers=1 batches=0
+stage=integrated round=0 hits=10 ms=6.2
+stage=integrated round=1 hits=10 ms=6.1
+stage=integrated round=2 hits=10 ms=6.1
+stage=integrated_sparse round=0 hits=2 ms=0.2
+stage=integrated_sparse round=1 hits=2 ms=0.1
+stage=integrated_sparse round=2 hits=2 ms=0.1
+stage=integrated_equal_filter round=0 hits=10 ms=7.5
+stage=integrated_equal_filter round=1 hits=10 ms=7.1
+stage=integrated_equal_filter round=2 hits=10 ms=6.9
+stage=integrated_range_facet round=0 hits=10 eligible=125000 ms=11.5
+stage=integrated_range_facet round=1 hits=10 eligible=125000 ms=10.6
+stage=integrated_range_facet round=2 hits=10 eligible=125000 ms=10.5
+stage=integrated_range_facet round=3 hits=10 eligible=125000 ms=10.5
+stage=integrated_range_facet round=4 hits=10 eligible=125000 ms=10.4
+stage=integrated_fuzzy round=0 hits=10 ms=19.3
+stage=integrated_fuzzy round=1 hits=10 ms=12.1
+stage=integrated_fuzzy round=2 hits=10 ms=12.1
+stage=integrated_fuzzy round=3 hits=10 ms=11.9
+stage=integrated_fuzzy round=4 hits=10 ms=11.8

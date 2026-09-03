@@ -105,6 +105,16 @@ bound moved only on the aggregate receipt.
   scorer in page verification, naming buffer-pool residency as the next
   slice. The same receipt publishes the materialized-path regression it
   found and its bisect.
+- Dedicated hardware after the B+tree fix and the 8,192-frame pool
+  (`i7i.metal-24xl`, commit `a443c52`,
+  `hyphae-3.0-metal-a443c52-2026-09-03.md`): materialized single-`SET`
+  commit 4.39 ms Strict / 3.86 ms Memory (2.2.0: 4.98 / 3.62; the
+  regression at `2ff8a4b`: 35.5 / 34.2); SQL prepared point read 20 µs;
+  embedded keyspace GET 2.2 µs p50 against Redis's 7.9 µs over UDS; BM25
+  top-10 111 µs against Tantivy's 78 µs, durable 1,000-doc ingest 1.12 s;
+  1M ladder linear in documents (bm25 23 ms, filtered+facet 43 ms, phrase
+  24 ms, fuzzy 54 ms — 3.3–4.5× the 250k stage for 4× the documents);
+  1,024 vs 8,192 pool frames on the same 1M directory: scorer 51 → 22 ms.
 - Virtualized c-16 ladder (`collection-cap-250k-2026-09-02.md`,
   `collection-manifest-chunked-1m-ladder-2026-09-03.md`): 100k → 250k with
   ingest 48 → 1,346 docs/s, bm25 73 → 22 ms, reopen ~17 min → 22.5 s;

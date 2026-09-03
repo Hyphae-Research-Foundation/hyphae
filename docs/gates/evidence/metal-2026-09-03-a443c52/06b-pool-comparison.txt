@@ -1,0 +1,50 @@
+== HYPHAE_BUFFER_POOL_FRAMES=1024
+stage=open ms=34755.7
+stage=manifest round=0 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=145 materialize_us=39906 contains_us=6 probe_present=true
+stage=manifest round=1 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=525 materialize_us=9709 contains_us=3 probe_present=true
+stage=manifest round=2 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=498 materialize_us=6372 contains_us=3 probe_present=true
+stage=durable_scorer round=0 hits=1000 ms=56.0 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=1 hits=1000 ms=51.1 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=2 hits=1000 ms=50.8 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=3 hits=1000 ms=50.8 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=4 hits=1000 ms=51.2 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=integrated round=0 hits=10 ms=52.2
+stage=integrated round=1 hits=10 ms=52.0
+stage=integrated round=2 hits=10 ms=51.9
+stage=integrated_sparse round=0 hits=2 ms=0.4
+stage=integrated_sparse round=1 hits=2 ms=0.2
+stage=integrated_sparse round=2 hits=2 ms=0.2
+stage=integrated_equal_filter round=0 hits=10 ms=60.5
+stage=integrated_equal_filter round=1 hits=10 ms=61.1
+stage=integrated_equal_filter round=2 hits=10 ms=58.4
+stage=integrated_range_facet round=0 hits=10 eligible=500000 ms=80.3
+stage=integrated_range_facet round=1 hits=10 eligible=500000 ms=78.4
+stage=integrated_range_facet round=2 hits=10 eligible=500000 ms=74.6
+stage=integrated_fuzzy round=0 hits=10 ms=91.9
+stage=integrated_fuzzy round=1 hits=10 ms=90.6
+stage=integrated_fuzzy round=2 hits=10 ms=88.1
+== HYPHAE_BUFFER_POOL_FRAMES=8192
+stage=open ms=34715.5
+stage=manifest round=0 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=140 materialize_us=39465 contains_us=6 probe_present=true
+stage=manifest round=1 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=531 materialize_us=9587 contains_us=3 probe_present=true
+stage=manifest round=2 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=499 materialize_us=6296 contains_us=3 probe_present=true
+stage=durable_scorer round=0 hits=1000 ms=40.0 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=1 hits=1000 ms=22.4 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=2 hits=1000 ms=22.4 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=3 hits=1000 ms=22.4 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=4 hits=1000 ms=22.4 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=integrated round=0 hits=10 ms=23.6
+stage=integrated round=1 hits=10 ms=23.6
+stage=integrated round=2 hits=10 ms=23.4
+stage=integrated_sparse round=0 hits=2 ms=0.3
+stage=integrated_sparse round=1 hits=2 ms=0.2
+stage=integrated_sparse round=2 hits=2 ms=0.2
+stage=integrated_equal_filter round=0 hits=10 ms=31.7
+stage=integrated_equal_filter round=1 hits=10 ms=32.2
+stage=integrated_equal_filter round=2 hits=10 ms=29.6
+stage=integrated_range_facet round=0 hits=10 eligible=500000 ms=50.9
+stage=integrated_range_facet round=1 hits=10 eligible=500000 ms=49.7
+stage=integrated_range_facet round=2 hits=10 eligible=500000 ms=45.6
+stage=integrated_fuzzy round=0 hits=10 ms=85.2
+stage=integrated_fuzzy round=1 hits=10 ms=56.4
+stage=integrated_fuzzy round=2 hits=10 ms=56.1

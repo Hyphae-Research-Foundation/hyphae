@@ -1,0 +1,28 @@
+stage=open ms=34622.8
+stage=manifest round=0 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=142 materialize_us=38771 contains_us=6 probe_present=true
+stage=manifest round=1 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=489 materialize_us=9451 contains_us=3 probe_present=true
+stage=manifest round=2 format=HYPSMAN2 total=1000000 chunks=1952 header_bytes=39056 largest_chunk_bytes=13356 header_us=480 materialize_us=6139 contains_us=3 probe_present=true
+stage=durable_scorer round=0 hits=1000 ms=39.2 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=1 hits=1000 ms=22.3 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=2 hits=1000 ms=22.2 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=3 hits=1000 ms=22.2 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=durable_scorer round=4 hits=1000 ms=22.2 terms=2 segments=1562 physical_entries=372418 workers=1 batches=0
+stage=integrated round=0 hits=10 ms=23.5
+stage=integrated round=1 hits=10 ms=23.3
+stage=integrated round=2 hits=10 ms=23.1
+stage=integrated_sparse round=0 hits=2 ms=0.3
+stage=integrated_sparse round=1 hits=2 ms=0.2
+stage=integrated_sparse round=2 hits=2 ms=0.2
+stage=integrated_equal_filter round=0 hits=10 ms=31.3
+stage=integrated_equal_filter round=1 hits=10 ms=31.8
+stage=integrated_equal_filter round=2 hits=10 ms=29.3
+stage=integrated_range_facet round=0 hits=10 eligible=500000 ms=50.4
+stage=integrated_range_facet round=1 hits=10 eligible=500000 ms=49.1
+stage=integrated_range_facet round=2 hits=10 eligible=500000 ms=45.3
+stage=integrated_range_facet round=3 hits=10 eligible=500000 ms=43.0
+stage=integrated_range_facet round=4 hits=10 eligible=500000 ms=42.6
+stage=integrated_fuzzy round=0 hits=10 ms=85.2
+stage=integrated_fuzzy round=1 hits=10 ms=56.2
+stage=integrated_fuzzy round=2 hits=10 ms=55.9
+stage=integrated_fuzzy round=3 hits=10 ms=54.0
+stage=integrated_fuzzy round=4 hits=10 ms=53.6

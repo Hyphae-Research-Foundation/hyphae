@@ -44,6 +44,11 @@ own commit as the evaluated source.
   touched chunks), lazy eligibility, and the first complete lexical ladder
   at 1,000,000 documents; the bound stays 250,000 pending the R5 vector
   conditions
+- [Hyphae 3.0.0 on dedicated hardware after the B+tree split fix and the buffer-pool bound — `a443c52`](hyphae-3.0-metal-a443c52-2026-09-03.md)
+  same host class eight hours later: materialized single-SET commit back to
+  4.39 ms (from 35.5), 1M ladder linear (bm25 23 ms, 3.7× the 250k stage),
+  BM25 top-10 111 µs against Tantivy's 78 µs, embedded GET 2.2 µs, and the
+  1,024 vs 8,192-frame pool comparison on one directory
 - [Hyphae 3.0 re-measurement on dedicated hardware — `2ff8a4b`](baseline-i7i-metal-2026-09-03.md)
   class-3 `i7i.metal-24xl` receipt on a committed SHA: TLC reproduced with
   spec digest, SQL/keyspace/lexical baselines (lexical query 16× and ingest
