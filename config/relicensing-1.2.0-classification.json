@@ -92,6 +92,7 @@
         "match": {
           "kind": "exact",
           "paths": [
+            ".github/assets/oin-member-2-0-horiz.png",
             "DCO",
             "THIRD_PARTY_LICENSES.txt"
           ]
@@ -360,6 +361,7 @@
     "third_party": {
       "notice": "THIRD_PARTY_NOTICES.md",
       "exact_paths": [
+        ".github/assets/oin-member-2-0-horiz.png",
         "DCO",
         "THIRD_PARTY_LICENSES.txt"
       ],

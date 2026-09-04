@@ -257,6 +257,7 @@ REPRESENTATIVE_CLASSIFICATIONS = {
     ".github/workflows/ci.yml": "software",
     "AGENTS.md": "narrative-documentation",
     "Cargo.toml": "software",
+    ".github/assets/oin-member-2-0-horiz.png": "third-party-material",
     "DCO": "third-party-material",
     "THIRD_PARTY_LICENSES.txt": "third-party-material",
     "LICENSE": "software",
@@ -321,7 +322,7 @@ EXPECTED_RULES = [
         11,
         "third-party-material",
         "exact",
-        ("DCO", "THIRD_PARTY_LICENSES.txt"),
+        (".github/assets/oin-member-2-0-horiz.png", "DCO", "THIRD_PARTY_LICENSES.txt"),
     ),
     (
         "documentation-license-texts",
@@ -943,7 +944,7 @@ def validate_contract(
             _validate_exact_paths(
                 third_party["exact_paths"],
                 "contract.boundaries.third_party.exact_paths",
-                ["DCO", "THIRD_PARTY_LICENSES.txt"],
+                [".github/assets/oin-member-2-0-horiz.png", "DCO", "THIRD_PARTY_LICENSES.txt"],
                 "third-party-material",
                 rules,
                 failures,

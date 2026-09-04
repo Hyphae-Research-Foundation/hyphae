@@ -20,15 +20,22 @@
   <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
 </p>
 
+<p align="center">
+  <a href="https://openinventionnetwork.com/community-alliance/" aria-label="Open Invention Network community member">
+    <img alt="Open Invention Network community member" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/oin-member-2-0-horiz.png" width="240">
+  </a>
+</p>
+
 Hyphae is a local-first data engine written in Rust. One process owns one data
 directory and exposes relational SQL, native structures, lexical search, and
 vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`2.2.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v2.2.0-crates)
+**Stable Native release:** [`3.0.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v3.0.0-crates)
 is the latest release of the active Native architecture and the complete
-24-crate graph is [published on crates.io](https://crates.io/crates/hyphae-cli/2.2.0).
+24-crate graph is [published on crates.io](https://crates.io/crates/hyphae-cli/3.0.0)
+([publication receipt](docs/release/receipts/3.0.0.md)).
 G0 through
 G8 are closed for their versioned, bounded profiles. G7 uses an
 environment-bound operational-scale authority; G8 binds the release archives,
@@ -37,14 +44,19 @@ commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
 
-**What changed in 2.2.0:** Agent Memory can now commit its search document,
-lifecycle envelope, and TTL under one transaction and one CSN. The complete
-document transaction stage also supports named vectors for callers that supply
-them; the five-verb Agent Memory MCP remains lexical in 2.2.0. The release adds
-proactive host hooks, physical personal/work/journal domain separation,
-temporal and session doc-values, retry-safe migration from the legacy mixed
-collection, and reproducible LoCoMo/LongMemEval retrieval harnesses. See the
-[2.2.0 changelog](CHANGELOG.md#220---2026-08-26).
+**What changed in 3.0.0:** the bounded SQL slice grows into its analytics
+form (`HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,
+aliases), the keyspace gains the Valkey-shaped conditional and range commands
+on wire minor 6, and search gains relative-score fusion, autocut, float doc
+values, range facets, lexical `AND`/`OR` with minimum-match, prefix and fuzzy
+expansion, phrase matching, and BM25F field boosts. The collection document
+bound moves from 100,000 to 250,000 documents on receipts, with the first
+complete lexical ladder at 1,000,000 documents and a dedicated-hardware
+re-measurement of the whole release bound to an exact commit. The major
+version marks durable records 2.x cannot read (`HYPOST02` postings, the
+chunked `HYPSMAN2`/`HYPSCHK1` manifest); every 2.x directory opens on 3.0 and
+upgrades in place on its first accepted mutation. See the
+[3.0.0 changelog](CHANGELOG.md#300---2026-09-03).
 
 G8 release evidence binds publication to the exact release commit. The G7
 closure certifies the C-60 operational-scale control matrix but makes no
@@ -56,11 +68,12 @@ The [canonical claims and non-claims](docs/product/claims.md) page is the
 wording authority for every capability statement below.
 
 - Executes bounded SQL DDL, DML, prepared queries, secondary-index reads,
-  multi-row inserts, total and primary-key-prefix grouped aggregates,
+  multi-row inserts, total and primary-key-prefix grouped aggregates with
+  `HAVING` and grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,
   descending primary-key scans, residual LIKE/IN predicates, and
   transactions over a Hyphae-owned indexed, fail-closed relational core.
   The admitted grammar is versioned and bounded: no subqueries, outer
-  joins, HAVING, or expression arithmetic; unsupported shapes fail closed
+  joins, UNION, or expression arithmetic; unsupported shapes fail closed
   rather than scan.
 - Provides native strings, counters, hashes, lists, sets, sorted sets, streams,
   TTL, scans, algebra, and atomic structure batches.
@@ -85,7 +98,7 @@ The [published 0.2.1 matrix](docs/product/capabilities.md) remains separate.
 ## Agent Memory
 
 Agent Memory is the first product that uses Hyphae's multipurpose substrate as
-one system rather than a collection of sidecars. In 2.2.0 each memory carries
+one system rather than a collection of sidecars. Since 2.2.0 each memory carries
 lifecycle state and TTL, searchable text, temporal and project doc-values,
 provenance, and optional proof material while retaining one identity and one
 commit sequence. The underlying complete-document transaction also admits
@@ -145,7 +158,7 @@ Read the [Agent Memory product contract](docs/product/agent-memory.md),
 
 ## Memory retrieval measurements
 
-Hyphae 2.2.0 includes a pinned, digest-verified evaluation harness for LoCoMo
+Since 2.2.0 Hyphae includes a pinned, digest-verified evaluation harness for LoCoMo
 and LongMemEval-S-cleaned. These are **retrieval measurements**, not generated
 answer accuracy and not directly comparable to published LLM-as-a-judge scores
 from systems that perform model-based extraction or answer generation.
@@ -223,19 +236,19 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`2.2.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v2.2.0-crates),
+[`3.0.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v3.0.0-crates),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 2.2.0 --locked
+cargo install hyphae-cli --version 3.0.0 --locked
 ```
 
 That coordinate is live for all 24 published crates. Build and embed the exact
 release source with:
 
 ```bash
-git checkout release-v2.2.0-crates
+git checkout release-v3.0.0-crates
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```
@@ -314,7 +327,7 @@ and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,m
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
 
-Version `2.2.0` publishes the complete 24-crate graph:
+Version `3.0.0` publishes the complete 24-crate graph:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;
