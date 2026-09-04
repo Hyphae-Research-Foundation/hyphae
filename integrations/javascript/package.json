@@ -1,8 +1,19 @@
 {
   "name": "@hyphae_/hyphae-integrations",
   "version": "3.0.0",
-  "description": "Optional Astro, Next, and Vite adapters for Hyphae v1",
+  "description": "Optional Astro, Next, and Vite adapters for Hyphae",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
+    "directory": "integrations/javascript"
+  },
+  "homepage": "https://hyphae.dev",
+  "bugs": {
+    "url": "https://github.com/Hyphae-Research-Foundation/hyphae/issues"
+  },
+  "author": "Hyphae Research Foundation",
+  "keywords": ["hyphae", "database", "sql", "search", "vector", "rag", "mcp"],
   "type": "module",
   "engines": {
     "node": ">=20.19"

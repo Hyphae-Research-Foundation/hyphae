@@ -16,13 +16,14 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 
 ## Start here
 
+- [Native quickstart](quickstart-native.md)
 - [Hyphae usage manual](usage-manual.md)
-- [Native 1.0 capabilities and limits](product/native-capabilities.md)
+- [Native capabilities and limits](product/native-capabilities.md)
+- [3.0.0 publication receipt](release/receipts/3.0.0.md)
 - [Canonical claims and non-claims](product/claims.md)
 - [Hyphae Agent Memory — product contract](product/agent-memory.md)
-- [Native quickstart](quickstart-native.md)
-- [Published 0.2.1 capabilities and limits](product/capabilities.md)
-- [Published 0.2.1 compatibility quickstart](quickstart.md)
+- [Published 0.2.1 capabilities and limits (legacy format-2)](product/capabilities.md)
+- [Published 0.2.1 compatibility quickstart (legacy format-2)](quickstart.md)
 - [CLI reference](cli/reference.md)
 - [Configuration reference](configuration.md)
 - [Data model](concepts/data-model.md)

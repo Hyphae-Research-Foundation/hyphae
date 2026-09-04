@@ -2,9 +2,9 @@
 
 `@hyphae_/hyphae` is the bounded ESM client for APIs v1 and Native v2. It requires Node.js 20
 or newer, uses the runtime `fetch`, and has no runtime package dependencies.
-The release source package version is `1.1.0`. It is maintained in this repository;
-this guide does not claim npm publication without a separate registry release
-and receipt.
+The release source package version is `3.0.0`. Per the `3.0.0` release
+receipt's distribution boundary, this package is source-only in `3.0.0`: it is
+not published to npm.
 
 ## Build from this repository
 
@@ -89,3 +89,25 @@ connector uses AF_UNIX paths on Unix and `\\.\pipe\...` named-pipe paths on
 Windows and carries exact `HYPHLCL1` frames without a wrapper protocol. HTTP
 uses canonical product envelopes at `/v2/execute`. Both expose typed product
 errors, request deadlines, `AbortSignal` cancellation, and transaction state.
+
+### Native v2 surface
+
+`@hyphae_/hyphae/v2` client methods, by area:
+
+- SQL: `sql`, `prepareSql`, `executePrepared`, `deallocatePrepared`.
+- Structures: `structureGet`, `structureSet`, `structureTtl`,
+  `structureMutate`, `structureRead`.
+- Search: `search`, `searchCollection`, `searchIngest`,
+  `searchDocumentUpdate`, `searchDocumentDelete`.
+- Transactions: `transactionStatus`, `transactionBegin`,
+  `transactionStageSql`, `transactionStageStructure`,
+  `transactionStageSearch`, `transactionStageVector`, `transactionCommit`,
+  `transactionRollback`, `explicitTransactionStatus`,
+  `transactionStatusByIdempotency`.
+- Proofs: `verifyProof`, `prove`, `proveSql`.
+- Backup/restore: `backup`, `restore`.
+
+The codec implements the following `3.0.0` search features: relative-score
+fusion, autocut knee truncation, range facets, lexical minimum-match, a
+per-branch vector `max_distance`, highlighting, fuzzy/prefix/phrase queries,
+BM25F field boosts, and offset pagination over the final ranking.

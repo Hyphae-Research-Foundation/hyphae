@@ -1,5 +1,13 @@
 # hyphae-native-pages
 
+```toml
+[dependencies]
+hyphae-native-pages = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Internal, unpublished page codec, append-only page file, and partitioned
 buffer pool for the native Hyphae substrate.
 

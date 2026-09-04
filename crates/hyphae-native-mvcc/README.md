@@ -1,5 +1,13 @@
 # hyphae-native-mvcc
 
+```toml
+[dependencies]
+hyphae-native-mvcc = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Internal, unpublished snapshot/version semantics and atomic cross-engine root
 publication for the native Hyphae substrate.
 

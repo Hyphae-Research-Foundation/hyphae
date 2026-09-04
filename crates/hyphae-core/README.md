@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-core
 
@@ -9,12 +9,11 @@ Shared product, API, disk-format, and proof-format version constants for
 [Hyphae](https://hyphae.dev), the autonomous, embeddable, verifiable Rust data
 engine.
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The crate is published at `3.0.0`:
 
 ```toml
 [dependencies]
-hyphae-core = "0.2.1"
+hyphae-core = "=3.0.0"
 ```
 
 Most applications should depend on `hyphae-engine` instead. This crate exists
@@ -23,4 +22,4 @@ server behavior.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

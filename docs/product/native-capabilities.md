@@ -1,10 +1,11 @@
-# Native 1.0 capabilities and limits
+# Native capabilities and limits
 
-Status: implemented and published with Native `1.1.0` for the closed bounded
-G0-G8 profiles. G7 operational-scale performance is closed with an explicitly
-environment-bound C-60 authority; dedicated-hardware latency and background
-interference remain non-claims. G8 closed on the exact `1.1.0` release commit;
-the [1.1.0 publication receipt](../release/receipts/1.1.0.md) records the
+Status: implemented and published, current for `3.0.0`, for the closed
+bounded G0-G8 profiles. G7 operational-scale performance is closed with an
+explicitly environment-bound C-60 authority; dedicated-hardware latency and
+background interference remain non-claims. G8 closed on the exact `3.0.0`
+release commit `24bce1accdff8d14127797afe6f237a57c1cd4f3`; the
+[3.0.0 publication receipt](../release/receipts/3.0.0.md) records the
 published artifacts.
 
 Hyphae Native is one process, one executable, and one exclusively owned data

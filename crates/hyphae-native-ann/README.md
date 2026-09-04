@@ -1,5 +1,13 @@
 # hyphae-native-ann
 
+```toml
+[dependencies]
+hyphae-native-ann = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 `hyphae-native-ann` is Hyphae's owned deterministic HNSW kernel. It provides:
 
 - canonical finite `f32` vectors;

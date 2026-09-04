@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-query
 
@@ -9,12 +9,11 @@ Pure deterministic query types and reference execution for
 [Hyphae](https://hyphae.dev). It provides structured values, filters, global
 sorting, logical cursors, aggregations, and explicit execution budgets.
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The crate is published at `3.0.0`:
 
 ```toml
 [dependencies]
-hyphae-query = "0.2.1"
+hyphae-query = "=3.0.0"
 ```
 
 The executor has no database, network, embedding, or LLM dependency. The
@@ -29,4 +28,4 @@ than partial success.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

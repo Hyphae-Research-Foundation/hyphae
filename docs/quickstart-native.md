@@ -1,12 +1,21 @@
 # Native quickstart
 
-Status: current for the published Native releases (`1.1.0` and later); the
+Status: current for `3.0.0` and later published Native releases; the
 closed G0-G8 profiles and their receipts are indexed by the
 [native gate status](gates/native-gate-status.md).
 
 This guide exercises the Native SQL, structure, and integrated search engines
 through one binary and one owned data directory. It starts no listener and
 requires no database, cache, cloud service, embedding provider, or LLM.
+
+## Install or build the binary
+
+```bash
+cargo install hyphae-cli --version 3.0.0 --locked
+hyphae version --json
+```
+
+Building from source instead:
 
 ## Build and initialize
 

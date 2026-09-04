@@ -12,11 +12,11 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "LICENSE-DOCUMENTATION", "LICENSE-POLICY.md", "THIRD_PARTY_NOTICES.md"]
 authors = [
-  { name = "Celiums Solutions LLC" },
+  { name = "Hyphae Research Foundation" },
 ]
 keywords = ["database", "sql", "vector-search", "rag", "local-first"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Operating System :: MacOS",
   "Operating System :: Microsoft :: Windows",

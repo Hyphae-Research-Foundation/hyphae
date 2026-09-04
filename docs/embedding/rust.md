@@ -21,13 +21,13 @@ engine and an embedding application together.
 | `hyphae-client` | Bounded async HTTP client; never opens local storage |
 | `hyphae-core` | Product/API/disk version constants |
 
-Applications normally start with `hyphae-engine`. The published `0.2.1`
+Applications normally start with `hyphae-engine`. The published `3.0.0`
 coordinates are:
 
 ```toml
 [dependencies]
-hyphae-engine = "=0.2.1"
-hyphae-query = "=0.2.1"
+hyphae-engine = "=3.0.0"
+hyphae-query = "=3.0.0"
 uuid = { version = "1", features = ["v7"] }
 ```
 

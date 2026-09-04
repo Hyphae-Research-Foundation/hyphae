@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-engine
 
@@ -10,9 +10,11 @@ autonomous, durable, and verifiable Rust data engine. New applications should
 embed the Native product facade in `hyphae-native-product`; this crate serves
 existing format-2 data directories and the published `/v1` surface.
 
+The crate is published at `3.0.0`:
+
 ```toml
 [dependencies]
-hyphae-engine = "1.2.2"
+hyphae-engine = "=3.0.0"
 ```
 
 Open one data directory, store structured records, run deterministic queries,
@@ -28,6 +30,11 @@ policy and `query_with_byte_limit` for aggregate scanned-byte accounting. The
 through snapshot creation; legacy proof methods snapshot afterward under the
 stored maintenance policy. The standalone server selects the bounded paths.
 
+At `3.0.0`, every `2.x` native directory opens on this crate and upgrades in
+place on the first accepted mutation; directories written by `3.0.0` do not
+open on `2.x`. The native local protocol stays at minor 6 (additive), and the
+format-2 line this crate serves is unchanged.
+
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source, examples, and
 security policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

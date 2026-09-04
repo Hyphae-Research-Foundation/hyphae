@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-pliegors
 
@@ -8,12 +8,11 @@
 Optional public-contract adapter between PliegoRS applications and the
 [Hyphae](https://hyphae.dev) `/v1` API.
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The crate is published at `3.0.0`:
 
 ```toml
 [dependencies]
-hyphae-pliegors = "0.2.1"
+hyphae-pliegors = "=3.0.0"
 ```
 
 The crate depends on `hyphae-client`, not PliegoRS internals or Hyphae storage.
@@ -30,4 +29,4 @@ API. It imports no private PliegoRS API and never opens a Hyphae data directory.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and integration
 boundary:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

@@ -1,5 +1,13 @@
 # Hyphae Native protocol
 
+```toml
+[dependencies]
+hyphae-native-protocol = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Portable `HYPHLCL1` frame, handshake, product request/response, `HYPERR01`,
 stream completion, flow-control, cancellation, and deadline codecs.
 

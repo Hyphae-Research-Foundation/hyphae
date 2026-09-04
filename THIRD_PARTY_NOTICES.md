@@ -5,9 +5,11 @@ inventories `Cargo.lock` and the repository `package-lock.json` files. Their
 copyrights and licenses remain with their respective authors. The project
 Apache-2.0 grant does not relicense those components.
 
-The current reviewed Rust, JavaScript, and Python inventory is aggregated by
-exact digest in
-`docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json`.
+The `1.2.0` relicensing-transition inventory aggregates the Rust, JavaScript,
+and Python dependencies reviewed at that transition, by exact digest, in
+`docs/gates/evidence/relicensing-1.2.0-dependency-license-aggregate.json`. The
+shipped dependency closure of each release is its SBOM, attached to that
+release's GitHub release.
 
 ## DCO 1.1
 
