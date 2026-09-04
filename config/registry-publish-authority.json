@@ -17,126 +17,126 @@
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Test (Linux stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Test (Linux MSRV)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Test (macOS stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Test (Windows stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Public client conformance",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Optional framework integrations",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Release readiness",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Security hard-kill aggregate",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "MCP real hosts",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Dependency and license policy",
       "workflow": ".github/workflows/security.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "name": "Package x86_64-unknown-linux-gnu",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Package x86_64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Package aarch64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Package x86_64-pc-windows-msvc",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Assemble and verify release candidate",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Publish GitHub release",
       "workflow": ".github/workflows/release.yml",
       "event": "workflow_dispatch",
       "head_branch": "main",
-      "head_sha": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
     },
     {
       "name": "Validate all exact-SHA G8 receipts",
       "workflow": ".github/workflows/native-g8-closure.yml",
       "event": "workflow_dispatch",
       "head_branch": "release/fix/release-readiness-semver-offline-merge-evidence",
-      "head_sha": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
     }
   ],
   "required_artifacts": [
@@ -148,7 +148,7 @@
     {
       "id": "signed-release-receipt",
       "workflow": ".github/workflows/release.yml",
-      "name": "native-g8-signed-release-5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
+      "name": "native-g8-signed-release-24bce1accdff8d14127797afe6f237a57c1cd4f3"
     },
     {
       "id": "g8-aggregate",
@@ -191,8 +191,8 @@
     "tools/produce_native_g8_receipt.py",
     "tools/verify_crate_packages.py"
   ],
-  "source_commit": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2",
-  "source_tree": "72c09ec5366d381c3ebf7b52d09bc98024d51a68",
-  "tag_object": "b961f7a40cd4bab9646d95727319638935ba4eb0",
-  "release_run_commit": "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+  "source_commit": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+  "source_tree": "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff",
+  "tag_object": "0bc6fe56498472804c3cc376b5b28d7652955701",
+  "release_run_commit": "8a58749d892a52e38c651669ade03df5a6ee54af"
 }

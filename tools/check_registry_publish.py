@@ -59,10 +59,10 @@ EXPECTED_POLICY_KEYS = {
     "tag_object",
     "release_run_commit",
 }
-SOURCE_COMMIT = "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2"
-SOURCE_TREE = "72c09ec5366d381c3ebf7b52d09bc98024d51a68"
-TAG_OBJECT = "b961f7a40cd4bab9646d95727319638935ba4eb0"
-RELEASE_RUN_COMMIT = "97bc3ff6034eac55bfe570f824be21aafd5c153b"
+SOURCE_COMMIT = "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+SOURCE_TREE = "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff"
+TAG_OBJECT = "0bc6fe56498472804c3cc376b5b28d7652955701"
+RELEASE_RUN_COMMIT = "8a58749d892a52e38c651669ade03df5a6ee54af"
 EXPECTED_CHECKS = (
     ("Quality", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
     ("Test (Linux stable)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
@@ -88,7 +88,7 @@ EXPECTED_ARTIFACTS = (
     (
         "signed-release-receipt",
         ".github/workflows/release.yml",
-        "native-g8-signed-release-5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2",
+        "native-g8-signed-release-24bce1accdff8d14127797afe6f237a57c1cd4f3",
     ),
     ("g8-aggregate", ".github/workflows/native-g8-closure.yml", "native-g8-aggregate-{commit}"),
     ("mcp-real-hosts", ".github/workflows/ci.yml", "mcp-real-hosts-{commit}"),
