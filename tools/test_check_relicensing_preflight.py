@@ -235,7 +235,7 @@ class RelicensingPreflightTests(unittest.TestCase):
         self.assertEqual(category, "third-party-material")
         self.assertEqual(
             self.contract["boundaries"]["third_party"]["exact_paths"],
-            ["DCO", "THIRD_PARTY_LICENSES.txt"],
+            [".github/assets/oin-member-2-0-horiz.png", "DCO", "THIRD_PARTY_LICENSES.txt"],
         )
 
     def test_generated_contract_copies_inherit_apache_and_exact_bytes(self) -> None:
