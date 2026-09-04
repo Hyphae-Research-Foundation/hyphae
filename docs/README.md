@@ -73,6 +73,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Verify a release](release/verification.md)
 - [0.2.1 publication receipt](release/receipts/0.2.1.md)
 - [1.1.0 publication receipt](release/receipts/1.1.0.md)
+- [3.0.0 publication receipt](release/receipts/3.0.0.md)
 - [Publish the Rust crates](release/crates-io.md)
 - [Publish the Python SDK](release/pypi.md)
 - [Compatibility and versioning](compatibility/versioning.md)
