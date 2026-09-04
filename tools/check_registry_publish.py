@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
     "version": "3.0.0",
-    "tag": "release-v2.2.0-crates",
+    "tag": "release-v3.0.0-crates",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
 }
@@ -81,7 +81,7 @@ EXPECTED_CHECKS = (
     ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
     ("Assemble and verify release candidate", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
     ("Publish GitHub release", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/security-check-permission-merge-evidence", SOURCE_COMMIT),
+    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/release-readiness-semver-offline-merge-evidence", SOURCE_COMMIT),
 )
 EXPECTED_ARTIFACTS = (
     ("release-candidate", ".github/workflows/release.yml", "hyphae-release-candidate"),
@@ -404,7 +404,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
         or value["version"] != "3.0.0"
-        or value["tag"] != "release-v2.2.0-crates"
+        or value["tag"] != "release-v3.0.0-crates"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
         != {
@@ -524,7 +524,7 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         "checks: read",
         "id-token: write",
         "Reject a non-main live dispatch before checkout",
-        "test '${{ inputs.source_tag }}' = release-v2.2.0-crates",
+        "test '${{ inputs.source_tag }}' = release-v3.0.0-crates",
         "refs/heads/main",
         "test \"${{ github.ref }}\" = refs/heads/main",
         "github.workflow_ref",
@@ -1428,11 +1428,11 @@ def resolve_live_authority(
         or source_tree != policy["source_tree"]
         or tag_object != policy["tag_object"]
     ):
-        raise GateFailure("2.2.0 source tag identity differs from pinned authority")
+        raise GateFailure("3.0.0 source tag identity differs from pinned authority")
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
     if not _git(root, "merge-base", "--is-ancestor", source_commit, origin_main, check=False).returncode == 0:
-        raise GateFailure("2.2.0 source tag is not an ancestor of origin/main")
+        raise GateFailure("3.0.0 source tag is not an ancestor of origin/main")
     if workflow_sha != origin_main:
         raise GateFailure("registry control workflow is not the exact origin/main commit")
     checks, runs_by_path = fetch_required_checks(

@@ -1,7 +1,7 @@
 # Publish the Rust crates
 
-The Apache registry publication is authorized only for exact version `2.2.0`
-from annotated tag `release-v2.2.0-crates`. The version, immutable
+The Apache registry publication is authorized only for exact version `3.0.0`
+from annotated tag `release-v3.0.0-crates`. The version, immutable
 dependency layers, and exact source authority are defined in
 [`config/crates-io-release.json`](../../config/crates-io-release.json).
 Conformance runners and independent verifiers remain private workspace tools
@@ -15,8 +15,8 @@ the tag being published. The trusted checker and policy are loaded from the
 
 ## Preconditions
 
-1. Land version `2.2.0`, then create the annotated tag
-   `release-v2.2.0-crates`. The registry workflow fetches the exact remote tag
+1. Land version `3.0.0`, then create the annotated tag
+   `release-v3.0.0-crates`. The registry workflow fetches the exact remote tag
    object, requires its target to be an ancestor of current `origin/main`, and
    separately requires the trusted workflow SHA to equal current `origin/main`.
 2. Complete the pinned exact-SHA GitHub check suite in
@@ -132,11 +132,11 @@ tag, main tip, policy file, or digest changes between gate and upload.
 Use clean temporary projects, not workspace paths:
 
 ```bash
-cargo install hyphae-cli --version 2.2.0 --locked
+cargo install hyphae-cli --version 3.0.0 --locked
 hyphae version --json
 ```
 
-Also create a minimal Rust application with exact `=2.2.0` dependencies on
+Also create a minimal Rust application with exact `=3.0.0` dependencies on
 `hyphae-engine`, `hyphae-query`, and `hyphae-native-product`; build it with
 `--locked`. Verify that docs.rs has accepted every library package, then record
 all crates.io URLs, checksums, and the Git tag in the publication receipt.
