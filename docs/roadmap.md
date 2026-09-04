@@ -1,5 +1,25 @@
 # Hyphae roadmap
 
+## 3.0.0 shipped (2026-09-04)
+
+Hyphae `3.0.0` published from source commit
+`24bce1accdff8d14127797afe6f237a57c1cd4f3` (tag `release-v3.0.0-crates`); see
+the [3.0.0 changelog entry](../CHANGELOG.md) for the full accounting and the
+[publication receipt](release/receipts/3.0.0.md) for the release identity,
+hosted evidence, and crates.io checksums. It shipped SQL slice 2 (`HAVING`,
+grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`, `AS` aliases),
+Valkey-shaped keyspace conditional and range commands (`SETNX`, `APPEND`,
+`SETRANGE`, `HSETNX`, `ZINCRBY`, `ZPOP`, seeded `SPOP`/`SRANDMEMBER`), search
+minor 6/semantics v5 (relative-score fusion, autocut, range facets, offset
+pagination, lexical `AND`/`OR` with minimum-match, prefix expansion, BM25F
+field boosts, fuzzy expansion, phrase matching, and highlighting over
+expanded terms), and HNSW diversity neighbour selection with the SQ8
+scalar-quantization primitive. A B+tree batch-rewrite fix removed a
+structural degeneration in the durable scorer and raised
+`MAX_PRODUCT_SEARCH_COLLECTION_DOCUMENTS` from 100,000 to 250,000 on the rung
+receipt; the 1,000,000-document rung is measured but not shipped until the
+ANN consolidation and RSS conditions of roadmap item R5 are met.
+
 `0.2.1` is the retained compatibility release. Its annotated `v0.2.1` tag peels to
 `08028e8dac077846c638f067ce74fbcf6fb75501`, its
 [GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v0.2.1) is
@@ -55,6 +75,10 @@ contracts and gates.
 
 ## Post-1.2 program
 
+Historical: this program predates the `3.0.0` release; see
+[3.0.0 shipped](#300-shipped-2026-09-04) above and `../CHANGELOG.md` for what
+actually landed.
+
 With the `1.2.2` registry publications complete, the active forward plan is
 the [Native acceleration and verification-asymmetry
 roadmap](roadmaps/native-acceleration-roadmap.md): embedded-path contention
@@ -63,6 +87,10 @@ acceleration behind the G9 gate, attested embeddings with Proof of
 Retrieval, and distribution.
 
 ## 1.2.0 programs
+
+Historical: this program predates the `3.0.0` release; see
+[3.0.0 shipped](#300-shipped-2026-09-04) above and `../CHANGELOG.md` for what
+actually landed.
 
 Hyphae `1.2.0` has two coupled execution programs. The
 [operator and agent experience plan](roadmaps/1.2.0-operator-and-agent-experience.md)

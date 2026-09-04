@@ -1,6 +1,7 @@
 # G2 metamorphic SQL corpus
 
-Status: bounded implementation evidence; G2 remains open.
+Status: bounded implementation evidence; not promoted into the G2 closure at
+`a839037`, which claims no universal SQL or official benchmark result.
 
 The versioned corpus at
 `crates/hyphae-native-runtime/tests/corpus/g2-metamorphic.json` freezes a

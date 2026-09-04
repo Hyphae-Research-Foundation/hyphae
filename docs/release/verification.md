@@ -6,7 +6,7 @@ verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 ## Maintainer tag-target invariant
 
 The version tag targets the canonical merge commit for the reviewed release
-PR. The release report binds 17 required PR checks to that PR's exact head
+PR. The release report binds 19 required PR checks to that PR's exact head
 commit and binds the exact-SHA G8 closure to the tagged merge commit on `main`.
 Every required PR workflow checks out the head rather than GitHub's synthetic
 merge commit, and the Release assemble job separately requires the merge
@@ -26,7 +26,7 @@ test "$(git rev-parse vVERSION^{commit})" = "MERGE_COMMIT"
 ```
 
 The publication workflow excludes every check from its own run and must find
-all 18 completed successful prior checks on their two exact authority commits.
+all 20 completed successful prior checks on their two exact authority commits.
 It fetches the remote tag, records both the ref object and peeled merge commit,
 requires that commit to remain reachable from `main`, and repeats those checks
 immediately before publication. Moving the tag, crossing PRs, changing the
@@ -168,7 +168,7 @@ external immutable approval boundary. Pull requests may run only the dry-run
 path.
 
 The workflow checks out `github.workflow_sha` as the trusted control plane and
-`v1.2.2` as source in separate directories. Before executing source package
+`v3.0.0` as source in separate directories. Before executing source package
 tools, the trusted checker requires the tag to be annotated, its peeled commit
 to equal the exact fetched `origin/main` tip, and all pinned control files to be
 byte-identical between trusted main and the tag tree. It then uses the GitHub
@@ -209,7 +209,7 @@ GitHub-hosted builder, and invocation URI. The invocation must use the same
 workflow run ID as the release-evidence manifest. Its attempt may be earlier
 than the assemble attempt when a successful package job was reused by a
 failed-job rerun, but it may never name another run or a later attempt.
-This provenance allowance is separate from the required-check report: all 18
+This provenance allowance is separate from the required-check report: all 20
 required-check jobs must match their workflow runs' current attempts.
 Require the native runner identity that matches the archive target:
 Linux/X64, macOS/X64, macOS/ARM64, or Windows/X64.

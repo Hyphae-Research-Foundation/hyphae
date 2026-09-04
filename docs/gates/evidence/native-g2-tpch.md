@@ -1,6 +1,7 @@
 # G2 TPC-H correctness vertical
 
-Status: bounded implementation evidence; G2 remains open.
+Status: bounded implementation evidence; not promoted into the G2 closure at
+`a839037`, which claims no universal SQL or official benchmark result.
 
 `crates/hyphae-native-runtime/tests/tpch_correctness_g2.rs` implements a small,
 deterministic TPC-H-derived customer/orders correctness vertical. It uses native

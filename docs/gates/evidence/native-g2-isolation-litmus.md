@@ -1,6 +1,7 @@
 # G2 SQL isolation litmus
 
-Status: bounded implementation evidence; G2 remains open.
+Status: bounded implementation evidence; not promoted into the G2 closure at
+`a839037`, which claims no universal SQL or official benchmark result.
 
 `crates/hyphae-native-runtime/tests/sql_isolation_g2.rs` exercises detached
 optimistic SQL batches against the native MVCC and conflict table. It proves:

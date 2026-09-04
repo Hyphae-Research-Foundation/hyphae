@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-09-03T17:39:16.519183+00:00",
+  "generated_at_utc": "2026-09-04T13:30:32.264827+00:00",
   "inventory": {
     "canonical_sha256": "ae0fa1dc4fdf5fe46390fa8b8fd7432bb9d710adc4e621de5314dc79ae5f3871",
     "external_package_count": 272,
@@ -2151,13 +2151,13 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "b7eb137e395ac93a255410581445e850534df019",
+    "commit": "f7ad00070b2f5eec55ff73c46a0fe7d4b3c9574c",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
-    "source_inputs_sha256": "f16a35256a487353d8eb7b3caa5252d4459476dae94584342b7f4a6076495fa4",
-    "tree": "fd37336623850069c91d38962758ba6df8fcd692",
+    "source_inputs_sha256": "c02677d6158f8f32b86b28aaae9842114f1f483c5ef98d7df112d7d3e468b638",
+    "tree": "1bd27dd014c2d407e7af0469e5c5cd7f25bc81e8",
     "worktree_clean": false
   },
   "source_inputs": [
@@ -2167,7 +2167,7 @@
     },
     {
       "path": "Cargo.toml",
-      "sha256": "e2c98b5a2d3f2d4043a7185cf295669afbef722e53d2877e65a604af19f55dc2"
+      "sha256": "86a03052e6f6469e3c58b55d084c2ac39581b6a6ea6d1e7b11420814e81cf587"
     },
     {
       "path": "benchmarks/baseline-harness/Cargo.lock",
@@ -2271,7 +2271,7 @@
     },
     {
       "path": "crates/hyphae-native-runtime/Cargo.toml",
-      "sha256": "698efe172e53af8d4d0499e6f0de351ec44c8c8ddfa8ceb45c1f6b3fea9fa769"
+      "sha256": "5ed4509beec7b40b7bf04822b382fe3a49569615c67a6af33582809de8238303"
     },
     {
       "path": "crates/hyphae-native-types/Cargo.toml",
@@ -2324,9 +2324,9 @@
   ],
   "target_release": "1.2.0",
   "tools": {
-    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05) (Arch Linux rust 1:1.98.0-1)",
+    "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
     "cargo_deny": "cargo-deny 0.20.2",
-    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1)"
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
   },
   "tree_observation": {
     "command": [
