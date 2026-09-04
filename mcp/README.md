@@ -1,8 +1,10 @@
 # Native MCP adapter
 
-`hyphae mcp` is a bounded, read-only stdio adapter for an already running
-managed Native local or HTTP v2 service. It never opens a data directory, starts a
-listener, accepts a format-2 bearer token, or exposes Native write operations.
+`hyphae mcp` is a bounded stdio adapter for an already running managed Native
+local or HTTP v2 service. It never opens a data directory, starts a listener,
+or accepts a format-2 bearer token. It is read-only unless the operator
+explicitly enables writes: `--allow-ingest` on the full profile, or
+`--allow-write` on the memory profile (`--profile memory`).
 
 ## Start and configure
 
@@ -87,17 +89,34 @@ error instead of truncating. `hyphae_native_verify_proof` re-verifies those
 artifacts entirely inside the adapter process — verification is trustless
 and never contacts the service.
 
-The adapter is read-only by default. Starting it with `--allow-ingest`
-additionally lists `hyphae_native_search_ingest`, one bounded atomic
-idempotent document-batch write (at most 256 documents and 16 MiB per batch,
-enforced fail-closed by the product). The flag only exposes the tool: the
-write still requires a key whose durable authority carries `data.write`
-(the built-in Writer role); a Reader or Auditor key receives a typed denial.
-The checked-in agent plugin never passes the flag and stays read-only.
+The full profile is read-only by default (eight tools). Starting it with
+`--allow-ingest` additionally lists three write-scoped tools:
+`hyphae_native_search_ingest` (one bounded atomic idempotent document-batch
+write, at most 256 documents and 16 MiB per batch, enforced fail-closed by
+the product), `hyphae_native_memory_store`, and `hyphae_native_memory_forget`.
+The flag only exposes the tools: each write still requires a key whose
+durable authority carries `data.write` (the built-in Writer role); a Reader
+or Auditor key receives a typed denial. The checked-in agent plugin never
+passes the flag and stays read-only.
 
-All three tools are read-only, non-destructive, idempotent, closed-world, and
-task-forbidden. Principal pages are bounded by `limit` (`1..=1000`) and use the
-opaque, authorization-epoch-bound Native security cursor.
+Every tool is non-destructive, idempotent, closed-world, and task-forbidden;
+the eight tools listed by default are also read-only. Principal pages are
+bounded by `limit` (`1..=1000`) and use the opaque, authorization-epoch-bound
+Native security cursor.
+
+## Memory profile
+
+`hyphae mcp --profile memory` swaps the full registry for the Agent Memory
+five-tool surface over three physically separated collections: personal,
+work, and journal, set with `--personal-memory-collection`,
+`--work-memory-collection`, and `--journal-memory-collection`. `recall` and
+`status` are always listed; `store`, `journal`, and `forget` are listed only
+with `--allow-write`, and each still requires a key with write authority. A
+recall's optional `layer` parameter (`all|personal|work|journal`) selects
+which collections it searches. The bundled plugin's `.mcp.json` starts the
+full profile above, not this one; wire an agent host to the memory profile
+with `hyphae agent configure <host>`. See
+[Agent Memory](../docs/product/agent-memory.md).
 
 ## Errors and redaction
 

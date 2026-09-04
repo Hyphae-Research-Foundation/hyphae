@@ -531,13 +531,23 @@ bounded typed read request.
 ## `search`
 
 ```text
-hyphae search --data-dir <NATIVE_DIRECTORY> <provision|query|integrated|ingest|update|delete> ...
+hyphae search --data-dir <NATIVE_DIRECTORY> <provision|query|integrated|consolidate|chunk|ingest|update|delete> ...
 ```
 
-`provision` creates catalog-owned physical indexes. Ingest/update/delete are
+`provision` creates catalog-owned physical indexes. `consolidate` merges
+every vector index of one collection into a fresh generation, draining
+accumulated deltas. `chunk` deterministically splits one document into
+ingest-ready JSON, fixed-window (`--size`/`--overlap`) or sentence-packed
+(`--sentence`, bounded by `--sentence-max`). Ingest/update/delete are
 idempotent all-branch mutations. Query surfaces cover lexical term/phrase/
 prefix/fuzzy matching and integrated lexical, exact-vector, ANN, hybrid,
-filter, sort, facet, and metric execution.
+filter, sort, facet, and metric execution. `integrated` also accepts
+`--fusion` (`weighted-score` or `relative-score`), `--autocut` knee-detection
+steepness, `--range-facets-json`, `--offset`, `--highlight-fragments` with
+`--highlight-bytes`, and `--dedupe-field`/`--dedupe-first-k` first-k-per-parent
+deduplication, plus one mutually exclusive lexical-operator selector:
+`--minimum-match`, `--lexical-and`, `--lexical-prefix`,
+`--field-boosts-json` BM25F field boosts, `--fuzzy`, or `--phrase`.
 
 ## `transaction`
 
@@ -775,20 +785,29 @@ secrets, never persists complete prompts or responses, and uses no model.
 ```text
 hyphae mcp (--endpoint <LOCAL_ENDPOINT> | --base-url <ROOT_ORIGIN>) --native-api-key-file <RESTRICTED_PATH>
 hyphae mcp (--endpoint <LOCAL_ENDPOINT> | --base-url <ROOT_ORIGIN>) --native-api-key-stdin
-hyphae mcp --profile memory [--allow-write] [--memory-collection <ID>] ...
+hyphae mcp ... [--allow-ingest]
+hyphae mcp --profile memory [--allow-write] [--personal-memory-collection <ID>] [--work-memory-collection <ID>] [--journal-memory-collection <ID>] ...
 ```
 
 Runs MCP revision `2025-06-18` as newline-delimited JSON-RPC 2.0 over stdio.
 It opens no listener or data directory. `--endpoint` uses the native local
 UDS/named-pipe transport and is the preferred same-machine path; `--base-url`
-uses HTTP v2. The adapter enforces a 4 MiB message
-bound and exposes only three Native v2 read tools: capabilities, redacted
-security status, and bounded redacted principal pages. `tools/list` returns at
-most two definitions and uses its own opaque cursor.
+uses HTTP v2. The adapter enforces a 4 MiB message bound and, by default,
+exposes eight Native v2 tools: capabilities, redacted security status,
+bounded redacted principal pages, one bounded lexical query, one integrated
+collection search, a sealed offline-verifiable search proof, trustless local
+proof verification, and Agent Memory recall. `--allow-ingest` additionally
+lists three write-scoped tools (document-batch ingest, memory store, memory
+forget), each still requiring a key with `data.write` authority.
+`tools/list` returns pages of at most one hundred definitions and uses its
+own opaque cursor.
 
-Use a restricted key for the built-in Auditor role at Instance scope. It has
-the `security.read` permission required by both security tools without write
-authority.
+Use a restricted key for the built-in Auditor role at Instance scope; it
+carries the `security.read` permission both security tools require without
+write authority. The search and recall tools instead need `search.execute`,
+which the built-in Reader role carries, and `hyphae_native_prove_search`
+further needs `proof.generate`. Issue the key whose durable authority
+matches the tools the agent needs; a mismatched key receives a typed denial.
 
 The key establishes the exact authority for every call. It is accepted only
 from a restricted file or the first stdin line, never an argv value or plain
@@ -804,10 +823,12 @@ use `https://`; plaintext remote origins fail before the stdio request loop.
 
 `--profile memory` swaps the registry for Agent Memory — recall and status
 always; store, first-person journal, and forget only with `--allow-write` —
-scoped to the memory collection. The surface never advertises a tool the
-presented credential cannot execute, and recall proofs are written to
-`$XDG_STATE_HOME/hyphae/proofs/` for offline `proof verify` instead of
-inlining hex past the message bound.
+scoped to the three physically separated personal, work, and journal
+collections named by `--personal-memory-collection`,
+`--work-memory-collection`, and `--journal-memory-collection`. The surface
+never advertises a tool the presented credential cannot execute, and recall
+proofs are written to `$XDG_STATE_HOME/hyphae/proofs/` for offline
+`proof verify` instead of inlining hex past the message bound.
 
 ## Environment summary
 

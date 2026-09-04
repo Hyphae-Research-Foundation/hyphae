@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -737,6 +738,18 @@ def load_object(path: Path, root: Path) -> dict[str, Any]:
     return value
 
 
+def workspace_version(root: Path) -> str:
+    path = root / "Cargo.toml"
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        fail(f"{path.relative_to(root)} is not valid TOML: {error}")
+    version = document.get("workspace", {}).get("package", {}).get("version")
+    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
+        fail("Cargo.toml [workspace.package] version is missing or not strict semver")
+    return version
+
+
 def validate_mcp(value: dict[str, Any]) -> None:
     if set(value) != {"mcpServers"}:
         fail("shared MCP config must contain only mcpServers")
@@ -763,7 +776,7 @@ def validate_codex(value: dict[str, Any]) -> str:
     if value.get("license") != "Apache-2.0":
         fail("Codex plugin license must match the repository")
     interface = value.get("interface")
-    if not isinstance(interface, dict) or interface.get("developerName") != "Celiums Solutions LLC":
+    if not isinstance(interface, dict) or interface.get("developerName") != "Hyphae Research Foundation":
         fail("Codex plugin interface metadata is incomplete")
     if interface.get("capabilities") != ["Read"]:
         fail("Codex plugin must advertise the exact read-only MCP capability")
@@ -807,6 +820,9 @@ def validate_marketplaces(root: Path, version: str) -> None:
         or plugins[0].get("license") != "Apache-2.0"
     ):
         fail("Claude Code marketplace is not bound to the checked-in plugin")
+    owner = claude.get("owner")
+    if not isinstance(owner, dict) or owner.get("name") != "Hyphae Research Foundation":
+        fail("Claude Code marketplace owner must be the Hyphae Research Foundation")
     description = str(plugins[0].get("description", ""))
     if "Auditor" not in description or "Instance" not in description:
         fail("Claude Code marketplace must recommend an Instance-scoped Auditor API key")
@@ -960,8 +976,9 @@ def validate(root: Path = ROOT) -> dict[str, Any]:
             fail(f"credential material is forbidden in {path.relative_to(root)}")
     validate_mcp(load_object(plugin / ".mcp.json", root))
     version = validate_codex(load_object(plugin / ".codex-plugin/plugin.json", root))
-    if version != "2.1.0":
-        fail("agent plugin version must match the bounded 2.0 MCP slice")
+    expected_version = workspace_version(root)
+    if version != expected_version:
+        fail(f"agent plugin version must match the workspace version {expected_version}")
     validate_claude(load_object(plugin / ".claude-plugin/plugin.json", root), version)
     validate_marketplaces(root, version)
     validate_contract(load_object(root / "contracts/native-mcp-v2.json", root))

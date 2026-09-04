@@ -151,8 +151,9 @@ hyphae_memory_status    (all profiles)
 - `journal(project, text, harness, model, ttl?)` → a first-person model
   journal entry in the separate `journal` layer. Text must begin in first
   person (`I ...`, `Yo ...`, `Pienso ...`, and bounded equivalents).
-- `recall(project, query, limit?, kind?, prove?)` → memories ordered by
-  relevance; with `prove`, the response carries the sealed proof,
+- `recall(project, query, limit?, kind?, layer?, prove?)` → memories ordered by
+  relevance; `layer` narrows to `all` (default), `personal`, `work`, or
+  `journal`. With `prove`, the response carries the sealed proof,
   witness, and anchor for offline verification with
   `hyphae proof verify`.
 - `forget(project, id)` → permanent removal.

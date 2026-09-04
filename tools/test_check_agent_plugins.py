@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_agent_plugins import AgentPluginValidationError, ROOT, validate
+from tools.check_agent_plugins import AgentPluginValidationError, ROOT, validate, workspace_version
 
 
 class AgentPluginContractTests(unittest.TestCase):
@@ -29,6 +29,7 @@ class AgentPluginContractTests(unittest.TestCase):
             ROOT / "contracts/native-mcp-v2.json",
             root / "contracts/native-mcp-v2.json",
         )
+        shutil.copy2(ROOT / "Cargo.toml", root / "Cargo.toml")
         shutil.copytree(
             ROOT / "conformance/mcp",
             root / "conformance/mcp",
@@ -79,15 +80,15 @@ class AgentPluginContractTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentPluginValidationError, "Claude Code marketplace"):
                 validate(root)
 
-    def test_plugin_version_is_the_bounded_slice_version(self) -> None:
+    def test_plugin_version_is_the_workspace_version(self) -> None:
         self.assertEqual(
             json.loads(
                 (ROOT / "plugins/hyphae/.codex-plugin/plugin.json").read_text(encoding="utf-8")
             )["version"],
-            "2.1.0",
+            workspace_version(ROOT),
         )
 
-    def test_plugin_version_cannot_remain_on_the_legacy_bundle(self) -> None:
+    def test_plugin_version_cannot_diverge_from_the_workspace(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
             for relative in (
@@ -96,8 +97,12 @@ class AgentPluginContractTests(unittest.TestCase):
                 ".claude-plugin/marketplace.json",
             ):
                 path = root / relative
-                path.write_text(path.read_text(encoding="utf-8").replace("2.1.0", "0.2.0"), encoding="utf-8")
-            with self.assertRaisesRegex(AgentPluginValidationError, "bounded 2.0"):
+                current = workspace_version(root)
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(current, "0.2.0"),
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(AgentPluginValidationError, "workspace version"):
                 validate(root)
 
     def test_credential_material_is_rejected_everywhere(self) -> None:
