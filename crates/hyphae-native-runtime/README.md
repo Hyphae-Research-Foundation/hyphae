@@ -1,5 +1,13 @@
 # hyphae-native-runtime
 
+```toml
+[dependencies]
+hyphae-native-runtime = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 This unpublished crate is the first executable convergence slice for Hyphae's
 native data ecosystem. It owns a single data directory and coordinates native
 catalog, relational, structure, lexical-search, and ANN state through

@@ -1,5 +1,13 @@
 # hyphae-native-wal
 
+```toml
+[dependencies]
+hyphae-native-wal = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Internal, unpublished block-framed WAL codec and append/recovery file for the
 native Hyphae transaction substrate.
 

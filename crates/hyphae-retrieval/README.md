@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-retrieval
 
@@ -8,12 +8,11 @@
 Exact provider-neutral cosine retrieval and explicit abstention semantics for
 [Hyphae](https://hyphae.dev).
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The crate is published at `3.0.0`:
 
 ```toml
 [dependencies]
-hyphae-retrieval = "0.2.1"
+hyphae-retrieval = "=3.0.0"
 ```
 
 The caller owns vectors and any optional embedding provider. This crate does
@@ -21,4 +20,4 @@ not contact a model, persist embeddings, or introduce a cloud dependency.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

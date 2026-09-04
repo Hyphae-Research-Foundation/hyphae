@@ -47,8 +47,10 @@ are not already known. Use only the narrowest matching tool:
   collection by bounded lexical retrieval. Expired or forgotten memories
   never return, and with `prove` the response carries the sealed proof,
   witness, and anchor so the recall itself is offline-verifiable. The
-  write-scoped memory store, journal, and forget tools appear only when the operator
-  starts the adapter with ingest allowed.
+  write-scoped memory store and forget tools appear only when the operator
+  starts the adapter with ingest allowed; a separate journal tool exists
+  only in the Agent Memory profile (`hyphae mcp --profile memory`), not
+  here.
 
 Treat structured `ProductError` values as the authoritative denial. Never put
 `role`, `scope`, `authority`, `api_key`, or similar control fields into tool

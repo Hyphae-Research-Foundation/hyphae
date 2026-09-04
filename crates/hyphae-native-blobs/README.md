@@ -1,5 +1,13 @@
 # hyphae-native-blobs
 
+```toml
+[dependencies]
+hyphae-native-blobs = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 This unpublished crate owns Hyphae's first immutable content-addressed blob
 store. Blob files bind an exact logical length, stable `BlobId`, CRC32C, and
 BLAKE3 content digest. Publication uses a synchronized create-new temporary

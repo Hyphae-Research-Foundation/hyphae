@@ -1,5 +1,13 @@
 # hyphae-native-records
 
+```toml
+[dependencies]
+hyphae-native-records = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 This unpublished crate owns the canonical binary encodings for committed MVCC
 rows, catalog-ordered typed tuples, row-version pointers, and immutable blob
 references. Rows and `HYTUPL01` tuples carry no per-column type tags; the

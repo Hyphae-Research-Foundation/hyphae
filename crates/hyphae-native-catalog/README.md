@@ -1,5 +1,13 @@
 # hyphae-native-catalog
 
+```toml
+[dependencies]
+hyphae-native-catalog = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Internal, unpublished immutable catalog model shared by Hyphae's native
 relational, structure, and search engines. It owns the bounded canonical
 `HYCOBJ01` definition codec used by legacy WAL mutations, and the additive

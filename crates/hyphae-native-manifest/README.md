@@ -1,5 +1,13 @@
 # hyphae-native-manifest
 
+```toml
+[dependencies]
+hyphae-native-manifest = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 This unpublished crate owns immutable, digest-chained root manifests for native
 checkpoints. A manifest binds one committed all-engine `RootSet`, its WAL
 anchor, and its predecessor.

@@ -71,5 +71,57 @@
         "closure": 31798866604
       }
     }
+  ],
+  "release_closures": [
+    {
+      "release": "v1.2.0",
+      "commit": "fc48d27",
+      "source_commit": "fc48d276a52320afae2f3c5cfb0df19ed8e4e677",
+      "readiness_run": 32200238284,
+      "release_run": 32200240005,
+      "closure_run": 32201136285,
+      "aggregate_sha256": "e3cb7eaca04e2c28681b2ff5f969731df9a6cfd8bfcc4e3c82f9a9a9d8e2c6a1"
+    },
+    {
+      "release": "v1.2.1",
+      "commit": "bc971c5",
+      "source_commit": "bc971c5bbbd415bee4297021a458fa4a4ba890bb",
+      "readiness_run": 32213097522,
+      "release_run": 32213098884,
+      "closure_run": 32214588620,
+      "aggregate_sha256": "e045430c3a99a2cf3d81a45c730031f741c094549375a2c3ecc3d033ef3a06cb"
+    },
+    {
+      "release": "v1.2.2",
+      "commit": "0471ae2",
+      "source_commit": "0471ae25b263fd506da1578068ec57429a6783de",
+      "readiness_run": 32253721973,
+      "release_run": 32253724833,
+      "closure_run": 32256031172,
+      "aggregate_sha256": "aa7a76f3e8aacc87a8da4afb412f7c8fb152b1703975da22bda1f74deaa44543"
+    },
+    {
+      "release": "2.2.0",
+      "tag": "release-v2.2.0-crates",
+      "commit": "5bd8afb",
+      "source_commit": "5bd8afbd036c5d18b2fce7c6f82abd5f306c02a2",
+      "readiness_run": 33216579500,
+      "release_run": 33229504738,
+      "closure_run": 33217308987,
+      "aggregate_sha256": "adbaef5a411ee3f72aac49ab98dfaa258d61894c12ed3540bdf5da07e74a6179",
+      "note": "reconstructed from the tag's own workflow_dispatch runs; no docs/release/receipts/2.2.0.md exists"
+    },
+    {
+      "release": "3.0.0",
+      "tag": "release-v3.0.0-crates",
+      "commit": "24bce1a",
+      "source_commit": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+      "readiness_run": 33836088262,
+      "release_run": 33838703304,
+      "closure_run": 33836655173,
+      "aggregate_sha256": "41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf",
+      "registry_run": 33859889168,
+      "retained_evidence": "docs/gates/evidence/closures/native-g8-24bce1a.json"
+    }
   ]
 }

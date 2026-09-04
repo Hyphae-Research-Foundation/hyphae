@@ -4,9 +4,8 @@
 Next, and Vite. `astro`, `next`, and `vite` are optional peer dependencies; an
 application installs only the host and integration it chooses.
 
-The `0.2.1` package is maintained as source-only in this repository. This
-guide does not claim npm publication without a separate registry release and
-receipt.
+The `3.0.0` package is maintained as source-only in this repository. Per the
+`3.0.0` release receipt's distribution boundary, it is not published to npm.
 
 - `./astro` creates middleware that places a public client in request-local
   `Astro.locals`.

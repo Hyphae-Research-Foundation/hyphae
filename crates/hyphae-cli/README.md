@@ -1,17 +1,17 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-cli
 
 [![crates.io](https://img.shields.io/crates/v/hyphae-cli?logo=rust)](https://crates.io/crates/hyphae-cli)
-[![GitHub release](https://img.shields.io/github/v/release/celiumsai/hyphae?logo=github)](https://github.com/celiumsai/hyphae/releases/latest)
+[![GitHub release](https://img.shields.io/github/v/release/Hyphae-Research-Foundation/hyphae?logo=github)](https://github.com/Hyphae-Research-Foundation/hyphae/releases/latest)
 
 The single `hyphae` executable: local data engine, operations CLI, `/v1`
 server, remote client, offline proof verifier, and MCP stdio adapter.
 
-The command below is valid only after crates.io lists version `0.2.1`:
+The crate is published at `3.0.0`:
 
 ```bash
-cargo install hyphae-cli --version 0.2.1 --locked
+cargo install hyphae-cli --version 3.0.0 --locked
 hyphae version --json
 ```
 
@@ -27,4 +27,4 @@ does not negotiate larger custom-server values from capabilities.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Quickstart, release
 verification, and security policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

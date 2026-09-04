@@ -4,18 +4,17 @@ Do not disclose suspected vulnerabilities in public issues, discussions, pull
 requests, or chat logs.
 
 Report a vulnerability through GitHub private vulnerability reporting for
-`celiumsai/hyphae`, or contact `security@celiums.ai` if that channel is not
-available. Include the affected revision, platform, reproduction steps,
-impact, and any proposed mitigation.
+`Hyphae-Research-Foundation/hyphae`, or contact `hello@celiums.ai` if that
+channel is not available. Include the affected revision, platform,
+reproduction steps, impact, and any proposed mitigation.
 
 ## Supported versions
 
 | Version | Supported |
 |---|---|
-| `0.2.0` | Yes |
-| `0.1.0` | Yes |
-| `0.2.1` source candidate | Not released |
-| `< 0.1.0` | No |
+| `3.0.0` | Yes, current release line |
+| `2.2.0` | Security fixes only, until the next 3.x minor is released |
+| Older `2.x`, `1.x`, `0.x` | No |
 
 ## Baseline security guarantees
 
@@ -27,10 +26,6 @@ impact, and any proposed mitigation.
   limits.
 - External providers are optional and cannot enter the core dependency path.
 
-These guarantees are release requirements. The historical `0.2.0` gate
-records complete local evidence, but this repository does not retain enough
-commit-bound hosted receipts to close its two hosted items. The published tag,
-GitHub release, and registry entries do not substitute for that missing
-evidence. Any source change, including the `0.2.1` candidate, requires the
-complete gate matrix to pass again on one exact commit before it becomes a
-supported release.
+These guarantees are release requirements. The `3.0.0` release evidence
+(signed archives, SBOMs, provenance, and G8 closure) is bound to its exact
+release commit; see `docs/release/verification.md` for how to verify it.

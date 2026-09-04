@@ -1,5 +1,13 @@
 # hyphae-native-types
 
+```toml
+[dependencies]
+hyphae-native-types = "=3.0.0"
+```
+
+The workspace pins every internal crate, including this one, to this exact
+version.
+
 Internal, unpublished canonical identities, logical-type descriptors,
 primitive scalar storage codecs, and memcomparable ordered-index components for
 the native Hyphae substrate.

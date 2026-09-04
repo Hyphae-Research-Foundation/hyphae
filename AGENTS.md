@@ -40,6 +40,9 @@
 - Add failure-path tests for durable behavior.
 - Do not claim a roadmap phase complete without its exit evidence.
 - Never add an automation attribution trailer to a commit.
+- Every release updates `docs/gates/native-gate-status.md`,
+  `config/native-gate-status.json`, `SECURITY.md` supported versions, and the
+  crate/SDK READMEs' version pins.
 
 ## Cursor Cloud specific instructions
 

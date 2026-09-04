@@ -1,9 +1,9 @@
 {
   "name": "hyphae",
-  "version": "2.1.0",
-  "description": "Inspect a local Hyphae data engine through bounded Native v2 MCP tools.",
+  "version": "3.0.0",
+  "description": "Bounded Native v2 MCP tools with an Instance-scoped Auditor API key: capabilities and redacted security metadata, lexical and integrated search, search proofs and offline verification, and Agent Memory recall, with write tools listed only when the operator allows ingest.",
   "author": {
-    "name": "Celiums Solutions LLC",
+    "name": "Hyphae Research Foundation",
     "url": "https://hyphae.dev"
   },
   "homepage": "https://hyphae.dev",
@@ -14,8 +14,8 @@
   "interface": {
     "displayName": "Hyphae",
     "shortDescription": "Inspect a local Native Hyphae engine.",
-    "longDescription": "Give Codex bounded read-only Native v2 capability and security metadata tools backed by one durable Hyphae Instance-scoped Auditor API-key authority.",
-    "developerName": "Celiums Solutions LLC",
+    "longDescription": "Give Codex bounded Native v2 MCP tools backed by one durable Hyphae Instance-scoped Auditor API-key authority: capabilities and redacted security metadata, lexical and integrated search, search proofs and offline verification, and Agent Memory recall, with write tools listed only when the operator allows ingest.",
+    "developerName": "Hyphae Research Foundation",
     "category": "Developer Tools",
     "capabilities": ["Read"],
     "websiteURL": "https://hyphae.dev",

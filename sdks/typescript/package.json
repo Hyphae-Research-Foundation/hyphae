@@ -3,6 +3,17 @@
   "version": "3.0.0",
   "description": "Bounded TypeScript client for Hyphae v1 and Native v2 APIs",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
+    "directory": "sdks/typescript"
+  },
+  "homepage": "https://hyphae.dev",
+  "bugs": {
+    "url": "https://github.com/Hyphae-Research-Foundation/hyphae/issues"
+  },
+  "author": "Hyphae Research Foundation",
+  "keywords": ["hyphae", "database", "sql", "search", "vector", "rag", "mcp"],
   "type": "module",
   "engines": {
     "node": ">=20"

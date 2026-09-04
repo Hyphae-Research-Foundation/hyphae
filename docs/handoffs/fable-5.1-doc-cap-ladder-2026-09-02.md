@@ -1,6 +1,8 @@
 # Fable 5.1 handoff — Hyphae engine, doc-cap ladder, and Studio
 
-Status: current handoff as of 2026-09-02. The previous handoff
+Status: as of 2026-09-03 (addendum); superseded by the 3.0.0 release, see
+[`docs/release/receipts/3.0.0.md`](../release/receipts/3.0.0.md). The previous
+handoff
 ([`fable-5-native-ecosystem-2026-08-02.md`](fable-5-native-ecosystem-2026-08-02.md))
 is superseded historical context; do not use its gate table.
 
@@ -499,6 +501,12 @@ labelled so.
 ---
 
 ## Quick start for Fable 5.1
+
+Historical: this block is as it stood when HEAD was `1b2cc70`, before the
+2026-09-03 addendum above. Step 4's open item 1 (the manifest) was completed
+in that addendum (`92f3c7a`, `51d8fb0`); do not re-run this quick start as
+written — see the addendum and [3.0.0 shipped](../roadmap.md#300-shipped-2026-09-04)
+for the current state.
 
 1. `cd ~/Documents/hyphae && git status && git log --oneline -12` — confirm
    HEAD `1b2cc70`, clean tree, branch unpushed.

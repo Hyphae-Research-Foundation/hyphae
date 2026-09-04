@@ -3,9 +3,9 @@
 `hyphae-sdk` is the bounded Python client for APIs v1 and Native v2. It requires
 Python 3.11 or newer, uses only the standard library at runtime, and includes
 typed generated models plus a `py.typed` marker. Native v2 has source-compatible
-synchronous calls and an async adapter with an owned serial worker. The
-development source package version is `1.1.0`; this guide does not claim PyPI
-publication without a separate registry release and receipt.
+synchronous calls and an async adapter with an owned serial worker. The source
+package version is `3.0.0`. Per the `3.0.0` release receipt's distribution
+boundary, this package is source-only in `3.0.0`: it is not published to PyPI.
 
 The distribution is named `hyphae-sdk` and the import package is
 `hyphae_sdk`. The unrelated `hyphae` distribution on PyPI is not this project.
@@ -83,7 +83,10 @@ or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
 `/v2/execute`. Both reconstruct `ProductError` typed fields and accept
 `RequestOptions` deadlines and cancellation.
 
-Managed local sessions negotiate Native 1.3 and authenticate in the bounded
+Managed local sessions negotiate Native local protocol minor 5, with minors
+3 through 5 supported (`hyphae_sdk.v2.protocol.PROTOCOL_MINOR` and
+`PROTOCOL_MINORS_SUPPORTED` in `http.py`); the TypeScript SDK's codec speaks
+minor 6. Sessions authenticate in the bounded
 `HELLO` trailer. Security metadata responses contain no credential secret or
 verifier, and every security mutation requires a caller-selected nonzero
 idempotency token:
@@ -125,6 +128,23 @@ The same typed security methods work through
 `security_principal_set_enabled`, `security_custom_role_create`,
 `security_built_in_assignment_create`, `security_custom_assignment_create`,
 and `security_assignment_revoke`.
+
+### Native v2 surface
+
+`hyphae_sdk.v2.HyphaeClient` methods, by area:
+
+- SQL: `sql`, `prepare_sql`, `execute_prepared`, `deallocate_prepared`.
+- Structures: `structure_get`, `structure_set`, `structure_ttl`,
+  `structure_mutate`, `structure_read`.
+- Search: `search`, `search_collection`, `search_ingest`,
+  `search_document_update`, `search_document_delete`.
+- Transactions: `transaction_status`, `transaction_begin`,
+  `transaction_stage_sql`, `transaction_stage_structure`,
+  `transaction_stage_search`, `transaction_stage_vector`,
+  `transaction_commit`, `transaction_rollback`,
+  `explicit_transaction_status`, `transaction_status_by_idempotency`.
+- Proofs: `verify_proof`, `prove`, `prove_sql`.
+- Backup/restore: `backup`, `restore`.
 
 ### Native v2 lifecycle and async use
 

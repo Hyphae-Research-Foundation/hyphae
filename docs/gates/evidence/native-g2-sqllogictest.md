@@ -1,6 +1,7 @@
 # G2 SQLLogicTest corpus
 
-Status: bounded implementation evidence; G2 remains open.
+Status: bounded implementation evidence; not promoted into the G2 closure at
+`a839037`, which claims no universal SQL or official benchmark result.
 
 `crates/hyphae-native-runtime/tests/corpus/g2-smoke.slt` is a checked-in,
 SQLLogicTest-compatible corpus executed directly against the Hyphae Native SQL

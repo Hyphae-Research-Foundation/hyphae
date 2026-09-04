@@ -39,4 +39,13 @@ transactions used, crash budget exhausted) that are not errors.
 
 Checked results are recorded as evidence receipts under
 [`docs/gates/evidence/`](../gates/evidence/) with the exact spec digest,
-TLC version, state counts, and wall time.
+TLC version, state counts, and wall time. Two dedicated-hardware receipts
+carry the actual TLC run: [the 2026-08-30 baseline, "1. Commit-protocol
+model checking
+(TLC)"](../gates/evidence/baseline-i7i-metal-2026-08-30.md#1-commit-protocol-model-checking-tlc)
+records the first run (79,063,806 states, depth 30, all six invariants
+held), and [the 2026-09-03 re-measurement, "1. Commit-protocol model
+checking (TLC), with spec digest"](../gates/evidence/baseline-i7i-metal-2026-09-03.md#1-commit-protocol-model-checking-tlc-with-spec-digest)
+reproduces the identical state counts against the exact spec/config/tool
+SHA-256 digests. Wording for any external statement about this model
+follows [`docs/product/claims.md`](../product/claims.md#formal-model-claims).

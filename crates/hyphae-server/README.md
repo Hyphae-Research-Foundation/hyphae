@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-server
 
@@ -8,12 +8,11 @@
 Secure, loopback-first HTTP server for the [Hyphae](https://hyphae.dev) data
 engine and its proof-bearing `/v1` API.
 
-The registry coordinate below is valid only after crates.io lists version
-`0.2.1`:
+The crate is published at `3.0.0`:
 
 ```toml
 [dependencies]
-hyphae-server = "0.2.1"
+hyphae-server = "=3.0.0"
 ```
 
 Remote bind requires explicit authentication. Request, result, concurrency,
@@ -29,4 +28,4 @@ exhausted.
 
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source, threat model, and
 security policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).

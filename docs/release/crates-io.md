@@ -44,6 +44,20 @@ the tag being published. The trusted checker and policy are loaded from the
    Sigstore-signed Release. If repository policy changes to require a signed Git
    tag, set `tag_signature.required=true` and ensure the runner has the trusted
    verification keyring before publication.
+
+   This protection must actually exist on the environment, not only in
+   workflow YAML that names it: the GitHub environment must carry a
+   `required_reviewers` protection rule, or the `registry-production` job
+   dispatches without ever pausing for approval. Before the `3.0.0`
+   publication the environment (created 2026-08-19) held the registry token
+   but no protection rule at all, and the `2.2.0` live run published without
+   any approval; the required-reviewer rule was added on 2026-09-04, and the
+   `3.0.0` live run (`33859889168`) is the first one that paused for and
+   recorded an approval. Confirm the rule before every publication with
+   `gh api repos/OWNER/REPO/environments/registry-production` and read
+   `protection_rules` back, rather than assuming the environment name in the
+   workflow file is enough. The [`3.0.0` receipt](receipts/3.0.0.md) records
+   the approval.
 6. Run the workspace validation and package-content audit:
 
    ```bash
@@ -126,6 +140,95 @@ continue at a partial topological layer without republishing them. Every crates
 layer must be completely visible before the next layer starts. The workflow is
 also intentionally fail-closed if a required artifact expires or any check,
 tag, main tip, policy file, or digest changes between gate and upload.
+
+## Readiness, G8 closure, and release dispatch inputs
+
+Three separate `workflow_dispatch` calls carry the source commit forward from
+readiness through the signed GitHub Release. Each is a distinct workflow with
+its own input names; do not assume one workflow's input name applies to
+another. The worked example throughout is the `3.0.0` publication, recorded in
+full in [the `3.0.0` receipt](receipts/3.0.0.md).
+
+1. **Readiness matrix** — `.github/workflows/native-g7-g8-readiness.yml`,
+   dispatched at the release readiness tag (`release-vX-registry`). Its
+   inputs are `g7_mode` (`authority` or `benchmark`; `authority` runs no
+   hardware benchmark) and `g8_mode` (`authority` or `matrix`). For `3.0.0`,
+   this ran at tag `release-v3.0.0-registry` with `g7_mode=authority`,
+   `g8_mode=matrix`, producing [run `33836088262`](https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/33836088262).
+
+2. **G8 exact-SHA closure** — `.github/workflows/native-g8-closure.yml`,
+   dispatched from a branch sitting at the source commit (for `3.0.0`, the
+   merge-evidence branch `release/fix/release-readiness-semver-offline-merge-evidence`).
+   Its inputs, verified against the workflow file, are:
+   - `source_commit` — the exact 40-character merge commit G8 closes;
+   - `release_source_commit` — the exact second-parent commit that produced
+     the Release evidence;
+   - `readiness_run_id` — the successful readiness run containing the G8
+     matrix evidence;
+   - `release_run_id` — a successful Release workflow run for that same
+     commit.
+
+   For `3.0.0`: `source_commit=24bce1accdff8d14127797afe6f237a57c1cd4f3`,
+   `readiness_run_id=33836088262`, producing
+   [run `33836655173`](https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/33836655173).
+   `release_run_id` here does not name the later recovery dispatch that cut
+   the tag (below); the `Release` workflow's own required checks bind to
+   `pull_request` events on the reviewed PR head, so the qualifying run is
+   the one triggered by PR `#262` itself. Querying the Checks API for that
+   PR's head commit (`d27546fda8b65cb253b88213e085f88c4d8b026d`) shows its
+   `Assemble and verify release candidate` job on
+   [run `33832418699`](https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/33832418699) —
+   independently confirmed here via `gh api`, since the `3.0.0` receipt does
+   not itself record this particular run ID.
+
+3. **Release** — `.github/workflows/release.yml`. Its normal trigger is a
+   `v*` tag push; its `workflow_dispatch` inputs (`release_tag`,
+   `release_commit`) exist only for the documented recovery path — an
+   existing immutable tag whose initial tag-triggered run failed. For
+   `3.0.0`, the Release workflow was dispatched from `main` this way:
+   `release_tag=release-v3.0.0-crates`, `release_commit=24bce1accdff8d14127797afe6f237a57c1cd4f3`,
+   producing [run `33838703304`](https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/33838703304)
+   at main tip `8a58749d892a52e38c651669ade03df5a6ee54af`. That main-tip
+   commit is what `config/registry-publish-authority.json` and
+   `tools/check_registry_publish.py` record as `release_run_commit` — the
+   commit `main` was at when the qualifying Release run executed, not a
+   dispatch input of `release.yml` itself.
+
+## Control-plane commits
+
+Publication authority is promoted to a new version in two separate control
+commits on `main`, mirroring the pattern used for `2.2.0`. Both are plain
+config/workflow edits — neither touches source crates or the tagged tree.
+
+- **Tag-pin control commit** — [`8a58749d…`](https://github.com/Hyphae-Research-Foundation/hyphae/commit/8a58749d892a52e38c651669ade03df5a6ee54af)
+  ([PR `#263`](https://github.com/Hyphae-Research-Foundation/hyphae/pull/263)).
+  Moves every registry authority, the live-publish guard, the `Release` tag
+  guard, the trusted checker and its fixtures, and the crates.io runbook to
+  name the new annotated tag (`release-v3.0.0-crates`) rather than an exact
+  commit. Touches `.github/workflows/registry-publish.yml`,
+  `.github/workflows/release.yml`, `config/crates-io-release.json`,
+  `config/npm-release.json`, `config/registry-publish-authority.json`,
+  `docs/gates/evidence/relicensing-1.2.0-transition.json`,
+  `docs/release/crates-io.md`, `packaging/README.md`,
+  `tools/check_registry_publish.py`, and
+  `tools/test_check_registry_publish.py`. Source, tree, tag-object, and
+  release-run pins are left at their prior release's values in this commit —
+  they only move in the next one.
+
+- **Exact-SHA pin control commit** — [`74ea4d8d…`](https://github.com/Hyphae-Research-Foundation/hyphae/commit/74ea4d8d3496014d5299205f307bc7df77758e89)
+  ([PR `#264`](https://github.com/Hyphae-Research-Foundation/hyphae/pull/264)).
+  Follows the `Release` dispatch above and promotes `SOURCE_COMMIT`,
+  `SOURCE_TREE`, `TAG_OBJECT`, `RELEASE_RUN_COMMIT`, and every pinned
+  `head_sha`/artifact literal in `config/registry-publish-authority.json` and
+  `tools/check_registry_publish.py` from the prior release's exact SHAs to
+  `3.0.0`'s. Touches `config/registry-publish-authority.json`,
+  `docs/gates/evidence/relicensing-1.2.0-transition.json`, and
+  `tools/check_registry_publish.py`. `Registry publish` is dispatched from
+  `main` only after this commit merges — dry run first, then live with
+  `registry-production` approval.
+
+(File lists above come from `gh pr view --json files` against the live
+repository, not from the receipt.)
 
 ## Verify consumers
 

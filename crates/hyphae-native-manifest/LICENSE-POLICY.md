@@ -17,9 +17,9 @@ Hyphae uses separate licenses by dominant purpose:
 
 The Hyphae name, logos, product marks, and brand identity are not granted under
 either license. Their use is governed by
-[`TRADEMARKS.md`](https://github.com/celiumsai/hyphae/blob/main/TRADEMARKS.md).
+[`TRADEMARKS.md`](https://github.com/Hyphae-Research-Foundation/hyphae/blob/main/TRADEMARKS.md).
 Third-party components and materials retain their own licenses; see
-[`THIRD_PARTY_NOTICES.md`](https://github.com/celiumsai/hyphae/blob/main/THIRD_PARTY_NOTICES.md),
+[`THIRD_PARTY_NOTICES.md`](https://github.com/Hyphae-Research-Foundation/hyphae/blob/main/THIRD_PARTY_NOTICES.md),
 dependency metadata, and
 the source-porting ledger where applicable.
 

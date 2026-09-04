@@ -1,6 +1,7 @@
 # G2 TPC-C ACID vertical
 
-Status: bounded implementation evidence; G2 remains open.
+Status: bounded implementation evidence; not promoted into the G2 closure at
+`a839037`, which claims no universal SQL or official benchmark result.
 
 `crates/hyphae-native-runtime/tests/tpcc_acid_g2.rs` implements a deterministic
 New-Order-derived transaction over district and order rows. The tests prove:

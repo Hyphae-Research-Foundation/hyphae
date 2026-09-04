@@ -1,8 +1,8 @@
 # Hyphae usage manual
 
-Status: current for the published `2.1.0` release. Every command, request
-shape, and output in this manual was executed against the released `2.1.0`
-binary; outputs are literal, trimmed only where marked. The normative
+Status: current for the published `3.0.0` release. Every command below was
+executed against the released `3.0.0` binary; outputs are literal, trimmed
+only where marked. The normative
 semantics remain in the versioned specifications under
 [`docs/native/`](native/local-product-v1.md) and the contracts under
 `contracts/`; this manual is the practical, end-to-end guide.
@@ -41,7 +41,7 @@ or LLM.
 From crates.io:
 
 ```bash
-cargo install hyphae-cli --version 2.1.0 --locked
+cargo install hyphae-cli --version 3.0.0 --locked
 hyphae version --json
 ```
 
@@ -49,19 +49,19 @@ hyphae version --json
 {
   "api_version": "v1",
   "disk_format_version": 2,
-  "engine_version": "2.1.0",
+  "engine_version": "3.0.0",
   "native_directory_format": 1,
   "product": "hyphae",
   "product_api_version": 1
 }
 ```
 
-The [GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/v2.1.0)
+The [GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v3.0.0-crates)
 ships signed archives for Linux x64, macOS x64/arm64, and Windows x64, each
 with SHA-256 checksums, SPDX/CycloneDX SBOMs, SLSA provenance, and Sigstore
 bundles; verify before installing. To embed, depend on exact versions:
-`hyphae-native-product = "=2.1.0"` for new applications, or
-`hyphae-engine = "=2.1.0"` for existing format-2 state. Client SDKs are
+`hyphae-native-product = "=3.0.0"` for new applications, or
+`hyphae-engine = "=3.0.0"` for existing format-2 state. Client SDKs are
 `hyphae-sdk` (Python 3.11+, standard library only) and `@hyphae_/hyphae`
 (Node 20+, ESM, no runtime dependencies).
 
@@ -174,6 +174,61 @@ aggregations, ORDER BY expressions, and disk spill fail closed.
 text without executing (`PrimaryKeyLookup(table=4)`); every mutation accepts
 `--durability strict|group|memory`.
 
+### Grouped and PostgreSQL-affinity forms
+
+Grouped queries additionally admit `HAVING` and an `ORDER BY` over group
+keys or aggregates, both with aliases:
+
+```bash
+hyphae sql --data-dir "$D" execute --statement \
+  'SELECT kind, COUNT(*) AS n, SUM(stars) AS total FROM notes
+   GROUP BY kind HAVING COUNT(*) >= 2 ORDER BY total DESC LIMIT 10'
+```
+
+```text
+{
+  "commit": null,
+  "result": {
+    "columns": ["kind", "n", "total"],
+    "rows": [["article", 3, 10], ["memo", 3, 8]],
+    "type": "rows"
+  },
+  "snapshot": { "catalog_version": 3, "visible_csn": 8, ... }
+}
+```
+
+**`HAVING`'s right-hand side must be a literal** — parameters inside
+`HAVING` fail closed, unlike everywhere else in the grammar. `SELECT
+DISTINCT` (plain projections only), `OFFSET` (with `LIMIT` still
+mandatory), and `BETWEEN` are also admitted:
+
+```bash
+hyphae sql --data-dir "$D" execute --statement \
+  'SELECT DISTINCT kind FROM notes ORDER BY id LIMIT 10'
+# → { "result": { "columns": ["kind"], "rows": [["article"], ["memo"]], "type": "rows" } }
+
+hyphae sql --data-dir "$D" execute --statement \
+  'SELECT id, body FROM notes ORDER BY id LIMIT 2 OFFSET 2'
+# → rows for id 3 and 4 — the first two matching rows are skipped, not returned
+
+hyphae sql --data-dir "$D" execute --statement \
+  'SELECT id, body, stars FROM notes WHERE id BETWEEN ? AND ? ORDER BY id LIMIT 10' \
+  --parameter 2 --parameter 5
+# → rows for id 2..5 inclusive; BETWEEN desugars to >= AND <= and accepts parameters
+```
+
+Every projection item, plain or aggregate, admits one `AS <identifier>`
+alias:
+
+```bash
+hyphae sql --data-dir "$D" execute --statement \
+  'SELECT id AS note_id, body AS text FROM notes ORDER BY id LIMIT 3'
+# → { "columns": ["note_id", "text"], "rows": [[1, "first offline note"], ...] }
+```
+
+Full grammar for `HAVING`, grouped `ORDER BY`, `DISTINCT`, `OFFSET`,
+`BETWEEN`, and aliases: [`sql-semantics-v1.md`](native/sql-semantics-v1.md).
+
 ## Structures
 
 Structures cover the string/counter/hash/list/set/sorted-set/stream space
@@ -233,6 +288,106 @@ Available reads: `string_get`, `counter_get`, `ttl`, `hash_get/scan/length`,
 bounded `set_algebra`, `sorted_set_score/rank/range/cardinality`, and
 `stream_range`. Full semantics:
 [`structures-semantics-v1.md`](native/structures-semantics-v1.md).
+
+### Native protocol minor 6: seven mutations, six reads
+
+Minor 6 adds seven Valkey-shaped typed mutations and six typed reads through
+the same `batch` and `read` envelopes. `batch`'s response is the commit
+receipt for the whole array — the CLI does not surface individual mutation
+outcomes (whether a conditional write applied, a resulting length, a popped
+member); read the structure back, or use an SDK's typed API, to observe a
+specific outcome.
+
+Known defect in `3.0.0`: a batch whose conditional mutations are **all**
+rejected (`string_set_conditional` with `if_absent` on an existing key,
+`hash_set_if_absent` on an existing field) stages nothing, and the empty
+commit is reported as `{"category":"corruption","code":"corruption"}` with
+exit class 9 even though the directory is healthy and unchanged. A batch that
+also carries an applied mutation commits normally. Tracked as
+[issue #268](https://github.com/Hyphae-Research-Foundation/hyphae/issues/268).
+
+```bash
+# SETNX (string_set_conditional): write only if absent
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"string_set_conditional","keyspace":3,"key":"session:cap",
+   "value":"v1","expires_at_micros":null,"condition":"if_absent"}]'
+
+# APPEND (string_append): concatenate onto the visible value
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"string_append","keyspace":3,"key":"session:cap","suffix":"-appended"}]'
+
+# SETRANGE (string_set_range): overwrite at a byte offset
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"string_set_range","keyspace":3,"key":"session:cap","offset":0,"patch":"V2"}]'
+```
+
+```bash
+hyphae structure --data-dir "$D" get --key session:cap
+# → { "found": true, "value": "V2-appended", "value_hex": "56322d617070656e646564" }
+```
+
+The three writes chain in sequence: `SETNX` creates `v1`; `APPEND` yields
+`v1-appended`; `SETRANGE` at offset 0 overwrites the first two bytes,
+yielding `V2-appended` — exactly what a follow-up `get` shows.
+
+```bash
+# HSETNX (hash_set_if_absent): the hash must already exist (create() first)
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"hash_set_if_absent","keyspace":20,"key":"profile:1","field":"role","value":"admin"}]'
+
+# ZINCRBY (sorted_set_increment): missing member starts from score 0.0
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"sorted_set_increment","keyspace":22,"key":"leaderboard","member":"alice","delta":5.0}]'
+
+# ZPOP (sorted_set_pop): remove the lowest- or highest-ranked member
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"sorted_set_pop","keyspace":22,"key":"leaderboard","end":"lowest"}]'
+
+# seeded SPOP (set_pop): deterministic member selection under an explicit seed
+hyphae structure --data-dir "$D" batch --mutations-json '[
+  {"operation":"set_pop","keyspace":21,"key":"tags:1","seed":42}]'
+```
+
+The six typed reads surface as `structure read`:
+
+```bash
+# sorted_set_score_range: ZRANGE_BY_SCORE / ZREVRANGE_BY_SCORE
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"sorted_set_score_range","keyspace":22,"key":"leaderboard",
+    "lower":"unbounded","upper":"unbounded","offset":0,"limit":10,"order":"ascending"}'
+# → { "result": { "entries": [ {"member":"bob","score":20.0}, {"member":"carol","score":30.0} ], "type": "sorted_set_entries" } }
+
+# hash_scan_reverse: HSCAN_REVERSE, descending field-byte order
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"hash_scan_reverse","keyspace":20,"key":"profile:1","start_before":null,"limit":10}'
+
+# hash_scan_match: HSCAN_MATCH with a bounded binary glob
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"hash_scan_match","keyspace":20,"key":"profile:1","pattern":"*",
+    "start_after":null,"output_limit":10,"visit_limit":100,"match_step_limit":100}'
+# → { "result": { "entries": [...], "match_steps": 10, "stop": "exhausted", "type": "hash_page", "visited": 2 } }
+
+# key_scan_match: KEY_SCAN_MATCH across every family in one keyspace
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"key_scan_match","keyspace":3,"pattern":"session:*",
+    "start_after":null,"output_limit":10,"visit_limit":100,"match_step_limit":100}'
+# → { "result": { "entries": [ {"family":"string","key":"session:cap"} ], "stop": "exhausted", "type": "key_page" } }
+
+# string_range: GETRANGE with Valkey-affine signed indices
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"string_range","keyspace":3,"key":"session:cap","start":0,"end":-1}'
+# → { "result": { "found": true, "type": "value", "value": "V2-appended" } }
+
+# set_random_members: SRANDMEMBER, deterministic under a seed
+hyphae structure --data-dir "$D" read --request-json \
+  '{"operation":"set_random_members","keyspace":21,"key":"tags:1","seed":7,"count":5}'
+# → { "result": { "type": "values", "values": [ {"value":"gamma"}, {"value":"alpha"} ] } }
+```
+
+The `set_random_members` result above only returns two members from a set
+seeded with three (`alpha`, `beta`, `gamma`) because the seeded `SPOP` call
+just above deterministically removed `beta`. Full semantics for all
+thirteen: [`structures-semantics-v1.md`](native/structures-semantics-v1.md#product-read-surface).
 
 ## The catalog
 
@@ -314,16 +469,109 @@ hyphae search --data-dir "$D" integrated --collection 13 \
 
 | Piece | Shapes |
 |---|---|
-| Filters (`--filter-json`) | `match_all` / `exists` / `compare` (equal, not_equal, less, less_or_equal, greater, greater_or_equal) / combinators `all`, `any`, `not` with `"filters":[...]` |
+| Filters (`--filter-json`) | `match_all` / `exists` / `compare` (equal, not_equal, less, less_or_equal, greater, greater_or_equal) / `in` (field equals any of a bounded same-type set) / `is_null` (field entirely absent) / `like` (`_`/`%` glob over a string field) / combinators `all`, `any`, `not` with `"filters":[...]` |
 | Vector strategy | `exact` (the oracle) / `ann` (incremental HNSW; discloses `approximate: true` plus candidate evidence) / `adaptive` |
-| ANN tuning | `--ef-search`, `--candidate-limit` |
-| Facets, metrics, sort | `--facets-json '[{"field":...,"limit":...}]'`, `--metrics-json`, `--sort-json` |
+| ANN tuning | `--ef-search`, `--candidate-limit`, `--max-distance` (finite nonnegative cutoff) |
+| Facets, metrics, sort | `--facets-json '[{"field":...,"limit":...}]'`, `--range-facets-json '[{"field":...,"ranges":[{"lower":?,"upper":?}]}]'`, `--metrics-json`, `--sort-json` |
+| Fusion, ranking, dedupe | `--fusion weighted-score\|relative-score`, `--autocut <1..16>` (knee-detection cut, steeper = more conservative), `--offset <n>` (skip leading hits before the limit window), `--dedupe-field`/`--dedupe-first-k` (first-k-per-parent) |
+| Highlighting | `--highlight-fragments <1..4>`, `--highlight-bytes <16..512>` (normalized-text byte budget per fragment) |
+| Lexical matching | `--minimum-match <n>` (distinct analyzed terms required), `--lexical-and` (every term required), `--lexical-prefix` (expand the final term as a bounded prefix), `--fuzzy <1..2>` (Levenshtein edit distance over every term), `--phrase` (exact consecutive analyzed phrase), `--field-boosts-json '[{"field":...,"weight_micros":...}]'` (BM25F) — `lexical_and`, `minimum_match`, `lexical_prefix`, `field_boosts_json`, `fuzzy`, and `phrase` are mutually exclusive |
 | Mutations | `update` (replaces one document across every branch), `delete`; both idempotent |
 
 Your application provides the vectors — Hyphae embeds no models. Mutations
 never rebuild the whole HNSW graph, and exact search stays available as the
 oracle. Semantics: [`search-semantics-v1.md`](native/search-semantics-v1.md)
 and [`ann-semantics-v1.md`](native/ann-semantics-v1.md).
+
+### Verified: fusion, autocut, range facets, offset, minimum-match, fuzzy, phrase, highlight
+
+Against an 8-document corpus (`category`, `price` doc-values; 2-dimensional
+vectors), relative-score fusion with highlighting:
+
+```bash
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --lexical "offline search engine" \
+  --vector-target exact --vector 1.0 --vector 0.0 --vector-strategy exact \
+  --fusion relative-score --highlight-fragments 2 --highlight-bytes 64 --limit 5
+```
+
+```text
+{
+  "hits": [
+    { "object_id": "1001", "score": 2.0,
+      "fragments": ["offline search engine with proofs and receipts"],
+      "doc_values": { "category": "article", "price": 5 } },
+    { "object_id": "1007", "score": 1.8339... },
+    { "object_id": "1005", "score": 1.5952... },
+    { "object_id": "1002", "score": 1.4444... },
+    { "object_id": "1008", "score": 0.7480... }
+  ],
+  "vector_branches": [ { "strategy": "exact_filtered", "exact_reranked": true, ... } ]
+}
+```
+
+`--offset` skips leading hits ahead of the limit window (`--limit 3
+--offset 2` on the same query returns the 3rd through 5th hits, not the
+1st through 3rd). `--autocut` finds a knee in the score curve and drops
+everything past it — the steepness argument trades recall for precision:
+
+```bash
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --lexical "offline search engine proofs receipts" \
+  --vector-target exact --vector 1.0 --vector 0.0 --vector-strategy exact \
+  --autocut 1 --limit 10
+# → 7 hits: the 8th candidate (score 0.0147, well below the other seven's
+#   ~0.03 band) is cut. The same query with --autocut 4 keeps all 8 —
+#   a gentler decay does not clear the steeper knee threshold.
+```
+
+Range facets bucket a numeric doc-value field into caller-defined ranges
+alongside the hits:
+
+```bash
+hyphae search --data-dir "$D" integrated --collection 13 --lexical offline \
+  --range-facets-json '[{"field":"price","ranges":[{"upper":10},{"lower":10,"upper":20},{"lower":20}]}]' \
+  --limit 10
+# → "range_facets": [ { "field": "price",
+#      "buckets": [ {"range_ordinal":0,"count":3}, {"range_ordinal":1,"count":1}, {"range_ordinal":2,"count":1} ] } ]
+```
+
+Lexical matching options select candidates before scoring: `minimum_match`
+requires a floor on distinct matched terms, `fuzzy` tolerates misspellings
+by edit distance, and `phrase` demands the exact consecutive sequence:
+
+```bash
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --lexical "offline search engine benchmark" --minimum-match 3 --limit 10
+# → 3 hits sharing at least 3 of the 4 query terms
+
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --lexical "offlne serch enigne" --fuzzy 2 --limit 10
+# → 7 of 8 documents match despite every query term being misspelled;
+#   only the one document sharing no term within edit distance 2 is excluded
+
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --lexical "offline search engine" --phrase --limit 10
+# → exactly the 2 documents containing "offline search engine" as a
+#   consecutive phrase (documents with "offline search" not immediately
+#   followed by "engine" do not match)
+```
+
+`in`, `is_null`, and `like` filters, verified on the same corpus:
+
+```bash
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --filter-json '{"operation":"in","field":"category","values":["memo","receipt"]}' --limit 10
+# → the 4 documents whose category is "memo" or "receipt"
+
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --filter-json '{"operation":"is_null","field":"nonexistent_field"}' --limit 10
+# → all 8 documents; none carry that field, so none are excluded
+
+hyphae search --data-dir "$D" integrated --collection 13 \
+  --filter-json '{"operation":"like","field":"category","pattern":"a%"}' --limit 10
+# → the 4 documents whose category starts with "a" ("article")
+```
 
 ## All-engine transactions
 
@@ -724,7 +972,7 @@ reproduced and resolved while validating this manual:
 
 ## Limits and non-capabilities
 
-Effective limits of the 2.1.0 build as reported by `capabilities` (yours
+Effective limits of the 3.0.0 build as reported by `capabilities` (yours
 are versioned in the contracts — consult them, do not assume):
 
 | Limit | Value | Limit | Value |

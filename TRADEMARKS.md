@@ -13,6 +13,9 @@ Hyphae's public versioned contracts. You may not imply sponsorship, ownership,
 certification, or official status; register confusingly similar marks; or use
 the identity for Hyphae Network, Mycelium, Celiums Network, or another product.
 
+Celiums Solutions LLC holds the Hyphae marks; Hyphae Research Foundation
+publishes the repository and packages under license from the mark holder.
+
 No registration status is represented by this document. Contact
-`legal@celiums.ai` before commercial co-branding or any use that may imply an
+`hello@celiums.ai` before commercial co-branding or any use that may imply an
 official relationship.

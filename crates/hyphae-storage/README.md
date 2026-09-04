@@ -1,4 +1,4 @@
-<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/celiumsai/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
+<p align="center"><a href="https://hyphae.dev"><img alt="Hyphae" src="https://raw.githubusercontent.com/Hyphae-Research-Foundation/hyphae/main/.github/assets/hyphae-lockup.svg" width="320"></a></p>
 
 # hyphae-storage
 
@@ -9,9 +9,11 @@ Durable local storage primitives for [Hyphae](https://hyphae.dev): an
 append-only checksummed and digest-chained log, atomic/idempotent mutation,
 recovery, snapshots, compaction, backups, and verified restore.
 
+The crate is published at `3.0.0`:
+
 ```toml
 [dependencies]
-hyphae-storage = "1.2.2"
+hyphae-storage = "=3.0.0"
 ```
 
 This crate owns the format-2 compatibility disk format. New applications
@@ -37,6 +39,10 @@ end-to-end deadline; restore still composes legacy verification, reopen, and
 snapshot paths. Filesystem calls and `sync_all` are not preemptible, so callers
 that need an absolute elapsed-time ceiling must enforce it operationally.
 
+At `3.0.0`, every `2.x` format-2 directory this crate opens upgrades in place
+on the first accepted mutation; directories written by `3.0.0` do not open on
+`2.x`. Format-2 itself is unchanged at `3.0.0`.
+
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Source and security
 policy:
-[`celiumsai/hyphae`](https://github.com/celiumsai/hyphae).
+[`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).
