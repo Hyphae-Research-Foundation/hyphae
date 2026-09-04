@@ -692,13 +692,13 @@ jobs:
         working-directory: integrations/javascript
         run: |
           npm ci --ignore-scripts
-          npm audit --audit-level=moderate
+          ../../tools/npm_audit.sh
           npm test
       - name: Prove hosts build without Hyphae
         working-directory: integrations/host-smoke
         run: |
           npm ci --ignore-scripts
-          npm audit --audit-level=moderate
+          ../../tools/npm_audit.sh
           npm test
       - name: Build standalone server
         run: cargo build -p hyphae-cli --locked

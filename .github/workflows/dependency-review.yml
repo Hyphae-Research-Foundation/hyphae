@@ -63,7 +63,7 @@ jobs:
           set -euo pipefail
           for directory in sdks/typescript integrations/javascript integrations/host-smoke conformance/mcp/hosts; do
             npm --prefix "$directory" ci --ignore-scripts
-            npm --prefix "$directory" audit --audit-level=moderate
+            tools/npm_audit.sh --prefix "$directory"
           done
       - name: Upload dependency review evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
