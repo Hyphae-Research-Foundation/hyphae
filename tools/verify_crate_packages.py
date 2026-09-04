@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from pathlib import Path, PurePosixPath
 
 if __package__ in {None, ""}:
@@ -20,6 +22,7 @@ from tools.check_registry_publish import validate_publish_authority
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_CONFIG = ROOT / "config" / "crates-io-release.json"
+WORKSPACE_LOCKFILE = ROOT / "Cargo.lock"
 
 
 def verification_manifest(packages: tuple[str, ...], version: str) -> str:
@@ -77,6 +80,54 @@ def validate_local_resolution(
         ):
             failures.append(f"{name}: verification did not use the extracted package")
     return failures
+
+
+def locked_registry_packages(lockfile: Path) -> set[tuple[str, str]]:
+    """Return every (name, version) the workspace lockfile pins to a registry."""
+    document = tomllib.loads(lockfile.read_text(encoding="utf-8"))
+    entries = document.get("package", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{lockfile.name}: package table is malformed")
+    locked: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or "source" not in entry:
+            continue
+        name, version = entry.get("name"), entry.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise ValueError(f"{lockfile.name}: package entry is malformed")
+        locked.add((name, version))
+    return locked
+
+
+def validate_locked_registry_resolution(
+    metadata: dict[str, object],
+    packages: tuple[str, ...],
+    locked: set[tuple[str, str]],
+) -> list[str]:
+    """Reject any registry package resolved at a version the lockfile did not pin.
+
+    The verification workspace is seeded with the workspace lockfile, so a
+    registry release published after the lockfile was written can never enter
+    the packaged build: Cargo may only drop lockfile entries the packaged
+    crates do not need, never pick a version the lockfile does not name.
+    """
+    expected = set(packages)
+    metadata_packages = metadata.get("packages", [])
+    if not isinstance(metadata_packages, list):
+        return ["verification metadata packages are malformed"]
+    failures: list[str] = []
+    for package in metadata_packages:
+        if not isinstance(package, dict) or package.get("name") in expected:
+            continue
+        name, version = package.get("name"), package.get("version")
+        if package.get("source") is None:
+            failures.append(f"{name}: verification resolved a non-registry dependency")
+            continue
+        if (name, version) not in locked:
+            failures.append(
+                f"{name} {version}: verification resolved a registry copy absent from Cargo.lock"
+            )
+    return sorted(failures)
 
 
 def extract_crate(
@@ -187,6 +238,12 @@ def main() -> int:
             (verification_root / "Cargo.toml").write_text(
                 verification_manifest(packages, version), encoding="utf-8"
             )
+            # Seed the verification workspace with the exact workspace lockfile:
+            # Cargo keeps every pinned version the packaged crates need and only
+            # prunes the entries they do not, so the registry index state at
+            # verification time cannot change what is built.
+            shutil.copyfile(WORKSPACE_LOCKFILE, verification_root / "Cargo.lock")
+            locked = locked_registry_packages(WORKSPACE_LOCKFILE)
             resolved = run_json(
                 verification_root,
                 "cargo",
@@ -195,6 +252,9 @@ def main() -> int:
                 "1",
             )
             failures = validate_local_resolution(resolved, packages, package_roots)
+            failures.extend(
+                validate_locked_registry_resolution(resolved, packages, locked)
+            )
             if failures:
                 raise ValueError("; ".join(failures))
             subprocess.run(

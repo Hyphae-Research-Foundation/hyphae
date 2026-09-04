@@ -692,13 +692,13 @@ jobs:
         working-directory: integrations/javascript
         run: |
           npm ci --ignore-scripts
-          npm audit --audit-level=moderate
+          ../../tools/npm_audit.sh
           npm test
       - name: Prove hosts build without Hyphae
         working-directory: integrations/host-smoke
         run: |
           npm ci --ignore-scripts
-          npm audit --audit-level=moderate
+          ../../tools/npm_audit.sh
           npm test
       - name: Build standalone server
         run: cargo build -p hyphae-cli --locked
@@ -785,15 +785,32 @@ jobs:
         shell: bash
         env:
           BASELINE_COMMIT: 08028e8dac077846c638f067ce74fbcf6fb75501
+          # The same rustdoc invocation cargo-semver-checks 0.48.0 performs
+          # itself (src/data_generation/generate.rs), minus its placeholder
+          # project: that project resolves dependencies without either
+          # Cargo.lock, so the gate inherited whatever the registry served
+          # that minute. Each crate is documented from its own lockfile here
+          # and the verifier compares the two rustdoc files.
+          RUSTC_BOOTSTRAP: "1"
+          RUSTDOCFLAGS: -Z unstable-options --document-private-items --document-hidden-items --output-format=json --cap-lints=allow
+          RUSTFLAGS: --cap-lints=allow
         run: |
           set -euo pipefail
           test "$(git rev-parse 'v0.2.1^{commit}')" = "$BASELINE_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/semver-baseline" "$BASELINE_COMMIT"
           while IFS= read -r package; do
-            "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
+            lib="${package//-/_}"
+            cargo doc --locked --lib --no-deps --all-features \
               --package "$package" \
-              --baseline-rev "$BASELINE_COMMIT" \
+              --target-dir "$RUNNER_TEMP/semver-current"
+            cargo doc --locked --lib --no-deps --all-features \
+              --package "$package" \
+              --manifest-path "$RUNNER_TEMP/semver-baseline/Cargo.toml" \
+              --target-dir "$RUNNER_TEMP/semver-baseline-target"
+            "$RUNNER_TEMP/cargo-semver-checks" semver-checks \
+              --current-rustdoc "$RUNNER_TEMP/semver-current/doc/${lib}.json" \
+              --baseline-rustdoc "$RUNNER_TEMP/semver-baseline-target/doc/${lib}.json" \
               --release-type major \
-              --all-features \
               --color never
           done < <(
             python3 -c \
