@@ -1131,6 +1131,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 ==============================================================================
+SHA-256: 27995d58ad5c1145c1a8cd86244ce844886958a35eb2b78c6b772748669999ac
+Packages:
+- autocfg 1.5.1 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-MIT]
+
+Copyright (c) 2018 Josh Stone
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+==============================================================================
 SHA-256: 29e9fe5074bd27e0e5d5d110394fbbcd841baee2651a3c4b4560a632702cede4
 Packages:
 - getrandom 0.3.4 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-MIT]
@@ -2416,6 +2447,7 @@ express Statement of Purpose.
 SHA-256: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 Packages:
 - arrayvec 0.7.8 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-APACHE]
+- autocfg 1.5.1 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-APACHE]
 - bitflags 1.3.2 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-APACHE]
 - bitflags 2.13.0 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-APACHE]
 - cc 1.2.67 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE-APACHE]
@@ -4280,6 +4312,31 @@ Packages:
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+==============================================================================
+SHA-256: eb69eece7d469c69466506e5819153646d8fb57b0350dadb62ac693f8a765c6b
+Packages:
+- memoffset 0.9.1 (registry+https://github.com/rust-lang/crates.io-index) [LICENSE]
+
+Copyright (c) 2017 Gilad Naaman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ==============================================================================
 SHA-256: f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1
