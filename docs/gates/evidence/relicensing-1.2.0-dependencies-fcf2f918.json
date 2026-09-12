@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-09-12T12:57:52.804626+00:00",
+  "generated_at_utc": "2026-09-12T13:13:11.990776+00:00",
   "inventory": {
     "canonical_sha256": "68695242fb9c14954affbd388ca95cfacb1aa5cb45f675b443f1768a776d8d11",
     "external_package_count": 273,
@@ -2158,13 +2158,13 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "864e10d34f3e54f652798a9880d6535531ea95c2",
+    "commit": "2ecef6344c7a3d7c152c48f7586295de11fcfd39",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
-    "source_inputs_sha256": "3733ec8817aa9f94bc2cc92d089d6633ccead8dd4facc5cf7efe65f63c9b192e",
-    "tree": "5706fb7e29f9cfa98bed7688da43e35e86fe40a1",
+    "source_inputs_sha256": "4804023bc23b812e00ada0c48fd39b2b6d965bcf5d8e23c4529c7823d720c6c9",
+    "tree": "61f85b2df4f28d81c08532a008ea958207219570",
     "worktree_clean": false
   },
   "source_inputs": [
@@ -2186,7 +2186,7 @@
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
-      "sha256": "779d74373022d0e0bbdc48d3015502377400fff433a5ac969f0d51a3604a2375"
+      "sha256": "20b2eefa33395032fe2ce78a86eda3c0f4e057884a6273b9859874f8a8f134f0"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.toml",
@@ -2194,7 +2194,7 @@
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.lock",
-      "sha256": "3a7cf0aad8f7bad4409b78fd7b7bb829696fa2c198d6fac2ca169b89fd052531"
+      "sha256": "ffe7dd6f29b88255e839d4a02bad754283fcc3e92525447a8c62ec752ae39156"
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.toml",
@@ -2250,7 +2250,7 @@
     },
     {
       "path": "crates/hyphae-native-daemon/Cargo.toml",
-      "sha256": "5117aacdd867cc6e3872026b70755c40fffdbe2d868639458515403feb86abad"
+      "sha256": "19c00e5e158591879ab11111e7f5a7f8e1b3268f1efe339693a2d52560a3053a"
     },
     {
       "path": "crates/hyphae-native-manifest/Cargo.toml",
