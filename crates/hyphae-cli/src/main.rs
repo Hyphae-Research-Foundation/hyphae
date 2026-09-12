@@ -11,6 +11,8 @@ mod compatibility;
 mod exit;
 mod json_value;
 mod mcp;
+#[cfg(unix)]
+mod memory_panel;
 mod migrate_valkey;
 mod native;
 mod native_client;
@@ -340,6 +342,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Serve a separately provisioned, least-privilege local memory client.
+    MemoryPanel {
+        #[command(subcommand)]
+        command: MemoryPanelCommand,
     },
     Mcp {
         /// Managed Native HTTP v2 root origin.
@@ -1812,6 +1819,22 @@ enum SearchQueryKind {
 }
 
 #[derive(Debug, clap::Subcommand)]
+enum MemoryPanelCommand {
+    /// Create a dedicated client credential without configuring any agent.
+    Init {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        socket: PathBuf,
+    },
+    /// Serve memory operations on a dedicated authenticated Unix socket.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
 enum AgentCommand {
     /// One bounded JSON operator request on stdin; used by the Omarchy plugin.
     Ui,
@@ -2018,6 +2041,24 @@ fn compatibility<T>(result: Result<T, Box<dyn std::error::Error>>) -> Result<T, 
 #[allow(clippy::too_many_lines)]
 async fn run(cli: Cli) -> Result<(), RunFailure> {
     match cli.command {
+        Command::MemoryPanel { command } => {
+            #[cfg(unix)]
+            {
+                match command {
+                    MemoryPanelCommand::Init { config, socket } => {
+                        memory_panel::initialize(&config, &socket).map_err(Into::into)
+                    }
+                    MemoryPanelCommand::Serve { config } => {
+                        memory_panel::serve(&config).await.map_err(Into::into)
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = command;
+                Err(RunFailure::Native(CliFailure::invalid()))
+            }
+        }
         Command::Version { json } => print_version(json).map_err(Into::into),
         Command::Put {
             data_dir,

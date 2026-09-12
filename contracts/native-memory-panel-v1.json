@@ -1,0 +1,410 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-memory-panel-contract-v1",
+  "interface": "hyphae-memory-panel-v1",
+  "transport": {
+    "kind": "unix-stream",
+    "framing": "one JSON request followed by client write EOF, one JSON response followed by close",
+    "request_bytes": 65536,
+    "response_bytes": 1048576,
+    "input_deadline_seconds": 5,
+    "operation_deadline_seconds": 120,
+    "write_deadline_seconds": 5,
+    "concurrent_requests": 4
+  },
+  "authority": {
+    "identity": "dedicated 256-bit OS-random panel token, distinct from every native/operator/client credential",
+    "peer": "same effective user; owner-only socket and parent directory",
+    "operations": [
+      "status",
+      "projects",
+      "recall",
+      "list",
+      "store",
+      "forget",
+      "backups",
+      "backup"
+    ],
+    "forbidden": "No operator dispatch, agent configuration, capture control, credential administration, service lifecycle, runtime/model installation, generic native API, restore, arbitrary paths, commands or proxy operations.",
+    "scope": "All memory projects belonging to the configured local user. Explicit store/forget and backup creation are included."
+  },
+  "request_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "schema": {
+        "const": "hyphae-memory-panel-v1"
+      },
+      "id": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 18446744073709551615
+      },
+      "token": {
+        "type": "string",
+        "pattern": "^hypm1_[0-9a-f]{64}$"
+      },
+      "operation": {
+        "enum": [
+          "status",
+          "projects",
+          "recall",
+          "list",
+          "store",
+          "forget",
+          "backups",
+          "backup"
+        ]
+      },
+      "arguments": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "schema",
+      "id",
+      "token",
+      "operation",
+      "arguments"
+    ],
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "status"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {},
+              "required": []
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "projects"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {},
+              "required": []
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "recall"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "project": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                "mode": {
+                  "enum": [
+                    "lexical",
+                    "hybrid"
+                  ]
+                },
+                "layer": {
+                  "enum": [
+                    "work",
+                    "personal",
+                    "journal",
+                    "all"
+                  ]
+                },
+                "prove": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "project"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "list"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "project": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                "mode": {
+                  "enum": [
+                    "lexical",
+                    "hybrid"
+                  ]
+                },
+                "layer": {
+                  "enum": [
+                    "work",
+                    "personal",
+                    "journal",
+                    "all"
+                  ]
+                },
+                "prove": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "project"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "store"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "project": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "text": {
+                  "type": "string",
+                  "maxLength": 2000,
+                  "minLength": 1
+                },
+                "kind": {
+                  "enum": [
+                    "fact",
+                    "decision",
+                    "constraint"
+                  ]
+                },
+                "layer": {
+                  "enum": [
+                    "work",
+                    "personal"
+                  ]
+                },
+                "scope": {
+                  "enum": [
+                    "project",
+                    "global"
+                  ]
+                }
+              },
+              "required": [
+                "project",
+                "text",
+                "kind"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "forget"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "project": {
+                  "type": "string",
+                  "maxLength": 256,
+                  "minLength": 1
+                },
+                "id": {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,40}$"
+                }
+              },
+              "required": [
+                "project",
+                "id"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "backups"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {},
+              "required": []
+            }
+          }
+        }
+      },
+      {
+        "if": {
+          "properties": {
+            "operation": {
+              "const": "backup"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "arguments": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {},
+              "required": []
+            }
+          }
+        }
+      }
+    ]
+  },
+  "connection_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "schema": {
+        "const": "hyphae-memory-panel-connection-v1"
+      },
+      "endpoint": {
+        "type": "string",
+        "minLength": 1
+      },
+      "token": {
+        "type": "string",
+        "pattern": "^hypm1_[0-9a-f]{64}$"
+      }
+    },
+    "required": [
+      "schema",
+      "endpoint",
+      "token"
+    ]
+  },
+  "response_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "schema": {
+        "const": "hyphae-memory-panel-v1"
+      },
+      "id": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "ok": {
+        "type": "boolean"
+      },
+      "result": {
+        "type": "object"
+      },
+      "error": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      }
+    },
+    "required": [
+      "schema",
+      "id",
+      "ok"
+    ]
+  },
+  "behavior": {
+    "proofs": "prove=true verifies the complete memory proof offline on the service and returns digest/anchor metadata without local paths; temporary proof files are removed.",
+    "backups": "List and create backups only in the configured memory backup directory's private panel subdirectory. IDs and checkpoint digests are returned; restore remains an independent operator action.",
+    "provenance": "Explicit writes receive memory-panel / user provenance from the server.",
+    "installation": "The user provisions Hyphae, memory services and the dedicated client configuration independently. The desktop client installs or administers neither the runtime nor agent integrations."
+  }
+}

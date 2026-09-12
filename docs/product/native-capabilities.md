@@ -86,3 +86,11 @@ backup-media policy, and optional vector generation.
 See the [Native product contract](../native/local-product-v1.md),
 [Native quickstart](../quickstart-native.md), and
 [current gate status](../gates/native-gate-status.md).
+
+## Dedicated desktop memory interface
+
+`hyphae memory-panel` provides an independently provisioned Unix socket with a
+dedicated credential for memory data, query/proof and backup operations. Its
+server-side dispatcher excludes operator and agent-configuration authority.
+See the [interface guide](../memory-panel.md) and
+[ADR 0030](../adr/0030-restricted-memory-panel-interface.md).

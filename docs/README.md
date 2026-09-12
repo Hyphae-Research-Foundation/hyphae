@@ -60,6 +60,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Stable API error codes](api/error-codes-v1.md)
 - [Public clients](clients/v1.md)
 - [Hyphae Agent Memory on Omarchy](integrations/omarchy.md)
+- [Dedicated local memory panel interface](memory-panel.md)
 - [Optional framework adapters](integrations/optional-adapters.md)
 - [Provable RAG cookbook](integrations/rag-cookbook.md)
 - [MCP adapter](../mcp/README.md)
@@ -342,3 +343,5 @@ links, this index, JSON examples, and the top-level CLI command inventory.
 `python tools/run_documentation_examples.py --binary target/debug/hyphae`
 executes the maintained HTTP examples. Public behavior changes must update the
 relevant contract, guide, example, and gate evidence in the same change.
+
+- [ADR-0030: Restricted memory panel interface](adr/0030-restricted-memory-panel-interface.md)

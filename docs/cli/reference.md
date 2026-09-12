@@ -51,6 +51,7 @@ binding or any malformed existing binding remains corruption.
 - `serve`
 - `remote`
 - `agent`
+- `memory-panel`
 - `mcp`
 <!-- cli-commands:end -->
 
@@ -843,3 +844,11 @@ proofs are written to `$XDG_STATE_HOME/hyphae/proofs/` for offline
 
 See the [configuration reference](../configuration.md) for precedence,
 security requirements, and programmatic server/client limits.
+
+## `memory-panel`
+
+`hyphae memory-panel init --config <private-file> --socket <private-socket>`
+creates a dedicated desktop credential. `hyphae memory-panel serve --config
+<private-file>` starts the restricted Unix memory interface. Provision the memory
+application independently; the panel interface contains only memory data,
+query/proof and backup operations. See the [guide](../memory-panel.md).
