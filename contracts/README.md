@@ -1,5 +1,10 @@
 # Public contracts
 
+`native-memory-panel-v1.json` is the normative, independently versioned
+desktop memory contract. Its dedicated authenticated Unix socket admits only
+memory data, query/proof and backup operations. It has no operator dispatch or
+agent-configuration authority. See ADR 0030 for the boundary and its limits.
+
 `openapi/hyphae-v1.yaml` remains the canonical published format-2 HTTP surface,
 and its JSON Schema 2020-12 documents define `/v1`. Native `dev` uses
 `openapi/hyphae-v2.yaml` plus `json-schema/native-v2.schema.json` as the
