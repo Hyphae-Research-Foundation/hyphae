@@ -21,6 +21,13 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Extend Rust, Python (sync/async), and TypeScript clients with memory operations
   and common wire fixtures. Preserve the existing protocol/proof versions for
   older operations. Fix the explicit cross-SDK SQL limit fixture.
+- Update reviewed Rust dependencies, including the futures memory-safety and
+  waker fixes, and keep auxiliary conformance lockfiles synchronized.
+- Refresh the pinned Codex 0.153.2 and Claude Code 2.1.260 MCP hosts, executable
+  provenance and license inventories; update both the TruffleHog action and
+  detector image to 3.97.4.
+- Update the isolated Tantivy benchmark baseline to 0.26.2, resolving the
+  vulnerable `lru` dependency to 0.16.4.
 
 This is unshipped source on top of 3.0.0. It is not a new crate/SDK registry
 release and does not inherit an exact-commit G7/G8 closure.

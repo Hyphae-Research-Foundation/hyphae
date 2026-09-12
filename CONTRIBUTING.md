@@ -9,8 +9,10 @@ explicitly authorized.
 
 `main` is the sole integration and release branch. Every pull request targets
 `main` and must pass the complete hosted check suite before merge. Direct
-pushes, force pushes, and branch deletion remain prohibited by repository
-protection; releases are tags on an exact, verified `main` commit. Release and
+pushes, force pushes, and deletion of `main` remain prohibited by repository
+protection; releases are tags on an exact, verified `main` commit. Delete
+obsolete PR branches after their useful changes are merged or their PRs are
+deliberately closed. Release and
 evidence pull requests merge with a merge commit, never squash or rebase:
 their receipts cite commit SHAs, and squashing or rebasing would break that
 citation. See [release verification](docs/release/verification.md).

@@ -182,11 +182,11 @@ class McpHostConformanceTests(unittest.TestCase):
         self.assertEqual(set(config["mcpServers"]), {"hyphae"})
         self.assertEqual(
             package["devDependencies"],
-            {"@anthropic-ai/claude-code": "2.1.233", "@openai/codex": "0.147.0"},
+            {"@anthropic-ai/claude-code": "2.1.260", "@openai/codex": "0.153.2"},
         )
-        self.assertEqual(lock["packages"]["node_modules/@openai/codex"]["version"], "0.147.0")
+        self.assertEqual(lock["packages"]["node_modules/@openai/codex"]["version"], "0.153.2")
         self.assertEqual(
-            lock["packages"]["node_modules/@anthropic-ai/claude-code"]["version"], "2.1.233"
+            lock["packages"]["node_modules/@anthropic-ai/claude-code"]["version"], "2.1.260"
         )
 
     def complete_evidence(self, directory: Path) -> None:

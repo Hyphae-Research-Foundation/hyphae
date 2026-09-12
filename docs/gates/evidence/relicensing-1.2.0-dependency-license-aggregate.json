@@ -186,47 +186,47 @@
         {
           "license": "SEE LICENSE IN README.md",
           "path": "node_modules/@anthropic-ai/claude-code",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-darwin-arm64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-darwin-x64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-linux-arm64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-linux-arm64-musl",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-linux-x64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-linux-x64-musl",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-win32-arm64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         },
         {
           "license": "SEE LICENSE IN LICENSE.md",
           "path": "node_modules/@anthropic-ai/claude-code-win32-x64",
-          "version": "2.1.233"
+          "version": "2.1.260"
         }
       ],
       "scope": "opt-in-development-and-real-host-conformance-only-not-redistributable-by-hyphae"
@@ -236,11 +236,11 @@
   "inventories": {
     "npm": [
       {
-        "canonical_sha256": "876edf5f73612c4b89d37a0b92cc4f7f14f15249bd8c932218e66a7044b864b9",
+        "canonical_sha256": "acf45c63fe6c9c047bb4549bfc1e6ec457f27bd1ad2b1c43c03c10f809211eb8",
         "lock": "conformance/mcp/hosts/package-lock.json",
         "package_count": 16,
         "result": "pass",
-        "sha256": "5f06a6b44b6d02603bb9bd70623df0019eda9cf73598c606071923eea86dd0e1"
+        "sha256": "f9630339a2999854f6dec1e85b9224398667ca7c9e94bbfb9346ad3fb89482f8"
       },
       {
         "canonical_sha256": "02bf90f58847631bde51cfb6723479f50317b553f329bbf5a86c8c41ab0c52f6",
@@ -275,11 +275,11 @@
       "runtime_dependency_count": 0
     },
     "rust": {
-      "canonical_sha256": "68695242fb9c14954affbd388ca95cfacb1aa5cb45f675b443f1768a776d8d11",
-      "package_count": 300,
+      "canonical_sha256": "138ee54cc5818db4a5d49934c724f598c77d6de1b6f82e6fa8df0b7818f078bc",
+      "package_count": 299,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "56a411b8976512636122cd2983aa5ec896ea8c84bd0c22bfdb3b6b7669ede9e6"
+      "sha256": "7ad71ecd0572cc85a077509e558aca477b7416e95a0994c579d5a99106b5bf80"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "2ecef6344c7a3d7c152c48f7586295de11fcfd39",
+      "commit": "9da2a804a51227e9caa91766a3d111bbdbd24cb4",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "61f85b2df4f28d81c08532a008ea958207219570"
+      "tree": "f01744ce3aecdcf912402663a5914669bf08fef8"
     }
   },
   "target_release": "1.2.0"

@@ -172,7 +172,7 @@ fn tantivy_run(
     for query_text in queries {
         let query = parser.parse_query(query_text)?;
         let hits = search.record(|| -> anyhow::Result<usize> {
-            let top = searcher.search(&query, &TopDocs::with_limit(TOP_K))?;
+            let top = searcher.search(&query, &TopDocs::with_limit(TOP_K).order_by_score())?;
             Ok(top.len())
         })?;
         hits_total += hits as u64;

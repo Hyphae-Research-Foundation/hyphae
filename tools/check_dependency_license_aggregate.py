@@ -45,15 +45,15 @@ ALLOWED_NPM_LICENSES = frozenset(
     }
 )
 PROPRIETARY_TOOLING_EXCEPTION = (
-    ("node_modules/@anthropic-ai/claude-code", "2.1.233", "SEE LICENSE IN README.md"),
-    ("node_modules/@anthropic-ai/claude-code-darwin-arm64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-darwin-x64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-linux-arm64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-linux-arm64-musl", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-linux-x64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-linux-x64-musl", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-win32-arm64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
-    ("node_modules/@anthropic-ai/claude-code-win32-x64", "2.1.233", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code", "2.1.260", "SEE LICENSE IN README.md"),
+    ("node_modules/@anthropic-ai/claude-code-darwin-arm64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-darwin-x64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-linux-arm64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-linux-arm64-musl", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-linux-x64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-linux-x64-musl", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-win32-arm64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
+    ("node_modules/@anthropic-ai/claude-code-win32-x64", "2.1.260", "SEE LICENSE IN LICENSE.md"),
 )
 LGPL_OBLIGATIONS = (
     "Preserve the applicable LGPL-3.0-or-later notices and license text with any redistributed covered binary.",
