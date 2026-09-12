@@ -130,7 +130,7 @@ def validate_schema_contract(schema: dict[str, Any]) -> None:
         or properties["status"] != {"const": "passed"}
         or properties["platform"].get("enum") != sorted(PLATFORMS)
         or properties["protocol"].get("properties")
-        != {"major": {"const": 1}, "minor": {"const": 3}}
+        != {"major": {"const": 1}, "minor": {"const": 7}}
         or properties["operations"].get("properties")
         != {
             "lifecycle": {"const": LIFECYCLE},
@@ -188,7 +188,7 @@ def validate_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     fixture_digest = _digest(fixture.get("sha256"), 64, "fixture binary digest")
 
     protocol = _exact_keys(receipt.get("protocol"), {"major", "minor"}, "protocol")
-    if protocol != {"major": 1, "minor": 3}:
+    if protocol != {"major": 1, "minor": 7}:
         fail("protocol version differs")
     expected_transports = (
         ["http-v2", "named-pipe"]

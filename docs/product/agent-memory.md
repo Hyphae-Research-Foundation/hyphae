@@ -3,6 +3,36 @@
 
 Local, shared, and verifiable memory for coding agents.
 
+## Unreleased Omarchy integration
+
+The Omarchy candidate adds a native panel, versioned operator controls,
+conservative capture policies and optional local semantic search. These
+features require the pinned candidate runtime; the published 3.0.0 binaries
+do not contain them. See [the operator contract](../native/agent-memory-control-v1.md)
+and [the native memory/proof contract](../native/agent-memory-read-v1.md).
+
+Semantic search starts disabled. Enabling it uses Hyphae's existing Candle
+embedding implementation, a fingerprinted local model, and RRF without an
+additional reranker. Migration takes a verified backup, copies and verifies
+live records into new physical collections, commits the active profile and
+retires the old generation. A persistent migration record supports retries;
+`hyphae agent recover` completes a committed cutover before managed service
+start. Capture remains in the durable spool during downtime.
+
+Proactive context is limited to 2,000 UTF-8 bytes with a one-second recall
+deadline by default. Malformed events or unavailable memory return an empty
+hook result and never block the host. Capture pause controls affect automatic
+capture; explicit user-authorized memory tools remain available. Project names
+are derived from a normalized Git remote, common Git directory, or canonical
+directory path and only the domain-separated digest is retained. Hashing a
+long path does not subject the path itself to memory-content heuristics.
+
+Complete memory proofs are generated only on explicit request. Their private
+files include a witness of retained directory data. They establish the result
+at the anchored snapshot, including project/lifecycle selection, and do not
+establish the truth of a note or independently prove that a model performed
+inference. Keep the anchor separately when exchanging proof artifacts.
+
 ## The problem and the primary workflow
 
 Coding agents forget everything between sessions, and every agent forgets
@@ -86,7 +116,9 @@ Every memory is one bounded record:
   user instruction or authority.
 - `ttl` — optional lifetime in seconds, 1 second to 10 years. Expiry is
   evaluated on the engine's clock; an expired memory never appears in a
-  recall again, and its storage is reclaimed by maintenance.
+  live recall again. Durable history, inactive migration generations and
+  previously created backups may retain bytes; expiry is not a secure-erase
+  guarantee.
 
 ## Project isolation semantics
 

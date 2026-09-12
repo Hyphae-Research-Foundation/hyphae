@@ -128,6 +128,8 @@ const REQUEST_SECURITY_API_KEY_ROTATE_ABORT: u16 = 66;
 const REQUEST_SECURITY_API_KEY_REVOKE_SELF: u16 = 67;
 const REQUEST_SECURITY_API_KEY_REVOKE: u16 = 68;
 const REQUEST_SECURITY_LEGACY_BEARER_REVOKE: u16 = 70;
+const REQUEST_MEMORY_RECALL: u16 = 71;
+const REQUEST_MEMORY_ENRICH: u16 = 72;
 
 const RESPONSE_CAPABILITIES: u16 = 1;
 const RESPONSE_PREPARED_SQL: u16 = 2;
@@ -173,6 +175,7 @@ const RESPONSE_SECURITY_MUTATED: u16 = 41;
 const RESPONSE_CATALOG_VISIBLE_PAGE: u16 = 42;
 const RESPONSE_SECURITY_API_KEY_STARTED: u16 = 43;
 const RESPONSE_SECURITY_API_KEY_ACTIVATED: u16 = 44;
+const RESPONSE_MEMORY_RECALL: u16 = 45;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -547,6 +550,11 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             body.extend_from_slice(&value.total_file_bytes.to_le_bytes());
             (RESPONSE_PROOF_VERIFICATION, body)
         }
+        ProductResponse::MemoryRecall(value) => {
+            let mut body = Vec::new();
+            encode_memory_result(&mut body, value)?;
+            (RESPONSE_MEMORY_RECALL, body)
+        }
         ProductResponse::IntegratedSearch(value) => {
             let mut body = Vec::new();
             encode_integrated_search(&mut body, value)?;
@@ -911,6 +919,9 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
                 },
             )
         }
+        RESPONSE_MEMORY_RECALL => {
+            ProductResponse::MemoryRecall(decode_memory_result(&mut decoder)?)
+        }
         RESPONSE_INTEGRATED_SEARCH => {
             ProductResponse::IntegratedSearch(decode_integrated_search(&mut decoder)?)
         }
@@ -1236,6 +1247,7 @@ fn ensure_operation_minor(
         ProductOperation::Prove { operation, .. } => {
             return ensure_operation_minor(operation, negotiated_minor);
         }
+        ProductOperation::MemoryRecall(_) | ProductOperation::MemoryEnrich(_) => 7,
         ProductOperation::SearchCollection { request, .. } => {
             search_request_required_minor(request)
         }
@@ -1295,6 +1307,12 @@ fn ensure_response_minor(
         | ProductResponse::SecurityApiKeyActivated(_) => 3,
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
+        }
+        ProductResponse::MemoryRecall(_) => 7,
+        ProductResponse::ProofVerification(report)
+            if report.kind == hyphae_native_product::proof::NativeProofKind::Memory =>
+        {
+            7
         }
         ProductResponse::IntegratedSearch(result) => {
             let values = result
@@ -1574,6 +1592,17 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             put_bytes(&mut body, witness)?;
             body.extend_from_slice(trusted_anchor);
             REQUEST_VERIFY_PROOF
+        }
+        ProductOperation::MemoryEnrich(request) => {
+            body.extend_from_slice(&request.collection.get().to_le_bytes());
+            body.extend_from_slice(&request.expected_envelope_digest);
+            body.extend_from_slice(&request.update.idempotency_id.to_le_bytes());
+            encode_product_document(&mut body, &request.update.document)?;
+            REQUEST_MEMORY_ENRICH
+        }
+        ProductOperation::MemoryRecall(request) => {
+            encode_memory_request(&mut body, request)?;
+            REQUEST_MEMORY_RECALL
         }
         ProductOperation::SearchCollection {
             collection,
@@ -2074,6 +2103,20 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
             witness: decoder.owned_bytes()?,
             trusted_anchor: decoder.array()?,
         },
+        REQUEST_MEMORY_ENRICH => {
+            ProductOperation::MemoryEnrich(hyphae_native_product::ProductMemoryEnrichRequest {
+                collection: ObjectId::new(decoder.u128()?)
+                    .map_err(|_| ProductCodecError::InvalidValue)?,
+                expected_envelope_digest: decoder.array()?,
+                update: ProductSearchDocumentUpdate {
+                    idempotency_id: decoder.u128()?,
+                    document: decode_product_document(&mut decoder)?,
+                },
+            })
+        }
+        REQUEST_MEMORY_RECALL => {
+            ProductOperation::MemoryRecall(decode_memory_request(&mut decoder)?)
+        }
         REQUEST_SEARCH_COLLECTION => {
             let (collection, request) = decode_search_collection(&mut decoder)?;
             ProductOperation::SearchCollection {
@@ -5392,6 +5435,141 @@ fn decode_query(
 }
 
 #[allow(clippy::too_many_lines)]
+fn encode_memory_request(
+    encoded: &mut Vec<u8>,
+    request: &hyphae_native_product::ProductMemoryRecallRequest,
+) -> Result<(), ProductCodecError> {
+    request
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    put_u32(encoded, request.collections.len())?;
+    for collection in &request.collections {
+        encoded.extend_from_slice(&collection.get().to_le_bytes());
+    }
+    put_u64(encoded, request.limit)?;
+    let mut search = Vec::new();
+    encode_search_collection(&mut search, request.collections[0], &request.search)?;
+    put_bytes(encoded, &search)?;
+    put_bytes(encoded, &request.provenance)
+}
+
+fn decode_memory_request(
+    decoder: &mut Decoder<'_>,
+) -> Result<hyphae_native_product::ProductMemoryRecallRequest, ProductCodecError> {
+    let count = decoder.usize_u32()?;
+    if !(1..=hyphae_native_product::MAX_MEMORY_COLLECTIONS).contains(&count) {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let mut collections = Vec::with_capacity(count);
+    for _ in 0..count {
+        collections
+            .push(ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?);
+    }
+    let limit = decoder.usize()?;
+    let bytes = decoder.owned_bytes()?;
+    let mut nested = Decoder::new(&bytes);
+    let (collection, search) = decode_search_collection(&mut nested)?;
+    nested.finish()?;
+    if collection != collections[0] {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let request = hyphae_native_product::ProductMemoryRecallRequest {
+        collections,
+        search,
+        limit,
+        provenance: decoder.owned_bytes()?,
+    };
+    request
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    Ok(request)
+}
+
+fn encode_memory_result(
+    encoded: &mut Vec<u8>,
+    result: &hyphae_native_product::ProductMemoryRecallResult,
+) -> Result<(), ProductCodecError> {
+    result
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    encode_snapshot(encoded, result.snapshot);
+    put_u32(encoded, result.searches.len())?;
+    for search in &result.searches {
+        encoded.extend_from_slice(&search.collection.get().to_le_bytes());
+        let mut bytes = Vec::new();
+        encode_integrated_search(&mut bytes, &search.result)?;
+        put_bytes(encoded, &bytes)?;
+    }
+    put_u32(encoded, result.memories.len())?;
+    for memory in &result.memories {
+        encoded.extend_from_slice(&memory.collection.get().to_le_bytes());
+        encoded.extend_from_slice(&memory.hit.object_id.get().to_le_bytes());
+        put_bytes(encoded, &memory.envelope)?;
+    }
+    put_u64(encoded, result.expired_filtered)
+}
+
+fn decode_memory_result(
+    decoder: &mut Decoder<'_>,
+) -> Result<hyphae_native_product::ProductMemoryRecallResult, ProductCodecError> {
+    let snapshot = decode_snapshot(decoder)?;
+    let count = decoder.usize_u32()?;
+    if !(1..=hyphae_native_product::MAX_MEMORY_COLLECTIONS).contains(&count) {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let mut searches = Vec::with_capacity(count);
+    for _ in 0..count {
+        let collection =
+            ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        let bytes = decoder.owned_bytes()?;
+        let mut nested = Decoder::new(&bytes);
+        let result = decode_integrated_search(&mut nested)?;
+        nested.finish()?;
+        searches.push(hyphae_native_product::ProductMemorySearchResult { collection, result });
+    }
+    let count = decoder.usize_u32()?;
+    if count > hyphae_native_product::MAX_MEMORY_RESULTS {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let mut memories = Vec::with_capacity(count);
+    for _ in 0..count {
+        let collection =
+            ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        let identity =
+            ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        let envelope = decoder.owned_bytes()?;
+        let hit = searches
+            .iter()
+            .find(|search| search.collection == collection)
+            .and_then(|search| {
+                search
+                    .result
+                    .hits
+                    .iter()
+                    .find(|hit| hit.object_id == identity)
+            })
+            .cloned()
+            .ok_or(ProductCodecError::InvalidValue)?;
+        memories.push(hyphae_native_product::ProductMemoryHit {
+            collection,
+            hit,
+            envelope,
+        });
+    }
+    let result = hyphae_native_product::ProductMemoryRecallResult {
+        snapshot,
+        memories,
+        searches,
+        expired_filtered: decoder.usize()?,
+    };
+    result
+        .validate()
+        .map_err(|_| ProductCodecError::InvalidValue)?;
+    Ok(result)
+}
+
+// Keep the canonical wire-field order visible beside the matching decoder.
+#[allow(clippy::too_many_lines)]
 fn encode_search_collection(
     encoded: &mut Vec<u8>,
     collection: ObjectId,
@@ -7406,6 +7584,7 @@ fn decode_proof_kind(
         5 => hyphae_native_product::proof::NativeProofKind::Ann,
         6 => hyphae_native_product::proof::NativeProofKind::Hybrid,
         7 => hyphae_native_product::proof::NativeProofKind::Catalog,
+        8 => hyphae_native_product::proof::NativeProofKind::Memory,
         _ => return Err(ProductCodecError::InvalidValue),
     })
 }

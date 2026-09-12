@@ -14,7 +14,7 @@ from .models import ClientError, ProductErrorFields, RequestOptions, Response, S
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 5
+PROTOCOL_MINOR = 7
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -105,6 +105,8 @@ REQUEST_KINDS = {
     "security_api_key_revoke_self": 67,
     "security_api_key_revoke": 68,
     "security_legacy_bearer_revoke": 70,
+    "memory_recall": 71,
+    "memory_enrich": 72,
 }
 
 SECURITY_READ_OPERATIONS = frozenset({
@@ -413,6 +415,8 @@ def _document_required_minor(document: Any) -> int:
 def operation_required_minor(
     operation: str, arguments: dict[str, Any] | None = None
 ) -> int:
+    if operation in {"memory_recall", "memory_enrich"}:
+        return 7
     if operation == "proof_generate" and arguments is not None:
         nested = arguments.get("operation")
         nested_arguments = arguments.get("arguments")
@@ -465,6 +469,8 @@ def operation_required_minor(
 
 
 def response_required_minor(kind: int) -> int:
+    if kind == 45:
+        return 7
     if kind in SECURITY_WRITE_RESPONSE_KINDS:
         return 2
     if kind in {42, 43, 44}:
@@ -653,6 +659,31 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         if not isinstance(anchor, bytes) or len(anchor) != 32:
             raise ClientError("trusted_anchor must contain 32 bytes")
         return _bytes(arguments["proof"]) + _bytes(arguments["witness"]) + anchor
+    if operation == "memory_recall":
+        collections = arguments["collections"]
+        search = arguments["search"]
+        limit = arguments["limit"]
+        provenance = arguments.get("provenance", b"")
+        if (not isinstance(collections, list) or not 1 <= len(collections) <= 3
+                or any(isinstance(item, bool) or not isinstance(item, int) or not 0 < item < 1 << 128 for item in collections)
+                or collections != sorted(set(collections))
+                or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 64
+                or not isinstance(search, dict) or not limit <= search.get("limit", 0) <= 1000
+                or any(search.get(key) for key in ("sort", "offset", "facets", "range_facets", "aggregations"))
+                or not isinstance(provenance, bytes) or len(provenance) > 65536):
+            raise ClientError("invalid bounded memory recall request")
+        return (struct.pack("<I", len(collections))
+                + b"".join(item.to_bytes(16, "little") for item in collections)
+                + struct.pack("<Q", limit)
+                + _bytes(_encode_search_collection({"collection": collections[0], "request": search}))
+                + _bytes(provenance))
+    if operation == "memory_enrich":
+        digest = arguments["expected_envelope_digest"]
+        if not isinstance(digest, bytes) or len(digest) != 32:
+            raise ClientError("expected_envelope_digest must contain 32 bytes")
+        return (int(arguments["collection"]).to_bytes(16, "little") + digest
+                + int(arguments["idempotency_id"]).to_bytes(16, "little")
+                + _encode_search_document(arguments["document"]))
     if operation == "search_collection":
         return _encode_search_collection(arguments)
     if operation == "search_ingest":
@@ -1573,14 +1604,16 @@ def decode_product_response(
         reader.finish()
         return Response("telemetry", value, request_id)
     if kind == 21:
-        proof_kinds = ("point", "sql", "lexical", "exact_vector", "ann", "hybrid", "catalog")
+        proof_kinds = ("point", "sql", "lexical", "exact_vector", "ann", "hybrid", "catalog", "memory")
         proof_kind = reader.u8()
+        if proof_kind == 8 and negotiated_minor is not None and negotiated_minor < 7:
+            raise ClientError("memory proof verification requires protocol minor 7")
         semantic = reader.boolean()
         reader.zeroes(6)
         if not 1 <= proof_kind <= len(proof_kinds):
             raise ClientError("proof verification kind is invalid")
         value = {
-            "scope": "artifact_integrity",
+            "scope": "semantic_reexecution" if semantic else "artifact_integrity",
             "kind": proof_kinds[proof_kind - 1],
             "semantic_reexecution_performed": semantic,
             "anchor_digest": reader.take(32),
@@ -1595,6 +1628,10 @@ def decode_product_response(
         }
         reader.finish()
         return Response("proof_verification", value, request_id)
+    if kind == 45:
+        value = _decode_memory_result(reader)
+        reader.finish()
+        return Response("memory_recall", value, request_id)
     if kind == 22:
         value = _decode_integrated_search(reader)
         reader.finish()
@@ -2272,6 +2309,59 @@ def _encode_search_document(document: Any) -> bytes:
         output.extend(struct.pack("<I", len(vector)))
         output.extend(struct.pack(f"<{len(vector)}f", *vector))
     return bytes(output)
+
+
+def _decode_memory_result(reader: _Reader) -> dict[str, Any]:
+    snapshot_bytes = reader.take(80)
+    snapshot = _decode_snapshot(_Reader(snapshot_bytes))
+    count = reader.u32()
+    if not 1 <= count <= 3:
+        raise ClientError("memory collection count is invalid")
+    searches = []
+    candidates = {}
+    previous = 0
+    for _ in range(count):
+        collection = reader.u128()
+        payload = reader.bytes()
+        if collection <= previous or payload[:80] != snapshot_bytes:
+            raise ClientError("memory search snapshot or ordering mismatch")
+        previous = collection
+        nested = _Reader(payload)
+        result = _decode_integrated_search(nested)
+        nested.finish()
+        if len(result["hits"]) > 1000:
+            raise ClientError("memory search candidates exceed their bound")
+        searches.append({"collection": collection, "result": result})
+        for hit in result["hits"]:
+            key = (collection, hit["object_id"])
+            if key in candidates:
+                raise ClientError("duplicate memory candidate")
+            candidates[key] = hit
+    count = reader.u32()
+    if count > 64:
+        raise ClientError("memory result count is invalid")
+    memories = []
+    seen = set()
+    previous_order = None
+    for _ in range(count):
+        collection, identity, envelope = reader.u128(), reader.u128(), reader.bytes()
+        key = (collection, identity)
+        if key not in candidates or key in seen or not 1 <= len(envelope) <= 64 * 1024:
+            raise ClientError("memory result has invalid lifecycle or candidate membership")
+        hit = candidates[key]
+        import math
+        if not math.isfinite(hit["score"]) or hit["score"] < 0:
+            raise ClientError("memory score is invalid")
+        order = (-hit["score"], collection, identity)
+        if previous_order is not None and previous_order > order:
+            raise ClientError("memory results are not canonically ordered")
+        previous_order = order
+        seen.add(key)
+        memories.append({"collection": collection, "hit": hit, "envelope": envelope})
+    expired = reader.u64()
+    if expired > sum(search["result"]["total_documents"] for search in searches):
+        raise ClientError("memory expiry accounting is invalid")
+    return {"snapshot": snapshot, "searches": searches, "memories": memories, "expired_filtered": expired}
 
 
 def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:

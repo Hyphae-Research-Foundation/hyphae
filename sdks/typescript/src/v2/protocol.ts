@@ -87,6 +87,8 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   security_api_key_revoke_self: 67,
   security_api_key_revoke: 68,
   security_legacy_bearer_revoke: 70,
+  memory_recall: 71,
+  memory_enrich: 72,
 };
 
 const BUILT_IN_ROLES = ["owner", "admin", "operator", "developer", "writer", "reader", "auditor"] as const;
@@ -185,7 +187,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 6) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 7) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -212,7 +214,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 6,
+  maximumMinor = 7,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -259,6 +261,7 @@ function documentRequiredMinor(value: unknown): number {
 }
 
 export function operationRequiredMinor(operation: string, args: Readonly<Record<string, unknown>> = {}): number {
+  if (operation === "memory_recall" || operation === "memory_enrich") return 7;
   if (operation === "proof_generate") {
     const nested = args.operation;
     return typeof nested === "string" ? operationRequiredMinor(nested, (args.arguments ?? {}) as Readonly<Record<string, unknown>>) : 0;
@@ -287,6 +290,7 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
 }
 
 export function responseRequiredMinor(kind: number): number {
+  if (kind === 45) return 7;
   if (kind >= 32 && kind <= 37) return 1;
   if (kind >= 38 && kind <= 41) return 2;
   if (kind >= 42 && kind <= 44) return 3;
@@ -298,7 +302,7 @@ export function decodeWelcome(encoded: Uint8Array): Readonly<Record<string, numb
     throw new ClientError("native welcome is malformed");
   }
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 4 || view.getBigUint64(24, true) === 0n) {
+  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 7 || view.getBigUint64(24, true) === 0n) {
     throw new ClientError("native welcome values are invalid");
   }
   return {
@@ -620,6 +624,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
   }
   if (kind === 21) {
     const proofKind = reader.u8();
+    if (proofKind < 1 || proofKind > 8 || (proofKind === 8 && negotiatedMinor !== undefined && negotiatedMinor < 7)) throw new ClientError("proof verification kind is unavailable at this protocol minor");
     const semanticReexecutionPerformed = reader.boolean();
     reader.zeroes(6);
     const value = {
@@ -637,6 +642,11 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
     };
     reader.finish();
     return { kind: "proof_verification", value, requestId };
+  }
+  if (kind === 45) {
+    const value = decodeMemoryResult(reader);
+    reader.finish();
+    return { kind: "memory_recall", value, requestId };
   }
   if (kind === 22) {
     const value = decodeIntegratedSearch(reader);
@@ -1452,6 +1462,27 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     if (anchor.byteLength !== 32) throw new ClientError("trusted anchor must contain 32 bytes");
     return join(bytes(requireBytes(args.proof)), bytes(requireBytes(args.witness)), anchor);
   }
+  if (operation === "memory_recall") {
+    if (!Array.isArray(args.collections) || args.collections.length < 1 || args.collections.length > 3) throw new ClientError("memory collections are invalid");
+    const collections = args.collections.map((id: unknown) => BigInt(id as bigint | number));
+    const limit = Number(args.limit);
+    const search = args.search as Readonly<Record<string, unknown>>;
+    const provenance = requireBytes(args.provenance ?? new Uint8Array());
+    if (collections.some((id, index) => id <= 0n || id >= 1n << 128n || (index > 0 && id <= collections[index - 1]!))
+        || !Number.isInteger(limit) || limit < 1 || limit > 64
+        || search === undefined || search === null || !Number.isInteger(search.limit) || Number(search.limit) < limit || Number(search.limit) > 1000
+        || ["sort", "facets", "range_facets", "aggregations"].some(key => Array.isArray(search[key]) && (search[key] as unknown[]).length > 0)
+        || Number(search.offset ?? 0) !== 0 || provenance.length > 65536) throw new ClientError("invalid bounded memory request");
+    return join(u32(collections.length), ...collections.map(u128), u64(BigInt(limit)),
+      bytes(encodeSearchCollection({collection: collections[0], request: search})),
+      bytes(provenance));
+  }
+  if (operation === "memory_enrich") {
+    const digest = requireBytes(args.expected_envelope_digest);
+    if (digest.length !== 32) throw new ClientError("expected_envelope_digest must contain 32 bytes");
+    return join(u128(BigInt(args.collection as bigint | number)), digest,
+      u128(BigInt(args.idempotency_id as bigint | number)), encodeSearchDocument(args.document));
+  }
   if (operation === "search_collection") return encodeSearchCollection(args);
   if (operation === "search_ingest") return join(u128(BigInt(args.collection as bigint | number)), encodeSearchBatch(args.batch));
   if (operation === "search_document_update") return join(u128(BigInt(args.collection as bigint | number)), u128(BigInt(args.idempotency_id as bigint | number)), encodeSearchDocument(args.document));
@@ -1528,7 +1559,7 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
     ...(request.autocut === undefined || request.autocut === null ? [] : [join(Uint8Array.of(5), u32(Number(request.autocut)))]),
     ...(request.offset === undefined || request.offset === null || Number(request.offset) === 0 ? [] : [join(Uint8Array.of(6), u32(Number(request.offset)))]),
     ...encodeRangeFacets(request.range_facets),
-    ...encodeDistanceCutoffs(request.vectors as ReadonlyArray<Readonly<Record<string, unknown>>>),
+    ...encodeDistanceCutoffs((request.vectors ?? []) as ReadonlyArray<Readonly<Record<string, unknown>>>),
     ...encodeLexicalOperator(lexical),
     ...encodeFieldBoosts(lexical),
   );
@@ -2076,6 +2107,56 @@ function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> 
     return { kind: "key_page", entries, continuation, stop, visited: reader.u64(), matchSteps: reader.u64() };
   }
   throw new ClientError("structure read response is invalid");
+}
+
+function decodeMemoryResult(reader: Reader): Readonly<Record<string, unknown>> {
+  const snapshotBytes = reader.take(80);
+  const snapshot = decodeSnapshot(new Reader(snapshotBytes));
+  const count = reader.u32();
+  if (count < 1 || count > 3) throw new ClientError("memory collection count is invalid");
+  const searches: Array<Readonly<Record<string, unknown>>> = [];
+  const candidates = new Map<string, Readonly<Record<string, unknown>>>();
+  let previous = 0n;
+  for (let i = 0; i < count; i++) {
+    const collection = reader.u128();
+    const payload = reader.bytes();
+    if (collection <= previous || payload.length < 80 || !snapshotBytes.every((byte, index) => payload[index] === byte)) throw new ClientError("memory snapshot or collection order mismatch");
+    previous = collection;
+    const nested = new Reader(payload);
+    const result = decodeIntegratedSearch(nested);
+    nested.finish();
+    const hits = result.hits as ReadonlyArray<Readonly<Record<string, unknown>>>;
+    if (hits.length > 1000) throw new ClientError("memory candidates exceed their bound");
+    searches.push({collection, result});
+    for (const hit of hits) {
+      const key = `${collection}/${hit.objectId}`;
+      if (candidates.has(key)) throw new ClientError("duplicate memory candidate");
+      candidates.set(key, hit);
+    }
+  }
+  const size = reader.u32();
+  if (size > 64) throw new ClientError("memory result count is invalid");
+  const memories: Array<Readonly<Record<string, unknown>>> = [];
+  const seen = new Set<string>();
+  let previousScore = Infinity;
+  let previousCollection = 0n;
+  let previousIdentity = 0n;
+  for (let i = 0; i < size; i++) {
+    const collection = reader.u128();
+    const identity = reader.u128();
+    const envelope = reader.bytes();
+    const key = `${collection}/${identity}`;
+    const hit = candidates.get(key);
+    if (hit === undefined || seen.has(key) || envelope.length < 1 || envelope.length > 64 * 1024) throw new ClientError("memory lifecycle or candidate membership is invalid");
+    const score = Number(hit.score);
+    if (!Number.isFinite(score) || score < 0 || score > previousScore || (score === previousScore && (collection < previousCollection || (collection === previousCollection && identity <= previousIdentity)))) throw new ClientError("memory result order is invalid");
+    previousScore = score; previousCollection = collection; previousIdentity = identity;
+    seen.add(key);
+    memories.push({collection, hit, envelope});
+  }
+  const expiredFiltered = reader.u64();
+  if (expiredFiltered > searches.reduce((sum, search) => sum + BigInt((search.result as Record<string, unknown>).totalDocuments as bigint), 0n)) throw new ClientError("memory expiry accounting is invalid");
+  return {snapshot, searches, memories, expiredFiltered};
 }
 
 function decodeIntegratedSearch(reader: Reader): Readonly<Record<string, unknown>> {

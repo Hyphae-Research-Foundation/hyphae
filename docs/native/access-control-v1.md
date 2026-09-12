@@ -127,6 +127,16 @@ names are not authority. Search operations bind the requested stable collection
 or index. A transaction accumulates the union of every referenced scope and
 reauthorizes the complete union before commit.
 
+`MemoryRecall` uses `memory_recall_objects`: `data.read` on the durable default
+scalar keyspace for lifecycle envelopes, plus `catalog.read` and
+`search.execute` on every requested collection. `MemoryEnrich` uses
+`memory_enrich_objects`: `data.read` on that same lifecycle keyspace,
+`catalog.read` and `data.write` on the target collection, and instance-wide
+`maintain` for bounded index maintenance. These are permission/scope unions;
+a collection grant alone does not authorize lifecycle reads or maintenance.
+Wrapping recall in `Prove` additionally requires `proof.generate` and retains
+all underlying requirements.
+
 Catalog listing currently requires instance-wide `catalog.read`. Object- and
 subtree-scoped pages fail closed before traversal because the public cursor and
 physical-work metadata are not yet scope-opaque. A requested parent must never

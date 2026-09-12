@@ -378,6 +378,26 @@ impl HyphaeClient {
         .await
     }
 
+    /// Reads candidate search hits and live envelopes at one common snapshot.
+    pub async fn memory_recall(
+        &self,
+        request: hyphae_native_product::ProductMemoryRecallRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::MemoryRecall(request), options)
+            .await
+    }
+
+    /// Enriches an unchanged live source using operator maintenance authority.
+    pub async fn memory_enrich(
+        &self,
+        request: hyphae_native_product::ProductMemoryEnrichRequest,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(ProductOperation::MemoryEnrich(request), options)
+            .await
+    }
+
     /// Atomically ingests integrated documents across all collection branches.
     pub async fn search_ingest(
         &self,

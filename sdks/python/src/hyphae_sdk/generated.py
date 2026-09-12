@@ -4,11 +4,121 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "fb7195bcd2d16117b0b5fd86f032db292870548c8095532d984ae583448e0656"
+CONTRACT_SHA256 = "804bac67747912550090c6f25504a0d6121d9b54af14f43e144054a07625511a"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
+
+class AgentMemoryControlConfigure(TypedDict):
+    host: Literal["claude", "codex", "opencode", "pi"]
+    access: NotRequired[Literal["read", "write"]]
+
+class AgentMemoryControlDisconnect(TypedDict):
+    host: Literal["claude", "codex", "opencode", "pi"]
+    access: NotRequired[str]
+
+class AgentMemoryControlEmpty(TypedDict):
+    pass
+
+class AgentMemoryControlForget(TypedDict):
+    project: NotRequired[str]
+    id: str
+
+class AgentMemoryControlList(TypedDict):
+    project: NotRequired[str]
+    query: str
+    limit: NotRequired[int]
+    kind: NotRequired[Literal["decision", "command", "constraint", "fact", "note"] | None]
+    layer: NotRequired[Literal["all", "personal", "work", "journal", None]]
+    mode: NotRequired[Literal["lexical", "hybrid", None]]
+    prove: NotRequired[bool]
+
+class AgentMemoryControlPause(TypedDict):
+    paused: bool
+    project: NotRequired[str | None]
+
+class AgentMemoryControlRecall(TypedDict):
+    project: NotRequired[str]
+    query: str
+    limit: NotRequired[int]
+    kind: NotRequired[Literal["decision", "command", "constraint", "fact", "note"] | None]
+    layer: NotRequired[Literal["all", "personal", "work", "journal", None]]
+    mode: NotRequired[Literal["lexical", "hybrid", None]]
+    prove: NotRequired[bool]
+
+class AgentMemoryControlRecallResult(TypedDict):
+    memories: list[dict[str, JsonValue]]
+    expired_filtered: int
+    proof: dict[str, JsonValue] | None
+    retrieval_mode: Literal["lexical", "hybrid"]
+    semantic_status: Literal["disabled", "ready", "unavailable"]
+    snapshot: dict[str, JsonValue]
+
+class AgentMemoryControlRemove(TypedDict):
+    confirm: Literal[True]
+
+class AgentMemoryControlRequest(TypedDict):
+    schema: Literal["hyphae-omarchy-control-v1"]
+    id: NotRequired[int | None]
+    operation: str
+    arguments: dict[str, JsonValue]
+
+class AgentMemoryControlResponseHyphaeOmarchyControlV1(TypedDict):
+    schema: Literal["hyphae-omarchy-control-v1"]
+    id: int | None
+    ok: Literal[True]
+    result: AgentMemoryControlResult
+
+class AgentMemoryControlResponseHyphaeOmarchyControlV1(TypedDict):
+    schema: Literal["hyphae-omarchy-control-v1"]
+    id: NotRequired[int | None]
+    ok: Literal[False]
+    error: dict[str, JsonValue]
+
+class AgentMemoryControlRestore(TypedDict):
+    backup: str
+    confirm: Literal[True]
+
+class AgentMemoryControlSemantic(TypedDict):
+    enabled: bool
+    model_dir: NotRequired[str | None]
+
+class AgentMemoryControlSetup(TypedDict):
+    enable_service: NotRequired[bool]
+
+class AgentMemoryControlStatusResult(TypedDict):
+    installed: bool
+    initialized: bool
+    service_active: bool
+    capture_paused: NotRequired[bool]
+    semantic_enabled: NotRequired[bool]
+    semantic_ready: NotRequired[bool]
+    runtime_activation_pending: NotRequired[bool]
+    pending_captures: NotRequired[int]
+    pending_embeddings: NotRequired[int]
+    memories: NotRequired[int]
+    paused_projects: NotRequired[list[str]]
+    control_version: NotRequired[Literal[1]]
+    protocol_minor: NotRequired[Literal[7]]
+    runtime_version: NotRequired[str]
+    endpoint: NotRequired[str]
+
+class AgentMemoryControlStore(TypedDict):
+    project: NotRequired[str]
+    text: str
+    kind: NotRequired[Literal["decision", "command", "constraint", "fact", "note"] | None]
+    scope: NotRequired[Literal["project", "global", None]]
+    agent: NotRequired[str | None]
+    harness: NotRequired[str | None]
+    model: NotRequired[str | None]
+    layer: NotRequired[Literal["personal", "work", "journal", None]]
+    ttl: NotRequired[int | None]
+
+class AgentMemoryControlVerify(TypedDict):
+    proof: str
+    witness: str
+    anchor: str
 
 class AggregationPlanV1(TypedDict):
     """Optional grouped aggregation plan."""
@@ -323,6 +433,40 @@ class HybridRetrievalResponseV1(TypedDict):
     """Proof-bearing deterministic hybrid retrieval response."""
     outcome: HybridRetrievalOutcomeV1
     proof: RetrievalProofV1
+
+class HyphaeAttestedLocalCPUModelManifestV1(TypedDict):
+    schema: Literal["hyphae-attested-model-v1"]
+    target: str
+    fingerprint: str
+    weights_blake3: str
+    config_blake3: str
+    tokenizer_blake3: str
+    dimensions: int
+    max_positions: int
+    pipeline: Literal["bert-mean-pool-l2-cpu-v1"]
+    device: Literal["cpu"]
+    runtime: Literal["hyphae-embed"]
+    runtime_version: str
+
+class HyphaeEmbedWorkerRequest(TypedDict):
+    schema: Literal["hyphae-embed-request-v1"]
+    id: int
+    operation: Literal["status", "embed", "rerank"]
+    texts: NotRequired[list[str]]
+    query: NotRequired[str | None]
+    expected_model: NotRequired[str | None]
+
+class HyphaeEmbedWorkerResponseHyphaeEmbedResponseV1(TypedDict):
+    schema: Literal["hyphae-embed-response-v1"]
+    id: int
+    ok: Literal[True]
+    result: HyphaeAttestedLocalCPUModelManifestV1 | dict[str, JsonValue] | dict[str, JsonValue]
+
+class HyphaeEmbedWorkerResponseHyphaeEmbedResponseV1(TypedDict):
+    schema: Literal["hyphae-embed-response-v1"]
+    id: int
+    ok: Literal[False]
+    error: dict[str, JsonValue]
 
 class HyphaeNativeANNDurableLocalQualificationV1(TypedDict):
     schema: Literal["hyphae-native-ann-durable-qualification-v1"]
@@ -741,6 +885,9 @@ class WorkerPoint(TypedDict):
     correctness: dict[str, JsonValue]
     status: Literal["stable", "unstable"]
 
+AgentMemoryControlResponse: TypeAlias = AgentMemoryControlResponseHyphaeOmarchyControlV1 | AgentMemoryControlResponseHyphaeOmarchyControlV1
+AgentMemoryControlResult: TypeAlias = AgentMemoryControlStatusResult | AgentMemoryControlRecallResult | dict[str, JsonValue] | dict[str, JsonValue] | dict[str, JsonValue] | dict[str, JsonValue] | dict[str, JsonValue] | dict[str, JsonValue]
+AgentMemoryLocalOperatorRequestAndResponseV1: TypeAlias = AgentMemoryControlRequest | AgentMemoryControlResponse
 Blake3: TypeAlias = str
 Class: TypeAlias = Literal["foreground-point", "foreground-bounded", "mutation", "bulk", "maintenance", "recovery", "administrative"]
 CompareOperatorV1: TypeAlias = Literal["equal"] | Literal["not_equal"] | Literal["less"] | Literal["less_or_equal"] | Literal["greater"] | Literal["greater_or_equal"]
@@ -752,6 +899,8 @@ GitObject: TypeAlias = str
 GroupKeyValueV1: TypeAlias = GroupKeyValueV1Missing | GroupKeyValueV1Value
 HybridBranchAbsenceV1: TypeAlias = Literal["lexical_no_candidates"] | Literal["vector_no_candidates"] | Literal["vector_below_threshold"] | Literal["vector_ambiguous"]
 HybridRetrievalOutcomeV1: TypeAlias = HybridRetrievalOutcomeV1Matches | HybridRetrievalOutcomeV1Abstained
+HyphaeEmbedWorkerResponse: TypeAlias = HyphaeEmbedWorkerResponseHyphaeEmbedResponseV1 | HyphaeEmbedWorkerResponseHyphaeEmbedResponseV1
+HyphaeLocalEmbeddingWorkerRequestAndResponseV1: TypeAlias = HyphaeEmbedWorkerRequest | HyphaeEmbedWorkerResponse
 Identity: TypeAlias = str
 LexicalAbstentionReasonV1: TypeAlias = Literal["no_candidates"]
 LexicalRetrievalOutcomeV1: TypeAlias = LexicalRetrievalOutcomeV1Matches | LexicalRetrievalOutcomeV1Abstained
@@ -774,6 +923,26 @@ UniqueStrings: TypeAlias = list[str]
 VectorMetricV1: TypeAlias = Literal["cosine_q15_nanos"]
 
 __all__ = [
+    "AgentMemoryControlConfigure",
+    "AgentMemoryControlDisconnect",
+    "AgentMemoryControlEmpty",
+    "AgentMemoryControlForget",
+    "AgentMemoryControlList",
+    "AgentMemoryControlPause",
+    "AgentMemoryControlRecall",
+    "AgentMemoryControlRecallResult",
+    "AgentMemoryControlRemove",
+    "AgentMemoryControlRequest",
+    "AgentMemoryControlResponse",
+    "AgentMemoryControlResponseHyphaeOmarchyControlV1",
+    "AgentMemoryControlRestore",
+    "AgentMemoryControlResult",
+    "AgentMemoryControlSemantic",
+    "AgentMemoryControlSetup",
+    "AgentMemoryControlStatusResult",
+    "AgentMemoryControlStore",
+    "AgentMemoryControlVerify",
+    "AgentMemoryLocalOperatorRequestAndResponseV1",
     "AggregationPlanV1",
     "AggregationResultV1",
     "ApiLimitsV1",
@@ -831,6 +1000,11 @@ __all__ = [
     "HybridRetrievalOutcomeV1Matches",
     "HybridRetrievalRequestV1",
     "HybridRetrievalResponseV1",
+    "HyphaeAttestedLocalCPUModelManifestV1",
+    "HyphaeEmbedWorkerRequest",
+    "HyphaeEmbedWorkerResponse",
+    "HyphaeEmbedWorkerResponseHyphaeEmbedResponseV1",
+    "HyphaeLocalEmbeddingWorkerRequestAndResponseV1",
     "HyphaeNativeANNDurableLocalQualificationV1",
     "HyphaeNativeHardwareCalibrationV1",
     "HyphaeNativeHardwareProfileV1",

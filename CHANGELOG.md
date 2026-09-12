@@ -3,6 +3,28 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
+## Unreleased — Agent Memory / Omarchy candidate
+
+- Add snapshot-coherent `MemoryRecall` (wire 71/45, minor 7) and memory proof
+  kind 8 / semantics 6. Project eligibility and live lifecycle filtering apply
+  before candidate selection; offline replay seals the complete composition
+  and opaque query-embedding provenance.
+- Add conditional `MemoryEnrich` (wire 72) so delayed inference cannot revive
+  expired, changed or forgotten sources. Reuse the existing Candle
+  `hyphae-embed` implementation through its persistent local worker.
+- Add optional semantic profiles, verified-backup migration, crash recovery,
+  background enrichment, durable capture queue, project/global pause controls,
+  and the bounded `hyphae agent ui` operator interface.
+- Update Claude Code, Codex, OpenCode and Pi integrations, including shared
+  project identity, fail-open proactive hooks, managed configuration ownership,
+  Pi MCP lifecycle/cancellation, and safe runtime reconnection.
+- Extend Rust, Python (sync/async), and TypeScript clients with memory operations
+  and common wire fixtures. Preserve the existing protocol/proof versions for
+  older operations. Fix the explicit cross-SDK SQL limit fixture.
+
+This is unshipped source on top of 3.0.0. It is not a new crate/SDK registry
+release and does not inherit an exact-commit G7/G8 closure.
+
 ## [3.0.0] - 2026-09-03
 
 Hyphae 3.0.0 is the engine release measured for the Thursday brief: the

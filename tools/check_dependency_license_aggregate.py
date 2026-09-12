@@ -129,13 +129,13 @@ def _npm_inventory(root: Path, relative: Path) -> tuple[list[dict[str, str]], li
                 proprietary.add(identity)
         elif "LGPL-" in license_value:
             valid_lgpl = (
-                (package_path.startswith("node_modules/@img/sharp-libvips-") and version == "1.3.2" and license_value == "LGPL-3.0-or-later")
-                or (package_path == "node_modules/@img/sharp-wasm32" and version == "0.35.3" and license_value == "Apache-2.0 AND LGPL-3.0-or-later AND MIT")
+                (package_path.startswith("node_modules/@img/sharp-libvips-") and version == "1.3.3" and license_value == "LGPL-3.0-or-later")
+                or (package_path == "node_modules/@img/sharp-wasm32" and version == "0.35.4" and license_value == "Apache-2.0 AND LGPL-3.0-or-later AND MIT")
                 or (package_path in {
                     "node_modules/@img/sharp-win32-arm64",
                     "node_modules/@img/sharp-win32-ia32",
                     "node_modules/@img/sharp-win32-x64",
-                } and version == "0.35.3" and license_value == "Apache-2.0 AND LGPL-3.0-or-later")
+                } and version == "0.35.4" and license_value == "Apache-2.0 AND LGPL-3.0-or-later")
             )
             if relative not in {
                 Path("integrations/host-smoke/package-lock.json"),

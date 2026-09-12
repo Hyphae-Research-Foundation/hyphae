@@ -225,8 +225,8 @@ export class LocalTransport implements Transport {
     }
     try {
       const hello = this.#apiKey === undefined
-        ? encodeHello(this.#clientIdentity, 3)
-        : encodeAuthenticatedHello(this.#apiKey, this.#clientIdentity, 3);
+        ? encodeHello(this.#clientIdentity, 7)
+        : encodeAuthenticatedHello(this.#apiKey, this.#clientIdentity, 7);
       try {
         await abortable(stream.write(encodeFrame(FRAME_KIND.hello, 0, requestId, hello), signal), signal);
         if (terminalRequest !== undefined) {

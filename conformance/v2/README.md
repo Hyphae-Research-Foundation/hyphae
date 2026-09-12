@@ -30,7 +30,7 @@ AF_UNIX or a local named pipe and the binary HTTP v2 edge. Generic operations
 use `/v2/execute`; every API-key lifecycle operation and legacy-bearer revoke
 use only the strict,
 managed `/v2/security/keys` family. Every HTTP request and response carries the
-exact protocol minor 3 header before session retention or body decoding. The JSON
+exact protocol minor 7 header before session retention or body decoding. The JSON
 corpus and static checker do not substitute for those hosted executions. The
 role-matrix row remains fixed to the exhaustive managed write-plane test:
 durable Admin and Owner credentials execute all six security mutations, while
@@ -46,7 +46,7 @@ the retention window. Minor 0 cannot carry security reads or writes, and minor
 dispatch.
 
 The live Python receipt binds the source commit and tree, installed wheel,
-product and fixture binaries, negotiated Native 1.3 protocol, exact transport
+product and fixture binaries, negotiated Native 1.7 protocol, exact transport
 inventory, and canonical transcript digest. The aggregate additionally binds
 those receipts to its own checkout and retains every lane's receipt, product,
 fixture, and transcript digest. The live corpus exhausts each bounded page,

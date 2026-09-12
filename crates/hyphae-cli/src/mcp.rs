@@ -147,7 +147,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
             "project": {"type": ["string", "null"]},
             "scope": {"type": ["string", "null"]},
             "kind": {"type": ["string", "null"]},
-            "layer": {"type": "string", "enum": ["work", "journal"]},
+            "layer": {"type": "string", "enum": ["personal", "work", "journal"]},
             "agent": {"type": ["string", "null"]},
             "harness": {"type": "string"},
             "model": {"type": "string"},
@@ -159,11 +159,11 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
         tool(
             "hyphae_memory_recall",
             true,
-            "Recall stored memories for one project (global memories included) by bounded lexical retrieval. Expired or forgotten memories never return; with prove the response carries the sealed proof, witness, and anchor for offline verification.",
+            "Recall stored memories for one project (global memories included) by bounded snapshot-coherent retrieval. Expired or forgotten memories never return; prove seals the ordered memories and lifecycle records across all requested layers.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["project", "query"],
+                "required": ["query"],
                 "properties": {
                     "project": {"type": "string", "minLength": 1, "maxLength": 256},
                     "query": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -171,6 +171,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
                     "kind": {"type": "string", "enum": MEMORY_KINDS},
                     "layer": {"type": "string", "enum": ["all", "personal", "work", "journal"]},
                     "prove": {"type": "boolean"},
+                    "mode": {"type": "string", "enum": ["lexical", "hybrid"]},
                 },
             }),
             json!({
@@ -181,6 +182,9 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
                     "memories": {"type": "array", "maxItems": 64, "items": memory_item},
                     "expired_filtered": {"type": "integer", "minimum": 0},
                     "proof": {"type": ["object", "null"]},
+                    "retrieval_mode": {"enum": ["lexical", "hybrid"]},
+                    "semantic_status": {"enum": ["disabled", "ready", "unavailable"]},
+                    "snapshot": {"type": "object"},
                 },
             }),
         ),
@@ -211,7 +215,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["project", "text"],
+                "required": ["text"],
                 "properties": {
                     "project": {"type": "string", "minLength": 1, "maxLength": 256},
                     "text": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -243,7 +247,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["project", "text", "harness", "model"],
+                "required": ["text", "harness", "model"],
                 "properties": {
                     "project": {"type": "string", "minLength": 1, "maxLength": 256},
                     "text": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -271,7 +275,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["project", "id"],
+                "required": ["id"],
                 "properties": {
                     "project": {"type": "string", "minLength": 1, "maxLength": 256},
                     "id": {"type": "string", "pattern": "^[0-9]+$"},
@@ -291,7 +295,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
     let serialized = serde_json::to_string(&tools)?;
     Ok(ToolRegistry {
         protocol: MCP_PROTOCOL.to_owned(),
-        schema_version: "hyphae-agent-memory-mcp-v1".to_owned(),
+        schema_version: "hyphae-agent-memory-mcp-v2".to_owned(),
         schema_digest: blake3::hash(serialized.as_bytes()).to_hex().to_string(),
         page_size: TOOL_PAGE_SIZE,
         tools,
@@ -565,17 +569,49 @@ pub(crate) enum Profile {
 
 #[derive(Clone, Copy)]
 pub(crate) struct MemoryCollections {
+    pub(crate) follow_policy: bool,
     pub(crate) personal: u128,
     pub(crate) work: u128,
     pub(crate) journal: u128,
 }
 
 impl MemoryCollections {
+    pub(crate) fn from_policy() -> Result<Self, CliFailure> {
+        let policy = crate::agent_policy::Policy::load()?;
+        Ok(Self {
+            personal: policy.collections[0],
+            work: policy.collections[1],
+            journal: policy.collections[2],
+            follow_policy: true,
+        })
+    }
+    async fn active(self, client: &HyphaeClient) -> Result<Self, Box<ProductError>> {
+        if !self.follow_policy {
+            return Ok(self);
+        }
+        let policy = crate::agent_policy::Policy::active(client)
+            .await
+            .map_err(|error| Box::new(error.error().clone()))?;
+        Ok(Self {
+            personal: policy.collections[0],
+            work: policy.collections[1],
+            journal: policy.collections[2],
+            follow_policy: false,
+        })
+    }
+    fn resolved(self) -> Result<Self, Box<ProductError>> {
+        if self.follow_policy {
+            Self::from_policy().map_err(|_| invalid_request())
+        } else {
+            Ok(self)
+        }
+    }
     fn for_layer(self, layer: &str) -> Result<u128, Box<ProductError>> {
+        let resolved = self.resolved()?;
         match layer {
-            "personal" => Ok(self.personal),
-            "work" => Ok(self.work),
-            "journal" => Ok(self.journal),
+            "personal" => Ok(resolved.personal),
+            "work" => Ok(resolved.work),
+            "journal" => Ok(resolved.journal),
             _ => Err(invalid_request()),
         }
     }
@@ -1234,13 +1270,21 @@ async fn execute_tool(
             return memory_forget(&client, input, options).await;
         }
         NativeTool::ProfileMemoryStore(collections) => {
+            let collections = collections.active(&client).await?;
             let input = strict_input::<ProfileStoreInput>(arguments)?;
             let collection = collections.for_layer(input.layer.as_deref().unwrap_or("work"))?;
             return profile_memory_store(&client, collection, input, options).await;
         }
         NativeTool::ProfileMemoryJournal(collections) => {
+            let collections = collections.active(&client).await?;
             let input = strict_input::<ProfileJournalInput>(arguments)?;
-            return profile_memory_journal(&client, collections.journal, input, options).await;
+            return profile_memory_journal(
+                &client,
+                collections.resolved()?.journal,
+                input,
+                options,
+            )
+            .await;
         }
         NativeTool::ProfileMemoryRecall(collections) => {
             let input = strict_input::<ProfileRecallInput>(arguments)?;
@@ -1741,6 +1785,7 @@ const MAX_MEMORY_TTL_SECONDS_PROFILE: u64 = 10 * 366 * 24 * 60 * 60;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileStoreInput {
+    #[serde(default = "default_agent_project")]
     project: String,
     text: String,
     #[serde(default)]
@@ -1762,6 +1807,9 @@ struct ProfileStoreInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileRecallInput {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default = "default_agent_project")]
     project: String,
     query: String,
     #[serde(default = "default_memory_recall_limit")]
@@ -1777,6 +1825,7 @@ struct ProfileRecallInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileJournalInput {
+    #[serde(default = "default_agent_project")]
     project: String,
     text: String,
     harness: String,
@@ -1788,8 +1837,16 @@ struct ProfileJournalInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileForgetInput {
+    #[serde(default = "default_agent_project")]
     project: String,
     id: String,
+}
+
+fn default_agent_project() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| crate::agent_hooks::resolve_project(&path).ok())
+        .unwrap_or_default()
 }
 
 fn valid_project(project: &str) -> bool {
@@ -1890,7 +1947,6 @@ async fn profile_memory_store(
     let effective_project = validated.effective_project.as_str();
     let identity = envelope_identity(effective_project, layer, &input.text);
     let collection = ObjectId::new(collection).map_err(|_| invalid_request())?;
-    let object_id = ObjectId::new(identity).map_err(|_| invalid_request())?;
     let mut doc_values = std::collections::BTreeMap::new();
     doc_values.insert(
         "project".to_owned(),
@@ -1930,32 +1986,13 @@ async fn profile_memory_store(
         envelope: serde_json::to_vec(&envelope).map_err(|_| invalid_request())?,
         expires_at_micros,
     };
-    if commit_memory_atomic(client, &atomic, options.clone())
+    if commit_memory_atomic(client, &atomic, options)
         .await?
         .is_none()
     {
-        let batch = ProductSearchIngestBatch {
-            idempotency_id: identity,
-            documents: vec![hyphae_native_product::ProductDocument {
-                object_id,
-                text: input.text.clone(),
-                doc_values: atomic.doc_values.clone(),
-                vectors: std::collections::BTreeMap::new(),
-            }],
-        };
-        client
-            .search_ingest(collection, batch, options.clone())
-            .await
-            .map_err(normalize_client_error)?;
-        client
-            .structure_set(
-                memory_key(collection.get(), identity),
-                atomic.envelope.clone(),
-                expires_at_micros,
-                options,
-            )
-            .await
-            .map_err(normalize_client_error)?;
+        return Err(Box::new(ProductError::from_code(
+            ProductErrorCode::Unavailable,
+        )));
     }
     Ok(json!({
         "status": "stored",
@@ -2001,29 +2038,58 @@ async fn profile_memory_journal(
 
 /// Recalls memories for one project (plus global memories), keeping only
 /// hits whose lifecycle envelope still lives.
-#[allow(clippy::too_many_lines)]
 async fn profile_memory_recall(
     client: &HyphaeClient,
     collection: u128,
     input: ProfileRecallInput,
     options: RequestOptions,
 ) -> Result<Value, Box<ProductError>> {
+    profile_memory_recall_selected(client, vec![collection], input, options, false).await
+}
+
+async fn profile_memory_recall_domains(
+    client: &HyphaeClient,
+    collections: MemoryCollections,
+    input: ProfileRecallInput,
+    options: RequestOptions,
+) -> Result<Value, Box<ProductError>> {
+    let collections = collections.active(client).await?;
+    let selected = if let Some(layer) = input.layer.as_deref().filter(|layer| *layer != "all") {
+        vec![collections.for_layer(layer)?]
+    } else {
+        vec![collections.personal, collections.work, collections.journal]
+    };
+    profile_memory_recall_selected(client, selected, input, options, false).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn profile_memory_recall_selected(
+    client: &HyphaeClient,
+    mut selected: Vec<u128>,
+    input: ProfileRecallInput,
+    mut options: RequestOptions,
+    browse: bool,
+) -> Result<Value, Box<ProductError>> {
     let project = normalize_project(&input.project);
     if !valid_project(&project)
-        || input.query.is_empty()
+        || (!browse && input.query.is_empty())
+        || input.query.len() > 4096
         || !(1..=MAX_MEMORY_RECALL_LIMIT).contains(&input.limit)
         || input
             .kind
             .as_deref()
             .is_some_and(|kind| !MEMORY_KINDS.contains(&kind))
+        || input
+            .layer
+            .as_deref()
+            .is_some_and(|layer| !matches!(layer, "all" | "personal" | "work" | "journal"))
     {
         return Err(invalid_request());
     }
-    let collection = ObjectId::new(collection).map_err(|_| invalid_request())?;
     let mut clauses = vec![ProductSearchFilter::In {
         field: "project".to_owned(),
         values: vec![
-            hyphae_native_product::ProductDocValue::String(project),
+            hyphae_native_product::ProductDocValue::String(project.clone()),
             hyphae_native_product::ProductDocValue::String(GLOBAL_PROJECT.to_owned()),
         ],
     }];
@@ -2034,13 +2100,6 @@ async fn profile_memory_recall(
             value: hyphae_native_product::ProductDocValue::String(kind.clone()),
         });
     }
-    if input
-        .layer
-        .as_deref()
-        .is_some_and(|layer| !matches!(layer, "all" | "personal" | "work" | "journal"))
-    {
-        return Err(invalid_request());
-    }
     if let Some(layer) = input.layer.as_deref().filter(|layer| *layer != "all") {
         clauses.push(ProductSearchFilter::Compare {
             field: "layer".to_owned(),
@@ -2048,9 +2107,9 @@ async fn profile_memory_recall(
             value: hyphae_native_product::ProductDocValue::String(layer.to_owned()),
         });
     }
-    let request = ProductSearchRequest {
-        lexical: Some(ProductLexicalBranch {
-            query: input.query,
+    let mut search = ProductSearchRequest {
+        lexical: (!input.query.is_empty()).then(|| ProductLexicalBranch {
+            query: input.query.clone(),
             candidate_limit: 1_000,
             weight: 1,
             operator: None,
@@ -2065,7 +2124,7 @@ async fn profile_memory_recall(
         facets: Vec::new(),
         range_facets: Vec::new(),
         aggregations: Vec::new(),
-        limit: input.limit,
+        limit: 1_000,
         fusion: None,
         parent_dedupe: None,
         rerank: None,
@@ -2073,183 +2132,250 @@ async fn profile_memory_recall(
         autocut: None,
         offset: 0,
     };
-    let (result, proof) = if input.prove {
-        let response = client
-            .prove(
-                hyphae_native_product::ProductOperation::SearchCollection {
-                    collection,
-                    request,
-                },
-                hyphae_native_product::proof::NativeProofGenerationLimits::default(),
-                options.clone(),
-            )
-            .await
-            .map_err(normalize_client_error)?;
-        let ProductResponse::Proven { response, artifact } = response else {
-            return Err(Box::new(ProductError::from_code(
-                ProductErrorCode::Internal,
-            )));
-        };
-        let ProductResponse::IntegratedSearch(result) = *response else {
-            return Err(Box::new(ProductError::from_code(
-                ProductErrorCode::Internal,
-            )));
-        };
-        // Sealed artifacts outgrow the MCP message bound on real
-        // directories, so they land in restricted local files and the
-        // response carries their paths, digests, and anchor for offline
-        // verification with `hyphae proof verify`.
-        let state_home = std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".local/state"))
-            })
-            .ok_or_else(invalid_request)?
-            .join("hyphae/proofs");
-        std::fs::create_dir_all(&state_home)
-            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&state_home, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
-        let stamp = crate::native::logical_time_micros();
-        let proof_path = state_home.join(format!("recall-{stamp}.proof"));
-        let witness_path = state_home.join(format!("recall-{stamp}.witness"));
-        write_private_artifact(&proof_path, &artifact.proof_bytes)?;
-        write_private_artifact(&witness_path, &artifact.witness_bytes)?;
-        (
-            result,
-            Some(json!({
-                "proof_path": proof_path.display().to_string(),
-                "witness_path": witness_path.display().to_string(),
-                "proof_blake3": blake3::hash(&artifact.proof_bytes).to_hex().to_string(),
-                "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
-            })),
-        )
-    } else {
-        let response = client
-            .search_collection(collection, request, options.clone())
-            .await
-            .map_err(normalize_client_error)?;
-        let ProductResponse::IntegratedSearch(result) = response else {
-            return Err(Box::new(ProductError::from_code(
-                ProductErrorCode::Internal,
-            )));
-        };
-        (result, None)
-    };
-    let mut memories = Vec::new();
-    let mut expired = 0_usize;
-    for hit in &result.hits {
-        let lifecycle = client
-            .structure_get(
-                memory_key(collection.get(), hit.object_id.get()),
-                options.clone(),
-            )
-            .await
-            .map_err(normalize_client_error)?;
-        match lifecycle {
-            ProductResponse::StructureValue(Some(bytes)) => {
-                let Ok(envelope) = serde_json::from_slice::<Value>(&bytes) else {
-                    expired += 1;
-                    continue;
-                };
-                let layer = envelope
-                    .get("layer")
-                    .and_then(Value::as_str)
-                    .unwrap_or("work");
-                if input
-                    .layer
-                    .as_deref()
-                    .is_some_and(|requested| requested != "all" && requested != layer)
-                {
-                    continue;
-                }
-                memories.push(json!({
-                    "id": hit.object_id.get().to_string(),
-                    "score": hit.score,
-                    "project": envelope.get("project"),
-                    "scope": envelope.get("scope"),
-                    "kind": envelope.get("kind"),
-                    "layer": layer,
-                    "agent": envelope.get("agent"),
-                    "harness": envelope.get("harness"),
-                    "model": envelope.get("model"),
-                    "text": envelope.get("text"),
-                    "expires_at_micros": envelope.get("expires_at_micros"),
-                }));
-                if memories.len() == input.limit {
-                    break;
-                }
+    let policy = crate::agent_policy::Policy::active(client)
+        .await
+        .map_err(|_| invalid_request())?;
+    if input
+        .mode
+        .as_deref()
+        .is_some_and(|mode| !matches!(mode, "lexical" | "hybrid"))
+    {
+        return Err(invalid_request());
+    }
+    let mut provenance = Vec::new();
+    let mut semantic_status = "disabled";
+    if policy.semantic.enabled
+        && input.mode.as_deref() != Some("lexical")
+        && !input.query.is_empty()
+    {
+        match crate::agent_semantic::embed(&input.query, &policy).await {
+            Ok((vector, attestation)) => {
+                provenance = serde_json::to_vec(&attestation).map_err(|_| invalid_request())?;
+                search
+                    .vectors
+                    .push(hyphae_native_product::ProductVectorBranch {
+                        target: "memory".into(),
+                        query: vector,
+                        candidate_limit: 64,
+                        weight: 1,
+                        execution: None,
+                        max_distance: None,
+                    });
+                semantic_status = "ready";
             }
-            ProductResponse::StructureValue(None) => expired += 1,
-            _ => {
-                return Err(Box::new(ProductError::from_code(
-                    ProductErrorCode::Internal,
-                )));
-            }
+            Err(_) => semantic_status = "unavailable",
         }
     }
-    Ok(json!({
-        "memories": memories,
-        "expired_filtered": expired,
-        "proof": proof,
-    }))
+    let retrieval_mode = if search.vectors.is_empty() {
+        "lexical"
+    } else {
+        "hybrid"
+    };
+    selected.sort_unstable();
+    selected.dedup();
+    let request = hyphae_native_product::ProductMemoryRecallRequest {
+        provenance,
+        collections: selected
+            .into_iter()
+            .map(|id| ObjectId::new(id).map_err(|_| invalid_request()))
+            .collect::<Result<_, _>>()?,
+        search,
+        limit: input.limit,
+    };
+    if options.logical_time_micros == 0 {
+        options.logical_time_micros = crate::native::logical_time_micros();
+    }
+    let operation = hyphae_native_product::ProductOperation::MemoryRecall(request);
+    let response = if input.prove {
+        client
+            .prove(
+                operation,
+                hyphae_native_product::proof::NativeProofGenerationLimits::default(),
+                options,
+            )
+            .await
+    } else {
+        client.execute(operation, options).await
+    }
+    .map_err(normalize_client_error)?;
+    let (result, proof) = match response {
+        ProductResponse::MemoryRecall(result) => (result, None),
+        ProductResponse::Proven { response, artifact } => {
+            let ProductResponse::MemoryRecall(result) = *response else {
+                return Err(invalid_request());
+            };
+            (result, Some(persist_memory_proof(&artifact)?))
+        }
+        _ => return Err(invalid_request()),
+    };
+    let mut memories = Vec::with_capacity(result.memories.len());
+    for memory in &result.memories {
+        let envelope: Value =
+            serde_json::from_slice(&memory.envelope).map_err(|_| invalid_request())?;
+        let scope = envelope
+            .get("scope")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_request)?;
+        let owner = envelope
+            .get("project")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_request)?;
+        if scope != "global" && normalize_project(owner) != project {
+            return Err(invalid_request());
+        }
+        memories.push(json!({
+            "id": memory.hit.object_id.get().to_string(), "score": memory.hit.score,
+            "project": owner, "scope": scope, "kind": envelope.get("kind"),
+            "layer": envelope.get("layer").and_then(Value::as_str).unwrap_or("work"),
+            "agent": envelope.get("agent"),
+            "harness": envelope.get("harness").and_then(Value::as_str).unwrap_or("unknown"),
+            "model": envelope.get("model").and_then(Value::as_str).unwrap_or("unknown"),
+            "text": envelope.get("text"), "expires_at_micros": envelope.get("expires_at_micros"),
+        }));
+    }
+    Ok(
+        json!({"memories": memories, "expired_filtered": result.expired_filtered, "proof": proof,
+        "retrieval_mode":retrieval_mode,"semantic_status":semantic_status,
+        "snapshot":{"visible_csn":result.snapshot.visible_csn.map(hyphae_native_product::Csn::get),
+            "root_digest":crate::encode_hex(&result.snapshot.root_digest),"logical_time_micros":result.snapshot.logical_time_micros}}),
+    )
 }
 
-async fn profile_memory_recall_domains(
-    client: &HyphaeClient,
-    collections: MemoryCollections,
-    input: ProfileRecallInput,
-    options: RequestOptions,
-) -> Result<Value, Box<ProductError>> {
-    if let Some(layer) = input.layer.as_deref().filter(|layer| *layer != "all") {
-        return profile_memory_recall(client, collections.for_layer(layer)?, input, options).await;
-    }
-    let mut memories = Vec::new();
-    let mut expired_filtered = 0_u64;
-    let limit = input.limit;
-    for (layer, collection) in [
-        ("personal", collections.personal),
-        ("work", collections.work),
-        ("journal", collections.journal),
-    ] {
-        let value = profile_memory_recall(
-            client,
-            collection,
-            ProfileRecallInput {
-                project: input.project.clone(),
-                query: input.query.clone(),
-                limit,
-                kind: input.kind.clone(),
-                layer: Some(layer.to_owned()),
-                prove: false,
-            },
-            options.clone(),
-        )
-        .await?;
-        expired_filtered = expired_filtered.saturating_add(
-            value
-                .get("expired_filtered")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-        if let Some(items) = value.get("memories").and_then(Value::as_array) {
-            memories.extend(items.iter().cloned());
+pub(crate) async fn control_projects() -> Result<Value, CliFailure> {
+    let paths = crate::agent::AgentPaths::resolve()?;
+    let mut known = match std::fs::read(paths.config.join("memory-projects.json")) {
+        Ok(bytes) if bytes.len() <= 128 * 1024 => {
+            serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes)?
+        }
+        _ => serde_json::Map::new(),
+    };
+    if let Ok(client) = crate::agent_control::operator_client()
+        && let Ok(policy) = crate::agent_policy::Policy::active(&client).await
+    {
+        for collection in policy.collections {
+            let mut request = crate::agent_semantic::plain_search(1);
+            request
+                .facets
+                .push(hyphae_native_product::ProductFacetRequest {
+                    field: "project".into(),
+                    limit: 256,
+                });
+            if let Ok(ProductResponse::IntegratedSearch(result)) = client
+                .search_collection(
+                    ObjectId::new(collection).map_err(|_| CliFailure::invalid())?,
+                    request,
+                    RequestOptions::default(),
+                )
+                .await
+            {
+                for facet in result.facets {
+                    for bucket in facet.buckets {
+                        if let hyphae_native_product::ProductDocValue::String(project) =
+                            bucket.value
+                        {
+                            let label = if project == "_global" {
+                                "Global".to_owned()
+                            } else if project.starts_with("local-v1:") {
+                                format!("Project {}", &project[9..project.len().min(17)])
+                            } else {
+                                project.clone()
+                            };
+                            known
+                                .entry(project.clone())
+                                .or_insert_with(|| json!({"id":project,"label":label}));
+                        }
+                    }
+                }
+            }
         }
     }
-    memories.sort_by(|left, right| {
-        right
-            .get("score")
-            .and_then(Value::as_f64)
-            .partial_cmp(&left.get("score").and_then(Value::as_f64))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    memories.truncate(limit);
+    let mut projects: Vec<_> = known.into_values().collect();
+    projects.sort_by(|a, b| a["label"].as_str().cmp(&b["label"].as_str()));
+    projects.truncate(256);
+    Ok(json!({"projects":projects}))
+}
+
+pub(crate) async fn control_memory(action: &str, arguments: Value) -> Result<Value, CliFailure> {
+    let paths = crate::agent::AgentPaths::resolve()?;
+    let key_path = if matches!(action, "forget" | "store") {
+        paths.writer_key()
+    } else {
+        paths.reader_key()
+    };
+    let key = crate::native_client::read_api_key_file(&key_path)?;
+    let client =
+        HyphaeClient::local_authenticated(crate::agent::memory_endpoint(&paths), key.credential()?)
+            .map_err(|_| CliFailure::io())?;
+    let collections = MemoryCollections::from_policy()?.active(&client).await?;
+    let options = RequestOptions {
+        logical_time_micros: crate::native::logical_time_micros(),
+        ..RequestOptions::default()
+    };
+    let result = match action {
+        "status" => profile_memory_status_domains(&client, collections, options).await,
+        "forget" => {
+            profile_memory_forget_domains(
+                &client,
+                collections,
+                serde_json::from_value(arguments)?,
+                options,
+            )
+            .await
+        }
+        "store" => {
+            let input: ProfileStoreInput = serde_json::from_value(arguments)?;
+            profile_memory_store(
+                &client,
+                collections.for_layer(input.layer.as_deref().unwrap_or("work"))?,
+                input,
+                options,
+            )
+            .await
+        }
+        "recall" | "list" => {
+            let input: ProfileRecallInput = serde_json::from_value(arguments)?;
+            let selected =
+                if let Some(layer) = input.layer.as_deref().filter(|layer| *layer != "all") {
+                    vec![collections.for_layer(layer)?]
+                } else {
+                    vec![collections.personal, collections.work, collections.journal]
+                };
+            profile_memory_recall_selected(&client, selected, input, options, action == "list")
+                .await
+        }
+        _ => return Err(CliFailure::invalid()),
+    };
+    result.map_err(Into::into)
+}
+
+fn persist_memory_proof(
+    artifact: &hyphae_native_product::proof::NativeOperationProofArtifact,
+) -> Result<Value, Box<ProductError>> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+        })
+        .ok_or_else(invalid_request)?
+        .join("hyphae/proofs");
+    std::fs::create_dir_all(&state_home)
+        .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&state_home, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
+    let stamp = uuid::Uuid::now_v7();
+    let proof_path = state_home.join(format!("recall-{stamp}.proof"));
+    let witness_path = state_home.join(format!("recall-{stamp}.witness"));
+    write_private_artifact(&proof_path, &artifact.proof_bytes)?;
+    write_private_artifact(&witness_path, &artifact.witness_bytes)?;
+    std::fs::File::open(&state_home)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ProductError::from_code(ProductErrorCode::Internal))?;
     Ok(json!({
-        "memories": memories,
-        "expired_filtered": expired_filtered,
-        "proof": null,
+        "scope": "memory-snapshot-v1",
+        "proof_path": proof_path.display().to_string(), "witness_path": witness_path.display().to_string(),
+        "proof_blake3": blake3::hash(&artifact.proof_bytes).to_hex().to_string(),
+        "anchor_hex": crate::encode_hex(&artifact.trusted_anchor.digest()),
     }))
 }
 
@@ -2315,6 +2441,7 @@ async fn profile_memory_forget_domains(
     input: ProfileForgetInput,
     options: RequestOptions,
 ) -> Result<Value, Box<ProductError>> {
+    let collections = collections.active(client).await?;
     for collection in [collections.personal, collections.work, collections.journal] {
         let identity = input.id.parse::<u128>().map_err(|_| invalid_request())?;
         let lifecycle = client
@@ -2333,6 +2460,7 @@ async fn profile_memory_status_domains(
     collections: MemoryCollections,
     options: RequestOptions,
 ) -> Result<Value, Box<ProductError>> {
+    let collections = collections.active(client).await?;
     let mut domains = serde_json::Map::new();
     for (name, collection) in [
         ("personal", collections.personal),
@@ -2356,16 +2484,18 @@ async fn profile_memory_status_domains(
 
 pub(crate) async fn agent_memory_recall(
     client: &HyphaeClient,
-    collection: u128,
     project: String,
     query: String,
     limit: usize,
     layer: Option<String>,
 ) -> Result<Value, CliFailure> {
+    let policy = crate::agent_policy::Policy::active(client).await?;
+    let collection = policy.collection(layer.as_deref().unwrap_or("work"))?;
     profile_memory_recall(
         client,
         collection,
         ProfileRecallInput {
+            mode: None,
             project,
             query,
             limit,
@@ -2789,7 +2919,7 @@ fn read_mcp_credential<R: BufRead>(
     }
 }
 
-fn normalize_client_error(error: ClientError) -> Box<ProductError> {
+pub(crate) fn normalize_client_error(error: ClientError) -> Box<ProductError> {
     match error {
         ClientError::Product(error) => error,
         ClientError::Cancelled => Box::new(ProductError::from_code(ProductErrorCode::Cancelled)),

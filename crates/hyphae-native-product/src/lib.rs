@@ -23,6 +23,7 @@ pub mod error;
 pub mod error_codec;
 mod lexical_analyzer;
 mod limits;
+mod memory;
 mod operation;
 /// Canonical, bounded native proof and directory-witness artifacts.
 pub mod proof;
@@ -60,6 +61,7 @@ pub use hyphae_native_types::{
     CanonicalF32, CanonicalF64, CatalogVersion, Csn, ObjectId, ScalarValue as ProductValue,
 };
 pub use limits::*;
+pub use memory::*;
 pub use operation::*;
 pub use search::*;
 pub use search_manifest::{

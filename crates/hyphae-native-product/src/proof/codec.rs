@@ -475,6 +475,7 @@ fn decode_kind(value: u8) -> Result<NativeProofKind, NativeProofError> {
         5 => Ok(NativeProofKind::Ann),
         6 => Ok(NativeProofKind::Hybrid),
         7 => Ok(NativeProofKind::Catalog),
+        8 => Ok(NativeProofKind::Memory),
         _ => Err(NativeProofError::Invalid("invalid native proof kind")),
     }
 }

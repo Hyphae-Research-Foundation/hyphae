@@ -4243,6 +4243,14 @@ fn run_mcp_session_with_flags(
         .arg("--native-api-key-file")
         .arg(key_file)
         .args(extra)
+        .env(
+            "XDG_STATE_HOME",
+            key_file.parent().ok_or("key parent")?.join("proof-state"),
+        )
+        .env(
+            "XDG_CONFIG_HOME",
+            key_file.parent().ok_or("key parent")?.join("config"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4521,7 +4529,7 @@ fn agent_lifecycle_is_idempotent_and_preserves_data() -> Result<(), Box<dyn Erro
     let opencode = run_agent(&["agent", "configure", "opencode"])?;
     assert!(opencode.status.success());
     let opencode_config = String::from_utf8(opencode.stdout)?;
-    assert!(opencode_config.contains("opencode mcp add hyphae-memory"));
+    assert!(opencode_config.contains("hyphae-opencode-agent-memory-v1"));
     assert!(opencode_config.contains("memory-reader.key"));
     assert!(!opencode_config.contains("--allow-write"));
     assert!(!opencode_config.contains("hyp1_"));
@@ -4536,7 +4544,14 @@ fn agent_lifecycle_is_idempotent_and_preserves_data() -> Result<(), Box<dyn Erro
         .stdout(Stdio::piped())
         .spawn()?;
     let hook = hook.wait_with_output()?;
-    assert!(!hook.status.success(), "empty hook input must fail closed");
+    assert!(
+        hook.status.success(),
+        "invalid proactive input must not block the host"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hook.stdout)?,
+        serde_json::json!({})
+    );
     // Remove preserves data; purge deletes only with the explicit flag.
     let remove = run_agent(&["agent", "remove"])?;
     assert!(remove.status.success());
@@ -5106,6 +5121,50 @@ async fn memory_profile_isolates_projects_and_gates_writes() -> Result<(), Box<d
             .any(|text| text.contains("global packaging constraint"))
     );
     assert_eq!(writer[7]["result"]["structuredContent"]["status"], "ok");
+
+    // A request for a proof must cover the complete memory composition for
+    // omitted, all, and explicit layer selection.
+    for layer in [None, Some("all"), Some("work")] {
+        let mut arguments = serde_json::json!({
+            "project":"acme/site", "query":"deterministic packaging", "prove":true,
+        });
+        if let Some(layer) = layer {
+            arguments["layer"] = serde_json::json!(layer);
+        }
+        let mut messages = handshake.to_vec();
+        messages.push(
+            serde_json::json!({"jsonrpc":"2.0","id":91,"method":"tools/call","params":{
+                "name":"hyphae_memory_recall","arguments":arguments,
+            }}),
+        );
+        let responses = run_mcp_session_with_flags(
+            &address_text,
+            &owner_key,
+            &["--profile", "memory", "--allow-write"],
+            &messages,
+        )?;
+        let result = &responses[1]["result"]["structuredContent"];
+        assert!(
+            result["memories"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+            "{result}"
+        );
+        let proof = &result["proof"];
+        assert_eq!(proof["scope"], "memory-snapshot-v1");
+        let verified = run_isolated(&[
+            "proof",
+            "verify",
+            "--proof",
+            proof["proof_path"].as_str().ok_or("proof path")?,
+            "--witness",
+            proof["witness_path"].as_str().ok_or("witness path")?,
+            "--anchor",
+            proof["anchor_hex"].as_str().ok_or("anchor")?,
+        ])?;
+        assert_eq!(verified["scope"], "semantic_reexecution");
+        assert_eq!(verified["kind"], "memory");
+    }
 
     // The model journal is a separate first-person layer with exact harness
     // and model provenance. Work-only recall excludes it; journal recall

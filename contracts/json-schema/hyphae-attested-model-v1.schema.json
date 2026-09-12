@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://hyphae.dev/contracts/json-schema/hyphae-attested-model-v1.schema.json",
+  "title": "Hyphae attested local CPU model manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target",
+    "fingerprint",
+    "weights_blake3",
+    "config_blake3",
+    "tokenizer_blake3",
+    "dimensions",
+    "max_positions",
+    "pipeline",
+    "device",
+    "runtime",
+    "runtime_version"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hyphae-attested-model-v1"
+    },
+    "target": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "x-hyphae-maxUtf8Bytes": 256
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "weights_blake3": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "config_blake3": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tokenizer_blake3": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "dimensions": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "max_positions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "pipeline": {
+      "const": "bert-mean-pool-l2-cpu-v1"
+    },
+    "device": {
+      "const": "cpu"
+    },
+    "runtime": {
+      "const": "hyphae-embed"
+    },
+    "runtime_version": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

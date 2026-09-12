@@ -30,6 +30,7 @@ hyphae-engine.workspace = true
 hyphae-native-catalog.workspace = true
 hyphae-native-daemon.workspace = true
 hyphae-native-product.workspace = true
+hyphae-native-protocol.workspace = true
 hyphae-native-runtime.workspace = true
 hyphae-native-types.workspace = true
 hyphae-query.workspace = true
@@ -41,7 +42,7 @@ same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 unicode-normalization.workspace = true
 uuid.workspace = true
 

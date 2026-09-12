@@ -3441,3 +3441,143 @@ fn phrase_matching_requires_consecutive_positions() -> Result<(), Box<dyn std::e
     fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn memory_proof_seals_lifecycle_and_applies_expiry_before_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyphae_native_product::proof::{CanonicalBytes, NativeVerificationScope};
+    use hyphae_native_product::{
+        ProductMemoryRecallRequest, ProductResponse, memory_lifecycle_key,
+    };
+    let path = temporary("memory-lifecycle-proof");
+    let (mut product, binding) = configure(&path)?;
+    product.ingest_search_batch(binding.collection, &seed()?, 7, ProductDurability::Strict)?;
+    let mut session = proof_session()?;
+    for (id, value, expires) in [
+        (201, b"expired".as_slice(), Some(50)),
+        (202, b"live-envelope".as_slice(), Some(150)),
+        (203, b"".as_slice(), None),
+    ] {
+        let mut context = proof_context(&session, id);
+        context.logical_time_micros = 10;
+        product.dispatch(
+            &mut session,
+            &context,
+            ProductOperation::StructureSet {
+                key: memory_lifecycle_key(binding.collection, ObjectId::new(id)?),
+                value: value.to_vec(),
+                expires_at_micros: expires,
+            },
+        )?;
+    }
+    let request = ProductMemoryRecallRequest {
+        provenance: Vec::new(),
+        collections: vec![binding.collection],
+        search: ProductSearchRequest {
+            lexical: Some(ProductLexicalBranch {
+                query: "rust database".into(),
+                candidate_limit: 1,
+                weight: 1,
+                operator: None,
+                prefix: false,
+                fields: Vec::new(),
+                fuzzy: None,
+                phrase: false,
+            }),
+            vectors: Vec::new(),
+            filter: ProductSearchFilter::MatchAll,
+            sort: Vec::new(),
+            facets: Vec::new(),
+            range_facets: Vec::new(),
+            aggregations: Vec::new(),
+            limit: 1,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
+        },
+        limit: 1,
+    };
+    let mut context = proof_context(&session, 301);
+    context.logical_time_micros = 100;
+    let (response, artifact) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::MemoryRecall(request.clone()),
+        NativeProofGenerationLimits::default(),
+    )?;
+    let ProductResponse::MemoryRecall(result) = response else {
+        return Err("memory response missing".into());
+    };
+    assert_eq!(result.memories.len(), 1);
+    assert_eq!(result.memories[0].hit.object_id.get(), 202);
+    assert_eq!(result.memories[0].envelope, b"live-envelope");
+    // Expiry, tombstones and missing lifecycle are removed even before the
+    // one-candidate lexical budget; none can crowd out the live document.
+    assert_eq!(result.expired_filtered, 3);
+    assert!(
+        result
+            .searches
+            .iter()
+            .all(|search| search.result.snapshot == result.snapshot)
+    );
+    assert!(product.memory_recall(&request, 200)?.memories.is_empty());
+    let mut hybrid = request.clone();
+    hybrid.search.vectors.push(ProductVectorBranch {
+        target: "semantic".into(),
+        query: ProductVector::new([0.0, 1.0])?,
+        candidate_limit: 16,
+        weight: 1,
+        execution: None,
+        max_distance: None,
+    });
+    let (_, hybrid_proof) = generate_native_operation_proof(
+        &mut product,
+        &mut session,
+        &context,
+        &ProductOperation::MemoryRecall(hybrid),
+        NativeProofGenerationLimits::default(),
+    )?;
+    assert!(
+        verify_native_proof_offline(
+            &hybrid_proof.proof_bytes,
+            &hybrid_proof.witness_bytes,
+            hybrid_proof.trusted_anchor,
+            &NativeVerificationLimits::default()
+        )?
+        .semantic_reexecution_performed
+    );
+    let mut invalid = request;
+    invalid.collections.push(binding.collection);
+    assert!(product.memory_recall(&invalid, 100).is_err());
+    let mut forged = artifact.proof.content().clone();
+    let mut bytes = forged.result.as_bytes().to_vec();
+    let last = bytes.last_mut().ok_or("empty memory result")?;
+    *last ^= 1;
+    forged.result = CanonicalBytes::new(bytes);
+    let forged = encode_native_proof(&NativeProof::new(forged)?, &ProofCodecLimits::default())?;
+    drop(product);
+    fs::remove_dir_all(&path)?;
+    let report = verify_native_proof_offline(
+        &artifact.proof_bytes,
+        &artifact.witness_bytes,
+        artifact.trusted_anchor,
+        &NativeVerificationLimits::default(),
+    )?;
+    assert_eq!(report.kind, NativeProofKind::Memory);
+    assert_eq!(report.scope, NativeVerificationScope::SemanticReexecution);
+    assert!(
+        verify_native_proof_offline(
+            &forged,
+            &artifact.witness_bytes,
+            artifact.trusted_anchor,
+            &NativeVerificationLimits::default()
+        )
+        .is_err()
+    );
+    Ok(())
+}

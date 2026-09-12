@@ -62,7 +62,7 @@ class NativeAccessControlContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["permissions"], 18)
         self.assertEqual(result["built_in_roles"], 7)
-        self.assertEqual(result["current_product_variants"], 69)
+        self.assertEqual(result["current_product_variants"], 71)
         self.assertEqual(result["planned_operations"], 2)
 
     def test_backup_verify_remains_planned_and_instance_scoped(self) -> None:
@@ -266,6 +266,28 @@ class NativeAccessControlContractTests(unittest.TestCase):
                 operation(contract, operation_id)["scope_resolution"] = "instance"
                 with self.assertRaisesRegex(
                     AccessControlValidationError, "durable default scalar keyspace"
+                ):
+                    validate(contract, SOURCE)
+
+    def test_memory_authority_cannot_drop_lifecycle_or_maintenance_scopes(self) -> None:
+        for operation_id, field, value in (
+            ("memory.recall", "scope_resolution", "request_object"),
+            ("memory.recall", "required_all", ["catalog.read", "search.execute"]),
+            ("memory.enrich", "scope_resolution", "request_object"),
+            ("memory.enrich", "required_all", ["catalog.read", "data.read", "data.write"]),
+        ):
+            with self.subTest(operation=operation_id, field=field):
+                contract = payload()
+                row = operation(contract, operation_id)
+                row[field] = value
+                row["allowed_roles"] = sorted(
+                    role["id"]
+                    for role in contract["built_in_roles"]
+                    if set(row["required_all"]).issubset(role["permissions"])
+                )
+                with self.assertRaisesRegex(
+                    AccessControlValidationError,
+                    "must retain collection, lifecycle, and maintenance authority",
                 ):
                     validate(contract, SOURCE)
 

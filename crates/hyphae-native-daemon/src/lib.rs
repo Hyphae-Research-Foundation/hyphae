@@ -420,9 +420,56 @@ fn validate_config(config: NativeDaemonConfig) -> Result<(), DaemonError> {
     }
 }
 
+#[cfg(unix)]
+fn remove_stale_endpoint(path: &std::path::Path) -> Result<(), DaemonError> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use std::os::{
+        fd::AsRawFd as _,
+        unix::fs::{FileTypeExt as _, MetadataExt as _},
+    };
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !before.file_type().is_socket() || before.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(DaemonError::InvalidEndpoint);
+    }
+    #[cfg(target_vendor = "apple")]
+    let flags = SockFlag::empty();
+    #[cfg(not(target_vendor = "apple"))]
+    let flags = SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK;
+    let probe = socket(AddressFamily::Unix, SockType::Stream, flags, None)
+        .map_err(|error| DaemonError::Io(std::io::Error::from_raw_os_error(error as i32)))?;
+    #[cfg(target_vendor = "apple")]
+    {
+        // Darwin requires descriptor flags to be set separately from socket().
+        // Set nonblocking mode before probing even a saturated live listener.
+        use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+        fcntl(&probe, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|error| DaemonError::Io(std::io::Error::from_raw_os_error(error as i32)))?;
+        fcntl(&probe, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .map_err(|error| DaemonError::Io(std::io::Error::from_raw_os_error(error as i32)))?;
+    }
+    let address = UnixAddr::new(path).map_err(|_| DaemonError::InvalidEndpoint)?;
+    if connect(probe.as_raw_fd(), &address) != Err(nix::errno::Errno::ECONNREFUSED) {
+        return Err(DaemonError::InvalidEndpoint);
+    }
+    let after = std::fs::symlink_metadata(path)?;
+    if after.ino() != before.ino() || after.dev() != before.dev() || !after.file_type().is_socket()
+    {
+        return Err(DaemonError::InvalidEndpoint);
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
 fn create_listener(
     endpoint: &str,
 ) -> Result<interprocess::local_socket::tokio::Listener, DaemonError> {
+    #[cfg(unix)]
+    remove_stale_endpoint(std::path::Path::new(endpoint))?;
+
     #[cfg(unix)]
     {
         let name = endpoint
@@ -1309,7 +1356,29 @@ async fn connection_loop(
                                             );
                                         })
                                     }
-                                    Err(error) => Err(error.into()),
+                                    Err(error) => {
+                                        let code = match error {
+                                            ProductCodecError::LimitExceeded => {
+                                                ProductErrorCode::LimitExceeded
+                                            }
+                                            ProductCodecError::Unsupported => {
+                                                ProductErrorCode::InvalidRequest
+                                            }
+                                            _ => ProductErrorCode::Internal,
+                                        };
+                                        send_terminal_product_error(
+                                            response_stream.as_ref(),
+                                            &response_codec,
+                                            &response_output,
+                                            &response_requests,
+                                            &response_windows,
+                                            frame.stream_id,
+                                            frame.request_id,
+                                            generation,
+                                            ProductError::from_code(code),
+                                        )
+                                        .await
+                                    }
                                 }
                             }
                             Err(error) => {

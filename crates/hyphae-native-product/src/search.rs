@@ -1547,7 +1547,6 @@ impl NativeProduct {
             .map_err(map_runtime_error)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn search_collection_with_checkpoint(
         &self,
         collection: crate::ObjectId,
@@ -1556,26 +1555,79 @@ impl NativeProduct {
         mut checkpoint: impl FnMut() -> Result<(), ProductError>,
     ) -> Result<ProductSearchResult, ProductError> {
         checkpoint()?;
-        let binding = self.resolve_search_collection_binding(collection, logical_time_micros)?;
-        let definition = self.search_definition(collection)?;
-        validate_search_request(&definition, &binding, request)?;
         let snapshot = self.snapshot_bounded(logical_time_micros)?;
-        let manifest = ManifestView::open(&snapshot, collection)?;
+        self.search_collection_on_snapshot_with_checkpoint(
+            &snapshot, collection, request, checkpoint,
+        )
+    }
+
+    pub(crate) fn search_collection_on_snapshot_with_checkpoint(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        request: &ProductSearchRequest,
+        checkpoint: impl FnMut() -> Result<(), ProductError>,
+    ) -> Result<ProductSearchResult, ProductError> {
+        self.search_with_lifecycle_at_snapshot(snapshot, collection, request, false, checkpoint)
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) fn search_memory_collection_at_snapshot(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        request: &ProductSearchRequest,
+        checkpoint: impl FnMut() -> Result<(), ProductError>,
+    ) -> Result<(ProductSearchResult, usize), ProductError> {
+        self.search_with_lifecycle_at_snapshot(snapshot, collection, request, true, checkpoint)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_with_lifecycle_at_snapshot(
+        &self,
+        snapshot: &crate::ProductSnapshot,
+        collection: crate::ObjectId,
+        request: &ProductSearchRequest,
+        require_live_memory: bool,
+        mut checkpoint: impl FnMut() -> Result<(), ProductError>,
+    ) -> Result<(ProductSearchResult, usize), ProductError> {
+        checkpoint()?;
+        let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
+        let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
+        validate_search_request(&definition, &binding, request)?;
+        let manifest = ManifestView::open(snapshot, collection)?;
         let total_documents = manifest.total();
-        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
-            &snapshot,
+        let (mut eligible_ids, source) = resolve_eligibility_with_checkpoint(
+            snapshot,
             collection,
             &request.filter,
             &manifest,
             &mut checkpoint,
         )?;
+        let mut expired = 0;
+        if require_live_memory {
+            let mut live = BTreeSet::new();
+            for identity in eligible_ids.sorted_ids()? {
+                checkpoint()?;
+                match snapshot.structure_get(&crate::memory_lifecycle_key(collection, identity)) {
+                    Some(bytes) if !bytes.is_empty() => {
+                        if bytes.len() > crate::MAX_MEMORY_ENVELOPE_BYTES {
+                            return Err(ProductError::from_code(ProductErrorCode::LimitExceeded));
+                        }
+                        live.insert(identity);
+                    }
+                    _ => expired += 1,
+                }
+            }
+            eligible_ids = Eligibility::Set(live);
+        }
         let transform = collection_lexical_transform(&definition, |id| {
             snapshot.inner.logical_catalog_object(id).cloned()
         })?;
         let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
         let lexical_candidates = execute_lexical_branch(
             &self.database,
-            &snapshot,
+            snapshot,
             collection,
             &source,
             binding.lexical_index,
@@ -1584,11 +1636,12 @@ impl NativeProduct {
             request.fusion,
             transform.as_ref(),
             &eligible_ids,
+            require_live_memory.then_some(total_documents.max(1)),
             &mut fused,
             &mut checkpoint,
         )?;
         let vector_receipts = execute_vector_branches(
-            &snapshot,
+            snapshot,
             &binding,
             &definition,
             &request.vectors,
@@ -1610,7 +1663,7 @@ impl NativeProduct {
             candidates.push(hyphae_native_runtime::DocValueCandidate {
                 document_id: object_id.get().to_be_bytes().to_vec(),
                 score,
-                values: source.values_of(&snapshot, collection, object_id)?,
+                values: source.values_of(snapshot, collection, object_id)?,
             });
         }
         let retrieval_candidates = candidates.len();
@@ -1654,27 +1707,30 @@ impl NativeProduct {
         result.hits.truncate(request.limit);
         checkpoint()?;
         let approximate = vector_receipts.iter().any(|receipt| receipt.approximate);
-        Ok(ProductSearchResult {
-            snapshot: snapshot.identity(),
-            hits: integrated_hits(
-                &self.database,
-                result.hits,
-                &snapshot,
-                binding.lexical_index,
-                request,
-                transform.as_ref(),
-            )?,
-            facets: result.facets,
-            range_facets: result.range_facets,
-            aggregations: result.aggregations,
-            vector_branches: vector_receipts,
-            approximate,
-            total_documents,
-            eligible_documents: eligible_ids.len(),
-            lexical_candidates,
-            retrieval_candidates,
-            matched_candidates: result.matched_candidates,
-        })
+        Ok((
+            ProductSearchResult {
+                snapshot: snapshot.identity(),
+                hits: integrated_hits(
+                    &self.database,
+                    result.hits,
+                    snapshot,
+                    binding.lexical_index,
+                    request,
+                    transform.as_ref(),
+                )?,
+                facets: result.facets,
+                range_facets: result.range_facets,
+                aggregations: result.aggregations,
+                vector_branches: vector_receipts,
+                approximate,
+                total_documents,
+                eligible_documents: eligible_ids.len(),
+                lexical_candidates,
+                retrieval_candidates,
+                matched_candidates: result.matched_candidates,
+            },
+            expired,
+        ))
     }
 
     /// Executes one integrated search against a caller-owned immutable product
@@ -1686,114 +1742,14 @@ impl NativeProduct {
     ///
     /// Returns an error for an invalid binding/request, missing durable side
     /// record, exhausted bound, or native lexical/vector execution failure.
-    #[allow(clippy::too_many_lines)]
     pub fn search_collection_at_snapshot(
         product: &Self,
         snapshot: &crate::ProductSnapshot,
         collection: crate::ObjectId,
         request: &ProductSearchRequest,
     ) -> Result<ProductSearchResult, ProductError> {
-        let binding = Self::search_collection_binding_at_snapshot(snapshot, collection)?;
-        let definition = Self::search_definition_at_snapshot(snapshot, collection)?;
-        validate_search_request(&definition, &binding, request)?;
-        let manifest = ManifestView::open(snapshot, collection)?;
-        let total_documents = manifest.total();
-        let (eligible_ids, source) = resolve_eligibility_with_checkpoint(
-            snapshot,
-            collection,
-            &request.filter,
-            &manifest,
-            &mut || Ok(()),
-        )?;
-        let transform = collection_lexical_transform(&definition, |id| {
-            snapshot.inner.logical_catalog_object(id).cloned()
-        })?;
-        let mut fused = BTreeMap::<crate::ObjectId, f64>::new();
-        let lexical_candidates = execute_lexical_branch(
-            &product.database,
-            snapshot,
-            collection,
-            &source,
-            binding.lexical_index,
-            request.lexical.as_ref(),
-            collection_bm25_parameters(&definition),
-            request.fusion,
-            transform.as_ref(),
-            &eligible_ids,
-            &mut fused,
-            &mut || Ok(()),
-        )?;
-        let vector_receipts = execute_vector_branches(
-            snapshot,
-            &binding,
-            &definition,
-            &request.vectors,
-            request.fusion,
-            &eligible_ids,
-            &mut fused,
-            &mut || Ok(()),
-        )?;
-        if request.lexical.is_none() && request.vectors.is_empty() {
-            for object_id in eligible_ids.sorted_ids()? {
-                fused.insert(object_id, 0.0);
-            }
-        }
-        let candidates = fused
-            .into_iter()
-            .map(|(object_id, score)| {
-                Ok(hyphae_native_runtime::DocValueCandidate {
-                    document_id: object_id.get().to_be_bytes().to_vec(),
-                    score,
-                    values: source.values_of(snapshot, collection, object_id)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ProductError>>()?;
-        let mut result = execute_doc_values(
-            &candidates,
-            &hyphae_native_runtime::DocValueRequest {
-                filter: request.filter.clone(),
-                sort: request.sort.clone(),
-                limit: if request.parent_dedupe.is_some() || request.rerank.is_some() {
-                    hyphae_native_runtime::MAX_DOC_VALUE_HITS
-                } else {
-                    request.limit
-                },
-                facets: request.facets.clone(),
-                range_facets: Vec::new(),
-                aggregations: request.aggregations.clone(),
-            },
-            &doc_value_limits(),
-        )
-        .map_err(|error| map_doc_value_error(&error))?;
-        if let Some(stage) = &request.rerank {
-            apply_rerank(&mut result.hits, stage)?;
-        }
-        if let Some(dedupe) = &request.parent_dedupe {
-            result.hits = apply_parent_dedupe(result.hits, dedupe, request.limit)?;
-        } else if request.rerank.is_some() {
-            result.hits.truncate(request.limit);
-        }
-        Ok(ProductSearchResult {
-            snapshot: snapshot.identity(),
-            hits: integrated_hits(
-                &product.database,
-                result.hits,
-                snapshot,
-                binding.lexical_index,
-                request,
-                transform.as_ref(),
-            )?,
-            facets: result.facets,
-            range_facets: result.range_facets,
-            aggregations: result.aggregations,
-            vector_branches: vector_receipts,
-            approximate: false,
-            total_documents,
-            eligible_documents: eligible_ids.len(),
-            lexical_candidates,
-            retrieval_candidates: candidates.len(),
-            matched_candidates: result.matched_candidates,
-        })
+        product
+            .search_collection_on_snapshot_with_checkpoint(snapshot, collection, request, || Ok(()))
     }
 
     fn search_definition(
@@ -2166,6 +2122,7 @@ fn execute_lexical_branch(
     fusion: Option<ProductFusionMethod>,
     transform: Option<&crate::lexical_analyzer::LexicalTransform>,
     eligible: &Eligibility<'_>,
+    eligibility_before_limit: Option<usize>,
     fused: &mut BTreeMap<crate::ObjectId, f64>,
     checkpoint: &mut impl FnMut() -> Result<(), ProductError>,
 ) -> Result<usize, ProductError> {
@@ -2184,6 +2141,10 @@ fn execute_lexical_branch(
         query
     };
     let query = query.as_str();
+    // Memory eligibility includes lifecycle and project scope. Score the
+    // retained corpus before selecting this branch's bounded live candidates;
+    // historical integrated-search behavior retains its original rank budget.
+    let scoring_limit = eligibility_before_limit.unwrap_or(lexical.candidate_limit);
     // The durable posting scorer is bit-identical to the retained model; a
     // reclaimed page generation or inline-format directory falls open to
     // the model, never to a different answer.
@@ -2192,18 +2153,20 @@ fn execute_lexical_branch(
             &snapshot.inner,
             index,
             query,
-            lexical.candidate_limit,
+            scoring_limit,
             parameters,
         ) {
             Ok(hits) => hits,
             Err(_) => snapshot
                 .inner
-                .match_text_with_parameters(index, query, lexical.candidate_limit, parameters)
+                .match_text_with_parameters(index, query, scoring_limit, parameters)
                 .map_err(map_runtime_error)?,
         }
     } else {
+        let mut scoring = lexical.clone();
+        scoring.candidate_limit = scoring_limit;
         execute_bm25f_branch(
-            snapshot, collection, source, index, lexical, query, checkpoint,
+            snapshot, collection, source, index, &scoring, query, checkpoint,
         )?
     };
     let hits = if lexical.phrase {
@@ -2235,7 +2198,16 @@ fn execute_lexical_branch(
             }
         };
         if operator_admits && eligible.contains(object_id)? {
+            let rank = if eligibility_before_limit.is_some() {
+                admitted_hits.len()
+            } else {
+                rank
+            };
             admitted_hits.push((rank, object_id, hit.score));
+            if eligibility_before_limit.is_some() && admitted_hits.len() == lexical.candidate_limit
+            {
+                break;
+            }
         }
     }
     let admitted = admitted_hits.len();

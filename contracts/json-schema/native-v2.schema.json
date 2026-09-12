@@ -54,6 +54,8 @@
         { "$ref": "#/$defs/OperationV2Search" },
         { "$ref": "#/$defs/OperationV2SearchCollection" },
         { "$ref": "#/$defs/OperationV2SearchIngest" },
+        { "$ref": "#/$defs/OperationV2MemoryRecall" },
+        { "$ref": "#/$defs/OperationV2MemoryEnrich" },
         { "$ref": "#/$defs/OperationV2Admin" },
         { "$ref": "#/$defs/OperationV2Telemetry" },
         { "$ref": "#/$defs/OperationV2Doctor" },
@@ -128,6 +130,51 @@
       "properties": {
         "kind": { "const": "search_ingest" },
         "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2MemoryRecall": {
+      "description": "Protocol minor 7. Search and lifecycle composition on one immutable snapshot; see docs/native/agent-memory-read-v1.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "memory_recall" },
+        "arguments": {
+          "type": "object", "additionalProperties": false,
+          "required": ["collections", "search", "limit"],
+          "properties": {
+            "collections": {
+              "description": "Distinct nonzero u128 IDs in ascending numeric order, encoded as decimal strings in JSON.",
+              "type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" }
+            },
+            "search": {
+              "description": "ProductSearchRequest; candidate limit must be at least the final memory limit. Offset, explicit sorting, facets and aggregations are excluded.",
+              "type": "object", "required": ["limit"],
+              "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 1000 } }
+            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "provenance": { "description": "Opaque attested query metadata, at most 65536 decoded bytes. Sealed by memory proofs.", "type": "string", "contentEncoding": "base64", "maxLength": 87384 }
+          }
+        }
+      }
+    },
+    "OperationV2MemoryEnrich": {
+      "description": "Protocol minor 7. Strict conditional enrichment of an unchanged live memory; requires maintenance authority.",
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "memory_enrich" },
+        "arguments": {
+          "type": "object", "additionalProperties": false,
+          "required": ["collection", "expected_envelope_digest", "idempotency_id", "document"],
+          "properties": {
+            "collection": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+            "expected_envelope_digest": { "description": "BLAKE3 of the exact live lifecycle envelope, 32 decoded bytes.", "type": "string", "contentEncoding": "base64", "minLength": 44, "maxLength": 44 },
+            "idempotency_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+            "document": { "description": "ProductDocument retaining original text and base doc values; only the memory vector and embedding metadata may change.", "type": "object" }
+          }
+        }
       }
     },
     "OperationV2Admin": {

@@ -390,6 +390,10 @@ pub enum ProductOperation {
         /// Complete bounded integrated request.
         request: ProductSearchRequest,
     },
+    /// Compose search and lifecycle reads over one immutable snapshot.
+    MemoryRecall(crate::ProductMemoryRecallRequest),
+    /// Conditionally enrich a live memory and perform bounded index maintenance.
+    MemoryEnrich(crate::ProductMemoryEnrichRequest),
     /// Atomically ingest integrated documents across native engines.
     SearchIngest {
         /// Logical Catalog V2 collection identity.
@@ -678,6 +682,8 @@ pub enum ProductResponse {
     Search(ProductSearchResults),
     /// Integrated lexical/vector/doc-value result.
     IntegratedSearch(ProductSearchResult),
+    /// Snapshot-coherent memory hits and lifecycle evidence.
+    MemoryRecall(crate::ProductMemoryRecallResult),
     /// Atomic integrated ingestion outcome.
     SearchIngested(ProductSearchIngestReceipt),
     /// Current administration status.
@@ -1265,6 +1271,14 @@ fn dispatch_inner(
         ProductOperation::ExplicitTransactionStatus { handle } => {
             ProductResponse::ExplicitTransactionStatus(session.explicit_transaction_status(handle))
         }
+        ProductOperation::MemoryEnrich(request) => ProductResponse::SearchIngested(
+            product.memory_enrich(&request, context.logical_time_micros)?,
+        ),
+        ProductOperation::MemoryRecall(request) => ProductResponse::MemoryRecall(
+            product.memory_recall_with_checkpoint(&request, context.logical_time_micros, || {
+                context.checkpoint()
+            })?,
+        ),
         ProductOperation::SearchCollection {
             collection,
             request,
@@ -2025,6 +2039,37 @@ fn operation_authorization_requirement(
         ),
         ProductOperation::Search { index, .. } => {
             ProductAuthorizationRequirement::object(permissions, *index)
+        }
+        ProductOperation::MemoryEnrich(request) => {
+            let mut requirement = ProductAuthorizationRequirement::instance(authorization([
+                ProductPermission::Maintain,
+            ]));
+            requirement.union(&ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::DataRead]),
+                product.default_scalar_keyspace_id()?,
+            ));
+            requirement.union(&ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
+                request.collection,
+            ));
+            requirement
+        }
+        ProductOperation::MemoryRecall(request) => {
+            request.validate()?;
+            let mut requirement = ProductAuthorizationRequirement::object(
+                authorization([ProductPermission::DataRead]),
+                product.default_scalar_keyspace_id()?,
+            );
+            for collection in &request.collections {
+                requirement.union(&ProductAuthorizationRequirement::object(
+                    authorization([
+                        ProductPermission::CatalogRead,
+                        ProductPermission::SearchExecute,
+                    ]),
+                    *collection,
+                ));
+            }
+            requirement
         }
         ProductOperation::SearchCollection { collection, .. }
         | ProductOperation::SearchIngest { collection, .. }
@@ -3946,6 +3991,17 @@ impl ProductOperation {
             | Self::SearchDocumentDelete { .. } => {
                 authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite])
             }
+            Self::MemoryEnrich(_) => authorization([
+                ProductPermission::CatalogRead,
+                ProductPermission::DataRead,
+                ProductPermission::DataWrite,
+                ProductPermission::Maintain,
+            ]),
+            Self::MemoryRecall(_) => authorization([
+                ProductPermission::CatalogRead,
+                ProductPermission::SearchExecute,
+                ProductPermission::DataRead,
+            ]),
             Self::Search { .. } | Self::SearchCollection { .. } => authorization([
                 ProductPermission::CatalogRead,
                 ProductPermission::SearchExecute,
@@ -4031,6 +4087,7 @@ impl ProductOperation {
             | Self::TransactionStatusByIdempotency { .. }
             | Self::Search { .. }
             | Self::SearchCollection { .. }
+            | Self::MemoryRecall(_)
             | Self::AdminStatus
             | Self::AdminExplainSql { .. }
             | Self::Doctor(_)
@@ -4050,6 +4107,7 @@ impl ProductOperation {
             }
             Self::Prove { operation, .. } => operation.is_read_only(),
             Self::CatalogCreate { .. }
+            | Self::MemoryEnrich(_)
             | Self::PrepareSql { .. }
             | Self::DeallocatePrepared { .. }
             | Self::StructureSet { .. }
@@ -4130,6 +4188,7 @@ impl ProductOperation {
         matches!(
             self,
             Self::CatalogCreate { .. }
+                | Self::MemoryEnrich(_)
                 | Self::StructureSet { .. }
                 | Self::StructureMutate { .. }
                 | Self::TransactionCommit { .. }
@@ -4271,6 +4330,15 @@ impl ProductOperation {
             Self::Search { query, limit, .. } => {
                 let bytes = search_query_bytes(query);
                 (*limit, bytes, bytes.max(*limit))
+            }
+            Self::MemoryEnrich(request) => debug_cost(request),
+            Self::MemoryRecall(request) => {
+                let bytes = format!("{request:?}").len();
+                let count = request
+                    .collections
+                    .len()
+                    .saturating_mul(request.search.limit);
+                (count, bytes, bytes.max(count))
             }
             Self::SearchCollection { request, .. } => {
                 let bytes = format!("{request:?}").len().saturating_add(16);
@@ -4515,6 +4583,7 @@ impl ProductResponse {
                     .sum(),
             ),
             Self::IntegratedSearch(result) => (result.hits.len(), format!("{result:?}").len()),
+            Self::MemoryRecall(result) => (result.memories.len(), format!("{result:?}").len()),
             Self::AdminStatus(_) | Self::Doctor(_) => (1, 512),
             Self::SecurityStatus(_) => (1, AccessControlStatus::encoded_size_bound()),
             Self::Backup(info) => (1, info.path.as_os_str().as_encoded_bytes().len() + 128),

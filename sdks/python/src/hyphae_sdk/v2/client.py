@@ -144,6 +144,14 @@ class HyphaeClient:
     def search_collection(self, collection: int, request: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         return self.execute("search_collection", {"collection": collection, "request": request}, options=options)
 
+    def memory_recall(self, collections: list[int], search: dict[str, object], limit: int = 6, *, provenance: bytes = b"", options: RequestOptions | None = None) -> Response:
+        """Read search hits and their live envelopes on one immutable snapshot."""
+        return self._execute_expected("memory_recall", "memory_recall", {"collections": collections, "search": search, "limit": limit, "provenance": provenance}, options=options)
+
+    def memory_enrich(self, collection: int, expected_envelope_digest: bytes, idempotency_id: int, document: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+        """Enrich an unchanged live source; requires operator maintenance authority."""
+        return self.execute("memory_enrich", {"collection": collection, "expected_envelope_digest": expected_envelope_digest, "idempotency_id": idempotency_id, "document": document}, options=options)
+
     def search_ingest(self, collection: int, batch: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         return self.execute("search_ingest", {"collection": collection, "batch": batch}, options=options)
 

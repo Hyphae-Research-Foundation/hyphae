@@ -89,7 +89,7 @@
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "6e42a45f895f89a04521a3c5c229124096024c25bf576bd161aa45d5e28973b8"
+      "sha256": "458077c0788182a912d7e43a712c2eca70d7d7a3f3768994184453054b9391ef"
     },
     {
       "reference": "docs/native/catalog-v1.md",
@@ -113,7 +113,7 @@
     },
     {
       "reference": "contracts/json-schema/native-v2.schema.json",
-      "sha256": "aa896774005c8d7f691bd0fecc49ac18e561c6f18350b77508952bb28a6ec711"
+      "sha256": "ed248c0704df4ea8ceb89eeec1916a47504f6d90d3dd475cc1315a42035ced67"
     },
     {
       "reference": "contracts/json-schema/product-error-v2.schema.json",

@@ -49,6 +49,7 @@ const SEMANTICS_VERSION_OPERATORS: u16 = 3;
 const SEMANTICS_VERSION_HIGHLIGHT: u16 = 4;
 /// Semantics version required by requests carrying an autocut stage.
 const SEMANTICS_VERSION_AUTOCUT: u16 = 5;
+const SEMANTICS_VERSION_MEMORY: u16 = 6;
 const ORDERING_VERSION: u16 = 2;
 const OP_POINT_CATALOG: u8 = 1;
 const OP_SQL: u8 = 2;
@@ -56,6 +57,7 @@ const OP_LEXICAL: u8 = 3;
 const OP_SEARCH_COLLECTION: u8 = 4;
 const OP_CATALOG_LIST: u8 = 5;
 const OP_CATALOG_DESCRIBE: u8 = 6;
+const OP_MEMORY_RECALL: u8 = 7;
 const MAX_OPERATION_DEPTH: usize = 32;
 static NEXT_EXTRACTION: AtomicU64 = AtomicU64::new(1);
 
@@ -77,6 +79,10 @@ enum SemanticOperation {
     SearchCollection {
         collection: ObjectId,
         request: Box<ProductSearchRequest>,
+        logical_time_micros: i64,
+    },
+    MemoryRecall {
+        request: Box<crate::ProductMemoryRecallRequest>,
         logical_time_micros: i64,
     },
     CatalogList(CatalogListRequest),
@@ -331,6 +337,10 @@ impl SemanticOperation {
             Self::SearchCollection {
                 logical_time_micros,
                 ..
+            }
+            | Self::MemoryRecall {
+                logical_time_micros,
+                ..
             } => *logical_time_micros,
             _ => 0,
         }
@@ -345,6 +355,7 @@ impl ProofOperationClass for ProductOperation {
     fn is_mutating_for_proof(&self) -> bool {
         match self {
             ProductOperation::CatalogCreate { .. }
+            | ProductOperation::MemoryEnrich(_)
             | ProductOperation::StructureSet { .. }
             | ProductOperation::StructureMutate { .. }
             | ProductOperation::SearchIngest { .. }
@@ -455,6 +466,14 @@ fn capture_execution(
             integrated_kind(request, result)?,
             result.snapshot,
         ),
+        (ProductOperation::MemoryRecall(request), ProductResponse::MemoryRecall(result)) => (
+            SemanticOperation::MemoryRecall {
+                request: Box::new(resolve_memory_proof_request(product, request)?),
+                logical_time_micros: context.logical_time_micros,
+            },
+            NativeProofKind::Memory,
+            result.snapshot,
+        ),
         (ProductOperation::CatalogList(request), ProductResponse::CatalogPage(page)) => (
             SemanticOperation::CatalogList(*request),
             NativeProofKind::Catalog,
@@ -520,6 +539,27 @@ fn resolve_proof_search_request(
     Ok(resolved)
 }
 
+fn resolve_memory_proof_request(
+    product: &NativeProduct,
+    request: &crate::ProductMemoryRecallRequest,
+) -> Result<crate::ProductMemoryRecallRequest, NativeProofError> {
+    let first = request
+        .collections
+        .first()
+        .ok_or(NativeProofError::Invalid("memory collection missing"))?;
+    let search = resolve_proof_search_request(product, *first, &request.search)?;
+    for collection in request.collections.iter().skip(1) {
+        if resolve_proof_search_request(product, *collection, &request.search)? != search {
+            return Err(NativeProofError::Invalid(
+                "memory proof requires compatible vector execution policies",
+            ));
+        }
+    }
+    let mut resolved = request.clone();
+    resolved.search = search;
+    Ok(resolved)
+}
+
 fn latest_snapshot_identity(
     product: &NativeProduct,
     logical_time_micros: i64,
@@ -534,6 +574,7 @@ fn latest_snapshot_identity(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn reexecute(
     product: &NativeProduct,
     operation: &SemanticOperation,
@@ -608,6 +649,16 @@ fn reexecute(
                 .map_err(|_| NativeProofError::Invalid("search proof reexecution failed"))?;
             let snapshot = result.snapshot;
             Ok((ProductResponse::IntegratedSearch(result), snapshot))
+        }
+        SemanticOperation::MemoryRecall {
+            request,
+            logical_time_micros,
+        } => {
+            let result = product
+                .memory_recall(request, *logical_time_micros)
+                .map_err(|_| NativeProofError::Invalid("memory proof reexecution failed"))?;
+            let snapshot = result.snapshot;
+            Ok((ProductResponse::MemoryRecall(result), snapshot))
         }
         SemanticOperation::CatalogList(request) => {
             let snapshot = product
@@ -706,6 +757,21 @@ fn enforce_generation_limits(
     evidence_bytes: usize,
     limits: AdmittedProofLimits,
 ) -> Result<(), NativeProofError> {
+    let candidates = match response {
+        ProductResponse::MemoryRecall(result) => result
+            .searches
+            .iter()
+            .map(|search| search.result.retrieval_candidates as u64)
+            .sum(),
+        _ => 0,
+    };
+    if candidates > limits.candidate_items {
+        return Err(limit(
+            "memory proof candidates",
+            candidates,
+            limits.candidate_items,
+        ));
+    }
     let items = response_items(response)?;
     if items > limits.result_items {
         return Err(limit("proof result items", items, limits.result_items));
@@ -777,6 +843,7 @@ fn response_items(response: &ProductResponse) -> Result<u64, NativeProofError> {
         } => rows.len(),
         ProductResponse::Search(result) => result.hits.len(),
         ProductResponse::IntegratedSearch(result) => result.hits.len(),
+        ProductResponse::MemoryRecall(result) => result.memories.len(),
         _ => {
             return Err(NativeProofError::Invalid(
                 "response is not a semantic proof result",
@@ -804,6 +871,9 @@ fn filter_requires_operator_semantics(filter: &DocValueFilter) -> bool {
 
 /// Lowest semantics version whose contract admits this operation.
 fn required_semantics_version(operation: &SemanticOperation) -> u16 {
+    if matches!(operation, SemanticOperation::MemoryRecall { .. }) {
+        return SEMANTICS_VERSION_MEMORY;
+    }
     let filter = match operation {
         SemanticOperation::SearchCollection { request, .. } => Some(&request.filter),
         _ => None,
@@ -889,6 +959,23 @@ fn encode_semantic_operation(operation: &SemanticOperation) -> Result<Vec<u8>, N
             encoded.u128(collection.get());
             encode_integrated_request(&mut encoded, request, semantics_version)?;
         }
+        SemanticOperation::MemoryRecall {
+            request,
+            logical_time_micros,
+        } => {
+            request
+                .validate()
+                .map_err(|_| NativeProofError::Invalid("invalid memory request"))?;
+            encoded.byte(OP_MEMORY_RECALL);
+            encoded.extend(&logical_time_micros.to_le_bytes());
+            put_count(&mut encoded, request.collections.len())?;
+            for collection in &request.collections {
+                encoded.u128(collection.get());
+            }
+            put_usize(&mut encoded, request.limit)?;
+            put_bytes(&mut encoded, &request.provenance)?;
+            encode_integrated_request(&mut encoded, &request.search, semantics_version)?;
+        }
         SemanticOperation::CatalogList(request) => {
             encoded.byte(OP_CATALOG_LIST);
             encode_catalog_list_request(&mut encoded, *request)?;
@@ -915,6 +1002,7 @@ fn decode_semantic_operation(
                 | SEMANTICS_VERSION_OPERATORS
                 | SEMANTICS_VERSION_HIGHLIGHT
                 | SEMANTICS_VERSION_AUTOCUT
+                | SEMANTICS_VERSION_MEMORY
         )
         || decoder.u16()? != ORDERING_VERSION
     {
@@ -960,6 +1048,37 @@ fn decode_semantic_operation(
                 semantics_version,
             )?),
         },
+        OP_MEMORY_RECALL => {
+            if semantics_version != SEMANTICS_VERSION_MEMORY {
+                return Err(NativeProofError::Invalid("memory requires semantics 6"));
+            }
+            let logical_time_micros = i64::from_le_bytes(decoder.array()?);
+            let count = bounded_count(
+                &mut decoder,
+                crate::MAX_MEMORY_COLLECTIONS,
+                "memory collections",
+            )?;
+            let mut collections = Vec::with_capacity(count);
+            for _ in 0..count {
+                collections.push(object_id(decoder.u128()?)?);
+            }
+            let limit = usize_value(&mut decoder)?;
+            let provenance = bytes(&mut decoder, crate::MAX_MEMORY_ENVELOPE_BYTES as u64)?;
+            let search = decode_integrated_request(&mut decoder, limits, semantics_version)?;
+            let request = crate::ProductMemoryRecallRequest {
+                collections,
+                search,
+                limit,
+                provenance,
+            };
+            request
+                .validate()
+                .map_err(|_| NativeProofError::Invalid("invalid memory request"))?;
+            SemanticOperation::MemoryRecall {
+                request: Box::new(request),
+                logical_time_micros,
+            }
+        }
         OP_CATALOG_LIST => {
             SemanticOperation::CatalogList(decode_catalog_list_request(&mut decoder)?)
         }
@@ -972,6 +1091,7 @@ fn decode_semantic_operation(
     Ok(operation)
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_claim(
     response: &ProductResponse,
     snapshot: SnapshotIdentity,
@@ -1042,6 +1162,48 @@ fn encode_claim(
                 put_usize(&mut evidence, count)?;
             }
         }
+        ProductResponse::MemoryRecall(memory) => {
+            memory
+                .validate()
+                .map_err(|_| NativeProofError::Invalid("invalid memory result"))?;
+            result.byte(OP_MEMORY_RECALL);
+            evidence.byte(OP_MEMORY_RECALL);
+            encode_snapshot(&mut evidence, memory.snapshot);
+            put_usize(&mut evidence, memory.expired_filtered)?;
+            put_count(&mut result, memory.searches.len())?;
+            for search in &memory.searches {
+                result.u128(search.collection.get());
+                let (search_result, search_evidence) = encode_claim(
+                    &ProductResponse::IntegratedSearch(search.result.clone()),
+                    memory.snapshot,
+                )?;
+                put_bytes(&mut result, &search_result)?;
+                put_bytes(&mut evidence, &search_evidence)?;
+                // Memory semantics additionally seal every returned fragment and range facet.
+                put_count(&mut result, search.result.hits.len())?;
+                for hit in &search.result.hits {
+                    put_count(&mut result, hit.fragments.len())?;
+                    for fragment in &hit.fragments {
+                        put_text(&mut result, fragment)?;
+                    }
+                }
+                put_count(&mut result, search.result.range_facets.len())?;
+                for facet in &search.result.range_facets {
+                    put_text(&mut result, &facet.field)?;
+                    put_count(&mut result, facet.buckets.len())?;
+                    for bucket in &facet.buckets {
+                        encode_doc_value(&mut result, &bucket.value)?;
+                        result.u64(bucket.count);
+                    }
+                }
+            }
+            put_count(&mut result, memory.memories.len())?;
+            for hit in &memory.memories {
+                result.u128(hit.collection.get());
+                result.u128(hit.hit.object_id.get());
+                put_bytes(&mut result, &hit.envelope)?;
+            }
+        }
         ProductResponse::CatalogPage(page) => {
             result.byte(OP_CATALOG_LIST);
             put_count(&mut result, page.items.len())?;
@@ -1078,6 +1240,7 @@ fn encode_claim(
     Ok((result.bytes, evidence.bytes))
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_object_bindings(
     product: &NativeProduct,
     operation: &SemanticOperation,
@@ -1119,6 +1282,32 @@ fn collect_object_bindings(
                             NativeProofError::Invalid("catalog binding encoding failed")
                         })?,
                     );
+                }
+            }
+        }
+        (SemanticOperation::MemoryRecall { request, .. }, ProductResponse::MemoryRecall(_)) => {
+            let snapshot = product
+                .catalog_snapshot()
+                .map_err(|_| NativeProofError::Invalid("memory catalog snapshot failed"))?;
+            let mut ids = vec![
+                product
+                    .default_scalar_keyspace_id()
+                    .map_err(|_| NativeProofError::Invalid("memory keyspace binding failed"))?,
+            ];
+            for collection in &request.collections {
+                let binding = product
+                    .resolve_search_collection_binding(*collection, 0)
+                    .map_err(|_| NativeProofError::Invalid("memory search binding failed"))?;
+                ids.push(*collection);
+                ids.push(binding.lexical_index);
+                ids.extend(binding.vectors.iter().map(|vector| vector.index));
+            }
+            for id in ids {
+                if let Some(object) = product
+                    .catalog_describe(&snapshot, id)
+                    .map_err(|_| NativeProofError::Invalid("memory binding read failed"))?
+                {
+                    definitions.insert(id, encode_logical_binding(&object)?);
                 }
             }
         }
@@ -1420,6 +1609,13 @@ fn verify_declared_metadata(
     snapshot: SnapshotIdentity,
     _evidence: &[u8],
 ) -> Result<(), NativeProofError> {
+    if matches!(operation, SemanticOperation::MemoryRecall { .. })
+        && (proof.content.kind != NativeProofKind::Memory
+            || proof.content.semantics_version != SEMANTICS_VERSION_MEMORY
+            || proof.content.ordering_version != ORDERING_VERSION)
+    {
+        return Err(NativeProofError::Invalid("memory proof contract mismatch"));
+    }
     let ann = ann_metadata(product, operation, response, snapshot)?;
     let hybrid = hybrid_metadata(operation, response)?;
     if ann != proof.content.ann {

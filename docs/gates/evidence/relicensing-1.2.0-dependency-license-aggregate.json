@@ -14,169 +14,169 @@
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-darwin-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-darwin-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-arm",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-ppc64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-riscv64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-s390x",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linuxmusl-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linuxmusl-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-wasm32",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-win32-arm64",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-win32-ia32",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/host-smoke/package-lock.json",
           "path": "node_modules/@img/sharp-win32-x64",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-darwin-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-darwin-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-arm",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-ppc64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-riscv64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-s390x",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linux-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linuxmusl-arm64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-libvips-linuxmusl-x64",
-          "version": "1.3.2"
+          "version": "1.3.3"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-wasm32",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-win32-arm64",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-win32-ia32",
-          "version": "0.35.3"
+          "version": "0.35.4"
         },
         {
           "license": "Apache-2.0 AND LGPL-3.0-or-later",
           "lock": "integrations/javascript/package-lock.json",
           "path": "node_modules/@img/sharp-win32-x64",
-          "version": "0.35.3"
+          "version": "0.35.4"
         }
       ]
     },
@@ -243,18 +243,18 @@
         "sha256": "5f06a6b44b6d02603bb9bd70623df0019eda9cf73598c606071923eea86dd0e1"
       },
       {
-        "canonical_sha256": "54937054408a9f6565997ce5031984b960c98decbe023a09cbbe992c827016eb",
+        "canonical_sha256": "02bf90f58847631bde51cfb6723479f50317b553f329bbf5a86c8c41ab0c52f6",
         "lock": "integrations/host-smoke/package-lock.json",
-        "package_count": 312,
+        "package_count": 304,
         "result": "pass",
-        "sha256": "2f2baa6501c391d849620ab81efe346f601318d0f7b8c7562fc3db67fed7095d"
+        "sha256": "34b1c91f49892c8b0fdcdf8d584d775488ff08cd3f52cd577636f9de3b53b9b0"
       },
       {
-        "canonical_sha256": "9b37352206954eac59dd874983665e3b1b7a7510c49d91fb673a537123a21872",
+        "canonical_sha256": "b2c959b21c68be09a4ad9f06151eb57c7d23fd0981eeda9a1dd756281b962e47",
         "lock": "integrations/javascript/package-lock.json",
-        "package_count": 298,
+        "package_count": 290,
         "result": "pass",
-        "sha256": "659264732138ddb3185454765960dd81c63f58241100d5a450f45c8bcf6b5469"
+        "sha256": "f752ffa88d236944b6bca6002826c4d09d4d447493b01f4b25f839a0e64e8620"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
@@ -275,11 +275,11 @@
       "runtime_dependency_count": 0
     },
     "rust": {
-      "canonical_sha256": "ae0fa1dc4fdf5fe46390fa8b8fd7432bb9d710adc4e621de5314dc79ae5f3871",
-      "package_count": 299,
+      "canonical_sha256": "68695242fb9c14954affbd388ca95cfacb1aa5cb45f675b443f1768a776d8d11",
+      "package_count": 300,
       "receipt": "docs/gates/evidence/relicensing-1.2.0-dependencies-fcf2f918.json",
       "result": "pass",
-      "sha256": "81bf7cc6f4e0e83f2f8723fa78a1aec54e01e080dab76a23c9038cc5cbe04737"
+      "sha256": "56a411b8976512636122cd2983aa5ec896ea8c84bd0c22bfdb3b6b7669ede9e6"
     }
   },
   "result": "pass",
@@ -287,11 +287,11 @@
   "source": {
     "mode": "content-bound-integration-tree",
     "rust_receipt_anchor": {
-      "commit": "f7ad00070b2f5eec55ff73c46a0fe7d4b3c9574c",
+      "commit": "2ecef6344c7a3d7c152c48f7586295de11fcfd39",
       "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
       "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
       "mode": "integration-tree",
-      "tree": "1bd27dd014c2d407e7af0469e5c5cd7f25bc81e8"
+      "tree": "61f85b2df4f28d81c08532a008ea958207219570"
     }
   },
   "target_release": "1.2.0"

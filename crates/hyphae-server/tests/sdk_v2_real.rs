@@ -166,7 +166,7 @@ async fn rust_transport_acceptance(
         (
             ProductErrorCode::LimitExceeded,
             ProductOperation::ExecuteSql {
-                statement: "SELECT id FROM proof_items".into(),
+                statement: "SELECT id FROM proof_items LIMIT 1".into(),
                 parameters: vec![],
             },
             Some("limit"),

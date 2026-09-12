@@ -101,6 +101,27 @@ impl AgentPaths {
     }
 }
 
+/// Managed Agent Memory IPC lives outside the durable directory so backups
+/// and witnesses contain only retained engine data.
+pub(crate) fn memory_endpoint(paths: &AgentPaths) -> String {
+    #[cfg(unix)]
+    {
+        let digest = blake3::hash(paths.data.as_os_str().as_encoded_bytes()).to_hex();
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| paths.config.join("runtime"));
+        runtime
+            .join(format!("hyphae-memory-{}.sock", &digest[..16]))
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        crate::native::default_endpoint(&paths.data)
+    }
+}
+
 fn run_self(arguments: &[&str]) -> Result<(), CliFailure> {
     run_self_json(arguments).map(|_| ())
 }
@@ -152,6 +173,7 @@ const WRITER_PERMISSIONS: &[&str] = &[
 #[allow(clippy::too_many_lines)]
 pub(crate) fn setup(enable_service: bool, no_service: bool) -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
+    crate::agent_policy::runtime_directory()?;
     println!("Hyphae Agent Memory setup will create:");
     println!("  data directory     {}", paths.data.display());
     println!("  configuration      {}", paths.config.display());
@@ -361,9 +383,11 @@ pub(crate) fn setup(enable_service: bool, no_service: bool) -> Result<(), CliFai
         println!("created the {label} credential");
     }
 
+    crate::agent_semantic::recover()?;
     if no_service {
         println!("service installation skipped (--no-service)");
     } else {
+        install_maintenance_units(&paths)?;
         let unit_path = install_service_unit(&paths)?;
         println!("installed service {}", unit_path.display());
         let start = enable_service || {
@@ -376,7 +400,13 @@ pub(crate) fn setup(enable_service: bool, no_service: bool) -> Result<(), CliFai
             matches!(answer.trim(), "y" | "Y" | "yes")
         };
         if start {
-            systemctl(&["enable", "--now", SERVICE_NAME])?;
+            reset_service_failure(SERVICE_NAME);
+            systemctl(&[
+                "enable",
+                "--now",
+                SERVICE_NAME,
+                "hyphae-agent-memory-maintain.timer",
+            ])?;
             println!("service enabled and started");
         } else {
             println!("service installed but not enabled; start it with:");
@@ -388,10 +418,7 @@ pub(crate) fn setup(enable_service: bool, no_service: bool) -> Result<(), CliFai
     println!("Agent Memory is ready. Operate it with:");
     println!("  hyphae serve --data-dir {data_text} --native-api-key-auth");
     println!("  hyphae mcp --profile memory \\");
-    println!(
-        "      --endpoint {}",
-        crate::native::default_endpoint(&paths.data)
-    );
+    println!("      --endpoint {}", memory_endpoint(&paths));
     println!(
         "      (HYPHAE_NATIVE_API_KEY_FILE={})",
         paths.reader_key().display()
@@ -1011,6 +1038,50 @@ fn recover_operator_key(data: &Path, key: &Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
+/// Preserve credentials that belong to a newer authority than the restored
+/// backup. The caller then runs normal setup and its native owner recovery.
+pub(crate) fn prepare_restored_credentials() -> Result<bool, CliFailure> {
+    let paths = AgentPaths::resolve()?;
+    let keys = [paths.operator_key(), paths.reader_key(), paths.writer_key()];
+    let product = NativeProduct::open(&paths.data)?;
+    let mut valid = true;
+    for path in &keys {
+        match crate::native_client::read_api_key_file(path) {
+            Ok(key) => match product.authenticate_api_key(key.credential()?, 0) {
+                Ok(_) => {}
+                Err(error) if error.code() == ProductErrorCode::AuthorizationDenied => {
+                    valid = false;
+                }
+                Err(error) => return Err(error.into()),
+            },
+            Err(_) => valid = false,
+        }
+    }
+    drop(product);
+    if valid {
+        return Ok(false);
+    }
+    let preserved = paths.config.join(format!(
+        "credentials-before-restore-{}",
+        crate::native::logical_time_micros()
+    ));
+    std::fs::create_dir(&preserved)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&preserved, std::fs::Permissions::from_mode(0o700))?;
+    }
+    for key in keys {
+        if std::fs::symlink_metadata(&key).is_ok() {
+            std::fs::rename(
+                &key,
+                preserved.join(key.file_name().ok_or_else(CliFailure::invalid)?),
+            )?;
+        }
+    }
+    Ok(true)
+}
+
 fn agent_principal(
     data: &Path,
     operator_key: &Path,
@@ -1149,21 +1220,18 @@ pub(crate) async fn backup() -> Result<(), CliFailure> {
 
 fn agent_client(paths: &AgentPaths) -> Result<HyphaeClient, CliFailure> {
     let key = crate::native_client::read_api_key_file(&paths.operator_key())?;
-    HyphaeClient::local_authenticated(
-        crate::native::default_endpoint(&paths.data),
-        key.credential()?,
-    )
-    .map_err(client_failure)
+    HyphaeClient::local_authenticated(memory_endpoint(paths), key.credential()?)
+        .map_err(client_failure)
 }
 
-fn local_endpoint_present(paths: &AgentPaths) -> bool {
-    #[cfg(unix)]
-    {
-        Path::new(&crate::native::default_endpoint(&paths.data)).exists()
-    }
-    #[cfg(windows)]
-    {
-        false
+pub(crate) fn local_endpoint_present(paths: &AgentPaths) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.data.join("LOCK"));
+    match lock {
+        Ok(lock) => lock.try_lock().is_err(),
+        Err(_) => false,
     }
 }
 
@@ -1193,9 +1261,22 @@ fn doctor_status(status: hyphae_native_product::DoctorStatus) -> &'static str {
 pub(crate) fn restore(backup: &Path) -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
     if service_active() {
-        eprintln!("stop the service first: systemctl --user stop {SERVICE_NAME}");
         return Err(CliFailure::invalid());
     }
+    let ownership = if paths.data.exists() {
+        let lock_path = paths.data.join("LOCK");
+        if !std::fs::symlink_metadata(&lock_path)?.file_type().is_file() {
+            return Err(CliFailure::invalid());
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock.try_lock().map_err(|_| CliFailure::invalid())?;
+        Some(lock)
+    } else {
+        None
+    };
     run_self(&[
         "backup",
         "verify",
@@ -1203,24 +1284,43 @@ pub(crate) fn restore(backup: &Path) -> Result<(), CliFailure> {
         &backup.display().to_string(),
     ])?;
     let stamp = crate::native::logical_time_micros();
-    let preserved = paths
+    let pending = paths
         .data
-        .with_file_name(format!("agent-memory.pre-restore-{stamp}"));
-    if paths.data.exists() {
-        std::fs::rename(&paths.data, &preserved).map_err(|_| CliFailure::io())?;
-        println!("previous data preserved at {}", preserved.display());
-    }
+        .with_file_name(format!("agent-memory.restore-{stamp}"));
     run_self(&[
         "restore",
         "--backup",
         &backup.display().to_string(),
         "--data-dir",
-        &paths.data.display().to_string(),
+        &pending.display().to_string(),
     ])?;
+    let request = DoctorRequest::new(&pending, crate::native::logical_time_micros())
+        .map_err(|_| CliFailure::invalid())?;
+    if hyphae_native_product::doctor(&request).status
+        != hyphae_native_product::DoctorStatus::Healthy
+    {
+        return Err(CliFailure::invalid());
+    }
+    let preserved = paths
+        .data
+        .with_file_name(format!("agent-memory.pre-restore-{stamp}"));
+    if paths.data.exists() {
+        std::fs::rename(&paths.data, &preserved)?;
+    }
+    if let Err(error) = std::fs::rename(&pending, &paths.data) {
+        if preserved.exists() {
+            let _ = std::fs::rename(&preserved, &paths.data);
+        }
+        return Err(error.into());
+    }
+    if let Some(parent) = paths.data.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    drop(ownership);
     println!(
-        "restored {} from {}",
+        "restored {}; previous data preserved at {}",
         paths.data.display(),
-        backup.display()
+        preserved.display()
     );
     Ok(())
 }
@@ -1233,12 +1333,12 @@ pub(crate) async fn upgrade() -> Result<(), CliFailure> {
     backup().await?;
     doctor().await?;
     println!("starting the service");
-    systemctl(&["start", SERVICE_NAME])?;
+    start_memory_service()?;
     println!("service restarted; verify a known memory with your agent host");
     Ok(())
 }
 
-fn systemctl(arguments: &[&str]) -> Result<(), CliFailure> {
+pub(crate) fn systemctl(arguments: &[&str]) -> Result<(), CliFailure> {
     let status = std::process::Command::new("systemctl")
         .arg("--user")
         .args(arguments)
@@ -1251,7 +1351,23 @@ fn systemctl(arguments: &[&str]) -> Result<(), CliFailure> {
     }
 }
 
-fn service_active() -> bool {
+/// Explicit operator starts recover a unit's prior systemd start-limit state.
+pub(crate) fn start_memory_service() -> Result<(), CliFailure> {
+    reset_service_failure(SERVICE_NAME);
+    systemctl(&["start", SERVICE_NAME])
+}
+
+pub(crate) fn reset_service_failure(name: &str) {
+    // A freshly installed unit is not loaded yet and has no failure state.
+    // The subsequent start/enable command remains the authoritative result.
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "reset-failed", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+pub(crate) fn service_active() -> bool {
     std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", SERVICE_NAME])
         .status()
@@ -1268,6 +1384,18 @@ fn service_unit_path() -> Result<PathBuf, CliFailure> {
 
 /// Writes the user service: loopback-only, explicit paths, bounded
 /// resources, clean shutdown, and no secrets in arguments or logs.
+pub(crate) fn systemd_argument(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('$', "$$")
+            .replace('\n', "\\n")
+    )
+}
+
 fn install_service_unit(paths: &AgentPaths) -> Result<PathBuf, CliFailure> {
     let unit_path = service_unit_path()?;
     std::fs::create_dir_all(unit_path.parent().ok_or_else(CliFailure::invalid)?)
@@ -1279,7 +1407,8 @@ fn install_service_unit(paths: &AgentPaths) -> Result<PathBuf, CliFailure> {
          Documentation=https://github.com/Hyphae-Research-Foundation/hyphae\n\n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={binary} serve --data-dir {data} --endpoint %t/{service}.sock --native-api-key-auth --http-bind 127.0.0.1:8787\n\
+         ExecStartPre={binary} agent recover\n\
+         ExecStart={binary} serve --data-dir {data} --endpoint {endpoint} --native-api-key-auth\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          TimeoutStopSec=30\n\
@@ -1291,9 +1420,9 @@ fn install_service_unit(paths: &AgentPaths) -> Result<PathBuf, CliFailure> {
          LimitNOFILE=4096\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        binary = binary.display(),
-        data = paths.data.display(),
-        service = SERVICE_NAME,
+        binary = systemd_argument(&binary.to_string_lossy()),
+        data = systemd_argument(&paths.data.to_string_lossy()),
+        endpoint = systemd_argument(&memory_endpoint(paths)),
     );
     std::fs::write(&unit_path, unit).map_err(|_| CliFailure::io())?;
     let _ignored = systemctl(&["daemon-reload"]);
@@ -1304,7 +1433,21 @@ fn install_service_unit(paths: &AgentPaths) -> Result<PathBuf, CliFailure> {
 /// and backups.
 pub(crate) fn remove() -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
+    deconfigure_hosts()?;
     let unit_path = service_unit_path()?;
+    for name in [
+        "hyphae-agent-memory-maintain.timer",
+        "hyphae-agent-memory-maintain.service",
+        "hyphae-agent-embed.service",
+    ] {
+        if let Some(parent) = unit_path.parent() {
+            let path = parent.join(name);
+            if path.is_file() {
+                let _ = systemctl(&["disable", "--now", name]);
+                std::fs::remove_file(path)?;
+            }
+        }
+    }
     if unit_path.exists() {
         let _ignored = systemctl(&["disable", "--now", SERVICE_NAME]);
         std::fs::remove_file(&unit_path).map_err(|_| CliFailure::io())?;
@@ -1317,7 +1460,6 @@ pub(crate) fn remove() -> Result<(), CliFailure> {
             println!("removed credential {}", key.display());
         }
     }
-    deconfigure_hosts();
     println!("preserved data      {}", paths.data.display());
     println!("preserved backups   {}", paths.backups.display());
     println!("reinstall any time with `hyphae agent setup`");
@@ -1346,6 +1488,15 @@ pub(crate) enum Access {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn configure(host: Host, access: Access, apply: bool) -> Result<(), CliFailure> {
     let paths = AgentPaths::resolve()?;
+    if apply && host_registration_path(host)?.exists() {
+        check_host_ownership(host)?;
+        disconnect_host(host)?;
+    } else if apply
+        && (host_extension(host)?.is_some_and(|path| path.exists())
+            || mcp_snapshot(host, None)?.is_some())
+    {
+        return Err(CliFailure::invalid());
+    }
     let key = match access {
         Access::Read => paths.reader_key(),
         Access::Write => paths.writer_key(),
@@ -1356,7 +1507,7 @@ pub(crate) fn configure(host: Host, access: Access, apply: bool) -> Result<(), C
         return Err(CliFailure::invalid());
     }
     let binary = std::env::current_exe().map_err(|_| CliFailure::io())?;
-    let endpoint = crate::native::default_endpoint(&paths.data);
+    let endpoint = memory_endpoint(&paths);
     let mut arguments = vec![
         "mcp".to_owned(),
         "--profile".to_owned(),
@@ -1428,28 +1579,32 @@ pub(crate) fn configure(host: Host, access: Access, apply: bool) -> Result<(), C
             }
         }
         Host::Opencode => {
+            let manifest = serde_json::json!({"schema":"hyphae-opencode-agent-memory-v1", "binary":binary_text,
+                "endpoint":memory_endpoint(&paths),"credential_file":key_text,
+                "allow_write":matches!(access,Access::Write)});
             if apply {
-                let mut command = std::process::Command::new("opencode");
-                command.args([
-                    "mcp",
-                    "add",
-                    "hyphae-memory",
-                    "--env",
-                    &format!("HYPHAE_NATIVE_API_KEY_FILE={key_text}"),
-                    "--",
-                    &binary_text,
-                ]);
-                command.args(&arguments);
-                if !command.status().map_err(|_| CliFailure::io())?.success() {
-                    return Err(CliFailure::invalid());
-                }
-                println!("OpenCode configured through `opencode mcp add`");
+                write_atomic(
+                    &paths.config.join("opencode-agent-memory.json"),
+                    &(serde_json::to_string_pretty(&manifest)? + "\n").into_bytes(),
+                )?;
                 install_proactive_host(host, &binary)?;
             } else {
-                print_host_command("opencode mcp add hyphae-memory", &binary, &arguments, &key);
+                println!(
+                    "OpenCode uses the Hyphae local plugin for MCP and lifecycle integration."
+                );
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
         }
-        Host::Pi => return configure_pi(&paths, access, apply),
+        Host::Pi => {
+            configure_pi(&paths, access, apply)?;
+            if apply {
+                record_host(host, access, &binary)?;
+            }
+            return Ok(());
+        }
+    }
+    if apply {
+        record_host(host, access, &binary)?;
     }
     Ok(())
 }
@@ -1477,7 +1632,7 @@ fn configure_pi(paths: &AgentPaths, access: Access, apply: bool) -> Result<(), C
     let value = serde_json::json!({
         "schema": "hyphae-pi-agent-memory-v1",
         "binary": std::env::current_exe().map_err(|_| CliFailure::io())?.display().to_string(),
-        "endpoint": crate::native::default_endpoint(&paths.data),
+        "endpoint": memory_endpoint(paths),
         "credential_file": key.display().to_string(),
         "allow_write": matches!(access, Access::Write),
     });
@@ -1507,7 +1662,7 @@ fn configure_pi(paths: &AgentPaths, access: Access, apply: bool) -> Result<(), C
 fn install_proactive_host(host: Host, binary: &Path) -> Result<(), CliFailure> {
     match host {
         Host::Claude => install_command_hooks(
-            &user_home()?.join(".claude/settings.json"),
+            &host_hook_file(Host::Claude)?.ok_or_else(CliFailure::invalid)?,
             "hooks",
             binary,
             "claude",
@@ -1564,12 +1719,11 @@ fn install_command_hooks(
     } else {
         serde_json::json!({})
     };
-    let command = binary.display().to_string();
+    let command = hook_command(binary, host);
     let handler = |timeout: u64, asynchronous: bool| {
         let mut value = serde_json::json!({
             "type": "command",
             "command": command,
-            "args": ["agent", "hook", "--host", host],
             "timeout": timeout,
         });
         if asynchronous {
@@ -1594,7 +1748,20 @@ fn install_command_hooks(
             .entry(event.clone())
             .or_insert_with(|| serde_json::json!([]));
         let target = target.as_array_mut().ok_or_else(CliFailure::invalid)?;
-        target.retain(|group| !is_hyphae_hook_group(group, binary, host));
+        for group in target.iter_mut() {
+            if let Some(hooks) = group
+                .get_mut("hooks")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                hooks.retain(|hook| !is_hyphae_hook(hook, binary, host));
+            }
+        }
+        target.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|hooks| !hooks.is_empty())
+        });
         target.extend(
             groups
                 .as_array()
@@ -1616,27 +1783,7 @@ fn install_command_hooks(
     Ok(())
 }
 
-fn is_hyphae_hook_group(group: &serde_json::Value, binary: &Path, host: &str) -> bool {
-    group
-        .get("hooks")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.get("command").and_then(serde_json::Value::as_str)
-                    == Some(binary.to_string_lossy().as_ref())
-                    && hook
-                        .get("args")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|args| {
-                            args.iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .eq(["agent", "hook", "--host", host])
-                        })
-            })
-        })
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {
     let temporary = path.with_extension(format!(
         "hyphae-tmp-{}",
         crate::native::logical_time_micros().unsigned_abs()
@@ -1664,27 +1811,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {
     Ok(())
 }
 
-fn deconfigure_hosts() {
-    for (program, arguments) in [
-        (
-            "claude",
-            &["mcp", "remove", "hyphae-memory", "--scope", "user"][..],
-        ),
-        ("codex", &["mcp", "remove", "hyphae-memory"][..]),
-    ] {
-        let _ignored = std::process::Command::new(program).args(arguments).status();
+fn deconfigure_hosts() -> Result<(), CliFailure> {
+    for host in [Host::Claude, Host::Codex, Host::Opencode, Host::Pi] {
+        if host_registration_path(host)?.exists() {
+            check_host_ownership(host)?;
+        }
     }
-    if let Ok(home) = user_home() {
-        let _ignored = std::fs::remove_file(home.join(".pi/agent/extensions/hyphae-memory.ts"));
+    for host in [Host::Claude, Host::Codex, Host::Opencode, Host::Pi] {
+        disconnect_host(host)?;
     }
-    if let Ok(paths) = AgentPaths::resolve() {
-        let _ignored = std::fs::remove_file(paths.config.join("pi-agent-memory.json"));
-    }
-    let config = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
-        || user_home().unwrap_or_default().join(".config"),
-        PathBuf::from,
-    );
-    let _ignored = std::fs::remove_file(config.join("opencode/plugins/hyphae-memory.ts"));
+    Ok(())
 }
 
 /// Deletes the Agent Memory data directory after explicit confirmation.
@@ -1717,5 +1853,375 @@ pub(crate) fn purge_data(confirmed: bool) -> Result<(), CliFailure> {
         println!("nothing to delete at {}", paths.data.display());
     }
     println!("backups remain at {}", paths.backups.display());
+    Ok(())
+}
+
+fn host_label(host: Host) -> &'static str {
+    match host {
+        Host::Claude => "claude",
+        Host::Codex => "codex",
+        Host::Opencode => "opencode",
+        Host::Pi => "pi",
+    }
+}
+
+fn host_registration_path(host: Host) -> Result<PathBuf, CliFailure> {
+    Ok(AgentPaths::resolve()?
+        .config
+        .join("hosts")
+        .join(format!("{}.json", host_label(host))))
+}
+
+fn host_hook_file(host: Host) -> Result<Option<PathBuf>, CliFailure> {
+    Ok(match host {
+        Host::Claude => Some(
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or(user_home()?.join(".claude"))
+                .join("settings.json"),
+        ),
+        Host::Codex => Some(
+            std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or(user_home()?.join(".codex"))
+                .join("hooks.json"),
+        ),
+        _ => None,
+    })
+}
+
+fn host_extension(host: Host) -> Result<Option<PathBuf>, CliFailure> {
+    Ok(match host {
+        Host::Opencode => Some(
+            AgentPaths::resolve()?
+                .config
+                .parent()
+                .ok_or_else(CliFailure::invalid)?
+                .join("opencode/plugins/hyphae-memory.ts"),
+        ),
+        Host::Pi => Some(
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or(user_home()?.join(".pi/agent"))
+                .join("extensions/hyphae-memory.ts"),
+        ),
+        _ => None,
+    })
+}
+
+fn record_host(host: Host, access: Access, binary: &Path) -> Result<(), CliFailure> {
+    let path = host_registration_path(host)?;
+    std::fs::create_dir_all(path.parent().ok_or_else(CliFailure::invalid)?)?;
+    let extension = host_extension(host)?;
+    let hash = extension
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()?
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+    let mcp_hash = mcp_snapshot(host, None)?
+        .as_ref()
+        .map(value_digest)
+        .transpose()?;
+    let host_manifest = AgentPaths::resolve()?
+        .config
+        .join(format!("{}-agent-memory.json", host_label(host)));
+    let manifest_hash = std::fs::read(host_manifest)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+    let record = serde_json::json!({"schema":"hyphae-managed-host-v1","host":host_label(host),
+        "access":match access {Access::Read=>"read",Access::Write=>"write"},"binary":binary,
+        "hook_file":host_hook_file(host)?,"extension":extension,"extension_blake3":hash,
+        "mcp_blake3":mcp_hash,"manifest_blake3":manifest_hash});
+    write_atomic(
+        &path,
+        &(serde_json::to_string_pretty(&record)? + "\n").into_bytes(),
+    )
+}
+
+fn shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+fn hook_command(binary: &Path, host: &str) -> String {
+    format!(
+        "{} agent hook --host {host}",
+        shell_argument(&binary.to_string_lossy())
+    )
+}
+
+fn value_digest(value: &serde_json::Value) -> Result<String, CliFailure> {
+    Ok(blake3::hash(&serde_json::to_vec(value)?)
+        .to_hex()
+        .to_string())
+}
+
+fn mcp_snapshot(
+    host: Host,
+    hook_file: Option<&Path>,
+) -> Result<Option<serde_json::Value>, CliFailure> {
+    match host {
+        Host::Claude => {
+            let config = if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+                host_hook_file(host)?
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+                    .ok_or_else(CliFailure::invalid)?
+                    .join(".claude.json")
+            } else {
+                user_home()?.join(".claude.json")
+            };
+            let bytes = match std::fs::read(config) {
+                Ok(bytes) if bytes.len() <= 4 * 1024 * 1024 => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                _ => return Err(CliFailure::invalid()),
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            Ok(value
+                .get("mcpServers")
+                .and_then(|value| value.get("hyphae-memory"))
+                .cloned())
+        }
+        Host::Codex => {
+            let mut command = std::process::Command::new("codex");
+            command.args(["mcp", "get", "hyphae-memory", "--json"]);
+            if let Some(parent) = hook_file.and_then(Path::parent) {
+                command.env("CODEX_HOME", parent);
+            }
+            let output = command.output()?;
+            if !output.status.success() {
+                return Ok(None);
+            }
+            if output.stdout.len() > 64 * 1024 {
+                return Err(CliFailure::invalid());
+            }
+            Ok(Some(serde_json::from_slice(&output.stdout)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn check_host_ownership(host: Host) -> Result<(), CliFailure> {
+    let bytes = std::fs::read(host_registration_path(host)?)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(CliFailure::invalid());
+    }
+    let record: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if record["schema"] != "hyphae-managed-host-v1" || record["host"] != host_label(host) {
+        return Err(CliFailure::invalid());
+    }
+    let hook = record["hook_file"].as_str().map(Path::new);
+    if let Some(value) = mcp_snapshot(host, hook)?
+        && record["mcp_blake3"].as_str() != Some(value_digest(&value)?.as_str())
+    {
+        return Err(CliFailure::invalid());
+    }
+    if let Some(path) = record["extension"].as_str()
+        && let Ok(bytes) = std::fs::read(path)
+        && record["extension_blake3"].as_str() != Some(blake3::hash(&bytes).to_hex().as_str())
+    {
+        return Err(CliFailure::invalid());
+    }
+    if matches!(host, Host::Pi | Host::Opencode) {
+        let manifest = AgentPaths::resolve()?
+            .config
+            .join(format!("{}-agent-memory.json", host_label(host)));
+        if let Ok(bytes) = std::fs::read(manifest)
+            && record["manifest_blake3"].as_str() != Some(blake3::hash(&bytes).to_hex().as_str())
+        {
+            return Err(CliFailure::invalid());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconnect_managed_hosts() -> Result<(), CliFailure> {
+    for host in [Host::Claude, Host::Codex, Host::Opencode, Host::Pi] {
+        let path = host_registration_path(host)?;
+        if !path.is_file() {
+            continue;
+        }
+        check_host_ownership(host)?;
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let access = if value["access"] == "write" {
+            "write"
+        } else {
+            "read"
+        };
+        // Official host CLIs and configure() print human-readable progress.
+        // Keep that output out of the caller's operator JSON response.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "agent",
+                "configure",
+                host_label(host),
+                "--access",
+                access,
+                "--apply",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(CliFailure::invalid());
+        }
+    }
+    Ok(())
+}
+
+fn remove_mcp_entry(host: Host, hook_file: Option<&Path>) -> Result<(), CliFailure> {
+    if mcp_snapshot(host, hook_file)?.is_none() {
+        return Ok(());
+    }
+    let (program, args): (&str, &[&str]) = match host {
+        Host::Claude => (
+            "claude",
+            &["mcp", "remove", "hyphae-memory", "--scope", "user"],
+        ),
+        Host::Codex => ("codex", &["mcp", "remove", "hyphae-memory"]),
+        _ => return Ok(()),
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Claude's default global MCP file is ~/.claude.json. Setting its config
+    // directory to ~/.claude would select a different global MCP file.
+    // Preserve the caller's Claude environment; Codex uses its hook directory.
+    if matches!(host, Host::Codex)
+        && let Some(parent) = hook_file.and_then(Path::parent)
+    {
+        command.env("CODEX_HOME", parent);
+    }
+    if command.status()?.success() {
+        Ok(())
+    } else {
+        Err(CliFailure::invalid())
+    }
+}
+
+pub(crate) fn disconnect_host(host: Host) -> Result<(), CliFailure> {
+    let path = host_registration_path(host)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() < 64 * 1024 => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        _ => return Err(CliFailure::invalid()),
+    };
+    let record: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if record["schema"] != "hyphae-managed-host-v1" || record["host"] != host_label(host) {
+        return Err(CliFailure::invalid());
+    }
+    check_host_ownership(host)?;
+    let binary = PathBuf::from(record["binary"].as_str().ok_or_else(CliFailure::invalid)?);
+    let hook_file = record["hook_file"].as_str().map(PathBuf::from);
+    remove_mcp_entry(host, hook_file.as_deref())?;
+    if let Some(hook_file) = hook_file.filter(|path| path.is_file()) {
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&hook_file)?)?;
+        if let Some(events) = config
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for groups in events
+                .values_mut()
+                .filter_map(serde_json::Value::as_array_mut)
+            {
+                for group in groups.iter_mut() {
+                    if let Some(hooks) = group
+                        .get_mut("hooks")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        hooks.retain(|hook| !is_hyphae_hook(hook, &binary, host_label(host)));
+                    }
+                }
+                groups.retain(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|hooks| !hooks.is_empty())
+                });
+            }
+        }
+        write_atomic(
+            &hook_file,
+            &(serde_json::to_string_pretty(&config)? + "\n").into_bytes(),
+        )?;
+    }
+    if let Some(extension) = record["extension"].as_str().map(PathBuf::from)
+        && let Ok(bytes) = std::fs::read(&extension)
+    {
+        if record["extension_blake3"].as_str() == Some(blake3::hash(&bytes).to_hex().as_str()) {
+            std::fs::remove_file(extension)?;
+        } else {
+            eprintln!("preserved a modified Hyphae host extension");
+        }
+    }
+    if matches!(host, Host::Pi | Host::Opencode) {
+        let manifest = AgentPaths::resolve()?
+            .config
+            .join(format!("{}-agent-memory.json", host_label(host)));
+        if manifest.is_file() {
+            std::fs::remove_file(manifest)?;
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn host_status() -> Result<serde_json::Value, CliFailure> {
+    let mut entries = Vec::new();
+    for (host, name) in [
+        (Host::Claude, "Claude Code"),
+        (Host::Codex, "Codex"),
+        (Host::Opencode, "OpenCode"),
+        (Host::Pi, "Pi"),
+    ] {
+        let program = host_label(host);
+        let installed = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|path| path.join(program).is_file());
+        let record = std::fs::read(host_registration_path(host)?)
+            .ok()
+            .filter(|bytes| bytes.len() < 64 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let configured = record
+            .as_ref()
+            .is_some_and(|record| record["schema"] == "hyphae-managed-host-v1");
+        entries.push(serde_json::json!({"id":program,"name":name,"installed":installed,"configured":configured,
+            "access":record.as_ref().and_then(|r|r["access"].as_str()).unwrap_or("read"),
+            "next_step":if configured && matches!(host,Host::Codex) {"Review the Hyphae hook definitions with /hooks in Codex, then start a new session."} else {""}}));
+    }
+    Ok(serde_json::json!({"agents":entries}))
+}
+
+fn is_hyphae_hook(hook: &serde_json::Value, binary: &Path, host: &str) -> bool {
+    let command = hook.get("command").and_then(serde_json::Value::as_str);
+    command == Some(hook_command(binary, host).as_str())
+        || (command == Some(binary.to_string_lossy().as_ref())
+            && hook
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|args| {
+                    args.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .eq(["agent", "hook", "--host", host])
+                }))
+}
+
+fn install_maintenance_units(paths: &AgentPaths) -> Result<(), CliFailure> {
+    let directory = service_unit_path()?
+        .parent()
+        .ok_or_else(CliFailure::invalid)?
+        .to_path_buf();
+    std::fs::create_dir_all(&directory)?;
+    let binary = std::env::current_exe()?;
+    let service = format!(
+        "[Unit]\nDescription=Hyphae memory capture and embedding maintenance\nPartOf=hyphae-agent-memory.service\nAfter=hyphae-agent-memory.service\n\n[Service]\nType=oneshot\nExecStart={} agent maintain\nNoNewPrivileges=yes\nUMask=0077\nNice=10\nTimeoutStartSec=90\n",
+        systemd_argument(&binary.to_string_lossy())
+    );
+    let timer = "[Unit]\nDescription=Maintain local Hyphae agent memory\nPartOf=hyphae-agent-memory.service\n\n[Timer]\nOnBootSec=10\nOnUnitInactiveSec=5\nAccuracySec=1\nUnit=hyphae-agent-memory-maintain.service\n\n[Install]\nWantedBy=hyphae-agent-memory.service\n";
+    write_atomic(
+        &directory.join("hyphae-agent-memory-maintain.service"),
+        service.as_bytes(),
+    )?;
+    write_atomic(
+        &directory.join("hyphae-agent-memory-maintain.timer"),
+        timer.as_bytes(),
+    )?;
+    let _ = paths;
     Ok(())
 }

@@ -1,0 +1,1140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://hyphae.dev/contracts/json-schema/agent-memory-control-v1.schema.json",
+  "title": "Agent Memory local operator request and response v1",
+  "description": "Engine operator envelope and payload shapes. UTF-8 byte, identifier, path ownership and state-dependent checks also apply; see agent-memory-control-v1.md. Plugin artifact installation is a separate extension.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/AgentMemoryControlRequest"
+    },
+    {
+      "$ref": "#/$defs/AgentMemoryControlResponse"
+    }
+  ],
+  "$defs": {
+    "AgentMemoryControlEmpty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {}
+    },
+    "AgentMemoryControlRecall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query"
+      ],
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-hyphae-maxUtf8Bytes": 256
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "x-hyphae-maxUtf8Bytes": 4096
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 8
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "decision",
+                "command",
+                "constraint",
+                "fact",
+                "note"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "layer": {
+          "enum": [
+            "all",
+            "personal",
+            "work",
+            "journal",
+            null
+          ]
+        },
+        "mode": {
+          "enum": [
+            "lexical",
+            "hybrid",
+            null
+          ]
+        },
+        "prove": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "AgentMemoryControlList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query"
+      ],
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-hyphae-maxUtf8Bytes": 256
+        },
+        "query": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 4096,
+          "x-hyphae-maxUtf8Bytes": 4096
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 8
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "decision",
+                "command",
+                "constraint",
+                "fact",
+                "note"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "layer": {
+          "enum": [
+            "all",
+            "personal",
+            "work",
+            "journal",
+            null
+          ]
+        },
+        "mode": {
+          "enum": [
+            "lexical",
+            "hybrid",
+            null
+          ]
+        },
+        "prove": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "AgentMemoryControlStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-hyphae-maxUtf8Bytes": 256
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "x-hyphae-maxUtf8Bytes": 4096
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "decision",
+                "command",
+                "constraint",
+                "fact",
+                "note"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "enum": [
+            "project",
+            "global",
+            null
+          ]
+        },
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "x-hyphae-maxUtf8Bytes": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "harness": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "x-hyphae-maxUtf8Bytes": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "x-hyphae-maxUtf8Bytes": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "layer": {
+          "enum": [
+            "personal",
+            "work",
+            "journal",
+            null
+          ]
+        },
+        "ttl": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 316224000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AgentMemoryControlForget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-hyphae-maxUtf8Bytes": 256
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      }
+    },
+    "AgentMemoryControlPause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paused"
+      ],
+      "properties": {
+        "paused": {
+          "type": "boolean"
+        },
+        "project": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "x-hyphae-maxUtf8Bytes": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AgentMemoryControlConfigure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "pi"
+          ]
+        },
+        "access": {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "default": "read"
+        }
+      }
+    },
+    "AgentMemoryControlDisconnect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode",
+            "pi"
+          ]
+        },
+        "access": {
+          "type": "string",
+          "default": "read"
+        }
+      }
+    },
+    "AgentMemoryControlSetup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "enable_service": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "AgentMemoryControlSemantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "model_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AgentMemoryControlRestore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup",
+        "confirm"
+      ],
+      "properties": {
+        "backup": {
+          "type": "string"
+        },
+        "confirm": {
+          "const": true
+        }
+      }
+    },
+    "AgentMemoryControlVerify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proof",
+        "witness",
+        "anchor"
+      ],
+      "properties": {
+        "proof": {
+          "type": "string"
+        },
+        "witness": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "AgentMemoryControlRemove": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confirm"
+      ],
+      "properties": {
+        "confirm": {
+          "const": true
+        }
+      }
+    },
+    "AgentMemoryControlRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "operation",
+        "arguments"
+      ],
+      "properties": {
+        "schema": {
+          "const": "hyphae-omarchy-control-v1"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "type": "string"
+        },
+        "arguments": {
+          "type": "object"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "status",
+                "projects",
+                "agents",
+                "backups",
+                "service_start",
+                "doctor",
+                "backup"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlEmpty"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "recall"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlRecall"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "list"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlList"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "store"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlStore"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "forget"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlForget"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "pause"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlPause"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "configure"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlConfigure"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "disconnect"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlDisconnect"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "setup"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlSetup"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "semantic"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlSemantic"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "restore"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlRestore"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "verify"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlVerify"
+            }
+          }
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "remove"
+              ]
+            },
+            "arguments": {
+              "$ref": "#/$defs/AgentMemoryControlRemove"
+            }
+          }
+        }
+      ]
+    },
+    "AgentMemoryControlRecallResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "memories",
+        "expired_filtered",
+        "proof",
+        "retrieval_mode",
+        "semantic_status",
+        "snapshot"
+      ],
+      "properties": {
+        "memories": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "score",
+              "project",
+              "scope",
+              "kind",
+              "layer",
+              "agent",
+              "harness",
+              "model",
+              "text",
+              "expires_at_micros"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              },
+              "score": {
+                "type": "number"
+              },
+              "project": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "scope": {
+                "enum": [
+                  "project",
+                  "global",
+                  null
+                ]
+              },
+              "kind": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "decision",
+                      "command",
+                      "constraint",
+                      "fact",
+                      "note"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "layer": {
+                "enum": [
+                  "personal",
+                  "work",
+                  "journal"
+                ]
+              },
+              "agent": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "harness": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "text": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "expires_at_micros": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "expired_filtered": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "proof": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scope",
+                "proof_path",
+                "witness_path",
+                "proof_blake3",
+                "anchor_hex"
+              ],
+              "properties": {
+                "scope": {
+                  "const": "memory-snapshot-v1"
+                },
+                "proof_path": {
+                  "type": "string"
+                },
+                "witness_path": {
+                  "type": "string"
+                },
+                "proof_blake3": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "anchor_hex": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retrieval_mode": {
+          "enum": [
+            "lexical",
+            "hybrid"
+          ]
+        },
+        "semantic_status": {
+          "enum": [
+            "disabled",
+            "ready",
+            "unavailable"
+          ]
+        },
+        "snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "visible_csn",
+            "root_digest",
+            "logical_time_micros"
+          ],
+          "properties": {
+            "visible_csn": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "root_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "logical_time_micros": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "AgentMemoryControlStatusResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installed",
+        "initialized",
+        "service_active"
+      ],
+      "properties": {
+        "installed": {
+          "type": "boolean"
+        },
+        "initialized": {
+          "type": "boolean"
+        },
+        "service_active": {
+          "type": "boolean"
+        },
+        "capture_paused": {
+          "type": "boolean"
+        },
+        "semantic_enabled": {
+          "type": "boolean"
+        },
+        "semantic_ready": {
+          "type": "boolean"
+        },
+        "runtime_activation_pending": {
+          "type": "boolean"
+        },
+        "pending_captures": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "pending_embeddings": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "memories": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "paused_projects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "control_version": {
+          "const": 1
+        },
+        "protocol_minor": {
+          "const": 7
+        },
+        "runtime_version": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        }
+      }
+    },
+    "AgentMemoryControlResult": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentMemoryControlStatusResult"
+        },
+        {
+          "$ref": "#/$defs/AgentMemoryControlRecallResult"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "message"
+          ],
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "projects"
+          ],
+          "properties": {
+            "projects": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "id",
+                  "label"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "agents"
+          ],
+          "properties": {
+            "agents": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "id",
+                  "name",
+                  "installed",
+                  "configured"
+                ],
+                "properties": {
+                  "id": {
+                    "enum": [
+                      "claude",
+                      "codex",
+                      "opencode",
+                      "pi"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "installed": {
+                    "type": "boolean"
+                  },
+                  "configured": {
+                    "type": "boolean"
+                  },
+                  "access": {
+                    "enum": [
+                      "read",
+                      "write",
+                      null
+                    ]
+                  },
+                  "next_step": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "backups"
+          ],
+          "properties": {
+            "backups": {
+              "type": "array",
+              "maxItems": 1000,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "label",
+                  "path"
+                ],
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "id"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "stored",
+                "forgotten"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9]+$"
+            },
+            "scope": {
+              "enum": [
+                "project",
+                "global"
+              ]
+            },
+            "expires_at_micros": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "status",
+            "kind",
+            "scope"
+          ],
+          "properties": {
+            "status": {
+              "const": "verified"
+            },
+            "kind": {
+              "const": "memory"
+            },
+            "scope": {
+              "const": "semantic_reexecution"
+            }
+          }
+        }
+      ]
+    },
+    "AgentMemoryControlResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "id",
+            "ok",
+            "result"
+          ],
+          "properties": {
+            "schema": {
+              "const": "hyphae-omarchy-control-v1"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/AgentMemoryControlResult"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "ok",
+            "error"
+          ],
+          "properties": {
+            "schema": {
+              "const": "hyphae-omarchy-control-v1"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "message"
+              ],
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
