@@ -1,6 +1,12 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+The unreleased Agent Memory candidate adds protocol minor 7: request `71`
+(`MemoryRecall`), response `45` (`MemoryRecall`), and request `72`
+(`MemoryEnrich`, returning `SearchIngested`). Memory proofs use kind `8` and
+semantics `6`. See [the complete composition and wire contract](agent-memory-read-v1.md).
+Older exchanges keep their existing encoding and negotiated minor gates.
+
 Protocol minor 6 additionally admits structure-read request tag `21`
 (`KeyScanMatch`: keyspace object id, length-framed binary-glob pattern,
 optional `start_after` cursor behind one presence byte, and `u64`

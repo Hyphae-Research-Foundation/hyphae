@@ -20,7 +20,7 @@ const fields = (error) => {
 const failures = [
   ["sql_invalid_syntax", (client, options) => client.sql("SELEC bad", [], options)],
   ["catalog_object_not_found", (client, options) => client.catalogObject(999n, options)],
-  ["limit_exceeded", (client, options) => client.sql("SELECT id FROM proof_items", [], options)],
+  ["limit_exceeded", (client, options) => client.sql("SELECT id FROM proof_items LIMIT 1", [], options)],
 ];
 for (const [offset, [code, call]] of failures.entries()) {
   const requestId = 30_100n + BigInt(offset);

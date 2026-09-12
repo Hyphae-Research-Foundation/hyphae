@@ -111,6 +111,16 @@ export class HyphaeClient {
     return this.execute("search_collection", { collection, request }, options);
   }
 
+  /** Read search hits and their live lifecycle envelopes on one snapshot. */
+  memoryRecall(collections: readonly bigint[], search: Readonly<Record<string, unknown>>, limit = 6, options: RequestOptions = {}, provenance = new Uint8Array()): Promise<Response> {
+    return this.execute("memory_recall", { collections, search, limit, provenance }, options);
+  }
+
+  /** Enrich an unchanged live source using operator maintenance authority. */
+  memoryEnrich(collection: bigint, expectedEnvelopeDigest: Uint8Array, idempotencyId: bigint, document: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+    return this.execute("memory_enrich", { collection, expected_envelope_digest: expectedEnvelopeDigest, idempotency_id: idempotencyId, document }, options);
+  }
+
   searchIngest(collection: bigint, batch: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
     return this.execute("search_ingest", { collection, batch }, options);
   }

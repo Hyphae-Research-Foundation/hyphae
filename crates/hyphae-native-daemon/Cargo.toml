@@ -20,6 +20,9 @@ interprocess.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user", "socket"] }
+
 [target.'cfg(windows)'.dependencies]
 widestring.workspace = true
 

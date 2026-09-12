@@ -23,6 +23,9 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
 use tokenizers::Tokenizer;
 
+#[cfg(target_os = "linux")]
+mod worker;
+
 const ATTESTATION_MAGIC: &[u8; 8] = b"HYATTS01";
 const MAX_NAME_BYTES: usize = 256;
 const MAX_TEXTS: usize = 256;
@@ -31,11 +34,12 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let (command, rest) = match arguments.get(1).map(String::as_str) {
-        Some(command @ ("embed" | "rerank")) => (command, &arguments[2..]),
-        _ => bail!("usage: hyphae-embed <embed|rerank> --model-dir <DIR> [--query <TEXT>]"),
+        Some(command @ ("embed" | "rerank" | "serve" | "model-info")) => (command, &arguments[2..]),
+        _ => bail!("usage: hyphae-embed <embed|rerank|serve|model-info> --model-dir <DIR> [--query <TEXT>] [--endpoint <SOCKET>]"),
     };
     let mut model_dir: Option<PathBuf> = None;
     let mut query: Option<String> = None;
+    let mut endpoint: Option<PathBuf> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -53,10 +57,29 @@ fn main() -> Result<()> {
                 );
                 index += 2;
             }
+            "--endpoint" => {
+                endpoint = Some(PathBuf::from(
+                    rest.get(index + 1).context("--endpoint needs a value")?,
+                ));
+                index += 2;
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
     let model_dir = model_dir.context("--model-dir is required")?;
+
+    if command == "serve" {
+        #[cfg(target_os = "linux")]
+        return worker::serve(&model_dir, &endpoint.context("--endpoint is required")?);
+        #[cfg(not(target_os = "linux"))]
+        bail!("persistent embedding IPC is supported on Linux");
+    }
+    if endpoint.is_some() {
+        bail!("--endpoint is only valid for serve");
+    }
+    if command == "model-info" {
+        return print_output(&AttestedModel::load(&model_dir)?.manifest());
+    }
 
     // Texts arrive as one JSON array on stdin so inputs are canonical bytes.
     let mut input = String::new();
@@ -107,6 +130,9 @@ fn hex(bytes: &[u8]) -> String {
 struct AttestedModel {
     target: String,
     weights_digest: [u8; 32],
+    config_digest: [u8; 32],
+    tokenizer_digest: [u8; 32],
+    dimensions: usize,
     tokenizer: Tokenizer,
     model: BertModel,
     device: Device,
@@ -125,6 +151,16 @@ impl AttestedModel {
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|error| anyhow::anyhow!("tokenizer.json failed to load: {error}"))?;
         let config: BertConfig = serde_json::from_slice(&config_bytes)?;
+        if config.hidden_size == 0
+            || config.hidden_size > 4096
+            || config.max_position_embeddings == 0
+        {
+            bail!("model dimensions or positional capacity are unsupported");
+        }
+        let config_digest = *blake3::hash(&config_bytes).as_bytes();
+        let tokenizer_digest =
+            *blake3::hash(&std::fs::read(model_dir.join("tokenizer.json"))?).as_bytes();
+        let dimensions = config.hidden_size;
         let target = model_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -141,10 +177,31 @@ impl AttestedModel {
         Ok(Self {
             target,
             weights_digest,
+            config_digest,
+            tokenizer_digest,
+            dimensions,
             tokenizer,
             model,
             device,
             max_positions,
+        })
+    }
+
+    fn manifest(&self) -> serde_json::Value {
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"hyphae-embed-model-v1\0bert-mean-pool-l2-cpu-v1\0");
+        digest.update(&self.weights_digest);
+        digest.update(&self.config_digest);
+        digest.update(&self.tokenizer_digest);
+        serde_json::json!({
+            "schema":"hyphae-attested-model-v1", "target":self.target,
+            "fingerprint":digest.finalize().to_hex().to_string(),
+            "weights_blake3":hex(&self.weights_digest),
+            "config_blake3":hex(&self.config_digest),
+            "tokenizer_blake3":hex(&self.tokenizer_digest),
+            "dimensions":self.dimensions,"max_positions":self.max_positions,
+            "pipeline":"bert-mean-pool-l2-cpu-v1","device":"cpu",
+            "runtime":"hyphae-embed","runtime_version":env!("CARGO_PKG_VERSION"),
         })
     }
 

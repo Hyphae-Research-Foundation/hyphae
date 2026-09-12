@@ -127,6 +127,8 @@ pub enum NativeProofKind {
     Hybrid = 6,
     /// Catalog inspection.
     Catalog = 7,
+    /// Snapshot-coherent memory selection and lifecycle records.
+    Memory = 8,
 }
 
 /// Whether the admitted operation completed its declared result semantics.

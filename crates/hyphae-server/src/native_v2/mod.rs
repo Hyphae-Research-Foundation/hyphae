@@ -2002,7 +2002,7 @@ mod tests {
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             unsupported.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "6"
+            "7"
         );
 
         for (request_id, minor) in [("496", None), ("497", Some("garbage"))] {
@@ -2026,7 +2026,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "6"
+                "7"
             );
         }
 
@@ -2040,6 +2040,7 @@ mod tests {
             ("508", "3,4,5", "5"),
             ("509", "3,4,5,6", "6"),
             ("521", "6", "6"),
+            ("522", "3,4,5,6,7", "7"),
         ] {
             let mut accepted = http_request(
                 "/v2/execute",
@@ -2083,7 +2084,7 @@ mod tests {
             ("515", "03"),
             ("516", "3,"),
             ("517", "1,2,5,6,7,8,9,10,3"),
-            ("518", "7"),
+            ("518", "8"),
             ("519", "3 4"),
         ] {
             let mut rejected = http_request(
@@ -2101,7 +2102,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "6"
+                "7"
             );
         }
 
@@ -2145,7 +2146,7 @@ mod tests {
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             error.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "6"
+            "7"
         );
         drop(service);
         Ok(())

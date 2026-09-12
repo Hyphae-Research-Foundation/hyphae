@@ -3,7 +3,10 @@
 //! Command-line entry point for the single native Hyphae executable.
 
 mod agent;
+mod agent_control;
 mod agent_hooks;
+mod agent_policy;
+mod agent_semantic;
 mod compatibility;
 mod exit;
 mod json_value;
@@ -377,14 +380,14 @@ enum Command {
         #[arg(long)]
         allow_write: bool,
         /// Personal-memory collection identity.
-        #[arg(long, default_value_t = 21)]
-        personal_memory_collection: u128,
+        #[arg(long)]
+        personal_memory_collection: Option<u128>,
         /// Shared work-memory collection identity.
-        #[arg(long, default_value_t = 22)]
-        work_memory_collection: u128,
+        #[arg(long)]
+        work_memory_collection: Option<u128>,
         /// Model-journal collection identity.
-        #[arg(long, default_value_t = 23)]
-        journal_memory_collection: u128,
+        #[arg(long)]
+        journal_memory_collection: Option<u128>,
     },
 }
 
@@ -1810,6 +1813,12 @@ enum SearchQueryKind {
 
 #[derive(Debug, clap::Subcommand)]
 enum AgentCommand {
+    /// One bounded JSON operator request on stdin; used by the Omarchy plugin.
+    Ui,
+    /// Drain durable captures and a bounded batch of pending local embeddings.
+    Maintain,
+    /// Recover an interrupted semantic profile cutover before service start.
+    Recover,
     /// Create every Agent Memory resource and smoke test the surface.
     Setup {
         /// Enable and start the user service without asking.
@@ -2190,6 +2199,9 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                 enable_service,
                 no_service,
             } => agent::setup(enable_service, no_service).map_err(Into::into),
+            AgentCommand::Ui => agent_control::run().await.map_err(Into::into),
+            AgentCommand::Maintain => agent_semantic::maintain().await.map_err(Into::into),
+            AgentCommand::Recover => agent_semantic::recover().map_err(Into::into),
             AgentCommand::Status => agent::status().map_err(Into::into),
             AgentCommand::Doctor => agent::doctor().await.map_err(Into::into),
             AgentCommand::Backup => agent::backup().await.map_err(Into::into),
@@ -2244,14 +2256,20 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             allow_ingest,
             match profile {
                 McpProfile::Full => mcp::Profile::Full,
-                McpProfile::Memory => mcp::Profile::Memory {
-                    allow_write,
-                    collections: mcp::MemoryCollections {
-                        personal: personal_memory_collection,
-                        work: work_memory_collection,
-                        journal: journal_memory_collection,
-                    },
-                },
+                McpProfile::Memory => {
+                    let policy = agent_policy::Policy::load()?;
+                    mcp::Profile::Memory {
+                        allow_write,
+                        collections: mcp::MemoryCollections {
+                            follow_policy: personal_memory_collection.is_none()
+                                && work_memory_collection.is_none()
+                                && journal_memory_collection.is_none(),
+                            personal: personal_memory_collection.unwrap_or(policy.collections[0]),
+                            work: work_memory_collection.unwrap_or(policy.collections[1]),
+                            journal: journal_memory_collection.unwrap_or(policy.collections[2]),
+                        },
+                    }
+                }
             },
         )
         .await
@@ -5303,6 +5321,17 @@ fn response_json(response: ProductResponse) -> Value {
             "witness_digest": encode_hex(&report.witness_digest),
             "semantic_reexecution_performed": report.semantic_reexecution_performed,
         }),
+        ProductResponse::MemoryRecall(result) => json!({
+            "kind": "memory_recall",
+            "visible_csn": result.snapshot.visible_csn.map(hyphae_native_product::Csn::get),
+            "expired_filtered": result.expired_filtered,
+            "memories": result.memories.iter().map(|memory| json!({
+                "collection": memory.collection.get().to_string(),
+                "id": memory.hit.object_id.get().to_string(),
+                "score": memory.hit.score,
+                "envelope_hex": encode_hex(&memory.envelope),
+            })).collect::<Vec<_>>(),
+        }),
         ProductResponse::IntegratedSearch(result) => json!({
             "snapshot": snapshot_json(result.snapshot),
             "hits": result.hits.into_iter().map(|hit| json!({
@@ -6982,6 +7011,7 @@ const fn proof_kind(kind: NativeProofKind) -> &'static str {
         NativeProofKind::Ann => "ann",
         NativeProofKind::Hybrid => "hybrid",
         NativeProofKind::Catalog => "catalog",
+        NativeProofKind::Memory => "memory",
     }
 }
 

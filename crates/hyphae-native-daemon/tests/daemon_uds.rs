@@ -519,6 +519,56 @@ fn response_completion_does_not_depend_on_the_blocking_pool() -> Result<(), Box<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_encoding_limit_is_terminal_and_connection_remains_usable()
+-> Result<(), Box<dyn Error>> {
+    let test = TestDirectory::new("encoding-limit")?;
+    let mut product = NativeProduct::create(&test.data)?;
+    let key = b"encoding-boundary".to_vec();
+    // The scalar fits the product value budget, while its wire envelope does
+    // not. This exercises the serializer failure after successful execution.
+    product.migration_store_public_entry(
+        key.clone(),
+        vec![b'x'; hyphae_native_protocol::MAX_PRODUCT_WIRE_BYTES],
+        None,
+    )?;
+    let daemon = NativeDaemon::start(
+        product,
+        test.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect(&test.socket, 64 * 1024).await?;
+    client
+        .send_request(1, 2, &request(ProductOperation::StructureGet { key }))
+        .await?;
+    let response = tokio::time::timeout(TEST_IO_TIMEOUT, client.response(1, 2)).await;
+    let rejected = match response {
+        Ok(Err(error)) => error
+            .downcast_ref::<hyphae_native_product::ProductError>()
+            .is_some_and(|error| error.code() == ProductErrorCode::LimitExceeded),
+        _ => false,
+    };
+    let reusable = if rejected {
+        client
+            .send_request(2, 3, &request(ProductOperation::Capabilities))
+            .await?;
+        matches!(
+            tokio::time::timeout(TEST_IO_TIMEOUT, client.response(2, 3)).await,
+            Ok(Ok(ProductResponse::Capabilities(_)))
+        )
+    } else {
+        false
+    };
+    drop(client);
+    drop(daemon.shutdown().await?);
+    assert!(
+        rejected,
+        "An oversized encoded response did not terminate with limit_exceeded"
+    );
+    assert!(reusable, "A rejected response made its connection unusable");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_clients_handshake_share_one_product_and_endpoint_is_private()
 -> Result<(), Box<dyn Error>> {
     let test = TestDirectory::new("multi-client")?;
@@ -722,7 +772,7 @@ async fn security_operations_require_their_minor_and_reject_retired_shapes_befor
     )?;
 
     let current = Client::connect_authenticated(&test.socket, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 6);
+    assert_eq!(current.negotiated_minor, 7);
     current
         .send_request(1, 2, &request(ProductOperation::SecurityStatus))
         .await?;
@@ -1624,5 +1674,37 @@ async fn duplicate_active_request_or_stream_closes_only_that_connection()
     ));
     drop(healthy);
     daemon.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_owned_socket_is_recovered_without_overwriting_live_endpoints()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("stale-recovery")?;
+    let stale = std::os::unix::net::UnixListener::bind(&directory.socket)?;
+    drop(stale);
+    let product = NativeProduct::create(&directory.data)?;
+    let daemon = NativeDaemon::start(
+        product,
+        directory.socket.to_string_lossy(),
+        NativeDaemonConfig::default(),
+    )?;
+    let client = Client::connect(&directory.socket, 64 * 1024).await?;
+    drop(client);
+    let product = daemon.shutdown().await?;
+    drop(product);
+    let directory = TestDirectory::new("active-preserved")?;
+    let listener = std::os::unix::net::UnixListener::bind(&directory.socket)?;
+    let product = NativeProduct::create(&directory.data)?;
+    assert!(
+        NativeDaemon::start(
+            product,
+            directory.socket.to_string_lossy(),
+            NativeDaemonConfig::default()
+        )
+        .is_err()
+    );
+    assert!(directory.socket.exists());
+    drop(listener);
     Ok(())
 }

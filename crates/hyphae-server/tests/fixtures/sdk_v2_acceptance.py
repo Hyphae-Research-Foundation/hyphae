@@ -22,7 +22,7 @@ denied_http = HyphaeClient.http(os.environ["HYPHAE_ORIGIN"])
 cases = [
     ("sql_invalid_syntax", lambda client, options: client.sql("SELEC bad", options=options)),
     ("catalog_object_not_found", lambda client, options: client.catalog_object(999, options=options)),
-    ("limit_exceeded", lambda client, options: client.sql("SELECT id FROM proof_items", options=options)),
+    ("limit_exceeded", lambda client, options: client.sql("SELECT id FROM proof_items LIMIT 1", options=options)),
 ]
 for offset, (code, call) in enumerate(cases):
     request_id = 20_100 + offset

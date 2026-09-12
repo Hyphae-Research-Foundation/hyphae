@@ -507,7 +507,7 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&45_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
     assert!(matches!(
         decode_product_response(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -1239,7 +1239,7 @@ fn security_write_plane_responses_reject_truncation_trailing_unknown_and_zero_fi
     ));
 
     let mut unknown = encoded.clone();
-    unknown[12..14].copy_from_slice(&45_u16.to_le_bytes());
+    unknown[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
     assert!(matches!(
         decode_product_response(&unknown),
         Err(ProductCodecError::Unsupported)
@@ -1296,7 +1296,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn protocol_minor_negotiation_preserves_1_0_through_1_5_and_selects_1_6()
+fn protocol_minor_negotiation_preserves_older_peers_and_selects_1_7()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1398,12 +1398,12 @@ fn protocol_minor_negotiation_preserves_1_0_through_1_5_and_selects_1_6()
             1
         )?
         .minor,
-        6
+        7
     );
 
     let incompatible = Hello {
-        minimum_minor: 7,
-        maximum_minor: 7,
+        minimum_minor: 8,
+        maximum_minor: 8,
         ..Hello::default()
     };
     assert_eq!(

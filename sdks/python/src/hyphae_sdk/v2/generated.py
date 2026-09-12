@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "492fd5b2491d6edf886f7b72347b4c056e736babde7ad99786ced11b6ddffe35"
+CONTRACT_SHA256 = "0f68106eafcd3d7a75451131b39fa98f75467d8bb98431f015152b127ee6df38"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -70,6 +70,16 @@ class OperationV2Catalog(TypedDict):
 
 class OperationV2Doctor(TypedDict):
     kind: Literal["doctor"]
+    arguments: dict[str, JsonValue]
+
+class OperationV2MemoryEnrich(TypedDict):
+    """Protocol minor 7. Strict conditional enrichment of an unchanged live memory; requires maintenance authority."""
+    kind: Literal["memory_enrich"]
+    arguments: dict[str, JsonValue]
+
+class OperationV2MemoryRecall(TypedDict):
+    """Protocol minor 7. Search and lifecycle composition on one immutable snapshot; see docs/native/agent-memory-read-v1.md."""
+    kind: Literal["memory_recall"]
     arguments: dict[str, JsonValue]
 
 class OperationV2ProofVerify(TypedDict):
@@ -153,7 +163,7 @@ class ProductLimitsV2(TypedDict):
 
 DurabilityV2: TypeAlias = Literal["strict", "group", "memory"]
 NativeReadStreamRecordV2: TypeAlias = NativeReadStreamRecordV2Data | NativeReadStreamRecordV2Completion
-OperationV2: TypeAlias = OperationV2Capabilities | OperationV2Catalog | OperationV2Sql | OperationV2Structure | OperationV2Search | OperationV2SearchCollection | OperationV2SearchIngest | OperationV2Admin | OperationV2Telemetry | OperationV2Doctor | OperationV2Backup | OperationV2ProofVerify | OperationV2TransactionStatus | OperationV2SecurityApiKey
+OperationV2: TypeAlias = OperationV2Capabilities | OperationV2Catalog | OperationV2Sql | OperationV2Structure | OperationV2Search | OperationV2SearchCollection | OperationV2SearchIngest | OperationV2MemoryRecall | OperationV2MemoryEnrich | OperationV2Admin | OperationV2Telemetry | OperationV2Doctor | OperationV2Backup | OperationV2ProofVerify | OperationV2TransactionStatus | OperationV2SecurityApiKey
 
 __all__ = [
     "CONTRACT_SHA256",
@@ -172,6 +182,8 @@ __all__ = [
     "OperationV2Capabilities",
     "OperationV2Catalog",
     "OperationV2Doctor",
+    "OperationV2MemoryEnrich",
+    "OperationV2MemoryRecall",
     "OperationV2ProofVerify",
     "OperationV2Search",
     "OperationV2SearchCollection",
