@@ -8,7 +8,7 @@
         "licenses"
       ],
       "exit_status": 0,
-      "stderr_sha256": "3452872b8beff44d4ea661902f5ebb274960e9527c77932dd30729a8accb8c64",
+      "stderr_sha256": "98df1a2120640f7baae24b7ebae9b9ac4fa3fa6e6c820bc5616663b989b06828",
       "stdout_sha256": "71dadc8c8978da797b94dc581b666330c737551839c8fc820d7647130930c4b7"
     },
     "cargo_deny_unmatched_allowances": [
@@ -39,11 +39,11 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-09-12T13:13:11.990776+00:00",
+  "generated_at_utc": "2026-09-12T14:16:08.150815+00:00",
   "inventory": {
-    "canonical_sha256": "68695242fb9c14954affbd388ca95cfacb1aa5cb45f675b443f1768a776d8d11",
-    "external_package_count": 273,
-    "package_count": 300,
+    "canonical_sha256": "138ee54cc5818db4a5d49934c724f598c77d6de1b6f82e6fa8df0b7818f078bc",
+    "external_package_count": 272,
+    "package_count": 299,
     "packages": [
       {
         "license": "MIT OR Apache-2.0",
@@ -95,13 +95,6 @@
         "version": "0.5.1"
       },
       {
-        "license": "BSD-2-Clause",
-        "license_file": null,
-        "name": "arrayref",
-        "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.9"
-      },
-      {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "arrayvec",
@@ -148,7 +141,7 @@
         "license_file": null,
         "name": "base64",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.23.0"
+        "version": "0.23.1"
       },
       {
         "license": "Apache-2.0 OR MIT",
@@ -183,7 +176,7 @@
         "license_file": null,
         "name": "blake3",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "1.8.5"
+        "version": "1.8.7"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -246,14 +239,14 @@
         "license_file": null,
         "name": "clap",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "4.6.4"
+        "version": "4.6.6"
       },
       {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "clap_builder",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "4.6.2"
+        "version": "4.6.6"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -463,21 +456,21 @@
         "license_file": null,
         "name": "futures-channel",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.32"
+        "version": "0.3.34"
       },
       {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "futures-core",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.32"
+        "version": "0.3.34"
       },
       {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "futures-macro",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.32"
+        "version": "0.3.34"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -491,14 +484,14 @@
         "license_file": null,
         "name": "futures-task",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.32"
+        "version": "0.3.34"
       },
       {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "futures-util",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.3.32"
+        "version": "0.3.34"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -883,7 +876,7 @@
         "license_file": null,
         "name": "interprocess",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "2.4.3"
+        "version": "2.4.4"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -932,7 +925,7 @@
         "license_file": null,
         "name": "libc",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "0.2.186"
+        "version": "0.2.189"
       },
       {
         "license": "MIT",
@@ -1303,7 +1296,7 @@
         "license_file": null,
         "name": "redb",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "4.1.0"
+        "version": "4.2.0"
       },
       {
         "license": "MIT",
@@ -1632,14 +1625,14 @@
         "license_file": null,
         "name": "thiserror",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "2.0.19"
+        "version": "2.0.20"
       },
       {
         "license": "MIT OR Apache-2.0",
         "license_file": null,
         "name": "thiserror-impl",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "2.0.19"
+        "version": "2.0.20"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -1842,7 +1835,7 @@
         "license_file": null,
         "name": "uuid",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "1.24.0"
+        "version": "1.26.0"
       },
       {
         "license": "MIT/Apache-2.0",
@@ -2158,19 +2151,19 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "2ecef6344c7a3d7c152c48f7586295de11fcfd39",
+    "commit": "9da2a804a51227e9caa91766a3d111bbdbd24cb4",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
-    "source_inputs_sha256": "4804023bc23b812e00ada0c48fd39b2b6d965bcf5d8e23c4529c7823d720c6c9",
-    "tree": "61f85b2df4f28d81c08532a008ea958207219570",
+    "source_inputs_sha256": "0848d1cf9210e4531706b4cb1ad62e6a6b8f31ea82deb3f906ca6b4dc3c6c669",
+    "tree": "f01744ce3aecdcf912402663a5914669bf08fef8",
     "worktree_clean": false
   },
   "source_inputs": [
     {
       "path": "Cargo.lock",
-      "sha256": "275a2ccfbcb9aaa83cd33aa74a0486737344e8fc709c1644455a352973afc12e"
+      "sha256": "34b7fabf0fa5541e275a52695e8460aaefabd93316f79b5e7e48cb7f034a8335"
     },
     {
       "path": "Cargo.toml",
@@ -2178,15 +2171,15 @@
     },
     {
       "path": "benchmarks/baseline-harness/Cargo.lock",
-      "sha256": "ce92de2f986eb3e09ef7930c73f64d2756a72917a7aa86ae91b705d3bf9a1a24"
+      "sha256": "7f625f2b9751aee222390dd2895fb9149e477af818819c103e82d6a3f91d54b8"
     },
     {
       "path": "benchmarks/baseline-harness/Cargo.toml",
-      "sha256": "f4a53b57d045f0e494344556ea7036f8b731d2e695c9d46e0a97ae54f96e427a"
+      "sha256": "c31237c16dec76fad4ef4f8becd096bfb0edaeaeb01efa6233e2862b2bf86eaa"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
-      "sha256": "20b2eefa33395032fe2ce78a86eda3c0f4e057884a6273b9859874f8a8f134f0"
+      "sha256": "7baf6cab05d108a8ab64298f01d922bb2cddeb1731bba29baa4fbb8d7a85689e"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.toml",
@@ -2194,7 +2187,7 @@
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.lock",
-      "sha256": "ffe7dd6f29b88255e839d4a02bad754283fcc3e92525447a8c62ec752ae39156"
+      "sha256": "6c7f6d4a785ac5e58514383415e5245a4515c23b2c0fd8a8530250e6cfc498b6"
     },
     {
       "path": "conformance/g7/runners/rust/Cargo.toml",
@@ -2318,7 +2311,7 @@
     },
     {
       "path": "fuzz/Cargo.lock",
-      "sha256": "e2c0b3e3689d74e7934c1e3fcf639a80f6fafeb918b6971f2df9fe621846f992"
+      "sha256": "89175fc087c4a3b36207b15eafdffeaeb7519009e2c9605ed5849c6df887cfa4"
     },
     {
       "path": "fuzz/Cargo.toml",
@@ -2345,7 +2338,7 @@
       "--format",
       "{p} {l}"
     ],
-    "normalized_unique_line_count": 628,
-    "normalized_unique_lines_sha256": "19a8964c0059dcfe774c6bc687d0e2155eba4f2c843453f4f92d959a6ba77f2a"
+    "normalized_unique_line_count": 626,
+    "normalized_unique_lines_sha256": "7a4eb817660862856069a6fdd19fb8f1d459267e7a0142fb28c3a0c5dfe3a4bf"
   }
 }

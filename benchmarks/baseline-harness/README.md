@@ -7,6 +7,10 @@ deliberately **not** a member of the root workspace: SQLite, DuckDB, Redis,
 and Tantivy exist here only as measurement subjects and never enter the
 product dependency graph.
 
+The current search baseline locks Tantivy 0.26.2 and `lru` 0.16.4 to include
+the cache iterator safety fix. New measurements report those engine versions;
+existing receipts remain bound to their original source commits and versions.
+
 ## Suites
 
 | Suite | Hyphae surface | Baseline | Variable isolated |

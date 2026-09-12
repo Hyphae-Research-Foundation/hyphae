@@ -6,8 +6,8 @@ they never start or call `hyphae mcp` directly.
 
 The host installation is immutable evidence:
 
-- `hosts/package.json` pins `@openai/codex` `0.147.0` and
-  `@anthropic-ai/claude-code` `2.1.233` exactly.
+- `hosts/package.json` pins `@openai/codex` `0.153.2` and
+  `@anthropic-ai/claude-code` `2.1.260` exactly.
 - `hosts/package-lock.json` binds all npm and platform package integrities.
 - `hosts/install-lock.json` binds package/version, exact `--version` output,
   expected executable basename, and native executable SHA-256 per CI platform.

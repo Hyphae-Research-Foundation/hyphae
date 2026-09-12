@@ -26,7 +26,7 @@ serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 duckdb = { version = "1.4.1", features = ["bundled"] }
 redis = { version = "0.32", default-features = false }
-tantivy = "0.25"
+tantivy = "0.26.2"
 
 [profile.release]
 lto = "thin"

@@ -40,7 +40,7 @@
     "adapter_sha256": {"$ref": "#/$defs/sha256"},
     "host_executable_sha256": {"$ref": "#/$defs/sha256"},
     "host_package_name": {"enum": ["@anthropic-ai/claude-code", "@openai/codex"]},
-    "host_package_version": {"enum": ["2.1.233", "0.147.0"]},
+    "host_package_version": {"enum": ["2.1.260", "0.153.2"]},
     "host_package_integrity": {"type": "string", "pattern": "^sha512-[A-Za-z0-9+/]+={0,2}$"},
     "host_lock_sha256": {"$ref": "#/$defs/sha256"},
     "host_package_lock_sha256": {"$ref": "#/$defs/sha256"},

@@ -50,14 +50,6 @@
   ],
   "external_packages": [
     {
-      "name": "arrayref",
-      "version": "0.3.9",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "license": "BSD-2-Clause",
-      "category": "BLAKE3 support primitive",
-      "rationale": "Fixed-size array reference helpers used transitively by BLAKE3."
-    },
-    {
       "name": "arrayvec",
       "version": "0.7.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -75,7 +67,7 @@
     },
     {
       "name": "blake3",
-      "version": "1.8.5",
+      "version": "1.8.7",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
       "category": "integrity primitive",
@@ -179,7 +171,7 @@
     },
     {
       "name": "futures-channel",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "bounded asynchronous channel primitive",
@@ -187,7 +179,7 @@
     },
     {
       "name": "futures-core",
-      "version": "0.3.32",
+      "version": "0.3.34",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "asynchronous trait primitive",
@@ -203,7 +195,7 @@
     },
     {
       "name": "interprocess",
-      "version": "2.4.3",
+      "version": "2.4.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "0BSD OR Apache-2.0",
       "category": "local IPC operating-system wrapper",
@@ -219,7 +211,7 @@
     },
     {
       "name": "libc",
-      "version": "0.2.186",
+      "version": "0.2.189",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "platform primitive",
@@ -427,7 +419,7 @@
     },
     {
       "name": "thiserror",
-      "version": "2.0.19",
+      "version": "2.0.20",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "error primitive",
@@ -435,7 +427,7 @@
     },
     {
       "name": "thiserror-impl",
-      "version": "2.0.19",
+      "version": "2.0.20",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "MIT OR Apache-2.0",
       "category": "derive build primitive",
