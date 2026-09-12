@@ -39,11 +39,11 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-09-04T13:30:32.264827+00:00",
+  "generated_at_utc": "2026-09-12T12:57:52.804626+00:00",
   "inventory": {
-    "canonical_sha256": "ae0fa1dc4fdf5fe46390fa8b8fd7432bb9d710adc4e621de5314dc79ae5f3871",
-    "external_package_count": 272,
-    "package_count": 299,
+    "canonical_sha256": "68695242fb9c14954affbd388ca95cfacb1aa5cb45f675b443f1768a776d8d11",
+    "external_package_count": 273,
+    "package_count": 300,
     "packages": [
       {
         "license": "MIT OR Apache-2.0",
@@ -1010,6 +1010,13 @@
         "name": "memchr",
         "source": "registry+https://github.com/rust-lang/crates.io-index",
         "version": "2.8.3"
+      },
+      {
+        "license": "MIT",
+        "license_file": null,
+        "name": "memoffset",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.9.1"
       },
       {
         "license": "MIT OR Apache-2.0",
@@ -2151,19 +2158,19 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "f7ad00070b2f5eec55ff73c46a0fe7d4b3c9574c",
+    "commit": "864e10d34f3e54f652798a9880d6535531ea95c2",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
-    "source_inputs_sha256": "c02677d6158f8f32b86b28aaae9842114f1f483c5ef98d7df112d7d3e468b638",
-    "tree": "1bd27dd014c2d407e7af0469e5c5cd7f25bc81e8",
+    "source_inputs_sha256": "3733ec8817aa9f94bc2cc92d089d6633ccead8dd4facc5cf7efe65f63c9b192e",
+    "tree": "5706fb7e29f9cfa98bed7688da43e35e86fe40a1",
     "worktree_clean": false
   },
   "source_inputs": [
     {
       "path": "Cargo.lock",
-      "sha256": "d34a8f1a50c4a386edb7ec5914cf6138e1a4f36709716901996242da6963a263"
+      "sha256": "275a2ccfbcb9aaa83cd33aa74a0486737344e8fc709c1644455a352973afc12e"
     },
     {
       "path": "Cargo.toml",
@@ -2207,7 +2214,7 @@
     },
     {
       "path": "crates/hyphae-cli/Cargo.toml",
-      "sha256": "5c0dd9265851b8ed3e401b5266ef511b55477d3860ed52892f829e00042ac2e5"
+      "sha256": "2f4ba15326ab041d09087094880b423b600f4f052a47f2ec18d873b68c88e798"
     },
     {
       "path": "crates/hyphae-client/Cargo.toml",
@@ -2243,7 +2250,7 @@
     },
     {
       "path": "crates/hyphae-native-daemon/Cargo.toml",
-      "sha256": "faacc24e61a4545945518ec9f738429f0b7acb6ca1df5ef8039008c36b740ae4"
+      "sha256": "5117aacdd867cc6e3872026b70755c40fffdbe2d868639458515403feb86abad"
     },
     {
       "path": "crates/hyphae-native-manifest/Cargo.toml",
@@ -2338,7 +2345,7 @@
       "--format",
       "{p} {l}"
     ],
-    "normalized_unique_line_count": 624,
-    "normalized_unique_lines_sha256": "fbc2cab776d414652e9d6446df1946c9fb7f98b50522a2c108fbc89f2c726e4e"
+    "normalized_unique_line_count": 628,
+    "normalized_unique_lines_sha256": "19a8964c0059dcfe774c6bc687d0e2155eba4f2c843453f4f92d959a6ba77f2a"
   }
 }

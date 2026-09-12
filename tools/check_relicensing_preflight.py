@@ -1388,7 +1388,9 @@ def validate_preflight_evidence(
                 failures.append(
                     f"{DEPENDENCY_RECEIPT_PATH}.inventory.external_package_count: count differs"
                 )
-            if len(packages) != 299 or workspace_count != 27:
+            # The reviewed integration graph adds MIT-licensed memoffset through
+            # the daemon's nix socket feature; the legal base remains unchanged.
+            if len(packages) != 300 or workspace_count != 27:
                 failures.append(
                     f"{DEPENDENCY_RECEIPT_PATH}.inventory: frozen exact-source counts differ"
                 )
