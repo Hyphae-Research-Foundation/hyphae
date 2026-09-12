@@ -43,7 +43,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["major", "minor"],
-      "properties": {"major": {"const": 1}, "minor": {"const": 3}}
+      "properties": {"major": {"const": 1}, "minor": {"const": 7}}
     },
     "transports": {
       "oneOf": [

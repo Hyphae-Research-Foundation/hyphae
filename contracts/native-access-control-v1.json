@@ -497,6 +497,26 @@
       "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
     },
     {
+      "id": "memory.recall",
+      "status": "current",
+      "source_variant": "MemoryRecall",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.read", "search.execute"],
+      "scope_resolution": "memory_recall_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "reader", "writer"]
+    },
+    {
+      "id": "memory.enrich",
+      "status": "current",
+      "source_variant": "MemoryEnrich",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.read", "data.write", "maintain"],
+      "scope_resolution": "memory_enrich_objects",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "owner"]
+    },
+    {
       "id": "search.execute",
       "status": "current",
       "source_variant": "Search",

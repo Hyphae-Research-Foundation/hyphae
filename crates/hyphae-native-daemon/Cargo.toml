@@ -21,7 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["user", "socket"] }
+nix = { workspace = true, features = ["user", "socket", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 widestring.workspace = true

@@ -28,6 +28,8 @@ OPERATION_SCOPE_RESOLUTION = {
     "bound_sql_parent_objects",
     "bound_sql_objects_transaction_union",
     "durable_default_scalar_keyspace",
+    "memory_recall_objects",
+    "memory_enrich_objects",
     "transaction_union",
     "originating_principal",
     "underlying_operation",
@@ -395,6 +397,27 @@ def validate_operations(
     require_variant_rule(operations_by_variant, "AdminCheckpoint", ["maintain"], False)
     require_variant_rule(operations_by_variant, "Doctor", ["maintain"], False)
     require_variant_rule(operations_by_variant, "Prove", ["proof.generate"], True)
+    for variant, permissions, resolver in (
+        (
+            "MemoryRecall",
+            ["catalog.read", "data.read", "search.execute"],
+            "memory_recall_objects",
+        ),
+        (
+            "MemoryEnrich",
+            ["catalog.read", "data.read", "data.write", "maintain"],
+            "memory_enrich_objects",
+        ),
+    ):
+        memory_rows = operations_by_variant.get(variant, [])
+        if (
+            len(memory_rows) != 1
+            or memory_rows[0]["classification"] != "fixed"
+            or memory_rows[0]["required_all"] != permissions
+            or memory_rows[0]["scope_resolution"] != resolver
+            or memory_rows[0]["inherits_underlying"] is not False
+        ):
+            fail(f"{variant} must retain collection, lifecycle, and maintenance authority")
     explain_rows = operations_by_variant.get("AdminExplainSql", [])
     if (
         len(explain_rows) != 1

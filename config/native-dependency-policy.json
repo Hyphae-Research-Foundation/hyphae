@@ -66,6 +66,14 @@
       "rationale": "Bounded inline array storage used transitively by BLAKE3."
     },
     {
+      "name": "autocfg",
+      "version": "1.5.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "Apache-2.0 OR MIT",
+      "category": "build support primitive",
+      "rationale": "Build-time compiler feature detection for memoffset's portable field-offset implementation."
+    },
+    {
       "name": "blake3",
       "version": "1.8.5",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -240,6 +248,14 @@
       "license": "Unlicense OR MIT",
       "category": "canonical JSON primitive",
       "rationale": "Byte scanning used transitively by serde_json parsing."
+    },
+    {
+      "name": "memoffset",
+      "version": "0.9.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "license": "MIT",
+      "category": "platform layout primitive",
+      "rationale": "Typed socket ABI layout offsets used transitively by nix for bounded Unix stale-endpoint detection."
     },
     {
       "name": "mio",
