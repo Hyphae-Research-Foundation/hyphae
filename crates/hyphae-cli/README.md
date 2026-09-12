@@ -28,3 +28,8 @@ does not negotiate larger custom-server values from capabilities.
 Code is Apache-2.0; documentation is CC-BY-SA-4.0. Quickstart, release
 verification, and security policy:
 [`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).
+
+Source builds also provide `hyphae memory-panel init` and `serve` for a dedicated
+Unix memory client interface. The 3.0.0 registry package predates this addition.
+See the [source guide](../../docs/memory-panel.md) for independent provisioning
+and the exact server-enforced operation boundary.

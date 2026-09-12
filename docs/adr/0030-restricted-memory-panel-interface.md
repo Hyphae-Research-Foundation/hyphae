@@ -1,6 +1,6 @@
 # ADR 0030: Restricted memory panel interface
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 

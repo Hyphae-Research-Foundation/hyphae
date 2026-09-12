@@ -1,4 +1,5 @@
 {
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-memory-panel-contract-v1",
   "interface": "hyphae-memory-panel-v1",
   "transport": {
@@ -402,7 +403,7 @@
   },
   "behavior": {
     "proofs": "prove=true verifies the complete memory proof offline on the service and returns digest/anchor metadata without local paths; temporary proof files are removed.",
-    "backups": "Only list and create memory directory backups. IDs and checkpoint digests are returned; destination paths are fixed server-side. Restore stays in the separately operated application.",
+    "backups": "List and create backups only in the configured memory backup directory's private panel subdirectory. IDs and checkpoint digests are returned; restore remains an independent operator action.",
     "provenance": "Explicit writes receive memory-panel / user provenance from the server.",
     "installation": "The user provisions Hyphae, memory services and the dedicated client configuration independently. The desktop client installs or administers neither the runtime nor agent integrations."
   }
