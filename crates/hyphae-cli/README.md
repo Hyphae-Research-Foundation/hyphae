@@ -33,3 +33,7 @@ Source builds also provide `hyphae memory-panel init` and `serve` for a dedicate
 Unix memory client interface. The 3.0.0 registry package predates this addition.
 See the [source guide](../../docs/memory-panel.md) for independent provisioning
 and the exact server-enforced operation boundary.
+
+Memory recalls support explicit `semantic`, `hybrid` and `lexical` modes.
+The `agent ui` semantic action can select the default for agent queries;
+existing profiles remain hybrid. See the Agent Memory operator contract.

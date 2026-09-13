@@ -171,7 +171,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
                     "kind": {"type": "string", "enum": MEMORY_KINDS},
                     "layer": {"type": "string", "enum": ["all", "personal", "work", "journal"]},
                     "prove": {"type": "boolean"},
-                    "mode": {"type": "string", "enum": ["lexical", "hybrid"]},
+                    "mode": {"type": "string", "enum": ["lexical", "hybrid", "semantic"]},
                 },
             }),
             json!({
@@ -182,7 +182,7 @@ fn memory_registry(allow_write: bool) -> Result<ToolRegistry, CliFailure> {
                     "memories": {"type": "array", "maxItems": 64, "items": memory_item},
                     "expired_filtered": {"type": "integer", "minimum": 0},
                     "proof": {"type": ["object", "null"]},
-                    "retrieval_mode": {"enum": ["lexical", "hybrid"]},
+                    "retrieval_mode": {"enum": ["lexical", "hybrid", "semantic"]},
                     "semantic_status": {"enum": ["disabled", "ready", "unavailable"]},
                     "snapshot": {"type": "object"},
                 },
@@ -2062,6 +2062,67 @@ async fn profile_memory_recall_domains(
     profile_memory_recall_selected(client, selected, input, options, false).await
 }
 
+fn select_memory_mode(
+    lexical: &mut Option<ProductLexicalBranch>,
+    has_vectors: bool,
+    mode: &str,
+) -> &'static str {
+    if !has_vectors {
+        "lexical"
+    } else if mode == "semantic" {
+        *lexical = None;
+        "semantic"
+    } else {
+        "hybrid"
+    }
+}
+
+#[cfg(test)]
+mod semantic_mode_tests {
+    use super::*;
+
+    fn lexical() -> ProductLexicalBranch {
+        ProductLexicalBranch {
+            query: "memory".into(),
+            candidate_limit: 1000,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }
+    }
+
+    #[test]
+    fn semantic_mode_removes_lexical_overlap_only_after_embedding_succeeds() {
+        let mut branch = Some(lexical());
+        assert_eq!(
+            select_memory_mode(&mut branch, true, "semantic"),
+            "semantic"
+        );
+        assert!(branch.is_none());
+        let mut branch = Some(lexical());
+        assert_eq!(
+            select_memory_mode(&mut branch, false, "semantic"),
+            "lexical"
+        );
+        assert_eq!(
+            branch.as_ref().map(|value| value.query.as_str()),
+            Some("memory")
+        );
+    }
+
+    #[test]
+    fn hybrid_mode_retains_the_existing_two_branch_request() {
+        let mut branch = Some(lexical());
+        assert_eq!(select_memory_mode(&mut branch, true, "hybrid"), "hybrid");
+        assert!(branch.is_some());
+        assert_eq!(select_memory_mode(&mut branch, false, "hybrid"), "lexical");
+        assert!(branch.is_some());
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn profile_memory_recall_selected(
     client: &HyphaeClient,
@@ -2138,16 +2199,17 @@ async fn profile_memory_recall_selected(
     if input
         .mode
         .as_deref()
-        .is_some_and(|mode| !matches!(mode, "lexical" | "hybrid"))
+        .is_some_and(|mode| !matches!(mode, "lexical" | "hybrid" | "semantic"))
     {
         return Err(invalid_request());
     }
     let mut provenance = Vec::new();
     let mut semantic_status = "disabled";
-    if policy.semantic.enabled
-        && input.mode.as_deref() != Some("lexical")
-        && !input.query.is_empty()
-    {
+    let mode = input
+        .mode
+        .as_deref()
+        .unwrap_or(policy.semantic.search_mode.as_str());
+    if policy.semantic.enabled && mode != "lexical" && !input.query.is_empty() {
         match crate::agent_semantic::embed(&input.query, &policy).await {
             Ok((vector, attestation)) => {
                 provenance = serde_json::to_vec(&attestation).map_err(|_| invalid_request())?;
@@ -2166,11 +2228,7 @@ async fn profile_memory_recall_selected(
             Err(_) => semantic_status = "unavailable",
         }
     }
-    let retrieval_mode = if search.vectors.is_empty() {
-        "lexical"
-    } else {
-        "hybrid"
-    };
+    let retrieval_mode = select_memory_mode(&mut search.lexical, !search.vectors.is_empty(), mode);
     selected.sort_unstable();
     selected.dedup();
     let request = hyphae_native_product::ProductMemoryRecallRequest {

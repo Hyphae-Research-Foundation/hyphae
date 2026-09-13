@@ -102,7 +102,7 @@ fn arguments(operation: &str, value: Value) -> Result<Value, CliFailure> {
             if !bounded(&input.project, 256)
                 || input.query.len() > 4096
                 || !(1..=100).contains(&input.limit)
-                || !matches!(input.mode.as_str(), "lexical" | "hybrid")
+                || !matches!(input.mode.as_str(), "lexical" | "hybrid" | "semantic")
                 || !matches!(
                     input.layer.as_str(),
                     "work" | "personal" | "journal" | "all"

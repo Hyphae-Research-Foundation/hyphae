@@ -299,10 +299,13 @@ fn embed_binary() -> Result<std::path::PathBuf, CliFailure> {
 pub(crate) async fn configure(
     enabled: bool,
     model_dir: Option<std::path::PathBuf>,
+    mode: Option<crate::agent_policy::SemanticSearchMode>,
 ) -> Result<Value, CliFailure> {
     let mut policy = Policy::current().await?;
+    let search_mode = mode.unwrap_or(policy.semantic.search_mode);
     if !enabled {
         policy.semantic.enabled = false;
+        policy.semantic.search_mode = search_mode;
         crate::agent_control::commit_policy(&policy).await?;
         if policy.manage_services {
             let _ = crate::agent::systemctl(&["stop", "hyphae-agent-embed"]);
@@ -342,6 +345,7 @@ pub(crate) async fn configure(
         enabled: true,
         model_dir: Some(directory.clone()),
         model: Some(model),
+        search_mode,
     };
     next.validate()?;
     // Capture remains durable in the spool while the daemon is stopped. Do
@@ -957,6 +961,7 @@ mod tests {
             enabled: true,
             model_dir: Some(path.join("model")),
             model: Some(json!({"fingerprint":"a".repeat(64),"dimensions":2})),
+            search_mode: crate::agent_policy::SemanticSearchMode::Hybrid,
         };
         Ok((path, policy))
     }
