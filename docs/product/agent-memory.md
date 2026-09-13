@@ -205,6 +205,21 @@ written with create-new and fsync semantics, deduplicated across retries, and
 drained opportunistically through the local socket. Successful commits create
 bounded acknowledgement records; only then is the pending record removed.
 
+Automatic capture selects standalone decision, constraint, fact, and first-person
+journal lines, plus a small allowlist of successful build/test commands. It does
+not retain ordinary conversation or raw transcripts. Sensitive-data checks apply
+to each selected candidate: an unrelated file path or identifier elsewhere in a
+response does not discard a safe standalone memory. Sensitive candidates, blockquote
+and code-block examples, and records over 512 UTF-8 bytes including their kind
+prefix are rejected. The complete input remains bounded, and each event admits
+at most three candidates. Explicit journal lines retain their separate journal
+layer even when they contain constraint words such as "must" or "never"; they
+still require first-person text and host-supplied model provenance.
+Command capture also requires an explicit successful outcome in the hook input.
+Codex 0.154 currently supplies shell output as a string without an exit status;
+that alone cannot establish success, so it does not create a command memory.
+Decision, fact, constraint, and journal capture do not depend on command output.
+
 ## Security and privacy boundaries
 
 - Everything is local: loopback-only HTTP and an owner-only local

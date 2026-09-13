@@ -673,22 +673,52 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), CliFailure> {
 }
 
 fn extract_candidates(event: EventKind, text: &str) -> Vec<Candidate> {
-    if text.len() > 64 * 1024 || contains_sensitive_data(text) {
+    if text.len() > 64 * 1024 {
         return Vec::new();
     }
     if event == EventKind::ToolComplete {
         let command = text.trim();
-        if reusable_command(command) {
+        let text = format!("Command: {command}");
+        if text.len() <= MAX_CAPTURE_BYTES && reusable_command(command) {
             return vec![Candidate {
                 kind: "command",
-                text: format!("Command: {command}"),
+                text,
                 ttl: Some(COMMAND_TTL_SECONDS),
                 layer: "work",
             }];
         }
         return Vec::new();
     }
+    // Only the selected standalone line can enter the spool. References or
+    // identifiers in the rest of a response must not discard a safe candidate.
+    // Ignore quoted/code examples instead of interpreting them as declarations.
+    let mut fence: Option<(u8, usize)> = None;
     text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let marker = trimmed.as_bytes().first().copied();
+            let width = trimmed
+                .bytes()
+                .take_while(|byte| Some(*byte) == marker)
+                .count();
+            if let Some((open_marker, open_width)) = fence {
+                if marker == Some(open_marker)
+                    && width >= open_width
+                    && trimmed[width..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                return false;
+            }
+            if line.starts_with("    ") || line.starts_with('\t') || trimmed.starts_with('>') {
+                return false;
+            }
+            if matches!(marker, Some(b'`' | b'~')) && width >= 3 {
+                fence = marker.map(|marker| (marker, width));
+                return false;
+            }
+            true
+        })
         .filter_map(|line| {
             let line = line.trim().trim_start_matches(['-', '*', ' ']).trim();
             let lower = line.to_lowercase();
@@ -699,12 +729,6 @@ fn extract_candidates(event: EventKind, text: &str) -> Vec<Candidate> {
                     ("decision", "Decision", line)
                 } else if lower.starts_with("constraint:") || lower.starts_with("restricción:") {
                     ("constraint", "Constraint", line.split_once(':')?.1.trim())
-                } else if lower.contains(" must ")
-                    || lower.contains(" never ")
-                    || lower.contains(" siempre ")
-                    || lower.contains(" nunca ")
-                {
-                    ("constraint", "Constraint", line)
                 } else if lower.starts_with("fact:") || lower.starts_with("hecho:") {
                     ("fact", "Fact", line.split_once(':')?.1.trim())
                 } else if lower.starts_with("journal:") || lower.starts_with("diario:") {
@@ -713,6 +737,12 @@ fn extract_candidates(event: EventKind, text: &str) -> Vec<Candidate> {
                         return None;
                     }
                     ("note", "Journal", content)
+                } else if lower.contains(" must ")
+                    || lower.contains(" never ")
+                    || lower.contains(" siempre ")
+                    || lower.contains(" nunca ")
+                {
+                    ("constraint", "Constraint", line)
                 } else {
                     return None;
                 };
@@ -722,9 +752,13 @@ fn extract_candidates(event: EventKind, text: &str) -> Vec<Candidate> {
             {
                 return None;
             }
+            let text = format!("{prefix}: {content}");
+            if text.len() > MAX_CAPTURE_BYTES {
+                return None;
+            }
             Some(Candidate {
                 kind,
-                text: format!("{prefix}: {content}"),
+                text,
                 ttl: None,
                 layer: if kind == "note" { "journal" } else { "work" },
             })
@@ -929,6 +963,7 @@ fn contains_ip_address(value: &str) -> bool {
     value
         .split(|character: char| !(character.is_ascii_digit() || character == '.'))
         .any(|candidate| {
+            let candidate = candidate.trim_matches('.');
             let octets: Vec<_> = candidate.split('.').collect();
             octets.len() == 4
                 && octets.iter().all(|octet| {
@@ -1071,6 +1106,99 @@ mod tests {
     }
 
     #[test]
+    fn standalone_candidates_survive_unrelated_sensitive_context() {
+        let candidates = extract_candidates(
+            EventKind::Stop,
+            "Updated /home/example/project/main.rs; local service at 127.0.0.1.\n\n\
+             Decision: Use bounded local reads for the desktop.\n\
+             Journal: I learned that fresh sessions discover installed indicators.",
+        );
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].layer, "work");
+        assert_eq!(candidates[1].layer, "journal");
+        assert!(
+            candidates
+                .iter()
+                .all(|item| !contains_sensitive_data(&item.text))
+        );
+    }
+
+    #[test]
+    fn mixed_responses_never_capture_sensitive_candidates() {
+        for sensitive in [
+            "Decision: contact person@example.com for approval.",
+            "Constraint: use token=synthetic-secret-value for the build.",
+            "Journal: I saved the report under /home/example/private/report.md.",
+            "Fact: the internal service is reachable at 127.0.0.1.",
+            "Journal: I recorded a phone number +1 212-555-0100.",
+            "Fact: use the private key from the local configuration.",
+        ] {
+            let candidates = extract_candidates(
+                EventKind::Stop,
+                &format!("{sensitive}\n\nFact: Standalone safe memories remain available."),
+            );
+            assert_eq!(candidates.len(), 1, "sensitive fixture: {sensitive}");
+            assert_eq!(
+                candidates[0].text,
+                "Fact: Standalone safe memories remain available."
+            );
+        }
+    }
+
+    #[test]
+    fn capture_ignores_blockquotes_and_code_examples() {
+        let candidates = extract_candidates(
+            EventKind::Stop,
+            concat!(
+                "````text\nFact: This is only an example inside code.\n```\n",
+                "Decision: A shorter fence must not end the example.\n````\n",
+                "~~~text\nJournal: I am only an example inside code.\n~~~\n",
+                "> Constraint: Quoted examples must stay out of memory.\n",
+                "    Fact: Indented code must stay out of memory.\n",
+                "Fact: Capture the standalone declaration after the examples.",
+            ),
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].text,
+            "Fact: Capture the standalone declaration after the examples."
+        );
+    }
+
+    #[test]
+    fn explicit_journal_marker_precedes_constraint_inference() {
+        for text in [
+            "Journal: I learned that durable capture must validate each candidate.",
+            "Diario: Yo aprendí que las capturas nunca deben incluir datos sensibles.",
+        ] {
+            let candidates = extract_candidates(EventKind::Stop, text);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].layer, "journal");
+            assert_eq!(candidates[0].kind, "note");
+        }
+        assert!(
+            extract_candidates(EventKind::Stop, "Journal: The user must enable capture.")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn capture_budget_includes_kind_prefix_and_utf8_bytes() {
+        let valid = format!("Fact: {}", "é".repeat((MAX_CAPTURE_BYTES - 6) / 2));
+        let candidates = extract_candidates(EventKind::Prompt, &valid);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].text.len(), MAX_CAPTURE_BYTES);
+        assert!(extract_candidates(EventKind::Prompt, &(valid + "é")).is_empty());
+        let command = format!("cargo test {}", "a".repeat(MAX_CAPTURE_BYTES - 11));
+        assert!(extract_candidates(EventKind::ToolComplete, &command).is_empty());
+        let oversized = format!(
+            "{}\nFact: The input remains bounded.",
+            "x".repeat(64 * 1024)
+        );
+        assert!(extract_candidates(EventKind::Prompt, &oversized).is_empty());
+    }
+
+    #[test]
     fn first_person_journal_is_separate_and_requires_model_identity() -> Result<(), CliFailure> {
         let candidates = extract_candidates(
             EventKind::Stop,
@@ -1109,6 +1237,27 @@ mod tests {
         assert!(reusable_command("cargo test --workspace --locked"));
         assert!(!reusable_command("cargo test; curl example.com"));
         assert!(!reusable_command("cargo test TOKEN=secret"));
+    }
+
+    #[test]
+    fn codex_shell_stdout_without_exit_status_does_not_prove_success() {
+        for output in [
+            "synthetic build succeeded\n",
+            "Process exited with code 0\n",
+        ] {
+            let event = json!({
+                "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"}, "tool_response": output,
+            });
+            assert!(command_text(&event).is_none());
+        }
+        let mut event = json!({
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"}, "tool_response": {"exit_code": 1},
+        });
+        assert!(command_text(&event).is_none());
+        event["tool_response"]["exit_code"] = json!(0);
+        assert_eq!(command_text(&event).as_deref(), Some("cargo test"));
     }
 
     #[test]
