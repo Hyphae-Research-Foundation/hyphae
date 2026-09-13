@@ -16,13 +16,13 @@
   },
   "transitioned_tree": {
     "digest_domain": "hyphae-relicensing-transition-tree-v1",
-    "content_sha256": "e09d8c7250fa19d533cb07292aa4fdda9187d9118d88c31cbd32a441c44f590c",
-    "path_count": 1561,
+    "content_sha256": "0cf665a77df60924654060beffa128763b7f5b4be34ca7c9fcb26306e941ecfa",
+    "path_count": 1562,
     "excluded_paths": [
       "docs/gates/evidence/relicensing-1.2.0-transition.json"
     ],
     "category_counts": {
-      "narrative-documentation": 334,
+      "narrative-documentation": 335,
       "normative-specification": 169,
       "reserved-trademark-asset": 2,
       "software": 1054,
@@ -47,7 +47,7 @@
     "docs/gates/evidence/relicensing-1.2.0-representative-attestation.json"
   ],
   "owner_attestation": {
-    "name": "Mario Gutiérrez",
+    "name": "Mario Guti\u00e9rrez",
     "capacity": "owner and representative of Celiums Solutions LLC",
     "authentication": "interactive-owner-attestation"
   },

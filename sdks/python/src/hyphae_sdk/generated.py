@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "804bac67747912550090c6f25504a0d6121d9b54af14f43e144054a07625511a"
+CONTRACT_SHA256 = "b95f8e59bc0c9b564a210269f3117b16301f77c036c64655cbcb3e02e3d09920"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -31,7 +31,7 @@ class AgentMemoryControlList(TypedDict):
     limit: NotRequired[int]
     kind: NotRequired[Literal["decision", "command", "constraint", "fact", "note"] | None]
     layer: NotRequired[Literal["all", "personal", "work", "journal", None]]
-    mode: NotRequired[Literal["lexical", "hybrid", None]]
+    mode: NotRequired[Literal["lexical", "hybrid", "semantic", None]]
     prove: NotRequired[bool]
 
 class AgentMemoryControlPause(TypedDict):
@@ -44,14 +44,14 @@ class AgentMemoryControlRecall(TypedDict):
     limit: NotRequired[int]
     kind: NotRequired[Literal["decision", "command", "constraint", "fact", "note"] | None]
     layer: NotRequired[Literal["all", "personal", "work", "journal", None]]
-    mode: NotRequired[Literal["lexical", "hybrid", None]]
+    mode: NotRequired[Literal["lexical", "hybrid", "semantic", None]]
     prove: NotRequired[bool]
 
 class AgentMemoryControlRecallResult(TypedDict):
     memories: list[dict[str, JsonValue]]
     expired_filtered: int
     proof: dict[str, JsonValue] | None
-    retrieval_mode: Literal["lexical", "hybrid"]
+    retrieval_mode: Literal["lexical", "hybrid", "semantic"]
     semantic_status: Literal["disabled", "ready", "unavailable"]
     snapshot: dict[str, JsonValue]
 
@@ -83,6 +83,7 @@ class AgentMemoryControlRestore(TypedDict):
 class AgentMemoryControlSemantic(TypedDict):
     enabled: bool
     model_dir: NotRequired[str | None]
+    mode: NotRequired[Literal["hybrid", "semantic", None]]
 
 class AgentMemoryControlSetup(TypedDict):
     enable_service: NotRequired[bool]
@@ -103,6 +104,7 @@ class AgentMemoryControlStatusResult(TypedDict):
     protocol_minor: NotRequired[Literal[7]]
     runtime_version: NotRequired[str]
     endpoint: NotRequired[str]
+    semantic_mode: NotRequired[Literal["hybrid", "semantic"]]
 
 class AgentMemoryControlStore(TypedDict):
     project: NotRequired[str]

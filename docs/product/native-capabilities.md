@@ -94,3 +94,7 @@ dedicated credential for memory data, query/proof and backup operations. Its
 server-side dispatcher excludes operator and agent-configuration authority.
 See the [interface guide](../memory-panel.md) and
 [ADR 0030](../adr/0030-restricted-memory-panel-interface.md).
+
+The Agent Memory operator and MCP surfaces support explicit `semantic` recall.
+An optional semantic profile default selects vector-only retrieval for queries
+without a mode; legacy profiles retain hybrid RRF. See ADR 0031.

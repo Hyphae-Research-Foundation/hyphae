@@ -28,6 +28,31 @@ pub(crate) struct Semantic {
     pub enabled: bool,
     pub model_dir: Option<PathBuf>,
     pub model: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "SemanticSearchMode::is_hybrid")]
+    pub search_mode: SemanticSearchMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SemanticSearchMode {
+    #[default]
+    Hybrid,
+    Semantic,
+}
+
+impl SemanticSearchMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Semantic => "semantic",
+        }
+    }
+
+    // Serde's skip_serializing_if predicate receives a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_hybrid(&self) -> bool {
+        matches!(self, Self::Hybrid)
+    }
 }
 
 impl Default for Policy {
@@ -236,6 +261,26 @@ pub(crate) fn record_project(project: &str, cwd: &Path) -> Result<(), CliFailure
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_semantic_policy_retains_hybrid_shape_and_explicit_mode_roundtrips()
+    -> Result<(), serde_json::Error> {
+        let legacy = serde_json::json!({"enabled":false,"model_dir":null,"model":null});
+        let mut semantic: Semantic = serde_json::from_value(legacy.clone())?;
+        assert_eq!(semantic.search_mode, SemanticSearchMode::Hybrid);
+        assert_eq!(serde_json::to_value(&semantic)?, legacy);
+        semantic.search_mode = SemanticSearchMode::Semantic;
+        let encoded = serde_json::to_value(&semantic)?;
+        assert_eq!(encoded["search_mode"], "semantic");
+        assert_eq!(
+            serde_json::from_value::<Semantic>(encoded)?.search_mode,
+            SemanticSearchMode::Semantic
+        );
+        assert!(
+            serde_json::from_value::<Semantic>(serde_json::json!({"search_mode":"proxy"})).is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn pause_is_scoped_and_invalid_semantic_state_fails_closed() {
         let mut policy = Policy::default();

@@ -137,7 +137,8 @@
                 "mode": {
                   "enum": [
                     "lexical",
-                    "hybrid"
+                    "hybrid",
+                    "semantic"
                   ]
                 },
                 "layer": {
@@ -190,7 +191,8 @@
                 "mode": {
                   "enum": [
                     "lexical",
-                    "hybrid"
+                    "hybrid",
+                    "semantic"
                   ]
                 },
                 "layer": {

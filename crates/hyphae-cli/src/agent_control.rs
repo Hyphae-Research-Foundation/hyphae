@@ -70,6 +70,8 @@ struct Semantic {
     enabled: bool,
     #[serde(default)]
     model_dir: Option<PathBuf>,
+    #[serde(default)]
+    mode: Option<crate::agent_policy::SemanticSearchMode>,
 }
 
 fn read_access() -> String {
@@ -407,7 +409,7 @@ async fn execute(operation: &str, arguments: Value) -> Result<Value, CliFailure>
         }
         "semantic" => {
             let args: Semantic = parse(arguments)?;
-            crate::agent_semantic::configure(args.enabled, args.model_dir).await
+            crate::agent_semantic::configure(args.enabled, args.model_dir, args.mode).await
         }
         "remove" => {
             if !parse::<Confirm>(arguments)?.confirm {
@@ -447,7 +449,7 @@ async fn status() -> Result<Value, CliFailure> {
     let mut value = json!({"installed":true,"initialized":initialized,"service_active":false,
         "capture_paused":!policy.capture_enabled,"paused_projects":policy.paused_projects,
         "pending_captures":pending,"pending_embeddings":0,"memories":0,
-        "semantic_enabled":policy.semantic.enabled,"semantic_ready":false,"control_version":1,
+        "semantic_enabled":policy.semantic.enabled,"semantic_mode":policy.semantic.search_mode.as_str(),"semantic_ready":false,"control_version":1,
         "endpoint":crate::agent::memory_endpoint(&paths),"protocol_minor":7,"runtime_version":env!("CARGO_PKG_VERSION")});
     if initialized {
         let probe = tokio::time::timeout(Duration::from_millis(800), crate::mcp::control_memory("recall",
