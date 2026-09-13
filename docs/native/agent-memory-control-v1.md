@@ -144,3 +144,19 @@ dimensions, positional capacity, CPU pipeline and runtime version. The
 standalone `model-info` command emits this manifest without a worker envelope.
 File identity and retrieval provenance do not independently prove that a
 particular model execution occurred.
+
+## Explicit semantic retrieval
+
+`recall` and `list` also accept `mode: "semantic"`. When the local worker is
+available, this selects the native vector branch without a lexical branch,
+so shared words in one language cannot displace a closer cross-language
+embedding match through fusion. `hybrid` retains lexical/vector RRF and
+`lexical` retains text search. An unavailable worker still falls back to
+lexical recall. Empty-query browsing remains lexical.
+
+The `semantic` operator action optionally accepts `mode: "hybrid" | "semantic"`
+to choose the default for agent recalls that omit a mode. Existing profiles
+default to hybrid. Status reports `semantic_mode`. Hybrid mode is omitted
+from serialized policy for compatibility; a profile explicitly selecting
+semantic mode requires a supporting runtime. Select hybrid again before
+rolling back to an older runtime. Native wire and durable formats are unchanged.

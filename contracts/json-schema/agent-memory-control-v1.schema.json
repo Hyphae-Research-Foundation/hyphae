@@ -73,6 +73,7 @@
           "enum": [
             "lexical",
             "hybrid",
+            "semantic",
             null
           ]
         },
@@ -136,6 +137,7 @@
           "enum": [
             "lexical",
             "hybrid",
+            "semantic",
             null
           ]
         },
@@ -367,6 +369,14 @@
               "type": "null"
             }
           ]
+        },
+        "mode": {
+          "enum": [
+            "hybrid",
+            "semantic",
+            null
+          ],
+          "description": "Default retrieval mode for agent queries without an explicit mode; existing profiles default to hybrid."
         }
       }
     },
@@ -762,7 +772,8 @@
         "retrieval_mode": {
           "enum": [
             "lexical",
-            "hybrid"
+            "hybrid",
+            "semantic"
           ]
         },
         "semantic_status": {
@@ -866,6 +877,12 @@
         },
         "endpoint": {
           "type": "string"
+        },
+        "semantic_mode": {
+          "enum": [
+            "hybrid",
+            "semantic"
+          ]
         }
       }
     },
