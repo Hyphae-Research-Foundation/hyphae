@@ -16,7 +16,7 @@
   "dependencies": {
     "astro": "7.3.1",
     "next": "16.3.4",
-    "react": "19.2.7",
+    "react": "19.3.0",
     "react-dom": "19.2.7",
     "vite": "8.1.4"
   },
