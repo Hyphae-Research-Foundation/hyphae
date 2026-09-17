@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       source_tag:
-        description: Existing immutable annotated release tag
+        description: Existing immutable annotated release-vX.Y.Z-crates tag
         required: true
         type: string
       repository:
@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           test "${{ github.ref }}" = refs/heads/main
-          [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_TAG" =~ ^release-v[0-9]+\.[0-9]+\.[0-9]+-crates$ ]]
       - name: Check out exact workflow control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,12 +88,18 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C source cat-file -t "refs/tags/$SOURCE_TAG")" = tag
+          tag_object="$(git -C source rev-parse "refs/tags/$SOURCE_TAG")"
           source_commit="$(git -C source rev-parse "refs/tags/$SOURCE_TAG^{commit}")"
           source_tree="$(git -C source rev-parse "$source_commit^{tree}")"
           test "$(git -C source rev-parse HEAD)" = "$source_commit"
-          version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          version="${SOURCE_TAG#release-v}"
+          version="${version%-crates}"
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          workspace_version="$(python -c 'import tomllib; print(tomllib.load(open("source/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          test "$version" = "$package_version"
+          test "$version" = "$workspace_version"
           test "$version" = "3.0.0"
-          test "$SOURCE_TAG" = "v$version"
+          test "$SOURCE_TAG" = "release-v$version-crates"
           source_date_epoch="$(git -C source show -s --format=%ct "$source_commit")"
           SOURCE_DATE_EPOCH="$source_date_epoch" uv build source/sdks/python --out-dir dist
           # uv build writes a dist/.gitignore marker; the immutable inventory
@@ -107,7 +113,7 @@ jobs:
             --expected-version "$version"
           mkdir artifact
           cp dist/*.whl dist/*.tar.gz artifact/
-          BUILDER="$BUILDER" SOURCE_COMMIT="$source_commit" \
+          BUILDER="$BUILDER" SOURCE_TAG_OBJECT="$tag_object" SOURCE_COMMIT="$source_commit" \
             SOURCE_TREE="$source_tree" SOURCE_TAG="$SOURCE_TAG" VERSION="$version" \
             python - <<'PY'
           import hashlib
@@ -131,6 +137,7 @@ jobs:
               "builder": os.environ["BUILDER"],
               "source": {
                   "tag": os.environ["SOURCE_TAG"],
+                  "tag_object": os.environ["SOURCE_TAG_OBJECT"],
                   "commit": os.environ["SOURCE_COMMIT"],
                   "tree": os.environ["SOURCE_TREE"],
               },
@@ -217,7 +224,9 @@ jobs:
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
           set -euo pipefail
-          version="${SOURCE_TAG#v}"
+          [[ "$SOURCE_TAG" =~ ^release-v[0-9]+\.[0-9]+\.[0-9]+-crates$ ]]
+          version="${SOURCE_TAG#release-v}"
+          version="${version%-crates}"
           for builder in a b; do
             mkdir "candidate-$builder"
             cp "independent-$builder"/*.whl "candidate-$builder/"
@@ -373,13 +382,20 @@ jobs:
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_TAG" =~ ^release-v[0-9]+\.[0-9]+\.[0-9]+-crates$ ]]
           test "$(git -C source cat-file -t "refs/tags/$SOURCE_TAG")" = tag
+          tag_object="$(git -C source rev-parse "refs/tags/$SOURCE_TAG")"
           source_commit="$(git -C source rev-parse "refs/tags/$SOURCE_TAG^{commit}")"
           source_tree="$(git -C source rev-parse "$source_commit^{tree}")"
           test "$(git -C source rev-parse HEAD)" = "$source_commit"
-          version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
-          test "$SOURCE_TAG" = "v$version"
+          version="${SOURCE_TAG#release-v}"
+          version="${version%-crates}"
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("source/sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          workspace_version="$(python -c 'import tomllib; print(tomllib.load(open("source/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          test "$version" = "$package_version"
+          test "$version" = "$workspace_version"
+          test "$SOURCE_TAG" = "release-v$version-crates"
+          echo "tag-object=$tag_object" >> "$GITHUB_OUTPUT"
           echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
           echo "tree=$source_tree" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -424,6 +440,7 @@ jobs:
           SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           SOURCE_TREE: ${{ steps.source.outputs.tree }}
           SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_TAG_OBJECT: ${{ steps.source.outputs.tag-object }}
           VERSION: ${{ steps.source.outputs.version }}
         run: |
           set -euo pipefail
@@ -437,6 +454,7 @@ jobs:
 
           expected_source = {
               "tag": os.environ["SOURCE_TAG"],
+              "tag_object": os.environ["SOURCE_TAG_OBJECT"],
               "commit": os.environ["SOURCE_COMMIT"],
               "tree": os.environ["SOURCE_TREE"],
           }
@@ -494,7 +512,7 @@ jobs:
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.testpypi_run_id }}
-          name: hyphae-python-testpypi-${{ steps.source.outputs.commit }}
+          name: hyphae-python-testpypi-${{ inputs.source_tag }}-${{ steps.source.outputs.commit }}
           path: testpypi-authority
       - name: Inspect retained TestPyPI distributions without executing them
         if: inputs.repository == 'pypi'
@@ -549,6 +567,7 @@ jobs:
         env:
           REPOSITORY: ${{ inputs.repository }}
           SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_TAG_OBJECT: ${{ steps.source.outputs.tag-object }}
           SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
           SOURCE_TREE: ${{ steps.source.outputs.tree }}
           VERSION: ${{ steps.source.outputs.version }}
@@ -587,7 +606,11 @@ jobs:
           import os
           from pathlib import Path
 
-          from tools.python_distribution_receipt import load_local_json
+          from tools.check_native_g8_receipts import validate_aggregate
+          from tools.python_distribution_receipt import (
+              PYTHON_3_0_0_RECOVERY_AUTHORITY,
+              load_local_json,
+          )
 
           def load(path):
               return load_local_json(Path(path), f"local publication authority {path}")
@@ -595,16 +618,13 @@ jobs:
           def digest(path):
               return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-          def run_authority(path, *, run_id, attempt, workflow, event, branch, commit):
+          def run_authority(path, *, run_id, attempt, workflow):
               run = load(path)
               expected = {
                   "id": int(run_id),
                   "run_attempt": int(attempt),
-                  "event": event,
                   "status": "completed",
                   "conclusion": "success",
-                  "head_branch": branch,
-                  "head_sha": commit,
                   "path": workflow,
               }
               if any(run.get(key) != value for key, value in expected.items()):
@@ -614,11 +634,11 @@ jobs:
               return {
                   "id": expected["id"],
                   "attempt": expected["run_attempt"],
-                  "event": expected["event"],
+                  "event": run.get("event"),
                   "status": expected["status"],
                   "conclusion": expected["conclusion"],
-                  "head_branch": expected["head_branch"],
-                  "head_sha": expected["head_sha"],
+                  "head_branch": run.get("head_branch"),
+                  "head_sha": run.get("head_sha"),
                   "path": expected["path"],
                   "repository": "Hyphae-Research-Foundation/hyphae",
               }
@@ -644,6 +664,7 @@ jobs:
 
           source = {
               "tag": os.environ["SOURCE_TAG"],
+              "tag_object": os.environ["SOURCE_TAG_OBJECT"],
               "commit": os.environ["SOURCE_COMMIT"],
               "tree": os.environ["SOURCE_TREE"],
           }
@@ -674,18 +695,12 @@ jobs:
                   run_id=os.environ["RELEASE_RUN_ID"],
                   attempt=os.environ["RELEASE_RUN_ATTEMPT"],
                   workflow=".github/workflows/release.yml",
-                  event="push",
-                  branch=os.environ["SOURCE_TAG"],
-                  commit=os.environ["SOURCE_COMMIT"],
               )
               g8_run = run_authority(
                   "g8-closure-authority/github-run.json",
                   run_id=os.environ["G8_CLOSURE_RUN_ID"],
                   attempt=os.environ["G8_CLOSURE_RUN_ATTEMPT"],
                   workflow=".github/workflows/native-g8-closure.yml",
-                  event="workflow_dispatch",
-                  branch="main",
-                  commit=os.environ["SOURCE_COMMIT"],
               )
               evidence_path = Path(
                   f"release-authority/hyphae-{os.environ['SOURCE_TAG']}.release-evidence.json"
@@ -695,6 +710,41 @@ jobs:
               aggregate_path = Path("g8-closure-authority/native-g8-aggregate.json")
               evidence = load(evidence_path)
               aggregate = load(aggregate_path)
+              if release_run["event"] == "workflow_dispatch":
+                  recovery = PYTHON_3_0_0_RECOVERY_AUTHORITY
+                  expected_run = recovery["release_run"]
+                  if source != recovery["source"] or any(
+                      release_run[key] != expected_run[key]
+                      for key in ("id", "attempt", "event", "head_branch", "head_sha")
+                  ):
+                      raise SystemExit("Release recovery run or source differs")
+                  expected_ref = recovery["release_evidence"]["ref"]
+                  expected_g8 = recovery["g8_closure"]
+                  if any(
+                      g8_run[key] != expected_g8[expected_key]
+                      for key, expected_key in (
+                          ("id", "run_id"),
+                          ("attempt", "run_attempt"),
+                          ("event", "event"),
+                          ("head_branch", "head_branch"),
+                          ("head_sha", "head_sha"),
+                      )
+                  ):
+                      raise SystemExit("G8 recovery run differs")
+              elif (
+                  release_run["event"] == "push"
+                  and release_run["head_branch"] == os.environ["SOURCE_TAG"]
+                  and release_run["head_sha"] == os.environ["SOURCE_COMMIT"]
+              ):
+                  if (
+                      g8_run["event"] != "workflow_dispatch"
+                      or g8_run["head_branch"] != "main"
+                      or g8_run["head_sha"] != os.environ["SOURCE_COMMIT"]
+                  ):
+                      raise SystemExit("normal G8 run differs from canonical authority")
+                  expected_ref = f"refs/tags/{os.environ['SOURCE_TAG']}"
+              else:
+                  raise SystemExit("Release run is neither canonical push nor pinned recovery")
               if (
                   evidence.get("release") != {
                       "tag": os.environ["SOURCE_TAG"],
@@ -704,17 +754,11 @@ jobs:
                   or evidence.get("source", {}).get("tree") != os.environ["SOURCE_TREE"]
                   or evidence.get("workflow", {}).get("run_id") != os.environ["RELEASE_RUN_ID"]
                   or evidence.get("workflow", {}).get("run_attempt") != int(os.environ["RELEASE_RUN_ATTEMPT"])
+                  or evidence.get("workflow", {}).get("event") != release_run["event"]
+                  or evidence.get("workflow", {}).get("ref") != expected_ref
               ):
                   raise SystemExit("release evidence source or workflow binding differs")
-              if (
-                  aggregate.get("schema") != "hyphae-native-g8-aggregate-v1"
-                  or aggregate.get("gate") != "G8"
-                  or aggregate.get("status") != "passed"
-                  or aggregate.get("source_commit") != os.environ["SOURCE_COMMIT"]
-                  or aggregate.get("claims") != ["G8"]
-                  or aggregate.get("closure_declared") is not True
-              ):
-                  raise SystemExit("G8 closure authority is open or source-unbound")
+              validate_aggregate(aggregate, os.environ["SOURCE_COMMIT"])
               release_authority = {
                   "run": release_run,
                   "artifact": artifact_authority(
@@ -722,6 +766,7 @@ jobs:
                   ),
                   "release_evidence": {
                       "filename": evidence_path.name,
+                      "ref": evidence["workflow"]["ref"],
                       "sha256": digest(evidence_path),
                   },
                   "sboms": {
@@ -781,6 +826,7 @@ jobs:
             --publication-authority python-publication-authority.json \
             --version '${{ steps.source.outputs.version }}' \
             --source-tag '${{ inputs.source_tag }}' \
+            --source-tag-object '${{ steps.source.outputs.tag-object }}' \
             --source-commit '${{ steps.source.outputs.commit }}' \
             --source-tree '${{ steps.source.outputs.tree }}' \
             --workflow-repository '${{ github.repository }}' \
@@ -865,7 +911,7 @@ jobs:
         id: publication-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hyphae-python-build-${{ inputs.repository }}-${{ steps.source.outputs.commit }}
+          name: hyphae-python-build-${{ inputs.repository }}-${{ inputs.source_tag }}-${{ steps.source.outputs.commit }}
           path: |
             publish-dist/*.whl
             publish-dist/*.tar.gz
@@ -1056,7 +1102,7 @@ jobs:
       - name: Upload publication receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hyphae-python-${{ inputs.repository }}-${{ needs.build.outputs.source-commit }}
+          name: hyphae-python-${{ inputs.repository }}-${{ inputs.source_tag }}-${{ needs.build.outputs.source-commit }}
           path: |
             python-publish-receipt.json
             installation-evidence/*.json

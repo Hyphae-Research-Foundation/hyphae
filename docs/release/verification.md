@@ -22,7 +22,7 @@ After hosted closure and explicit publication authorization, create the
 version tag on `MERGE_COMMIT`. Verify the target before push:
 
 ```bash
-test "$(git rev-parse vVERSION^{commit})" = "MERGE_COMMIT"
+test "$(git rev-parse release-vVERSION-crates^{commit})" = "MERGE_COMMIT"
 ```
 
 The publication workflow excludes every check from its own run and must find
@@ -38,9 +38,10 @@ it never recreates or moves the tag.
 
 Download every file named in `SHA256SUMS`, including the archive, provenance
 predicates, both SBOMs, and
-`hyphae-vVERSION.release-evidence.json`. A tagged release must also list
-`hyphae-vVERSION.required-checks.json`. Download `SHA256SUMS` and the
-corresponding `.sigstore.json` bundles into the same directory:
+`hyphae-release-vVERSION-crates.release-evidence.json`. A tagged release must
+also list `hyphae-release-vVERSION-crates.required-checks.json`. Download
+`SHA256SUMS` and the corresponding `.sigstore.json` bundles into the same
+directory:
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -57,8 +58,9 @@ with its `SHA256SUMS` entry:
 
 Use Cosign 3.1.1 or a later compatible verifier. The certificate identity is
 bound to the exact Release workflow ref recorded in the release evidence. It
-is `refs/tags/vVERSION` for a tag push and `refs/heads/main` for an authorized
-exact-tag recovery:
+is `refs/tags/release-vVERSION-crates` for a normal tag push. The observed
+`3.0.0` exact-tag recovery uses `refs/heads/main`; that recovery is not a
+general `workflow_dispatch` authority for Python publication:
 
 ```bash
 cosign verify-blob \
@@ -70,13 +72,13 @@ cosign verify-blob \
 ```
 
 Run the same verification for `SHA256SUMS`, both SBOM files, every provenance
-predicate, `hyphae-vVERSION.required-checks.json`, and
-`hyphae-vVERSION.release-evidence.json`. A bundle from another repository,
-workflow, branch, or tag must fail the identity check.
+predicate, `hyphae-release-vVERSION-crates.required-checks.json`, and
+`hyphae-release-vVERSION-crates.release-evidence.json`. A bundle from another
+repository, workflow, branch, or tag must fail the identity check.
 
 ## 3. Verify the release evidence binding
 
-Inspect `hyphae-vVERSION.release-evidence.json`. Its
+Inspect `hyphae-release-vVERSION-crates.release-evidence.json`. Its
 `release`, `source`, and `workflow` objects must identify the expected version,
 tag, commit, tree, fetched tag object, peeled tag target, full tag ref, release
 workflow, and GitHub Actions run. Its artifact inventory must contain every
@@ -122,12 +124,12 @@ object/target binding together with all inventoried payload hashes:
 ```bash
 git checkout --detach COMMIT
 git fetch --force --no-tags origin \
-  '+refs/tags/vVERSION:refs/hyphae/verify-tag'
+  '+refs/tags/release-vVERSION-crates:refs/hyphae/verify-tag'
 TAG_OBJECT="$(git rev-parse refs/hyphae/verify-tag)"
 TAG_TARGET="$(git rev-parse 'refs/hyphae/verify-tag^{commit}')"
 python packaging/release_evidence.py verify \
   --directory /path/to/downloaded-release \
-  --manifest /path/to/downloaded-release/hyphae-vVERSION.release-evidence.json \
+  --manifest /path/to/downloaded-release/hyphae-release-vVERSION-crates.release-evidence.json \
   --commit COMMIT \
   --tag-object "$TAG_OBJECT" \
   --tag-target "$TAG_TARGET"
@@ -168,10 +170,11 @@ external immutable approval boundary. Pull requests may run only the dry-run
 path.
 
 The workflow checks out `github.workflow_sha` as the trusted control plane and
-`v3.0.0` as source in separate directories. Before executing source package
-tools, the trusted checker requires the tag to be annotated, its peeled commit
-to equal the exact fetched `origin/main` tip, and all pinned control files to be
-byte-identical between trusted main and the tag tree. It then uses the GitHub
+`release-v3.0.0-crates` as source in separate directories. Before executing
+source package tools, the trusted checker requires the tag to be annotated, its
+peeled commit to equal the exact fetched `origin/main` tip, and all pinned
+control files to be byte-identical between trusted main and the tag tree. It
+then uses the GitHub
 Checks, Actions, Jobs, and Artifacts APIs to bind each expected workflow/job
 name to one successful current exact-SHA authority, rejects other apps or paths,
 and downloads only the named unexpired Release and G8 artifacts from those run
@@ -197,7 +200,7 @@ cosign verify-blob-attestation \
   --bundle hyphae-VERSION-TARGET.tar.gz.intoto.sigstore.json \
   --type slsaprovenance1 \
   --certificate-identity \
-    'https://github.com/Hyphae-Research-Foundation/hyphae/.github/workflows/release.yml@refs/tags/vVERSION' \
+    'https://github.com/Hyphae-Research-Foundation/hyphae/.github/workflows/release.yml@refs/tags/release-vVERSION-crates' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   hyphae-VERSION-TARGET.tar.gz
 ```
@@ -252,6 +255,7 @@ tar -xzf hyphae-VERSION-TARGET.tar.gz
 ./hyphae-VERSION-TARGET/hyphae version --json
 ```
 
-The reported product must be `hyphae` and `engine_version` must equal the tag
-without the leading `v`. A release tag that differs from the workspace version
-is rejected by the publication workflow.
+The reported product must be `hyphae` and `engine_version` must equal the
+version between the tag's `release-v` prefix and `-crates` suffix. A release
+tag that differs from the workspace version is rejected by the publication
+workflow.

@@ -20,6 +20,11 @@ EXPECTED_NAME = "hyphae-sdk"
 REQUIRED_URLS = {"Homepage", "Documentation", "Repository", "Issues", "Changelog"}
 PYPI_ACTION = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 APACHE_RELEASE_VERSION = "3.0.0"
+CANONICAL_TAG_GUARD = (
+    '[[ "$SOURCE_TAG" =~ ^release-v[0-9]+\\.[0-9]+\\.[0-9]+-crates$ ]]'
+)
+TAG_VERSION_PREFIX_STRIP = 'version="${SOURCE_TAG#release-v}"'
+TAG_VERSION_SUFFIX_STRIP = 'version="${version%-crates}"'
 
 
 class PythonPackageValidationError(ValueError):
@@ -127,7 +132,7 @@ def validate(
         "actions/download-artifact",
         "run-id: ${{ inputs.testpypi_run_id }}",
         "github-token: ${{ github.token }}",
-        "hyphae-python-testpypi-${{ steps.source.outputs.commit }}",
+        "hyphae-python-testpypi-${{ inputs.source_tag }}-${{ steps.source.outputs.commit }}",
         "testpypi-authority/release/publish-dist",
         "uv build source/sdks/python --out-dir dist",
         "packages-dir: release/publish-dist/",
@@ -173,6 +178,18 @@ def validate(
         "actions/runs/${{ github.run_id }}/artifacts?per_page=100",
         "--independent-build-receipt independent-a/builder-receipt.json",
         "--independent-build-receipt independent-b/builder-receipt.json",
+        "--source-tag-object '${{ steps.source.outputs.tag-object }}'",
+        CANONICAL_TAG_GUARD,
+        TAG_VERSION_PREFIX_STRIP,
+        TAG_VERSION_SUFFIX_STRIP,
+        'test "$version" = "$package_version"',
+        'test "$version" = "$workspace_version"',
+        "PYTHON_3_0_0_RECOVERY_AUTHORITY",
+        "validate_aggregate(aggregate, os.environ[\"SOURCE_COMMIT\"])",
+        'raise SystemExit("normal G8 run differs from canonical authority")',
+        '"ref": evidence["workflow"]["ref"]',
+        "hyphae-python-build-${{ inputs.repository }}-${{ inputs.source_tag }}-${{ steps.source.outputs.commit }}",
+        "hyphae-python-${{ inputs.repository }}-${{ inputs.source_tag }}-${{ needs.build.outputs.source-commit }}",
         'test "$version" = "3.0.0"',
     }
     if any(fragment not in workflow for fragment in required_workflow):
@@ -193,6 +210,25 @@ def validate(
         fail("Python publication must use only the two-job independent build matrix")
     if workflow.count("path: artifact/*") != 1:
         fail("independent builders must upload one flat artifact staging directory")
+    if workflow.count(CANONICAL_TAG_GUARD) != 3:
+        fail("every Python authority path must require one exact canonical release tag")
+    if workflow.count(TAG_VERSION_PREFIX_STRIP) != 3 or workflow.count(
+        TAG_VERSION_SUFFIX_STRIP
+    ) != 3:
+        fail("Python package versions must be safely derived from the canonical tag")
+    if workflow.count('test "$version" = "$package_version"') != 2 or workflow.count(
+        'test "$version" = "$workspace_version"'
+    ) != 2:
+        fail("canonical tag versions must equal both repository manifests")
+    legacy_live_tag_fragments = {
+        '[[ "$SOURCE_TAG" =~ ^v[0-9]',
+        '${SOURCE_TAG#v}',
+        'test "$SOURCE_TAG" = "v$version"',
+        'test "$SOURCE_TAG" = "release-v$version"',
+        'test "$SOURCE_TAG" = "v$version-crates"',
+    }
+    if any(fragment in workflow for fragment in legacy_live_tag_fragments):
+        fail("Python publication cannot restore an SDK-specific or legacy live tag")
     if workflow.count("packages-dir: release/publish-dist/") != 2:
         fail("both registries must publish only the selected exact bytes")
     if workflow.count("--no-cache") < 3:
@@ -200,6 +236,7 @@ def validate(
     candidate_job = workflow_job(workflow, "candidate-validation")
     candidate_requirements = {
         "needs: independent-build",
+        CANONICAL_TAG_GUARD,
         "name: hyphae-python-independent-a-${{ inputs.source_tag }}",
         "name: hyphae-python-independent-b-${{ inputs.source_tag }}",
         "python -m unittest discover -s source/sdks/python/tests -v",
@@ -213,9 +250,19 @@ def validate(
         fail("candidate-validation must exercise both named independent artifacts")
     if "actions/upload-artifact" in candidate_job or "\n    outputs:" in candidate_job:
         fail("candidate-validation must not expose artifacts or outputs to authority")
+    independent_job = workflow_job(workflow, "independent-build")
+    independent_guard = independent_job.find(CANONICAL_TAG_GUARD)
+    independent_checkout = independent_job.find("actions/checkout")
+    if (
+        independent_guard < 0
+        or independent_checkout < 0
+        or independent_guard > independent_checkout
+    ):
+        fail("independent builders must reject noncanonical tags before checkout")
     build_job = workflow_job(workflow, "build")
     build_requirements = {
         "needs:\n      - independent-build\n      - candidate-validation",
+        CANONICAL_TAG_GUARD,
         "name: hyphae-python-independent-a-${{ inputs.source_tag }}",
         "name: hyphae-python-independent-b-${{ inputs.source_tag }}",
     }
@@ -252,10 +299,14 @@ def validate(
     if any(fragment in build_job for fragment in forbidden_build_execution):
         fail("build authority must not install, import, build, or test candidate code")
     publish_job = workflow_job(workflow, "publish")
-    if "actions/checkout" in publish_job or "\n        run:" in publish_job:
+    if (
+        "needs: build" not in publish_job
+        or "actions/checkout" in publish_job
+        or "\n        run:" in publish_job
+    ):
         fail("OIDC publish job must not execute repository code or shell commands")
-    # The checked-in source remains 1.1.0 until release preparation, but every
-    # workflow path that can reach OIDC must reject it first.
+    # The source-only 3.0.0 package remains explicitly gated until a real
+    # publication run produces a terminal receipt.
     if f'test "$version" = "{APACHE_RELEASE_VERSION}"' not in workflow:
         fail("Apache Python publication must be gated on version 3.0.0")
     contract_root = workflow_root or root

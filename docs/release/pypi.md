@@ -4,6 +4,10 @@ Hyphae publishes the pure-Python client as the `hyphae-sdk` distribution. Its
 import package is `hyphae_sdk`. The `hyphae` name on PyPI belongs to an
 unrelated project and must never be used by this repository.
 
+The checked-in `3.0.0` Python SDK remains source-only. No terminal Python
+publication receipt records `3.0.0` on PyPI, and this runbook is not evidence
+that it has been published there.
+
 Publication is a promotion protocol, not a maintainer workstation command.
 The `Python package` workflow runs only from the `main` control plane. Two
 independent GitHub-hosted jobs build an existing immutable annotated source tag
@@ -18,6 +22,14 @@ strict v2 receipt. That privileged job contains no checkout, shell, or
 repository code: it downloads the preflighted artifact by immutable GitHub
 artifact ID and invokes only the pinned publisher action. The final receipt
 retains that artifact ID and digest.
+
+The only live source-tag form is `release-vVERSION-crates`, shared with the
+native Release and registry authorities. Do not create a second Python- or
+SDK-specific tag. The workflow rejects `vVERSION`, `release-vVERSION`,
+`vVERSION-crates`, prerelease aliases, and malformed tags before a job that can
+reach the OIDC publisher. It strips the exact `release-v` prefix and `-crates`
+suffix, then requires that version to equal both the Python project version and
+`workspace.package.version`.
 
 ## One-time registry setup
 
@@ -41,9 +53,11 @@ workflow, environment, filename, or SHA-256 subject.
 ## Release sequence
 
 1. Land the exact SDK version and complete hosted conformance.
-2. Create the immutable annotated `vVERSION` tag. The Python version must equal
+2. Create the immutable annotated `release-vVERSION-crates` tag. Its push is
+   the normal Release authority. The Python version must equal
    `workspace.package.version` in the source tree.
-3. Dispatch `Python package` from `main` with `source_tag=vVERSION`,
+3. Dispatch `Python package` from `main` with
+   `source_tag=release-vVERSION-crates`,
    `repository=testpypi`, and both TestPyPI authority inputs empty.
 4. Wait for the TestPyPI job to publish, install on Python 3.11 and 3.14, and
    produce `python-publish-receipt.json`. Record both its workflow run ID and
@@ -61,14 +75,45 @@ workflow, environment, filename, or SHA-256 subject.
    `aggregate_sha256`. IDs and attempts are positive decimal integers; every
    digest is 64-character lowercase hexadecimal.
 
+For a normal release, the Python receipt requires the Release workflow run to
+have `event=push`, `head_branch=release-vVERSION-crates`, and
+`head_sha=SOURCE_COMMIT`. Its release evidence must use
+`ref=refs/tags/release-vVERSION-crates`. Arbitrary manual Release runs are not
+Python publication authority.
+
+The sole retained exception is the exact `3.0.0` Release recovery already
+observed by the registry authority. It is accepted only as this complete tuple:
+
+- source tag `release-v3.0.0-crates`, annotated object
+  `0bc6fe56498472804c3cc376b5b28d7652955701`;
+- source commit `24bce1accdff8d14127797afe6f237a57c1cd4f3` and tree
+  `52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff`;
+- Release run `33838703304`, attempt `1`, `event=workflow_dispatch`, branch
+  `main`, and run head/control SHA
+  `8a58749d892a52e38c651669ade03df5a6ee54af`;
+- release-evidence ref `refs/heads/main` and SHA-256
+  `34c791a0cda982389cd55fb055376af20e174a7ef1921c4816d38ad6ec798c61`;
+- SPDX SHA-256
+  `c146fde572531fe665f8a2b1460035cb9deb251b95cb95ca65568865009ee209`
+  and CycloneDX SHA-256
+  `460093bcbe2943e4803e48225b624a41ff44599f98d028a39f2b23486fde472d`;
+- G8 run `33836655173`, attempt `1`, `event=workflow_dispatch`, branch
+  `release/fix/release-readiness-semver-offline-merge-evidence`, head SHA equal
+  to the source commit, and aggregate SHA-256
+  `41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf`.
+
+Changing any recovery source, run, ref, head, or evidence digest fails closed.
+These retained Release facts do not establish a TestPyPI or PyPI publication;
+only a terminal Python publication receipt can do that.
+
 The PyPI dispatch downloads the named receipt artifact from that exact prior
 run, including the already-published wheel and sdist. It accepts only a
 terminal published TestPyPI receipt with the same source commit/tree, version,
-wheel, sdist, and canonical workflow identity. The fresh double build is a
-reproducibility check; PyPI uploads the exact distribution bytes retained by
-the TestPyPI run, not those rebuilt in the PyPI run. PyPI is never a direct
-first publication and a PyPI receipt cannot substitute for the TestPyPI
-authority.
+annotated tag object, wheel, sdist, and canonical workflow identity. The fresh
+double build is a reproducibility check; PyPI uploads the exact distribution
+bytes retained by the TestPyPI run, not those rebuilt in the PyPI run. PyPI is
+never a direct first publication and a PyPI receipt cannot substitute for the
+TestPyPI authority.
 
 TestPyPI intentionally precedes the signed release so public-package
 conformance can run without granting production publication authority. All
@@ -91,6 +136,14 @@ filenames/digests, and the exact G8 closure run, artifact
 identity/digest, aggregate digest, claim, and closure declaration. This object
 is generated from independently downloaded bytes and live GitHub metadata; it
 is not supplied as an unverified operator assertion.
+
+New v2 receipts require the canonical tag and retain its annotated tag object;
+their Release evidence record also retains the exact tag or recovery ref. The
+schema and semantic validator continue to accept the previous `vVERSION`
+source shape under the current Foundation workflow identity. That compatibility
+is validation-only and does not broaden authority to receipts issued under a
+different repository identity: neither the live workflow nor the receipt
+builder can generate another legacy-tag receipt.
 
 Before accepting that prior run, the workflow queries the GitHub Actions API
 and requires the exact run to be `completed/success`, dispatched by the

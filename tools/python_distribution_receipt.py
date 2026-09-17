@@ -54,6 +54,39 @@ REPOSITORIES = {
         "integrity": "https://test.pypi.org/integrity",
     },
 }
+# This immutable tuple is historical evidence, not current-release policy.
+# Keep it literal so a future registry authority update cannot rebind 3.0.0.
+PYTHON_3_0_0_RECOVERY_AUTHORITY = {
+    "source": {
+        "tag": "release-v3.0.0-crates",
+        "tag_object": "0bc6fe56498472804c3cc376b5b28d7652955701",
+        "commit": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+        "tree": "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff",
+    },
+    "release_run": {
+        "id": 33838703304,
+        "attempt": 1,
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af",
+    },
+    "release_evidence": {
+        "ref": "refs/heads/main",
+        "sha256": "34c791a0cda982389cd55fb055376af20e174a7ef1921c4816d38ad6ec798c61",
+    },
+    "sboms": {
+        "spdx": "c146fde572531fe665f8a2b1460035cb9deb251b95cb95ca65568865009ee209",
+        "cyclonedx": "460093bcbe2943e4803e48225b624a41ff44599f98d028a39f2b23486fde472d",
+    },
+    "g8_closure": {
+        "run_id": 33836655173,
+        "run_attempt": 1,
+        "event": "workflow_dispatch",
+        "head_branch": "release/fix/release-readiness-semver-offline-merge-evidence",
+        "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+        "aggregate_sha256": "41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf",
+    },
+}
 
 
 class PythonReceiptError(ValueError):
@@ -189,6 +222,20 @@ def _file_digest(value: object, expected_filename: str, label: str) -> dict[str,
         evidence.get("sha256"), 64
     ):
         fail(f"{label} identity is invalid")
+    return evidence
+
+
+def _release_evidence_digest(
+    value: object, *, expected_filename: str, expected_ref: str | None
+) -> dict[str, str]:
+    keys = {"filename", "sha256"} | ({"ref"} if expected_ref is not None else set())
+    evidence = _exact_object(value, keys, "release evidence")
+    if (
+        evidence.get("filename") != expected_filename
+        or not _is_sha(evidence.get("sha256"), 64)
+        or (expected_ref is not None and evidence.get("ref") != expected_ref)
+    ):
+        fail("release evidence identity is invalid")
     return evidence
 
 
@@ -333,32 +380,73 @@ def _release_authority(
     )
     tag = str(source["tag"])
     commit = str(source["commit"])
-    release_run = _authority_run(
-        release["run"],
-        workflow=".github/workflows/release.yml",
-        event="push",
-        branch=tag,
-        commit=commit,
-    )
+    run = release.get("run")
+    if not isinstance(run, dict):
+        fail("publication authority run fields are invalid")
+    recovery = run.get("event") == "workflow_dispatch"
+    if recovery:
+        expected = PYTHON_3_0_0_RECOVERY_AUTHORITY
+        if source != expected["source"]:
+            fail("Release workflow_dispatch is not the pinned 3.0.0 recovery")
+        expected_run = expected["release_run"]
+        release_run = _authority_run(
+            run,
+            workflow=".github/workflows/release.yml",
+            event=expected_run["event"],
+            branch=expected_run["head_branch"],
+            commit=expected_run["head_sha"],
+        )
+        if (
+            release_run["id"] != expected_run["id"]
+            or release_run["attempt"] != expected_run["attempt"]
+        ):
+            fail("Release recovery run or attempt differs from pinned authority")
+        evidence_ref = expected["release_evidence"]["ref"]
+    else:
+        release_run = _authority_run(
+            run,
+            workflow=".github/workflows/release.yml",
+            event="push",
+            branch=tag,
+            commit=commit,
+        )
+        evidence_ref = f"refs/tags/{tag}" if "tag_object" in source else None
     _workflow_artifact(release["artifact"], "hyphae-release-candidate")
-    _file_digest(
+    release_evidence = _release_evidence_digest(
         release["release_evidence"],
-        f"hyphae-{tag}.release-evidence.json",
-        "release evidence",
+        expected_filename=f"hyphae-{tag}.release-evidence.json",
+        expected_ref=evidence_ref,
     )
     sboms = _exact_object(release["sboms"], {"spdx", "cyclonedx"}, "release SBOMs")
-    _file_digest(sboms["spdx"], f"hyphae-{tag}.spdx.json", "SPDX SBOM")
-    _file_digest(sboms["cyclonedx"], f"hyphae-{tag}.cdx.json", "CycloneDX SBOM")
+    spdx = _file_digest(sboms["spdx"], f"hyphae-{tag}.spdx.json", "SPDX SBOM")
+    cyclonedx = _file_digest(
+        sboms["cyclonedx"], f"hyphae-{tag}.cdx.json", "CycloneDX SBOM"
+    )
     g8 = _exact_object(
         release["g8_closure"], {"run", "artifact", "aggregate"}, "G8 closure"
     )
-    g8_run = _authority_run(
-        g8["run"],
-        workflow=".github/workflows/native-g8-closure.yml",
-        event="workflow_dispatch",
-        branch="main",
-        commit=commit,
-    )
+    if recovery:
+        expected_g8 = PYTHON_3_0_0_RECOVERY_AUTHORITY["g8_closure"]
+        g8_run = _authority_run(
+            g8["run"],
+            workflow=".github/workflows/native-g8-closure.yml",
+            event=expected_g8["event"],
+            branch=expected_g8["head_branch"],
+            commit=expected_g8["head_sha"],
+        )
+        if (
+            g8_run["id"] != expected_g8["run_id"]
+            or g8_run["attempt"] != expected_g8["run_attempt"]
+        ):
+            fail("G8 recovery run or attempt differs from pinned authority")
+    else:
+        g8_run = _authority_run(
+            g8["run"],
+            workflow=".github/workflows/native-g8-closure.yml",
+            event="workflow_dispatch",
+            branch="main",
+            commit=commit,
+        )
     _workflow_artifact(g8["artifact"], f"native-g8-aggregate-{commit}")
     aggregate = _exact_object(
         g8["aggregate"],
@@ -372,6 +460,16 @@ def _release_authority(
         or aggregate.get("closure_declared") is not True
     ):
         fail("G8 aggregate authority is open or source-unbound")
+    if recovery:
+        expected = PYTHON_3_0_0_RECOVERY_AUTHORITY
+        if (
+            release_evidence["sha256"] != expected["release_evidence"]["sha256"]
+            or spdx["sha256"] != expected["sboms"]["spdx"]
+            or cyclonedx["sha256"] != expected["sboms"]["cyclonedx"]
+            or aggregate["sha256"]
+            != expected["g8_closure"]["aggregate_sha256"]
+        ):
+            fail("Release recovery evidence digest differs from pinned authority")
     return release, (release_run["id"], g8_run["id"])
 
 
@@ -431,12 +529,23 @@ def _publication_authority(
     return authority
 
 
-def _source(version: str, source_tag: str, commit: str, tree: str) -> dict[str, object]:
-    if source_tag != f"v{version}":
-        fail("Python version and immutable source tag differ")
-    if not _is_sha(commit, 40) or not _is_sha(tree, 40):
-        fail("source commit and tree must be full lowercase Git object IDs")
-    return {"tag": source_tag, "commit": commit, "tree": tree}
+def _canonical_source_tag(version: str) -> str:
+    return f"release-v{version}-crates"
+
+
+def _source(
+    version: str, source_tag: str, tag_object: str, commit: str, tree: str
+) -> dict[str, object]:
+    if source_tag != _canonical_source_tag(version):
+        fail("new Python receipts require the canonical release-vVERSION-crates tag")
+    if not all(_is_sha(value, 40) for value in (tag_object, commit, tree)):
+        fail("source tag object, commit, and tree must be full lowercase Git object IDs")
+    return {
+        "tag": source_tag,
+        "tag_object": tag_object,
+        "commit": commit,
+        "tree": tree,
+    }
 
 
 def _run(
@@ -541,6 +650,7 @@ def build_receipt(
     source_tag: str,
     source_commit: str,
     *,
+    source_tag_object: str,
     reproducible_directory: Path,
     independent_build_receipts: tuple[Path, ...],
     publication_authority: Path,
@@ -561,7 +671,9 @@ def build_receipt(
         fail("Python version must be strict semver")
     if repository not in REPOSITORIES:
         fail("unknown Python package repository")
-    source = _source(version, source_tag, source_commit, source_tree)
+    source = _source(
+        version, source_tag, source_tag_object, source_commit, source_tree
+    )
     run = _run(
         workflow_repository,
         workflow_ref,
@@ -667,12 +779,20 @@ def _validate_distribution(value: object, expected_filename: str) -> dict[str, o
 
 
 def _validate_source(value: object, version: str) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {"tag", "commit", "tree"}:
+    if not isinstance(value, dict):
         fail("Python distribution source binding is invalid")
-    if (
-        value.get("tag") != f"v{version}"
-        or not _is_sha(value.get("commit"), 40)
-        or not _is_sha(value.get("tree"), 40)
+    canonical = value.get("tag") == _canonical_source_tag(version)
+    historical = value.get("tag") == f"v{version}"
+    if canonical:
+        expected_keys = {"tag", "tag_object", "commit", "tree"}
+        object_keys = {"tag_object", "commit", "tree"}
+    elif historical:
+        expected_keys = {"tag", "commit", "tree"}
+        object_keys = {"commit", "tree"}
+    else:
+        fail("Python distribution source tag is not canonical or retained historical evidence")
+    if set(value) != expected_keys or not all(
+        _is_sha(value.get(key), 40) for key in object_keys
     ):
         fail("Python distribution source identity is invalid")
     return value
@@ -1358,6 +1478,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--publication-authority", type=Path, required=True)
     build.add_argument("--version", required=True)
     build.add_argument("--source-tag", required=True)
+    build.add_argument("--source-tag-object", required=True)
     build.add_argument("--source-commit", required=True)
     build.add_argument("--source-tree", required=True)
     build.add_argument("--workflow-repository", required=True)
@@ -1400,6 +1521,7 @@ def main() -> int:
             args.version,
             args.source_tag,
             args.source_commit,
+            source_tag_object=args.source_tag_object,
             reproducible_directory=args.reproducible_directory,
             independent_build_receipts=tuple(args.independent_build_receipt),
             publication_authority=args.publication_authority,

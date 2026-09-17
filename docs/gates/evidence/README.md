@@ -500,9 +500,9 @@ own commit as the evaluated source.
 ## Hosted release evidence
 
 The release workflow generates
-`hyphae-vVERSION.release-evidence.json` after the release commit is checked
-out and after the native archives, provenance predicates, and both SBOMs
-exist. The document conforms to
+`hyphae-release-vVERSION-crates.release-evidence.json` after the release commit
+is checked out and after the native archives, provenance predicates, and both
+SBOMs exist. The document conforms to
 [`packaging/release-evidence-v1.schema.json`](../../../packaging/release-evidence-v1.schema.json)
 and binds:
 
@@ -514,8 +514,8 @@ and binds:
   payload.
 
 For a tagged `push` or exact-tag recovery run, the primary payloads also include
-`hyphae-vVERSION.required-checks.json` with role `required-checks`. That report
-conforms structurally to
+`hyphae-release-vVERSION-crates.required-checks.json` with role
+`required-checks`. That report conforms structurally to
 [`packaging/required-checks-report-v1.schema.json`](../../../packaging/required-checks-report-v1.schema.json)
 and records exactly the 20 canonical required GitHub Actions checks. Nineteen
 records bind the reviewed PR head and the G8 closure record binds the tagged

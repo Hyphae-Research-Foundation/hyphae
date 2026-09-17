@@ -48,7 +48,7 @@
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "source": {
+    "historical_source": {
       "type": "object",
       "additionalProperties": false,
       "required": ["tag", "commit", "tree"],
@@ -57,6 +57,36 @@
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
       }
+    },
+    "canonical_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "tag_object", "commit", "tree"],
+      "properties": {
+        "tag": {"type": "string", "pattern": "^release-v[0-9]+\\.[0-9]+\\.[0-9]+-crates$"},
+        "tag_object": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "recovery_source": {
+      "allOf": [
+        {"$ref": "#/$defs/canonical_source"},
+        {
+          "properties": {
+            "tag": {"const": "release-v3.0.0-crates"},
+            "tag_object": {"const": "0bc6fe56498472804c3cc376b5b28d7652955701"},
+            "commit": {"const": "24bce1accdff8d14127797afe6f237a57c1cd4f3"},
+            "tree": {"const": "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff"}
+          }
+        }
+      ]
+    },
+    "source": {
+      "oneOf": [
+        {"$ref": "#/$defs/historical_source"},
+        {"$ref": "#/$defs/canonical_source"}
+      ]
     },
     "run": {
       "type": "object",
@@ -184,7 +214,7 @@
         "repository": {"const": "Hyphae-Research-Foundation/hyphae"}
       }
     },
-    "release_run": {
+    "normal_release_run": {
       "allOf": [
         {"$ref": "#/$defs/authority_run"},
         {
@@ -195,7 +225,28 @@
         }
       ]
     },
-    "g8_run": {
+    "recovery_release_run": {
+      "allOf": [
+        {"$ref": "#/$defs/authority_run"},
+        {
+          "properties": {
+            "id": {"const": 33838703304},
+            "attempt": {"const": 1},
+            "event": {"const": "workflow_dispatch"},
+            "head_branch": {"const": "main"},
+            "head_sha": {"const": "8a58749d892a52e38c651669ade03df5a6ee54af"},
+            "path": {"const": ".github/workflows/release.yml"}
+          }
+        }
+      ]
+    },
+    "release_run": {
+      "oneOf": [
+        {"$ref": "#/$defs/normal_release_run"},
+        {"$ref": "#/$defs/recovery_release_run"}
+      ]
+    },
+    "normal_g8_run": {
       "allOf": [
         {"$ref": "#/$defs/authority_run"},
         {
@@ -207,6 +258,27 @@
         }
       ]
     },
+    "recovery_g8_run": {
+      "allOf": [
+        {"$ref": "#/$defs/authority_run"},
+        {
+          "properties": {
+            "id": {"const": 33836655173},
+            "attempt": {"const": 1},
+            "event": {"const": "workflow_dispatch"},
+            "head_branch": {"const": "release/fix/release-readiness-semver-offline-merge-evidence"},
+            "head_sha": {"const": "24bce1accdff8d14127797afe6f237a57c1cd4f3"},
+            "path": {"const": ".github/workflows/native-g8-closure.yml"}
+          }
+        }
+      ]
+    },
+    "g8_run": {
+      "oneOf": [
+        {"$ref": "#/$defs/normal_g8_run"},
+        {"$ref": "#/$defs/recovery_g8_run"}
+      ]
+    },
     "file_digest": {
       "type": "object",
       "additionalProperties": false,
@@ -216,6 +288,21 @@
         "sha256": {"$ref": "#/$defs/sha256"}
       }
     },
+    "release_evidence_digest": {
+      "oneOf": [
+        {"$ref": "#/$defs/file_digest"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["filename", "ref", "sha256"],
+          "properties": {
+            "filename": {"type": "string", "minLength": 1},
+            "ref": {"type": "string", "pattern": "^refs/(?:heads|tags)/[^/].*$"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      ]
+    },
     "release_authority": {
       "type": "object",
       "additionalProperties": false,
@@ -223,7 +310,7 @@
       "properties": {
         "run": {"$ref": "#/$defs/release_run"},
         "artifact": {"$ref": "#/$defs/workflow_artifact"},
-        "release_evidence": {"$ref": "#/$defs/file_digest"},
+        "release_evidence": {"$ref": "#/$defs/release_evidence_digest"},
         "sboms": {
           "type": "object",
           "additionalProperties": false,
@@ -253,7 +340,39 @@
             }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "run": {"properties": {"event": {"const": "workflow_dispatch"}}}
+            }
+          },
+          "then": {
+            "properties": {
+              "release_evidence": {
+                "properties": {
+                  "ref": {"const": "refs/heads/main"},
+                  "sha256": {"const": "34c791a0cda982389cd55fb055376af20e174a7ef1921c4816d38ad6ec798c61"}
+                },
+                "required": ["ref"]
+              },
+              "sboms": {
+                "properties": {
+                  "spdx": {"properties": {"sha256": {"const": "c146fde572531fe665f8a2b1460035cb9deb251b95cb95ca65568865009ee209"}}},
+                  "cyclonedx": {"properties": {"sha256": {"const": "460093bcbe2943e4803e48225b624a41ff44599f98d028a39f2b23486fde472d"}}}
+                }
+              },
+              "g8_closure": {
+                "properties": {
+                  "run": {"$ref": "#/$defs/recovery_g8_run"},
+                  "aggregate": {"properties": {"sha256": {"const": "41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf"}}}
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "publication_authority": {
       "type": "object",
@@ -505,6 +624,43 @@
             "oneOf": [
               {"type": "null"},
               {"$ref": "#/$defs/pypi_registry_verification"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["publication_authority"],
+        "properties": {
+          "publication_authority": {
+            "required": ["release_authority"],
+            "properties": {
+              "release_authority": {
+                "type": "object",
+                "required": ["run"],
+                "properties": {
+                  "run": {
+                    "required": ["event"],
+                    "properties": {"event": {"const": "workflow_dispatch"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "version": {"const": "3.0.0"},
+          "source": {"$ref": "#/$defs/recovery_source"},
+          "publication_authority": {
+            "properties": {"source": {"$ref": "#/$defs/recovery_source"}}
+          },
+          "testpypi_authority": {
+            "allOf": [
+              {"$ref": "#/$defs/testpypi_authority"},
+              {"properties": {"source": {"$ref": "#/$defs/recovery_source"}}}
             ]
           }
         }
