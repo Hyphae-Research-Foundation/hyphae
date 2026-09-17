@@ -887,6 +887,18 @@ The typed product structure mutation additionally admits (minor 6):
 - `SetPop`: `SPOP` above with a mandatory `u64` seed; the result is the
   optional popped member (`Value`).
 
+At protocol minor 7, a direct nonempty mutation batch returns one ordered
+`(changed, result)` entry per input. If at least one mutation staged a physical
+write, the batch returns one commit receipt and one new CSN. If every mutation
+was rejected or otherwise staged no write, the batch returns `commit: None`,
+the read CSN against which it was evaluated, and no transaction, WAL, or
+durability identity. Such a no-op does not consume an idempotency token; a
+later retry re-evaluates the conditions against its then-current snapshot.
+Peers at minor 6 or earlier receive the historical commit-only response for a
+batch that changed state and a typed invalid-request response for an all-no-op
+batch. Empty input remains invalid, and the runtime continues to reject empty
+WAL transactions.
+
 The typed product structure read additionally admits (minor 6):
 
 - `StringRange`: `GETRANGE` above with signed inclusive positions; the

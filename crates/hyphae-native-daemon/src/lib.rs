@@ -1297,7 +1297,11 @@ async fn connection_loop(
                 context.idempotency_token = request.idempotency_token;
                 context.limits = request.limits;
                 context.durability = request.durability;
-                let pending = match client.submit_async(context, request.operation) {
+                let pending = match client.submit_async_for_protocol_minor(
+                    context,
+                    request.operation,
+                    welcome.minor,
+                ) {
                     Ok(pending) => pending,
                     Err(error) => {
                         send_terminal_product_error(

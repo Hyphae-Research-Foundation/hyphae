@@ -322,7 +322,10 @@ impl HyphaeClient {
             .await
     }
 
-    /// Applies a nonempty atomic mutation batch across all structure families.
+    /// Evaluates a nonempty atomic mutation batch across all structure families.
+    ///
+    /// Current-minor responses include one ordered result per mutation and
+    /// omit commit evidence when every mutation is a logical no-op.
     pub async fn structure_mutate(
         &self,
         mutations: Vec<ProductStructureMutation>,

@@ -50,17 +50,18 @@ use crate::{
     ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
     ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
     ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureRead, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductTransactionHandle, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionStageReceipt, ProductTransactionStageResult,
-    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
-    ProgressControl, QualifiedName, RestoreRequest, RoleAssignmentMutationReceipt,
-    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditPage,
-    SecurityAuditReadRequest, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
-    SecurityPrincipalListRequest, SecurityPrincipalMutationReceipt, SecurityPrincipalPage,
-    SecurityRoleListRequest, SecurityRolePage, SnapshotIdentity, StatusRequest, TelemetryEvent,
-    TelemetryEventKind, TelemetryRegistry, TimingClass,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationBatchReceipt,
+    ProductStructureMutationOutcome, ProductStructureMutationResult, ProductStructureRead,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
+    ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
+    ProductTransactionVectorMutation, ProductTtl, ProductValue, ProgressControl, QualifiedName,
+    RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
+    SecurityAssignmentPage, SecurityAuditPage, SecurityAuditReadRequest, SecurityId,
+    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest,
+    SecurityPrincipalMutationReceipt, SecurityPrincipalPage, SecurityRoleListRequest,
+    SecurityRolePage, SnapshotIdentity, StatusRequest, TelemetryEvent, TelemetryEventKind,
+    TelemetryRegistry, TimingClass,
 };
 
 /// Product-owned durability policy applied to every mutation in one request.
@@ -312,9 +313,9 @@ pub enum ProductOperation {
         /// Exact binary scalar key.
         key: Vec<u8>,
     },
-    /// Atomically applies a nonempty batch across native structure families.
+    /// Atomically evaluates a nonempty batch across native structure families.
     StructureMutate {
-        /// Ordered mutations committed under one CSN.
+        /// Ordered mutations committed under one CSN when any mutation changes state.
         mutations: Vec<ProductStructureMutation>,
     },
     /// Reads one non-scalar structure family at an immutable snapshot.
@@ -666,6 +667,8 @@ pub enum ProductResponse {
     StructureTtl(ProductTtl),
     /// Atomic non-scalar structure mutation outcome.
     StructureMutated(ProductCommitOutcome),
+    /// Detailed current-minor structure batch outcome.
+    StructureMutationBatch(ProductStructureMutationBatchReceipt),
     /// Snapshot-bound non-scalar structure read.
     StructureRead(ProductStructureRead),
     /// Explicit transaction began or its current status was requested.
@@ -772,7 +775,7 @@ impl NativeProduct {
         context: &ProductRequestContext,
         operation: ProductOperation,
     ) -> Result<ProductResponse, ProductError> {
-        dispatch(self, session, context, operation)
+        dispatch(self, session, context, operation, None)
     }
 }
 
@@ -781,6 +784,7 @@ pub(crate) fn dispatch(
     session: &mut ProductSession,
     context: &ProductRequestContext,
     operation: ProductOperation,
+    response_protocol_minor: Option<u16>,
 ) -> Result<ProductResponse, ProductError> {
     let telemetry = product.telemetry.clone();
     let rollback_on_authority_loss = session.is_managed()
@@ -798,7 +802,13 @@ pub(crate) fn dispatch(
     let sql_binding_key = request_sql_binding_key(context, &operation);
     let result = admitted.and_then(|()| {
         let execution_started = Instant::now();
-        let result = dispatch_inner(product, session, context, operation);
+        let result = dispatch_inner(
+            product,
+            session,
+            context,
+            operation,
+            response_protocol_minor,
+        );
         telemetry.record_timing(TimingClass::EngineExecution, execution_started.elapsed());
         result
     });
@@ -915,6 +925,7 @@ fn dispatch_inner(
     session: &mut ProductSession,
     context: &ProductRequestContext,
     operation: ProductOperation,
+    response_protocol_minor: Option<u16>,
 ) -> Result<ProductResponse, ProductError> {
     let read_only = !operation.is_mutating();
     let key_self_manage = operation.is_self_key_lifecycle();
@@ -1090,13 +1101,73 @@ fn dispatch_inner(
                 context.logical_time_micros,
                 context.durability.durability.into(),
             )?;
+            let read_csn = transaction.read_csn().map(hyphae_native_types::Csn::get);
+            let mut results = Vec::with_capacity(mutations.len());
             for mutation in mutations {
-                let _result = apply_structure_mutation(&mut transaction, mutation)?;
+                let before = transaction.mutation_count();
+                let result = apply_structure_mutation(&mut transaction, mutation)?;
+                results.push(ProductStructureMutationOutcome {
+                    changed: transaction.mutation_count() > before,
+                    result,
+                });
             }
             context.checkpoint()?;
+            let changed = transaction.mutation_count() != 0;
+            let detailed_response = response_protocol_minor.is_none_or(|minor| minor >= 7);
+            if !changed {
+                transaction.rollback();
+                if let Some(token) = context.idempotency_token {
+                    let principal = context.principal.identity();
+                    if product
+                        .database
+                        .transaction_resolution_for_token(
+                            principal_hash(principal),
+                            supplied_idempotency_token(principal, token),
+                        )
+                        .is_some()
+                    {
+                        return Err(ProductError::from_code(
+                            ProductErrorCode::IdempotencyConflict,
+                        ));
+                    }
+                }
+                if !detailed_response {
+                    return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+                }
+                let response_bytes = structure_mutation_batch_response_bytes(&results, false);
+                context
+                    .limits
+                    .admit_response(results.len(), response_bytes, response_bytes)?;
+                return Ok(ProductResponse::StructureMutationBatch(
+                    ProductStructureMutationBatchReceipt {
+                        read_csn,
+                        commit: None,
+                        results,
+                    },
+                ));
+            }
+            let (response_count, response_bytes) = if detailed_response {
+                (
+                    results.len(),
+                    structure_mutation_batch_response_bytes(&results, true),
+                )
+            } else {
+                (1, LEGACY_STRUCTURE_MUTATION_RESPONSE_BYTES)
+            };
+            context
+                .limits
+                .admit_response(response_count, response_bytes, response_bytes)?;
             let telemetry = product.telemetry.clone();
             let receipt = commit(&telemetry, transaction, session, context)?;
-            ProductResponse::StructureMutated(ProductCommitOutcome::Committed(receipt))
+            if detailed_response {
+                ProductResponse::StructureMutationBatch(ProductStructureMutationBatchReceipt {
+                    read_csn,
+                    commit: Some(receipt),
+                    results,
+                })
+            } else {
+                ProductResponse::StructureMutated(ProductCommitOutcome::Committed(receipt))
+            }
         }
         ProductOperation::StructureRead(request) => {
             let snapshot = product.snapshot_bounded(context.logical_time_micros)?;
@@ -3600,6 +3671,27 @@ fn structure_mutation_result_wire_bytes(result: &ProductStructureMutationResult)
     }
 }
 
+fn structure_mutation_batch_response_bytes(
+    results: &[ProductStructureMutationOutcome],
+    has_commit: bool,
+) -> usize {
+    // Envelope, read CSN, commit flag/reserved bytes, count/reserved bytes.
+    let header = 16_usize
+        .saturating_add(8)
+        .saturating_add(8)
+        .saturating_add(8);
+    let results = results.iter().fold(0_usize, |total, outcome| {
+        total
+            .saturating_add(1)
+            .saturating_add(structure_mutation_result_wire_bytes(&outcome.result))
+    });
+    header
+        .saturating_add(results)
+        .saturating_add(if has_commit { 96 } else { 0 })
+}
+
+const LEGACY_STRUCTURE_MUTATION_RESPONSE_BYTES: usize = 16 + 8 + 96;
+
 fn sql_result_wire_bytes(result: &ProductSqlResult) -> usize {
     match result {
         ProductSqlResult::Command { object_id, .. } => {
@@ -4444,7 +4536,6 @@ impl ProductOperation {
             Self::CatalogCreate { .. }
             | Self::PrepareSql { .. }
             | Self::StructureSet { .. }
-            | Self::StructureMutate { .. }
             | Self::TransactionBegin
             | Self::TransactionCommit { .. }
             | Self::TransactionRollback { .. }
@@ -4566,6 +4657,10 @@ impl ProductResponse {
             | Self::SecurityMutated(_)
             | Self::SecurityApiKeyStarted(_)
             | Self::SecurityApiKeyActivated(_) => (1, 256),
+            Self::StructureMutationBatch(receipt) => (
+                receipt.results.len(),
+                structure_mutation_batch_response_bytes(&receipt.results, receipt.commit.is_some()),
+            ),
             Self::TransactionStaged(receipt) => (1, transaction_stage_response_bytes(receipt)),
             Self::Explain(explanation) => (1, format!("{explanation:?}").len()),
             Self::Sql { result, .. } => sql_result_cost(result),

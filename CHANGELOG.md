@@ -21,6 +21,12 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Extend Rust, Python (sync/async), and TypeScript clients with memory operations
   and common wire fixtures. Preserve the existing protocol/proof versions for
   older operations. Fix the explicit cross-SDK SQL limit fixture.
+- Return ordered mutation outcomes for direct structure batches at protocol
+  minor 7. An all-rejected conditional batch is now an explicit no-op with no
+  fabricated CSN or durability receipt instead of a `corruption` error.
+- Bound Native protocol collection and vector allocations before reservation
+  using domain limits, remaining wire bytes, checked arithmetic, and fallible
+  allocation.
 - Update reviewed Rust dependencies, including the futures memory-safety and
   waker fixes, and keep auxiliary conformance lockfiles synchronized.
 - Refresh the pinned Codex 0.153.2 and Claude Code 2.1.260 MCP hosts, executable

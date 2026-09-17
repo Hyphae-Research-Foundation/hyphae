@@ -23,6 +23,7 @@ MAX_SECURITY_LIST_ROWS = 1_000
 MAX_SECURITY_GRANTS = 256
 MAX_SECURITY_ASSIGNMENTS = 128
 MAX_CATALOG_VISIBLE_ITEMS = 4_096
+MAX_TRANSACTION_OPERATIONS = 1_024
 FRAME_KINDS = {
     "hello": 1,
     "welcome": 2,
@@ -469,7 +470,7 @@ def operation_required_minor(
 
 
 def response_required_minor(kind: int) -> int:
-    if kind == 45:
+    if kind in {45, 46}:
         return 7
     if kind in SECURITY_WRITE_RESPONSE_KINDS:
         return 2
@@ -1640,6 +1641,27 @@ def decode_product_response(
         value = _decode_commit_outcome(reader)
         reader.finish()
         return Response("structure_mutated", value, request_id)
+    if kind == 46:
+        read_csn = reader.u64() or None
+        has_commit = reader.boolean()
+        reader.zeroes(7)
+        count = reader.u32()
+        if not 1 <= count <= MAX_TRANSACTION_OPERATIONS or count * 2 > reader.remaining:
+            raise ClientError("structure mutation result count exceeds its bound")
+        reader.zeroes(4)
+        results = [
+            {"changed": reader.boolean(), "result": _decode_structure_mutation_result(reader)}
+            for _ in range(count)
+        ]
+        commit = _decode_commit_receipt(reader) if has_commit else None
+        if has_commit != any(result["changed"] for result in results):
+            raise ClientError("structure mutation batch commit evidence is inconsistent")
+        reader.finish()
+        return Response(
+            "structure_mutation_batch",
+            {"read_csn": read_csn, "commit": commit, "results": results},
+            request_id,
+        )
     if kind == 24:
         value = {"snapshot": _decode_snapshot(reader), "result": _decode_structure_read(reader)}
         reader.finish()
@@ -2934,6 +2956,17 @@ def _decode_structure_mutation_result(reader: _Reader) -> dict[str, Any]:
         return {"kind": "value", "value": reader.bytes() if reader.boolean() else None}
     if tag == 5:
         return {"kind": "stream_id", "value": reader.u64()}
+    if tag == 6:
+        return {"kind": "score", "value": reader.f64()}
+    if tag == 7:
+        return {
+            "kind": "popped_entry",
+            "entry": (
+                {"member": reader.bytes(), "score": reader.f64()}
+                if reader.boolean()
+                else None
+            ),
+        }
     raise ClientError("structure mutation result is malformed")
 
 

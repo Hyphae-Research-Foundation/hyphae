@@ -32,7 +32,8 @@ use hyphae_native_product::{
     ProductSearchRequest, ProductSearchResult, ProductSearchResults, ProductSearchSort,
     ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSortedSetEntry,
     ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
-    ProductStructureMutation, ProductStructureMutationResult, ProductStructureReadRequest,
+    ProductStructureMutation, ProductStructureMutationBatchReceipt,
+    ProductStructureMutationOutcome, ProductStructureMutationResult, ProductStructureReadRequest,
     ProductStructureReadResult, ProductTransactionHandle, ProductTransactionId,
     ProductTransactionSearchMutation, ProductTransactionSqlMutation,
     ProductTransactionStageReceipt, ProductTransactionStageResult, ProductTransactionStatus,
@@ -176,6 +177,7 @@ const RESPONSE_CATALOG_VISIBLE_PAGE: u16 = 42;
 const RESPONSE_SECURITY_API_KEY_STARTED: u16 = 43;
 const RESPONSE_SECURITY_API_KEY_ACTIVATED: u16 = 44;
 const RESPONSE_MEMORY_RECALL: u16 = 45;
+const RESPONSE_STRUCTURE_MUTATION_BATCH: u16 = 46;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -593,6 +595,11 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             encode_commit_outcome(&mut body, *value)?;
             (RESPONSE_STRUCTURE_MUTATED, body)
         }
+        ProductResponse::StructureMutationBatch(value) => {
+            let mut body = Vec::new();
+            encode_structure_mutation_batch(&mut body, value)?;
+            (RESPONSE_STRUCTURE_MUTATION_BATCH, body)
+        }
         ProductResponse::StructureRead(value) => {
             let mut body = Vec::new();
             encode_snapshot(&mut body, value.snapshot);
@@ -719,6 +726,18 @@ pub fn encode_product_response_for_minor(
     response: &ProductResponse,
     negotiated_minor: u16,
 ) -> Result<Vec<u8>, ProductCodecError> {
+    if let ProductResponse::StructureMutationBatch(receipt) = response {
+        validate_structure_mutation_batch(receipt)?;
+        if negotiated_minor < 7 {
+            return receipt
+                .commit
+                .map_or(Err(ProductCodecError::Unsupported), |commit| {
+                    encode_product_response(&ProductResponse::StructureMutated(
+                        ProductCommitOutcome::Committed(commit),
+                    ))
+                });
+        }
+    }
     ensure_response_minor(response, negotiated_minor)?;
     encode_product_response(response)
 }
@@ -835,7 +854,8 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
             let token_visits = decoder.usize()?;
             let token_comparisons = decoder.usize()?;
             let fuzzy_steps = decoder.usize()?;
-            let mut hits = Vec::with_capacity(count.min(4096));
+            let mut hits =
+                decoder.reserve_vec(count, hyphae_native_product::MAX_PRODUCT_CONTEXT_COUNT, 12)?;
             for _ in 0..count {
                 hits.push(ProductSearchHit {
                     document_id: decoder.owned_bytes()?,
@@ -928,6 +948,9 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
         RESPONSE_STRUCTURE_MUTATED => {
             ProductResponse::StructureMutated(decode_commit_outcome(&mut decoder)?)
         }
+        RESPONSE_STRUCTURE_MUTATION_BATCH => {
+            ProductResponse::StructureMutationBatch(decode_structure_mutation_batch(&mut decoder)?)
+        }
         RESPONSE_STRUCTURE_READ => ProductResponse::StructureRead(ProductRead {
             snapshot: decode_snapshot(&mut decoder)?,
             value: decode_structure_read_result(&mut decoder)?,
@@ -944,7 +967,7 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
             doctor: decode_doctor_report(&mut decoder)?,
             phases: {
                 let count = decoder.usize_u32()?;
-                let mut phases = Vec::with_capacity(count);
+                let mut phases = decoder.reserve_vec(count, 6, 1)?;
                 for _ in 0..count {
                     phases.push(decode_restore_phase(decoder.u8()?)?);
                 }
@@ -1308,7 +1331,7 @@ fn ensure_response_minor(
         ProductResponse::Proven { response, .. } => {
             return ensure_response_minor(response, negotiated_minor);
         }
-        ProductResponse::MemoryRecall(_) => 7,
+        ProductResponse::MemoryRecall(_) | ProductResponse::StructureMutationBatch(_) => 7,
         ProductResponse::ProofVerification(report)
             if report.kind == hyphae_native_product::proof::NativeProofKind::Memory =>
         {
@@ -2148,10 +2171,14 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
         },
         REQUEST_STRUCTURE_MUTATE => {
             let count = decoder.usize_u32()?;
-            if count == 0 || count > 4096 {
+            if count == 0 || count > hyphae_native_product::MAX_PRODUCT_TRANSACTION_OPERATIONS {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut mutations = Vec::with_capacity(count);
+            let mut mutations = decoder.reserve_vec(
+                count,
+                hyphae_native_product::MAX_PRODUCT_TRANSACTION_OPERATIONS,
+                1,
+            )?;
             for _ in 0..count {
                 mutations.push(decode_structure_mutation(&mut decoder)?);
             }
@@ -2709,7 +2736,7 @@ fn decode_security_principal_page(
 ) -> Result<SecurityPrincipalPage, ProductCodecError> {
     let (authorization_epoch, item_count, next_cursor) =
         decode_security_page_header(decoder, SecurityCursorFamily::Principal)?;
-    let mut items = Vec::with_capacity(item_count);
+    let mut items = decoder.reserve_vec(item_count, MAX_SECURITY_LIST_ROWS, 28)?;
     for _ in 0..item_count {
         let id = decode_security_id(decoder.array()?)?;
         let enabled = decoder.boolean()?;
@@ -2764,7 +2791,7 @@ fn decode_security_role_page(
 ) -> Result<SecurityRolePage, ProductCodecError> {
     let (authorization_epoch, item_count, next_cursor) =
         decode_security_page_header(decoder, SecurityCursorFamily::Role)?;
-    let mut items = Vec::with_capacity(item_count);
+    let mut items = decoder.reserve_vec(item_count, MAX_SECURITY_LIST_ROWS, 8)?;
     for _ in 0..item_count {
         items.push(match decoder.u8()? {
             0 => {
@@ -2820,7 +2847,7 @@ fn decode_custom_role_grants(
     {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut grants = Vec::with_capacity(count);
+    let mut grants = decoder.reserve_vec(count, AccessControlLimits::V1.grants_per_role, 32)?;
     for _ in 0..count {
         let permission =
             ProductPermission::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?;
@@ -2877,7 +2904,7 @@ fn decode_security_assignment_page(
 ) -> Result<SecurityAssignmentPage, ProductCodecError> {
     let (authorization_epoch, item_count, next_cursor) =
         decode_security_page_header(decoder, SecurityCursorFamily::Assignment)?;
-    let mut items = Vec::with_capacity(item_count);
+    let mut items = decoder.reserve_vec(item_count, MAX_SECURITY_LIST_ROWS, 56)?;
     for _ in 0..item_count {
         let id = decode_security_id(decoder.array()?)?;
         let principal_id = decode_security_id(decoder.array()?)?;
@@ -2931,7 +2958,7 @@ fn decode_security_key_page(
 ) -> Result<SecurityKeyPage, ProductCodecError> {
     let (authorization_epoch, item_count, next_cursor) =
         decode_security_page_header(decoder, SecurityCursorFamily::Key)?;
-    let mut items = Vec::with_capacity(item_count);
+    let mut items = decoder.reserve_vec(item_count, MAX_SECURITY_LIST_ROWS, 1)?;
     for _ in 0..item_count {
         items.push(decode_security_key_summary(decoder)?);
     }
@@ -3023,7 +3050,7 @@ fn decode_built_in_roles(decoder: &mut Decoder<'_>) -> Result<Vec<BuiltInRole>, 
     if count > 7 || decoder.bytes(4)? != [0; 4] {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut roles = Vec::with_capacity(count);
+    let mut roles = decoder.reserve_vec(count, 7, 1)?;
     for _ in 0..count {
         roles.push(BuiltInRole::from_tag(decoder.u8()?).ok_or(ProductCodecError::InvalidValue)?);
     }
@@ -3047,7 +3074,8 @@ fn decode_security_ids(decoder: &mut Decoder<'_>) -> Result<Vec<SecurityId>, Pro
     if count > AccessControlLimits::V1.assignments_per_principal || decoder.bytes(4)? != [0; 4] {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut ids = Vec::with_capacity(count);
+    let mut ids =
+        decoder.reserve_vec(count, AccessControlLimits::V1.assignments_per_principal, 16)?;
     for _ in 0..count {
         ids.push(decode_security_id(decoder.array()?)?);
     }
@@ -3079,7 +3107,8 @@ fn decode_product_scopes(
     {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut scopes = Vec::with_capacity(count);
+    let mut scopes =
+        decoder.reserve_vec(count, AccessControlLimits::V1.assignments_per_principal, 24)?;
     for _ in 0..count {
         scopes.push(decode_product_scope(decoder)?);
     }
@@ -3144,7 +3173,7 @@ fn decode_security_audit_page(
         return Err(ProductCodecError::LimitExceeded);
     }
     let next_cursor = decode_optional_security_id(decoder)?;
-    let mut events = Vec::with_capacity(count);
+    let mut events = decoder.reserve_vec(count, AccessControlLimits::V1.audit_result_rows, 104)?;
     for _ in 0..count {
         events.push(decode_security_audit_event(decoder)?);
     }
@@ -3259,7 +3288,8 @@ fn decode_security_audit_targets(
     {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut targets = Vec::with_capacity(count);
+    let mut targets =
+        decoder.reserve_vec(count, AccessControlLimits::V1.assignments_per_principal, 24)?;
     for _ in 0..count {
         let kind = decoder.u8()?;
         if decoder.bytes(7)? != [0; 7] {
@@ -3306,7 +3336,8 @@ fn decode_security_audit_metadata(
     if count > AccessControlLimits::V1.assignments_per_principal || decoder.bytes(4)? != [0; 4] {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut metadata = Vec::with_capacity(count);
+    let mut metadata =
+        decoder.reserve_vec(count, AccessControlLimits::V1.assignments_per_principal, 16)?;
     for _ in 0..count {
         let kind = decoder.u8()?;
         if decoder.bytes(7)? != [0; 7] {
@@ -3480,7 +3511,7 @@ fn decode_values(decoder: &mut Decoder<'_>) -> Result<Vec<ProductValue>, Product
     if count > 4096 {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut values = Vec::with_capacity(count);
+    let mut values = decoder.reserve_vec(count, 4096, 1)?;
     for _ in 0..count {
         values.push(decode_value(decoder, 0)?);
     }
@@ -3623,7 +3654,7 @@ fn decode_value(
             if count > 4096 {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut entries = Vec::with_capacity(count);
+            let mut entries = decoder.reserve_vec(count, 4096, 2)?;
             for _ in 0..count {
                 entries.push((
                     decode_value(decoder, depth + 1)?,
@@ -3637,7 +3668,7 @@ fn decode_value(
             if count > 4096 {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut values = Vec::with_capacity(count);
+            let mut values = decoder.reserve_vec(count, 4096, 4)?;
             for _ in 0..count {
                 values.push(hyphae_native_product::CanonicalF32::new(f32::from_bits(
                     decoder.u32()?,
@@ -3890,10 +3921,11 @@ fn decode_structure_mutation(
         16 => {
             let key = decode_structure_key(decoder)?;
             let count = decoder.usize_u32()?;
-            if count == 0 || count > 4096 {
+            if count == 0 || count > hyphae_native_product::MAX_PRODUCT_STREAM_FIELDS {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut fields = Vec::with_capacity(count);
+            let mut fields =
+                decoder.reserve_vec(count, hyphae_native_product::MAX_PRODUCT_STREAM_FIELDS, 8)?;
             for _ in 0..count {
                 fields.push(ProductHashEntry {
                     field: decoder.owned_bytes()?,
@@ -4142,7 +4174,7 @@ fn decode_transaction_vector_mutation(
     match tag {
         0 => {
             let dimension = decoder.usize_u32()?;
-            let mut values = Vec::with_capacity(dimension);
+            let mut values = decoder.reserve_vec(dimension, usize::from(u16::MAX), 4)?;
             for _ in 0..dimension {
                 values.push(f32::from_bits(decoder.u32()?));
             }
@@ -4560,7 +4592,8 @@ fn decode_structure_read_request(
                 _ => return Err(ProductCodecError::InvalidValue),
             };
             let count = decoder.usize_u32()?;
-            let mut keys = Vec::with_capacity(count);
+            let mut keys =
+                decoder.reserve_vec(count, hyphae_native_runtime::MAX_SET_ALGEBRA_KEYS, 4)?;
             for _ in 0..count {
                 keys.push(decoder.owned_bytes()?);
             }
@@ -4857,6 +4890,7 @@ fn encode_structure_read_result(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_structure_read_result(
     decoder: &mut Decoder<'_>,
 ) -> Result<ProductStructureReadResult, ProductCodecError> {
@@ -4871,7 +4905,7 @@ fn decode_structure_read_result(
         3 => ProductStructureReadResult::Ttl(decode_product_ttl(decoder)?),
         4 => {
             let count = decoder.usize_u32()?;
-            let mut entries = Vec::with_capacity(count);
+            let mut entries = decoder.reserve_vec(count, MAX_PRODUCT_WIRE_BYTES / 8, 8)?;
             for _ in 0..count {
                 entries.push(ProductHashEntry {
                     field: decoder.owned_bytes()?,
@@ -4900,7 +4934,7 @@ fn decode_structure_read_result(
         }),
         10 => {
             let count = decoder.usize_u32()?;
-            let mut entries = Vec::with_capacity(count);
+            let mut entries = decoder.reserve_vec(count, MAX_PRODUCT_WIRE_BYTES / 12, 12)?;
             for _ in 0..count {
                 entries.push(ProductSortedSetEntry {
                     member: decoder.owned_bytes()?,
@@ -4911,11 +4945,16 @@ fn decode_structure_read_result(
         }
         11 => {
             let count = decoder.usize_u32()?;
-            let mut entries = Vec::with_capacity(count);
+            let mut entries =
+                decoder.reserve_vec(count, hyphae_native_product::MAX_PRODUCT_CONTEXT_COUNT, 12)?;
             for _ in 0..count {
                 let id = decoder.u64()?;
                 let field_count = decoder.usize_u32()?;
-                let mut fields = Vec::with_capacity(field_count);
+                let mut fields = decoder.reserve_vec(
+                    field_count,
+                    hyphae_native_product::MAX_PRODUCT_STREAM_FIELDS,
+                    8,
+                )?;
                 for _ in 0..field_count {
                     fields.push(ProductHashEntry {
                         field: decoder.owned_bytes()?,
@@ -4928,7 +4967,8 @@ fn decode_structure_read_result(
         }
         12 => {
             let count = decoder.usize_u32()?;
-            let mut entries = Vec::with_capacity(count);
+            let mut entries =
+                decoder.reserve_vec(count, hyphae_native_product::MAX_PRODUCT_CONTEXT_COUNT, 8)?;
             for _ in 0..count {
                 entries.push(ProductHashEntry {
                     field: decoder.owned_bytes()?,
@@ -4964,7 +5004,8 @@ fn decode_key_page(
     decoder: &mut Decoder<'_>,
 ) -> Result<ProductStructureReadResult, ProductCodecError> {
     let count = decoder.usize_u32()?;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries =
+        decoder.reserve_vec(count, hyphae_native_product::MAX_PRODUCT_CONTEXT_COUNT, 5)?;
     for _ in 0..count {
         entries.push(hyphae_native_product::ProductKeyEntry {
             key: decoder.owned_bytes()?,
@@ -5167,6 +5208,77 @@ fn decode_transaction_stage_receipt(
     })
 }
 
+fn validate_structure_mutation_batch(
+    value: &ProductStructureMutationBatchReceipt,
+) -> Result<(), ProductCodecError> {
+    if value.results.is_empty()
+        || value.results.len() > hyphae_native_product::MAX_PRODUCT_TRANSACTION_OPERATIONS
+        || value.read_csn == Some(0)
+        || value.commit.is_some() != value.results.iter().any(|outcome| outcome.changed)
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn encode_structure_mutation_batch(
+    encoded: &mut Vec<u8>,
+    value: &ProductStructureMutationBatchReceipt,
+) -> Result<(), ProductCodecError> {
+    validate_structure_mutation_batch(value)?;
+    encoded.extend_from_slice(&value.read_csn.unwrap_or(0).to_le_bytes());
+    encoded.push(u8::from(value.commit.is_some()));
+    encoded.extend_from_slice(&[0; 7]);
+    put_u32(encoded, value.results.len())?;
+    encoded.extend_from_slice(&[0; 4]);
+    for outcome in &value.results {
+        encoded.push(u8::from(outcome.changed));
+        encode_structure_mutation_result(encoded, &outcome.result)?;
+    }
+    if let Some(commit) = value.commit {
+        encode_receipt(encoded, commit)?;
+    }
+    Ok(())
+}
+
+fn decode_structure_mutation_batch(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductStructureMutationBatchReceipt, ProductCodecError> {
+    let read_csn = decoder.u64()?;
+    let has_commit = decoder.boolean()?;
+    if decoder.bytes(7)? != [0; 7] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let count = decoder.usize_u32()?;
+    if count == 0 {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    if count > hyphae_native_product::MAX_PRODUCT_TRANSACTION_OPERATIONS {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    if decoder.bytes(4)? != [0; 4] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let mut results = decoder.reserve_vec(
+        count,
+        hyphae_native_product::MAX_PRODUCT_TRANSACTION_OPERATIONS,
+        2,
+    )?;
+    for _ in 0..count {
+        results.push(ProductStructureMutationOutcome {
+            changed: decoder.boolean()?,
+            result: decode_structure_mutation_result(decoder)?,
+        });
+    }
+    let value = ProductStructureMutationBatchReceipt {
+        read_csn: (read_csn != 0).then_some(read_csn),
+        commit: has_commit.then(|| decode_receipt(decoder)).transpose()?,
+        results,
+    };
+    validate_structure_mutation_batch(&value)?;
+    Ok(value)
+}
+
 fn encode_structure_mutation_result(
     encoded: &mut Vec<u8>,
     value: &ProductStructureMutationResult,
@@ -5258,7 +5370,7 @@ fn put_byte_values(encoded: &mut Vec<u8>, values: &[Vec<u8>]) -> Result<(), Prod
 
 fn read_byte_values(decoder: &mut Decoder<'_>) -> Result<Vec<Vec<u8>>, ProductCodecError> {
     let count = decoder.usize_u32()?;
-    let mut values = Vec::with_capacity(count);
+    let mut values = decoder.reserve_vec(count, MAX_PRODUCT_WIRE_BYTES / 4, 4)?;
     for _ in 0..count {
         values.push(decoder.owned_bytes()?);
     }
@@ -5331,13 +5443,13 @@ fn decode_sql_result(decoder: &mut Decoder<'_>) -> Result<ProductSqlResult, Prod
             if column_count > 4096 || row_count > 4096 {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut columns = Vec::with_capacity(column_count);
+            let mut columns = decoder.reserve_vec(column_count, 4096, 4)?;
             for _ in 0..column_count {
                 columns.push(decoder.text()?);
             }
-            let mut rows = Vec::with_capacity(row_count);
+            let mut rows = decoder.reserve_vec(row_count, 4096, column_count)?;
             for _ in 0..row_count {
-                let mut row = Vec::with_capacity(column_count);
+                let mut row = decoder.reserve_vec(column_count, 4096, 1)?;
                 for _ in 0..column_count {
                     row.push(decode_value(decoder, 0)?);
                 }
@@ -5419,7 +5531,7 @@ fn decode_query(
                 return Err(ProductCodecError::LimitExceeded);
             }
             let mut read = |count| -> Result<Vec<BoundedSearchQuery>, ProductCodecError> {
-                let mut values = Vec::with_capacity(count);
+                let mut values = decoder.reserve_vec(count, 4096, 1)?;
                 for _ in 0..count {
                     values.push(decode_query(decoder, depth + 1)?);
                 }
@@ -5460,7 +5572,8 @@ fn decode_memory_request(
     if !(1..=hyphae_native_product::MAX_MEMORY_COLLECTIONS).contains(&count) {
         return Err(ProductCodecError::InvalidValue);
     }
-    let mut collections = Vec::with_capacity(count);
+    let mut collections =
+        decoder.reserve_vec(count, hyphae_native_product::MAX_MEMORY_COLLECTIONS, 16)?;
     for _ in 0..count {
         collections
             .push(ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?);
@@ -5517,7 +5630,8 @@ fn decode_memory_result(
     if !(1..=hyphae_native_product::MAX_MEMORY_COLLECTIONS).contains(&count) {
         return Err(ProductCodecError::InvalidValue);
     }
-    let mut searches = Vec::with_capacity(count);
+    let mut searches =
+        decoder.reserve_vec(count, hyphae_native_product::MAX_MEMORY_COLLECTIONS, 20)?;
     for _ in 0..count {
         let collection =
             ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
@@ -5531,7 +5645,7 @@ fn decode_memory_result(
     if count > hyphae_native_product::MAX_MEMORY_RESULTS {
         return Err(ProductCodecError::InvalidValue);
     }
-    let mut memories = Vec::with_capacity(count);
+    let mut memories = decoder.reserve_vec(count, hyphae_native_product::MAX_MEMORY_RESULTS, 36)?;
     for _ in 0..count {
         let collection =
             ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
@@ -5795,11 +5909,15 @@ fn decode_search_collection(
     if vector_count > hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut vectors = Vec::with_capacity(vector_count);
+    let mut vectors = decoder.reserve_vec(
+        vector_count,
+        hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
+        28,
+    )?;
     for _ in 0..vector_count {
         let target = decoder.text()?;
         let dimension = decoder.usize_u32()?;
-        let mut values = Vec::with_capacity(dimension);
+        let mut values = decoder.reserve_vec(dimension, usize::from(u16::MAX), 4)?;
         for _ in 0..dimension {
             values.push(f32::from_bits(decoder.u32()?));
         }
@@ -5858,7 +5976,8 @@ fn decode_search_collection(
     if sort_count > hyphae_native_runtime::MAX_DOC_VALUE_SORTS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut sort = Vec::with_capacity(sort_count);
+    let mut sort =
+        decoder.reserve_vec(sort_count, hyphae_native_runtime::MAX_DOC_VALUE_SORTS, 3)?;
     for _ in 0..sort_count {
         let source = match decoder.u8()? {
             0 => ProductSortSource::Score,
@@ -5885,7 +6004,8 @@ fn decode_search_collection(
     if facet_count > hyphae_native_runtime::MAX_DOC_VALUE_FACETS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut facets = Vec::with_capacity(facet_count);
+    let mut facets =
+        decoder.reserve_vec(facet_count, hyphae_native_runtime::MAX_DOC_VALUE_FACETS, 12)?;
     for _ in 0..facet_count {
         facets.push(hyphae_native_product::ProductFacetRequest {
             field: decoder.text()?,
@@ -5896,7 +6016,11 @@ fn decode_search_collection(
     if aggregation_count > hyphae_native_runtime::MAX_DOC_VALUE_AGGREGATIONS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut aggregations = Vec::with_capacity(aggregation_count);
+    let mut aggregations = decoder.reserve_vec(
+        aggregation_count,
+        hyphae_native_runtime::MAX_DOC_VALUE_AGGREGATIONS,
+        5,
+    )?;
     for _ in 0..aggregation_count {
         let name = decoder.text()?;
         let aggregation = match decoder.u8()? {
@@ -5951,7 +6075,8 @@ fn decode_search_collection(
                 if !(1..=hyphae_native_product::MAX_RERANK_ENTRIES).contains(&count) {
                     return Err(ProductCodecError::InvalidValue);
                 }
-                let mut scores = Vec::with_capacity(count);
+                let mut scores =
+                    decoder.reserve_vec(count, hyphae_native_product::MAX_RERANK_ENTRIES, 24)?;
                 for _ in 0..count {
                     let object_id = ObjectId::new(decoder.u128()?)
                         .map_err(|_| ProductCodecError::InvalidValue)?;
@@ -6009,7 +6134,11 @@ fn decode_search_collection(
                     {
                         return Err(ProductCodecError::InvalidValue);
                     }
-                    let mut ranges = Vec::with_capacity(range_count);
+                    let mut ranges = decoder.reserve_vec(
+                        range_count,
+                        hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES,
+                        2,
+                    )?;
                     for _ in 0..range_count {
                         ranges.push(hyphae_native_product::ProductFacetRange {
                             lower: decode_optional_canonical_float(decoder)?,
@@ -6215,7 +6344,8 @@ fn decode_search_filter(
             if count > hyphae_native_runtime::MAX_DOC_VALUE_FILTER_NODES {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut filters = Vec::with_capacity(count);
+            let mut filters =
+                decoder.reserve_vec(count, hyphae_native_runtime::MAX_DOC_VALUE_FILTER_NODES, 1)?;
             for _ in 0..count {
                 filters.push(decode_search_filter(decoder, depth + 1)?);
             }
@@ -6232,7 +6362,8 @@ fn decode_search_filter(
             if count > hyphae_native_runtime::MAX_DOC_VALUE_IN_MEMBERS {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut values = Vec::with_capacity(count);
+            let mut values =
+                decoder.reserve_vec(count, hyphae_native_runtime::MAX_DOC_VALUE_IN_MEMBERS, 2)?;
             for _ in 0..count {
                 values.push(decode_doc_value(decoder)?);
             }
@@ -6270,7 +6401,11 @@ fn decode_search_ingest_batch(
     {
         return Err(ProductCodecError::InvalidValue);
     }
-    let mut documents = Vec::with_capacity(count);
+    let mut documents = decoder.reserve_vec(
+        count,
+        hyphae_native_product::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS,
+        28,
+    )?;
     for _ in 0..count {
         documents.push(decode_product_document(decoder)?);
     }
@@ -6329,7 +6464,7 @@ fn decode_product_document(
     for _ in 0..vector_count {
         let name = decoder.text()?;
         let dimension = decoder.usize_u32()?;
-        let mut values = Vec::with_capacity(dimension);
+        let mut values = decoder.reserve_vec(dimension, usize::from(u16::MAX), 4)?;
         for _ in 0..dimension {
             values.push(f32::from_bits(decoder.u32()?));
         }
@@ -6543,7 +6678,11 @@ fn decode_integrated_search(
     if hit_count > hyphae_native_product::MAX_PRODUCT_SEARCH_HITS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut hits = Vec::with_capacity(hit_count);
+    let mut hits = decoder.reserve_vec(
+        hit_count,
+        hyphae_native_product::MAX_PRODUCT_SEARCH_HITS,
+        28,
+    )?;
     for _ in 0..hit_count {
         let object_id =
             ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
@@ -6576,14 +6715,19 @@ fn decode_integrated_search(
     if facet_count > hyphae_native_runtime::MAX_DOC_VALUE_FACETS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut facets = Vec::with_capacity(facet_count);
+    let mut facets =
+        decoder.reserve_vec(facet_count, hyphae_native_runtime::MAX_DOC_VALUE_FACETS, 8)?;
     for _ in 0..facet_count {
         let field = decoder.text()?;
         let bucket_count = decoder.usize_u32()?;
         if bucket_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_TERMS {
             return Err(ProductCodecError::LimitExceeded);
         }
-        let mut buckets = Vec::with_capacity(bucket_count);
+        let mut buckets = decoder.reserve_vec(
+            bucket_count,
+            hyphae_native_runtime::MAX_DOC_VALUE_FACET_TERMS,
+            10,
+        )?;
         for _ in 0..bucket_count {
             buckets.push(hyphae_native_product::ProductFacetBucket {
                 value: decode_doc_value(decoder)?,
@@ -6596,7 +6740,11 @@ fn decode_integrated_search(
     if aggregation_count > hyphae_native_runtime::MAX_DOC_VALUE_AGGREGATIONS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut aggregations = Vec::with_capacity(aggregation_count);
+    let mut aggregations = decoder.reserve_vec(
+        aggregation_count,
+        hyphae_native_runtime::MAX_DOC_VALUE_AGGREGATIONS,
+        5,
+    )?;
     for _ in 0..aggregation_count {
         aggregations.push(ProductNamedAggregationValue {
             name: decoder.text()?,
@@ -6607,7 +6755,11 @@ fn decode_integrated_search(
     if branch_count > hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut vector_branches = Vec::with_capacity(branch_count);
+    let mut vector_branches = decoder.reserve_vec(
+        branch_count,
+        hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
+        36,
+    )?;
     for _ in 0..branch_count {
         let target = decoder.text()?;
         let strategy = match decoder.u8()? {
@@ -6657,7 +6809,11 @@ fn decode_integrated_search(
                     if fragment_count > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS {
                         return Err(ProductCodecError::LimitExceeded);
                     }
-                    let mut fragments = Vec::with_capacity(fragment_count);
+                    let mut fragments = decoder.reserve_vec(
+                        fragment_count,
+                        hyphae_native_product::MAX_HIGHLIGHT_FRAGMENTS,
+                        4,
+                    )?;
                     for _ in 0..fragment_count {
                         let fragment = decoder.text()?;
                         if fragment.len() > hyphae_native_product::MAX_HIGHLIGHT_FRAGMENT_BYTES {
@@ -6683,7 +6839,11 @@ fn decode_integrated_search(
                     if bucket_count > hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES {
                         return Err(ProductCodecError::LimitExceeded);
                     }
-                    let mut buckets = Vec::with_capacity(bucket_count);
+                    let mut buckets = decoder.reserve_vec(
+                        bucket_count,
+                        hyphae_native_runtime::MAX_DOC_VALUE_FACET_RANGES,
+                        10,
+                    )?;
                     for _ in 0..bucket_count {
                         buckets.push(hyphae_native_product::ProductFacetBucket {
                             value: decode_doc_value(decoder)?,
@@ -6859,7 +7019,7 @@ fn decode_catalog_page(
     if count > 4096 {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut items = Vec::with_capacity(count);
+    let mut items = decoder.reserve_vec(count, 4096, 48)?;
     for _ in 0..count {
         let id = ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
         let kind = decode_catalog_kind(decoder.u8()?)?;
@@ -6920,7 +7080,7 @@ fn decode_catalog_visible_page(
     if count > 4096 {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut items = Vec::with_capacity(count);
+    let mut items = decoder.reserve_vec(count, 4096, 48)?;
     for _ in 0..count {
         let id = ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
         let kind = decode_catalog_kind(decoder.u8()?)?;
@@ -6971,7 +7131,7 @@ fn decode_dependency_page(
     if count > 4096 {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut items = Vec::with_capacity(count);
+    let mut items = decoder.reserve_vec(count, 4096, 33)?;
     for _ in 0..count {
         let dependent =
             ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
@@ -7314,7 +7474,8 @@ fn decode_explain(decoder: &mut Decoder<'_>) -> Result<ProductExplain, ProductCo
             if count > hyphae_native_runtime::MAX_CONVERGENCE_SOURCES {
                 return Err(ProductCodecError::LimitExceeded);
             }
-            let mut strategies = Vec::with_capacity(count);
+            let mut strategies =
+                decoder.reserve_vec(count, hyphae_native_runtime::MAX_CONVERGENCE_SOURCES, 1)?;
             for _ in 0..count {
                 strategies.push(decode_convergence_strategy(decoder.u8()?)?);
             }
@@ -7474,7 +7635,7 @@ fn decode_telemetry(decoder: &mut Decoder<'_>) -> Result<TelemetrySnapshot, Prod
     if metric_count > 256 || event_count > hyphae_native_product::MAX_TELEMETRY_EVENTS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut metrics = Vec::with_capacity(metric_count);
+    let mut metrics = decoder.reserve_vec(metric_count, 256, 13)?;
     for _ in 0..metric_count {
         let name = decoder.text()?;
         let descriptor = hyphae_native_product::METRIC_REGISTRY_V1
@@ -7503,7 +7664,8 @@ fn decode_telemetry(decoder: &mut Decoder<'_>) -> Result<TelemetrySnapshot, Prod
         };
         metrics.push(hyphae_native_product::MetricRow { descriptor, value });
     }
-    let mut events = Vec::with_capacity(event_count);
+    let mut events =
+        decoder.reserve_vec(event_count, hyphae_native_product::MAX_TELEMETRY_EVENTS, 16)?;
     for _ in 0..event_count {
         let captured_at_micros = decoder.i64()?;
         let kind = decoder.u8()?;
@@ -7870,6 +8032,34 @@ impl<'a> Decoder<'a> {
         let (value, remaining) = self.remaining.split_at(length);
         self.remaining = remaining;
         Ok(value)
+    }
+
+    fn reserve_vec<T>(
+        &self,
+        count: usize,
+        maximum: usize,
+        minimum_item_bytes: usize,
+    ) -> Result<Vec<T>, ProductCodecError> {
+        if count > maximum {
+            return Err(ProductCodecError::LimitExceeded);
+        }
+        let minimum_bytes = count
+            .checked_mul(minimum_item_bytes)
+            .ok_or(ProductCodecError::LimitExceeded)?;
+        let allocation_bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(ProductCodecError::LimitExceeded)?;
+        if allocation_bytes > hyphae_native_product::MAX_PRODUCT_CONTEXT_MEMORY_BYTES {
+            return Err(ProductCodecError::LimitExceeded);
+        }
+        if minimum_bytes > self.remaining.len() {
+            return Err(ProductCodecError::Truncated);
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| ProductCodecError::LimitExceeded)?;
+        Ok(values)
     }
 
     fn owned_bytes(&mut self) -> Result<Vec<u8>, ProductCodecError> {
