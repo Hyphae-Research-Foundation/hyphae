@@ -61,10 +61,10 @@ without publishing a release. If an immutable tag run fails after the tag is
 created, one manual recovery may name both the existing tag and its exact
 peeled commit. That path re-fetches and verifies the tag, rebuilds every native
 archive from the tagged commit, binds the hosted checks, and may publish without
-moving or recreating the tag. Publication is reachable only from a `v*` tag
-push or that exact-tag recovery path, and
-`finalize_release.py` rejects a tag that does not equal `v` plus the workspace
-version. The workflow binds the fetched tag object and peeled commit, requires
+moving or recreating the tag. Publication is reachable only from a
+`release-v*-crates` tag push or that exact-tag recovery path, and
+`finalize_release.py` rejects a tag that does not equal `release-v` plus the
+workspace version plus `-crates`. The workflow binds the fetched tag object and peeled commit, requires
 that commit to remain reachable from `main`, and re-fetches both immediately
 before publication. A tag may be pushed only after the complete gate is green
 and publication is explicitly authorized.

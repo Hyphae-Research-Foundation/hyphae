@@ -246,7 +246,7 @@
       "properties": {
         "tag": {
           "type": "string",
-          "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+          "pattern": "^(?:v[0-9]+\\.[0-9]+\\.[0-9]+(?:-(?!crates$)[0-9A-Za-z.-]+)?|release-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?-crates)$"
         },
         "version": {
           "type": "string",
@@ -441,7 +441,7 @@
             "then": {
               "properties": {
                 "name": {
-                  "pattern": "^hyphae-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?\\.required-checks\\.json$"
+                  "pattern": "^hyphae-(?:v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?|release-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?-crates)\\.required-checks\\.json$"
                 }
               }
             }
@@ -460,7 +460,7 @@
             "then": {
               "properties": {
                 "name": {
-                  "pattern": "^hyphae-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?\\.cdx\\.json$"
+                  "pattern": "^hyphae-(?:v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?|release-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?-crates)\\.cdx\\.json$"
                 }
               }
             }
@@ -479,7 +479,7 @@
             "then": {
               "properties": {
                 "name": {
-                  "pattern": "^hyphae-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?\\.spdx\\.json$"
+                  "pattern": "^hyphae-(?:v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?|release-v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?-crates)\\.spdx\\.json$"
                 }
               }
             }

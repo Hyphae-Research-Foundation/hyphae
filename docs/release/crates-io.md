@@ -182,7 +182,7 @@ full in [the `3.0.0` receipt](receipts/3.0.0.md).
    not itself record this particular run ID.
 
 3. **Release** — `.github/workflows/release.yml`. Its normal trigger is a
-   `v*` tag push; its `workflow_dispatch` inputs (`release_tag`,
+   `release-v*-crates` tag push; its `workflow_dispatch` inputs (`release_tag`,
    `release_commit`) exist only for the documented recovery path — an
    existing immutable tag whose initial tag-triggered run failed. For
    `3.0.0`, the Release workflow was dispatched from `main` this way:
