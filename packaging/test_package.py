@@ -398,6 +398,14 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(workflow.count(recovery_guard), 2)
         self.assertIn("release_tag:", workflow)
         self.assertIn("release_commit:", workflow)
+        self.assertIn('- "release-v*-crates"', workflow)
+        self.assertNotIn('- "v*"', workflow)
+        canonical_tag_guard = (
+            "(github.event_name == 'push' && "
+            "startsWith(github.ref, 'refs/tags/release-v') && "
+            "endsWith(github.ref, '-crates'))"
+        )
+        self.assertEqual(workflow.count(canonical_tag_guard), 2)
         self.assertIn("RELEASE_SOURCE_REF", workflow)
         self.assertEqual(
             workflow.count(
@@ -431,6 +439,9 @@ class PackageTests(unittest.TestCase):
         self.assertIn('test -z "${{ inputs.release_commit }}"', workflow)
         self.assertIn("anchore/sbom-action/download-syft@", workflow)
         self.assertIn("syft-version: v1.46.0", workflow)
+        self.assertIn('release_version="${RELEASE_TAG#release-v}"', workflow)
+        self.assertIn('release_version="${release_version%-crates}"', workflow)
+        self.assertIn('if [[ "$release_version" == *-* ]]', workflow)
         scan = workflow.index('scan dir:. --exclude ./embed -o "syft-json=${native_sbom}"')
         conclude = workflow.index("packaging/conclude_release_sbom_licenses.py")
         spdx = workflow.index('convert "$native_sbom" -o "spdx-json=${spdx_sbom}"')
@@ -1685,8 +1696,8 @@ class PackageTests(unittest.TestCase):
     def test_release_evidence_schema_matches_the_emitted_identifier(self) -> None:
         try:
             from jsonschema import Draft202012Validator, ValidationError
-        except ImportError:
-            self.skipTest("jsonschema is not installed")
+        except ImportError as error:
+            self.fail(f"jsonschema is required for release contract validation: {error}")
 
         release_schema = json.loads(SCHEMA_PATH.read_text("utf-8"))
         checks_schema = json.loads(REPORT_SCHEMA_PATH.read_text("utf-8"))
@@ -1698,6 +1709,15 @@ class PackageTests(unittest.TestCase):
             manifest = add_test_release_evidence(root, tag_release=True)
             document = json.loads(manifest.read_text("utf-8"))
             Draft202012Validator(release_schema).validate(document)
+            for malformed in (
+                "release-v3.0.0",
+                "v3.0.0-crates",
+                "release-3.0.0-crates",
+            ):
+                invalid_tag = copy.deepcopy(document)
+                invalid_tag["release"]["tag"] = malformed
+                with self.assertRaises(ValidationError):
+                    Draft202012Validator(release_schema).validate(invalid_tag)
             candidate_with_report = copy.deepcopy(document)
             candidate_with_report["workflow"]["ref"] = (
                 "refs/heads/release-candidate"

@@ -15,7 +15,7 @@ on:
         type: string
   push:
     tags:
-      - "v*"
+      - "release-v*-crates"
 
 concurrency:
   group: release-${{ inputs.release_tag || github.ref }}
@@ -279,7 +279,7 @@ jobs:
           "$syft" convert "$native_sbom" -o "cyclonedx-json=${cyclonedx_sbom}"
       - name: Bind successful hosted checks for a tag
         if: >-
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-v') && endsWith(github.ref, '-crates')) ||
           (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != '')
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -424,7 +424,7 @@ jobs:
   publish:
     name: Publish GitHub release
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release-v') && endsWith(github.ref, '-crates')) ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_commit != '')
     needs: assemble
     runs-on: ubuntu-24.04
@@ -535,7 +535,9 @@ jobs:
           git merge-base --is-ancestor \
             "$merge_commit" refs/remotes/origin/main
           arguments=(--verify-tag --generate-notes --title "Hyphae ${RELEASE_TAG}")
-          if [[ "$RELEASE_TAG" == *-* ]]; then
+          release_version="${RELEASE_TAG#release-v}"
+          release_version="${release_version%-crates}"
+          if [[ "$release_version" == *-* ]]; then
             arguments+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" dist/* "${arguments[@]}"

@@ -864,6 +864,7 @@ jobs:
             tools.test_rag_eval \
             tools.test_agent_memory_retrieval_eval \
             tools.test_long_term_memory_benchmarks -v
+          python -m pip install jsonschema==4.25.1
           python packaging/test_package.py
       - name: Install from a generated Linux archive
         shell: bash
