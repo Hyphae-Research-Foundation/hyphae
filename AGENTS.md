@@ -2,27 +2,52 @@
 
 ## Product boundary
 
-- Hyphae is an autonomous Rust data engine: one binary and one data directory.
-- The default product must work offline without a database, cache, cloud,
+- Hyphae is one autonomous Rust data engine. A node is one binary and one
+  exclusively owned data directory; one node remains a complete offline
+  product, and multiple nodes may form one self-hosted Hyphae cluster.
+- The default product must work offline without another database, cache, cloud,
   embedding provider, or LLM.
-- The phase-1 target is a fully Hyphae-owned local data ecosystem with three
-  first-class native engines: relational/SQL, keyspace/data structures, and
-  lexical/vector search.
-- Those engines share Hyphae-owned types, catalog, page/blob allocation, WAL,
-  MVCC/commit sequencing, scheduling, memory policy, backup, and proofs. They
-  are not wrappers, compatibility facades, or projections of one another.
+- The Universal Engine program makes relations, keyspaces and data structures,
+  documents, lexical and vector retrieval, time series, graphs, geospatial
+  data, and columnar analytics first-class catalogued object domains.
+- Public product language presents one engine with one object, query,
+  transaction, administration, and proof authority. Technical specifications
+  may name specialized execution domains and access methods where correctness
+  requires it.
+- Every domain shares Hyphae-owned types, catalog and entity identities,
+  page/blob allocation, WAL, MVCC/commit sequencing, scheduling, memory policy,
+  authorization, backup, and proofs. Domains are not wrappers, compatibility
+  facades, or mandatory projections of one another.
 - Do not introduce PostgreSQL, Valkey, OpenSearch, another database, or a
   third-party query/search engine as an internal runtime or sidecar. General
   purpose audited primitives remain allowed.
-- Embedded calls and the native local protocol are the primary performance
-  surfaces. No internal engine-to-engine path may use TCP, HTTP, JSON, or
-  another serialized compatibility protocol.
+- Embedded calls and the native local protocol remain primary performance
+  surfaces. Same-node domain execution never uses TCP, HTTP, JSON, RESP,
+  PostgreSQL wire, or another serialized compatibility protocol.
+- A self-hosted cluster uses a versioned Hyphae-native authenticated binary
+  protocol. Strong consistency is the default: replicated metadata and shard
+  authority must fail closed rather than silently weaken consistency.
+- Single-node execution must not pay an artificial network or consensus round
+  trip. It is the one-node form of the same product and retains direct fast
+  paths.
 - Treat "microsecond-first" as a measured hot-path objective. Report transport,
   execution, queueing, and physical durability separately; never promise a
   universal sub-millisecond bound for fsync, cold I/O, or unbounded queries.
-- PliegoRS, Mycelium, Hyphae Network, Celiums Network, cognitive experiments,
-  hosted SaaS concerns, billing, and cloud operations are outside this repo.
+- Accelerator-capable builds automatically select a validated compatible GPU,
+  report the exact execution profile, and fall back to CPU only under the
+  versioned operation contract. A GPU, model, or provider is never mandatory
+  for the default offline product.
+- PostgreSQL, Valkey, Qdrant, Weaviate, and other systems are external
+  conformance and measurement subjects, never embedded authorities. Parity or
+  superiority claims require pinned versions, configurations, hardware,
+  datasets, durability, and retained receipts.
+- Hosted SaaS concerns, billing, and cloud control planes remain outside this
+  repository. The self-hosted cluster data plane is inside it. PliegoRS,
+  Mycelium, Hyphae Network, Celiums Network, and cognitive experiments remain
+  outside it.
 - Integrations and semantic providers consume only public versioned contracts.
+- Existing releases retain their bounded claims. A roadmap decision does not
+  retroactively expand shipped behavior or gate evidence.
 
 ## Historical source
 
