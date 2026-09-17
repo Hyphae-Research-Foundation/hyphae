@@ -2,10 +2,20 @@
 # Native local protocol v1
 
 The unreleased Agent Memory candidate adds protocol minor 7: request `71`
-(`MemoryRecall`), response `45` (`MemoryRecall`), and request `72`
-(`MemoryEnrich`, returning `SearchIngested`). Memory proofs use kind `8` and
-semantics `6`. See [the complete composition and wire contract](agent-memory-read-v1.md).
-Older exchanges keep their existing encoding and negotiated minor gates.
+(`MemoryRecall`), response `45` (`MemoryRecall`), request `72`
+(`MemoryEnrich`, returning `SearchIngested`), and response `46`
+(`StructureMutationBatch`). Memory proofs use kind `8` and semantics `6`. See
+[the complete composition and wire contract](agent-memory-read-v1.md). Older
+exchanges keep their existing encoding and negotiated minor gates.
+
+Response `46` contains an optional nonzero read CSN, a commit-presence byte and
+seven zero reserved bytes, a nonzero bounded `u32` result count and four zero
+reserved bytes, then one canonical changed boolean plus an existing structure
+mutation result per input. A present commit uses the existing fixed commit
+receipt and is required exactly when any result changed. At minors 0 through 6
+a committed response down-converts to historical response `23`; an all-no-op
+response is unsupported and the adapter returns typed invalid-request without
+publishing state.
 
 Protocol minor 6 additionally admits structure-read request tag `21`
 (`KeyScanMatch`: keyspace object id, length-framed binary-glob pattern,

@@ -124,6 +124,57 @@ test("v2 negotiated minor rejects unavailable operations before writing", () => 
   assert.throws(() => encodeProductRequest("security_status", {}, {}, 0), /negotiated protocol minor/);
 });
 
+test("v2 structure batch no-op response is minor seven and bounded", () => {
+  const encoded = new Uint8Array(43);
+  encoded.set(new TextEncoder().encode("HYPRSP01"));
+  const view = new DataView(encoded.buffer);
+  view.setUint32(8, encoded.byteLength, true);
+  view.setUint16(12, 46, true);
+  view.setBigUint64(16, 7n, true);
+  view.setUint32(32, 1, true);
+  encoded[41] = 2;
+
+  assert.deepEqual(decodeProductResponse(encoded, 9n, 7), {
+    kind: "structure_mutation_batch",
+    value: {
+      readCsn: 7n,
+      commit: undefined,
+      results: [{ changed: false, result: { kind: "boolean", value: false } }],
+    },
+    requestId: 9n,
+  });
+  assert.throws(() => decodeProductResponse(encoded, 9n, 6), /minor/);
+  view.setUint32(32, 0xffffffff, true);
+  assert.throws(() => decodeProductResponse(encoded, 9n, 7), /count/);
+});
+
+test("v2 structure batch decodes committed current-minor evidence", () => {
+  const encoded = new Uint8Array(146);
+  encoded.set(new TextEncoder().encode("HYPRSP01"));
+  const view = new DataView(encoded.buffer);
+  view.setUint32(8, encoded.byteLength, true);
+  view.setUint16(12, 46, true);
+  view.setBigUint64(16, 7n, true);
+  encoded[24] = 1;
+  view.setUint32(32, 1, true);
+  encoded[40] = 1;
+  encoded[41] = 3;
+  view.setBigUint64(42, 5n, true);
+  view.setBigUint64(50, 9n, true);
+  view.setBigUint64(66, 8n, true);
+  view.setBigUint64(74, 3n, true);
+  view.setBigUint64(82, 11n, true);
+  encoded.fill(4, 90, 122);
+  view.setBigUint64(130, 1n, true);
+
+  const response = decodeProductResponse(encoded, 10n, 7);
+  assert.equal(response.kind, "structure_mutation_batch");
+  assert.equal(response.value.commit.transactionId, 9n);
+  assert.deepEqual(response.value.results, [
+    { changed: true, result: { kind: "count", value: 5n } },
+  ]);
+});
+
 test("v2 security tags 42 through 53 and 70 have strict/idempotent parity", () => {
   const cases = [
     ["security_status", {}, false],

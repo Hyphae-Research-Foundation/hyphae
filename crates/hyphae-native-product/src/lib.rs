@@ -911,6 +911,10 @@ impl NativeProduct {
         for mutation in mutations {
             operation::apply_structure_mutation(&mut transaction, mutation)?;
         }
+        if transaction.mutation_count() == 0 {
+            transaction.rollback();
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+        }
         let receipt = transaction.commit()?;
         self.observe_commit(&receipt);
         Ok(receipt.into())
