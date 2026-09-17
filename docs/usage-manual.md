@@ -292,19 +292,20 @@ bounded `set_algebra`, `sorted_set_score/rank/range/cardinality`, and
 ### Native protocol minor 6: seven mutations, six reads
 
 Minor 6 adds seven Valkey-shaped typed mutations and six typed reads through
-the same `batch` and `read` envelopes. `batch`'s response is the commit
-receipt for the whole array — the CLI does not surface individual mutation
-outcomes (whether a conditional write applied, a resulting length, a popped
-member); read the structure back, or use an SDK's typed API, to observe a
-specific outcome.
+the same `batch` and `read` envelopes. Current minor-7 clients return an
+ordered `results` array containing `changed` and the typed result for every
+mutation. Applied or mixed batches also carry the normal flat commit fields;
+an all-rejected batch returns `status: "no_op"` and `read_csn` without a
+transaction or durability receipt.
 
-Known defect in `3.0.0`: a batch whose conditional mutations are **all**
+Release `3.0.0` defect: a batch whose conditional mutations are **all**
 rejected (`string_set_conditional` with `if_absent` on an existing key,
 `hash_set_if_absent` on an existing field) stages nothing, and the empty
 commit is reported as `{"category":"corruption","code":"corruption"}` with
 exit class 9 even though the directory is healthy and unchanged. A batch that
-also carries an applied mutation commits normally. Tracked as
-[issue #268](https://github.com/Hyphae-Research-Foundation/hyphae/issues/268).
+also carries an applied mutation commits normally. Current source fixes this
+as the explicit no-op response above; the historical release remains tracked
+by [issue #268](https://github.com/Hyphae-Research-Foundation/hyphae/issues/268).
 
 ```bash
 # SETNX (string_set_conditional): write only if absent

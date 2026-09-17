@@ -401,6 +401,26 @@ pub enum ProductStructureMutationResult {
     PoppedEntry(Option<ProductSortedSetEntry>),
 }
 
+/// Result of one mutation in an ordered direct structure batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductStructureMutationOutcome {
+    /// Whether this mutation added at least one physical mutation.
+    pub changed: bool,
+    /// Typed logical result of the mutation.
+    pub result: ProductStructureMutationResult,
+}
+
+/// Result of one successful direct ordered structure batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductStructureMutationBatchReceipt {
+    /// All-engine CSN visible when the private batch began.
+    pub read_csn: Option<u64>,
+    /// Commit evidence, absent exactly when no physical mutation was staged.
+    pub commit: Option<ProductCommitReceipt>,
+    /// Mutation results in exact request order.
+    pub results: Vec<ProductStructureMutationOutcome>,
+}
+
 /// One scanned key with its structure family.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductKeyEntry {

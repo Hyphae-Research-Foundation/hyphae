@@ -48,6 +48,75 @@ class FakeTransport:
         return Response("fake", arguments, options.checked_request_id())
 
 
+class StructureBatchResponseTests(unittest.TestCase):
+    def test_noop_response_requires_minor_seven_and_bounds_results(self) -> None:
+        import struct
+
+        body = b"".join(
+            [
+                struct.pack("<Q", 7),
+                b"\0" * 8,
+                struct.pack("<I", 1),
+                b"\0" * 4,
+                b"\0\2\0",
+            ]
+        )
+        encoded = _response(46, body)
+        response = decode_product_response(encoded, 9, negotiated_minor=7)
+        self.assertEqual(response.kind, "structure_mutation_batch")
+        self.assertEqual(response.value["read_csn"], 7)
+        self.assertIsNone(response.value["commit"])
+        self.assertEqual(
+            response.value["results"],
+            [{"changed": False, "result": {"kind": "boolean", "value": False}}],
+        )
+        with self.assertRaises(ClientError):
+            decode_product_response(encoded, 9, negotiated_minor=6)
+        excessive = bytearray(encoded)
+        excessive[32:36] = struct.pack("<I", 0xFFFFFFFF)
+        with self.assertRaises(ClientError):
+            decode_product_response(bytes(excessive), 9, negotiated_minor=7)
+
+    def test_committed_response_decodes_every_minor_six_result_shape(self) -> None:
+        import struct
+
+        receipt = b"".join(
+            [
+                (9).to_bytes(16, "little"),
+                struct.pack("<QQQ", 8, 3, 11),
+                bytes([4]) * 32,
+                b"\0" * 8,
+                struct.pack("<QQ", 1, 0),
+            ]
+        )
+        body = b"".join(
+            [
+                struct.pack("<Q", 7),
+                b"\1" + b"\0" * 7,
+                struct.pack("<I", 2),
+                b"\0" * 4,
+                b"\1\6" + struct.pack("<d", 1.5),
+                b"\0\7\1" + struct.pack("<I", 1) + b"x" + struct.pack("<d", 2.5),
+                receipt,
+            ]
+        )
+        response = decode_product_response(_response(46, body), 10, negotiated_minor=7)
+        self.assertEqual(response.value["commit"]["transaction_id"], 9)
+        self.assertEqual(
+            response.value["results"],
+            [
+                {"changed": True, "result": {"kind": "score", "value": 1.5}},
+                {
+                    "changed": False,
+                    "result": {
+                        "kind": "popped_entry",
+                        "entry": {"member": b"x", "score": 2.5},
+                    },
+                },
+            ],
+        )
+
+
 class FakeHttpResponse:
     status = 200
 

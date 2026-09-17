@@ -58,17 +58,18 @@ use hyphae_native_product::{
     ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
     ProductSearchOperator, ProductSearchRequest, ProductSearchResults, ProductSearchSort,
     ProductSetAlgebraOperation, ProductSortDirection, ProductSortSource, ProductSqlResult,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
-    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
-    ProductTransactionSearchMutation, ProductTransactionSqlMutation, ProductTransactionStageResult,
-    ProductTransactionStatus, ProductTransactionVectorMutation, ProductTtl, ProductValue,
-    ProductVector, ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
-    ProgressControl, RestorePhase, RestoreRequest, SecurityAssignmentListRequest,
-    SecurityAssignmentPage, SecurityAuditAction, SecurityAuditMetadata, SecurityAuditPage,
-    SecurityAuditReadRequest, SecurityAuditResult, SecurityAuditTarget, SecurityCursor, SecurityId,
-    SecurityKeyListRequest, SecurityKeyPage, SecurityPrincipalListRequest, SecurityPrincipalPage,
-    SecurityRoleListRequest, SecurityRolePage, SecurityRoleSummary, SnapshotIdentity,
-    StructureKind, VerifyBackupRequest, capabilities, verify_backup,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationBatchReceipt,
+    ProductStructureMutationResult, ProductStructureReadRequest, ProductStructureReadResult,
+    ProductTransactionHandle, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
+    ProductTransactionStageResult, ProductTransactionStatus, ProductTransactionVectorMutation,
+    ProductTtl, ProductValue, ProductVector, ProductVectorBranch, ProductVectorExecution,
+    ProductVectorStrategy, ProgressControl, RestorePhase, RestoreRequest,
+    SecurityAssignmentListRequest, SecurityAssignmentPage, SecurityAuditAction,
+    SecurityAuditMetadata, SecurityAuditPage, SecurityAuditReadRequest, SecurityAuditResult,
+    SecurityAuditTarget, SecurityCursor, SecurityId, SecurityKeyListRequest, SecurityKeyPage,
+    SecurityPrincipalListRequest, SecurityPrincipalPage, SecurityRoleListRequest, SecurityRolePage,
+    SecurityRoleSummary, SnapshotIdentity, StructureKind, VerifyBackupRequest, capabilities,
+    verify_backup,
 };
 use hyphae_native_runtime::{
     CalibrationMode, CalibrationRequest, GovernorMode, GovernorPolicyError, HardwareCalibration,
@@ -5253,6 +5254,7 @@ fn response_json(response: ProductResponse) -> Value {
         ProductResponse::StructureSet(outcome)
         | ProductResponse::StructureMutated(outcome)
         | ProductResponse::CatalogCreated(outcome) => commit_outcome_json(outcome),
+        ProductResponse::StructureMutationBatch(receipt) => structure_mutation_batch_json(receipt),
         ProductResponse::StructureTtl(ttl) => ttl_json(ttl),
         ProductResponse::StructureRead(read) => json!({
             "snapshot": snapshot_json(read.snapshot),
@@ -5868,6 +5870,32 @@ fn structure_mutation_result_json(result: ProductStructureMutationResult) -> Val
             "score": entry.map(|entry| entry.score.get()),
         }),
         _ => json!({ "type": "unsupported" }),
+    }
+}
+
+fn structure_mutation_batch_json(receipt: ProductStructureMutationBatchReceipt) -> Value {
+    let results = receipt
+        .results
+        .into_iter()
+        .map(|outcome| {
+            json!({
+                "changed": outcome.changed,
+                "result": structure_mutation_result_json(outcome.result),
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(commit) = receipt.commit {
+        let mut value = commit_json(commit);
+        value["status"] = json!("committed");
+        value["read_csn"] = json!(receipt.read_csn);
+        value["results"] = json!(results);
+        value
+    } else {
+        json!({
+            "status": "no_op",
+            "read_csn": receipt.read_csn,
+            "results": results,
+        })
     }
 }
 

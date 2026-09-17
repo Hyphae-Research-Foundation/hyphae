@@ -173,8 +173,8 @@ Every Native v2 request must offer its supported protocol minors in
 across every header instance, comma separation tolerated for header-coalescing
 intermediaries, no duplicates, no leading zeros, no other bytes. The server
 selects the highest offered minor it serves (this build serves minors 3, 4, 5,
-and 6) and rejects a missing, malformed, duplicated, or entirely unsupported offer
-before authentication and product dispatch. The selection gates request decode
+6, and 7) and rejects a missing, malformed, duplicated, or entirely unsupported
+offer before authentication and product dispatch. The selection gates request decode
 and response encode, and the server emits the selected minor (or its highest
 served minor on admission failure) in `X-Hyphae-Protocol-Minor` on every
 success and error. Clients validate that the echoed selection is one of their

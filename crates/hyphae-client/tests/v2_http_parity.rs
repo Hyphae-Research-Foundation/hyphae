@@ -8,7 +8,10 @@ use hyphae_client::v2::{
     CatalogVisibleCursor, CatalogVisibleListFilter, CatalogVisibleListRequest, HttpTransport,
     HyphaeClient, ProductResponse, RequestOptions,
 };
-use hyphae_native_product::{NativeProduct, NativeProductService, NativeProductServiceConfig};
+use hyphae_native_product::{
+    NativeProduct, NativeProductService, NativeProductServiceConfig, ObjectId, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationResult,
+};
 use hyphae_server::{NativeHttpV2Config, NativeHttpV2Server};
 
 #[tokio::test]
@@ -41,6 +44,7 @@ async fn real_http_capabilities_execute() -> Result<(), Box<dyn std::error::Erro
     let ids = visible_catalog_sequence(&real).await?;
     assert!(!ids.is_empty());
     assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_structure_noop(&real).await?;
 
     let _ignored = shutdown.0.send(());
     serve.await??;
@@ -73,6 +77,7 @@ async fn real_local_capabilities_execute() -> Result<(), Box<dyn std::error::Err
     let ids = visible_catalog_sequence(&real).await?;
     assert!(!ids.is_empty());
     assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_structure_noop(&real).await?;
 
     drop(real);
     let product = daemon.shutdown().await?;
@@ -116,4 +121,38 @@ fn visible_catalog_request(cursor: Option<CatalogVisibleCursor>) -> CatalogVisib
         visit_limit: 8,
         byte_limit: 4_096,
     }
+}
+
+async fn assert_structure_noop(client: &HyphaeClient) -> Result<(), Box<dyn std::error::Error>> {
+    client
+        .structure_set(
+            b"conditional".to_vec(),
+            b"present".to_vec(),
+            None,
+            RequestOptions::default(),
+        )
+        .await?;
+    let response = client
+        .structure_mutate(
+            vec![ProductStructureMutation::StringSetConditional {
+                key: ProductStructureKey {
+                    keyspace: ObjectId::new(3)?,
+                    key: b"conditional".to_vec(),
+                },
+                value: b"other".to_vec(),
+                expires_at_micros: None,
+                if_present: false,
+            }],
+            RequestOptions::default(),
+        )
+        .await?;
+    assert!(matches!(
+        response,
+        ProductResponse::StructureMutationBatch(receipt)
+            if receipt.commit.is_none()
+                && !receipt.results[0].changed
+                && receipt.results[0].result
+                    == ProductStructureMutationResult::Boolean(false)
+    ));
+    Ok(())
 }

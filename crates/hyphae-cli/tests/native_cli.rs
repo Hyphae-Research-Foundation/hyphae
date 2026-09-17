@@ -1999,16 +1999,38 @@ fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(),
         {"operation":"create","keyspace":26,"key":"events","family":"stream"},
         {"operation":"stream_add","keyspace":26,"key":"events","fields":{"kind":"created"}}
     ]).to_string();
+    let committed = run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "batch",
+        "--mutations-json",
+        &mutations,
+    ])?;
+    assert_eq!(committed["status"], "committed");
+    assert_eq!(committed["results"].as_array().map(Vec::len), Some(17));
+
+    let rejected = serde_json::json!([
+        {"operation":"string_set_conditional","keyspace":20,"key":"message","value":"other","expires_at_micros":null,"condition":"if_absent"},
+        {"operation":"hash_set_if_absent","keyspace":22,"key":"hash","field":"name","value":"other"}
+    ])
+    .to_string();
+    let no_op = run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "batch",
+        "--mutations-json",
+        &rejected,
+    ])?;
+    assert_eq!(no_op["status"], "no_op");
+    assert!(no_op.get("transaction_id").is_none());
     assert_eq!(
-        run(&[
-            "structure",
-            "--data-dir",
-            &data_text,
-            "batch",
-            "--mutations-json",
-            &mutations,
-        ])?["status"],
-        "committed"
+        no_op["results"],
+        serde_json::json!([
+            {"changed":false,"result":{"type":"boolean","value":false}},
+            {"changed":false,"result":{"type":"boolean","value":false}}
+        ])
     );
     for (request, expected) in [
         (
