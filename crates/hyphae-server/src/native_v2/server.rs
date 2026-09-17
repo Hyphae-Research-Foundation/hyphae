@@ -1072,7 +1072,7 @@ async fn execute_operation(
         .checkpoint()
         .map_err(|error| NativeApiError::product(error, &metadata))?;
     let pending = client
-        .try_submit(context, operation)
+        .try_submit_for_protocol_minor(context, operation, negotiated_minor)
         .map_err(|error| NativeApiError::product(error, &metadata))?;
     let task = tokio::task::spawn_blocking(move || pending.wait().map_err(Box::new));
     let mut response = wait_for_product(task, &token, wire.deadline_micros, &metadata).await?;
@@ -1106,7 +1106,18 @@ async fn execute_operation(
     let encoding_started = Instant::now();
     let encoded =
         hyphae_native_protocol::encode_product_response_for_minor(&response, negotiated_minor)
-            .map_err(|_| NativeApiError::code(ProductErrorCode::Internal, &metadata))?;
+            .map_err(|error| {
+                let code = match error {
+                    hyphae_native_protocol::ProductCodecError::LimitExceeded => {
+                        ProductErrorCode::LimitExceeded
+                    }
+                    hyphae_native_protocol::ProductCodecError::Unsupported => {
+                        ProductErrorCode::InvalidRequest
+                    }
+                    _ => ProductErrorCode::Internal,
+                };
+                NativeApiError::code(code, &metadata)
+            })?;
     client.record_timing(TimingClass::ResultEncoding, encoding_started.elapsed());
     client.record_timing(TimingClass::Transport, transport_started.elapsed());
     let maximum = state

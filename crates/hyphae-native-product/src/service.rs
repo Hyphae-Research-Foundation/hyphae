@@ -198,6 +198,7 @@ enum ServiceCommand {
         session_id: ProductSessionId,
         context: ProductRequestContext,
         operation: Box<ProductOperation>,
+        response_protocol_minor: Option<u16>,
         enqueued_at: Instant,
         reply: DispatchReply,
     },
@@ -716,6 +717,7 @@ impl NativeProductHandle {
         session_id: ProductSessionId,
         context: ProductRequestContext,
         operation: ProductOperation,
+        response_protocol_minor: Option<u16>,
         reply: DispatchReply,
     ) -> Result<(), ProductError> {
         #[cfg(test)]
@@ -731,7 +733,14 @@ impl NativeProductHandle {
         }
         let structure_get = matches!(operation, ProductOperation::StructureGet { .. });
         if !structure_get {
-            return self.enqueue_dispatch(&mut admission, session_id, context, operation, reply);
+            return self.enqueue_dispatch(
+                &mut admission,
+                session_id,
+                context,
+                operation,
+                response_protocol_minor,
+                reply,
+            );
         }
         if admission.pending_owner_commands != 0 {
             #[cfg(test)]
@@ -741,7 +750,14 @@ impl NativeProductHandle {
                     .fetch_add(1, Ordering::Relaxed);
                 self.pause_before_fallback_enqueue();
             }
-            return self.enqueue_dispatch(&mut admission, session_id, context, operation, reply);
+            return self.enqueue_dispatch(
+                &mut admission,
+                session_id,
+                context,
+                operation,
+                response_protocol_minor,
+                reply,
+            );
         }
         let product = self
             .shared
@@ -770,7 +786,14 @@ impl NativeProductHandle {
             drop(session);
             drop(sessions);
             drop(product);
-            return self.enqueue_dispatch(&mut admission, session_id, context, operation, reply);
+            return self.enqueue_dispatch(
+                &mut admission,
+                session_id,
+                context,
+                operation,
+                response_protocol_minor,
+                reply,
+            );
         }
         let product = product
             .as_ref()
@@ -799,6 +822,7 @@ impl NativeProductHandle {
         session_id: ProductSessionId,
         context: ProductRequestContext,
         operation: ProductOperation,
+        response_protocol_minor: Option<u16>,
         reply: DispatchReply,
     ) -> Result<(), ProductError> {
         let request_id = context.request_id;
@@ -808,6 +832,7 @@ impl NativeProductHandle {
             session_id,
             context,
             operation: Box::new(operation),
+            response_protocol_minor,
             enqueued_at: Instant::now(),
             reply,
         };
@@ -948,6 +973,7 @@ impl NativeProductClient {
             self.session_id,
             context,
             operation,
+            None,
             DispatchReply::Blocking(reply),
         )?;
         Ok(NativeProductPendingResponse {
@@ -977,6 +1003,39 @@ impl NativeProductClient {
             self.session_id,
             context,
             operation,
+            None,
+            DispatchReply::Async(reply),
+        )?;
+        Ok(NativeProductPendingAsyncResponse {
+            receive,
+            request_id,
+        })
+    }
+
+    /// Admits one asynchronous operation with an exact transport response minor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the minor is unsupported, the context is foreign,
+    /// or service admission fails.
+    pub fn submit_async_for_protocol_minor(
+        &self,
+        context: ProductRequestContext,
+        operation: ProductOperation,
+        protocol_minor: u16,
+    ) -> Result<NativeProductPendingAsyncResponse, ProductError> {
+        if protocol_minor > 7 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)
+                .with_request_id(context.request_id));
+        }
+        self.validate_context(&context)?;
+        let request_id = context.request_id;
+        let (reply, receive) = futures_channel::oneshot::channel();
+        self.handle.dispatch_or_enqueue(
+            self.session_id,
+            context,
+            operation,
+            Some(protocol_minor),
             DispatchReply::Async(reply),
         )?;
         Ok(NativeProductPendingAsyncResponse {
@@ -1002,6 +1061,39 @@ impl NativeProductClient {
             self.session_id,
             context,
             operation,
+            None,
+            DispatchReply::Blocking(reply),
+        )?;
+        Ok(NativeProductPendingResponse {
+            receive,
+            request_id,
+        })
+    }
+
+    /// Attempts nonblocking admission with an exact transport response minor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the minor is unsupported, the context is foreign,
+    /// or the service queue is unavailable.
+    pub fn try_submit_for_protocol_minor(
+        &self,
+        context: ProductRequestContext,
+        operation: ProductOperation,
+        protocol_minor: u16,
+    ) -> Result<NativeProductPendingResponse, ProductError> {
+        if protocol_minor > 7 {
+            return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)
+                .with_request_id(context.request_id));
+        }
+        self.validate_context(&context)?;
+        let request_id = context.request_id;
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.handle.dispatch_or_enqueue(
+            self.session_id,
+            context,
+            operation,
+            Some(protocol_minor),
             DispatchReply::Blocking(reply),
         )?;
         Ok(NativeProductPendingResponse {
@@ -1445,6 +1537,7 @@ fn owner_loop(
                 session_id,
                 context,
                 operation,
+                response_protocol_minor,
                 enqueued_at,
                 reply,
             } => {
@@ -1470,7 +1563,13 @@ fn owner_loop(
                         let mut session = session
                             .write()
                             .map_err(|_| unavailable().with_request_id(context.request_id))?;
-                        product.dispatch(&mut session, &context, *operation)
+                        crate::operation::dispatch(
+                            product,
+                            &mut session,
+                            &context,
+                            *operation,
+                            response_protocol_minor,
+                        )
                     },
                 );
                 reply.send(result);
@@ -2372,6 +2471,7 @@ mod tests {
                 session.id(),
                 test_context(&session, 77, 0),
                 ProductOperation::Capabilities,
+                None,
                 DispatchReply::Blocking(dispatch_reply),
             )
             .expect_err("full queue must reject dispatch");

@@ -143,6 +143,8 @@ approximation status.
 ## Product invariants
 
 - A committed all-engine write has one visible CSN on every surface.
+- A logical mutation no-op carries no fabricated commit, CSN, WAL, or
+  durability evidence.
 - Readers never combine roots from different generations.
 - Catalog names resolve to the same stable IDs on every surface.
 - Result ordering and tie-breaking are canonical and transport-independent.

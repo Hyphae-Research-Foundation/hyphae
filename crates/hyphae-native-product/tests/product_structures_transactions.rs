@@ -13,13 +13,15 @@ use hyphae_native_catalog::{
     StructureOwnership,
 };
 use hyphae_native_product::{
-    NativeProduct, ObjectId, ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
+    NativeProduct, NativeProductService, NativeProductServiceConfig, ObjectId,
+    ProductAuthorization, ProductDurabilityPolicy, ProductErrorCode,
     ProductExplicitTransactionStatus, ProductLimits, ProductListSide, ProductOperation,
     ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession, ProductSessionId,
-    ProductStructureKey, ProductStructureMutation, ProductStructureReadRequest,
-    ProductStructureReadResult, ProductTransactionId, ProductTransactionSearchMutation,
-    ProductTransactionSqlMutation, ProductTransactionStageResult, ProductTransactionStatus,
-    ProductTransactionVectorMutation, ProductValue, ProductVector, StructureKind,
+    ProductStructureKey, ProductStructureMutation, ProductStructureMutationResult,
+    ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionId,
+    ProductTransactionSearchMutation, ProductTransactionSqlMutation, ProductTransactionStageResult,
+    ProductTransactionStatus, ProductTransactionVectorMutation, ProductValue, ProductVector,
+    StructureKind,
 };
 use hyphae_native_types::{EngineKind, LogicalType};
 
@@ -169,6 +171,123 @@ fn list_pop_stage_response_limit_does_not_retain_a_hidden_mutation()
         &final_rollback_context,
         ProductOperation::TransactionRollback { handle },
     )?;
+
+    let direct_response_bytes = 16 + 8 + 8 + 4 + 4 + 1 + 1 + 1 + 4 + 512 + 96;
+    let mut direct_limited = context(&session, 10);
+    direct_limited.limits.max_response_bytes = direct_response_bytes - 1;
+    let error = product.dispatch(
+        &mut session,
+        &direct_limited,
+        ProductOperation::StructureMutate {
+            mutations: vec![ProductStructureMutation::ListPop {
+                key: key(4, b"queue")?,
+                side: ProductListSide::Left,
+            }],
+        },
+    );
+    let Err(error) = error else {
+        return Err("oversized direct ListPop response committed".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+    let unchanged_context = context(&session, 11);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &unchanged_context,
+            ProductOperation::StructureRead(ProductStructureReadRequest::ListRange {
+                key: key(4, b"queue")?,
+                start: 0,
+                stop: -1,
+            }),
+        )?,
+        ProductResponse::StructureRead(read)
+            if read.value == ProductStructureReadResult::Values(vec![vec![b'x'; 512]])
+    ));
+
+    let mut direct_exact = context(&session, 12);
+    direct_exact.limits.max_response_bytes = direct_response_bytes;
+    let response = product.dispatch(
+        &mut session,
+        &direct_exact,
+        ProductOperation::StructureMutate {
+            mutations: vec![ProductStructureMutation::ListPop {
+                key: key(4, b"queue")?,
+                side: ProductListSide::Left,
+            }],
+        },
+    )?;
+    assert!(matches!(
+        response,
+        ProductResponse::StructureMutationBatch(receipt)
+            if receipt.commit.is_some()
+                && receipt.results[0].result
+                    == ProductStructureMutationResult::Value(Some(vec![b'x'; 512]))
+    ));
+
+    let push_context = context(&session, 13);
+    product.dispatch(
+        &mut session,
+        &push_context,
+        ProductOperation::StructureMutate {
+            mutations: vec![ProductStructureMutation::ListPush {
+                key: key(4, b"queue")?,
+                side: ProductListSide::Right,
+                value: vec![b'y'; 512],
+            }],
+        },
+    )?;
+    drop(session);
+    let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
+    let client = service.handle().open_session(
+        ProductPrincipal::new("legacy-product-test").ok_or("invalid principal")?,
+        ProductAuthorization::ALL,
+    )?;
+    let mut legacy = client.request_context(14, 10);
+    legacy.limits.max_response_bytes = 256;
+    let response = client
+        .try_submit_for_protocol_minor(
+            legacy,
+            ProductOperation::StructureMutate {
+                mutations: vec![ProductStructureMutation::ListPop {
+                    key: key(4, b"queue")?,
+                    side: ProductListSide::Left,
+                }],
+            },
+            6,
+        )?
+        .wait()?;
+    assert!(matches!(response, ProductResponse::StructureMutated(_)));
+    let mut legacy_noop = client.request_context(15, 10);
+    legacy_noop.limits.max_response_bytes = 256;
+    let Err(error) = client
+        .try_submit_for_protocol_minor(
+            legacy_noop,
+            ProductOperation::StructureMutate {
+                mutations: vec![ProductStructureMutation::ListPop {
+                    key: key(4, b"queue")?,
+                    side: ProductListSide::Left,
+                }],
+            },
+            6,
+        )?
+        .wait()
+    else {
+        return Err("legacy peer accepted an unrepresentable no-op receipt".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+    drop(client);
+    let product = service.shutdown()?;
+    assert_eq!(
+        product.migration_read_structures(
+            10,
+            vec![ProductStructureReadRequest::ListRange {
+                key: key(4, b"queue")?,
+                start: 0,
+                stop: -1,
+            }],
+        )?,
+        vec![ProductStructureReadResult::Values(Vec::new())]
+    );
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())
@@ -222,6 +341,189 @@ fn key(id: u128, value: &[u8]) -> Result<ProductStructureKey, Box<dyn std::error
         keyspace: ObjectId::new(id)?,
         key: value.to_vec(),
     })
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn direct_structure_batch_reports_noop_and_ordered_mixed_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("direct-noop");
+    let _ = fs::remove_dir_all(&path);
+    let mut runtime = hyphae_native_runtime::NativeDatabase::create(&path)?;
+    let mut seed = runtime.begin(0, hyphae_native_types::DurabilityClass::Memory)?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(8, "strings", StructureKind::String)?,
+    ))?;
+    seed.create_catalog_object_v2(hyphae_native_product::LogicalCatalogObject::from_legacy(
+        keyspace(9, "hashes", StructureKind::Hash)?,
+    ))?;
+    seed.set(b"greeting".to_vec(), b"hello".to_vec(), None)?;
+    seed.create_hash(b"profile".to_vec())?;
+    seed.hset(b"profile".to_vec(), b"user".to_vec(), b"ana".to_vec())?;
+    seed.commit()?;
+    drop(runtime);
+
+    let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
+    let mut session = session()?;
+    let before = product.snapshot_bounded(10)?.identity();
+    for (request_id, durability) in [
+        (1, ProductDurabilityPolicy::MEMORY),
+        (2, ProductDurabilityPolicy::GROUP),
+        (3, ProductDurabilityPolicy::STRICT),
+    ] {
+        let mut request = context(&session, request_id);
+        request.durability = durability;
+        if request_id == 3 {
+            request.idempotency_token = Some(77);
+        }
+        let response = product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::StructureMutate {
+                mutations: vec![
+                    ProductStructureMutation::StringSetConditional {
+                        key: key(8, b"greeting")?,
+                        value: b"other".to_vec(),
+                        expires_at_micros: None,
+                        if_present: false,
+                    },
+                    ProductStructureMutation::HashSetIfAbsent {
+                        key: key(9, b"profile")?,
+                        field: b"user".to_vec(),
+                        value: b"bruno".to_vec(),
+                    },
+                ],
+            },
+        )?;
+        let ProductResponse::StructureMutationBatch(receipt) = response else {
+            return Err("direct no-op did not return a detailed batch receipt".into());
+        };
+        assert_eq!(
+            receipt.read_csn,
+            before.visible_csn.map(hyphae_native_types::Csn::get)
+        );
+        assert_eq!(receipt.commit, None);
+        assert_eq!(receipt.results.len(), 2);
+        assert!(receipt.results.iter().all(|outcome| !outcome.changed));
+        assert!(
+            receipt.results.iter().all(|outcome| {
+                outcome.result == ProductStructureMutationResult::Boolean(false)
+            })
+        );
+        assert_eq!(product.snapshot_bounded(10)?.identity(), before);
+    }
+
+    let status_context = context(&session, 4);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &status_context,
+            ProductOperation::TransactionStatusByIdempotency {
+                idempotency_token: 77,
+            },
+        )?,
+        ProductResponse::TransactionStatus(ProductTransactionStatus::Unknown)
+    ));
+
+    let request = context(&session, 5);
+    let response = product.dispatch(
+        &mut session,
+        &request,
+        ProductOperation::StructureMutate {
+            mutations: vec![
+                ProductStructureMutation::StringSetConditional {
+                    key: key(8, b"greeting")?,
+                    value: b"other".to_vec(),
+                    expires_at_micros: None,
+                    if_present: false,
+                },
+                ProductStructureMutation::StringAppend {
+                    key: key(8, b"greeting")?,
+                    suffix: b" world".to_vec(),
+                },
+                ProductStructureMutation::HashSetIfAbsent {
+                    key: key(9, b"profile")?,
+                    field: b"user".to_vec(),
+                    value: b"bruno".to_vec(),
+                },
+            ],
+        },
+    )?;
+    let ProductResponse::StructureMutationBatch(receipt) = response else {
+        return Err("mixed direct batch did not return a detailed receipt".into());
+    };
+    assert_eq!(
+        receipt.read_csn,
+        before.visible_csn.map(hyphae_native_types::Csn::get)
+    );
+    assert!(receipt.commit.is_some());
+    assert_eq!(receipt.results.len(), 3);
+    assert!(!receipt.results[0].changed);
+    assert_eq!(
+        receipt.results[0].result,
+        ProductStructureMutationResult::Boolean(false)
+    );
+    assert!(receipt.results[1].changed);
+    assert_eq!(
+        receipt.results[1].result,
+        ProductStructureMutationResult::Count(11)
+    );
+    assert!(!receipt.results[2].changed);
+    assert_eq!(
+        receipt.results[2].result,
+        ProductStructureMutationResult::Boolean(false)
+    );
+    assert_eq!(
+        receipt.commit.map(|commit| commit.commit_csn),
+        before.visible_csn.map(|csn| csn.get() + 1)
+    );
+    assert_eq!(
+        product.snapshot_bounded(10)?.structure_get(b"greeting"),
+        Some(b"hello world".as_slice())
+    );
+
+    let token_mutation = ProductOperation::StructureMutate {
+        mutations: vec![ProductStructureMutation::StringSetConditional {
+            key: key(8, b"token-bound")?,
+            value: b"created".to_vec(),
+            expires_at_micros: None,
+            if_present: false,
+        }],
+    };
+    let mut first_token_context = context(&session, 6);
+    first_token_context.idempotency_token = Some(88);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &first_token_context,
+            token_mutation.clone(),
+        )?,
+        ProductResponse::StructureMutationBatch(receipt) if receipt.commit.is_some()
+    ));
+    let after_token_commit = product.snapshot_bounded(10)?.identity();
+    let mut retry_token_context = context(&session, 7);
+    retry_token_context.idempotency_token = Some(88);
+    let Err(error) = product.dispatch(&mut session, &retry_token_context, token_mutation) else {
+        return Err("a consumed token was hidden by a conditional no-op".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::IdempotencyConflict);
+    assert_eq!(product.snapshot_bounded(10)?.identity(), after_token_commit);
+
+    let Err(error) =
+        product.migration_store_structures(vec![ProductStructureMutation::StringSetConditional {
+            key: key(8, b"greeting")?,
+            value: b"migration".to_vec(),
+            expires_at_micros: None,
+            if_present: false,
+        }])
+    else {
+        return Err("migration no-op reached the runtime commit".into());
+    };
+    assert_eq!(error.code(), ProductErrorCode::InvalidRequest);
+
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
 }
 
 #[test]
@@ -321,7 +623,11 @@ fn every_structure_family_is_catalogued_atomic_and_snapshot_equal()
             ],
         },
     )?;
-    assert!(matches!(response, ProductResponse::StructureMutated(_)));
+    assert!(matches!(
+        response,
+        ProductResponse::StructureMutationBatch(ref receipt)
+            if receipt.commit.is_some() && receipt.results.len() == 12
+    ));
 
     let request = context(&session, 2);
     let read = product.dispatch(

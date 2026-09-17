@@ -290,7 +290,7 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
 }
 
 export function responseRequiredMinor(kind: number): number {
-  if (kind === 45) return 7;
+  if (kind === 45 || kind === 46) return 7;
   if (kind >= 32 && kind <= 37) return 1;
   if (kind >= 38 && kind <= 41) return 2;
   if (kind >= 42 && kind <= 44) return 3;
@@ -677,6 +677,28 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
     const value = decodeCommitOutcome(reader);
     reader.finish();
     return { kind: "structure_mutated", value, requestId };
+  }
+  if (kind === 46) {
+    const readCsn = reader.u64();
+    const hasCommit = reader.boolean();
+    reader.zeroes(7);
+    const count = boundedCount(reader.u32(), 1_024, reader, 2, "structure mutation result");
+    if (count === 0) throw new ClientError("structure mutation result count is invalid");
+    reader.zeroes(4);
+    const results = Array.from({ length: count }, () => ({
+      changed: reader.boolean(),
+      result: decodeStructureMutationResult(reader),
+    }));
+    const commit = hasCommit ? decodeCommitReceipt(reader) : undefined;
+    if (hasCommit !== results.some((result) => result.changed)) {
+      throw new ClientError("structure mutation batch commit evidence is inconsistent");
+    }
+    reader.finish();
+    return {
+      kind: "structure_mutation_batch",
+      value: { readCsn: readCsn === 0n ? undefined : readCsn, commit, results },
+      requestId,
+    };
   }
   if (kind === 24) {
     const value = { snapshot: decodeSnapshot(reader), result: decodeStructureRead(reader) };

@@ -116,7 +116,11 @@ mod tests {
                 .count(),
             18
         );
-        assert!(contract.contains("description: Exact Native product protocol minor"));
+        assert!(
+            contract
+                .contains("description: Bounded comma-separated Native product protocol minors")
+        );
+        assert!(contract.contains("enum: [\"3\", \"4\", \"5\", \"6\", \"7\"]"));
         assert!(contract.contains("Generic /v2/execute rejects these variants"));
         assert!(contract.contains("legacy-migration-1.2:"));
         assert!(contract.contains("Canonical hyp1 is always parsed without fallback"));
