@@ -250,11 +250,11 @@
         "sha256": "8f6e779983000ebbad1c9b15d01268d29a94da441e4fdf291334b2477416b0b9"
       },
       {
-        "canonical_sha256": "b2c959b21c68be09a4ad9f06151eb57c7d23fd0981eeda9a1dd756281b962e47",
+        "canonical_sha256": "2a5e8165b9020bad84f5d8a5efb1405f00e44e9d5d6769a8f841a20e325fa34e",
         "lock": "integrations/javascript/package-lock.json",
         "package_count": 290,
         "result": "pass",
-        "sha256": "f752ffa88d236944b6bca6002826c4d09d4d447493b01f4b25f839a0e64e8620"
+        "sha256": "18f176b8ceae98a644854185e3c42995ee2e16720ff27b8d223b0c2831d206b0"
       },
       {
         "canonical_sha256": "b7b74e6a030db3f37862937b67541e996cc6bd444761790b5cc603ac4dac1ea0",
