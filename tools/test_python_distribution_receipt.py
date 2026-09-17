@@ -16,8 +16,10 @@ from unittest import mock
 from tools.python_distribution_receipt import (
     CRYPTOGRAPHIC_VERIFIER,
     INSTALLATION_EVIDENCE_SCHEMA,
+    PYTHON_3_0_0_RECOVERY_AUTHORITY,
     WORKFLOW_REF,
     PythonReceiptError,
+    _release_authority,
     build_receipt,
     check_local_distributions,
     load_local_json,
@@ -31,6 +33,8 @@ from tools.python_distribution_receipt import (
 COMMIT = "a" * 40
 TREE = "b" * 40
 WORKFLOW_SHA = "c" * 40
+TAG = "release-v1.2.0-crates"
+TAG_OBJECT = "d" * 40
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -64,8 +68,9 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 return build_receipt(
                     directory,
                     "1.2.0",
-                    "v1.2.0",
+                    TAG,
                     COMMIT,
+                    source_tag_object=TAG_OBJECT,
                     reproducible_directory=repeated,
                     independent_build_receipts=receipts,
                     publication_authority=authority,
@@ -88,7 +93,12 @@ class PythonDistributionReceiptTests(unittest.TestCase):
     def publication_contract(
         self, root: Path, first: Path, second: Path, repository: str
     ) -> tuple[tuple[Path, Path], Path]:
-        source = {"tag": "v1.2.0", "commit": COMMIT, "tree": TREE}
+        source = {
+            "tag": TAG,
+            "tag_object": TAG_OBJECT,
+            "commit": COMMIT,
+            "tree": TREE,
+        }
         receipts = []
         receipt_values = []
         for builder, directory in (("a", first), ("b", second)):
@@ -123,7 +133,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 "builder": value["builder"],
                 "artifact": {
                     "id": 100 + index,
-                    "name": (f"hyphae-python-independent-{value['builder']}-v1.2.0"),
+                    "name": (f"hyphae-python-independent-{value['builder']}-{TAG}"),
                     "digest": f"sha256:{str(index + 1) * 64}",
                 },
                 "receipt_sha256": sha256_bytes(path.read_bytes()),
@@ -176,6 +186,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
             },
             "release_evidence": {
                 "filename": f"hyphae-{source['tag']}.release-evidence.json",
+                "ref": f"refs/tags/{source['tag']}",
                 "sha256": "4" * 64,
             },
             "sboms": {
@@ -209,6 +220,68 @@ class PythonDistributionReceiptTests(unittest.TestCase):
             },
         }
 
+    def recovery_release_authority(self) -> tuple[dict[str, object], dict[str, object]]:
+        recovery = PYTHON_3_0_0_RECOVERY_AUTHORITY
+
+        def run(
+            values: dict[str, object], workflow: str
+        ) -> dict[str, object]:
+            return {
+                "id": values.get("id", values.get("run_id")),
+                "attempt": values.get("attempt", values.get("run_attempt")),
+                "event": values["event"],
+                "status": "completed",
+                "conclusion": "success",
+                "head_branch": values["head_branch"],
+                "head_sha": values["head_sha"],
+                "path": workflow,
+                "repository": "Hyphae-Research-Foundation/hyphae",
+            }
+
+        source = copy.deepcopy(recovery["source"])
+        tag = source["tag"]
+        commit = source["commit"]
+        release = {
+            "run": run(recovery["release_run"], ".github/workflows/release.yml"),
+            "artifact": {
+                "id": 300,
+                "name": "hyphae-release-candidate",
+                "digest": f"sha256:{'3' * 64}",
+            },
+            "release_evidence": {
+                "filename": f"hyphae-{tag}.release-evidence.json",
+                **recovery["release_evidence"],
+            },
+            "sboms": {
+                "spdx": {
+                    "filename": f"hyphae-{tag}.spdx.json",
+                    "sha256": recovery["sboms"]["spdx"],
+                },
+                "cyclonedx": {
+                    "filename": f"hyphae-{tag}.cdx.json",
+                    "sha256": recovery["sboms"]["cyclonedx"],
+                },
+            },
+            "g8_closure": {
+                "run": run(
+                    recovery["g8_closure"],
+                    ".github/workflows/native-g8-closure.yml",
+                ),
+                "artifact": {
+                    "id": 301,
+                    "name": f"native-g8-aggregate-{commit}",
+                    "digest": f"sha256:{'7' * 64}",
+                },
+                "aggregate": {
+                    "filename": "native-g8-aggregate.json",
+                    "sha256": recovery["g8_closure"]["aggregate_sha256"],
+                    "claims": ["G8"],
+                    "closure_declared": True,
+                },
+            },
+        }
+        return source, release
+
     def run_metadata(self, **overrides: object) -> dict[str, object]:
         metadata: dict[str, object] = {
             "id": 123,
@@ -238,6 +311,34 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 for entry in distributions.values()
             ],
         }
+
+    def historical_receipt(self, receipt: dict[str, object]) -> dict[str, object]:
+        historical = copy.deepcopy(receipt)
+        sources = [
+            historical["source"],
+            historical["publication_authority"]["source"],
+        ]
+        testpypi = historical.get("testpypi_authority")
+        if isinstance(testpypi, dict):
+            sources.append(testpypi["source"])
+        for source in sources:
+            source["tag"] = "v1.2.0"
+            del source["tag_object"]
+        for build in historical["publication_authority"]["independent_builds"]:
+            build["artifact"]["name"] = build["artifact"]["name"].replace(
+                TAG, "v1.2.0"
+            )
+        release = historical["publication_authority"]["release_authority"]
+        if isinstance(release, dict):
+            release["run"]["head_branch"] = "v1.2.0"
+            del release["release_evidence"]["ref"]
+            for entry in (
+                release["release_evidence"],
+                release["sboms"]["spdx"],
+                release["sboms"]["cyclonedx"],
+            ):
+                entry["filename"] = entry["filename"].replace(TAG, "v1.2.0")
+        return historical
 
     def provenance(
         self, filename: str, digest: str, *, repository: str = "testpypi"
@@ -352,6 +453,134 @@ class PythonDistributionReceiptTests(unittest.TestCase):
             ],
             ["a", "b"],
         )
+        self.assertEqual(receipt["source"]["tag"], TAG)
+        self.assertEqual(receipt["source"]["tag_object"], TAG_OBJECT)
+
+    def test_new_receipt_generation_rejects_historical_tag_alias(self) -> None:
+        with (
+            self.fixture() as directory,
+            self.fixture() as repeated,
+            tempfile.TemporaryDirectory() as evidence,
+        ):
+            receipts, authority = self.publication_contract(
+                Path(evidence), Path(directory), Path(repeated), "testpypi"
+            )
+            with self.assertRaisesRegex(PythonReceiptError, "canonical"):
+                build_receipt(
+                    Path(directory),
+                    "1.2.0",
+                    "v1.2.0",
+                    COMMIT,
+                    source_tag_object=TAG_OBJECT,
+                    reproducible_directory=Path(repeated),
+                    independent_build_receipts=receipts,
+                    publication_authority=authority,
+                    source_tree=TREE,
+                    workflow_repository="Hyphae-Research-Foundation/hyphae",
+                    workflow_ref=WORKFLOW_REF,
+                    workflow_sha=WORKFLOW_SHA,
+                    workflow_run_id=123,
+                    workflow_run_attempt=1,
+                    repository="testpypi",
+                )
+
+    def test_previous_v2_source_tag_shape_remains_valid(self) -> None:
+        with self.fixture() as directory, self.fixture() as repeated:
+            receipt = self.build(Path(directory), Path(repeated))
+        validate_receipt(
+            self.historical_receipt(receipt), expected_status="built"
+        )
+
+    def test_3_0_0_recovery_authority_is_exactly_pinned(self) -> None:
+        self.assertEqual(
+            PYTHON_3_0_0_RECOVERY_AUTHORITY,
+            {
+                "source": {
+                    "tag": "release-v3.0.0-crates",
+                    "tag_object": "0bc6fe56498472804c3cc376b5b28d7652955701",
+                    "commit": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+                    "tree": "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff",
+                },
+                "release_run": {
+                    "id": 33838703304,
+                    "attempt": 1,
+                    "event": "workflow_dispatch",
+                    "head_branch": "main",
+                    "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af",
+                },
+                "release_evidence": {
+                    "ref": "refs/heads/main",
+                    "sha256": "34c791a0cda982389cd55fb055376af20e174a7ef1921c4816d38ad6ec798c61",
+                },
+                "sboms": {
+                    "spdx": "c146fde572531fe665f8a2b1460035cb9deb251b95cb95ca65568865009ee209",
+                    "cyclonedx": "460093bcbe2943e4803e48225b624a41ff44599f98d028a39f2b23486fde472d",
+                },
+                "g8_closure": {
+                    "run_id": 33836655173,
+                    "run_attempt": 1,
+                    "event": "workflow_dispatch",
+                    "head_branch": "release/fix/release-readiness-semver-offline-merge-evidence",
+                    "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
+                    "aggregate_sha256": "41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf",
+                },
+            },
+        )
+        source, release = self.recovery_release_authority()
+        _release_authority(release, source)
+        mutations = (
+            ("source-tag", "source", ("tag",), "release-v3.0.1-crates"),
+            ("source-tag-object", "source", ("tag_object",), "e" * 40),
+            ("source-commit", "source", ("commit",), "e" * 40),
+            ("source-tree", "source", ("tree",), "e" * 40),
+            ("release-run", "release", ("run", "id"), 33838703305),
+            ("release-attempt", "release", ("run", "attempt"), 2),
+            ("release-event", "release", ("run", "event"), "push"),
+            (
+                "release-ref",
+                "release",
+                ("release_evidence", "ref"),
+                "refs/tags/release-v3.0.0-crates",
+            ),
+            ("release-head", "release", ("run", "head_sha"), "e" * 40),
+            ("release-branch", "release", ("run", "head_branch"), "feature"),
+            (
+                "release-workflow",
+                "release",
+                ("run", "path"),
+                ".github/workflows/other.yml",
+            ),
+            (
+                "release-evidence",
+                "release",
+                ("release_evidence", "sha256"),
+                "e" * 64,
+            ),
+            ("spdx", "release", ("sboms", "spdx", "sha256"), "e" * 64),
+            ("cyclonedx", "release", ("sboms", "cyclonedx", "sha256"), "e" * 64),
+            ("g8-run", "release", ("g8_closure", "run", "id"), 33836655174),
+            ("g8-attempt", "release", ("g8_closure", "run", "attempt"), 2),
+            ("g8-event", "release", ("g8_closure", "run", "event"), "push"),
+            ("g8-branch", "release", ("g8_closure", "run", "head_branch"), "main"),
+            ("g8-head", "release", ("g8_closure", "run", "head_sha"), "e" * 40),
+            (
+                "g8-workflow",
+                "release",
+                ("g8_closure", "run", "path"),
+                ".github/workflows/other.yml",
+            ),
+            ("g8-digest", "release", ("g8_closure", "aggregate", "sha256"), "e" * 64),
+        )
+        for name, container, path, value in mutations:
+            with self.subTest(name=name):
+                changed_source = copy.deepcopy(source)
+                changed_release = copy.deepcopy(release)
+                target = changed_source if container == "source" else changed_release
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaises(PythonReceiptError):
+                    _release_authority(changed_release, changed_source)
 
     def test_publication_authority_binds_exact_builder_receipt_bytes(self) -> None:
         with (
@@ -371,8 +600,9 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 build_receipt(
                     Path(directory),
                     "1.2.0",
-                    "v1.2.0",
+                    TAG,
                     COMMIT,
+                    source_tag_object=TAG_OBJECT,
                     reproducible_directory=Path(repeated),
                     independent_build_receipts=receipts,
                     publication_authority=authority,
@@ -424,8 +654,9 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                         build_receipt(
                             Path(directory),
                             "1.2.0",
-                            "v1.2.0",
+                            TAG,
                             COMMIT,
+                            source_tag_object=TAG_OBJECT,
                             reproducible_directory=Path(repeated),
                             independent_build_receipts=receipts,
                             publication_authority=authority,
@@ -443,8 +674,8 @@ class PythonDistributionReceiptTests(unittest.TestCase):
         with self.fixture() as directory, self.fixture() as repeated:
             receipt = self.build(Path(directory), Path(repeated))
             encoded = json.dumps(receipt).replace(
-                '"source": {"tag": "v1.2.0",',
-                '"source": {"tag": "v1.2.0", "tag": "v1.2.0",',
+                f'"source": {{"tag": "{TAG}",',
+                f'"source": {{"tag": "{TAG}", "tag": "{TAG}",',
                 1,
             )
             with self.assertRaisesRegex(PythonReceiptError, "duplicate.*tag"):
@@ -544,6 +775,14 @@ class PythonDistributionReceiptTests(unittest.TestCase):
         self.assertEqual(pypi["testpypi_authority"]["run"]["id"], 123)
         self.assertEqual(
             pypi["testpypi_authority"]["run_metadata"]["conclusion"], "success"
+        )
+        release = pypi["publication_authority"]["release_authority"]
+        self.assertEqual(release["run"]["event"], "push")
+        self.assertEqual(release["run"]["head_branch"], TAG)
+        self.assertEqual(release["run"]["head_sha"], COMMIT)
+        self.assertEqual(release["release_evidence"]["ref"], f"refs/tags/{TAG}")
+        validate_receipt(
+            self.historical_receipt(pypi), expected_status="built"
         )
 
     def test_pypi_rejects_authority_digest_and_source_drift(self) -> None:
@@ -967,6 +1206,90 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                     cryptographic_verifier=rejected,
                 )
 
+    def test_schema_pins_recovery_source_across_the_full_receipt(self) -> None:
+        schema = ROOT / "docs/release/schema/python-distribution-receipt-v2.schema.json"
+        with (
+            self.fixture() as directory,
+            self.fixture() as repeated,
+            tempfile.NamedTemporaryFile() as authority,
+            tempfile.NamedTemporaryFile() as metadata,
+            tempfile.TemporaryDirectory() as samples,
+        ):
+            built = self.build(Path(directory), Path(repeated))
+            published, _ = self.publish(built)
+            authority_bytes = (json.dumps(published, sort_keys=True) + "\n").encode()
+            authority.write(authority_bytes)
+            authority.flush()
+            metadata.write(json.dumps(self.run_metadata()).encode())
+            metadata.flush()
+            receipt = self.build(
+                Path(directory),
+                Path(repeated),
+                repository="pypi",
+                testpypi_receipt=Path(authority.name),
+                testpypi_run_metadata=Path(metadata.name),
+                testpypi_receipt_sha256=sha256_bytes(authority_bytes),
+                testpypi_run_id=123,
+            )
+            source, release = self.recovery_release_authority()
+            receipt["version"] = "3.0.0"
+            receipt["source"] = copy.deepcopy(source)
+            receipt["publication_authority"]["source"] = copy.deepcopy(source)
+            receipt["publication_authority"]["release_authority"] = release
+            receipt["testpypi_authority"]["source"] = copy.deepcopy(source)
+
+            valid_path = Path(samples, "valid.json")
+            valid_path.write_text(json.dumps(receipt), encoding="utf-8")
+            mutations = (
+                (("version",), "3.0.1"),
+                (("source", "tag"), "release-v3.0.1-crates"),
+                (("source", "tag_object"), "e" * 40),
+                (("source", "commit"), "e" * 40),
+                (("source", "tree"), "e" * 40),
+                (("publication_authority", "source", "commit"), "e" * 40),
+                (("testpypi_authority", "source", "tree"), "e" * 40),
+            )
+            invalid_paths = []
+            for index, (path, value) in enumerate(mutations):
+                invalid = copy.deepcopy(receipt)
+                target = invalid
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                invalid_path = Path(samples, f"invalid-{index}.json")
+                invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+                invalid_paths.append(invalid_path)
+
+            script = (
+                "import json,sys; "
+                "from jsonschema import Draft202012Validator; "
+                "schema=json.load(open(sys.argv[1], encoding='utf-8')); "
+                "validator=Draft202012Validator(schema); "
+                "validator.validate(json.load(open(sys.argv[2], encoding='utf-8'))); "
+                "assert all(not validator.is_valid(json.load(open(path, encoding='utf-8'))) "
+                "for path in sys.argv[3:])"
+            )
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "--quiet",
+                    "--no-project",
+                    "--with",
+                    "jsonschema==4.25.1",
+                    "python",
+                    "-c",
+                    script,
+                    str(schema),
+                    str(valid_path),
+                    *(str(path) for path in invalid_paths),
+                ],
+                check=False,
+                capture_output=True,
+                timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_schema_metaschema_and_built_published_samples_are_semantic(self) -> None:
         schema = ROOT / "docs/release/schema/python-distribution-receipt-v2.schema.json"
         with (
@@ -976,8 +1299,13 @@ class PythonDistributionReceiptTests(unittest.TestCase):
         ):
             built = self.build(Path(directory), Path(repeated))
             published, _ = self.publish(built)
+            historical = self.historical_receipt(built)
             sample_paths = []
-            for name, value in (("built", built), ("published", published)):
+            for name, value in (
+                ("built", built),
+                ("published", published),
+                ("historical", historical),
+            ):
                 path = Path(samples, f"{name}.json")
                 path.write_text(json.dumps(value), encoding="utf-8")
                 sample_paths.append(path)
@@ -987,6 +1315,9 @@ class PythonDistributionReceiptTests(unittest.TestCase):
             ]
             invalid_path = Path(samples, "invalid.json")
             invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+            _, recovery = self.recovery_release_authority()
+            recovery_path = Path(samples, "recovery-authority.json")
+            recovery_path.write_text(json.dumps(recovery), encoding="utf-8")
             script = (
                 "import json,sys; "
                 "from jsonschema import Draft202012Validator; "
@@ -994,7 +1325,11 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                 "Draft202012Validator.check_schema(schema); "
                 "validator=Draft202012Validator(schema); "
                 "[validator.validate(json.load(open(path, encoding='utf-8'))) "
-                "for path in sys.argv[2:]]"
+                "for path in sys.argv[2:-1]]; "
+                "release_schema={'$schema':schema['$schema'], '$defs':schema['$defs'], "
+                "'$ref':'#/$defs/release_authority'}; "
+                "Draft202012Validator(release_schema).validate("
+                "json.load(open(sys.argv[-1], encoding='utf-8')))"
             )
             result = subprocess.run(
                 [
@@ -1009,6 +1344,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                     script,
                     str(schema),
                     *(str(path) for path in sample_paths),
+                    str(recovery_path),
                 ],
                 check=False,
                 capture_output=True,
@@ -1027,6 +1363,7 @@ class PythonDistributionReceiptTests(unittest.TestCase):
                     script,
                     str(schema),
                     str(invalid_path),
+                    str(recovery_path),
                 ],
                 check=False,
                 capture_output=True,
@@ -1098,6 +1435,16 @@ class PythonDistributionReceiptTests(unittest.TestCase):
         self.assertEqual(
             schema["$defs"]["distributions"]["properties"]["wheel"]["$ref"],
             "#/$defs/wheel_distribution",
+        )
+        self.assertEqual(
+            schema["$defs"]["canonical_source"]["properties"]["tag"]["pattern"],
+            "^release-v[0-9]+\\.[0-9]+\\.[0-9]+-crates$",
+        )
+        self.assertEqual(
+            schema["$defs"]["recovery_release_run"]["allOf"][1]["properties"][
+                "id"
+            ]["const"],
+            33838703304,
         )
         installation = schema["$defs"]["installation_evidence"]
         self.assertEqual(installation["minItems"], 4)

@@ -60,8 +60,42 @@ class PythonPackageContractTests(unittest.TestCase):
         with self.fixture() as directory:
             root = Path(directory)
             self.remove_from_workflow(root, 'test "$version" = "3.0.0"')
-            with self.assertRaisesRegex(PythonPackageValidationError, "workflow|2.1.0"):
+            with self.assertRaisesRegex(PythonPackageValidationError, "workflow|3.0.0"):
                 validate(root)
+
+    def test_live_workflow_rejects_every_noncanonical_tag_alias(self) -> None:
+        canonical = (
+            '[[ "$SOURCE_TAG" =~ '
+            '^release-v[0-9]+\\.[0-9]+\\.[0-9]+-crates$ ]]'
+        )
+        aliases = (
+            '[[ "$SOURCE_TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+            '[[ "$SOURCE_TAG" =~ ^release-v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+            '[[ "$SOURCE_TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+-crates$ ]]',
+            '[[ "$SOURCE_TAG" =~ ^release-v[0-9]+\\.[0-9]+\\.[0-9]+.*-crates$ ]]',
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias), self.fixture() as directory:
+                root = Path(directory)
+                self.replace_in_workflow(root, canonical, alias)
+                with self.assertRaisesRegex(
+                    PythonPackageValidationError, "canonical|legacy"
+                ):
+                    validate(root)
+
+    def test_canonical_tag_version_derivation_cannot_regress(self) -> None:
+        mutations = (
+            ('version="${SOURCE_TAG#release-v}"', 'version="${SOURCE_TAG#v}"'),
+            ('version="${version%-crates}"', 'version="$version"'),
+            ('test "$version" = "$package_version"', "true # package version"),
+            ('test "$version" = "$workspace_version"', "true # workspace version"),
+        )
+        for before, after in mutations:
+            with self.subTest(before=before), self.fixture() as directory:
+                root = Path(directory)
+                self.replace_in_workflow(root, before, after)
+                with self.assertRaises(PythonPackageValidationError):
+                    validate(root)
 
     def test_distribution_name_cannot_collide_with_unrelated_project(self) -> None:
         with self.fixture() as directory:
@@ -117,6 +151,11 @@ class PythonPackageContractTests(unittest.TestCase):
             "artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}",
             "--no-cache",
             "--publication-artifact-sha256",
+            "--source-tag-object '${{ steps.source.outputs.tag-object }}'",
+            "PYTHON_3_0_0_RECOVERY_AUTHORITY",
+            "validate_aggregate(aggregate, os.environ[\"SOURCE_COMMIT\"])",
+            'raise SystemExit("normal G8 run differs from canonical authority")',
+            '"ref": evidence["workflow"]["ref"]',
         ):
             with self.subTest(fragment=fragment), self.fixture() as directory:
                 root = Path(directory)

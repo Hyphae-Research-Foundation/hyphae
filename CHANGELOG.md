@@ -5,8 +5,8 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
 ## Unreleased — Agent Memory / Omarchy candidate
 
-- Make `release-vVERSION-crates` the canonical Release workflow trigger and
-  evidence-schema identity while retaining historical `vVERSION` validation.
+- Make `release-vVERSION-crates` the canonical Release and Python publication
+  identity while retaining validation of the previous `vVERSION` source shape.
 - Add snapshot-coherent `MemoryRecall` (wire 71/45, minor 7) and memory proof
   kind 8 / semantics 6. Project eligibility and live lifecycle filtering apply
   before candidate selection; offline replay seals the complete composition

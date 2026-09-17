@@ -37,8 +37,12 @@ match the workspace version. The release workflow builds on each native
 operating system and emits SHA-256 checksums, SPDX and CycloneDX SBOMs, GitHub
 Actions SLSA v1 provenance predicates, and keyless Sigstore signature,
 provenance, and SBOM-attestation bundles. Manual workflow runs execute the
-complete build/sign/verify path but cannot publish; only a matching `v*` tag
-enters the publish job.
+complete build/sign/verify path but cannot publish unless they supply the
+existing immutable tag and exact peeled commit for an authorized recovery. The
+normal publish authority is a matching `release-vVERSION-crates` tag push. A
+Python publication uses that same tag and must not create an SDK-specific tag;
+its only retained manual Release authority is the exactly pinned `3.0.0`
+recovery tuple.
 
 ## Consequences
 
