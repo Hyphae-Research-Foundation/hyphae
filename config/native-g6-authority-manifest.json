@@ -57,7 +57,7 @@
     },
     {
       "reference": "docs/native/local-product-v1.md",
-      "sha256": "512af08594631e37b1daf8a8f986ed02f6853f6dab2253a94927260c4ac35bf2"
+      "sha256": "2758727a1a6263562f67462cd2460a23409bbacc89048194c12746a3c820906d"
     },
     {
       "reference": "docs/native/product-error-v1.md",
@@ -85,11 +85,11 @@
     },
     {
       "reference": "docs/native/http-v2.md",
-      "sha256": "6dd9917bb29b3e0f6a97be6e7b5dd92270632b8407bc71ab17b08d2532073a7a"
+      "sha256": "ad7ce26c6ff69a724469246e6ba42d5f1230532579ffb733a2386ef6bd934e27"
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "458077c0788182a912d7e43a712c2eca70d7d7a3f3768994184453054b9391ef"
+      "sha256": "6959945f20f130c1d86ebb35f82d2ac57dec4d1ae067e3d8fe6d47a77a58ff8e"
     },
     {
       "reference": "docs/native/catalog-v1.md",
@@ -109,7 +109,7 @@
     },
     {
       "reference": "contracts/openapi/hyphae-v2.yaml",
-      "sha256": "6a1d2209cbc01b0c04a0b4f6806c4514ff75be95dd695ce7a842680e19d45036"
+      "sha256": "3ed67d4c7f46101fb3100f41b991bb29cc43230a7ffff70d1ab7b2360f73a5c3"
     },
     {
       "reference": "contracts/json-schema/native-v2.schema.json",
