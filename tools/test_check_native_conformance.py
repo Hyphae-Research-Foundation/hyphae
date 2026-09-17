@@ -275,7 +275,10 @@ class NativeConformanceProfileTests(unittest.TestCase):
         self.assertIn("pull_request:", workflow)
         self.assertIn("head_sha: sha", workflow)
         self.assertIn("steps.ci.outputs.run_id", workflow)
-        self.assertIn("attempt <= 80", workflow)
+        self.assertIn("timeout-minutes: 90", workflow)
+        self.assertIn("retries: 3", workflow)
+        self.assertIn("const maxAttempts = 160", workflow)
+        self.assertIn("attempt <= maxAttempts", workflow)
         self.assertIn("item.conclusion === 'success'", workflow)
         self.assertIn("--aggregate", workflow)
         for platform in ("linux", "macos", "windows"):

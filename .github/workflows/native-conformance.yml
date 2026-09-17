@@ -17,6 +17,7 @@ jobs:
   aggregate:
     name: Native conformance aggregate
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Check out the exact tested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,10 +31,12 @@ jobs:
         id: ci
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
+          retries: 3
           script: |
             const sha = context.payload.pull_request?.head.sha || context.sha;
+            const maxAttempts = 160;
             let run;
-            for (let attempt = 1; attempt <= 80; attempt++) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
               const response = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -45,7 +48,7 @@ jobs:
                 .filter(item => item.head_sha === sha && item.conclusion === 'success')
                 .sort((a, b) => b.run_number - a.run_number)[0];
               if (run) break;
-              core.info(`waiting for successful CI run for ${sha} (${attempt}/80)`);
+              core.info(`waiting for successful CI run for ${sha} (${attempt}/${maxAttempts})`);
               await new Promise(resolve => setTimeout(resolve, 30000));
             }
             if (!run) {
