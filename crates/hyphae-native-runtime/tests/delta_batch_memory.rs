@@ -9,8 +9,8 @@ use std::{
 };
 
 use hyphae_native_runtime::{
-    GovernorAdmissionError, NativeDatabase, NativeDeltaWriteBatch, NativeRuntimeError, SqlError,
-    SqlResult,
+    GovernorAdmissionError, HnswConfig, NativeDatabase, NativeDeltaWriteBatch, NativeRuntimeError,
+    SqlError, SqlResult, Vector, VectorMetric,
 };
 use hyphae_native_types::{DurabilityClass, ObjectId, ScalarValue};
 
@@ -469,6 +469,72 @@ fn failed_hash_increment_restores_hydration_and_keeps_prior_stage_committable()
     assert_eq!(
         database.get_latest_structure(b"prior-stage", 2)?,
         Some(b"committed".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn ann_delta_hydration_is_rejected_before_the_parent_allocation_is_exceeded()
+-> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("data");
+    let mut database = NativeDatabase::create(&data)?;
+    let config = HnswConfig::new(4, 16, 8, 32, 7)?;
+    let indexes = (0_u128..64)
+        .map(|offset| ObjectId::new(10_000 + offset))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.iter().enumerate() {
+        seed.create_vector_index(
+            *index,
+            &format!("bounded-{ordinal}"),
+            2,
+            VectorMetric::SquaredL2,
+            config,
+        )?;
+    }
+    seed.commit()?;
+
+    let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Memory)?;
+    let mut admitted = Vec::new();
+    let mut rejected = None;
+    for (ordinal, index) in indexes.iter().enumerate() {
+        let object = ObjectId::new(20_000 + u128::try_from(ordinal)?)?;
+        let before = delta.mutation_count();
+        match database.stage_delta_upsert_vector(
+            &mut delta,
+            *index,
+            object,
+            Vector::new([1.0, 0.0])?,
+        ) {
+            Ok(()) => admitted.push((*index, object)),
+            Err(error) if is_capacity_rejection(&error) => {
+                assert_eq!(delta.mutation_count(), before);
+                rejected = Some((*index, object));
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (rejected_index, rejected_object) = rejected.ok_or("ANN delta capacity did not bind")?;
+    assert!(!admitted.is_empty());
+    database.commit_optimistic(delta)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    for (index, object) in admitted {
+        assert!(
+            reopened
+                .search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?
+                .first()
+                .is_some_and(|hit| hit.object_id == object)
+        );
+    }
+    assert!(
+        reopened
+            .search_vector_exact_latest(rejected_index, &Vector::new([1.0, 0.0])?, 1,)?
+            .iter()
+            .all(|hit| hit.object_id != rejected_object)
     );
     Ok(())
 }

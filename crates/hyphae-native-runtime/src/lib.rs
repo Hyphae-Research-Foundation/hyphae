@@ -326,6 +326,18 @@ fn reject_full_catalog_state_load_for_test() -> Result<(), NativeRuntimeError> {
 static FULL_STATE_LOADS: AtomicU64 = AtomicU64::new(0);
 static FULL_CATALOG_STATE_LOADS: AtomicU64 = AtomicU64::new(0);
 
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn record_full_state_materialization() -> Result<(), NativeRuntimeError> {
+    FULL_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_FULL_STATE_LOADS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    if FAIL_FULL_STATE_LOAD.get() {
+        return Err(NativeRuntimeError::UnexpectedFullStateLoad);
+    }
+    Ok(())
+}
+
 use crate::{
     hash_pattern::HashPatternMatchBudget,
     model::{
@@ -2116,7 +2128,7 @@ pub struct NativePhysicalObservation {
     pub physical_page_reads: u64,
     /// Current physical bytes in the active WAL file.
     pub wal_bytes: u64,
-    /// Process-wide complete all-engine state materializations.
+    /// Process-wide complete engine-state materializations.
     pub process_full_state_loads: u64,
     /// Process-wide complete catalog-tree materializations.
     pub process_full_catalog_loads: u64,
@@ -2126,7 +2138,7 @@ pub struct NativePhysicalObservation {
 /// not materialize complete engine or catalog state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeMaterializationObservation {
-    /// Complete all-engine state materializations observed by this process.
+    /// Complete engine-state materializations observed by this process.
     pub full_state_loads: u64,
     /// Complete catalog-tree materializations observed by this process.
     pub full_catalog_loads: u64,
@@ -18670,6 +18682,144 @@ impl NativeDatabase {
         staged
     }
 
+    /// Stages one named-vector upsert through the durable ANN object delta.
+    ///
+    /// Only the target index metadata and its bounded object delta are
+    /// hydrated; the immutable HNSW base and unrelated engines remain on
+    /// their committed pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-delta batch, unknown index, invalid vector,
+    /// exhausted ANN delta bound, resource rejection, or physical corruption.
+    pub fn stage_delta_upsert_vector(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        index: ObjectId,
+        object_id: ObjectId,
+        vector: Vector,
+    ) -> Result<(), NativeRuntimeError> {
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        let encoded = ann_store::encode_vector_mutation(&vector);
+        let candidate_charge =
+            delta_payload_retained_charge(std::mem::size_of::<u128>(), encoded.capacity(), 1, 1)
+                .saturating_add(
+                    ann_store::AnnDeltaMutationState::upsert_retained_memory_bytes(&vector),
+                )
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+
+        let already_hydrated = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .ann_mutations
+            .contains_key(&index);
+        let mut added_catalog_object = false;
+        if !already_hydrated {
+            let catalog_candidate = self.delta_search_index_candidate(batch, index)?;
+            let search_definition = match catalog_candidate
+                .as_ref()
+                .map(|(object, _)| object)
+                .or_else(|| batch.state.catalog.object(index))
+            {
+                Some(CatalogObject::Search(definition)) if definition.ann.is_some() => definition,
+                _ => return Err(NativeRuntimeError::UnknownVectorIndex { index }),
+            };
+            let definition = ann_store::definition_from_search(search_definition)?;
+            let root = batch
+                .snapshot
+                .roots()
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let plan = ann_store::plan_delta_mutation(
+                &self.pages,
+                &self.buffer_pool,
+                root,
+                index,
+                definition,
+            )?;
+            let catalog_charge = catalog_candidate
+                .as_ref()
+                .map_or(0, |(_, retained_bytes)| *retained_bytes);
+            Self::ensure_delta_memory_growth(
+                batch,
+                catalog_charge.saturating_add(plan.retained_memory_bytes()),
+            )?;
+            let authority = ann_store::load_delta_mutation(&self.pages, &self.buffer_pool, plan)?;
+            if let Some((object, retained_bytes)) = catalog_candidate {
+                batch.state.catalog.create(object)?;
+                batch
+                    .delta
+                    .as_mut()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                    .catalog_object_memory_bytes
+                    .insert(index, retained_bytes);
+                added_catalog_object = true;
+            }
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .ann_mutations
+                .insert(index, authority);
+            Self::refresh_delta_memory_ledger(batch)?;
+            if let Err(error) = Self::ensure_delta_memory_growth(batch, candidate_charge) {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+                return Err(error);
+            }
+        }
+
+        let staged = batch
+            .delta
+            .as_mut()
+            .and_then(|delta| delta.ann_mutations.get_mut(&index))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .upsert(object_id, vector);
+        if let Err(error) = staged {
+            if !already_hydrated {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
+        batch.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::UpsertVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(object_id),
+            value: encoded,
+            expires_at_micros: None,
+        });
+        batch.dirty[3] = true;
+        Self::refresh_delta_memory_ledger(batch)
+    }
+
+    fn restore_delta_ann_hydration(
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        added_catalog_object: bool,
+    ) -> Result<(), NativeRuntimeError> {
+        {
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            delta.ann_mutations.remove(&index);
+            if added_catalog_object {
+                batch.state.catalog.objects.remove(&index);
+                delta.catalog_object_memory_bytes.remove(&index);
+            }
+        }
+        let retained = replay_delta_retained_memory_bytes(batch);
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes = retained;
+        Ok(())
+    }
+
     fn require_delta_batch(&self, batch: &NativeWriteBatch) -> Result<(), NativeRuntimeError> {
         if batch.directory_identity != *self.directory_identity()
             || !self.owns_detached_batch(batch)
@@ -21103,6 +21253,7 @@ struct DeltaOverlay {
     structure_hash_memory_bytes: u64,
     retained_memory_bytes: u64,
     search_documents: BTreeSet<(ObjectId, Vec<u8>)>,
+    ann_mutations: BTreeMap<ObjectId, ann_store::AnnDeltaMutationState>,
     unique_probes: BTreeSet<DeltaUniqueProbe>,
 }
 
@@ -21307,6 +21458,9 @@ fn retained_delta_overlay_bytes(delta: &DeltaOverlay) -> u64 {
         bytes = bytes
             .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
             .saturating_add(retained_vec_bytes(document_id));
+    }
+    for authority in delta.ann_mutations.values() {
+        bytes = bytes.saturating_add(authority.retained_memory_bytes());
     }
     for probe in &delta.unique_probes {
         bytes = bytes
@@ -21797,7 +21951,7 @@ impl GroupCommitStorage<'_, '_> {
         }
 
         let concrete_roots = require_roots(roots)?;
-        let wal_mutations = wal_mutations(&batch.mutations, &blob_references)?;
+        let wal_mutations = wal_mutations(&batch, &blob_references)?;
         let page_generation = self.root_group.base_roots().page_generation();
         let retention_floor_csn = self
             .root_group
@@ -25670,7 +25824,7 @@ impl NativeTransaction<'_> {
             },
         )?;
 
-        let wal_mutations = wal_mutations(&batch.mutations, &page_commit.blob_references)?;
+        let wal_mutations = wal_mutations(&batch, &page_commit.blob_references)?;
         let page_generation = self.root_transaction.base_roots().page_generation();
         let retention_floor_csn = self
             .root_transaction
@@ -26351,7 +26505,7 @@ fn apply_mutations_to_state(
                     apply_search_mutation_to_state(state, mutation)?;
                 }
             }
-            Opcode::PublishInitialAnnBulk => {
+            Opcode::PublishInitialAnnBulk | Opcode::AnnDeltaAuthorityV1 => {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
@@ -26668,6 +26822,11 @@ fn catalog_object_lifecycle_write_key(object: ObjectId) -> WriteKey {
 }
 
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
+    mutation_conflict_keys(mutations, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn mutation_conflict_keys(mutations: &[Mutation], publish_ann_authority: bool) -> Vec<WriteKey> {
     let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
     for mutation in mutations {
         if mutation.opcode == Opcode::VacuumPageGeneration {
@@ -26739,9 +26898,23 @@ fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
             Opcode::CompactSearch => vec![6],
             Opcode::ConsolidateAnn => vec![7],
             Opcode::PublishInitialAnnBulk => vec![10],
+            Opcode::AnnDeltaAuthorityV1 => vec![12],
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
+        if publish_ann_authority
+            && matches!(
+                mutation.opcode,
+                Opcode::CreateAnnIndex
+                    | Opcode::UpsertVector
+                    | Opcode::DeleteVector
+                    | Opcode::ConsolidateAnn
+                    | Opcode::PublishInitialAnnBulk
+            )
+            && let Some(index) = mutation.target
+        {
+            keys.push(delta_ann_write_key(index));
+        }
         if matches!(
             mutation.opcode,
             Opcode::CreateTable
@@ -26779,8 +26952,13 @@ fn write_batch_validation_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
     let mut keys = mutation_validation_keys(&batch.mutations);
     if let Some(delta) = &batch.delta {
         keys.extend(delta.unique_probes.iter().map(delta_unique_write_key));
+        keys.extend(delta.ann_mutations.keys().copied().map(delta_ann_write_key));
     }
     keys
+}
+
+fn delta_ann_write_key(index: ObjectId) -> WriteKey {
+    WriteKey::new(EngineKind::Search, Some(index), vec![12])
 }
 
 fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
@@ -26791,7 +26969,7 @@ fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
 }
 
 fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
-    let mut keys = mutation_write_keys(mutations);
+    let mut keys = mutation_conflict_keys(mutations, false);
     for mutation in mutations {
         if mutation.engine == EngineKind::Relational
             && matches!(
@@ -27452,6 +27630,7 @@ fn commit_engine_roots(
                 state: &batch.state.search,
                 mutations: &batch.mutations,
                 blob_references,
+                ann_delta: batch.delta.as_ref().map(|delta| &delta.ann_mutations),
                 ann_consolidation: batch.ann_consolidation.as_ref(),
                 ann_consolidation_structure: batch.ann_consolidation_structure.as_ref(),
                 ann_initial_bulk: batch.ann_initial_bulk.as_ref(),
@@ -28658,6 +28837,7 @@ fn validate_physical_initial_ann_bulk(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_delta_write_batch_shape(
     batch: &NativeWriteBatch,
     roots: &[Option<PageId>; 4],
@@ -28722,7 +28902,7 @@ fn validate_delta_write_batch_shape(
                 }
                 EngineKind::Search => {
                     expected_dirty[3] = true;
-                    mutation.target.is_some_and(|index| {
+                    let document_mutation = mutation.target.is_some_and(|index| {
                         delta
                             .search_documents
                             .contains(&(index, mutation.key.clone()))
@@ -28730,7 +28910,13 @@ fn validate_delta_write_batch_shape(
                         mutation.opcode,
                         Opcode::IndexDocument | Opcode::ReplaceDocument | Opcode::DeleteDocument
                     ) && mutation.expires_at_micros.is_none()
-                        && (mutation.opcode != Opcode::DeleteDocument || mutation.value.is_empty())
+                        && (mutation.opcode != Opcode::DeleteDocument || mutation.value.is_empty());
+                    let vector_mutation = mutation
+                        .target
+                        .is_some_and(|index| delta.ann_mutations.contains_key(&index))
+                        && mutation.opcode == Opcode::UpsertVector
+                        && mutation.expires_at_micros.is_none();
+                    document_mutation || vector_mutation
                 }
                 EngineKind::Kernel => false,
             });
@@ -28742,6 +28928,8 @@ fn validate_delta_write_batch_shape(
             )
     });
     let valid_hash_overlay = validate_delta_hash_overlay_shape(batch, delta)?;
+    let valid_ann_overlay =
+        ann_store::validate_delta_mutation_batch(&delta.ann_mutations, &batch.mutations).is_ok();
     let replayed_memory_bytes = replay_delta_retained_memory_bytes(batch);
     let valid_memory_ledger = replayed_memory_bytes == delta.retained_memory_bytes
         && replayed_memory_bytes <= NativeDatabase::delta_memory_capacity(batch);
@@ -28751,6 +28939,7 @@ fn validate_delta_write_batch_shape(
         && valid_mutations
         && valid_unique_probes
         && valid_hash_overlay
+        && valid_ann_overlay
         && valid_memory_ledger
         && batch.dirty == expected_dirty
         && !batch.dirty[0]
@@ -29251,10 +29440,11 @@ fn decode_delta_structure_value(encoded: &[u8]) -> Result<Option<()>, NativeRunt
 }
 
 fn wal_mutations(
-    mutations: &[Mutation],
+    batch: &NativeWriteBatch,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
 ) -> Result<Vec<Mutation>, NativeRuntimeError> {
-    mutations
+    let mut mutations = batch
+        .mutations
         .iter()
         .cloned()
         .map(|mut mutation| {
@@ -29296,7 +29486,17 @@ fn wal_mutations(
             }
             Ok(mutation)
         })
-        .collect()
+        .collect::<Result<Vec<_>, NativeRuntimeError>>()?;
+    if let Some(delta) = &batch.delta {
+        mutations.extend(
+            delta
+                .ann_mutations
+                .keys()
+                .copied()
+                .map(wal_codec::ann_delta_authority_marker_v1),
+        );
+    }
+    Ok(mutations)
 }
 
 fn structure_key(key: &[u8]) -> Vec<u8> {
@@ -33868,7 +34068,14 @@ fn search_tree_after_mutations(
             cursor += 1;
         }
     }
-    ann_store::apply_tree_mutations(pages, tree, creating_csn, catalog, mutations)
+    ann_store::apply_tree_mutations(
+        pages,
+        tree,
+        creating_csn,
+        catalog,
+        mutations,
+        context.ann_delta,
+    )
 }
 
 fn apply_search_tree_mutation(
@@ -34281,6 +34488,7 @@ struct SearchMutationContext<'a> {
     state: &'a SearchState,
     mutations: &'a [Mutation],
     blob_references: &'a BTreeMap<[u8; 32], BlobReference>,
+    ann_delta: Option<&'a BTreeMap<ObjectId, ann_store::AnnDeltaMutationState>>,
     ann_consolidation: Option<&'a ann_store::ConsolidationPlan>,
     ann_consolidation_structure: Option<&'a PrefixReplacementStructuralPlan>,
     ann_initial_bulk: Option<&'a InitialAnnBulkPublication>,
@@ -36484,13 +36692,7 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
-    FULL_STATE_LOADS.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    THREAD_FULL_STATE_LOADS.with(|count| count.set(count.get() + 1));
-    #[cfg(test)]
-    if FAIL_FULL_STATE_LOAD.get() {
-        return Err(NativeRuntimeError::UnexpectedFullStateLoad);
-    }
+    record_full_state_materialization()?;
     let catalog = load_catalog_state(pages, blobs, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
     let search = load_search_state(pages, blobs, roots)?;
@@ -42388,6 +42590,118 @@ mod tests {
             database.get_latest_structure(b"joint-key", 2)?,
             Some(b"delta".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_ann_commit_uses_the_receipt_csn_and_avoids_the_materialized_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(901)?;
+        let object = ObjectId::new(902)?;
+        let definition =
+            VectorIndexDefinition::new(index, 2, VectorMetric::SquaredL2, ann_config()?)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "delta-receipt",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.upsert_vector(index, ObjectId::new(1)?, Vector::new([0.0, 0.0])?)?;
+        seed.commit()?;
+
+        let guard = FullLoadFailureGuard::install();
+        let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+        database.stage_delta_upsert_vector(&mut delta, index, object, Vector::new([1.0, 2.0])?)?;
+        let committed = database.commit_optimistic(delta)?;
+        drop(guard);
+
+        let snapshot = database.coordinator.snapshot(2)?;
+        let search_root = snapshot
+            .roots()
+            .root(super::SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let (creating_csn, persisted_view, calculated_view) =
+            super::ann_store::delta_record_identity_for_test(
+                &database.pages,
+                &database.buffer_pool,
+                search_root,
+                index,
+                definition,
+                object,
+            )?;
+        assert_eq!(creating_csn, committed.commit_csn);
+        assert_eq!(persisted_view, calculated_view);
+        assert_eq!(
+            database.observe_ann_index(index)?.view_identity,
+            persisted_view
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_stale_delta_ann_authority_history() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(911)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "recovery-authority",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        let seeded = seed.commit()?;
+        let snapshot = database.coordinator.snapshot(2)?;
+        let roots = super::require_roots(super::roots_from_snapshot(snapshot.roots()))?;
+        let root_set = snapshot.roots();
+
+        for (offset, object) in [ObjectId::new(1)?, ObjectId::new(2)?]
+            .into_iter()
+            .enumerate()
+        {
+            let commit_csn = Csn::new(seeded.commit_csn.get() + u64::try_from(offset)? + 1)?;
+            let mut mutations = vec![Mutation {
+                engine: EngineKind::Search,
+                opcode: Opcode::UpsertVector,
+                target: Some(index),
+                key: object.get().to_be_bytes().to_vec(),
+                value: super::ann_store::encode_vector_mutation(&Vector::new([
+                    f32::from(u16::try_from(offset)?),
+                    1.0,
+                ])?),
+                expires_at_micros: None,
+            }];
+            mutations.push(super::wal_codec::ann_delta_authority_marker_v1(index));
+            let pending = super::encode_transaction(&super::TransactionPlan {
+                transaction_id: TransactionId::new(10 + u128::try_from(offset)?)?,
+                read_csn: Some(seeded.commit_csn),
+                catalog_version: seeded.catalog_version,
+                logical_time_micros: 2,
+                durability: DurabilityClass::Strict,
+                mutations: &mutations,
+                commit_csn,
+                roots,
+                blob_generation: root_set.blob_generation(),
+                page_generation: root_set.page_generation(),
+                retention_floor_csn: root_set
+                    .retention_floor_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            })?;
+            database.wal.append_records(pending, true)?;
+        }
+        drop(snapshot);
+        drop(database);
+
+        assert!(matches!(
+            NativeDatabase::open(temporary.path()),
+            Err(NativeRuntimeError::WriteConflict(_))
+        ));
         Ok(())
     }
 

@@ -8,7 +8,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use hyphae_native_runtime::{NativeDatabase, NativeRuntimeError, SqlError, SqlResult};
+use hyphae_native_runtime::{
+    AnnSearchOptions, AnnSearchStrategy, CommitBoundary, HnswConfig, NativeDatabase,
+    NativeRuntimeError, SqlError, SqlResult, Vector, VectorMetric,
+};
 use hyphae_native_types::{DurabilityClass, ObjectId, ScalarValue};
 
 type TestError = Box<dyn std::error::Error>;
@@ -255,6 +258,319 @@ fn concurrent_delta_inserts_conflict_on_one_unique_projection() -> Result<(), Te
         database.commit_optimistic(second),
         Err(NativeRuntimeError::WriteConflict(_))
     ));
+    Ok(())
+}
+
+fn ann_config() -> Result<HnswConfig, TestError> {
+    Ok(HnswConfig::new(4, 16, 8, 32, 0x0044_454c_5441)?)
+}
+
+#[test]
+fn vector_delta_commit_is_exact_immediate_bounded_and_reopen_equal() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("data");
+    let lexical = ObjectId::new(700)?;
+    let vectors = ObjectId::new(701)?;
+    let base_object = ObjectId::new(1)?;
+    let delta_object = ObjectId::new(2)?;
+    let rolled_back_object = ObjectId::new(3)?;
+    let query = Vector::new([0.0, 1.0])?;
+    let mut database = NativeDatabase::create(&data)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_search_index(lexical, "documents")?;
+    seed.create_vector_index(
+        vectors,
+        "embeddings",
+        2,
+        VectorMetric::SquaredL2,
+        ann_config()?,
+    )?;
+    seed.upsert_vector(vectors, base_object, Vector::new([1.0, 0.0])?)?;
+    seed.commit()?;
+
+    let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    database.stage_delta_set(
+        &mut delta,
+        b"vector-transaction".to_vec(),
+        b"complete".to_vec(),
+        None,
+    )?;
+    database.stage_delta_index_document(
+        &mut delta,
+        lexical,
+        b"delta-document".to_vec(),
+        "exact delta visibility".to_owned(),
+    )?;
+    database.stage_delta_upsert_vector(&mut delta, vectors, delta_object, query.clone())?;
+    let committed = database.commit_optimistic(delta)?;
+
+    let expected = database.search_vector_exact_latest(vectors, &query, 2)?;
+    assert_eq!(expected[0].object_id, delta_object);
+    let observed = database.observe_ann_index(vectors)?;
+    let ann = database.search_ann_latest(vectors, &query, AnnSearchOptions::new(1, 8, Some(1))?)?;
+    assert_eq!(ann.snapshot_csn, Some(committed.commit_csn));
+    assert_eq!(ann.build_identity, observed.view_identity);
+    let snapshot = database.snapshot(2)?;
+    assert_eq!(
+        snapshot.get(b"vector-transaction"),
+        Some(b"complete".as_slice())
+    );
+    assert_eq!(
+        snapshot.match_text(lexical, "visibility", 1)?[0].document_id,
+        b"delta-document"
+    );
+
+    let mut rolled_back = database.begin_optimistic_delta(3, DurabilityClass::Strict)?;
+    database.stage_delta_upsert_vector(
+        &mut rolled_back,
+        vectors,
+        rolled_back_object,
+        Vector::new([0.0, 2.0])?,
+    )?;
+    rolled_back.rollback();
+    assert!(
+        database
+            .search_vector_exact_latest(vectors, &Vector::new([0.0, 2.0])?, 3)?
+            .iter()
+            .all(|hit| hit.object_id != rolled_back_object)
+    );
+    drop(snapshot);
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    assert_eq!(
+        reopened.search_vector_exact_latest(vectors, &query, 2)?,
+        expected
+    );
+    let snapshot = reopened.snapshot(4)?;
+    assert_eq!(
+        snapshot.get(b"vector-transaction"),
+        Some(b"complete".as_slice())
+    );
+    assert_eq!(
+        snapshot.match_text(lexical, "visibility", 1)?[0].document_id,
+        b"delta-document"
+    );
+    Ok(())
+}
+
+#[test]
+fn vector_delta_runs_real_hnsw_base_plus_exact_delta_before_and_after_reopen()
+-> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("data");
+    let index = ObjectId::new(720)?;
+    let delta_object = ObjectId::new(10_000)?;
+    let query = Vector::new([31.25, 3.5])?;
+    let mut database = NativeDatabase::create(&data)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_vector_index(
+        index,
+        "traversed-embeddings",
+        2,
+        VectorMetric::SquaredL2,
+        ann_config()?,
+    )?;
+    seed.upsert_vectors(
+        index,
+        (1..=64_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([f32::from(value), f32::from(value % 7)])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, TestError>>()?,
+    )?;
+    seed.commit()?;
+    let base = database.observe_ann_index(index)?;
+
+    let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    database.stage_delta_upsert_vector(&mut delta, index, delta_object, query.clone())?;
+    let committed = database.commit_optimistic(delta)?;
+    let observed = database.observe_ann_index(index)?;
+    assert_eq!(observed.base_identity, base.base_identity);
+    assert_ne!(observed.view_identity, base.view_identity);
+    let options = AnnSearchOptions::new(4, 8, Some(4))?;
+    let traversed = database.search_ann_latest(index, &query, options)?;
+    assert!(traversed.approximate);
+    assert_eq!(traversed.strategy, AnnSearchStrategy::GraphTraversal);
+    assert!(traversed.visited_nodes > 0);
+    assert_eq!(traversed.snapshot_csn, Some(committed.commit_csn));
+    assert_eq!(traversed.build_identity, observed.view_identity);
+    assert_eq!(traversed.hits[0].object_id, delta_object);
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    assert_eq!(reopened.observe_ann_index(index)?, observed);
+    let reopened_traversal = reopened.search_ann_latest(index, &query, options)?;
+    assert_eq!(reopened_traversal, traversed);
+    assert_eq!(
+        reopened_traversal.strategy,
+        AnnSearchStrategy::GraphTraversal
+    );
+    assert!(reopened_traversal.visited_nodes > 0);
+    Ok(())
+}
+
+#[test]
+fn concurrent_vector_deltas_conflict_on_the_index_sequence_authority() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path().join("data"))?;
+    let vectors = ObjectId::new(750)?;
+    let first_object = ObjectId::new(1)?;
+    let second_object = ObjectId::new(2)?;
+    let materialized_object = ObjectId::new(3)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_vector_index(
+        vectors,
+        "embeddings",
+        2,
+        VectorMetric::SquaredL2,
+        ann_config()?,
+    )?;
+    seed.commit()?;
+
+    let mut first = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    let mut second = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    database.stage_delta_upsert_vector(
+        &mut first,
+        vectors,
+        first_object,
+        Vector::new([1.0, 0.0])?,
+    )?;
+    database.stage_delta_upsert_vector(
+        &mut second,
+        vectors,
+        second_object,
+        Vector::new([0.0, 1.0])?,
+    )?;
+    database.commit_optimistic(first)?;
+    assert!(matches!(
+        database.commit_optimistic(second),
+        Err(NativeRuntimeError::WriteConflict(_))
+    ));
+    let hits = database.search_vector_exact_latest(vectors, &Vector::new([0.0, 1.0])?, 2)?;
+    assert!(hits.iter().any(|hit| hit.object_id == first_object));
+    assert!(hits.iter().all(|hit| hit.object_id != second_object));
+
+    let mut stale_delta = database.begin_optimistic_delta(3, DurabilityClass::Strict)?;
+    database.stage_delta_upsert_vector(
+        &mut stale_delta,
+        vectors,
+        second_object,
+        Vector::new([0.0, 1.0])?,
+    )?;
+    let mut materialized = database.begin_optimistic(3, DurabilityClass::Strict)?;
+    materialized.upsert_vector(vectors, materialized_object, Vector::new([0.5, 0.5])?)?;
+    database.commit_optimistic(materialized)?;
+    assert!(matches!(
+        database.commit_optimistic(stale_delta),
+        Err(NativeRuntimeError::WriteConflict(_))
+    ));
+    let hits = database.search_vector_exact_latest(vectors, &Vector::new([0.0, 1.0])?, 3)?;
+    assert!(hits.iter().any(|hit| hit.object_id == materialized_object));
+    assert!(hits.iter().all(|hit| hit.object_id != second_object));
+    Ok(())
+}
+
+#[test]
+fn concurrent_materialized_disjoint_vectors_rebase_and_reopen() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("data");
+    let mut database = NativeDatabase::create(&data)?;
+    let vectors = ObjectId::new(760)?;
+    let first_object = ObjectId::new(1)?;
+    let second_object = ObjectId::new(2)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_vector_index(
+        vectors,
+        "legacy-disjoint",
+        2,
+        VectorMetric::SquaredL2,
+        ann_config()?,
+    )?;
+    seed.commit()?;
+
+    let mut first = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    let mut second = database.begin_optimistic(2, DurabilityClass::Strict)?;
+    first.upsert_vector(vectors, first_object, Vector::new([1.0, 0.0])?)?;
+    second.upsert_vector(vectors, second_object, Vector::new([0.0, 1.0])?)?;
+    database.commit_optimistic(first)?;
+    database.commit_optimistic(second)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    let hits = reopened.search_vector_exact_latest(vectors, &Vector::new([0.0, 0.0])?, 2)?;
+    assert_eq!(
+        hits.into_iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        [first_object, second_object]
+    );
+    Ok(())
+}
+
+#[test]
+fn vector_delta_crash_recovers_old_or_complete_all_engine_state() -> Result<(), TestError> {
+    for boundary in [
+        CommitBoundary::BlobStaged,
+        CommitBoundary::BlobPromoted,
+        CommitBoundary::PageAppended,
+        CommitBoundary::PageSynchronized,
+        CommitBoundary::WalAppended,
+        CommitBoundary::WalSynchronized,
+        CommitBoundary::RootPublished,
+    ] {
+        let temporary = TemporaryDirectory::create()?;
+        let data = temporary.path().join("data");
+        let lexical = ObjectId::new(800)?;
+        let vectors = ObjectId::new(801)?;
+        let object = ObjectId::new(802)?;
+        let query = Vector::new([0.0, 1.0])?;
+        let mut database = NativeDatabase::create(&data)?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_search_index(lexical, "documents")?;
+        seed.create_vector_index(
+            vectors,
+            "embeddings",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+
+        let mut delta = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+        database.stage_delta_set(
+            &mut delta,
+            b"atomic-vector".to_vec(),
+            b"complete".to_vec(),
+            None,
+        )?;
+        database.stage_delta_index_document(
+            &mut delta,
+            lexical,
+            b"atomic-document".to_vec(),
+            "atomic vector delta".to_owned(),
+        )?;
+        database.stage_delta_upsert_vector(&mut delta, vectors, object, query.clone())?;
+        assert!(matches!(
+            database.commit_optimistic_with_interruption(delta, boundary),
+            Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+        ));
+        drop(database);
+
+        let reopened = NativeDatabase::open(&data)?;
+        let snapshot = reopened.snapshot(3)?;
+        let structure_visible = snapshot.get(b"atomic-vector").is_some();
+        let lexical_visible = !snapshot.match_text(lexical, "atomic", 1)?.is_empty();
+        let vector_visible = reopened
+            .search_vector_exact_latest(vectors, &query, 1)?
+            .first()
+            .is_some_and(|hit| hit.object_id == object);
+        assert_eq!(structure_visible, lexical_visible, "boundary {boundary:?}");
+        assert_eq!(structure_visible, vector_visible, "boundary {boundary:?}");
+    }
     Ok(())
 }
 

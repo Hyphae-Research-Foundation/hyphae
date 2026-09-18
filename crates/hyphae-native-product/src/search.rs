@@ -695,11 +695,10 @@ impl NativeProduct {
     /// Validates and atomically ingests one bounded cross-engine document batch.
     ///
     /// Cost scales with the batch: the idempotency marker, binding, and
-    /// manifest resolve through durable point reads, and a batch whose
-    /// documents carry no named vectors stages through the physical delta
-    /// batch, so neither `BEGIN`, staging, nor the receipt materializes the
-    /// complete all-engine state. A batch that carries vectors keeps the
-    /// materialized transaction until the ANN store gains a delta stage.
+    /// manifest resolve through durable point reads. Lexical documents and
+    /// named vectors stage through the physical delta batch, so neither
+    /// `BEGIN`, staging, nor the receipt materializes complete all-engine
+    /// state; vector targets hydrate only their bounded durable object deltas.
     ///
     /// # Errors
     ///
@@ -743,15 +742,7 @@ impl NativeProduct {
             logical_time_micros,
             durability,
         };
-        let carries_vectors = batch
-            .documents
-            .iter()
-            .any(|document| !document.vectors.is_empty());
-        let commit = if carries_vectors {
-            self.ingest_search_batch_materialized(&plan)?
-        } else {
-            self.ingest_search_batch_delta(&plan)?
-        };
+        let commit = self.ingest_search_batch_delta(&plan)?;
         self.observe_commit(&commit);
         Ok(ProductSearchIngestReceipt {
             snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
@@ -781,7 +772,7 @@ impl NativeProduct {
         Ok((manifest.finish()?, collection_was_empty))
     }
 
-    /// Point-resolved ingest for a batch whose documents carry no vectors.
+    /// Point-resolved ingest across documents, postings, and named vectors.
     fn ingest_search_batch_delta(
         &mut self,
         plan: &IngestPlan<'_>,
@@ -864,6 +855,18 @@ impl NativeProduct {
                     text,
                 )
                 .map_err(map_runtime_error)?;
+            for vector_binding in &plan.binding.vectors {
+                if let Some(vector) = document.vectors.get(&vector_binding.name) {
+                    self.database
+                        .stage_delta_upsert_vector(
+                            &mut delta,
+                            vector_binding.index,
+                            document.object_id,
+                            vector.clone(),
+                        )
+                        .map_err(map_runtime_error)?;
+                }
+            }
         }
         let commit = self
             .database
@@ -875,75 +878,6 @@ impl NativeProduct {
             return Err(corruption());
         }
         Ok(commit)
-    }
-
-    /// Materialized ingest for a batch that carries named vectors.
-    fn ingest_search_batch_materialized(
-        &mut self,
-        plan: &IngestPlan<'_>,
-    ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
-        let mut transaction = self
-            .database
-            .begin(plan.logical_time_micros, plan.durability.into())
-            .map_err(map_runtime_error)?;
-        let (manifest_writes, collection_was_empty) =
-            Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
-                Ok(transaction.get(key).map(<[u8]>::to_vec))
-            })?;
-        for document in &plan.batch.documents {
-            let object_bytes = document.object_id.get().to_be_bytes().to_vec();
-            let text = match &plan.transform {
-                None => document.text.clone(),
-                Some(transform) => transform.apply(&document.text),
-            };
-            transaction
-                .index_document(plan.binding.lexical_index, object_bytes, text)
-                .map_err(map_runtime_error)?;
-            for vector_binding in &plan.binding.vectors {
-                if let Some(vector) = document.vectors.get(&vector_binding.name) {
-                    transaction
-                        .upsert_vector(vector_binding.index, document.object_id, vector.clone())
-                        .map_err(map_runtime_error)?;
-                }
-            }
-            transaction
-                .set(
-                    document_key(plan.collection, document.object_id),
-                    encode_document(document)?,
-                    None,
-                )
-                .map_err(map_runtime_error)?;
-        }
-        let (covered, newly_covered) =
-            posting_coverage(&transaction, plan.collection, collection_was_empty);
-        if covered {
-            for document in &plan.batch.documents {
-                write_document_postings(&mut transaction, plan.collection, document)?;
-            }
-        }
-        if newly_covered {
-            transaction
-                .set(
-                    posting_coverage_key(plan.collection),
-                    POSTING_COVERAGE_MAGIC.to_vec(),
-                    None,
-                )
-                .map_err(map_runtime_error)?;
-        }
-        apply_manifest_mutations(&mut transaction, manifest_writes)?;
-        let transaction_id = transaction.transaction_id().get();
-        transaction
-            .set(
-                plan.marker_key.clone(),
-                encode_idempotency(&IdempotencyMarker {
-                    digest: plan.digest,
-                    documents: plan.batch.documents.len(),
-                    transaction_id,
-                })?,
-                None,
-            )
-            .map_err(map_runtime_error)?;
-        transaction.commit().map_err(map_runtime_error)
     }
 
     /// Reads one current structure value through its physical root without

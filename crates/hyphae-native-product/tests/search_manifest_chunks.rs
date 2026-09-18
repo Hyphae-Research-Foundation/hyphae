@@ -58,8 +58,7 @@ fn header(
 }
 
 /// A lexical collection with one integer doc value and one named vector, so
-/// the same definition serves the delta path (vector-less documents) and the
-/// materialized path (documents carrying the vector).
+/// the same definition exercises vector-less and vector-bearing delta ingest.
 fn configure(
     path: &PathBuf,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
@@ -167,7 +166,7 @@ fn document(id: u128, with_vector: bool) -> Result<ProductDocument, Box<dyn std:
 
 /// Ingests identities `first..first + count` in bound-sized batches. When
 /// `vector_leader` is set, the first document of every batch carries the
-/// named vector so the batch takes the materialized transaction.
+/// named vector so the batch also stages an ANN object delta.
 fn ingest_range(
     product: &mut NativeProduct,
     collection: ObjectId,
@@ -290,37 +289,26 @@ fn context(session: &ProductSession, request_id: u128) -> ProductRequestContext 
 }
 
 #[test]
-fn delta_and_materialized_paths_write_identical_manifest_records_across_a_split()
+fn vectorless_and_vector_delta_paths_write_identical_manifest_records_across_a_split()
 -> Result<(), Box<dyn std::error::Error>> {
     let count = MAX_PRODUCT_SEARCH_MANIFEST_CHUNK_ENTRIES + 276;
     let delta_path = temporary("delta");
     let (mut delta, binding) = configure(&delta_path)?;
     ingest_range(&mut delta, binding.collection, 1, count, false, 100, 1)?;
-    let materialized_path = temporary("materialized");
-    let (mut materialized, _) = configure(&materialized_path)?;
-    ingest_range(
-        &mut materialized,
-        binding.collection,
-        1,
-        count,
-        true,
-        100,
-        1,
-    )?;
+    let vector_path = temporary("vector");
+    let (mut vector, _) = configure(&vector_path)?;
+    ingest_range(&mut vector, binding.collection, 1, count, true, 100, 1)?;
 
     let delta_records = delta.manifest_records_for_test(binding.collection, 1)?;
-    let materialized_records = materialized.manifest_records_for_test(binding.collection, 1)?;
-    assert_eq!(delta_records, materialized_records);
+    let vector_records = vector.manifest_records_for_test(binding.collection, 1)?;
+    assert_eq!(delta_records, vector_records);
     let (legacy, headers, chunks) = record_kinds(&delta_records)?;
     assert_eq!((legacy, headers), (0, 1));
     assert_eq!(chunks, 2, "the corpus crossed exactly one split");
 
     let expected: Vec<u128> = (1..=u128::try_from(count)?).collect();
     assert_eq!(paginate(&delta, binding.collection, 300, 1)?, expected);
-    assert_eq!(
-        paginate(&materialized, binding.collection, 300, 1)?,
-        expected
-    );
+    assert_eq!(paginate(&vector, binding.collection, 300, 1)?, expected);
     assert_eq!(
         delta
             .search_collection(binding.collection, &match_all(5), 1)?
@@ -328,28 +316,28 @@ fn delta_and_materialized_paths_write_identical_manifest_records_across_a_split(
         count
     );
     assert_eq!(
-        materialized
+        vector
             .search_collection(binding.collection, &match_all(5), 1)?
             .total_documents,
         count
     );
 
     drop(delta);
-    drop(materialized);
+    drop(vector);
     let delta = NativeProduct::open(&delta_path)?;
-    let materialized = NativeProduct::open(&materialized_path)?;
+    let vector = NativeProduct::open(&vector_path)?;
     assert_eq!(
         delta.manifest_records_for_test(binding.collection, 1)?,
         delta_records
     );
     assert_eq!(
-        materialized.manifest_records_for_test(binding.collection, 1)?,
-        materialized_records
+        vector.manifest_records_for_test(binding.collection, 1)?,
+        vector_records
     );
     drop(delta);
-    drop(materialized);
+    drop(vector);
     fs::remove_dir_all(delta_path)?;
-    fs::remove_dir_all(materialized_path)?;
+    fs::remove_dir_all(vector_path)?;
     Ok(())
 }
 

@@ -181,16 +181,17 @@ whose cost scales with the batch, not with the collection:
   resolve through durable point reads of the current structure root. The replay receipt and the fresh receipt bind the
   committed root identity (`visible_csn`, `catalog_version`, `root_digest`)
   without materializing engine state.
-- A batch whose documents carry no named vectors stages every document
-  source, doc-value posting, manifest header and touched chunk, coverage
-  flag, and idempotency marker through the physical delta batch and commits it as one all-engine
-  transaction. The marker records the transaction identity the serialized
-  writer will publish under; a commit that publishes under any other identity
-  is a fail-closed corruption error, never a silent foreign receipt.
-- A batch that carries at least one named vector keeps the materialized
-  transaction until the ANN store gains a delta stage. Both paths write the
-  same durable records: a reopened directory cannot tell which path ingested
-  a batch.
+- Every batch stages each document source, doc-value posting, manifest header
+  and touched chunk, coverage flag, idempotency marker, lexical document, and
+  supplied named vector through one physical delta batch. The marker records
+  the transaction identity the serialized writer will publish under; a commit
+  that publishes under any other identity is a fail-closed corruption error,
+  never a silent foreign receipt.
+- Named-vector staging reads only each target's catalog definition, metadata,
+  and bounded durable object delta. It does not restore the immutable HNSW
+  base. Commit publishes the vectors under the same CSN as every side record;
+  exact search sees the new delta immediately and ANN retains its existing
+  base-plus-exact-delta merge behavior.
 - Duplicate document identities, the collection document bound, and
   idempotency conflicts are rejected before the first staged mutation on
   either path.
@@ -238,12 +239,12 @@ set.
   therefore keeps every adjacent pair above half the entry bound, which is
   what bounds the chunk count; decoders enforce the derived chunk-count bound,
   not the pair invariant.
-- The delta ingest, the materialized ingest, the operation-batch document
+- Vector-less and vector-bearing delta ingest, the operation-batch document
   stage, document update, and document delete run one shared state machine
   over their own point reads and stage exactly the writes it emits, so the
-  three write contexts leave byte-identical manifest records for the same
-  operation sequence. A document replace inside an operation batch writes no
-  manifest record.
+  write contexts leave byte-identical manifest records for the same operation
+  sequence. A document replace inside an operation batch writes no manifest
+  record.
 - Every header, chunk, and legacy decode fails closed as corruption on a
   magic, length, order, floor, count, missing-chunk, or bound violation. Chunk
   decoding validates the chunk against the header entry that names it.
@@ -276,10 +277,10 @@ The slice requires:
 - large-text blob replacement, deletion, reopen, vacuum, and blob-collection
   safety;
 - a thread-local fail gate proving no complete state or catalog load;
-- a process-counter gate proving vector-less batch ingest, its idempotent
-  replay, and its receipts perform no complete state load, with equivalence of
-  corpus, lexical, and doc-value results against the materialized path and
-  after reopen;
+- a process-counter gate proving vector-bearing batch ingest, its idempotent
+  replay, and its receipts perform no complete state load, with exact and ANN
+  base-plus-delta visibility plus corpus, lexical, doc-value, and reopen
+  equality;
 - exact logical equivalence of a coalesced scalar `SET` run against sequential
   application, including expiry-index retirement, plus rejection of a run that
   reaches a live collection key or carries an expiring member without
@@ -290,9 +291,9 @@ The slice requires:
   merge and empty-chunk removal on delete; and the adjacent-pair invariant
   with the derived chunk-count bound under a deterministic insert/delete
   sequence;
-- byte-identical manifest records from the delta, materialized, and
-  operation-batch write paths across a chunk split, before and after reopen,
-  with `total_documents` and pagination unchanged;
+- byte-identical manifest records from vector-less delta, vector-bearing delta,
+  and operation-batch write paths across a chunk split, before and after
+  reopen, with `total_documents` and pagination unchanged;
 - `HYPSMAN1` read compatibility on a reopened directory, no rewrite by reads
   or rejected mutations, and atomic first-accepted-mutation upgrade to
   `HYPSMAN2`;

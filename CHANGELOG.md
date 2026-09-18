@@ -95,9 +95,10 @@ unchanged.
   receipt; the 1,000,000 rung is measured but not shipped until the ANN
   consolidation and RSS conditions of roadmap item R5 are met.
 - Product batch ingest is point-resolved: idempotency, binding, manifest,
-  and coverage resolve through durable point reads, vector-less batches
-  stage through the physical delta batch, and runs of scalar `SET`s build
-  the structure root as one sorted copy-on-write batch.
+  and coverage resolve through durable point reads; vector-bearing batches
+  stage bounded per-index object deltas without restoring immutable ANN bases
+  or complete all-engine state; and runs of scalar `SET`s build the structure
+  root as one sorted copy-on-write batch.
 - Open decodes complete state once (the root that becomes current) and
   verifies every retained superseded root structurally.
 - The durable posting scorer borrows leaf entries from the verified buffer
