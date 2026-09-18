@@ -125,16 +125,21 @@ enforcement are not yet implemented; those forms fail or remain outside this
 slice.
 
 `DROP INDEX <name>` is strict: the index must exist and be a relational secondary
-index. Commit removes its catalog object/name/dependency entries and rebuilds
-the relational namespace without its metadata or entry keys. Existing prepared
-plans fail with `CatalogChanged`; reopen preserves the absence. `IF EXISTS` and
-`CASCADE` are not accepted.
+index. A foreign key that targets the index blocks removal with
+`catalog_conflict` before private catalog or relational state changes. Commit
+removes an unreferenced index's catalog object/name/dependency entries and
+rebuilds the relational namespace without its metadata or entry keys. Existing
+prepared plans fail with `CatalogChanged`; reopen preserves the absence. `IF
+EXISTS` and `CASCADE` are not accepted.
 
-`DROP TABLE <name>` uses strict `RESTRICT` semantics: live secondary indexes or
-incoming foreign keys block it. After dependencies are removed, commit removes
-the relation and all row keys, rebuilds catalog/relational roots, invalidates
-prepared plans and preserves absence across reopen. `IF EXISTS` and `CASCADE`
-remain unsupported.
+`DROP TABLE <name>` uses strict `RESTRICT` semantics: canonical dependents,
+including live secondary indexes, incoming foreign keys, cross-engine links and
+V2 relation-schema references, block it with the stable `catalog_conflict`
+classification before either private catalog or relational state changes. A
+self-referencing foreign key is not an incoming dependency from another object.
+After dependencies are removed, commit removes the relation and all row keys,
+rebuilds catalog/relational roots, invalidates prepared plans and preserves
+absence across reopen. `IF EXISTS` and `CASCADE` remain unsupported.
 
 `ALTER TABLE <old> RENAME TO <new>` is metadata-only: it preserves the stable
 relation ID and physical row namespace, atomically replaces the catalog name,
@@ -172,9 +177,12 @@ secondary-index key, and catalog-bound prepared point lookup.
 `INSERT` accepts one or more parenthesized row groups after `VALUES`, each
 binding the same named columns in order, up to an explicit ceiling of 1,024
 row groups per statement (`HYSQL020` past the ceiling). Rows apply in
-statement order inside the surrounding transaction: constraint failure on any
-row fails the complete statement, and the delta staging surface admits only
-the single-row form (multi-row stays on the materialized path).
+statement order inside the surrounding transaction. A primary-key,
+foreign-key, or secondary-unique failure on any row leaves none of that
+statement's rows staged. A duplicate primary key returns `HYSQL012` and the
+stable `sql_unique_violation` conflict without replacing the existing row. The
+delta staging surface admits only the single-row form (multi-row stays on the
+materialized path).
 
 The bounded total-aggregate projection slice accepts:
 

@@ -1633,6 +1633,145 @@ fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Bo
 }
 
 #[test]
+fn sql_user_conflicts_are_machine_readable_and_leave_state_healthy() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    for statement in [
+        "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+        "INSERT INTO people (id, email) VALUES (1, 'first@example.test')",
+        "CREATE UNIQUE INDEX people_email ON people (email)",
+    ] {
+        run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--statement",
+            statement,
+        ])?;
+    }
+
+    let duplicate = output(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO people (id, email) VALUES (1, 'replacement@example.test')",
+    ])?;
+    assert_eq!(duplicate.status.code(), Some(4));
+    let duplicate_error: serde_json::Value = serde_json::from_slice(&duplicate.stderr)?;
+    assert_eq!(duplicate_error["error"]["code"], "sql_unique_violation");
+    assert_eq!(duplicate_error["error"]["category"], "conflict");
+
+    let dependent = output(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "DROP TABLE people",
+    ])?;
+    assert_eq!(dependent.status.code(), Some(4));
+    let dependency_error: serde_json::Value = serde_json::from_slice(&dependent.stderr)?;
+    assert_eq!(dependency_error["error"]["code"], "catalog_conflict");
+    assert_eq!(dependency_error["error"]["category"], "conflict");
+
+    let selected = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "SELECT id, email FROM people WHERE email = 'first@example.test'",
+    ])?;
+    assert_eq!(
+        selected["result"]["rows"],
+        serde_json::json!([[1, "first@example.test"]])
+    );
+    assert_eq!(
+        run(&["doctor", "--data-dir", &data_text])?["status"],
+        "healthy"
+    );
+    Ok(())
+}
+
+#[test]
+fn sql_multi_row_constraint_errors_follow_row_order() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    for statement in [
+        "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL CHECK (balance >= 0))",
+        "INSERT INTO accounts (id, balance) VALUES (1, 10)",
+    ] {
+        run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--statement",
+            statement,
+        ])?;
+    }
+
+    let duplicate = output(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO accounts (id, balance) VALUES (1, 10), (2, -1)",
+    ])?;
+    assert_eq!(duplicate.status.code(), Some(4));
+    let duplicate_error: serde_json::Value = serde_json::from_slice(&duplicate.stderr)?;
+    assert_eq!(duplicate_error["error"]["code"], "sql_unique_violation");
+
+    let check = output(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO accounts (id, balance) VALUES (2, -1), (1, 10)",
+    ])?;
+    assert_eq!(check.status.code(), Some(4));
+    let check_error: serde_json::Value = serde_json::from_slice(&check.stderr)?;
+    assert_eq!(check_error["error"]["code"], "sql_check_violation");
+
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO accounts (id, balance) VALUES (3, 30)",
+    ])?;
+    for (id, expected) in [
+        (2, serde_json::json!([])),
+        (3, serde_json::json!([[3, 30]])),
+    ] {
+        let selected = run(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--statement",
+            &format!("SELECT id, balance FROM accounts WHERE id = {id}"),
+        ])?;
+        assert_eq!(selected["result"]["rows"], expected);
+    }
+    assert_eq!(
+        run(&["doctor", "--data-dir", &data_text])?["status"],
+        "healthy"
+    );
+    Ok(())
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn native_backup_restore_and_proof_verification_are_offline() -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new()?;

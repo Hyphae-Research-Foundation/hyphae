@@ -1464,8 +1464,12 @@ impl From<NativeRuntimeError> for ProductError {
             | NativeRuntimeError::SearchIdentityTooLarge => {
                 Self::from_code(ProductErrorCode::LimitExceeded)
             }
-            NativeRuntimeError::UniqueSecondaryIndexViolation => {
+            NativeRuntimeError::UniquePrimaryKeyViolation
+            | NativeRuntimeError::UniqueSecondaryIndexViolation => {
                 Self::from_code(ProductErrorCode::SqlUniqueViolation)
+            }
+            NativeRuntimeError::CatalogDependencyConflict { object } => {
+                Self::from_code(ProductErrorCode::CatalogConflict).with_object_id(object)
             }
             NativeRuntimeError::CheckConstraintViolation => {
                 Self::from_code(ProductErrorCode::SqlCheckViolation)
