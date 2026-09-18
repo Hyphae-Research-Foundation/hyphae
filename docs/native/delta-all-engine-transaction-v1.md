@@ -5,11 +5,12 @@
 Status: the base point-resolved execution is implemented and verified by
 [`native-delta-all-engine-transaction-linux-2026-08-03.md`](../gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md).
 The current worktree additionally gives the point-resolved SQL, scalar,
-lexical, and exact-field V3 Hash slices a conservative batch-wide
-retained-memory ledger under the 32 MiB mutation allocation. Hash-field state
-also has an 8 MiB sub-budget inside that parent bound. The linked evidence
-predates this ledger; exact-SHA phase qualification remains required. This is
-not allocation-exact or complete P6 evidence, and G7 remains open.
+lexical, named-vector upsert, and exact-field V3 Hash slices a conservative
+batch-wide retained-memory ledger under the 32 MiB mutation allocation.
+Hash-field state also has an 8 MiB sub-budget inside that parent bound. The
+linked evidence predates this ledger and the vector slice; exact-SHA phase
+qualification remains required. This is not allocation-exact or complete P6
+evidence, and G7 remains open.
 
 This contract replaces the materialized hot path behind the local
 SQL-plus-structure-plus-search transaction with a Hyphae-owned physical delta
@@ -78,8 +79,11 @@ The batch contains:
 - a relational overlay keyed by relation and encoded primary key;
 - a scalar-structure overlay keyed by binary structure key;
 - a lexical overlay keyed by search collection and document ID;
+- a named-vector mutation overlay containing only each target's metadata and
+  bounded durable object delta, never its immutable HNSW base;
 - a conservative retained-memory ledger covering the in-scope catalog,
-  relational, scalar, lexical, mutation, identity, and container capacities;
+  relational, scalar, lexical, vector-delta, mutation, identity, and container
+  capacities;
   and
 - an 8 MiB retained sub-ledger for the V3 Hash-field slice.
 
@@ -96,12 +100,13 @@ overlay before the immutable snapshot. This preserves sequential private
 semantics without materializing unrelated data.
 
 The batch retains the existing limit of 1,024 successfully staged local
-operations. SQL, scalar, lexical, and V3 Hash-field staging preflight the
-candidate against the aggregate parent ledger. A rejected stage restores any
-private hydration and leaves earlier staged operations committable. Hash-field
-staging must additionally fit its identity, envelope, mutation, and retained
-payload inside the 8 MiB Hash sub-budget. These are conservative checked
-bounds; they must not be described as exact request-plan or RSS accounting.
+operations. SQL, scalar, lexical, named-vector, and V3 Hash-field staging
+preflight the candidate against the aggregate parent ledger. A rejected stage
+restores any private hydration and leaves earlier staged operations
+committable. Hash-field staging must additionally fit its identity, envelope,
+mutation, and retained payload inside the 8 MiB Hash sub-budget. These are
+conservative checked bounds; they must not be described as exact request-plan
+or RSS accounting.
 
 `NativeDatabase::begin_optimistic_delta` returns the opaque
 `NativeDeltaWriteBatch` authority. It does not dereference, borrow, or convert
@@ -186,6 +191,38 @@ Document identities are never renamed. Deletion followed by creation may reuse
 the same exact identity; the benchmark must continue to disclose lexical
 identity growth.
 
+### Named-vector upsert
+
+`stage_delta_upsert_vector` resolves one catalog-bound vector index, reads its
+metadata, and visits only that index's bounded durable object-delta range. It
+validates the vector against the existing definition and lifecycle limits
+without restoring the immutable single or partitioned HNSW base. Planning
+charges a conservative metadata, encoded-delta, decoded-vector, identity, and
+container bound before the range is allocated.
+
+Commit writes the target's next base-plus-delta view identity, metadata, and
+changed object records over the existing search root. Exact search observes a
+successful upsert immediately, while ANN continues to search the unchanged
+base and merge the exact object delta under the existing authority. Delta
+transactions validate a per-index authority key, so two independently staged
+delta batches cannot publish the same stale vector sequence. Materialized ANN
+transactions retain their existing disjoint-object rebase behavior.
+
+Delta vector commits append one fixed 16-byte `HYANNA01` WAL metadata marker
+per target index after the ordinary mutations, in ascending index order. The
+marker is WAL-only: it never enters page or materialized-state application.
+Its target reconstructs the same per-index validation key used by live delta
+admission. Recovery requires markers to be unique, trailing, ordered, and to
+cover exactly the vector-upsert index set; malformed metadata or a recovered
+stale sequence fails closed. Legacy WAL without the marker keeps object-level
+validation, so independently prepared materialized writes to disjoint vector
+IDs retain their existing rebase semantics while still publishing the index
+authority observed by later delta batches.
+
+This first vector slice supports upsert only. Point-resolved vector deletion
+and integrated document update/delete remain on their existing materialized
+transaction path.
+
 ## Commit admission and publication
 
 Commit consumes the delta batch.
@@ -198,7 +235,8 @@ Commit consumes the delta batch.
 6. Apply relational, structure, and search deltas to their admitted B+tree
    roots with copy-on-write page mutation.
 7. Stage and publish only large values referenced by admitted mutations.
-8. Encode the existing canonical WAL transaction.
+8. Encode the canonical WAL transaction, including any delta ANN authority
+   markers.
 9. Apply the selected page/WAL synchronization policy.
 10. Publish all changed roots once through the existing commit coordinator.
 
@@ -240,6 +278,7 @@ This slice does not:
 - add joins, scans, DDL, prepared DML, or transaction-private reads;
 - validate inbound or outbound SQL foreign keys in a delta batch;
 - expose aggregate or scanning Hash reads on a delta batch;
+- stage vector deletion on a delta batch;
 - make lexical document identities mutable;
 - change group durability;
 - remove full validation from recovery or explicit verification;
@@ -280,7 +319,18 @@ benchmark-only helper.
 - explicit full verification still rejects corruption in an older linked
   version;
 - local `BEGIN`, stage, and commit succeed under a test guard that rejects
-  any hot-path `load_state` call;
+  any hot-path complete-state materialization; the guard instruments both
+  `load_state` and the ANN `apply_tree_mutations` full `load_from_tree`
+  fallback;
+- delta ANN WAL marker decoding is fixed-size and bounded, recovered stale
+  delta-index histories are rejected, and legacy disjoint materialized writes
+  still rebase and reopen;
+- V1 ANN metadata upgrades safely on delta mutation while V2 and V3 preserve
+  their format branches, with trailing or inconsistent lengths rejected;
+- one committed delta vector's creating CSN equals its commit receipt CSN and
+  its persisted view identity equals the recomputed base-plus-delta identity;
+- unfiltered ANN evidence executes `GraphTraversal` over a non-empty HNSW base,
+  merges an exact delta hit, and remains identical after reopen;
 - unrelated row, structure, document, and version population does not change
   the number of point identities admitted for the same three-operation
   transaction;

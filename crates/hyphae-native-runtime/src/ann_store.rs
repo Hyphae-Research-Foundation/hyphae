@@ -1670,7 +1670,7 @@ impl PersistedChildDescriptor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PersistedIndexMetadata {
     build_identity: [u8; 32],
     vector_count: u64,
@@ -1896,6 +1896,92 @@ impl AnnIndexLoadPlan {
     #[cfg(test)]
     pub(crate) fn physical_entry_limit(&self) -> usize {
         self.physical_limits.total_entries()
+    }
+}
+
+/// Bounded authority for mutating one index's durable object delta without
+/// restoring its immutable HNSW base generation.
+pub(crate) struct AnnDeltaMutationPlan {
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    expected_metadata: Vec<u8>,
+    metadata: PersistedIndexMetadata,
+    retained_memory_bytes: u64,
+    delta_limit: AnnPhysicalRangeLimit,
+}
+
+impl AnnDeltaMutationPlan {
+    pub(crate) const fn retained_memory_bytes(&self) -> u64 {
+        self.retained_memory_bytes
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnnDeltaMutationState {
+    definition: VectorIndexDefinition,
+    expected_metadata: Vec<u8>,
+    metadata: PersistedIndexMetadata,
+    deltas: BTreeMap<ObjectId, DeltaRecord>,
+    staged_objects: BTreeSet<ObjectId>,
+    retained_memory_bytes: u64,
+}
+
+impl AnnDeltaMutationState {
+    pub(crate) const fn retained_memory_bytes(&self) -> u64 {
+        self.retained_memory_bytes
+    }
+
+    pub(crate) fn upsert_retained_memory_bytes(vector: &Vector) -> u64 {
+        u64::try_from(vector.dimension())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(std::mem::size_of::<f32>()).unwrap_or(u64::MAX))
+            .saturating_add(512)
+    }
+
+    pub(crate) fn upsert(
+        &mut self,
+        object_id: ObjectId,
+        vector: Vector,
+    ) -> Result<(), NativeRuntimeError> {
+        if self.staged_objects.contains(&object_id) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        validate_vector(self.definition, &vector)?;
+        let sequence = self.metadata.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::AnnDeltaLimitExceeded)?;
+        let previous = self.deltas.insert(
+            object_id,
+            DeltaRecord::Upsert {
+                sequence,
+                record: VectorRecord {
+                    object_id,
+                    creating_csn: private_mutation_csn()?,
+                    vector,
+                },
+            },
+        );
+        if let Err(error) = validate_delta_mutation_bounds(&self.metadata, &self.deltas) {
+            if let Some(previous) = previous {
+                self.deltas.insert(object_id, previous);
+            } else {
+                self.deltas.remove(&object_id);
+            }
+            return Err(error);
+        }
+        self.metadata.next_sequence = next_sequence;
+        self.staged_objects.insert(object_id);
+        self.retained_memory_bytes =
+            self.retained_memory_bytes
+                .saturating_add(Self::upsert_retained_memory_bytes(
+                    match self.deltas.get(&object_id) {
+                        Some(DeltaRecord::Upsert { record, .. }) => &record.vector,
+                        _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+                    },
+                ));
+        Ok(())
     }
 }
 
@@ -2295,12 +2381,14 @@ fn validate_initial_bulk_candidate(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn apply_tree_mutations(
     pages: &mut PageStore,
     mut tree: BTree,
     creating_csn: Csn,
     catalog: &CatalogState,
     mutations: &[Mutation],
+    delta_mutations: Option<&BTreeMap<ObjectId, AnnDeltaMutationState>>,
 ) -> Result<BTree, NativeRuntimeError> {
     let ann_mutations = mutations
         .iter()
@@ -2314,7 +2402,18 @@ pub(crate) fn apply_tree_mutations(
     if ann_mutations.is_empty() {
         return Ok(tree);
     }
+    if let Some(delta_mutations) = delta_mutations.filter(|mutations| !mutations.is_empty()) {
+        return apply_delta_tree_mutations(
+            pages,
+            tree,
+            creating_csn,
+            catalog,
+            &ann_mutations,
+            delta_mutations,
+        );
+    }
 
+    crate::record_full_state_materialization()?;
     let mut state = load_from_tree(pages, tree.root(), catalog, false)?;
     let mut changed = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
     let mut created = BTreeSet::new();
@@ -2407,6 +2506,104 @@ pub(crate) fn apply_tree_mutations(
     Ok(tree)
 }
 
+fn apply_delta_tree_mutations(
+    pages: &mut PageStore,
+    tree: BTree,
+    creating_csn: Csn,
+    catalog: &CatalogState,
+    mutations: &[&Mutation],
+    authorities: &BTreeMap<ObjectId, AnnDeltaMutationState>,
+) -> Result<BTree, NativeRuntimeError> {
+    validate_delta_mutation_shape(authorities, mutations.iter().copied())?;
+    let mut entries = BTreeMap::new();
+    for (index, authority) in authorities {
+        if catalog_ann_definition(catalog, *index)? != authority.definition {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let current_metadata = tree
+            .get(pages, &meta_key(*index))?
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if current_metadata != authority.expected_metadata {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let view_identity = calculate_view_identity_at_csn(
+            authority.metadata.build_identity,
+            authority.metadata.next_sequence,
+            &authority.deltas,
+            Some((&authority.staged_objects, creating_csn)),
+        );
+        entries.insert(
+            meta_key(*index),
+            encode_delta_metadata(
+                &authority.metadata,
+                &authority.expected_metadata,
+                &authority.deltas,
+                view_identity,
+            )?,
+        );
+        for object_id in &authority.staged_objects {
+            let delta = authority
+                .deltas
+                .get(object_id)
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            entries.insert(
+                delta_key(*index, *object_id),
+                encode_delta_at_csn(delta, creating_csn)?,
+            );
+        }
+    }
+    Ok(tree
+        .upsert_sorted_batch(pages, creating_csn, entries.into_iter().collect())?
+        .tree)
+}
+
+pub(crate) fn validate_delta_mutation_batch(
+    authorities: &BTreeMap<ObjectId, AnnDeltaMutationState>,
+    mutations: &[Mutation],
+) -> Result<(), NativeRuntimeError> {
+    validate_delta_mutation_shape(
+        authorities,
+        mutations.iter().filter(|mutation| {
+            matches!(mutation.opcode, Opcode::UpsertVector | Opcode::DeleteVector)
+        }),
+    )
+}
+
+fn validate_delta_mutation_shape<'a>(
+    authorities: &BTreeMap<ObjectId, AnnDeltaMutationState>,
+    mutations: impl IntoIterator<Item = &'a Mutation>,
+) -> Result<(), NativeRuntimeError> {
+    let mut represented = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
+    for mutation in mutations {
+        let index = mutation
+            .target
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let object_id = decode_object_identity(&mutation.key)?;
+        let authority = authorities
+            .get(&index)
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let vector = decode_vector_mutation(&mutation.value)?;
+        let valid = mutation.engine == hyphae_native_types::EngineKind::Search
+            && mutation.opcode == Opcode::UpsertVector
+            && mutation.expires_at_micros.is_none()
+            && matches!(authority.deltas.get(&object_id),
+                Some(DeltaRecord::Upsert { record, .. }) if record.vector == vector);
+        if !valid {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        represented.entry(index).or_default().insert(object_id);
+    }
+    if represented.len() != authorities.len()
+        || authorities.iter().any(|(index, authority)| {
+            represented.get(index) != Some(&authority.staged_objects)
+                || validate_delta_mutation_bounds(&authority.metadata, &authority.deltas).is_err()
+        })
+    {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
+    Ok(())
+}
+
 pub(crate) fn load(
     pages: &PageStore,
     root: Option<PageId>,
@@ -2428,6 +2625,168 @@ pub(crate) fn plan_index_load(
     definition: VectorIndexDefinition,
 ) -> Result<AnnIndexLoadPlan, NativeRuntimeError> {
     plan_index_load_with_cancellation(pages, buffer_pool, root, index, definition, None)
+}
+
+pub(crate) fn plan_delta_mutation(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+) -> Result<AnnDeltaMutationPlan, NativeRuntimeError> {
+    if definition.index_id() != index
+        || !matches!(
+            pages.read(root)?.kind(),
+            PageKind::BTreeLeaf | PageKind::BTreeInternal
+        )
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let tree = BTree::from_root(root);
+    let marker = tree
+        .get_cached_pinned(pages, buffer_pool, crate::SEARCH_FORMAT_KEY)?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if marker.bytes() != crate::SEARCH_FORMAT_VALUE_V1
+        && marker.bytes() != crate::SEARCH_FORMAT_VALUE_V2
+        && marker.bytes() != crate::SEARCH_FORMAT_VALUE_V3
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let expected_metadata = tree
+        .get_cached_pinned(pages, buffer_pool, &meta_key(index))?
+        .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?
+        .bytes()
+        .to_vec();
+    let metadata = decode_metadata(&expected_metadata)?;
+    let delta_entries =
+        usize::try_from(metadata.delta_count).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let delta_limit = AnnPhysicalRangeLimit {
+        entries: delta_entries,
+        bytes: metadata
+            .delta_bytes
+            .checked_add(
+                metadata
+                    .delta_count
+                    .saturating_mul(u64::try_from(ANN_DELTA_KEY_SIZE).unwrap_or(u64::MAX)),
+            )
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+    };
+    let retained_memory_bytes = delta_mutation_memory_bytes(&metadata, expected_metadata.len())?;
+    Ok(AnnDeltaMutationPlan {
+        root,
+        index,
+        definition,
+        expected_metadata,
+        metadata,
+        retained_memory_bytes,
+        delta_limit,
+    })
+}
+
+pub(crate) fn load_delta_mutation(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    plan: AnnDeltaMutationPlan,
+) -> Result<AnnDeltaMutationState, NativeRuntimeError> {
+    let tree = BTree::from_root(plan.root);
+    let current_metadata = tree
+        .get_cached_pinned(pages, buffer_pool, &meta_key(plan.index))?
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if current_metadata.bytes() != plan.expected_metadata {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let mut entries = Vec::with_capacity(plan.delta_limit.entries);
+    visit_bounded_physical_range(
+        tree,
+        pages,
+        buffer_pool,
+        &object_prefix(ANN_DELTA_PREFIX, plan.index),
+        plan.delta_limit,
+        None,
+        &mut entries,
+    )?;
+    let mut deltas = BTreeMap::new();
+    for (key, value) in entries {
+        let (index, object_id) = decode_delta_key(&key)?;
+        if index != plan.index
+            || deltas
+                .insert(object_id, decode_delta(&value, object_id, plan.definition)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    validate_restored_deltas(&plan.metadata, &deltas)?;
+    let maximum_sequence = deltas
+        .values()
+        .map(DeltaRecord::sequence)
+        .max()
+        .unwrap_or(0);
+    if plan.metadata.next_sequence == 0
+        || plan.metadata.next_sequence <= maximum_sequence
+        || plan.metadata.view_identity
+            != calculate_view_identity(
+                plan.metadata.build_identity,
+                plan.metadata.next_sequence,
+                &deltas,
+            )
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(AnnDeltaMutationState {
+        definition: plan.definition,
+        expected_metadata: plan.expected_metadata,
+        metadata: plan.metadata,
+        deltas,
+        staged_objects: BTreeSet::new(),
+        retained_memory_bytes: plan.retained_memory_bytes,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn delta_record_identity_for_test(
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    root: PageId,
+    index: ObjectId,
+    definition: VectorIndexDefinition,
+    object_id: ObjectId,
+) -> Result<(Csn, [u8; 32], [u8; 32]), NativeRuntimeError> {
+    let plan = plan_delta_mutation(pages, buffer_pool, root, index, definition)?;
+    let state = load_delta_mutation(pages, buffer_pool, plan)?;
+    let creating_csn = match state.deltas.get(&object_id) {
+        Some(DeltaRecord::Upsert { record, .. }) => record.creating_csn,
+        _ => return Err(NativeRuntimeError::InvalidAnnTree),
+    };
+    let calculated = calculate_view_identity(
+        state.metadata.build_identity,
+        state.metadata.next_sequence,
+        &state.deltas,
+    );
+    Ok((creating_csn, state.metadata.view_identity, calculated))
+}
+
+fn delta_mutation_memory_bytes(
+    metadata: &PersistedIndexMetadata,
+    metadata_bytes: usize,
+) -> Result<u64, NativeRuntimeError> {
+    const FIXED_BYTES: u64 = 1024 * 1024;
+    const RECORD_OVERHEAD_BYTES: u64 = 512;
+    metadata
+        .delta_bytes
+        .checked_mul(2)
+        .and_then(|bytes| {
+            bytes.checked_add(metadata.delta_count.saturating_mul(RECORD_OVERHEAD_BYTES))
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::try_from(metadata_bytes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(2),
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(FIXED_BYTES))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)
 }
 
 pub(crate) fn plan_index_load_with_cancellation(
@@ -3469,6 +3828,19 @@ fn validate_restored_deltas(
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     Ok(())
+}
+
+fn validate_delta_mutation_bounds(
+    metadata: &PersistedIndexMetadata,
+    deltas: &BTreeMap<ObjectId, DeltaRecord>,
+) -> Result<(), NativeRuntimeError> {
+    if deltas.len() > usize::try_from(metadata.lifecycle.delta_max_entries).unwrap_or(usize::MAX)
+        || deltas.values().map(DeltaRecord::encoded_len).sum::<usize>() > MAX_ANN_DELTA_BYTES
+    {
+        Err(NativeRuntimeError::AnnDeltaLimitExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn plan_consolidation(
@@ -4713,6 +5085,135 @@ fn encode_metadata(state: &AnnIndexState) -> Result<Vec<u8>, NativeRuntimeError>
     Ok(encoded)
 }
 
+#[allow(clippy::too_many_lines)]
+fn encode_delta_metadata(
+    metadata: &PersistedIndexMetadata,
+    expected_metadata: &[u8],
+    deltas: &BTreeMap<ObjectId, DeltaRecord>,
+    view_identity: [u8; 32],
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    metadata
+        .lifecycle
+        .validate()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    validate_delta_mutation_bounds(metadata, deltas)?;
+    if metadata.next_sequence == 0 || view_identity == [0; 32] {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let delta_count =
+        u64::try_from(deltas.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let delta_bytes = deltas
+        .values()
+        .try_fold(0_u64, |bytes, delta| {
+            bytes.checked_add(u64::try_from(delta.encoded_len()).ok()?)
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if matches!(metadata.version, 2 | 3) {
+        let mut encoded = expected_metadata.to_vec();
+        encoded[88..120].copy_from_slice(&view_identity);
+        encoded[120..128].copy_from_slice(&delta_count.to_le_bytes());
+        encoded[128..136].copy_from_slice(&delta_bytes.to_le_bytes());
+        encoded[136..144].copy_from_slice(&metadata.next_sequence.to_le_bytes());
+        decode_metadata(&encoded)?;
+        return Ok(encoded);
+    }
+    let child_count =
+        u16::try_from(metadata.children.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let retained_count = u16::try_from(metadata.retained_generations.len())
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    if usize::from(retained_count) > usize::from(metadata.lifecycle.retain_generations) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    validate_current_base_metadata(
+        metadata.base_kind,
+        metadata.build_identity,
+        metadata.input_identity.unwrap_or([0; 32]),
+        metadata.vector_count,
+        metadata
+            .children
+            .iter()
+            .try_fold(0_u64, |count, child| {
+                count.checked_add(child.graph_node_count)
+            })
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        &metadata.children,
+    )?;
+    validate_retained_generations(&metadata.retained_generations, metadata.build_identity)?;
+    let retained_size = metadata
+        .retained_generations
+        .iter()
+        .try_fold(0_usize, |size, generation| {
+            ANN_INDEX_META_V4_RETAINED_HEADER_SIZE
+                .checked_add(
+                    generation
+                        .children
+                        .len()
+                        .checked_mul(ANN_INDEX_META_V4_CHILD_SIZE)?,
+                )
+                .and_then(|generation_size| size.checked_add(generation_size))
+        })
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let capacity = ANN_INDEX_META_V4_HEADER_SIZE
+        .checked_add(
+            metadata
+                .children
+                .len()
+                .checked_mul(ANN_INDEX_META_V4_CHILD_SIZE)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        )
+        .and_then(|size| size.checked_add(retained_size))
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(ANN_INDEX_META_MAGIC_V4);
+    encoded.extend_from_slice(&metadata.build_identity);
+    encoded.extend_from_slice(&view_identity);
+    encoded.extend_from_slice(&metadata.input_identity.unwrap_or([0; 32]));
+    encoded.extend_from_slice(&metadata.vector_count.to_le_bytes());
+    encoded.extend_from_slice(
+        &metadata
+            .children
+            .iter()
+            .try_fold(0_u64, |count, child| {
+                count.checked_add(child.graph_node_count)
+            })
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&delta_count.to_le_bytes());
+    encoded.extend_from_slice(&delta_bytes.to_le_bytes());
+    encoded.extend_from_slice(&metadata.next_sequence.to_le_bytes());
+    encoded.extend_from_slice(&metadata.lifecycle.delta_max_entries.to_le_bytes());
+    encoded.extend_from_slice(&metadata.lifecycle.consolidate_after_deltas.to_le_bytes());
+    encoded.extend_from_slice(&metadata.lifecycle.retain_generations.to_le_bytes());
+    encoded.push(match metadata.base_kind {
+        PersistedBaseKind::Single => ANN_BASE_SINGLE,
+        PersistedBaseKind::Partitioned => ANN_BASE_PARTITIONED,
+    });
+    encoded.push(0);
+    encoded.extend_from_slice(&child_count.to_le_bytes());
+    encoded.extend_from_slice(&retained_count.to_le_bytes());
+    encoded.extend_from_slice(&[0; 2]);
+    for child in &metadata.children {
+        encode_persisted_child_descriptor(&mut encoded, child)?;
+    }
+    for generation in &metadata.retained_generations {
+        encoded.extend_from_slice(&generation.build_identity);
+        encoded.extend_from_slice(
+            &u16::try_from(generation.children.len())
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&[0; 6]);
+        for child in &generation.children {
+            encode_persisted_child_descriptor(&mut encoded, child)?;
+        }
+    }
+    if encoded.len() != capacity {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(encoded)
+}
+
 fn decode_metadata(encoded: &[u8]) -> Result<PersistedIndexMetadata, NativeRuntimeError> {
     if encoded.len() >= ANN_INDEX_META_V4_HEADER_SIZE
         && encoded.get(..8) == Some(ANN_INDEX_META_MAGIC_V4.as_slice())
@@ -5211,6 +5712,34 @@ fn encode_delta(delta: &DeltaRecord) -> Result<Vec<u8>, NativeRuntimeError> {
     Ok(encoded)
 }
 
+fn encode_delta_at_csn(
+    delta: &DeltaRecord,
+    mutation_csn: Csn,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let (kind, sequence, dimension, vector) = match delta {
+        DeltaRecord::Upsert { sequence, record } => (
+            ANN_DELTA_UPSERT,
+            *sequence,
+            u16::try_from(record.vector.dimension())
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            Some(&record.vector),
+        ),
+        DeltaRecord::Tombstone { sequence, .. } => (ANN_DELTA_TOMBSTONE, *sequence, 0, None),
+    };
+    let mut encoded = Vec::with_capacity(delta.encoded_len());
+    encoded.extend_from_slice(ANN_DELTA_MAGIC);
+    encoded.push(kind);
+    encoded.extend_from_slice(&[0; 7]);
+    encoded.extend_from_slice(&sequence.to_le_bytes());
+    encoded.extend_from_slice(&mutation_csn.get().to_le_bytes());
+    encoded.extend_from_slice(&dimension.to_le_bytes());
+    encoded.extend_from_slice(&[0; 6]);
+    if let Some(vector) = vector {
+        encoded.extend_from_slice(&encode_vector_mutation(vector));
+    }
+    Ok(encoded)
+}
+
 fn decode_delta(
     encoded: &[u8],
     object_id: ObjectId,
@@ -5324,6 +5853,15 @@ fn calculate_view_identity(
     next_sequence: u64,
     deltas: &BTreeMap<ObjectId, DeltaRecord>,
 ) -> [u8; 32] {
+    calculate_view_identity_at_csn(base_identity, next_sequence, deltas, None)
+}
+
+fn calculate_view_identity_at_csn(
+    base_identity: [u8; 32],
+    next_sequence: u64,
+    deltas: &BTreeMap<ObjectId, DeltaRecord>,
+    staged: Option<(&BTreeSet<ObjectId>, Csn)>,
+) -> [u8; 32] {
     if deltas.is_empty() {
         return base_identity;
     }
@@ -5337,11 +5875,17 @@ fn calculate_view_identity(
         match delta {
             DeltaRecord::Upsert { record, .. } => {
                 hasher.update(&[ANN_DELTA_UPSERT]);
-                hasher.update(&record.creating_csn.get().to_le_bytes());
+                let creating_csn = staged
+                    .filter(|(objects, _)| objects.contains(object_id))
+                    .map_or(record.creating_csn, |(_, creating_csn)| creating_csn);
+                hasher.update(&creating_csn.get().to_le_bytes());
                 hasher.update(&encode_vector_mutation(&record.vector));
             }
             DeltaRecord::Tombstone { mutation_csn, .. } => {
                 hasher.update(&[ANN_DELTA_TOMBSTONE]);
+                let mutation_csn = staged
+                    .filter(|(objects, _)| objects.contains(object_id))
+                    .map_or(*mutation_csn, |(_, creating_csn)| creating_csn);
                 hasher.update(&mutation_csn.get().to_le_bytes());
             }
         }
@@ -5448,6 +5992,106 @@ mod tests {
             lifecycle: DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
             retained_generations: Vec::new(),
         })
+    }
+
+    fn encode_legacy_metadata(
+        snapshot: &IndexSnapshot,
+        version: u8,
+    ) -> Result<Vec<u8>, NativeRuntimeError> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(match version {
+            1 => ANN_INDEX_META_MAGIC_V1,
+            2 => ANN_INDEX_META_MAGIC_V2,
+            3 => ANN_INDEX_META_MAGIC_V3,
+            _ => return Err(NativeRuntimeError::InvalidAnnTree),
+        });
+        encoded.extend_from_slice(&snapshot.build_identity);
+        encoded.extend_from_slice(
+            &u64::try_from(snapshot.vectors.len())
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(
+            &u64::try_from(snapshot.nodes.len())
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&snapshot.entry_point.map_or(0, ObjectId::get).to_be_bytes());
+        encoded.extend_from_slice(&snapshot.max_level.to_le_bytes());
+        encoded.extend_from_slice(&[0; 6]);
+        if version >= 2 {
+            encoded.extend_from_slice(ANN_INDEX_META_MAGIC_V1);
+            encoded.extend_from_slice(&snapshot.build_identity);
+            encoded.extend_from_slice(&0_u64.to_le_bytes());
+            encoded.extend_from_slice(&0_u64.to_le_bytes());
+            encoded.extend_from_slice(&1_u64.to_le_bytes());
+        }
+        if version >= 3 {
+            encoded.extend_from_slice(
+                &DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE
+                    .delta_max_entries
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(
+                &DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE
+                    .consolidate_after_deltas
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(
+                &DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE
+                    .retain_generations
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(&0_u16.to_le_bytes());
+            encoded.extend_from_slice(&[0; 6]);
+        }
+        Ok(encoded)
+    }
+
+    #[test]
+    fn delta_metadata_preserves_v2_v3_and_safely_upgrades_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = HnswIndex::new(definition()?)?.export_snapshot();
+        let object_id = ObjectId::new(91)?;
+        let delta = DeltaRecord::Upsert {
+            sequence: 1,
+            record: VectorRecord {
+                object_id,
+                creating_csn: Csn::new(2)?,
+                vector: Vector::new([1.0, 2.0])?,
+            },
+        };
+        let deltas = BTreeMap::from([(object_id, delta)]);
+
+        for (input_version, output_version, encoded_size) in [
+            (1, 4, ANN_INDEX_META_V1_SIZE),
+            (2, 2, ANN_INDEX_META_V2_SIZE),
+            (3, 3, ANN_INDEX_META_V3_SIZE),
+        ] {
+            let expected = encode_legacy_metadata(&snapshot, input_version)?;
+            assert_eq!(expected.len(), encoded_size);
+            let mut trailing = expected.clone();
+            trailing.push(0);
+            assert!(decode_metadata(&trailing).is_err());
+
+            let mut metadata = decode_metadata(&expected)?;
+            metadata.next_sequence = 2;
+            let view_identity =
+                calculate_view_identity(metadata.build_identity, metadata.next_sequence, &deltas);
+            let encoded = encode_delta_metadata(&metadata, &expected, &deltas, view_identity)?;
+            let decoded = decode_metadata(&encoded)?;
+            assert_eq!(decoded.version, output_version);
+            assert_eq!(decoded.view_identity, view_identity);
+            assert_eq!(decoded.delta_count, 1);
+            assert_eq!(
+                decoded.delta_bytes,
+                u64::try_from(deltas[&object_id].encoded_len())?
+            );
+            assert_eq!(decoded.next_sequence, 2);
+            assert_eq!(decoded.lifecycle, DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE);
+            assert_eq!(decoded.build_identity, snapshot.build_identity);
+        }
+        Ok(())
     }
 
     #[test]

@@ -11,16 +11,22 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use hyphae_native_catalog::{
-    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, CatalogName, CatalogObjectV2,
-    DefinitionVersion, FieldSourcePolicy, LexicalIndexPolicy, LogicalCatalogObject, ObjectHeaderV2,
-    QualifiedName, SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions,
+    AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogName,
+    CatalogObjectV2, DefinitionVersion, FieldSourcePolicy, IncrementalVectorLifecycle,
+    LexicalIndexPolicy, LogicalCatalogObject, NamedVectorDefinition, ObjectHeaderV2, QualifiedName,
+    SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions, VectorMetric,
+    VectorSearchPolicy,
 };
 use hyphae_native_product::{
-    NativeProduct, ProductDocValue, ProductDocument, ProductDurability, ProductLexicalBranch,
-    ProductSearchCollectionBinding, ProductSearchFilter, ProductSearchIngestBatch,
-    ProductSearchOperator, ProductSearchRequest,
+    AnnConsolidationRequest, NativeProduct, ProductDocValue, ProductDocument, ProductDurability,
+    ProductLexicalBranch, ProductSearchCollectionBinding, ProductSearchFilter,
+    ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductVector,
+    ProductVectorBranch, ProductVectorExecution,
 };
-use hyphae_native_types::{EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId};
+use hyphae_native_runtime::NativeDatabase;
+use hyphae_native_types::{
+    EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId, VectorElement, VectorType,
+};
 
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -67,7 +73,7 @@ fn doc_value_field(
     })
 }
 
-/// A lexical collection with doc values and no named vectors.
+/// A lexical collection with doc values and one named ANN vector.
 fn configure_chunked(
     path: &PathBuf,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
@@ -127,7 +133,39 @@ fn configure_chunked(
                         LogicalType::Signed(IntegerWidth::Bits64),
                     )?,
                 ],
-                vectors: Vec::new(),
+                vectors: vec![
+                    NamedVectorDefinition {
+                        id: FieldId::new(7)?,
+                        name: name("embedding")?,
+                        vector_type: VectorType::new(VectorElement::Float32, 2)?,
+                        metric: VectorMetric::SquaredL2,
+                        policy: VectorSearchPolicy::Ann(AnnIndexDefinition::new(
+                            VectorMetric::SquaredL2,
+                            8,
+                            32,
+                            16,
+                            256,
+                            7,
+                        )?),
+                        lifecycle: IncrementalVectorLifecycle {
+                            delta_max_entries: 1_000,
+                            consolidate_after_deltas: 2,
+                            retain_generations: 1,
+                        },
+                    },
+                    NamedVectorDefinition {
+                        id: FieldId::new(8)?,
+                        name: name("exact")?,
+                        vector_type: VectorType::new(VectorElement::Float32, 2)?,
+                        metric: VectorMetric::SquaredL2,
+                        policy: VectorSearchPolicy::Exact,
+                        lifecycle: IncrementalVectorLifecycle {
+                            delta_max_entries: 1_000,
+                            consolidate_after_deltas: 2,
+                            retain_generations: 1,
+                        },
+                    },
+                ],
             },
         )),
         ProductDurability::Strict,
@@ -139,6 +177,13 @@ fn configure_chunked(
 }
 
 fn chunk_document(id: u128, text: &str) -> Result<ProductDocument, Box<dyn std::error::Error>> {
+    let coordinate = match id {
+        301 => 1.0,
+        302 => 2.0,
+        303 => 3.0,
+        304 => 4.0,
+        _ => return Err("unexpected fixture identity".into()),
+    };
     Ok(ProductDocument {
         object_id: ObjectId::new(id)?,
         text: text.into(),
@@ -155,7 +200,10 @@ fn chunk_document(id: u128, text: &str) -> Result<ProductDocument, Box<dyn std::
                 ProductDocValue::Integer(i64::try_from(id)?),
             ),
         ]),
-        vectors: BTreeMap::new(),
+        vectors: BTreeMap::from([
+            ("embedding".into(), ProductVector::new([coordinate, 0.0])?),
+            ("exact".into(), ProductVector::new([coordinate, 0.0])?),
+        ]),
     })
 }
 
@@ -188,16 +236,17 @@ fn full_state_loads(product: &mut NativeProduct) -> Result<u64, Box<dyn std::err
         .process_full_state_loads)
 }
 
-/// A vector-less batch must stage through the physical delta path: no
+/// A vector-bearing batch must stage through the physical delta path: no
 /// complete all-engine state load at `BEGIN`, staging, commit, or receipt,
 /// while every durable side record (documents, postings, manifest,
 /// idempotency marker) lands exactly as the materialized path writes it.
 #[test]
 #[allow(clippy::too_many_lines)]
-fn vectorless_ingest_is_point_resolved_and_semantically_identical()
+fn vector_ingest_is_point_resolved_and_semantically_identical()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("delta-ingest");
-    let (mut product, binding) = configure_chunked(&path)?;
+    let (mut product, binding) = configure_chunked(&path)
+        .map_err(|error| format!("vector collection configuration failed: {error:?}"))?;
     let first = ProductSearchIngestBatch {
         idempotency_id: 7,
         documents: vec![
@@ -206,8 +255,25 @@ fn vectorless_ingest_is_point_resolved_and_semantically_identical()
         ],
     };
     // The first batch turns posting coverage on; the second exercises the
-    // steady state where coverage is already durable.
-    product.ingest_search_batch(binding.collection, &first, 3, ProductDurability::Strict)?;
+    // steady state where coverage is already durable. Consolidation places
+    // the first vectors in the immutable base so the measured ingest proves
+    // base-plus-delta behavior rather than an empty-base special case.
+    product
+        .ingest_search_batch(binding.collection, &first, 3, ProductDurability::Strict)
+        .map_err(|error| format!("first vector ingest failed: {error:?}"))?;
+    let vector_index = binding
+        .vectors
+        .iter()
+        .find(|binding| binding.name == "embedding")
+        .ok_or("missing vector binding")?
+        .index;
+    product
+        .administration()
+        .consolidate_ann(
+            AnnConsolidationRequest::new(vector_index, 16, 16, ProductDurability::Strict)
+                .ok_or("invalid consolidation request")?,
+        )
+        .map_err(|error| format!("ANN consolidation failed: {error:?}"))?;
     let second = ProductSearchIngestBatch {
         idempotency_id: 8,
         documents: vec![
@@ -216,12 +282,19 @@ fn vectorless_ingest_is_point_resolved_and_semantically_identical()
         ],
     };
     let before = full_state_loads(&mut product)?;
-    let receipt =
-        product.ingest_search_batch(binding.collection, &second, 4, ProductDurability::Strict)?;
+    let ann_restores = NativeDatabase::process_ann_index_restore_count();
+    let receipt = product
+        .ingest_search_batch(binding.collection, &second, 4, ProductDurability::Strict)
+        .map_err(|error| format!("second vector ingest failed: {error:?}"))?;
     assert_eq!(
         full_state_loads(&mut product)?,
         before,
-        "vector-less ingest materialized the complete all-engine state"
+        "vector ingest materialized the complete all-engine state"
+    );
+    assert_eq!(
+        NativeDatabase::process_ann_index_restore_count(),
+        ann_restores,
+        "vector ingest restored the immutable ANN base"
     );
     assert!(!receipt.idempotent_replay);
     assert_eq!(receipt.documents, 2);
@@ -311,6 +384,35 @@ fn vectorless_ingest_is_point_resolved_and_semantically_identical()
     assert_eq!(filtered.hits.len(), 1);
     assert_eq!(filtered.hits[0].object_id.get(), 304);
 
+    let mut exact_request = match_all(16);
+    exact_request.vectors.push(ProductVectorBranch {
+        target: "exact".into(),
+        query: ProductVector::new([3.0, 0.0])?,
+        candidate_limit: 4,
+        weight: 1,
+        execution: Some(ProductVectorExecution::Exact),
+        max_distance: None,
+    });
+    let exact = product.search_collection(binding.collection, &exact_request, 6)?;
+    assert_eq!(exact.hits[0].object_id.get(), 303);
+    assert!(!exact.approximate);
+
+    let mut ann = match_all(16);
+    ann.vectors.push(ProductVectorBranch {
+        target: "embedding".into(),
+        query: ProductVector::new([3.0, 0.0])?,
+        candidate_limit: 4,
+        weight: 1,
+        execution: Some(ProductVectorExecution::Ann {
+            ef_search: 16,
+            exact_rerank: Some(4),
+        }),
+        max_distance: None,
+    });
+    let ann = product.search_collection(binding.collection, &ann, 6)?;
+    assert_eq!(ann.hits[0].object_id.get(), 303);
+    assert_eq!(ann.hits.len(), 4);
+
     // Everything survives reopen: the delta path wrote the same durable
     // records the materialized path writes, manifest header and chunks
     // included.
@@ -324,6 +426,8 @@ fn vectorless_ingest_is_point_resolved_and_semantically_identical()
     );
     let result = reopened.search_collection(binding.collection, &match_all(16), 6)?;
     assert_eq!(result.total_documents, 4);
+    let reopened_exact = reopened.search_collection(binding.collection, &exact_request, 6)?;
+    assert_eq!(reopened_exact.hits, exact.hits);
     let replay =
         reopened.ingest_search_batch(binding.collection, &second, 7, ProductDurability::Strict)?;
     assert!(replay.idempotent_replay);
