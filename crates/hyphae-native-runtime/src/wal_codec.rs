@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
+
 use hyphae_native_types::{
     CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
     PageGeneration, PageId, TransactionId,
@@ -17,6 +19,8 @@ const ABORT_MAGIC: &[u8; 8] = b"HYABT001";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"HYCHK001";
 const OUTCOME_MAGIC: &[u8; 8] = b"HYOUT001";
 const OUTCOME_BODY_SIZE: usize = 120;
+const ANN_DELTA_AUTHORITY_MAGIC_V1: &[u8; 8] = b"HYANNA01";
+const ANN_DELTA_AUTHORITY_V1_SIZE: usize = 16;
 const ROOT_COUNT: usize = 4;
 const MUTATION_HAS_EXPIRY: u8 = 1;
 
@@ -93,6 +97,7 @@ pub(crate) enum Opcode {
     CleanupStructureRetirementV3 = 52,
     PublishInitialAnnBulk = 53,
     MigrateCatalogV7 = 54,
+    AnnDeltaAuthorityV1 = 55,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +125,20 @@ impl Mutation {
         bytes.extend_from_slice(&self.key);
         bytes.extend_from_slice(&self.value);
         Ok(bytes)
+    }
+}
+
+pub(crate) fn ann_delta_authority_marker_v1(index: ObjectId) -> Mutation {
+    let mut value = Vec::with_capacity(ANN_DELTA_AUTHORITY_V1_SIZE);
+    value.extend_from_slice(ANN_DELTA_AUTHORITY_MAGIC_V1);
+    value.extend_from_slice(&[0; 8]);
+    Mutation {
+        engine: EngineKind::Search,
+        opcode: Opcode::AnnDeltaAuthorityV1,
+        target: Some(index),
+        key: Vec::new(),
+        value,
+        expires_at_micros: None,
     }
 }
 
@@ -292,6 +311,7 @@ pub(crate) fn encode_transaction(
         plan.retention_floor_csn,
         plan.commit_csn,
     )?;
+    validate_ann_delta_authority_markers(plan.mutations.iter())?;
     let encoded_mutations = plan
         .mutations
         .iter()
@@ -719,6 +739,7 @@ fn decode_begin(body: &[u8]) -> Result<Begin, WalSemanticError> {
 
 impl ActiveTransaction {
     fn validate(&self, commit: &CommitManifest) -> Result<(), WalSemanticError> {
+        validate_ann_delta_authority_markers(self.mutations.iter().map(|(mutation, _)| mutation))?;
         let count =
             u32::try_from(self.mutations.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
         let bytes = self.mutations.iter().try_fold(0_u64, |total, (_, body)| {
@@ -877,6 +898,9 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::MigrateCatalogV7 as u8 => {
             (Opcode::MigrateCatalogV7, EngineKind::Kernel)
         }
+        value if value == Opcode::AnnDeltaAuthorityV1 as u8 => {
+            (Opcode::AnnDeltaAuthorityV1, EngineKind::Search)
+        }
         _ => return Err(WalSemanticError::InvalidBody),
     })
 }
@@ -944,6 +968,9 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     if opcode == Opcode::PublishInitialAnnBulk && !valid_initial_ann_bulk_publication(value) {
         return Err(WalSemanticError::InvalidBody);
     }
+    if opcode == Opcode::AnnDeltaAuthorityV1 && !valid_ann_delta_authority_v1(value) {
+        return Err(WalSemanticError::InvalidBody);
+    }
     Ok(Mutation {
         engine,
         opcode,
@@ -954,6 +981,7 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_mutation_shape(
     opcode: Opcode,
     has_target: bool,
@@ -961,6 +989,15 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
+    if opcode == Opcode::AnnDeltaAuthorityV1 {
+        return validate_targeted_ann_maintenance_shape(
+            has_target,
+            value_length,
+            ANN_DELTA_AUTHORITY_V1_SIZE,
+            expires_at_micros,
+            key,
+        );
+    }
     if let Some(expected_length) = targeted_ann_maintenance_length(opcode) {
         return validate_targeted_ann_maintenance_shape(
             has_target,
@@ -1126,6 +1163,48 @@ fn valid_initial_ann_bulk_publication(value: &[u8]) -> bool {
         && Csn::new(read_u64(&value[152..160])).is_ok()
 }
 
+fn valid_ann_delta_authority_v1(value: &[u8]) -> bool {
+    value.len() == ANN_DELTA_AUTHORITY_V1_SIZE
+        && value.get(..8) == Some(ANN_DELTA_AUTHORITY_MAGIC_V1.as_slice())
+        && value[8..].iter().all(|byte| *byte == 0)
+}
+
+fn validate_ann_delta_authority_markers<'a>(
+    mutations: impl IntoIterator<Item = &'a Mutation>,
+) -> Result<(), WalSemanticError> {
+    let mut vector_indexes = BTreeSet::new();
+    let mut authority_indexes = BTreeSet::new();
+    let mut markers_started = false;
+    let mut previous_marker = None;
+    for mutation in mutations {
+        if mutation.opcode == Opcode::AnnDeltaAuthorityV1 {
+            markers_started = true;
+            let index = mutation.target.ok_or(WalSemanticError::InvalidBody)?;
+            if mutation.engine != EngineKind::Search
+                || !mutation.key.is_empty()
+                || mutation.expires_at_micros.is_some()
+                || !valid_ann_delta_authority_v1(&mutation.value)
+                || previous_marker.is_some_and(|previous| previous >= index)
+                || !authority_indexes.insert(index)
+            {
+                return Err(WalSemanticError::InvalidBody);
+            }
+            previous_marker = Some(index);
+        } else {
+            if markers_started {
+                return Err(WalSemanticError::InvalidSequence);
+            }
+            if mutation.opcode == Opcode::UpsertVector {
+                vector_indexes.insert(mutation.target.ok_or(WalSemanticError::InvalidBody)?);
+            }
+        }
+    }
+    if markers_started && vector_indexes != authority_indexes {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    Ok(())
+}
+
 fn validate_mutation_target_shape(
     opcode: Opcode,
     has_target: bool,
@@ -1180,6 +1259,7 @@ fn validate_mutation_target_shape(
             | Opcode::DeleteVector
             | Opcode::ConsolidateAnn
             | Opcode::PublishInitialAnnBulk
+            | Opcode::AnnDeltaAuthorityV1
             | Opcode::CreateCatalogObjectV2
             | Opcode::UpdateRow
             | Opcode::DeleteRow
@@ -1324,8 +1404,9 @@ mod tests {
     use hyphae_native_wal::WalBlock;
 
     use super::{
-        CommitManifest, Mutation, Opcode, TransactionPlan, WalSemanticError, decode_mutation,
-        decode_opcode, encode_checkpoint, encode_transaction, recover_wal, validate_mutation_shape,
+        CommitManifest, Mutation, Opcode, TransactionPlan, WalSemanticError,
+        ann_delta_authority_marker_v1, decode_mutation, decode_opcode, encode_checkpoint,
+        encode_transaction, recover_wal, validate_mutation_shape,
     };
 
     fn mutation(
@@ -1491,6 +1572,139 @@ mod tests {
             PageId::new(3)?,
             PageId::new(4)?,
         ])
+    }
+
+    fn encode_test_transaction(
+        mutations: &[Mutation],
+    ) -> Result<Vec<hyphae_native_wal::PendingRecord>, Box<dyn std::error::Error>> {
+        Ok(encode_transaction(&TransactionPlan {
+            transaction_id: TransactionId::new(1)?,
+            read_csn: None,
+            catalog_version: CatalogVersion::new(1)?,
+            logical_time_micros: 10,
+            durability: DurabilityClass::Strict,
+            mutations,
+            commit_csn: Csn::FIRST,
+            roots: test_roots()?,
+            blob_generation: 0,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
+        })?)
+    }
+
+    #[test]
+    fn ann_delta_authority_marker_is_append_only_fixed_and_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = ObjectId::new(7)?;
+        let marker = ann_delta_authority_marker_v1(index);
+        assert_eq!(Opcode::AnnDeltaAuthorityV1 as u8, 55);
+        assert_eq!(
+            decode_opcode(55)?,
+            (Opcode::AnnDeltaAuthorityV1, EngineKind::Search)
+        );
+        assert_eq!(marker.value.len(), super::ANN_DELTA_AUTHORITY_V1_SIZE);
+        let encoded = marker.encode()?;
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, marker);
+
+        for invalid_value in [
+            marker.value[..marker.value.len() - 1].to_vec(),
+            [marker.value.as_slice(), &[0]].concat(),
+            {
+                let mut reserved = marker.value.clone();
+                reserved[8] = 1;
+                reserved
+            },
+        ] {
+            let mut invalid = marker.clone();
+            invalid.value = invalid_value;
+            assert!(matches!(
+                decode_mutation(EngineKind::Search, &invalid.encode()?),
+                Err(WalSemanticError::InvalidBody)
+            ));
+        }
+        for invalid in [
+            validate_mutation_shape(
+                Opcode::AnnDeltaAuthorityV1,
+                false,
+                super::ANN_DELTA_AUTHORITY_V1_SIZE,
+                None,
+                b"",
+            ),
+            validate_mutation_shape(
+                Opcode::AnnDeltaAuthorityV1,
+                true,
+                super::ANN_DELTA_AUTHORITY_V1_SIZE + 1,
+                None,
+                b"",
+            ),
+            validate_mutation_shape(
+                Opcode::AnnDeltaAuthorityV1,
+                true,
+                super::ANN_DELTA_AUTHORITY_V1_SIZE,
+                Some(1),
+                b"",
+            ),
+            validate_mutation_shape(
+                Opcode::AnnDeltaAuthorityV1,
+                true,
+                super::ANN_DELTA_AUTHORITY_V1_SIZE,
+                None,
+                b"key",
+            ),
+        ] {
+            assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ann_delta_authority_markers_are_canonical_and_cover_exactly_the_vector_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = ObjectId::new(7)?;
+        let second = ObjectId::new(8)?;
+        let upsert = |index, object: u128| {
+            mutation(
+                EngineKind::Search,
+                Opcode::UpsertVector,
+                Some(index),
+                &object.to_be_bytes(),
+                &[0, 0, 128, 63],
+                None,
+            )
+        };
+        let valid = vec![
+            upsert(first, 1),
+            upsert(second, 2),
+            ann_delta_authority_marker_v1(first),
+            ann_delta_authority_marker_v1(second),
+        ];
+        let block = WalBlock::build(1, [0; 32], encode_test_transaction(&valid)?)?;
+        let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
+        assert_eq!(recover_wal(decoded.records())?.commits[0].mutations, valid);
+
+        for invalid in [
+            vec![ann_delta_authority_marker_v1(first)],
+            vec![ann_delta_authority_marker_v1(first), upsert(first, 1)],
+            vec![
+                upsert(first, 1),
+                upsert(second, 2),
+                ann_delta_authority_marker_v1(first),
+            ],
+            vec![
+                upsert(first, 1),
+                ann_delta_authority_marker_v1(first),
+                ann_delta_authority_marker_v1(first),
+            ],
+            vec![
+                upsert(first, 1),
+                upsert(second, 2),
+                ann_delta_authority_marker_v1(second),
+                ann_delta_authority_marker_v1(first),
+            ],
+        ] {
+            assert!(encode_test_transaction(&invalid).is_err());
+        }
+        Ok(())
     }
 
     #[test]
