@@ -349,3 +349,4 @@ relevant contract, guide, example, and gate evidence in the same change.
 - [ADR-0030: Restricted memory panel interface](adr/0030-restricted-memory-panel-interface.md)
 
 - [Explicit semantic memory retrieval](adr/0031-explicit-semantic-memory-retrieval.md) — selectable vector-only recall, profile defaults and lexical fallback.
+- [ADR-0033: Version physiological redo separately from WAL v1](adr/0033-versioned-physiological-redo.md)
