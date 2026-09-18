@@ -53141,7 +53141,7 @@ mod tests {
         )?;
         assert_typed_sql_insert_rejections(&mut transaction);
         let private = transaction.execute_sql(
-            "SELECT name, active, score FROM people WHERE id = ?",
+            "SELECT name, active, score FROM people WHERE id = ? LIMIT 1",
             &[SqlValue::Signed(7)],
         )?;
         assert_eq!(
@@ -53170,7 +53170,7 @@ mod tests {
         assert_eq!(definition.columns[3].logical_type, LogicalType::Float64);
         assert_eq!(definition.primary_key, [ColumnId::new(1)?]);
         let prepared =
-            snapshot.prepare_sql("SELECT name, active, score FROM people WHERE id = ?")?;
+            snapshot.prepare_sql("SELECT name, active, score FROM people WHERE id = ? LIMIT 1")?;
         assert_eq!(
             snapshot.execute_prepared(&prepared, &[SqlValue::Signed(7)])?,
             private
@@ -53186,7 +53186,7 @@ mod tests {
 
         let reopened = NativeDatabase::open(temporary.path())?;
         let recovered = reopened.snapshot(12)?;
-        let recovered_plan = recovered.prepare_sql("SELECT * FROM people WHERE id = ?")?;
+        let recovered_plan = recovered.prepare_sql("SELECT * FROM people WHERE id = ? LIMIT 1")?;
         assert_eq!(
             recovered.execute_prepared(&recovered_plan, &[SqlValue::Signed(7)])?,
             SqlResult::Rows {
@@ -53204,6 +53204,151 @@ mod tests {
                 ]],
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primary_key_lookup_limit_zero_preserves_validation_and_cardinality()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut transaction = database.begin_sql(10, DurabilityClass::Strict)?;
+        let SqlResult::Command {
+            object_id: Some(table),
+            ..
+        } = transaction.execute_sql(
+            "CREATE TABLE limit_items (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)",
+            &[],
+        )?
+        else {
+            return Err("missing LIMIT table identity".into());
+        };
+        transaction.execute_sql(
+            "INSERT INTO limit_items (id, payload) VALUES (?, ?)",
+            &[SqlValue::Signed(7), SqlValue::Text("seven".to_owned())],
+        )?;
+        let zero_queries = [
+            "SELECT payload FROM limit_items WHERE id = ? LIMIT 0",
+            "SELECT payload FROM limit_items WHERE id = ? LIMIT 0 OFFSET 0",
+            "SELECT payload FROM limit_items WHERE id = ? LIMIT 0 OFFSET 1",
+            "SELECT DISTINCT payload FROM limit_items WHERE id = ? LIMIT 0",
+            "SELECT DISTINCT payload FROM limit_items WHERE id = ? LIMIT 0 OFFSET 1",
+        ];
+        let empty_rows = || SqlResult::Rows {
+            columns: vec!["payload".to_owned()],
+            rows: Vec::new(),
+        };
+        for statement in zero_queries {
+            assert_eq!(
+                transaction.execute_sql(statement, &[SqlValue::Signed(7)])?,
+                empty_rows(),
+                "transactional LIMIT 0 emitted a row for {statement}"
+            );
+            assert!(matches!(
+                transaction.execute_sql(statement, &[]),
+                Err(SqlError::ParameterMismatch)
+            ));
+            assert!(matches!(
+                transaction.execute_sql(statement, &[SqlValue::Text("wrong".to_owned())]),
+                Err(SqlError::TypeMismatch)
+            ));
+        }
+        for limit in [1, 8] {
+            assert_eq!(
+                transaction.execute_sql(
+                    &format!("SELECT payload FROM limit_items WHERE id = ? LIMIT {limit}"),
+                    &[SqlValue::Signed(7)],
+                )?,
+                SqlResult::Rows {
+                    columns: vec!["payload".to_owned()],
+                    rows: vec![vec![SqlValue::Text("seven".to_owned())]],
+                }
+            );
+        }
+        for limit in [0, 1] {
+            assert!(matches!(
+                transaction.execute_sql(
+                    &format!(
+                        "SELECT payload FROM limit_items WHERE id = ? ORDER BY id LIMIT {limit}"
+                    ),
+                    &[SqlValue::Signed(7)],
+                ),
+                Err(SqlError::InvalidSyntax)
+            ));
+        }
+        for statement in [
+            "EXPLAIN SELECT payload FROM limit_items WHERE id = 7 LIMIT 0",
+            "EXPLAIN SELECT DISTINCT payload FROM limit_items WHERE id = 7 LIMIT 0 OFFSET 1",
+            "EXPLAIN SELECT payload FROM limit_items WHERE id = 7 LIMIT 8",
+        ] {
+            assert_eq!(
+                transaction.execute_sql(statement, &[])?,
+                SqlResult::Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![SqlValue::Text(format!(
+                        "PrimaryKeyLookup(table={table})"
+                    ))]],
+                }
+            );
+        }
+        transaction.commit()?;
+
+        let snapshot = database.snapshot(11)?;
+        for statement in zero_queries {
+            let prepared = snapshot.prepare_sql(statement)?;
+            assert_eq!(prepared.parameter_count(), 1);
+            assert_eq!(prepared.maximum_result_rows(), Some(0));
+            assert_eq!(
+                snapshot.execute_prepared(&prepared, &[SqlValue::Signed(7)])?,
+                empty_rows()
+            );
+            assert!(matches!(
+                snapshot.execute_prepared(&prepared, &[]),
+                Err(SqlError::ParameterMismatch)
+            ));
+            assert!(matches!(
+                snapshot.execute_prepared(&prepared, &[SqlValue::Text("wrong".to_owned())],),
+                Err(SqlError::TypeMismatch)
+            ));
+        }
+        for limit in [1, 8] {
+            let prepared = snapshot.prepare_sql(&format!(
+                "SELECT payload FROM limit_items WHERE id = ? LIMIT {limit}"
+            ))?;
+            assert_eq!(prepared.maximum_result_rows(), Some(1));
+            assert_eq!(
+                snapshot.execute_prepared(&prepared, &[SqlValue::Signed(7)])?,
+                SqlResult::Rows {
+                    columns: vec!["payload".to_owned()],
+                    rows: vec![vec![SqlValue::Text("seven".to_owned())]],
+                }
+            );
+        }
+        let latest = database.prepare_sql_latest(zero_queries[4])?;
+        assert_eq!(latest.maximum_result_rows(), Some(0));
+        assert_eq!(
+            database.execute_prepared_latest(&latest, &[SqlValue::Signed(7)])?,
+            empty_rows()
+        );
+        drop(snapshot);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let zero = reopened.prepare_sql_latest(zero_queries[3])?;
+        assert_eq!(zero.maximum_result_rows(), Some(0));
+        assert_eq!(
+            reopened.execute_prepared_latest(&zero, &[SqlValue::Signed(7)])?,
+            empty_rows()
+        );
+        let positive =
+            reopened.prepare_sql_latest("SELECT payload FROM limit_items WHERE id = ? LIMIT 8")?;
+        assert_eq!(positive.maximum_result_rows(), Some(1));
+        assert!(matches!(
+            reopened.execute_prepared_latest(&positive, &[SqlValue::Signed(7)])?,
+            SqlResult::Rows { rows, .. }
+                if rows == vec![vec![SqlValue::Text("seven".to_owned())]]
+        ));
         Ok(())
     }
 
@@ -57599,6 +57744,75 @@ mod tests {
         seed.execute_sql("CREATE UNIQUE INDEX users_email ON users (email)", &[])?;
         seed.execute_sql("CREATE INDEX users_cohort ON users (cohort)", &[])?;
         seed.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_key_inner_join_rejects_limits_without_changing_point_selects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_indexed_join(&mut database)?;
+        let snapshot = database.snapshot(11)?;
+        let statements = [0, 2].map(|limit| {
+            format!(
+                "SELECT users.id, profiles.city
+                 FROM users
+                 INNER JOIN profiles ON users.profile_id = profiles.id
+                 WHERE id = ? LIMIT {limit}"
+            )
+        });
+        for statement in &statements {
+            assert!(matches!(
+                snapshot.prepare_sql(statement),
+                Err(SqlError::InvalidSyntax)
+            ));
+            assert!(matches!(
+                database.prepare_sql_latest(statement),
+                Err(SqlError::InvalidSyntax)
+            ));
+            assert!(matches!(
+                database.bind_sql_latest(statement, &[SqlValue::Signed(1)]),
+                Err(SqlError::InvalidSyntax)
+            ));
+        }
+        let point = "SELECT name FROM users WHERE id = ? LIMIT 0";
+        let prepared = snapshot.prepare_sql(point)?;
+        assert_eq!(prepared.maximum_result_rows(), Some(0));
+        assert_eq!(
+            snapshot.execute_prepared(&prepared, &[SqlValue::Signed(1)])?,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+
+        let mut transaction = database.begin_sql(12, DurabilityClass::Memory)?;
+        for statement in &statements {
+            assert!(matches!(
+                transaction.execute_sql(statement, &[SqlValue::Signed(1)]),
+                Err(SqlError::InvalidSyntax)
+            ));
+            assert!(matches!(
+                transaction.execute_sql(&format!("EXPLAIN {statement}"), &[]),
+                Err(SqlError::InvalidSyntax)
+            ));
+        }
+        assert_eq!(
+            transaction.execute_sql(point, &[SqlValue::Signed(1)])?,
+            SqlResult::Rows {
+                columns: vec!["name".to_owned()],
+                rows: Vec::new(),
+            }
+        );
+        assert_eq!(
+            transaction.execute_sql("EXPLAIN SELECT name FROM users WHERE id = 1 LIMIT 0", &[])?,
+            SqlResult::Rows {
+                columns: vec!["plan".to_owned()],
+                rows: vec![vec![SqlValue::Text("PrimaryKeyLookup(table=1)".to_owned())]],
+            }
+        );
+        transaction.rollback();
         Ok(())
     }
 

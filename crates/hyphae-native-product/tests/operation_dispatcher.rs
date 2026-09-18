@@ -1066,22 +1066,346 @@ fn direct_sql_query_response_is_typed() -> Result<(), Box<dyn Error>> {
             parameters: vec![],
         },
     )?;
-    let query_context = context(&session, 52, 0);
+    let insert_context = memory_context(&session, 52, 0);
+    product.dispatch(
+        &mut session,
+        &insert_context,
+        ProductOperation::ExecuteSql {
+            statement: "INSERT INTO values_table (id) VALUES (?)".to_owned(),
+            parameters: vec![ProductValue::Signed(1)],
+        },
+    )?;
+    let query_context = context(&session, 53, 0);
     let response = product.dispatch(
         &mut session,
         &query_context,
         ProductOperation::ExecuteSql {
-            statement: "SELECT id FROM values_table WHERE id = ?".to_owned(),
+            statement: "SELECT id FROM values_table WHERE id = ? LIMIT 1".to_owned(),
             parameters: vec![ProductValue::Signed(1)],
         },
     )?;
     assert!(matches!(
         response,
         ProductResponse::Sql {
-            result: ProductSqlResult::Rows { .. },
+            result: ProductSqlResult::Rows { rows, .. },
             snapshot: Some(_),
             commit: None,
-        }
+        } if rows == vec![vec![ProductValue::Signed(1)]]
+    ));
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sql_limit_zero_is_bounded_across_product_execution_paths() -> Result<(), Box<dyn Error>> {
+    let path = temporary("sql-limit-zero");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut session = direct_session("sql-limit-zero", ProductAuthorization::ALL)?;
+    let create_context = memory_context(&session, 54, 0);
+    product.dispatch(
+        &mut session,
+        &create_context,
+        ProductOperation::ExecuteSql {
+            statement: "CREATE TABLE limit_items (id BIGINT PRIMARY KEY)".to_owned(),
+            parameters: vec![],
+        },
+    )?;
+    let insert_context = memory_context(&session, 55, 0);
+    product.dispatch(
+        &mut session,
+        &insert_context,
+        ProductOperation::ExecuteSql {
+            statement: "INSERT INTO limit_items (id) VALUES (?)".to_owned(),
+            parameters: vec![ProductValue::Signed(1)],
+        },
+    )?;
+
+    let statement = "SELECT DISTINCT id FROM limit_items WHERE id = ? LIMIT 0 OFFSET 1";
+    let direct = product.prepare_sql(statement)?;
+    assert_eq!(direct.parameter_count(), 1);
+    assert_eq!(direct.maximum_result_rows(), 0);
+    assert!(matches!(
+        product.execute_prepared(&direct, &[ProductValue::Signed(1)])?.value,
+        ProductSqlResult::Rows { rows, .. } if rows.is_empty()
+    ));
+    assert_eq!(
+        product
+            .execute_prepared(&direct, &[])
+            .expect_err("LIMIT 0 accepted missing parameters")
+            .code(),
+        ProductErrorCode::SqlParameterMismatch
+    );
+    assert_eq!(
+        product
+            .execute_prepared(&direct, &[ProductValue::Text("wrong".to_owned())])
+            .expect_err("LIMIT 0 accepted a parameter with the wrong type")
+            .code(),
+        ProductErrorCode::SqlInvalidValue
+    );
+    let positive = product.prepare_sql("SELECT id FROM limit_items WHERE id = ? LIMIT 8")?;
+    assert_eq!(positive.maximum_result_rows(), 1);
+    assert!(matches!(
+        product
+            .execute_prepared(&positive, &[ProductValue::Signed(1)])?
+            .value,
+        ProductSqlResult::Rows { rows, .. }
+            if rows == vec![vec![ProductValue::Signed(1)]]
+    ));
+
+    let prepare_context = context(&session, 56, 0);
+    let ProductResponse::PreparedSql {
+        handle,
+        parameter_count: 1,
+        maximum_result_rows: 0,
+        ..
+    } = product.dispatch(
+        &mut session,
+        &prepare_context,
+        ProductOperation::PrepareSql {
+            statement: statement.to_owned(),
+        },
+    )?
+    else {
+        return Err("LIMIT 0 prepare returned incorrect metadata".into());
+    };
+    let execute_context = context(&session, 57, 0);
+    let response = product.dispatch(
+        &mut session,
+        &execute_context,
+        ProductOperation::ExecutePrepared {
+            handle,
+            parameters: vec![ProductValue::Signed(1)],
+        },
+    )?;
+    assert!(matches!(
+        response,
+        ProductResponse::Sql {
+            result: ProductSqlResult::Rows { rows, .. },
+            snapshot: Some(_),
+            commit: None,
+        } if rows.is_empty()
+    ));
+    let direct_context = context(&session, 58, 0);
+    let response = product.dispatch(
+        &mut session,
+        &direct_context,
+        ProductOperation::ExecuteSql {
+            statement: "SELECT id FROM limit_items WHERE id = ? LIMIT 0 OFFSET 0".to_owned(),
+            parameters: vec![ProductValue::Signed(1)],
+        },
+    )?;
+    assert!(matches!(
+        response,
+        ProductResponse::Sql {
+            result: ProductSqlResult::Rows { rows, .. },
+            ..
+        } if rows.is_empty()
+    ));
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn exact_key_join_limits_fail_closed_across_product_paths() -> Result<(), Box<dyn Error>> {
+    let path = temporary("exact-key-join-limit");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut session = direct_session("exact-key-join-limit", ProductAuthorization::ALL)?;
+    let users_context = memory_context(&session, 59, 0);
+    product.dispatch(
+        &mut session,
+        &users_context,
+        ProductOperation::ExecuteSql {
+            statement: "CREATE TABLE join_users (id BIGINT PRIMARY KEY, profile_id BIGINT)"
+                .to_owned(),
+            parameters: vec![],
+        },
+    )?;
+    let profiles_context = memory_context(&session, 60, 0);
+    product.dispatch(
+        &mut session,
+        &profiles_context,
+        ProductOperation::ExecuteSql {
+            statement: "CREATE TABLE join_profiles (id BIGINT PRIMARY KEY, label TEXT NOT NULL)"
+                .to_owned(),
+            parameters: vec![],
+        },
+    )?;
+
+    let mut request_id = 61_u128;
+    for limit in [0, 2] {
+        let statement = format!(
+            "SELECT join_users.id, join_profiles.label
+             FROM join_users
+             INNER JOIN join_profiles ON join_users.profile_id = join_profiles.id
+             WHERE id = ? LIMIT {limit}"
+        );
+        assert_eq!(
+            product
+                .prepare_sql(&statement)
+                .expect_err("exact-key join LIMIT unexpectedly prepared")
+                .code(),
+            ProductErrorCode::SqlInvalidSyntax
+        );
+        let execute_context = context(&session, request_id, 0);
+        request_id += 1;
+        assert_eq!(
+            product
+                .dispatch(
+                    &mut session,
+                    &execute_context,
+                    ProductOperation::ExecuteSql {
+                        statement: statement.clone(),
+                        parameters: vec![ProductValue::Signed(1)],
+                    },
+                )
+                .expect_err("exact-key join LIMIT unexpectedly executed")
+                .code(),
+            ProductErrorCode::SqlInvalidSyntax
+        );
+        let prepare_context = context(&session, request_id, 0);
+        request_id += 1;
+        assert_eq!(
+            product
+                .dispatch(
+                    &mut session,
+                    &prepare_context,
+                    ProductOperation::PrepareSql { statement },
+                )
+                .expect_err("exact-key join LIMIT unexpectedly retained")
+                .code(),
+            ProductErrorCode::SqlInvalidSyntax
+        );
+    }
+
+    let point = product.prepare_sql("SELECT id FROM join_users WHERE id = ? LIMIT 0")?;
+    assert_eq!(point.maximum_result_rows(), 0);
+    assert!(matches!(
+        product.execute_prepared(&point, &[ProductValue::Signed(1)])?.value,
+        ProductSqlResult::Rows { rows, .. } if rows.is_empty()
+    ));
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sql_offset_windows_and_grouped_zero_keep_product_bounds() -> Result<(), Box<dyn Error>> {
+    let path = temporary("sql-offset-bounds");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut session = direct_session("sql-offset-bounds", ProductAuthorization::ALL)?;
+    let create_context = memory_context(&session, 70, 0);
+    product.dispatch(
+        &mut session,
+        &create_context,
+        ProductOperation::ExecuteSql {
+            statement: "CREATE TABLE shape_items (id BIGINT PRIMARY KEY, bucket TEXT NOT NULL)"
+                .to_owned(),
+            parameters: vec![],
+        },
+    )?;
+    let insert_context = memory_context(&session, 71, 0);
+    product.dispatch(
+        &mut session,
+        &insert_context,
+        ProductOperation::ExecuteSql {
+            statement: "INSERT INTO shape_items (id, bucket) VALUES \
+                        (1, 'alpha'), (2, 'beta'), (3, 'gamma')"
+                .to_owned(),
+            parameters: vec![],
+        },
+    )?;
+
+    let expected_distinct = vec![
+        vec![ProductValue::Text("beta".to_owned())],
+        vec![ProductValue::Text("gamma".to_owned())],
+    ];
+    let distinct =
+        product.prepare_sql("SELECT DISTINCT bucket FROM shape_items LIMIT 2 OFFSET 1")?;
+    assert_eq!(distinct.maximum_result_rows(), 2);
+    assert!(matches!(
+        product.execute_prepared(&distinct, &[])?.value,
+        ProductSqlResult::Rows { rows, .. } if rows == expected_distinct
+    ));
+
+    let expected_grouped = vec![
+        vec![
+            ProductValue::Text("beta".to_owned()),
+            ProductValue::Unsigned(1),
+        ],
+        vec![
+            ProductValue::Text("gamma".to_owned()),
+            ProductValue::Unsigned(1),
+        ],
+    ];
+    let grouped = product
+        .prepare_sql("SELECT bucket, COUNT(*) FROM shape_items GROUP BY bucket LIMIT 2 OFFSET 1")?;
+    assert_eq!(grouped.maximum_result_rows(), 2);
+    assert!(matches!(
+        product.execute_prepared(&grouped, &[])?.value,
+        ProductSqlResult::Rows { rows, .. } if rows == expected_grouped
+    ));
+
+    let grouped_zero = "SELECT COUNT(*) FROM shape_items GROUP BY bucket LIMIT 0";
+    assert_eq!(
+        product
+            .prepare_sql(grouped_zero)
+            .expect_err("grouped LIMIT 0 unexpectedly prepared")
+            .code(),
+        ProductErrorCode::SqlInvalidSyntax
+    );
+    let direct_context = context(&session, 72, 0);
+    assert_eq!(
+        product
+            .dispatch(
+                &mut session,
+                &direct_context,
+                ProductOperation::ExecuteSql {
+                    statement: grouped_zero.to_owned(),
+                    parameters: vec![],
+                },
+            )
+            .expect_err("grouped LIMIT 0 unexpectedly executed")
+            .code(),
+        ProductErrorCode::SqlInvalidSyntax
+    );
+    let prepare_context = context(&session, 73, 0);
+    assert_eq!(
+        product
+            .dispatch(
+                &mut session,
+                &prepare_context,
+                ProductOperation::PrepareSql {
+                    statement: grouped_zero.to_owned(),
+                },
+            )
+            .expect_err("grouped LIMIT 0 unexpectedly retained")
+            .code(),
+        ProductErrorCode::SqlInvalidSyntax
+    );
+    let grouped_context = context(&session, 74, 0);
+    let response = product.dispatch(
+        &mut session,
+        &grouped_context,
+        ProductOperation::ExecuteSql {
+            statement: "SELECT bucket, COUNT(*) FROM shape_items \
+                        GROUP BY bucket LIMIT 2 OFFSET 1"
+                .to_owned(),
+            parameters: vec![],
+        },
+    )?;
+    assert!(matches!(
+        response,
+        ProductResponse::Sql {
+            result: ProductSqlResult::Rows { rows, .. },
+            ..
+        } if rows == expected_grouped
     ));
     drop(product);
     fs::remove_dir_all(path)?;

@@ -1768,7 +1768,7 @@ mod tests {
             .oneshot(http_request_with_session(
                 "/v2/sql",
                 request(ProductOperation::ExecuteSql {
-                    statement: "SELECT label FROM http_tx_items WHERE id = ?".to_owned(),
+                    statement: "SELECT label FROM http_tx_items WHERE id = ? LIMIT 1".to_owned(),
                     parameters: vec![hyphae_native_product::ProductValue::Signed(7)],
                 })?,
                 "89",
@@ -2369,6 +2369,217 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn sql_limit_zero_preserves_http_validation_and_metadata() -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("sql-limit-zero")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+        let created = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement: "CREATE TABLE limit_items (id BIGINT PRIMARY KEY)".to_owned(),
+                    parameters: Vec::new(),
+                })?,
+                "106",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let inserted = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement: "INSERT INTO limit_items (id) VALUES (?)".to_owned(),
+                    parameters: vec![hyphae_native_product::ProductValue::Signed(1)],
+                })?,
+                "107",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let direct = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecuteSql {
+                    statement: "SELECT id FROM limit_items WHERE id = ? LIMIT 0 OFFSET 0"
+                        .to_owned(),
+                    parameters: vec![hyphae_native_product::ProductValue::Signed(1)],
+                })?,
+                "108",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(direct).await?)?,
+            hyphae_native_product::ProductResponse::Sql {
+                result: hyphae_native_product::ProductSqlResult::Rows { rows, .. },
+                ..
+            } if rows.is_empty()
+        ));
+
+        let prepared = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::PrepareSql {
+                    statement: "SELECT DISTINCT id FROM limit_items WHERE id = ? LIMIT 0 OFFSET 1"
+                        .to_owned(),
+                })?,
+                "109",
+                None,
+                None,
+            )?)
+            .await?;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let session_id = prepared.headers()[hyphae_contracts::v2::SESSION_ID_HEADER_V2]
+            .to_str()?
+            .to_owned();
+        let hyphae_native_product::ProductResponse::PreparedSql {
+            handle,
+            parameter_count: 1,
+            maximum_result_rows: 0,
+            ..
+        } = decode_product_response(&response_bytes(prepared).await?)?
+        else {
+            return Err("HTTP LIMIT 0 prepare returned incorrect metadata".into());
+        };
+        let executed = app
+            .clone()
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecutePrepared {
+                    handle,
+                    parameters: vec![hyphae_native_product::ProductValue::Signed(1)],
+                })?,
+                "110",
+                None,
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(matches!(
+            decode_product_response(&response_bytes(executed).await?)?,
+            hyphae_native_product::ProductResponse::Sql {
+                result: hyphae_native_product::ProductSqlResult::Rows { rows, .. },
+                ..
+            } if rows.is_empty()
+        ));
+        let wrong = app
+            .oneshot(http_request_with_session(
+                "/v2/sql",
+                request(ProductOperation::ExecutePrepared {
+                    handle,
+                    parameters: vec![hyphae_native_product::ProductValue::Text(
+                        "wrong".to_owned(),
+                    )],
+                })?,
+                "111",
+                None,
+                Some(&session_id),
+            )?)
+            .await?;
+        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_key_join_limits_fail_closed_on_http_sql_prepare_and_explain()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, service) = service("exact-key-join-limit")?;
+        let app =
+            NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?.test_router();
+        for (request_id, statement) in [
+            (
+                "112",
+                "CREATE TABLE join_users (id BIGINT PRIMARY KEY, profile_id BIGINT)",
+            ),
+            (
+                "113",
+                "CREATE TABLE join_profiles (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "/v2/sql",
+                    request(ProductOperation::ExecuteSql {
+                        statement: statement.to_owned(),
+                        parameters: Vec::new(),
+                    })?,
+                    Some(request_id),
+                    None,
+                    None,
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let mut request_id = 114_u128;
+        for limit in [0, 2] {
+            let statement = format!(
+                "SELECT join_users.id, join_profiles.label
+                 FROM join_users
+                 INNER JOIN join_profiles ON join_users.profile_id = join_profiles.id
+                 WHERE id = ? LIMIT {limit}"
+            );
+            let operations = [
+                (
+                    "/v2/sql",
+                    ProductOperation::ExecuteSql {
+                        statement: statement.clone(),
+                        parameters: vec![hyphae_native_product::ProductValue::Signed(1)],
+                    },
+                ),
+                (
+                    "/v2/sql",
+                    ProductOperation::PrepareSql {
+                        statement: statement.clone(),
+                    },
+                ),
+                (
+                    "/v2/admin",
+                    ProductOperation::AdminExplainSql {
+                        statement: statement.clone(),
+                    },
+                ),
+            ];
+            for (path, operation) in operations {
+                let request_id_text = request_id.to_string();
+                request_id += 1;
+                let response = app
+                    .clone()
+                    .oneshot(http_request(
+                        path,
+                        request(operation)?,
+                        Some(&request_id_text),
+                        None,
+                        Some(ERROR_MEDIA_TYPE),
+                    )?)
+                    .await?;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let error =
+                    hyphae_native_protocol::decode_failure(&response_bytes(response).await?)?;
+                assert_eq!(
+                    error.code(),
+                    hyphae_native_product::ProductErrorCode::SqlInvalidSyntax
+                );
+            }
+        }
+        drop(service);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn principal_cannot_cross_use_another_principals_session() -> Result<(), Box<dyn Error>> {
         let (_directory, service) = service("prepared-principal")?;
         let server = NativeHttpV2Server::new(service.handle(), NativeHttpV2Config::default())?;
@@ -2711,7 +2922,7 @@ mod tests {
             .oneshot(http_request(
                 "/v2/admin",
                 request(ProductOperation::AdminExplainSql {
-                    statement: "SELECT id FROM explain_items WHERE id = 1".into(),
+                    statement: "SELECT id FROM explain_items WHERE id = 1 LIMIT 1".into(),
                 })?,
                 Some("143"),
                 None,

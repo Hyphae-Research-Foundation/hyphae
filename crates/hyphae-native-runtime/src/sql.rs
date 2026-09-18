@@ -436,7 +436,7 @@ enum PreparedPlan {
         group_columns: Vec<usize>,
         /// Logical types of the group-key columns, in order.
         group_types: Vec<LogicalType>,
-        /// Maximum emitted groups (parser-mandatory for grouped selects).
+        /// Maximum groups retained before optional OFFSET shaping.
         group_limit: Option<usize>,
         /// Primary-key-prefix contiguous-run fold vs bounded ordered fold.
         streaming_groups: bool,
@@ -1207,6 +1207,9 @@ fn distinct_rows(
     projected_types: &[LogicalType],
     limit: usize,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut output = Vec::new();
     for row in rows {
@@ -1228,6 +1231,20 @@ fn distinct_rows(
         }
     }
     Ok(output)
+}
+
+const fn limit_with_offset(limit: usize, offset: Option<usize>) -> Option<usize> {
+    match offset {
+        Some(offset) => limit.checked_add(offset),
+        None => Some(limit),
+    }
+}
+
+const fn valid_group_window(limit: Option<usize>, offset: Option<usize>) -> bool {
+    match limit {
+        Some(limit) => limit > 0 && limit_with_offset(limit, offset).is_some(),
+        None => false,
+    }
 }
 
 /// Applies `OFFSET` (skip) then re-applies `LIMIT` to shaped rows.
@@ -1790,6 +1807,8 @@ struct BoundSelect {
     /// True when group keys are a primary-key left prefix (contiguous
     /// runs); false takes the bounded ordered-grouped fold.
     streaming_groups: bool,
+    /// Groups retained before OFFSET, widened from the emitted LIMIT.
+    group_limit: Option<usize>,
     /// Post-fold group shaping (`HAVING`, grouped `ORDER BY`, hidden
     /// accumulator trimming); `None` for plain grouped selects.
     group_shape: Option<BoundGroupShape>,
@@ -2092,13 +2111,13 @@ fn prepare_select_plan(
     query: SelectQuery<'_>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
 ) -> Result<PreparedPlan, SqlError> {
-    let mut bound = bind_select(catalog, query, ordered_secondary_indexes)?;
+    let mut bound = bind_select(catalog, query, ordered_secondary_indexes, true)?;
     let aggregates = bound.aggregates.take();
     let group_columns = std::mem::take(&mut bound.group_columns);
     let group_types = std::mem::take(&mut bound.group_types);
     let streaming_groups = bound.streaming_groups;
     let group_shape = bound.group_shape.take();
-    let group_limit = (!group_columns.is_empty()).then_some(query.limit).flatten();
+    let group_limit = bound.group_limit;
     let aggregate_columns = aggregates
         .is_some()
         .then(|| std::mem::take(&mut bound.output_columns));
@@ -2250,7 +2269,9 @@ fn prepare_select_plan(
         },
         _ => inner,
     };
-    if bound.distinct || bound.offset.is_some() {
+    let zero_point_lookup =
+        query.limit == Some(0) && matches!(plan, PreparedPlan::PrimaryKeyLookup { .. });
+    if bound.distinct || bound.offset.is_some() || zero_point_lookup {
         if matches!(plan, PreparedPlan::Aggregate { .. }) && bound.distinct {
             return Err(SqlError::InvalidSyntax);
         }
@@ -3113,11 +3134,14 @@ fn shape_plain_rows(
         return Err(SqlError::InvalidSyntax);
     };
     if distinct {
-        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        let bound = limit_with_offset(limit.ok_or(SqlError::InvalidSyntax)?, offset)
+            .ok_or(SqlError::InvalidSyntax)?;
         rows = distinct_rows(rows, projected_types, bound)?;
     }
     if let Some(offset) = offset {
         apply_offset(&mut rows, offset, limit)?;
+    } else if let Some(limit) = limit {
+        rows.truncate(limit);
     }
     Ok(SqlResult::Rows { columns, rows })
 }
@@ -5734,6 +5758,7 @@ fn execute_explain(
         &transaction.state.catalog,
         query,
         &ordered_secondary_indexes,
+        true,
     )?;
     let plan = match bound.access {
         SelectAccess::PrimaryKey { .. } => {
@@ -6508,6 +6533,7 @@ fn execute_select(
         &transaction.state.catalog,
         query,
         &ordered_secondary_indexes,
+        true,
     )?;
     let BoundSelect {
         table,
@@ -6521,6 +6547,7 @@ fn execute_select(
         group_columns,
         group_types,
         streaming_groups,
+        group_limit,
         group_shape,
         distinct,
         offset,
@@ -6583,7 +6610,7 @@ fn execute_select(
             // is the work bound; LIMIT applies after shaping.
             Some(MAX_SQL_ORDERED_GROUPS)
         } else {
-            query.limit
+            group_limit
         };
         let mut grouped = fold_aggregate_rows(
             &rows,
@@ -6595,7 +6622,7 @@ fn execute_select(
             group_shape.is_some(),
         )?;
         if let Some(shape) = &group_shape {
-            let limit = query.limit.ok_or(SqlError::InvalidAggregate)?;
+            let limit = group_limit.ok_or(SqlError::InvalidAggregate)?;
             grouped = shape_grouped_rows(grouped, shape, limit)?;
         }
         if let Some(offset) = offset {
@@ -6634,11 +6661,14 @@ fn shape_transaction_plain_rows(
                     .ok_or(SqlError::InvalidCatalogObject)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bound = limit.ok_or(SqlError::InvalidSyntax)?;
+        let bound = limit_with_offset(limit.ok_or(SqlError::InvalidSyntax)?, offset)
+            .ok_or(SqlError::InvalidSyntax)?;
         rows = distinct_rows(rows, &projected_types, bound)?;
     }
     if let Some(offset) = offset {
         apply_offset(&mut rows, offset, limit)?;
+    } else if let Some(limit) = limit {
+        rows.truncate(limit);
     }
     Ok(rows)
 }
@@ -7152,6 +7182,7 @@ fn bind_select(
     catalog: &crate::model::CatalogState,
     query: SelectQuery<'_>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
+    allow_primary_key_limit: bool,
 ) -> Result<BoundSelect, SqlError> {
     let (table, definition) = relation_named(catalog, query.name)?;
     let (group_columns, streaming_groups) = if query.group_by.is_empty() {
@@ -7186,6 +7217,19 @@ fn bind_select(
     let (projection, mut aggregates, output_columns) =
         bind_select_projection(definition, query.projection, &group_columns)?;
     let group_shape = bind_group_shape(definition, &query, &group_columns, aggregates.as_mut())?;
+    let group_limit = if group_columns.is_empty() {
+        None
+    } else {
+        let limit = query.limit.ok_or(SqlError::InvalidAggregate)?;
+        if limit == 0 {
+            return Err(SqlError::InvalidAggregate);
+        }
+        let widened = limit_with_offset(limit, query.offset).ok_or(SqlError::InvalidAggregate)?;
+        if widened > MAX_SQL_ORDERED_GROUPS && (!streaming_groups || group_shape.is_some()) {
+            return Err(SqlError::InvalidAggregate);
+        }
+        Some(widened)
+    };
     let filter = query
         .filter
         .map(|expression| bind_filter_expression(definition, expression))
@@ -7209,7 +7253,7 @@ fn bind_select(
         } else {
             query
                 .limit
-                .and_then(|limit| limit.checked_add(query.offset.unwrap_or(0)))
+                .and_then(|limit| limit_with_offset(limit, query.offset))
         };
         SelectQuery {
             limit: widened,
@@ -7225,6 +7269,7 @@ fn bind_select(
         access_query,
         filter.as_ref(),
         ordered_secondary_indexes,
+        allow_primary_key_limit,
     )?;
     Ok(BoundSelect {
         table,
@@ -7238,6 +7283,7 @@ fn bind_select(
         group_columns,
         group_types,
         streaming_groups,
+        group_limit,
         group_shape,
         distinct: query.distinct,
         offset: query.offset,
@@ -7547,6 +7593,7 @@ fn bind_select_access(
     query: SelectQuery<'_>,
     filter: Option<&BoundFilterExpression>,
     ordered_secondary_indexes: &BTreeSet<ObjectId>,
+    allow_primary_key_limit: bool,
 ) -> Result<(SelectAccess, usize), SqlError> {
     let expected_primary_key = primary_key_indices(definition)?;
     let legacy_binary = is_legacy_binary_relation(definition);
@@ -7579,7 +7626,10 @@ fn bind_select_access(
             0,
         )
     } else if let Some(key) = find_equality_key(&comparisons, &expected_primary_key) {
-        if !query.order_by.is_empty() || query.limit.is_some() {
+        // Ordinary full-key SELECTs admit redundant positive limits and
+        // preserve LIMIT 0 through post-access shaping. Exact-key joins have
+        // no limit-bearing plan variant, so their caller keeps LIMIT closed.
+        if !query.order_by.is_empty() || (query.limit.is_some() && !allow_primary_key_limit) {
             return Err(SqlError::InvalidSyntax);
         }
         let used_terms = key.columns.len();
@@ -7781,6 +7831,7 @@ fn bind_indexed_inner_join(
             offset: None,
         },
         ordered_secondary_indexes,
+        false,
     )?;
     let left_relation = relation_by_id(catalog, bound.table)?.clone();
     if is_legacy_binary_relation(&left_relation) {
@@ -11035,14 +11086,42 @@ fn validate_distinct_shape(
     projection: &Projection,
     group_by: &[String],
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<(), SqlError> {
     if !distinct {
         return Ok(());
     }
     let plain = matches!(projection, Projection::All | Projection::Columns(_))
         || matches!(projection, Projection::Named { aggregates, .. } if aggregates.is_empty());
-    if !plain || !group_by.is_empty() || limit.is_none() {
+    if !plain
+        || !group_by.is_empty()
+        || limit.is_none_or(|limit| limit_with_offset(limit, offset).is_none())
+    {
         return Err(SqlError::InvalidSyntax);
+    }
+    Ok(())
+}
+
+fn validate_grouped_select_shape(
+    projection: &Projection,
+    group_by: &[String],
+    order_by: &[String],
+    has_aggregates: bool,
+    descending: bool,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<(), SqlError> {
+    if !has_aggregates || !order_by.is_empty() || descending || !valid_group_window(limit, offset) {
+        return Err(SqlError::InvalidAggregate);
+    }
+    if let Projection::Named { columns, .. } = projection
+        && (columns.len() != group_by.len()
+            || columns
+                .iter()
+                .zip(group_by)
+                .any(|(column, key)| !column.name.eq_ignore_ascii_case(key)))
+    {
+        return Err(SqlError::InvalidAggregate);
     }
     Ok(())
 }
@@ -11098,28 +11177,22 @@ fn parse_select(parser: &mut Parser) -> Result<Statement, SqlError> {
         None
     };
     let offset = parse_select_offset(parser, limit)?;
-    validate_distinct_shape(distinct, &projection, &group_by, limit)?;
+    validate_distinct_shape(distinct, &projection, &group_by, limit, offset)?;
     let has_aggregates = matches!(projection, Projection::Aggregates(_))
         || matches!(&projection, Projection::Named { aggregates, .. } if !aggregates.is_empty());
     if !group_by.is_empty() {
         // Grouped selects require an aggregate projection — implicit-key
         // (aggregates only) or PostgreSQL-style with the key columns named
         // ahead of the aggregates. LIMIT (mandatory) bounds emitted rows.
-        if !has_aggregates || !order_by.is_empty() || descending || limit.is_none() {
-            return Err(SqlError::InvalidAggregate);
-        }
-        if let Projection::Named { columns, .. } = &projection {
-            // The named plain columns must be exactly the GROUP BY list in
-            // GROUP BY order.
-            if columns.len() != group_by.len()
-                || columns
-                    .iter()
-                    .zip(&group_by)
-                    .any(|(column, key)| !column.name.eq_ignore_ascii_case(key))
-            {
-                return Err(SqlError::InvalidAggregate);
-            }
-        }
+        validate_grouped_select_shape(
+            &projection,
+            &group_by,
+            &order_by,
+            has_aggregates,
+            descending,
+            limit,
+            offset,
+        )?;
     } else if has_aggregates {
         // Total aggregates emit exactly one bounded row; ORDER BY/LIMIT/
         // HAVING have no admitted meaning and the scan-candidate budget is

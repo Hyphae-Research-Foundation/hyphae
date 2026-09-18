@@ -519,10 +519,10 @@ fn distinct_offset_and_between_shape_plain_and_grouped_selects() -> Result<(), T
     };
     assert_eq!(
         rows,
-        vec![vec![
-            SqlValue::Text("globex".to_owned()),
-            SqlValue::Unsigned(2)
-        ]]
+        vec![
+            vec![SqlValue::Text("globex".to_owned()), SqlValue::Unsigned(2)],
+            vec![SqlValue::Text("initech".to_owned()), SqlValue::Unsigned(1)],
+        ]
     );
     transaction.rollback();
 
@@ -541,5 +541,110 @@ fn distinct_offset_and_between_shape_plain_and_grouped_selects() -> Result<(), T
         Err(SqlError::InvalidSyntax)
     ));
     transaction.rollback();
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn distinct_and_grouped_offset_windows_match_bounds_across_reopen() -> Result<(), TestError> {
+    const DISTINCT_OFFSET: &str = "SELECT DISTINCT tenant FROM ledger LIMIT 2 OFFSET 1";
+    const GROUPED_OFFSET: &str = "SELECT tenant, COUNT(*) AS n FROM ledger GROUP BY tenant \
+         ORDER BY n DESC LIMIT 2 OFFSET 1";
+    const STREAMING_OFFSET: &str =
+        "SELECT tenant, COUNT(*) AS n FROM ledger GROUP BY tenant LIMIT 2 OFFSET 1";
+    const GROUPED_ZERO: &str = "SELECT COUNT(*) FROM ledger GROUP BY tenant LIMIT 0";
+    let expected_distinct = vec![
+        vec![SqlValue::Text("globex".to_owned())],
+        vec![SqlValue::Text("initech".to_owned())],
+    ];
+    let expected_grouped = vec![
+        vec![SqlValue::Text("globex".to_owned()), SqlValue::Unsigned(2)],
+        vec![SqlValue::Text("initech".to_owned()), SqlValue::Unsigned(1)],
+    ];
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+
+    let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+    for (statement, expected) in [
+        (DISTINCT_OFFSET, &expected_distinct),
+        (GROUPED_OFFSET, &expected_grouped),
+        (STREAMING_OFFSET, &expected_grouped),
+    ] {
+        let SqlResult::Rows { rows, .. } = transaction.execute_sql(statement, &[])? else {
+            return Err("expected offset rows".into());
+        };
+        assert_eq!(&rows, expected);
+        assert!(rows.len() <= 2);
+    }
+    assert!(matches!(
+        transaction.execute_sql(GROUPED_ZERO, &[]),
+        Err(SqlError::InvalidAggregate)
+    ));
+    transaction.rollback();
+
+    let snapshot = database.snapshot(0)?;
+    for (statement, expected) in [
+        (DISTINCT_OFFSET, &expected_distinct),
+        (GROUPED_OFFSET, &expected_grouped),
+        (STREAMING_OFFSET, &expected_grouped),
+    ] {
+        let prepared = snapshot.prepare_sql(statement)?;
+        assert_eq!(prepared.maximum_result_rows(), Some(2));
+        let SqlResult::Rows { rows, .. } = snapshot.execute_prepared(&prepared, &[])? else {
+            return Err("expected prepared offset rows".into());
+        };
+        assert_eq!(&rows, expected);
+        assert!(rows.len() <= prepared.maximum_result_rows().unwrap_or(0));
+
+        let latest = database.prepare_sql_latest(statement)?;
+        assert_eq!(latest.maximum_result_rows(), Some(2));
+        let SqlResult::Rows { rows, .. } = database.execute_prepared_latest(&latest, &[])? else {
+            return Err("expected latest offset rows".into());
+        };
+        assert_eq!(&rows, expected);
+    }
+    assert!(matches!(
+        snapshot.prepare_sql(GROUPED_ZERO),
+        Err(SqlError::InvalidAggregate)
+    ));
+    assert!(matches!(
+        database.prepare_sql_latest(GROUPED_ZERO),
+        Err(SqlError::InvalidAggregate)
+    ));
+    assert!(matches!(
+        database
+            .prepare_sql_latest("SELECT COUNT(*) FROM ledger GROUP BY amount LIMIT 65536 OFFSET 1"),
+        Err(SqlError::InvalidAggregate)
+    ));
+    let overflow = format!(
+        "SELECT DISTINCT tenant FROM ledger LIMIT {} OFFSET 1",
+        usize::MAX
+    );
+    assert!(matches!(
+        database.prepare_sql_latest(&overflow),
+        Err(SqlError::InvalidSyntax)
+    ));
+    drop(snapshot);
+    drop(database);
+
+    let reopened = NativeDatabase::open(temporary.path())?;
+    for (statement, expected) in [
+        (DISTINCT_OFFSET, expected_distinct),
+        (GROUPED_OFFSET, expected_grouped),
+        (
+            STREAMING_OFFSET,
+            vec![
+                vec![SqlValue::Text("globex".to_owned()), SqlValue::Unsigned(2)],
+                vec![SqlValue::Text("initech".to_owned()), SqlValue::Unsigned(1)],
+            ],
+        ),
+    ] {
+        let prepared = reopened.prepare_sql_latest(statement)?;
+        assert_eq!(prepared.maximum_result_rows(), Some(2));
+        let SqlResult::Rows { rows, .. } = reopened.execute_prepared_latest(&prepared, &[])? else {
+            return Err("expected reopened offset rows".into());
+        };
+        assert_eq!(rows, expected);
+    }
     Ok(())
 }
