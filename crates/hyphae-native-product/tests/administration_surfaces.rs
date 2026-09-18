@@ -6,9 +6,9 @@ use std::{error::Error, fs, path::PathBuf, time::Duration};
 
 use hyphae_native_product::{
     BackupPhase, BackupProductError, BackupRequest, DoctorRequest, DoctorStatus, MetricId,
-    MetricValue, NativeProduct, ProductAuthorization, ProductExplain, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession, ProductSessionId,
-    ProgressControl, RestorePhase, RestoreRequest, SQL_PLAN_TEXT_VERSION,
+    MetricValue, NativeProduct, ProductAuthorization, ProductErrorCode, ProductExplain,
+    ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse, ProductSession,
+    ProductSessionId, ProgressControl, RestorePhase, RestoreRequest, SQL_PLAN_TEXT_VERSION,
     TELEMETRY_HISTOGRAM_BOUNDS_MICROS, TelemetryConfig, TelemetryEvent, TelemetryEventKind,
     TelemetryRegistry, TimingClass, doctor, restore,
 };
@@ -267,21 +267,51 @@ fn sql_explain_is_versioned_bounded_opaque_text() -> Result<(), Box<dyn Error>> 
     let _ = fs::remove_dir_all(&path);
     let mut runtime = NativeDatabase::create(&path)?;
     let mut transaction = runtime.begin_sql(0, DurabilityClass::Memory)?;
-    transaction.execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[])?;
+    transaction.execute_sql(
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, profile_id BIGINT)",
+        &[],
+    )?;
+    transaction.execute_sql(
+        "CREATE TABLE profiles (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+        &[],
+    )?;
     transaction.commit()?;
     drop(runtime);
 
     let mut product = NativeProduct::open_with_preview_default_scalar_migration(&path)?;
-    let ProductExplain::SqlPlanText(plan) = product
+    for statement in [
+        "SELECT id FROM items WHERE id = 1 LIMIT 0",
+        "SELECT DISTINCT id FROM items WHERE id = 1 LIMIT 0 OFFSET 1",
+        "SELECT id FROM items WHERE id = 1 LIMIT 8",
+    ] {
+        let ProductExplain::SqlPlanText(plan) = product.administration().explain_sql(statement)?
+        else {
+            return Err("SQL explain returned a non-SQL strategy".into());
+        };
+        assert_eq!(plan.version, SQL_PLAN_TEXT_VERSION);
+        assert!(plan.text.starts_with("PrimaryKeyLookup("));
+        assert_eq!(plan.catalog_version, 3);
+        assert!(!plan.executed);
+    }
+    for limit in [0, 2] {
+        let error = product
+            .administration()
+            .explain_sql(&format!(
+                "SELECT items.id, profiles.label
+                 FROM items
+                 INNER JOIN profiles ON items.profile_id = profiles.id
+                 WHERE id = 1 LIMIT {limit}"
+            ))
+            .err()
+            .ok_or("exact-key join LIMIT unexpectedly explained")?;
+        assert_eq!(error.code(), ProductErrorCode::SqlInvalidSyntax);
+    }
+    let grouped_zero = product
         .administration()
-        .explain_sql("SELECT id FROM items WHERE id = 1")?
-    else {
-        return Err("SQL explain returned a non-SQL strategy".into());
-    };
-    assert_eq!(plan.version, SQL_PLAN_TEXT_VERSION);
-    assert!(plan.text.starts_with("PrimaryKeyLookup("));
-    assert_eq!(plan.catalog_version, 3);
-    assert!(!plan.executed);
+        .explain_sql("SELECT COUNT(*) FROM items GROUP BY profile_id LIMIT 0")
+        .err()
+        .ok_or("grouped LIMIT 0 unexpectedly explained")?;
+    assert_eq!(grouped_zero.code(), ProductErrorCode::SqlInvalidSyntax);
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())

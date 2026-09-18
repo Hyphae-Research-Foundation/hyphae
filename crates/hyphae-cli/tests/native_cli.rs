@@ -1533,9 +1533,17 @@ fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Bo
         &data_text,
         "execute",
         "--statement",
-        "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL, profile_id BIGINT)",
     ])?;
     assert_eq!(created["commit"]["status"], "committed");
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "CREATE TABLE profiles (id BIGINT PRIMARY KEY, label TEXT NOT NULL)",
+    ])?;
     run(&[
         "sql",
         "--data-dir",
@@ -1548,13 +1556,21 @@ fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Bo
         "--parameter",
         r#""alpha""#,
     ])?;
+    run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "INSERT INTO items (id, name) VALUES (2, 'beta'), (3, 'gamma')",
+    ])?;
     let selected = run(&[
         "sql",
         "--data-dir",
         &data_text,
         "execute",
         "--statement",
-        "SELECT id, name FROM items WHERE id = ?",
+        "SELECT id, name FROM items WHERE id = ? LIMIT 1",
         "--parameter",
         "1",
     ])?;
@@ -1562,6 +1578,120 @@ fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Bo
         selected["result"]["rows"][0],
         serde_json::json!([1, "alpha"])
     );
+    let zero = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "SELECT DISTINCT name FROM items WHERE id = ? LIMIT 0 OFFSET 1",
+        "--parameter",
+        "1",
+    ])?;
+    assert_eq!(zero["result"]["rows"], serde_json::json!([]));
+    let prepared_zero = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "prepared",
+        "--statement",
+        "SELECT name FROM items WHERE id = ? LIMIT 0 OFFSET 0",
+        "--parameter",
+        "1",
+    ])?;
+    assert_eq!(
+        prepared_zero["result"]["result"]["rows"],
+        serde_json::json!([])
+    );
+    let distinct_offset = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--statement",
+        "SELECT DISTINCT name FROM items LIMIT 2 OFFSET 1",
+    ])?;
+    assert_eq!(
+        distinct_offset["result"]["rows"],
+        serde_json::json!([["beta"], ["gamma"]])
+    );
+    let grouped_offset = run(&[
+        "sql",
+        "--data-dir",
+        &data_text,
+        "prepared",
+        "--statement",
+        "SELECT name, COUNT(*) FROM items GROUP BY name LIMIT 2 OFFSET 1",
+    ])?;
+    assert_eq!(
+        grouped_offset["result"]["result"]["rows"],
+        serde_json::json!([["beta", 1], ["gamma", 1]])
+    );
+    let grouped_zero = "SELECT COUNT(*) FROM items GROUP BY name LIMIT 0";
+    for command in ["execute", "prepared"] {
+        let rejected = output(&[
+            "sql",
+            "--data-dir",
+            &data_text,
+            command,
+            "--statement",
+            grouped_zero,
+        ])?;
+        assert!(!rejected.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&rejected.stderr)?;
+        assert_eq!(error["error"]["code"], "sql_invalid_syntax");
+    }
+    let rejected = output(&[
+        "explain",
+        "--data-dir",
+        &data_text,
+        "sql",
+        "--statement",
+        grouped_zero,
+    ])?;
+    assert!(!rejected.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&rejected.stderr)?;
+    assert_eq!(error["error"]["code"], "sql_invalid_syntax");
+    for limit in [0, 2] {
+        let statement = format!(
+            "SELECT items.id, profiles.label
+             FROM items
+             INNER JOIN profiles ON items.profile_id = profiles.id
+             WHERE id = ? LIMIT {limit}"
+        );
+        for command in ["execute", "prepared"] {
+            let rejected = output(&[
+                "sql",
+                "--data-dir",
+                &data_text,
+                command,
+                "--statement",
+                &statement,
+                "--parameter",
+                "1",
+            ])?;
+            assert!(!rejected.status.success());
+            let error: serde_json::Value = serde_json::from_slice(&rejected.stderr)?;
+            assert_eq!(error["error"]["code"], "sql_invalid_syntax");
+        }
+        let explain_statement = format!(
+            "SELECT items.id, profiles.label
+             FROM items
+             INNER JOIN profiles ON items.profile_id = profiles.id
+             WHERE id = 1 LIMIT {limit}"
+        );
+        let rejected = output(&[
+            "explain",
+            "--data-dir",
+            &data_text,
+            "sql",
+            "--statement",
+            &explain_statement,
+        ])?;
+        assert!(!rejected.status.success());
+        let error: serde_json::Value = serde_json::from_slice(&rejected.stderr)?;
+        assert_eq!(error["error"]["code"], "sql_invalid_syntax");
+    }
 
     assert_eq!(
         run(&[
@@ -1605,9 +1735,27 @@ fn native_sql_structure_status_and_administration_are_exposed() -> Result<(), Bo
         &data_text,
         "sql",
         "--statement",
-        "SELECT id, name FROM items WHERE id = 1",
+        "SELECT id, name FROM items WHERE id = 1 LIMIT 1",
     ])?;
     assert_eq!(explained["type"], "sql_plan_text");
+    assert!(
+        explained["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("PrimaryKeyLookup("))
+    );
+    let zero_explained = run(&[
+        "explain",
+        "--data-dir",
+        &data_text,
+        "sql",
+        "--statement",
+        "SELECT DISTINCT id FROM items WHERE id = 1 LIMIT 0 OFFSET 1",
+    ])?;
+    assert!(
+        zero_explained["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("PrimaryKeyLookup("))
+    );
     assert_eq!(
         run(&[
             "transaction",
