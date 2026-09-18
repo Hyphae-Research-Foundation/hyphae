@@ -647,9 +647,10 @@ mod unix {
 
     use hyphae_native_runtime::{
         FrameKind, LocalDataSession, LocalFailureCode, LocalSqlPreparedReceipt, LocalSqlRows,
-        NativeDatabase, NativeSchedulerClock, SqlError, SqlResult, SqlValue, UdsFrameConnection,
-        UdsFrameListener, decode_local_failure, decode_local_sql_prepared_receipt,
-        decode_local_sql_rows, encode_local_sql_execute, encode_local_sql_prepare,
+        NativeDatabase, NativeSchedulerClock, NativeSqlExecutionPath, SqlError, SqlResult,
+        SqlValue, UdsFrameConnection, UdsFrameListener, decode_local_failure,
+        decode_local_sql_prepared_receipt, decode_local_sql_rows, encode_local_sql_execute,
+        encode_local_sql_prepare,
     };
     use hyphae_native_types::{CatalogVersion, Csn, DurabilityClass, LogicalType, ScalarValue};
 
@@ -663,7 +664,9 @@ mod unix {
     const JOIN_SQL: &str = "SELECT people.id, groups.label
                             FROM people
                             INNER JOIN groups ON people.group_id = groups.id
-                            WHERE email = ?";
+                            WHERE active = ?
+                            ORDER BY id
+                            LIMIT 2";
 
     struct ExpectedSql {
         visible_csn: Csn,
@@ -671,7 +674,8 @@ mod unix {
         primary: SqlResult,
         unique: SqlResult,
         bounded: SqlResult,
-        join: SqlResult,
+        join_true: SqlResult,
+        join_false: SqlResult,
     }
 
     struct TemporaryDirectory(PathBuf);
@@ -787,11 +791,14 @@ mod unix {
             )",
             &[],
         )?;
-        seed.execute_sql("INSERT INTO groups (id, label) VALUES (100, 'core')", &[])?;
-        for (id, email, active, payload) in [
-            (1_i64, "one@hyphae.local", true, b"small".to_vec()),
-            (2, "two@hyphae.local", true, vec![b'x'; 700]),
-            (3, "three@hyphae.local", false, b"third".to_vec()),
+        seed.execute_sql(
+            "INSERT INTO groups (id, label) VALUES (100, 'core'), (200, 'edge')",
+            &[],
+        )?;
+        for (id, email, active, payload, group_id) in [
+            (0_i64, "zero@hyphae.local", false, b"zero".to_vec(), 200_i64),
+            (1_i64, "one@hyphae.local", true, b"small".to_vec(), 100_i64),
+            (2, "two@hyphae.local", true, vec![b'x'; 700], 200),
         ] {
             seed.execute_sql(
                 "INSERT INTO people (id, email, active, payload, group_id)
@@ -801,7 +808,7 @@ mod unix {
                     SqlValue::Text(email.to_owned()),
                     SqlValue::Boolean(active),
                     SqlValue::Binary(payload),
-                    SqlValue::Signed(100),
+                    SqlValue::Signed(group_id),
                 ],
             )?;
         }
@@ -809,6 +816,100 @@ mod unix {
         seed.execute_sql("CREATE INDEX people_active ON people (active)", &[])?;
         seed.commit()?;
         Ok(())
+    }
+
+    fn collect_join_expected(
+        database: &NativeDatabase,
+    ) -> Result<(SqlResult, SqlResult), Box<dyn std::error::Error>> {
+        let join = database.prepare_sql_latest(JOIN_SQL)?;
+        let join_true_execution =
+            database.execute_prepared_latest_profiled(&join, &[SqlValue::Boolean(true)])?;
+        assert_eq!(
+            join_true_execution.path,
+            NativeSqlExecutionPath::IndexedNestedLoopJoin
+        );
+        assert_eq!(join_true_execution.join_right_probes, 2);
+        let join_true = join_true_execution.result;
+        assert_eq!(
+            join_true,
+            SqlResult::Rows {
+                columns: vec!["people.id".to_owned(), "groups.label".to_owned()],
+                rows: vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+                    vec![SqlValue::Signed(2), SqlValue::Text("edge".to_owned())],
+                ],
+            }
+        );
+        for (failure, rejected) in [
+            (
+                "wrong rows",
+                vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("edge".to_owned())],
+                    vec![SqlValue::Signed(2), SqlValue::Text("core".to_owned())],
+                ],
+            ),
+            (
+                "cross product",
+                vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+                    vec![SqlValue::Signed(1), SqlValue::Text("edge".to_owned())],
+                    vec![SqlValue::Signed(2), SqlValue::Text("core".to_owned())],
+                    vec![SqlValue::Signed(2), SqlValue::Text("edge".to_owned())],
+                ],
+            ),
+            (
+                "ignored ON predicate",
+                vec![
+                    vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+                    vec![SqlValue::Signed(2), SqlValue::Text("core".to_owned())],
+                ],
+            ),
+            (
+                "ignored WHERE parameter",
+                vec![
+                    vec![SqlValue::Signed(0), SqlValue::Text("edge".to_owned())],
+                    vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+                ],
+            ),
+        ] {
+            let SqlResult::Rows { rows, .. } = &join_true else {
+                return Err("expected literal join rows".into());
+            };
+            assert_ne!(
+                rows, &rejected,
+                "{failure} must fail the literal join oracle"
+            );
+        }
+        let join_false_execution =
+            database.execute_prepared_latest_profiled(&join, &[SqlValue::Boolean(false)])?;
+        assert_eq!(
+            join_false_execution.path,
+            NativeSqlExecutionPath::IndexedNestedLoopJoin
+        );
+        assert_eq!(join_false_execution.join_right_probes, 1);
+        let join_false = join_false_execution.result;
+        assert_eq!(
+            join_false,
+            SqlResult::Rows {
+                columns: vec!["people.id".to_owned(), "groups.label".to_owned()],
+                rows: vec![vec![SqlValue::Signed(0), SqlValue::Text("edge".to_owned()),]],
+            }
+        );
+        let SqlResult::Rows {
+            rows: false_rows, ..
+        } = &join_false
+        else {
+            return Err("expected literal false-parameter join rows".into());
+        };
+        assert_ne!(
+            false_rows,
+            &vec![
+                vec![SqlValue::Signed(0), SqlValue::Text("edge".to_owned())],
+                vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+            ],
+            "ignoring the false WHERE parameter must fail the literal join oracle"
+        );
+        Ok((join_true, join_false))
     }
 
     fn collect_expected(
@@ -838,16 +939,15 @@ mod unix {
         let bounded = database.prepare_sql_latest(BOUNDED_SQL)?;
         let bounded_result =
             database.execute_prepared_latest(&bounded, &[SqlValue::Boolean(true)])?;
-        let join = database.prepare_sql_latest(JOIN_SQL)?;
-        let join_result = database
-            .execute_prepared_latest(&join, &[SqlValue::Text("one@hyphae.local".to_owned())])?;
+        let (join_true, join_false) = collect_join_expected(database)?;
         Ok(ExpectedSql {
             visible_csn,
             catalog_version: primary.catalog_version(),
             primary: primary_result,
             unique: unique_result,
             bounded: bounded_result,
-            join: join_result,
+            join_true,
+            join_false,
         })
     }
 
@@ -989,15 +1089,45 @@ mod unix {
         assert_embedded_equivalence(&bounded_rows, &expected.bounded)?;
 
         let join_receipt = prepare(client, buffer, JOIN_SQL, 16)?;
-        assert_eq!(join_receipt.maximum_rows, 1);
-        let join_rows = execute(
+        assert_eq!(join_receipt.maximum_rows, 2);
+        let join_true_rows = execute(client, buffer, join_receipt, &[SqlValue::Boolean(true)], 17)?;
+        assert_eq!(
+            join_true_rows
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["people.id", "groups.label"]
+        );
+        assert_eq!(
+            join_true_rows.rows,
+            vec![
+                vec![SqlValue::Signed(1), SqlValue::Text("core".to_owned())],
+                vec![SqlValue::Signed(2), SqlValue::Text("edge".to_owned())],
+            ]
+        );
+        assert_embedded_equivalence(&join_true_rows, &expected.join_true)?;
+
+        let join_false_rows = execute(
             client,
             buffer,
             join_receipt,
-            &[SqlValue::Text("one@hyphae.local".to_owned())],
-            17,
+            &[SqlValue::Boolean(false)],
+            18,
         )?;
-        assert_embedded_equivalence(&join_rows, &expected.join)
+        assert_eq!(
+            join_false_rows
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["people.id", "groups.label"]
+        );
+        assert_eq!(
+            join_false_rows.rows,
+            vec![vec![SqlValue::Signed(0), SqlValue::Text("edge".to_owned()),]]
+        );
+        assert_embedded_equivalence(&join_false_rows, &expected.join_false)
     }
 
     fn fill_plan_table_and_reuse_first(

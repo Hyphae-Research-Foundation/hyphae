@@ -1,0 +1,322 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-postgresql-application-core-profile-v1",
+  "profile": {
+    "id": "postgresql-application-core-v1",
+    "title": "PostgreSQL Application Core v1",
+    "priority": "P0",
+    "parity_claim": {
+      "asserted": false,
+      "scope": "PostgreSQL Application Core v1",
+      "exact_language": "Hyphae satisfies PostgreSQL Application Core v1",
+      "generic_postgresql_compatible_permitted": false
+    }
+  },
+  "boundary": {
+    "role": "external-conformance-subject",
+    "harness": "conformance/postgresql",
+    "workspace_excluded": true,
+    "prohibited_roles": [
+      "runtime",
+      "planner",
+      "executor",
+      "storage",
+      "cache"
+    ]
+  },
+  "postgresql": {
+    "version": "18.6",
+    "server_version_num": "180006",
+    "source": {
+      "authority": "PostgreSQL Global Development Group",
+      "uri": "https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2",
+      "sha256": "555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f"
+    },
+    "container": {
+      "authority": "Docker Official Images library/postgres",
+      "reference": "docker.io/library/postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af",
+      "manifest_digest": "sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af",
+      "registry": "registry-1.docker.io",
+      "repository": "library/postgres"
+    },
+    "configuration": {
+      "initdb_args": "--encoding=UTF8 --locale=C",
+      "server_encoding": "UTF8",
+      "client_encoding": "UTF8",
+      "lc_collate": "C",
+      "lc_ctype": "C",
+      "timezone": "UTC",
+      "settings": {
+        "DateStyle": "ISO, YMD",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "jit": "off",
+        "lc_messages": "C",
+        "listen_addresses": "",
+        "max_connections": "20",
+        "max_parallel_workers_per_gather": "0",
+        "shared_buffers": "128MB",
+        "standard_conforming_strings": "on",
+        "synchronous_commit": "on"
+      }
+    }
+  },
+  "status_classifications": {
+    "conformant": {
+      "closes_mandatory_cell": true,
+      "meaning": "Current Hyphae behavior satisfies this bounded case with cited repository evidence."
+    },
+    "partial": {
+      "closes_mandatory_cell": false,
+      "meaning": "Hyphae implements only part of the bounded case; the mandatory cell remains open."
+    },
+    "unsupported": {
+      "closes_mandatory_cell": false,
+      "meaning": "Current Hyphae does not implement the bounded case; the mandatory cell remains open."
+    },
+    "unverified": {
+      "closes_mandatory_cell": false,
+      "meaning": "No sufficient current Hyphae evidence is cited; the mandatory cell remains open."
+    }
+  },
+  "cases": [
+    {
+      "id": "identifiers",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "Unquoted identifiers fold to lowercase and quoted identifiers preserve exact case.",
+      "oracle": "conformance/postgresql/cases/identifiers.sql",
+      "oracle_sha256": "5b67c852ea2d60ba17bfb817118315f1e37109d6c483158638b5f27259790500",
+      "hyphae": {
+        "classification": "partial",
+        "evidence": [
+          "docs/native/catalog-v1.md",
+          "crates/hyphae-native-runtime/src/sql.rs"
+        ],
+        "executable_authority": null,
+        "note": "Catalog names model quoted preservation, but the SQL lexer erases quotedness before identifier normalization."
+      }
+    },
+    {
+      "id": "typed-parameters",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "Application-supplied integer, text, and boolean parameters retain declared types.",
+      "oracle": "conformance/postgresql/cases/typed-parameters.sql",
+      "oracle_sha256": "52e9ea8db94960e82735a93f256eab5d8f75330a31382051cb853ac18bb3a11b",
+      "hyphae": {
+        "classification": "conformant",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md",
+          "crates/hyphae-native-runtime/tests/sql_typed_parameters.rs"
+        ],
+        "executable_authority": {
+          "kind": "cargo-test",
+          "path": "crates/hyphae-native-runtime/tests/sql_typed_parameters.rs",
+          "package": "hyphae-native-runtime",
+          "test_target": "sql_typed_parameters",
+          "test_name": "parameterized_insert_persists_declared_integer_text_and_boolean_types",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "hyphae-native-runtime",
+            "--test",
+            "sql_typed_parameters",
+            "parameterized_insert_persists_declared_integer_text_and_boolean_types",
+            "--",
+            "--exact"
+          ]
+        },
+        "note": "The native API parameterizes INSERT with typed values, commits and reopens persisted BIGINT/TEXT/BOOLEAN data, and uses question-mark placeholders rather than PostgreSQL wire placeholders."
+      }
+    },
+    {
+      "id": "constraint-sqlstate",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "Unique, not-null, check, and foreign-key failures expose the PostgreSQL SQLSTATE classes used by applications.",
+      "oracle": "conformance/postgresql/cases/constraint-sqlstate.sql",
+      "oracle_sha256": "9a87d98a43e17aa28b7928c053ffe5b69c0ad13e0f7c650173405355ff32ef9b",
+      "hyphae": {
+        "classification": "unsupported",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md",
+          "docs/native/product-error-v1.md"
+        ],
+        "executable_authority": null,
+        "note": "Hyphae has stable native constraint errors; compatibility SQLSTATE mapping remains a target requirement."
+      }
+    },
+    {
+      "id": "redundant-limit-point-lookup",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "A primary-key point lookup accepts a redundant positive LIMIT without changing its result.",
+      "oracle": "conformance/postgresql/cases/redundant-limit-point-lookup.sql",
+      "oracle_sha256": "a36546365d5113d2d9fcd7d280823462850bbdde4cc3fe63adee995be719735d",
+      "hyphae": {
+        "classification": "unverified",
+        "evidence": [
+          "crates/hyphae-native-runtime/src/sql.rs",
+          "crates/hyphae-native-runtime/src/lib.rs"
+        ],
+        "executable_authority": null,
+        "note": "The rebased implementation and unit coverage admit redundant positive LIMIT on a full primary-key lookup, but this profile cell remains open until it has a dedicated case-specific executable authority."
+      }
+    },
+    {
+      "id": "like-bind",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "A text LIKE pattern can be supplied as a typed application parameter.",
+      "oracle": "conformance/postgresql/cases/like-bind.sql",
+      "oracle_sha256": "39ad3618f8f28a4f0626e617048de92ac1662173d07e88102a04dfbaf858d995",
+      "hyphae": {
+        "classification": "unsupported",
+        "evidence": [
+          "crates/hyphae-native-runtime/tests/sql_like_in_g2.rs"
+        ],
+        "executable_authority": null,
+        "note": "The bounded residual LIKE slice currently requires a text literal and rejects a pattern parameter."
+      }
+    },
+    {
+      "id": "returning",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "INSERT, UPDATE, and DELETE can return affected application columns in the same statement.",
+      "oracle": "conformance/postgresql/cases/returning.sql",
+      "oracle_sha256": "2c96e4453ebfc42d480eca8ca42a7898c8dcdfdcf91643b4b20d2500056f32c5",
+      "hyphae": {
+        "classification": "unsupported",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md"
+        ],
+        "executable_authority": null,
+        "note": "RETURNING is outside the current bounded mutation grammar."
+      }
+    },
+    {
+      "id": "on-conflict",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "A primary-key conflict supports deterministic DO UPDATE and DO NOTHING outcomes.",
+      "oracle": "conformance/postgresql/cases/on-conflict.sql",
+      "oracle_sha256": "29634c77dc5a337200587972c24c0e2fc9fdc61098da67432bec0fa224be3959",
+      "hyphae": {
+        "classification": "unsupported",
+        "evidence": [
+          "docs/roadmaps/universal-engine-program.md"
+        ],
+        "executable_authority": null,
+        "note": "ON CONFLICT is a planned application-profile gap, not current behavior."
+      }
+    },
+    {
+      "id": "explicit-transaction-savepoint",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "Explicit begin, commit, rollback, savepoint, and rollback-to-savepoint preserve the expected write set.",
+      "oracle": "conformance/postgresql/cases/explicit-transaction-savepoint.sql",
+      "oracle_sha256": "8f5a49499b3009960f630222c983f1623b76324af9ba121c53ab7092bede1192",
+      "hyphae": {
+        "classification": "partial",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md",
+          "crates/hyphae-native-runtime/tests/local_all_engine_transaction.rs"
+        ],
+        "executable_authority": null,
+        "note": "Explicit begin, commit, and rollback exist; SQL savepoint execution is not implemented."
+      }
+    },
+    {
+      "id": "basic-joins",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "A parameterized indexed inner equijoin returns the matching application row.",
+      "oracle": "conformance/postgresql/cases/basic-joins.sql",
+      "oracle_sha256": "52a69cadf89f1a784395301dc5ed3ed51ce1e91158fbd5be4ba50544f0fa2544",
+      "hyphae": {
+        "classification": "conformant",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md",
+          "crates/hyphae-native-runtime/tests/local_sql_select.rs"
+        ],
+        "executable_authority": {
+          "kind": "cargo-test",
+          "path": "crates/hyphae-native-runtime/tests/local_sql_select.rs",
+          "package": "hyphae-native-runtime",
+          "test_target": "local_sql_select",
+          "test_name": "unix::uds_sql_matches_physical_plans_recovers_failures_and_reopens",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "hyphae-native-runtime",
+            "--test",
+            "local_sql_select",
+            "unix::uds_sql_matches_physical_plans_recovers_failures_and_reopens",
+            "--",
+            "--exact"
+          ]
+        },
+        "note": "The authority requires indexed nested-loop paths for distinct true/false parameter results across two groups, with literal ordered rows and exact right-probe counts; wrong, cross-product, ignored-ON, and ignored-WHERE outcomes are negative controls. Outer and general joins are not implied."
+      }
+    },
+    {
+      "id": "group-by",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "A bounded GROUP BY with COUNT produces deterministic ordered groups.",
+      "oracle": "conformance/postgresql/cases/group-by.sql",
+      "oracle_sha256": "43ede570d8ebceee1fbbe68c7f2228057069cbf71c6daff809bb23a27029356b",
+      "hyphae": {
+        "classification": "conformant",
+        "evidence": [
+          "docs/native/sql-semantics-v1.md",
+          "crates/hyphae-native-runtime/tests/sql_group_by_g2.rs"
+        ],
+        "executable_authority": {
+          "kind": "cargo-test",
+          "path": "crates/hyphae-native-runtime/tests/sql_group_by_g2.rs",
+          "package": "hyphae-native-runtime",
+          "test_target": "sql_group_by_g2",
+          "test_name": "projected_group_key_and_count_are_explicitly_ordered",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "hyphae-native-runtime",
+            "--test",
+            "sql_group_by_g2",
+            "projected_group_key_and_count_are_explicitly_ordered",
+            "--",
+            "--exact"
+          ]
+        },
+        "note": "The authority projects the group key and COUNT(*), orders by that key, and includes the positive LIMIT required by Hyphae's bounded grouped profile."
+      }
+    },
+    {
+      "id": "catalog-columns",
+      "priority": "P0",
+      "mandatory": true,
+      "requirement": "Applications can inspect table column name, ordinal, nullability, and data type through SQL catalog columns.",
+      "oracle": "conformance/postgresql/cases/catalog-columns.sql",
+      "oracle_sha256": "ca4a31c58c5581cbf1cee44cc637f210a8f140b8b421a57b7a66222da3b6a160",
+      "hyphae": {
+        "classification": "unsupported",
+        "evidence": [
+          "docs/native/catalog-api-v1.md",
+          "docs/native/sql-semantics-v1.md"
+        ],
+        "executable_authority": null,
+        "note": "Hyphae exposes a native catalog API but not PostgreSQL information_schema column views through SQL."
+      }
+    }
+  ]
+}

@@ -132,6 +132,29 @@ fn grouped_aggregates_stream_identically_across_all_surfaces() -> Result<(), Tes
 }
 
 #[test]
+fn projected_group_key_and_count_are_explicitly_ordered() -> Result<(), TestError> {
+    const APPLICATION_CORE: &str = "SELECT tenant, COUNT(*) AS item_count FROM ledger \
+         GROUP BY tenant ORDER BY tenant ASC LIMIT 10";
+    let temporary = TemporaryDirectory::create()?;
+    let database = seeded_database(temporary.path())?;
+    let prepared = database.prepare_sql_latest(APPLICATION_CORE)?;
+    let SqlResult::Rows { columns, rows } = database.execute_prepared_latest(&prepared, &[])?
+    else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(columns, vec!["tenant", "item_count"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Text("acme".to_owned()), SqlValue::Unsigned(3)],
+            vec![SqlValue::Text("globex".to_owned()), SqlValue::Unsigned(2)],
+            vec![SqlValue::Text("initech".to_owned()), SqlValue::Unsigned(1)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn grouped_aggregates_respect_the_group_limit_and_range_filters() -> Result<(), TestError> {
     let temporary = TemporaryDirectory::create()?;
     let database = seeded_database(temporary.path())?;

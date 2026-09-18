@@ -21,6 +21,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native capabilities and limits](product/native-capabilities.md)
 - [3.0.0 publication receipt](release/receipts/3.0.0.md)
 - [Canonical claims and non-claims](product/claims.md)
+- [PostgreSQL Application Core v1 external conformance profile](conformance/postgresql-application-core-v1.md)
 - [Hyphae Agent Memory — product contract](product/agent-memory.md)
 - [Published 0.2.1 capabilities and limits (legacy format-2)](product/capabilities.md)
 - [Published 0.2.1 compatibility quickstart (legacy format-2)](quickstart.md)
