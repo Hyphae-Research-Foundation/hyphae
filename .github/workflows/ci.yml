@@ -43,6 +43,14 @@ jobs:
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_gate_closures -v
           python tools/check_native_gate_closures.py
+      - name: Verify PostgreSQL external conformance profile
+        run: |
+          PYTHONPATH=. python -m unittest \
+            tools.test_check_postgresql_application_core \
+            tools.test_check_postgresql_application_core_receipt \
+            tools.test_run_postgresql_application_core \
+            -v
+          PYTHONPATH=. python tools/check_postgresql_application_core.py
       - name: Enforce DCO sign-offs on the pull-request commit range
         if: github.event_name == 'pull_request'
         run: |

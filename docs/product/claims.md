@@ -80,6 +80,12 @@ crash matrices (`tests/all_engine_transaction_g5.rs`,
 ## Prohibited claim shapes
 
 - "Universal SQL", "drop-in replacement", "protocol compatible".
+- "PostgreSQL-compatible", "PostgreSQL replacement", or any other unscoped
+  PostgreSQL compatibility claim, permanently. Only the exact profile-scoped
+  statement "Hyphae satisfies PostgreSQL Application Core v1" may ever become
+  eligible, and only under the
+  [external profile](../conformance/postgresql-application-core-v1.md) closure
+  rules. It is currently blocked.
 - "Serializable" in any form.
 - "Distributed", "replicated", "highly available".
 - Any latency number without its environment class and receipt.
