@@ -2,8 +2,8 @@
 
 //! Multi-row `INSERT ... VALUES (...),(...)` bounded conformance.
 
-use hyphae_native_runtime::{NativeDatabase, SqlError, SqlResult, SqlValue};
-use hyphae_native_types::DurabilityClass;
+use hyphae_native_runtime::{NativeDatabase, NativeRuntimeError, SqlError, SqlResult, SqlValue};
+use hyphae_native_types::{DurabilityClass, ObjectId};
 
 type TestError = Box<dyn std::error::Error>;
 
@@ -47,6 +47,33 @@ fn seeded_database(path: &std::path::Path) -> Result<NativeDatabase, TestError> 
     )?;
     seed.commit()?;
     Ok(database)
+}
+
+#[test]
+fn direct_insert_reports_primary_key_conflict_without_replacing_the_row() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let table = ObjectId::new(1)?;
+    let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    batch.create_relation(table, "accounts")?;
+    batch.insert(table, b"one".to_vec(), b"original".to_vec())?;
+    let mutation_count = batch.mutation_count();
+
+    assert!(matches!(
+        batch.insert(table, b"one".to_vec(), b"replacement".to_vec()),
+        Err(NativeRuntimeError::UniquePrimaryKeyViolation)
+    ));
+    assert_eq!(batch.mutation_count(), mutation_count);
+    assert_eq!(batch.select(table, b"one"), Some(b"original".as_slice()));
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(temporary.path())?;
+    assert_eq!(
+        reopened.snapshot(0)?.select(table, b"one"),
+        Some(b"original".as_slice())
+    );
+    Ok(())
 }
 
 #[test]
@@ -121,19 +148,286 @@ fn multi_row_insert_is_atomic_when_one_row_fails() -> Result<(), TestError> {
 }
 
 #[test]
-fn multi_row_insert_duplicate_primary_key_fails_closed() -> Result<(), TestError> {
+fn multi_row_insert_persisted_primary_key_conflict_restores_batch() -> Result<(), TestError> {
     let temporary = TemporaryDirectory::create()?;
-    let database = seeded_database(temporary.path())?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut seed = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    seed.execute_sql_dml(
+        "INSERT INTO accounts (id, balance, label) VALUES (1, 100, 'original')",
+        &[],
+    )?;
+    database.commit_optimistic(seed)?;
 
     let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = batch.mutation_count();
     let outcome = batch.execute_sql_dml(
         "INSERT INTO accounts (id, balance, label) VALUES \
-         (20, 1, 'first'), (20, 2, 'duplicate')",
+         (20, 1, 'first'), (1, 2, 'replacement')",
         &[],
     );
-    assert!(
-        outcome.is_err(),
-        "duplicate primary key inside one VALUES list must fail"
+    assert!(matches!(outcome, Err(SqlError::UniqueViolation)));
+    assert_eq!(batch.mutation_count(), mutation_count);
+    assert_eq!(
+        batch.execute_sql("SELECT balance, label FROM accounts WHERE id = 1", &[])?,
+        SqlResult::Rows {
+            columns: vec!["balance".to_owned(), "label".to_owned()],
+            rows: vec![vec![
+                SqlValue::Signed(100),
+                SqlValue::Text("original".to_owned()),
+            ]],
+        }
+    );
+    assert_eq!(
+        batch.execute_sql("SELECT id FROM accounts WHERE id = 20", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    batch.execute_sql_dml(
+        "INSERT INTO accounts (id, balance, label) VALUES (30, 3, 'after')",
+        &[],
+    )?;
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(temporary.path())?;
+    let snapshot = reopened.snapshot(0)?;
+    let prepared = snapshot.prepare_sql("SELECT label FROM accounts WHERE id = ?")?;
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(1)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: vec![vec![SqlValue::Text("original".to_owned())]],
+        }
+    );
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(20)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(30)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: vec![vec![SqlValue::Text("after".to_owned())]],
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_row_insert_same_statement_primary_key_conflict_restores_batch() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = batch.mutation_count();
+
+    assert!(matches!(
+        batch.execute_sql_dml(
+            "INSERT INTO accounts (id, balance, label) VALUES \
+             (20, 1, 'first'), (20, 2, 'duplicate')",
+            &[],
+        ),
+        Err(SqlError::UniqueViolation)
+    ));
+    assert_eq!(batch.mutation_count(), mutation_count);
+    assert_eq!(
+        batch.execute_sql("SELECT id FROM accounts WHERE id = 20", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    batch.execute_sql_dml(
+        "INSERT INTO accounts (id, balance, label) VALUES (30, 3, 'after')",
+        &[],
+    )?;
+    database.commit_optimistic(batch)?;
+
+    let snapshot = database.snapshot(0)?;
+    let prepared = snapshot.prepare_sql("SELECT label FROM accounts WHERE id = ?")?;
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(20)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(30)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: vec![vec![SqlValue::Text("after".to_owned())]],
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_row_insert_later_foreign_key_failure_restores_batch() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin_sql(0, DurabilityClass::Strict)?;
+    seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
+    seed.execute_sql(
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, \
+         FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        &[],
+    )?;
+    seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;
+    seed.commit()?;
+
+    let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = batch.mutation_count();
+    assert!(matches!(
+        batch.execute_sql_dml(
+            "INSERT INTO children (id, parent_id) VALUES (10, 1), (11, 999)",
+            &[],
+        ),
+        Err(SqlError::ForeignKeyViolation)
+    ));
+    assert_eq!(batch.mutation_count(), mutation_count);
+    assert_eq!(
+        batch.execute_sql("SELECT id FROM children WHERE id = 10", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    batch.execute_sql_dml("INSERT INTO children (id, parent_id) VALUES (12, 1)", &[])?;
+    database.commit_optimistic(batch)?;
+
+    let snapshot = database.snapshot(0)?;
+    let prepared = snapshot.prepare_sql("SELECT parent_id FROM children WHERE id = ?")?;
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(10)])?,
+        SqlResult::Rows {
+            columns: vec!["parent_id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(12)])?,
+        SqlResult::Rows {
+            columns: vec!["parent_id".to_owned()],
+            rows: vec![vec![SqlValue::Signed(1)]],
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_row_insert_reports_the_first_row_constraint_failure() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.path())?;
+    let mut seed = database.begin_sql(0, DurabilityClass::Strict)?;
+    seed.execute_sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)", &[])?;
+    seed.execute_sql(
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, \
+         FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        &[],
+    )?;
+    seed.execute_sql("INSERT INTO parents (id) VALUES (1)", &[])?;
+    seed.execute_sql("INSERT INTO children (id, parent_id) VALUES (1, 1)", &[])?;
+    seed.commit()?;
+
+    let mut foreign_key_first = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = foreign_key_first.mutation_count();
+    assert!(matches!(
+        foreign_key_first.execute_sql_dml(
+            "INSERT INTO children (id, parent_id) VALUES (10, 999), (1, 1)",
+            &[],
+        ),
+        Err(SqlError::ForeignKeyViolation)
+    ));
+    assert_eq!(foreign_key_first.mutation_count(), mutation_count);
+    assert_eq!(
+        foreign_key_first.execute_sql("SELECT id FROM children WHERE id = 10", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    foreign_key_first.rollback();
+
+    let mut primary_key_first = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = primary_key_first.mutation_count();
+    assert!(matches!(
+        primary_key_first.execute_sql_dml(
+            "INSERT INTO children (id, parent_id) VALUES (1, 1), (10, 999)",
+            &[],
+        ),
+        Err(SqlError::UniqueViolation)
+    ));
+    assert_eq!(primary_key_first.mutation_count(), mutation_count);
+    assert_eq!(
+        primary_key_first.execute_sql("SELECT id FROM children WHERE id = 10", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    primary_key_first.rollback();
+    Ok(())
+}
+
+#[test]
+fn multi_row_insert_later_secondary_unique_failure_restores_batch() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = seeded_database(temporary.path())?;
+    let mut seed = database.begin_sql(0, DurabilityClass::Strict)?;
+    seed.execute_sql(
+        "CREATE UNIQUE INDEX accounts_label ON accounts (label)",
+        &[],
+    )?;
+    seed.execute_sql(
+        "INSERT INTO accounts (id, balance, label) VALUES (1, 100, 'original')",
+        &[],
+    )?;
+    seed.commit()?;
+
+    let mut batch = database.begin_optimistic(0, DurabilityClass::Strict)?;
+    let mutation_count = batch.mutation_count();
+    assert!(matches!(
+        batch.execute_sql_dml(
+            "INSERT INTO accounts (id, balance, label) VALUES \
+             (20, 1, 'first'), (21, 2, 'original')",
+            &[],
+        ),
+        Err(SqlError::UniqueViolation)
+    ));
+    assert_eq!(batch.mutation_count(), mutation_count);
+    assert_eq!(
+        batch.execute_sql("SELECT id FROM accounts WHERE id = 20", &[])?,
+        SqlResult::Rows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    batch.execute_sql_dml(
+        "INSERT INTO accounts (id, balance, label) VALUES (30, 3, 'after')",
+        &[],
+    )?;
+    database.commit_optimistic(batch)?;
+
+    let snapshot = database.snapshot(0)?;
+    let prepared = snapshot.prepare_sql("SELECT label FROM accounts WHERE id = ?")?;
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(20)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: Vec::new(),
+        }
+    );
+    assert_eq!(
+        snapshot.execute_prepared(&prepared, &[SqlValue::Signed(30)])?,
+        SqlResult::Rows {
+            columns: vec!["label".to_owned()],
+            rows: vec![vec![SqlValue::Text("after".to_owned())]],
+        }
     );
     Ok(())
 }

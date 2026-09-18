@@ -12,11 +12,13 @@ use std::{
 };
 
 use hyphae_native_product::{
-    AuthorizationEpoch, BuiltInRole, MetricId, MetricValue, NativeProduct, NativeProductService,
-    NativeProductServiceConfig, ProductAuthorization, ProductCommitOutcome, ProductDurability,
-    ProductDurabilityPolicy, ProductErrorCode, ProductOperation, ProductPermission,
+    AuthorizationEpoch, BuiltInRole, DoctorRequest, DoctorStatus, MetricId, MetricValue,
+    NativeProduct, NativeProductService, NativeProductServiceConfig, ProductAuthorization,
+    ProductCommitOutcome, ProductDurability, ProductDurabilityPolicy, ProductErrorCategory,
+    ProductErrorCode, ProductExplicitTransactionStatus, ProductOperation, ProductPermission,
     ProductPrincipal, ProductRequestContext, ProductResponse, ProductScope, ProductSession,
-    ProductSessionId, ProductSqlResult, ProductValue, RestoreRequest,
+    ProductSessionId, ProductSqlResult, ProductTransactionSqlMutation, ProductValue,
+    RestoreRequest, doctor,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -154,6 +156,241 @@ fn direct_facade_and_operation_dispatcher_return_the_same_prepared_read()
         }
     );
 
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sql_user_conflicts_are_typed_atomic_and_survive_reopen() -> Result<(), Box<dyn Error>> {
+    let path = temporary("sql-user-conflicts");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut session = direct_session("sql-user-conflicts", ProductAuthorization::ALL)?;
+    for (request_id, statement) in [
+        (
+            1,
+            "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+        ),
+        (
+            2,
+            "INSERT INTO people (id, email) VALUES (1, 'first@example.test')",
+        ),
+        (3, "CREATE UNIQUE INDEX people_email ON people (email)"),
+    ] {
+        let request = context(&session, request_id, 0);
+        product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: statement.to_owned(),
+                parameters: Vec::new(),
+            },
+        )?;
+    }
+
+    let request = context(&session, 4, 0);
+    let duplicate = product
+        .dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: "INSERT INTO people (id, email) VALUES (1, 'replacement@example.test')"
+                    .to_owned(),
+                parameters: Vec::new(),
+            },
+        )
+        .expect_err("duplicate primary key was accepted");
+    assert_eq!(duplicate.code(), ProductErrorCode::SqlUniqueViolation);
+    assert_eq!(duplicate.category(), ProductErrorCategory::Conflict);
+
+    let request = context(&session, 5, 0);
+    let dependent = product
+        .dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: "DROP TABLE people".to_owned(),
+                parameters: Vec::new(),
+            },
+        )
+        .expect_err("DROP TABLE ignored its secondary-index dependency");
+    assert_eq!(dependent.code(), ProductErrorCode::CatalogConflict);
+    assert_eq!(dependent.category(), ProductErrorCategory::Conflict);
+
+    let request = context(&session, 6, 0);
+    let selected = product.dispatch(
+        &mut session,
+        &request,
+        ProductOperation::ExecuteSql {
+            statement: "SELECT id, email FROM people WHERE email = 'first@example.test'".to_owned(),
+            parameters: Vec::new(),
+        },
+    )?;
+    assert!(matches!(
+        selected,
+        ProductResponse::Sql {
+            result: ProductSqlResult::Rows { ref rows, .. },
+            ..
+        } if rows == &vec![vec![
+            ProductValue::Signed(1),
+            ProductValue::Text("first@example.test".to_owned()),
+        ]]
+    ));
+    drop(product);
+
+    assert_eq!(
+        doctor(&DoctorRequest::new(&path, 0)?).status,
+        DoctorStatus::Healthy
+    );
+    let mut reopened = NativeProduct::open(&path)?;
+    let mut reopened_session = direct_session("sql-user-conflicts", ProductAuthorization::ALL)?;
+    let request = context(&reopened_session, 7, 0);
+    assert!(matches!(
+        reopened.dispatch(
+            &mut reopened_session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: "SELECT email FROM people WHERE id = 1".to_owned(),
+                parameters: Vec::new(),
+            },
+        )?,
+        ProductResponse::Sql {
+            result: ProductSqlResult::Rows { ref rows, .. },
+            ..
+        } if rows == &vec![vec![ProductValue::Text("first@example.test".to_owned())]]
+    ));
+    drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bound_multi_row_insert_preserves_constraint_order_and_transaction() -> Result<(), Box<dyn Error>>
+{
+    let path = temporary("sql-constraint-order");
+    let _ = fs::remove_dir_all(&path);
+    let mut product = NativeProduct::create(&path)?;
+    let mut session = direct_session("sql-constraint-order", ProductAuthorization::ALL)?;
+    for (request_id, statement) in [
+        (
+            1,
+            "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL CHECK (balance >= 0))",
+        ),
+        (2, "INSERT INTO accounts (id, balance) VALUES (1, 10)"),
+    ] {
+        let request = context(&session, request_id, 0);
+        product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: statement.to_owned(),
+                parameters: Vec::new(),
+            },
+        )?;
+    }
+    let request = context(&session, 3, 0);
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = product.dispatch(&mut session, &request, ProductOperation::TransactionBegin)?
+    else {
+        return Err("transaction did not begin".into());
+    };
+
+    let request = context(&session, 4, 0);
+    let duplicate = product
+        .dispatch(
+            &mut session,
+            &request,
+            ProductOperation::TransactionStageSql {
+                handle,
+                mutation: ProductTransactionSqlMutation {
+                    statement: "INSERT INTO accounts (id, balance) VALUES (1, 10), (2, -1)"
+                        .to_owned(),
+                    parameters: Vec::new(),
+                },
+            },
+        )
+        .expect_err("later CHECK failure preempted the first-row duplicate");
+    assert_eq!(duplicate.code(), ProductErrorCode::SqlUniqueViolation);
+    assert_eq!(duplicate.category(), ProductErrorCategory::Conflict);
+
+    let request = context(&session, 5, 0);
+    let check = product
+        .dispatch(
+            &mut session,
+            &request,
+            ProductOperation::TransactionStageSql {
+                handle,
+                mutation: ProductTransactionSqlMutation {
+                    statement: "INSERT INTO accounts (id, balance) VALUES (2, -1), (1, 10)"
+                        .to_owned(),
+                    parameters: Vec::new(),
+                },
+            },
+        )
+        .expect_err("later duplicate preempted the first-row CHECK failure");
+    assert_eq!(check.code(), ProductErrorCode::SqlCheckViolation);
+    assert_eq!(check.category(), ProductErrorCategory::Conflict);
+
+    let request = context(&session, 6, 0);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExplicitTransactionStatus { handle },
+        )?,
+        ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+            staged_operations: 0,
+            ..
+        })
+    ));
+    let request = context(&session, 7, 0);
+    product.dispatch(
+        &mut session,
+        &request,
+        ProductOperation::TransactionStageSql {
+            handle,
+            mutation: ProductTransactionSqlMutation {
+                statement: "INSERT INTO accounts (id, balance) VALUES (3, 30)".to_owned(),
+                parameters: Vec::new(),
+            },
+        },
+    )?;
+    let request = context(&session, 8, 0);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::TransactionCommit { handle },
+        )?,
+        ProductResponse::TransactionCommitted(receipt) if receipt.staged_operations == 1
+    ));
+
+    for (request_id, id, rows) in [
+        (9, 2, Vec::new()),
+        (10, 3, vec![vec![ProductValue::Signed(30)]]),
+    ] {
+        let request = context(&session, request_id, 0);
+        let selected = product.dispatch(
+            &mut session,
+            &request,
+            ProductOperation::ExecuteSql {
+                statement: format!("SELECT balance FROM accounts WHERE id = {id}"),
+                parameters: Vec::new(),
+            },
+        )?;
+        assert!(matches!(
+            selected,
+            ProductResponse::Sql {
+                result: ProductSqlResult::Rows { rows: actual, .. },
+                ..
+            } if actual == rows
+        ));
+    }
     drop(product);
     fs::remove_dir_all(path)?;
     Ok(())

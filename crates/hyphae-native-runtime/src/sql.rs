@@ -167,7 +167,7 @@ pub enum SqlError {
     /// No primary or secondary index can satisfy the exact predicates.
     #[error("HYSQL011 native SQL query has no implemented access path")]
     NoAccessPath,
-    /// A non-null unique secondary-index key already identifies a row.
+    /// A primary-key or non-null unique secondary-index key already identifies a row.
     #[error("HYSQL012 native SQL unique constraint failed")]
     UniqueViolation,
     /// Updating a primary-key column is outside the current mutation contract.
@@ -6213,16 +6213,14 @@ fn execute_drop_table(
         return Err(SqlError::InvalidCatalogObject);
     };
     execution_checkpoint(checkpoint)?;
-    transaction
-        .state
-        .relational
+    let mut relational = transaction.state.relational.clone();
+    let mut catalog = transaction.state.catalog.clone();
+    relational
         .drop_table(id)
         .map_err(NativeRuntimeError::from)?;
-    transaction
-        .state
-        .catalog
-        .remove(id)
-        .map_err(NativeRuntimeError::from)?;
+    catalog.remove(id).map_err(NativeRuntimeError::from)?;
+    transaction.state.relational = relational;
+    transaction.state.catalog = catalog;
     transaction.mutations.push(crate::wal_codec::Mutation {
         engine: EngineKind::Relational,
         opcode: crate::wal_codec::Opcode::DropTable,
@@ -6257,16 +6255,14 @@ fn execute_drop_index(
         return Err(SqlError::InvalidCatalogObject);
     };
     execution_checkpoint(checkpoint)?;
-    transaction
-        .state
-        .relational
+    let mut relational = transaction.state.relational.clone();
+    let mut catalog = transaction.state.catalog.clone();
+    relational
         .drop_secondary_index(id)
         .map_err(NativeRuntimeError::from)?;
-    transaction
-        .state
-        .catalog
-        .remove(id)
-        .map_err(NativeRuntimeError::from)?;
+    catalog.remove(id).map_err(NativeRuntimeError::from)?;
+    transaction.state.relational = relational;
+    transaction.state.catalog = catalog;
     transaction.mutations.push(crate::wal_codec::Mutation {
         engine: EngineKind::Relational,
         opcode: crate::wal_codec::Opcode::DropSecondaryIndex,
@@ -6294,35 +6290,52 @@ fn execute_insert(
 ) -> Result<SqlResult, SqlError> {
     let (table, definition) = relation_named(&transaction.state.catalog, name)?;
     let definition = definition.clone();
-    let mut rows_affected = 0_u64;
-    for row_operands in
-        std::iter::once(supplied_values).chain(additional_rows.iter().map(Vec::as_slice))
-    {
-        let resolved =
-            resolve_mutation_operands(&definition, row_operands, parameter_count, parameters)?;
-        let values = bind_insert_values(&definition, row_operands, &resolved)?;
-        validate_foreign_keys(transaction, &definition, &values, checkpoint)?;
-        if is_legacy_binary_relation(&definition) {
-            let primary_key = legacy_binary_value(values[0], false)?;
-            let row = legacy_binary_value(values[1], false)?;
-            transaction
-                .insert_with_checkpoint(table, primary_key, row, checkpoint)
-                .map_err(map_runtime_error)?;
-        } else {
-            let primary_key = encode_primary_key(&definition, &values)?;
-            let tuple = encode_tuple(&definition, &values)?;
-            transaction
-                .insert_with_checkpoint(table, primary_key, tuple, checkpoint)
-                .map_err(map_runtime_error)?;
+    let rollback = (!additional_rows.is_empty()).then(|| {
+        (
+            transaction.state.relational.clone(),
+            transaction.mutations.len(),
+            transaction.dirty,
+        )
+    });
+    let result = (|| {
+        let mut rows_affected = 0_u64;
+        for row_operands in
+            std::iter::once(supplied_values).chain(additional_rows.iter().map(Vec::as_slice))
+        {
+            let resolved =
+                resolve_mutation_operands(&definition, row_operands, parameter_count, parameters)?;
+            let values = bind_insert_values(&definition, row_operands, &resolved)?;
+            validate_foreign_keys(transaction, &definition, &values, checkpoint)?;
+            if is_legacy_binary_relation(&definition) {
+                let primary_key = legacy_binary_value(values[0], false)?;
+                let row = legacy_binary_value(values[1], false)?;
+                transaction
+                    .insert_with_checkpoint(table, primary_key, row, checkpoint)
+                    .map_err(map_runtime_error)?;
+            } else {
+                let primary_key = encode_primary_key(&definition, &values)?;
+                let tuple = encode_tuple(&definition, &values)?;
+                transaction
+                    .insert_with_checkpoint(table, primary_key, tuple, checkpoint)
+                    .map_err(map_runtime_error)?;
+            }
+            rows_affected = rows_affected
+                .checked_add(1)
+                .ok_or(SqlError::InsertRowBudgetExceeded)?;
         }
-        rows_affected = rows_affected
-            .checked_add(1)
-            .ok_or(SqlError::InsertRowBudgetExceeded)?;
+        Ok(SqlResult::Command {
+            rows_affected,
+            object_id: None,
+        })
+    })();
+    if result.is_err()
+        && let Some((relational, mutation_count, dirty)) = rollback
+    {
+        transaction.state.relational = relational;
+        transaction.mutations.truncate(mutation_count);
+        transaction.dirty = dirty;
     }
-    Ok(SqlResult::Command {
-        rows_affected,
-        object_id: None,
-    })
+    result
 }
 
 fn decode_stored_values(
@@ -8875,7 +8888,7 @@ fn bind_data_mutation(
                     *parameter_count,
                     parameters,
                 )?;
-                let _ = bind_insert_values(definition, row_operands, &resolved)?;
+                let _ = bind_insert_shape(definition, row_operands, &resolved)?;
             }
             (table, definition)
         }
@@ -8987,17 +9000,7 @@ fn bind_catalog_mutation(
         Statement::DropTable { name } => {
             let (table, _) = relation_named(catalog, name)?;
             referenced.insert(table);
-            referenced.extend(secondary_indexes_for_relation(catalog, table));
-            for object in catalog.objects.values() {
-                if let CatalogObject::Relation(child) = object
-                    && child
-                        .foreign_keys
-                        .iter()
-                        .any(|foreign_key| foreign_key.referenced_relation == table)
-                {
-                    referenced.insert(child.header.id);
-                }
-            }
+            referenced.extend(catalog.dependent_ids(table));
         }
         Statement::DropIndex { name } => {
             let id = catalog
@@ -9005,6 +9008,7 @@ fn bind_catalog_mutation(
                 .map_err(NativeRuntimeError::from)?;
             let definition = secondary_index_by_id(catalog, id)?;
             referenced.extend([id, definition.relation]);
+            referenced.extend(catalog.dependent_ids(id));
         }
         _ => return Err(SqlError::InvalidSyntax),
     }
@@ -9217,14 +9221,7 @@ fn bind_insert_values<'value>(
     supplied_values: &[ColumnOperand],
     resolved: &'value [SqlValue],
 ) -> Result<Vec<Option<&'value SqlValue>>, SqlError> {
-    let mut values = vec![None; definition.columns.len()];
-    for (binding, value) in supplied_values.iter().zip(resolved) {
-        let index = column_index(&definition.columns, &binding.column)?;
-        if values[index].is_some() {
-            return Err(SqlError::DuplicateColumn);
-        }
-        values[index] = Some(value);
-    }
+    let values = bind_insert_shape(definition, supplied_values, resolved)?;
     for (index, column) in definition.columns.iter().enumerate() {
         if values[index].is_none() && !column.nullable {
             return Err(SqlError::NullViolation);
@@ -9234,6 +9231,22 @@ fn bind_insert_values<'value>(
         }
     }
     validate_checks(definition, &values)?;
+    Ok(values)
+}
+
+fn bind_insert_shape<'value>(
+    definition: &RelationDefinition,
+    supplied_values: &[ColumnOperand],
+    resolved: &'value [SqlValue],
+) -> Result<Vec<Option<&'value SqlValue>>, SqlError> {
+    let mut values = vec![None; definition.columns.len()];
+    for (binding, value) in supplied_values.iter().zip(resolved) {
+        let index = column_index(&definition.columns, &binding.column)?;
+        if values[index].is_some() {
+            return Err(SqlError::DuplicateColumn);
+        }
+        values[index] = Some(value);
+    }
     Ok(values)
 }
 
@@ -10511,7 +10524,8 @@ fn secondary_index_by_id(
 
 pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> SqlError {
     match error {
-        NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
+        NativeRuntimeError::UniquePrimaryKeyViolation
+        | NativeRuntimeError::UniqueSecondaryIndexViolation => SqlError::UniqueViolation,
         NativeRuntimeError::CheckConstraintViolation => SqlError::CheckViolation,
         NativeRuntimeError::ForeignKeyConstraintViolation => SqlError::ForeignKeyViolation,
         NativeRuntimeError::ResourceQueue(crate::GovernorQueueError::Cancelled) => {

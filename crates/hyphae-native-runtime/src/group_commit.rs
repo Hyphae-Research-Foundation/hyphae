@@ -2375,7 +2375,9 @@ fn scheduler_request_local(source: &NativeRuntimeError) -> bool {
             | NativeRuntimeError::WriteConflict(_)
             | NativeRuntimeError::Catalog(_)
             | NativeRuntimeError::Model(_)
+            | NativeRuntimeError::UniquePrimaryKeyViolation
             | NativeRuntimeError::UniqueSecondaryIndexViolation
+            | NativeRuntimeError::CatalogDependencyConflict { .. }
             | NativeRuntimeError::UnknownSecondaryIndex { .. }
             | NativeRuntimeError::UnknownRelation { .. }
             | NativeRuntimeError::UnknownVectorIndex { .. }

@@ -750,9 +750,18 @@ pub enum NativeRuntimeError {
     /// Engine-state codec or semantic validation failed.
     #[error("native engine state failed: {0}")]
     Model(String),
+    /// A primary-key value already identifies a row.
+    #[error("native relational primary key already exists")]
+    UniquePrimaryKeyViolation,
     /// A non-null native unique secondary-index key already identifies a row.
     #[error("native relational unique secondary index is violated")]
     UniqueSecondaryIndexViolation,
+    /// A catalog object cannot be removed while another object depends on it.
+    #[error("native catalog object {object} has live dependents")]
+    CatalogDependencyConflict {
+        /// Stable catalog identity whose removal was rejected.
+        object: ObjectId,
+    },
     /// One persisted relation CHECK predicate rejected a row.
     #[error("native relational CHECK constraint is violated")]
     CheckConstraintViolation,
@@ -1336,7 +1345,9 @@ impl From<WalSemanticError> for NativeRuntimeError {
 impl From<ModelError> for NativeRuntimeError {
     fn from(source: ModelError) -> Self {
         match source {
+            ModelError::DuplicatePrimaryKey => Self::UniquePrimaryKeyViolation,
             ModelError::UniqueSecondaryIndexViolation => Self::UniqueSecondaryIndexViolation,
+            ModelError::DependencyConflict(object) => Self::CatalogDependencyConflict { object },
             source => Self::Model(source.to_string()),
         }
     }

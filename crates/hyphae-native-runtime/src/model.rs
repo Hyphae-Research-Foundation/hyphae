@@ -43,6 +43,8 @@ pub(crate) enum ModelError {
     UnknownObject,
     #[error("native catalog object belongs to a different engine")]
     WrongEngine,
+    #[error("native catalog object {0} has live dependents")]
+    DependencyConflict(ObjectId),
     #[error("native secondary index references an unknown relation")]
     UnknownSecondaryIndexRelation,
     #[error("native relational primary key already exists")]
@@ -262,18 +264,23 @@ impl CatalogState {
         if !self.objects.contains_key(&id) {
             return Err(ModelError::UnknownObject);
         }
-        if self.objects.values().any(|candidate| match candidate {
-            CatalogObject::SecondaryIndex(index) => index.relation == id,
-            CatalogObject::Relation(relation) => relation
-                .foreign_keys
-                .iter()
-                .any(|foreign_key| foreign_key.referenced_relation == id),
-            CatalogObject::CrossEngineLink(link) => link.source == id || link.target == id,
-            CatalogObject::Structure(_) | CatalogObject::Search(_) => false,
-        }) {
-            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+        if !self.dependent_ids(id).is_empty() {
+            return Err(ModelError::DependencyConflict(id));
         }
         self.objects.remove(&id).ok_or(ModelError::UnknownObject)
+    }
+
+    pub(crate) fn dependent_ids(&self, id: ObjectId) -> BTreeSet<ObjectId> {
+        self.objects
+            .values()
+            .flat_map(CatalogObject::dependencies)
+            .chain(
+                self.logical_objects
+                    .values()
+                    .flat_map(LogicalCatalogObject::dependencies),
+            )
+            .filter_map(|edge| (edge.prerequisite == id).then_some(edge.dependent))
+            .collect()
     }
 
     pub(crate) fn object(&self, id: ObjectId) -> Option<&CatalogObject> {
@@ -577,7 +584,7 @@ impl RelationState {
         id: ObjectId,
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, ModelError> {
         if self.indexes.values().any(|index| index.relation == id) {
-            return Err(ModelError::Catalog(CatalogError::InvalidDefinitionEncoding));
+            return Err(ModelError::DependencyConflict(id));
         }
         self.tables.remove(&id).ok_or(ModelError::UnknownObject)
     }
@@ -707,9 +714,10 @@ impl RelationState {
             .tables
             .get_mut(&table)
             .ok_or(ModelError::UnknownObject)?;
-        if rows.insert(key, value).is_some() {
+        if rows.contains_key(&key) {
             return Err(ModelError::DuplicatePrimaryKey);
         }
+        rows.insert(key, value);
         Ok(())
     }
 
@@ -2809,7 +2817,10 @@ mod tests {
         let mut renamed = relation.clone();
         renamed.header.name.object = CatalogName::unquoted("customers")?;
         catalog.replace(CatalogObject::Relation(renamed))?;
-        assert!(catalog.remove(source).is_err());
+        assert_eq!(
+            catalog.remove(source),
+            Err(ModelError::DependencyConflict(source))
+        );
 
         let reopened = CatalogState::decode(&catalog.encode()?)?;
         let Some(CatalogObject::CrossEngineLink(definition)) = reopened.object(link) else {
@@ -2909,7 +2920,10 @@ mod tests {
         relational.create_table(table)?;
         relational.insert(table, b"pk".to_vec(), b"row".to_vec())?;
         relational.create_secondary_index(index, table, false, true)?;
-        assert!(relational.drop_table(table).is_err());
+        assert_eq!(
+            relational.drop_table(table),
+            Err(ModelError::DependencyConflict(table))
+        );
         relational.drop_secondary_index(index)?;
         let removed = relational.drop_table(table)?;
         assert_eq!(removed.get(b"pk".as_slice()), Some(&b"row".to_vec()));
@@ -2917,6 +2931,25 @@ mod tests {
             relational.drop_table(table),
             Err(ModelError::UnknownObject)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_primary_key_preserves_the_existing_row() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let table = ObjectId::new(1)?;
+        let mut relational = RelationState::default();
+        relational.create_table(table)?;
+        relational.insert(table, b"pk".to_vec(), b"original".to_vec())?;
+
+        assert_eq!(
+            relational.insert(table, b"pk".to_vec(), b"replacement".to_vec()),
+            Err(ModelError::DuplicatePrimaryKey)
+        );
+        assert_eq!(
+            relational.select(table, b"pk"),
+            Some(b"original".as_slice())
+        );
         Ok(())
     }
 
