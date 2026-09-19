@@ -104,6 +104,14 @@ jobs:
             tools.test_run_native_g7 \
             tools.test_run_native_performance_baseline \
             -v
+      - name: Verify standalone Valkey application-core contracts
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python benchmarks/baseline-harness/valkey/check_profile.py \
+            --executed-source-commit "$(git rev-parse HEAD)" --compact
+          python -m unittest discover \
+            -s benchmarks/baseline-harness/valkey -p 'test_*.py' -v
       - name: Verify G6 manifests
         run: |
           PYTHONPATH=. python -m unittest tools.test_check_native_g6_foundation -v
@@ -123,6 +131,14 @@ jobs:
           components: clippy,rustfmt
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Test standalone baseline harness contracts
+        run: |
+          cargo fmt --manifest-path benchmarks/baseline-harness/Cargo.toml --all --check
+          cargo test --locked --manifest-path benchmarks/baseline-harness/Cargo.toml
+          cargo test --locked --manifest-path benchmarks/baseline-harness/Cargo.toml \
+            rust_producer_interoperates_with_independent_saved_receipt_validator
+          cargo clippy --locked --manifest-path benchmarks/baseline-harness/Cargo.toml \
+            --all-targets -- -D warnings
       - name: Verify local durable ANN qualification
         run: |
           PYTHONPATH=. python tools/run_native_ann_durable_qualification.py \
