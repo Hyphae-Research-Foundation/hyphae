@@ -4915,6 +4915,53 @@ mod security_response_cost_tests {
     use super::*;
 
     #[test]
+    fn structure_read_producer_and_validator_share_exact_debug_byte_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog_version = crate::CatalogVersion::new(1)?;
+        let snapshot = SnapshotIdentity {
+            directory_lineage: [1; 24],
+            visible_csn: None,
+            catalog_version,
+            root_digest: [2; 32],
+            logical_time_micros: 0,
+        };
+        let values = [
+            ProductStructureReadResult::SortedSetEntries(vec![ProductSortedSetEntry {
+                member: vec![0, 127, 255],
+                score: CanonicalF64::new(1.5),
+            }]),
+            ProductStructureReadResult::SetAlgebra {
+                members: vec![vec![0, 127, 255]],
+                visited: 3,
+            },
+        ];
+        for value in values {
+            let validator_debug_bytes = format!("{value:?}").len();
+            let response = ProductResponse::StructureRead(ProductRead { snapshot, value });
+            let producer_cost = response.cost();
+            assert_eq!(producer_cost, (1, validator_debug_bytes));
+            let exact = ProductLimits {
+                max_count: 1,
+                max_request_bytes: 1,
+                max_response_bytes: validator_debug_bytes,
+                max_work_units: 1,
+                max_memory_bytes: validator_debug_bytes,
+            };
+            exact.admit_response(producer_cost.0, producer_cost.1, validator_debug_bytes)?;
+            let below = ProductLimits {
+                max_response_bytes: validator_debug_bytes - 1,
+                ..exact
+            };
+            assert!(
+                below
+                    .admit_response(producer_cost.0, producer_cost.1, validator_debug_bytes)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn security_response_cost_uses_canonical_encoded_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
         let epoch = AuthorizationEpoch::INITIAL;

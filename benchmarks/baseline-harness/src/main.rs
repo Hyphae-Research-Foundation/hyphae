@@ -6,7 +6,7 @@
 //!   hyphae-baseline-harness <suite> <scratch_root> <output.json> [options]
 //!
 //! Suites: `sql`, `keyspace`, `lexical`, `ablation`, `all`.
-//! Keyspace options: `--redis-strict <socket>` `--redis-everysec <socket>`.
+//! Keyspace options: `--valkey-no`, `--valkey-always`, `--valkey-everysec`.
 //! Scale option: `--scale small|full` (small is a smoke profile).
 
 mod ablation_suite;
@@ -21,28 +21,35 @@ struct Arguments {
     suite: String,
     scratch_root: String,
     output: String,
-    redis_strict: String,
-    redis_everysec: String,
+    valkey_no: String,
+    valkey_always: String,
+    valkey_everysec: String,
     full_scale: bool,
 }
 
 fn parse_arguments() -> anyhow::Result<Arguments> {
     let mut positional = Vec::new();
-    let mut redis_strict = String::new();
-    let mut redis_everysec = String::new();
+    let mut valkey_no = String::new();
+    let mut valkey_always = String::new();
+    let mut valkey_everysec = String::new();
     let mut full_scale = true;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--redis-strict" => {
-                redis_strict = arguments
+            "--valkey-no" => {
+                valkey_no = arguments
                     .next()
-                    .context("--redis-strict requires a socket path")?;
+                    .context("--valkey-no requires a socket path")?;
             }
-            "--redis-everysec" => {
-                redis_everysec = arguments
+            "--valkey-always" => {
+                valkey_always = arguments
                     .next()
-                    .context("--redis-everysec requires a socket path")?;
+                    .context("--valkey-always requires a socket path")?;
+            }
+            "--valkey-everysec" => {
+                valkey_everysec = arguments
+                    .next()
+                    .context("--valkey-everysec requires a socket path")?;
             }
             "--scale" => {
                 let scale = arguments.next().context("--scale requires a value")?;
@@ -58,15 +65,17 @@ fn parse_arguments() -> anyhow::Result<Arguments> {
     if positional.len() != 3 {
         bail!(
             "usage: hyphae-baseline-harness <suite> <scratch_root> <output.json> \
-             [--redis-strict <socket>] [--redis-everysec <socket>] [--scale small|full]"
+             [--valkey-no <socket>] [--valkey-always <socket>] \
+             [--valkey-everysec <socket>] [--scale small|full]"
         );
     }
     Ok(Arguments {
         suite: positional[0].clone(),
         scratch_root: positional[1].clone(),
         output: positional[2].clone(),
-        redis_strict,
-        redis_everysec,
+        valkey_no,
+        valkey_always,
+        valkey_everysec,
         full_scale,
     })
 }
@@ -102,8 +111,9 @@ fn main() -> anyhow::Result<()> {
             relaxed_sets: scale_usize(200_000, 5_000),
             scratch_root: arguments.scratch_root.clone(),
             seed,
-            redis_strict_socket: arguments.redis_strict.clone(),
-            redis_everysec_socket: arguments.redis_everysec.clone(),
+            valkey_no_socket: arguments.valkey_no.clone(),
+            valkey_always_socket: arguments.valkey_always.clone(),
+            valkey_everysec_socket: arguments.valkey_everysec.clone(),
         };
         eprintln!("running keyspace suite ({} keys)...", config.keys);
         results.insert("keyspace".to_owned(), keyspace_suite::run(&config)?);
@@ -143,11 +153,7 @@ fn main() -> anyhow::Result<()> {
         bail!("unknown suite {}", arguments.suite);
     }
 
-    util::write_receipt(
-        &arguments.output,
-        "hyphae-baseline-harness-v1",
-        serde_json::Value::Object(results),
-    )?;
+    util::write_receipt(&arguments.output, serde_json::Value::Object(results))?;
     eprintln!("receipt written to {}", arguments.output);
     Ok(())
 }

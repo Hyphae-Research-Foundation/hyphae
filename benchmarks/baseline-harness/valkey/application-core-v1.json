@@ -1,0 +1,791 @@
+{
+  "schema": "hyphae-external-valkey-application-core-v1",
+  "profile": "Valkey Application Core",
+  "profile_version": 1,
+  "status": "foundation_only",
+  "foundation_only": true,
+  "claim_semantics_seal": {
+    "algorithm": "sha256",
+    "canonicalization": "sorted-key-compact-json-utf8-v1",
+    "sha256": "77aea8e0ab99ef8ec838367b0ab1da8610aa66e28227b4b60017b1a19a949a0f"
+  },
+  "oracle": {
+    "role": "external_conformance_and_measurement_subject",
+    "runtime_dependency": false,
+    "name": "Valkey",
+    "version": "9.1.2",
+    "repository": "https://github.com/valkey-io/valkey",
+    "tag": "9.1.2",
+    "source_commit": "7f1dffedff6de73058b2c2a389422b6ecd56c8fb",
+    "source_tree": "c8cbc1ffb2c4526c3f487aaeadcb0234636f5ca5",
+    "artifact": {
+      "url": "https://codeload.github.com/valkey-io/valkey/tar.gz/refs/tags/9.1.2",
+      "sha256": "19c23908e7d57e8d91ef85b41f5646307582f10f4f0fb999bbf89ed24ec9c983",
+      "format": "source_tar_gzip"
+    },
+    "operation_authority": "src/commands/<lowercase-operation>.json at source_commit"
+  },
+  "hyphae_authority": {
+    "source_commit": "7e25fc7eaa7fe91bc55e16314074d66ad943b090",
+    "source_tree": "aea2680c992697d68c2b52582f8399f9189108ac",
+    "workspace_version": "3.0.0",
+    "qualification": "unshipped current source; this profile does not expand the stable 3.0.0 release claims"
+  },
+  "executed_source_binding": {
+    "policy": "exact-profile-and-sealed-semantic-bundle-v1",
+    "profile_path": "benchmarks/baseline-harness/valkey/application-core-v1.json",
+    "self_checked_paths": [
+      "benchmarks/baseline-harness/valkey/application-core-v1.json"
+    ],
+    "authority_paths": [
+      "docs/native/structures-semantics-v1.md",
+      "crates/hyphae-native-runtime/src/lib.rs",
+      "crates/hyphae-native-runtime/src/model.rs",
+      "crates/hyphae-native-runtime/src/set_algebra.rs",
+      "crates/hyphae-native-runtime/src/structure_v3.rs",
+      "crates/hyphae-native-runtime/src/wal_codec.rs",
+      "crates/hyphae-native-product/src/lib.rs",
+      "crates/hyphae-native-product/src/structures.rs",
+      "crates/hyphae-native-product/src/operation.rs",
+      "crates/hyphae-native-product/src/limits.rs",
+      "crates/hyphae-native-product/src/error.rs",
+      "crates/hyphae-native-product/src/error_codec.rs",
+      "crates/hyphae-native-protocol/src/product.rs"
+    ],
+    "producer_validator_paths": [
+      ".github/workflows/ci.yml",
+      "Cargo.toml",
+      "Cargo.lock",
+      "rust-toolchain.toml",
+      "benchmarks/baseline-harness/Cargo.toml",
+      "benchmarks/baseline-harness/Cargo.lock",
+      "benchmarks/baseline-harness/scripts/run-metal.sh",
+      "benchmarks/baseline-harness/src/main.rs",
+      "benchmarks/baseline-harness/src/ablation_suite.rs",
+      "benchmarks/baseline-harness/src/keyspace_suite.rs",
+      "benchmarks/baseline-harness/src/lexical_suite.rs",
+      "benchmarks/baseline-harness/src/sql_suite.rs",
+      "benchmarks/baseline-harness/src/util.rs",
+      "benchmarks/baseline-harness/valkey/check_profile.py",
+      "benchmarks/baseline-harness/valkey/check_receipt.py",
+      "benchmarks/baseline-harness/valkey/config/valkey-no.conf",
+      "benchmarks/baseline-harness/valkey/config/valkey-always.conf",
+      "benchmarks/baseline-harness/valkey/config/valkey-everysec.conf"
+    ],
+    "test_paths": [
+      "crates/hyphae-native-product/tests/product_structures_transactions.rs",
+      "crates/hyphae-native-runtime/tests/scalar_set_model_g3.rs",
+      "crates/hyphae-native-runtime/tests/sorted_set_model_g3.rs",
+      "benchmarks/baseline-harness/valkey/test_check_profile.py",
+      "benchmarks/baseline-harness/valkey/test_check_receipt.py"
+    ],
+    "semantic_bundle_sha256": "098697077cdfeda35a5628b79f1a0a0a3fa555b0706459d2c3a17dfb9c4bbbf4",
+    "semantic_change_requires_profile_revision": true
+  },
+  "claim_policy": {
+    "valkey_compatible": false,
+    "redis_compatible": false,
+    "resp_surface": false,
+    "allowed_product_description": "native keyspace/data-structure engine",
+    "bounded_claim": "Only the named operations and scopes in this inventory may be compared semantically after executable vectors exist.",
+    "prohibited_claims": [
+      "Valkey-compatible",
+      "Redis-compatible",
+      "drop-in replacement",
+      "RESP-compatible"
+    ]
+  },
+  "classification_definitions": {
+    "exact": "The scoped data-operation result matches; protocol, transport, error encoding, durability policy, and out-of-scope options are not claimed.",
+    "equivalent": "The scoped application outcome is available through a bounded argument or result transformation.",
+    "stronger": "The scoped application outcome is available with an additional native atomicity, isolation, or durability guarantee; protocol compatibility is not implied.",
+    "different": "A related native operation exists, but at least one observable application semantic deliberately differs.",
+    "excluded": "No current native operation is claimed for this command in the profile."
+  },
+  "evidence_authorities": {
+    "structures-contract": "docs/native/structures-semantics-v1.md",
+    "product-surface": "crates/hyphae-native-product/src/structures.rs",
+    "transaction-surface": "crates/hyphae-native-product/src/operation.rs",
+    "operation-tests": "crates/hyphae-native-product/tests/product_structures_transactions.rs"
+  },
+  "configuration_authority": {
+    "identity_info_field": "valkey_version",
+    "effective_config_capture": "CONFIG GET *",
+    "transport": "unix_domain_socket",
+    "tcp_enabled": false,
+    "lanes": [
+      {
+        "name": "no",
+        "config": "benchmarks/baseline-harness/valkey/config/valkey-no.conf",
+        "sha256": "6f3abe771321dcd8d832bd3927a0ccdd0ef08270cea41dbe7dcfa2bfae361166",
+        "socket": "/run/hyphae-valkey-no.sock",
+        "dir": "/mnt/nvme/valkey-no",
+        "appendonly": "no",
+        "appendfsync": "no",
+        "comparison": "Hyphae Memory; neither lane acknowledges physical persistence"
+      },
+      {
+        "name": "always",
+        "config": "benchmarks/baseline-harness/valkey/config/valkey-always.conf",
+        "sha256": "e32bcbdaec8a9698a8d3d19957a7ca54527819802f74c83efcd514215d76fa91",
+        "socket": "/run/hyphae-valkey-always.sock",
+        "dir": "/mnt/nvme/valkey-always",
+        "appendonly": "yes",
+        "appendfsync": "always",
+        "comparison": "Hyphae Strict; both lanes acknowledge an fsync for each measured write/commit"
+      },
+      {
+        "name": "everysec",
+        "config": "benchmarks/baseline-harness/valkey/config/valkey-everysec.conf",
+        "sha256": "07bc14fd2ea328b03641576e6f274ec05dc759540325d2fbc138b31504b6e879",
+        "socket": "/run/hyphae-valkey-everysec.sock",
+        "dir": "/mnt/nvme/valkey-everysec",
+        "appendonly": "yes",
+        "appendfsync": "everysec",
+        "comparison": "No Hyphae equivalence claim; reported as a separate asynchronous periodic-fsync lane"
+      }
+    ]
+  },
+  "inventory_scope": "A first bounded inventory of common stateful application operations. Administrative, cluster, replication, module, protocol, and observability commands are outside this profile.",
+  "inventory": [
+    {
+      "operation": "GET",
+      "family": "string",
+      "classification": "exact",
+      "native": ["StructureGet", "StructureRead.StringGet"],
+      "scope": "One binary scalar key at one immutable logical snapshot.",
+      "reason": "Both return the exact bytes or an absent value.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SET",
+      "family": "string",
+      "classification": "exact",
+      "native": ["StructureSet", "StructureMutation.StringSet"],
+      "scope": "Unconditional scalar replacement without Valkey options, only when the key is missing from every live structure family or is already a live scalar, within Hyphae's declared key/value bounds. Live typed hash, list, set, sorted-set, and stream collections are excluded.",
+      "reason": "Within this scalar-only lifecycle scope both create or replace the exact scalar bytes; collection collisions and Valkey option combinations are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SETNX",
+      "family": "string",
+      "classification": "exact",
+      "native": ["StructureMutation.StringSetConditional(if_present=false)"],
+      "scope": "One scalar key without an expiry option.",
+      "reason": "Both write only when no visible value exists and report whether the write applied.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "APPEND",
+      "family": "string",
+      "classification": "exact",
+      "native": ["StructureMutation.StringAppend"],
+      "scope": "Resulting scalar length at most 8 MiB.",
+      "reason": "Missing values start empty, bytes are appended, and the resulting length is returned.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "GETRANGE",
+      "family": "string",
+      "classification": "different",
+      "native": ["StructureRead.StringRange"],
+      "scope": "Signed inclusive byte indices for a binary scalar key, including the missing-key observation.",
+      "reason": "Existing-scalar indexing aligns, but Valkey returns empty bytes for a missing key while Hyphae returns typed absence.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SETRANGE",
+      "family": "string",
+      "classification": "different",
+      "native": ["StructureMutation.StringSetRange"],
+      "scope": "Unsigned 32-bit offset and resulting scalar length at most 8 MiB, including an empty patch against a missing key.",
+      "reason": "For a missing key with an empty patch, Valkey returns length 0 and leaves the key absent, while Hyphae materializes offset zero bytes and returns the offset; nonempty existing-scalar overwrite and gap filling otherwise align.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "DEL",
+      "family": "keyspace",
+      "classification": "different",
+      "native": ["StructureMutation.StringDelete", "StructureMutation.Delete"],
+      "scope": "Scalar or explicitly typed collection deletion.",
+      "reason": "Hyphae requires the typed family for collections and rejects a wrong family instead of accepting arbitrary mixed keys.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "INCRBY",
+      "family": "string",
+      "classification": "different",
+      "native": ["StructureMutation.CounterAdd"],
+      "scope": "Signed 64-bit counter addition.",
+      "reason": "Hyphae accepts only its canonical signed-decimal encoding and preserves an existing TTL under native typed semantics.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "MGET",
+      "family": "string",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No one-request multi-key scalar read exists on the current product operation surface.",
+      "evidence": ["product-surface"]
+    },
+    {
+      "operation": "MSET",
+      "family": "string",
+      "classification": "stronger",
+      "native": ["StructureMutate[StringSet...]"],
+      "scope": "A bounded batch of scalar keys that do not conflict with live typed collections.",
+      "reason": "One native batch publishes all scalar replacements under one durable CSN and can atomically include other Hyphae engine mutations.",
+      "evidence": ["structures-contract", "product-surface", "transaction-surface"]
+    },
+    {
+      "operation": "EXISTS",
+      "family": "keyspace",
+      "classification": "different",
+      "native": ["StructureGet", "StructureRead requests"],
+      "scope": "Existence derived from a typed point read.",
+      "reason": "Hyphae has no untyped multi-key existence command; callers select the expected family and receive wrong-kind failures.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "TTL",
+      "family": "keyspace",
+      "classification": "equivalent",
+      "native": ["StructureTtl", "StructureRead.Ttl"],
+      "scope": "One live known-family key with a strictly future expiry where expires_at_micros - snapshot_time_micros >= 1000000, so both native remaining microseconds and Valkey TTL seconds are positive.",
+      "reason": "Transform the positive remaining microseconds to Valkey's second result domain. Persistent, missing, expired, and now == expiry boundaries, plus future expiries that do not produce a positive Valkey seconds value, are outside this equivalent scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "PTTL",
+      "family": "keyspace",
+      "classification": "equivalent",
+      "native": ["StructureTtl", "StructureRead.Ttl"],
+      "scope": "One live known-family key with a strictly future expiry where expires_at_micros - snapshot_time_micros >= 1000, so both native remaining microseconds and Valkey PTTL milliseconds are positive.",
+      "reason": "Transform the positive remaining microseconds to Valkey's millisecond result domain. Persistent, missing, expired, and now == expiry boundaries, plus future expiries that do not produce a positive Valkey milliseconds value, are outside this equivalent scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "EXPIREAT",
+      "family": "keyspace",
+      "classification": "equivalent",
+      "native": ["StructureMutation.Expire"],
+      "scope": "One live pre-existing known-family key, unconditional absolute expiry, and a signed Unix-seconds timestamp in [-9223372036854, 9223372036854].",
+      "reason": "Convert with expires_at_micros = unix_seconds * 1000000; exactly this shared domain fits signed i64 microseconds without overflow. Valkey NX/XX/GT/LT options and timestamps outside the stated bounds are excluded.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "PEXPIREAT",
+      "family": "keyspace",
+      "classification": "equivalent",
+      "native": ["StructureMutation.Expire"],
+      "scope": "One live pre-existing known-family key, unconditional absolute expiry, and a signed Unix-milliseconds timestamp in [-9223372036854775, 9223372036854775].",
+      "reason": "Convert with expires_at_micros = unix_milliseconds * 1000; exactly this shared domain fits signed i64 microseconds without overflow. Valkey NX/XX/GT/LT options and timestamps outside the stated bounds are excluded.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "EXPIRE",
+      "family": "keyspace",
+      "classification": "excluded",
+      "native": [],
+      "gap": "The public typed mutation takes an absolute expiry; no relative-expiry operation is implemented.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "PERSIST",
+      "family": "keyspace",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No public operation removes an existing expiry while preserving the value.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "SCAN",
+      "family": "keyspace",
+      "classification": "different",
+      "native": ["StructureRead.KeyScanMatch"],
+      "scope": "Bounded binary-glob key iteration in one catalogued keyspace.",
+      "reason": "Hyphae returns ordered keys plus family with explicit visit and matcher budgets and a physical continuation, not Valkey's opaque cursor contract.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "KEYS",
+      "family": "keyspace",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Hyphae deliberately exposes bounded scans rather than an unbounded whole-keyspace command.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "TYPE",
+      "family": "keyspace",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No current public point operation returns an arbitrary key's structure family.",
+      "evidence": ["product-surface"]
+    },
+    {
+      "operation": "HSET",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureMutation.HashSet"],
+      "scope": "One field in an explicitly created hash.",
+      "reason": "Hyphae requires explicit typed collection creation and does not implicitly create a missing hash.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HGET",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureRead.HashGet"],
+      "scope": "One field in an explicitly created hash.",
+      "reason": "Existing-hash field lookup aligns, but missing or expired hash handling remains typed rather than Valkey's missing-field result.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HDEL",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureMutation.HashDelete"],
+      "scope": "One field in an explicitly created hash.",
+      "reason": "Hyphae uses explicit typed lifecycle and one-field mutations; missing collection behavior differs.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HINCRBY",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureMutation.HashCounterAdd"],
+      "scope": "One signed 64-bit field counter in an explicitly created hash.",
+      "reason": "Hyphae requires canonical signed-decimal field bytes and explicit hash creation.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HLEN",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureRead.HashLength"],
+      "scope": "One explicitly created hash.",
+      "reason": "Live-field cardinality aligns, but missing collection and field-expiry validation semantics differ.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HSETNX",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureMutation.HashSetIfAbsent"],
+      "scope": "One field in an explicitly created hash.",
+      "reason": "Hyphae deliberately errors on a missing hash rather than implicitly creating it.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HSCAN",
+      "family": "hash",
+      "classification": "different",
+      "native": ["StructureRead.HashScan", "StructureRead.HashScanMatch"],
+      "scope": "Bounded forward field scan.",
+      "reason": "Hyphae orders exact field bytes and uses explicit output, visit, and matcher bounds rather than an opaque cursor and advisory count.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "HMGET",
+      "family": "hash",
+      "classification": "excluded",
+      "native": [],
+      "gap": "The runtime has bounded internal multi-field paths, but the current product read inventory exposes one HashGet field per request.",
+      "evidence": ["product-surface"]
+    },
+    {
+      "operation": "LPUSH",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureMutation.ListPush(side=left)"],
+      "scope": "One value per mutation in an explicitly created list.",
+      "reason": "Hyphae requires explicit list creation and expresses multi-value pushes as an ordered atomic mutation batch.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "RPUSH",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureMutation.ListPush(side=right)"],
+      "scope": "One value per mutation in an explicitly created list.",
+      "reason": "Hyphae requires explicit list creation and expresses multi-value pushes as an ordered atomic mutation batch.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "LPOP",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureMutation.ListPop(side=left)"],
+      "scope": "One value per mutation in an explicitly created list.",
+      "reason": "Hyphae has typed missing-list behavior and no count option on one mutation.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "RPOP",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureMutation.ListPop(side=right)"],
+      "scope": "One value per mutation in an explicitly created list.",
+      "reason": "Hyphae has typed missing-list behavior and no count option on one mutation.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "LLEN",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureRead.ListLength"],
+      "scope": "One explicitly created list.",
+      "reason": "Cardinality aligns for a live list, but missing-list behavior is typed.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "LRANGE",
+      "family": "list",
+      "classification": "different",
+      "native": ["StructureRead.ListRange"],
+      "scope": "Inclusive signed range over one explicitly created list.",
+      "reason": "Range indexing aligns for a live list, but missing-list and bounded execution semantics differ.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SADD",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureMutation.SetAdd"],
+      "scope": "One member per mutation in an explicitly created set.",
+      "reason": "Hyphae requires explicit set creation and expresses multi-member adds as an ordered atomic batch.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SREM",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureMutation.SetRemove"],
+      "scope": "One member per mutation in an explicitly created set.",
+      "reason": "Hyphae retains typed missing-set behavior and expresses multi-member removal as a batch.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SISMEMBER",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureRead.SetContains"],
+      "scope": "One member in an explicitly created set.",
+      "reason": "Live membership aligns, but missing-set behavior is typed.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SCARD",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureRead.SetCardinality"],
+      "scope": "One explicitly created set.",
+      "reason": "Live cardinality aligns, but missing-set behavior is typed.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SSCAN",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureRead.SetMembers"],
+      "scope": "Bounded ascending exact-byte member scan.",
+      "reason": "Hyphae uses an exclusive exact-member continuation and mandatory result bound, not an opaque cursor.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SINTER",
+      "family": "set",
+      "classification": "equivalent",
+      "native": ["StructureRead.SetAlgebra(intersection)"],
+      "scope": "1..=64 input key positions, output_member_limit in 1..=4096, visit_limit in 1..=1000000, and a complete result whose response_debug_bytes = format!(\"{:?}\", ProductStructureReadResult::SetAlgebra { members, visited }).len() is <= 16777216.",
+      "reason": "Missing sets are mathematical empty inputs and the exact intersection is returned in canonical order. ProductLimits admits the StructureRead with response_count = 1 and the exact Rust Debug byte length; oversized item, work, or response-byte shapes are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SUNION",
+      "family": "set",
+      "classification": "equivalent",
+      "native": ["StructureRead.SetAlgebra(union)"],
+      "scope": "1..=64 input key positions, output_member_limit in 1..=4096, visit_limit in 1..=1000000, and a complete result whose response_debug_bytes = format!(\"{:?}\", ProductStructureReadResult::SetAlgebra { members, visited }).len() is <= 16777216.",
+      "reason": "The exact union is returned in canonical order under explicit fail-closed bounds. ProductLimits admits the StructureRead with response_count = 1 and the exact Rust Debug byte length; oversized item, work, or response-byte shapes are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SDIFF",
+      "family": "set",
+      "classification": "equivalent",
+      "native": ["StructureRead.SetAlgebra(difference)"],
+      "scope": "1..=64 input key positions, output_member_limit in 1..=4096, visit_limit in 1..=1000000, and a complete result whose response_debug_bytes = format!(\"{:?}\", ProductStructureReadResult::SetAlgebra { members, visited }).len() is <= 16777216.",
+      "reason": "The exact ordered-key difference is returned in canonical order under explicit fail-closed bounds. ProductLimits admits the StructureRead with response_count = 1 and the exact Rust Debug byte length; oversized item, work, or response-byte shapes are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SPOP",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureMutation.SetPop"],
+      "scope": "One member from an explicitly created set.",
+      "reason": "Hyphae requires a caller seed and selects a deterministic rank instead of hidden server randomness.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "SRANDMEMBER",
+      "family": "set",
+      "classification": "different",
+      "native": ["StructureRead.SetRandomMembers"],
+      "scope": "A positive count of distinct members from an explicitly created set.",
+      "reason": "Hyphae requires a caller seed, returns a deterministic walk, and does not implement Valkey's negative-count duplicate behavior.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZADD",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureMutation.SortedSetAdd"],
+      "scope": "One finite score/member in an explicitly created sorted set.",
+      "reason": "Hyphae requires explicit creation and does not expose Valkey's conditional and change-count options.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZREM",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureMutation.SortedSetRemove"],
+      "scope": "One member in an explicitly created sorted set.",
+      "reason": "Hyphae uses typed lifecycle and one-member mutations.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZSCORE",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureRead.SortedSetScore"],
+      "scope": "One member in an explicitly created sorted set.",
+      "reason": "Live-member lookup aligns, but missing-collection behavior and canonical finite-score validation differ.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZCARD",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureRead.SortedSetCardinality"],
+      "scope": "One explicitly created sorted set.",
+      "reason": "Live cardinality aligns, but missing-collection behavior is typed.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZRANGE",
+      "case": "rank",
+      "family": "sorted_set",
+      "classification": "equivalent",
+      "native": ["StructureRead.SortedSetRange"],
+      "scope": "Rank-index form only on one live pre-existing explicitly created sorted set: signed inclusive start/stop whose normalized inclusive span returns at most 4096 items, optional REV and WITHSCORES, and no BYSCORE, BYLEX, LIMIT, or OFFSET shape. The result must satisfy response_debug_bytes = format!(\"{:?}\", ProductStructureReadResult::SortedSetEntries(entries)).len() <= 16777216.",
+      "reason": "Hyphae returns the same score/member rank ordering; callers retain scores for WITHSCORES or drop them otherwise. ProductLimits admits the StructureRead with response_count = 1 and response_debug_bytes <= max_response_bytes = 16777216. Rank LIMIT/OFFSET, oversized item/Debug-byte results, and missing or expired collections are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZRANGE",
+      "case": "score",
+      "family": "sorted_set",
+      "classification": "equivalent",
+      "native": ["StructureRead.SortedSetScoreRange"],
+      "scope": "BYSCORE form only on one live pre-existing explicitly created sorted set, with inclusive/exclusive or unbounded score endpoints, optional REV and WITHSCORES, and explicit LIMIT offset/count where offset is nonnegative and 1 <= count <= 4096. Returned items must be <= count and <= 4096, and the result must satisfy response_debug_bytes = format!(\"{:?}\", ProductStructureReadResult::SortedSetEntries(entries)).len() <= 16777216.",
+      "reason": "Hyphae maps score endpoints, direction, offset, and positive count to its bounded score-range request. ProductLimits admits the StructureRead with response_count = 1 and response_debug_bytes <= max_response_bytes = 16777216. BYLEX, omitted or negative count, oversized item/Debug-byte results, and missing or expired collections are outside scope.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZRANK",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureRead.SortedSetRank(order=ascending)"],
+      "scope": "One member in an explicitly created sorted set.",
+      "reason": "Zero-based rank aligns, but missing-collection behavior and result shape differ.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZREVRANK",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureRead.SortedSetRank(order=descending)"],
+      "scope": "One member in an explicitly created sorted set.",
+      "reason": "Reverse zero-based rank aligns, but missing-collection behavior and result shape differ.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZINCRBY",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureMutation.SortedSetIncrement"],
+      "scope": "One finite delta/member in an explicitly created sorted set.",
+      "reason": "Hyphae requires explicit collection creation and rejects every non-finite input or result under canonical binary64 semantics.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "ZPOPMIN",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureMutation.SortedSetPop(highest=false)"],
+      "scope": "Default count of one, including missing, expired, empty, and live sorted-set observations.",
+      "reason": "Live extreme removal aligns, but Hyphae has typed explicit lifecycle and missing or expired collection behavior rather than Valkey's empty-array result.",
+      "evidence": ["structures-contract", "product-surface", "operation-tests"]
+    },
+    {
+      "operation": "ZPOPMAX",
+      "family": "sorted_set",
+      "classification": "different",
+      "native": ["StructureMutation.SortedSetPop(highest=true)"],
+      "scope": "Default count of one, including missing, expired, empty, and live sorted-set observations.",
+      "reason": "Live extreme removal aligns, but Hyphae has typed explicit lifecycle and missing or expired collection behavior rather than Valkey's empty-array result.",
+      "evidence": ["structures-contract", "product-surface", "operation-tests"]
+    },
+    {
+      "operation": "ZSCAN",
+      "family": "sorted_set",
+      "classification": "excluded",
+      "native": [],
+      "gap": "The product surface has rank and score ranges but no member-pattern sorted-set scan.",
+      "evidence": ["product-surface"]
+    },
+    {
+      "operation": "XADD",
+      "family": "stream",
+      "classification": "different",
+      "native": ["StructureMutation.StreamAdd"],
+      "scope": "Append one field map to an explicitly created stream.",
+      "reason": "Hyphae assigns a native monotonic u64 identity and does not implement Valkey stream-ID, trimming, or create-on-append options.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "XRANGE",
+      "family": "stream",
+      "classification": "different",
+      "native": ["StructureRead.StreamRange"],
+      "scope": "Inclusive u64 identity range with a mandatory limit.",
+      "reason": "The native stream identity and bound model differs from Valkey's stream IDs and optional COUNT.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "XLEN",
+      "family": "stream",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No stream cardinality request exists on the current product surface.",
+      "evidence": ["product-surface"]
+    },
+    {
+      "operation": "XREAD",
+      "family": "stream",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No blocking or multi-stream read operation exists on the current product surface.",
+      "evidence": ["structures-contract", "product-surface"]
+    },
+    {
+      "operation": "MULTI",
+      "family": "transaction",
+      "classification": "stronger",
+      "native": ["TransactionBegin", "TransactionStageStructure"],
+      "scope": "Bounded native operations supported by an explicit session-local transaction.",
+      "reason": "Hyphae stages structures together with SQL, search, and vectors against one snapshot for one durable all-engine commit.",
+      "evidence": ["structures-contract", "transaction-surface"]
+    },
+    {
+      "operation": "EXEC",
+      "family": "transaction",
+      "classification": "stronger",
+      "native": ["TransactionCommit"],
+      "scope": "Commit of a valid bounded explicit native transaction.",
+      "reason": "Hyphae publishes every staged engine under one CSN with a durable receipt and first-committer-wins conflict handling.",
+      "evidence": ["structures-contract", "transaction-surface"]
+    },
+    {
+      "operation": "WATCH",
+      "family": "transaction",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Hyphae exposes snapshot transactions and conflict detection, not a WATCH command or connection protocol state.",
+      "evidence": ["transaction-surface"]
+    },
+    {
+      "operation": "EVAL",
+      "family": "scripting",
+      "classification": "excluded",
+      "native": [],
+      "gap": "The native product does not embed a scripting runtime.",
+      "evidence": ["transaction-surface"]
+    },
+    {
+      "operation": "PUBLISH",
+      "family": "pubsub",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No Valkey-style Pub/Sub surface is implemented.",
+      "evidence": ["transaction-surface"]
+    },
+    {
+      "operation": "SUBSCRIBE",
+      "family": "pubsub",
+      "classification": "excluded",
+      "native": [],
+      "gap": "No Valkey-style Pub/Sub surface is implemented.",
+      "evidence": ["transaction-surface"]
+    },
+    {
+      "operation": "GETBIT",
+      "family": "bitmap",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Bitmap operations remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "SETBIT",
+      "family": "bitmap",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Bitmap operations remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "PFADD",
+      "family": "hyperloglog",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Cardinality sketches remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "PFCOUNT",
+      "family": "hyperloglog",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Cardinality sketches remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "GEOADD",
+      "family": "geo",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Geo structures remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    },
+    {
+      "operation": "GEOSEARCH",
+      "family": "geo",
+      "classification": "excluded",
+      "native": [],
+      "gap": "Geo structures remain outside the implemented native family inventory.",
+      "evidence": ["structures-contract"]
+    }
+  ],
+  "summary": {
+    "operations": 72,
+    "exact": 4,
+    "equivalent": 9,
+    "stronger": 3,
+    "different": 37,
+    "excluded": 19
+  }
+}

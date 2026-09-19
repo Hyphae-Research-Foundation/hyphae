@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Standalone workspace: intentionally NOT a member of the Hyphae root
-# workspace. Baselines (SQLite, DuckDB, Redis, Tantivy) must never enter the
+# workspace. Baselines (SQLite, DuckDB, Valkey, Tantivy) must never enter the
 # product dependency graph; this harness exists only to produce dedicated
 # hardware evidence receipts.
 [workspace]
@@ -21,8 +21,10 @@ hyphae-native-types = { path = "../../crates/hyphae-native-types" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
-# Baselines. Bundled engines pin the exact measured library version.
+# Baselines. Bundled engines pin the exact measured library version. The
+# protocol client is not a Valkey runtime and remains confined to this workspace.
 rusqlite = { version = "0.37", features = ["bundled"] }
 duckdb = { version = "1.4.1", features = ["bundled"] }
 redis = { version = "0.32", default-features = false }
