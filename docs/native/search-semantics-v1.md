@@ -9,6 +9,8 @@ typed doc values, filters, sort, facets, aggregations, native hybrid fusion,
 legacy inline-state compatibility, rebuild, corruption, and bounded quality
 evidence are implemented. Automatic segments, page-buffered ANN and
 production-scale performance remain non-claims.
+The M05 authenticated ANN overlay is reader-only and non-emittable; it adds no
+search capability or release claim.
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -59,10 +61,13 @@ in one immutable copy-on-write native B+tree. It stores:
 | `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
 | `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
 | `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01`/`HYPOST02` or v2 `HYPOSTT1` tombstone |
-| `0x05` | vector-index `ObjectId` | legacy `HYANNM01` or current `HYANNM02` selected base-plus-delta metadata |
+| `0x05` | vector-index `ObjectId` | readable `HYANNM01` through reader-only `HYANNM05`; current writers emit `HYANNM04` |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
 | `0x08` | vector-index `ObjectId` + object `ObjectId` | current `HYANND01` vector upsert or tombstone |
+| `0x09` | vector-index `ObjectId` | reader-only fixed `HYANNO01` overlay manifest |
+| `0x0a` | vector-index `ObjectId` + object `ObjectId` | reader-only `HYANND02` overlay upsert or tombstone |
+| `0x0b` | vector-index `ObjectId` + depth + 128-bit high-nibble path | reader-only `HYANNN01` sparse-Merkle internal node |
 
 The fixed 128-bit object ID is big-endian in every key. The posting term
 length is big-endian so a prefix scan identifies exactly one term even when
@@ -96,10 +101,21 @@ v1](search-tombstone-compaction-v1.md).
 `CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
 root and global transaction. Creation produces the initial canonical HNSW
 base. Later vector writes update the bounded object-keyed `0x08` delta and
-`HYANNM03` view metadata without rebuilding or repersisting the base graph.
+`HYANNM04` view metadata without rebuilding or repersisting the base graph.
 Exact query ranks the effective base-plus-delta set. Approximate query merges
 base graph candidates with exact live-delta candidates and suppresses every
 shadowed base object. `HYSEABT1`/`2` and `HYANNM01` remain readable.
+
+The passive M05 reader composes `0x0a` first, frozen `0x08` second, and the base
+last. An overlay tombstone suppresses both lower layers. It validates exact
+layer counts/bytes/sequences, one manifest, all ordered radix-16 Merkle paths,
+the root, and the final view identity before either exact or ANN hydration.
+XOR, additive, and other commutative accumulators are explicitly rejected.
+The exact byte contract is [ANN delta overlay format
+v1](../storage/ann-delta-overlay-format-v1.md). Current writers never emit the
+new magic or prefixes, `HYANNA02`, or a new WAL opcode. Foreground ANN mutation,
+initial-bulk publication, and ANN consolidation fail closed; lexical compaction
+and page-generation vacuum may preserve authenticated M05 bytes unchanged.
 
 Bounded ANN consolidation captures an effective set, constructs a replacement
 base and publishes it through an ordinary root commit using append-only WAL
@@ -114,6 +130,23 @@ frequencies, document count, and total length from stored source text and
 requires byte-for-byte equality with the physical metadata and postings.
 Orphan documents/postings, noncanonical terms, count divergence, invalid
 UTF-8, bad envelopes, and missing/corrupt blobs fail closed.
+
+Lexical complete-state materialization owns only one borrowed B+tree range
+visit over `[0x00,0x05)`. It never visits or copies ANN metadata, vectors,
+graphs, deltas, manifests, or Merkle nodes. The visit admits at most 131,072
+lexical entries and 64 MiB of encoded lexical key/value bytes. Before any live
+entry is copied or any document blob is read, retained accounting charges 512
+bytes plus four copies of the physical key length and the logical document
+bytes, when applicable; the aggregate is capped at the 64 MiB recovery
+authority. A separate zero-entry borrowed range over `[0x0c,+inf)` preserves
+unknown-prefix corruption authority. Prefixes `0x05` through `0x0b` belong
+exclusively to ANN validation.
+
+When an M05 root is loaded as complete product authority, measured lexical
+retention is subtracted from the shared 64 MiB recovery allowance before ANN
+metadata admission. Search and ANN cannot each consume an independent 64 MiB
+allowance. Oversized or malformed ANN values do not allocate through lexical
+materialization.
 
 ## Query operators
 

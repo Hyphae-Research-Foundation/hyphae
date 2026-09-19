@@ -7,7 +7,7 @@
   "claim_semantics_seal": {
     "algorithm": "sha256",
     "canonicalization": "sorted-key-compact-json-utf8-v1",
-    "sha256": "77aea8e0ab99ef8ec838367b0ab1da8610aa66e28227b4b60017b1a19a949a0f"
+    "sha256": "a233d26eb4b543f09365ae1a092708205c59036dc3c72460ab445d33aa9582c5"
   },
   "oracle": {
     "role": "external_conformance_and_measurement_subject",
@@ -79,7 +79,7 @@
       "benchmarks/baseline-harness/valkey/test_check_profile.py",
       "benchmarks/baseline-harness/valkey/test_check_receipt.py"
     ],
-    "semantic_bundle_sha256": "098697077cdfeda35a5628b79f1a0a0a3fa555b0706459d2c3a17dfb9c4bbbf4",
+    "semantic_bundle_sha256": "dd1a2c6dbb01f9b5eead69b256211b94fb738b4d2da79290e4abd47dd3ee28bd",
     "semantic_change_requires_profile_revision": true
   },
   "claim_policy": {

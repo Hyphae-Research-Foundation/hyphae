@@ -296,6 +296,31 @@ specified in
 Legacy page-kind-10 `SearchState` roots remain readable and writable without
 implicit conversion. New directories use the B+tree format.
 
+## Borrowed range visits
+
+The additive borrowed range visitor decodes internal separators and leaf
+entries directly from verified immutable page payloads. Its callback receives
+key and value slices tied to the current page invocation; references cannot
+escape. No per-entry key or value `Vec` is created before the callback.
+
+The visitor validates reached page kinds and canonical preambles, exact payload
+consumption, key order, separator-to-child minima and upper bounds, cycles,
+height, and balanced reached leaves. It intersects one lower/upper range with
+structural child ranges, checks cooperative cancellation before pages and
+entries, and checks maximum entry count plus total key/value bytes before
+delivering each entry. Limit failure therefore precedes consumer copying or
+value decoding. Tests use adjacent 7,000-byte values and the owned-leaf
+allocation counter to prove a rejected value causes zero callback copies and
+zero owned leaf-entry allocations.
+
+Every separator in a reached internal page must be strictly greater than its
+inherited ancestor lower bound and strictly less than its inherited ancestor
+upper bound. This validation occurs before query-range pruning. Child envelopes
+use the tighter intersection of child separators and inherited bounds; they
+never replace or widen an ancestor envelope. Multilevel forged-separator tests
+cover both sides of the ancestor envelope, including ranges that would
+otherwise prune the malformed sibling and incorrectly report a complete visit.
+
 ## Current-root rebuild
 
 Structure and lexical-search reachability compaction each validate and scan

@@ -16,6 +16,9 @@ use hyphae_native_pages::{
 use hyphae_native_types::{Csn, PageGeneration, PageId};
 use thiserror::Error;
 
+mod visitor;
+pub use visitor::{BorrowedVisitError, BorrowedVisitLimits, BorrowedVisitStats};
+
 const LEAF_MAGIC: &[u8; 8] = b"HYBTLF01";
 const INTERNAL_MAGIC: &[u8; 8] = b"HYBTIN01";
 const FORMAT_VERSION: u16 = 1;
@@ -37,6 +40,7 @@ thread_local! {
     static PREFIX_REPLACEMENT_APPENDED_PAGES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    static OWNED_LEAF_ENTRY_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Owned canonical binary key/value pair returned by a materialized scan.
@@ -2458,6 +2462,8 @@ fn decode_leaf(payload: &[u8]) -> Result<Node, BTreeError> {
     if count == 0 || count > (payload.len() - LEAF_HEADER_SIZE) / 8 {
         return Err(BTreeError::InvalidCount);
     }
+    #[cfg(test)]
+    OWNED_LEAF_ENTRY_ALLOCATIONS.set(OWNED_LEAF_ENTRY_ALLOCATIONS.get().saturating_add(count));
     let mut cursor = Cursor::new(&payload[LEAF_HEADER_SIZE..]);
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
