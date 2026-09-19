@@ -2,7 +2,9 @@
 
 # Native ANN read view v1
 
-Status: planned implementation contract; no P4 or G7 closure claim
+Status: planned implementation contract; no P4 or G7 closure claim. The M05
+authenticated layered-delta input is reader-only and non-emittable and creates
+no capability, performance, or release claim.
 
 `NativeAnnReadView` is an owned, index-scoped, immutable current-root read
 authority. It separates one governed physical hydration from the repeatable ANN
@@ -43,6 +45,15 @@ The last handle drop destroys the owned state and releases its retained memory.
 No borrowed page, B-tree cursor, transaction lifetime, or mutable database
 reference may escape into the view.
 
+For reader-only M05 input, "one exact delta overlay" means the effective
+object-keyed composition of authenticated D02 first, frozen D01 second, and the
+base last. An overlay tombstone hides both lower layers. The opener validates
+the fixed manifest, frozen legacy identity/count/bytes, overlay
+count/bytes/sequences, complete ordered radix-16 sparse-Merkle reachability,
+effective count/bytes, next sequence, root, and final view identity before it
+returns the same owned query shape. The exact encoding is [ANN delta overlay
+format v1](../storage/ann-delta-overlay-format-v1.md).
+
 ## Governed open and one-time hydration
 
 Opening follows one fail-closed sequence:
@@ -67,6 +78,23 @@ Opening follows one fail-closed sequence:
    is unaccounted.
 8. Release the physical snapshot/root pin and return the immutable view plus
    its open receipt.
+
+M05 node validation uses one bounded shape pass and depth-keyed validation with
+a frontier no larger than the 4,096 overlay leaves. The opener accounts for all
+persisted node entries and bytes but does not collect the possible 131,072
+internal nodes into retained state. Explicit empty children, unordered child
+positions, and XOR/additive or other commutative summaries fail closed.
+
+Complete product-root materialization is separate from index-scoped opening:
+lexical state borrows only `[0x00,0x05)`, then measured lexical retention is
+subtracted from the shared 64 MiB recovery authority before the complete-root
+M05 metadata and physical borrowed visits. ANN values are never copied by the
+lexical loader.
+
+No read-view path emits M05, its manifest/leaves/nodes, `HYANNA02`, or a WAL
+opcode. Foreground ANN mutation, initial-bulk publication, and ANN consolidation
+do not adopt this reader authority in this slice. Lexical compaction and page
+vacuum may preserve its authenticated bytes unchanged.
 
 The memory-only permit requests zero compute threads and zero I/O slots and
 remains live through every handle clone. A rejected, canceled, corrupt, or

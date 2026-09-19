@@ -8,7 +8,9 @@ base-plus-delta lifecycle, bounded consolidation, historical snapshots,
 stable-ID eligibility traversal, adaptive exact filtering, durable lifecycle
 policy, maintenance due signaling, retained generations, and fail-closed
 recovery are implemented. Page-buffered traversal and a background scheduler
-remain production non-claims.
+remain production non-claims. The authenticated M05 layered-delta format has a
+passive reader/validator only; it is non-emittable and adds no capability or
+release claim.
 
 ANN is a Hyphae-owned search-engine capability. Exact vector execution remains
 the quality oracle.
@@ -74,25 +76,33 @@ canonical build.
 The native runtime stores ANN in the same copy-on-write search B+tree as
 lexical state:
 
-- `0x05 + index ObjectId` selects legacy `HYANNM01` or current `HYANNM02`
-  generation metadata;
+- `0x05 + index ObjectId` selects readable `HYANNM01` through `HYANNM05`
+  generation metadata; current writers emit `HYANNM04`;
 - `0x06 + index ObjectId + build identity + object ObjectId` stores one
   `HYANNV01` vector with its creating CSN; and
 - `0x07 + index ObjectId + build identity + object ObjectId + u16 layer`
   stores one `HYANNG01` neighbor list; and
 - `0x08 + index ObjectId + object ObjectId` stores one current `HYANND01`
-  upsert or tombstone with a monotonic per-index sequence and mutation CSN.
+  upsert or tombstone with a monotonic per-index sequence and mutation CSN;
+- reader-only `0x09 + index ObjectId` stores the one fixed `HYANNO01` overlay
+  manifest;
+- reader-only `0x0a + index ObjectId + object ObjectId` stores one `HYANND02`
+  overlay upsert or tombstone; and
+- reader-only `0x0b + index ObjectId + depth + high-nibble path` stores one
+  `HYANNN01` fixed-depth radix-16 sparse-Merkle internal node.
 
 Every identity component is big-endian in the key. The 32-byte build identity
 is content-bound by the kernel. Vector components remain canonical
 little-endian `f32`; graph neighbors are stable 128-bit object IDs.
 
-`HYANNM02` names the selected immutable base identity and a view identity over
-that base plus the complete current delta, together with base counts, delta
-record/byte counts and next sequence. `HYANNM01`, `HYANNV01`, and `HYANNG01`
-remain readable. The v2 envelope includes and validates `HYANNM01` as its
-predecessor-lineage tag. `HYSEABT1` and `HYSEABT2` remain readable; the first
-base-plus-delta mutation selects `HYSEABT3`.
+M02 through M04 name the selected immutable base identity and a view identity
+over that base plus the complete current D01 delta, together with base counts,
+delta record/byte counts and next sequence. M03 adds durable lifecycle and
+retention policy; M04 adds partitioned child and retained-generation
+descriptors. `HYANNM01`, `HYANNV01`, and `HYANNG01` remain readable. The v2
+envelope includes and validates `HYANNM01` as its predecessor-lineage tag.
+`HYSEABT1` and `HYSEABT2` remain readable; the first base-plus-delta mutation
+selects `HYSEABT3`.
 
 Index creation, including vectors staged in the same transaction, constructs
 the initial canonical base. Every later foreground upsert or delete validates
@@ -104,6 +114,26 @@ unchanged across foreground mutation commits. Each index durably selects a
 `consolidate_after_deltas` threshold no larger than that capacity, and one to
 64 retained generations. Encoded delta data remains capped at 64 MiB. A
 mutation exceeding its per-index or byte bound fails before publication.
+
+M05 is the passive authenticated layered representation defined by [ANN delta
+overlay format v1](../storage/ann-delta-overlay-format-v1.md). It freezes the
+complete D01 map and its unchanged legacy view identity, then authenticates an
+object-keyed D02 overlay with an ordered sparse-Merkle tree. Lookup takes the
+overlay first, frozen legacy second, and immutable base last; an overlay
+tombstone suppresses both lower layers. Validation requires one manifest,
+exact frozen/overlay/effective counts and bytes, legal nonoverlapping sequence
+ranges, complete tree reachability and node count, its root, and the final view
+identity. XOR and additive/commutative accumulators are invalid substitutes for
+these ordered hashes.
+
+No ANN creation, foreground mutation, initial-bulk publication, consolidation,
+WAL, API, protocol, catalog, backup, or proof writer synthesizes M05, D02,
+overlay manifests/nodes, `HYANNA02`, or a new opcode. Those ANN write paths fail
+closed against M05 independently of identity equality. Lexical search
+compaction and page-generation vacuum may preserve already validated ANN bytes
+byte-for-byte. Normal WAL recovery cannot generate M05; page-backed tests
+install an already committed test root instead of claiming WAL emission. This
+reader status creates no capability or performance claim.
 
 Open and snapshot materialization scan the selected base and delta, validate
 every ANN physical key/value, reconstruct the base `IndexSnapshot`, and require

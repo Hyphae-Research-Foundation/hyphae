@@ -256,7 +256,8 @@ use hyphae_native_blobs::{
     BlobError, BlobInventory, BlobRecovery, BlobReferenceSet, BlobStore, StagedBlob,
 };
 use hyphae_native_btree::{
-    BTREE_MAX_KEY_SIZE, BTree, BTreeError, BTreeSegment, PrefixReplacementStructuralPlan,
+    BTREE_MAX_KEY_SIZE, BTree, BTreeError, BTreeSegment, BorrowedVisitError, BorrowedVisitLimits,
+    PrefixReplacementStructuralPlan,
 };
 use hyphae_native_catalog::{
     AnnIndexDefinition, CatalogError, CatalogName, CatalogObject, CatalogObjectKind,
@@ -36706,8 +36707,16 @@ fn load_state(
     record_full_state_materialization()?;
     let catalog = load_catalog_state(pages, blobs, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
-    let search = load_search_state(pages, blobs, roots)?;
-    let ann = ann_store::load(pages, roots.root(SLOT_SEARCH), &catalog)?;
+    let (search, search_retained_bytes) = load_search_state_with_retained(pages, blobs, roots)?;
+    let ann_memory_limit = RECOVERY_MEMORY_BYTES
+        .checked_sub(search_retained_bytes)
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let ann = ann_store::load_with_memory_limit(
+        pages,
+        roots.root(SLOT_SEARCH),
+        &catalog,
+        ann_memory_limit,
+    )?;
     Ok(MaterializedState {
         catalog,
         relational,
@@ -37971,15 +37980,24 @@ fn validate_hash_field_expiry_index(
     Ok(())
 }
 
+#[cfg(test)]
 fn load_search_state(
     pages: &PageStore,
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<SearchState, NativeRuntimeError> {
+    load_search_state_with_retained(pages, blobs, roots).map(|(state, _)| state)
+}
+
+fn load_search_state_with_retained(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+) -> Result<(SearchState, u64), NativeRuntimeError> {
     let Some(root) = roots.root(SLOT_SEARCH) else {
-        return Ok(SearchState::default());
+        return Ok((SearchState::default(), 0));
     };
-    load_search_state_root(pages, blobs, root)
+    load_search_state_root_with_retained(pages, blobs, root)
 }
 
 fn load_search_state_root(
@@ -37987,92 +38005,265 @@ fn load_search_state_root(
     blobs: &BlobStore,
     root: PageId,
 ) -> Result<SearchState, NativeRuntimeError> {
+    load_search_state_root_with_retained(pages, blobs, root).map(|(state, _)| state)
+}
+
+fn load_search_state_root_with_retained(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<(SearchState, u64), NativeRuntimeError> {
     let page = pages.read(root)?;
     if page.kind() == PageKind::SearchDelta {
-        return Ok(SearchState::decode(page.payload())?);
+        return Ok((SearchState::decode(page.payload())?, 0));
     }
     if !matches!(page.kind(), PageKind::BTreeLeaf | PageKind::BTreeInternal) {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
-    let entries = BTree::from_root(root).scan(pages)?;
-    let mut iterator = entries.into_iter();
-    let Some((format_key, format_value)) = iterator.next() else {
-        return Err(NativeRuntimeError::InvalidSearchTree);
-    };
-    if format_key != SEARCH_FORMAT_KEY {
+    let tree = BTree::from_root(root);
+    let mut restored = BorrowedSearchRestore::new(blobs);
+    let mut failure = None;
+    let stats = tree
+        .visit_range_borrowed_with_control(
+            pages,
+            Bound::Unbounded,
+            Bound::Excluded(&[5]),
+            BorrowedVisitLimits {
+                maximum_entries: usize::try_from(RECOVERY_MEMORY_BYTES / 512).unwrap_or(usize::MAX),
+                maximum_bytes: RECOVERY_MEMORY_BYTES,
+            },
+            || ControlFlow::Continue(()),
+            |key, value| {
+                if let Err(error) = restored.accept(key, value) {
+                    failure = Some(error);
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .map_err(map_borrowed_search_visit_error)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !stats.complete {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
-    let format = PhysicalSearchFormat::decode(&format_value)?;
-    let mut indexes = BTreeMap::<ObjectId, BTreeMap<Vec<u8>, String>>::new();
-    let mut index_metadata = BTreeMap::<ObjectId, (u64, u64)>::new();
-    let mut term_metadata = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
-    let mut postings = BTreeMap::<(ObjectId, Vec<u8>, Vec<u8>), u32>::new();
-    let mut document_token_counts = BTreeMap::<(ObjectId, Vec<u8>), u64>::new();
-    let mut carried_lengths = Vec::<((ObjectId, Vec<u8>), u32)>::new();
-    for (key, value) in iterator {
+    tree.visit_range_borrowed_with_control(
+        pages,
+        Bound::Included(&[12]),
+        Bound::Unbounded,
+        BorrowedVisitLimits {
+            maximum_entries: 0,
+            maximum_bytes: 0,
+        },
+        || ControlFlow::Continue(()),
+        |_, _| ControlFlow::Continue(()),
+    )
+    .map_err(map_borrowed_search_visit_error)?;
+    restored.finish()
+}
+
+struct BorrowedSearchRestore<'a> {
+    blobs: &'a BlobStore,
+    format: Option<PhysicalSearchFormat>,
+    indexes: BTreeMap<ObjectId, BTreeMap<Vec<u8>, String>>,
+    index_metadata: BTreeMap<ObjectId, (u64, u64)>,
+    term_metadata: BTreeMap<(ObjectId, Vec<u8>), u64>,
+    postings: BTreeMap<(ObjectId, Vec<u8>, Vec<u8>), u32>,
+    document_token_counts: BTreeMap<(ObjectId, Vec<u8>), u64>,
+    carried_lengths: Vec<((ObjectId, Vec<u8>), u32)>,
+    retained_bytes: u64,
+}
+
+impl<'a> BorrowedSearchRestore<'a> {
+    fn new(blobs: &'a BlobStore) -> Self {
+        Self {
+            blobs,
+            format: None,
+            indexes: BTreeMap::new(),
+            index_metadata: BTreeMap::new(),
+            term_metadata: BTreeMap::new(),
+            postings: BTreeMap::new(),
+            document_token_counts: BTreeMap::new(),
+            carried_lengths: Vec::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    fn accept(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
         match key.first().copied() {
+            Some(0) => {
+                if key != SEARCH_FORMAT_KEY || self.format.is_some() {
+                    return Err(NativeRuntimeError::InvalidSearchTree);
+                }
+                self.format = Some(PhysicalSearchFormat::decode(value)?);
+                Ok(())
+            }
             Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
-                let (index, suffix) = decode_search_object_key(&key, SEARCH_INDEX_META_PREFIX)?;
+                self.admit_retained(key, 0)?;
+                let (index, suffix) = decode_search_object_key(key, SEARCH_INDEX_META_PREFIX)?;
                 if !suffix.is_empty()
-                    || indexes.insert(index, BTreeMap::new()).is_some()
-                    || index_metadata
-                        .insert(index, decode_search_index_metadata(&value)?)
+                    || self.indexes.insert(index, BTreeMap::new()).is_some()
+                    || self
+                        .index_metadata
+                        .insert(index, decode_search_index_metadata(value)?)
                         .is_some()
                 {
                     return Err(NativeRuntimeError::InvalidSearchTree);
                 }
+                Ok(())
             }
-            Some(SEARCH_DOCUMENT_PREFIX) => {
-                let (index, document_id) = decode_search_object_key(&key, SEARCH_DOCUMENT_PREFIX)?;
-                let documents = indexes
-                    .get_mut(&index)
-                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                validate_search_document_identity(document_id, "")
-                    .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-                let Some((text, token_count)) = decode_live_search_document(&value, blobs, format)?
-                else {
-                    continue;
-                };
-                validate_search_document_identity(document_id, &text)
-                    .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-                if documents.insert(document_id.to_vec(), text).is_some() {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-                document_token_counts.insert((index, document_id.to_vec()), token_count);
-            }
-            Some(SEARCH_TERM_META_PREFIX) => {
-                let (index, term) = decode_search_object_key(&key, SEARCH_TERM_META_PREFIX)?;
-                if !indexes.contains_key(&index) || !is_canonical_search_term(term) {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-                let Some(document_frequency) = decode_live_search_term_metadata(&value, format)?
-                else {
-                    continue;
-                };
-                if term_metadata
-                    .insert((index, term.to_vec()), document_frequency)
-                    .is_some()
-                {
-                    return Err(NativeRuntimeError::InvalidSearchTree);
-                }
-            }
-            Some(SEARCH_POSTING_PREFIX) => {
-                load_search_posting_entry(
-                    &key,
-                    &value,
-                    format,
-                    &indexes,
-                    &mut postings,
-                    &mut carried_lengths,
-                )?;
-            }
-            _ if ann_store::is_ann_physical_key(&key) => {}
-            _ => return Err(NativeRuntimeError::InvalidSearchTree),
+            Some(SEARCH_DOCUMENT_PREFIX) => self.accept_document(key, value),
+            Some(SEARCH_TERM_META_PREFIX) => self.accept_term(key, value),
+            Some(SEARCH_POSTING_PREFIX) => self.accept_posting(key, value),
+            _ => Err(NativeRuntimeError::InvalidSearchTree),
         }
     }
-    validate_carried_posting_lengths(&document_token_counts, &carried_lengths)?;
-    validate_search_projection(&indexes, &index_metadata, &term_metadata, &postings)?;
-    Ok(SearchState { indexes })
+
+    fn accept_document(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        let format = self.format.ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let (index, document_id) = decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
+        validate_search_document_identity(document_id, "")
+            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        let logical_bytes = search_document_logical_bytes(value, format)?;
+        let Some(logical_bytes) = logical_bytes else {
+            return Ok(());
+        };
+        self.admit_retained(key, logical_bytes)?;
+        let documents = self
+            .indexes
+            .get_mut(&index)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let (text, token_count) = decode_search_document(value, self.blobs)?;
+        validate_search_document_identity(document_id, &text)
+            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+        if documents.insert(document_id.to_vec(), text).is_some()
+            || self
+                .document_token_counts
+                .insert((index, document_id.to_vec()), token_count)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        Ok(())
+    }
+
+    fn accept_term(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        let format = self.format.ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let (index, term) = decode_search_object_key(key, SEARCH_TERM_META_PREFIX)?;
+        if !self.indexes.contains_key(&index) || !is_canonical_search_term(term) {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        let Some(document_frequency) = decode_live_search_term_metadata(value, format)? else {
+            return Ok(());
+        };
+        self.admit_retained(key, 0)?;
+        if self
+            .term_metadata
+            .insert((index, term.to_vec()), document_frequency)
+            .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        Ok(())
+    }
+
+    fn accept_posting(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        let format = self.format.ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        if is_search_posting_tombstone(value) {
+            decode_live_search_posting(value, format)?;
+            return Ok(());
+        }
+        self.admit_retained(key, 0)?;
+        load_search_posting_entry(
+            key,
+            value,
+            format,
+            &self.indexes,
+            &mut self.postings,
+            &mut self.carried_lengths,
+        )
+    }
+
+    fn admit_retained(
+        &mut self,
+        key: &[u8],
+        logical_value_bytes: u64,
+    ) -> Result<(), NativeRuntimeError> {
+        let key_bytes = u64::try_from(key.len())
+            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?
+            .checked_mul(4)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let retained = 512_u64
+            .checked_add(key_bytes)
+            .and_then(|bytes| bytes.checked_add(logical_value_bytes))
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let next = self
+            .retained_bytes
+            .checked_add(retained)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        if next > RECOVERY_MEMORY_BYTES {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        self.retained_bytes = next;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(SearchState, u64), NativeRuntimeError> {
+        if self.format.is_none() {
+            return Err(NativeRuntimeError::InvalidSearchTree);
+        }
+        validate_carried_posting_lengths(&self.document_token_counts, &self.carried_lengths)?;
+        validate_search_projection(
+            &self.indexes,
+            &self.index_metadata,
+            &self.term_metadata,
+            &self.postings,
+        )?;
+        Ok((
+            SearchState {
+                indexes: self.indexes,
+            },
+            self.retained_bytes,
+        ))
+    }
+}
+
+fn search_document_logical_bytes(
+    encoded: &[u8],
+    format: PhysicalSearchFormat,
+) -> Result<Option<u64>, NativeRuntimeError> {
+    if is_search_document_tombstone(encoded) {
+        return if format.admits_tombstones() {
+            Ok(None)
+        } else {
+            Err(NativeRuntimeError::InvalidSearchTree)
+        };
+    }
+    let (_, storage, payload) = decode_search_document_header(encoded)?;
+    match storage {
+        SEARCH_DOCUMENT_INLINE if payload.len() <= SEARCH_INLINE_VALUE_LIMIT => Ok(Some(
+            u64::try_from(payload.len()).map_err(|_| NativeRuntimeError::InvalidSearchTree)?,
+        )),
+        SEARCH_DOCUMENT_BLOB if payload.len() == hyphae_native_records::BLOB_REFERENCE_SIZE => {
+            let reference = BlobReference::decode(payload)?;
+            if reference.logical_length <= SEARCH_INLINE_VALUE_LIMIT as u64 {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Ok(Some(reference.logical_length))
+        }
+        _ => Err(NativeRuntimeError::InvalidSearchTree),
+    }
+}
+
+fn map_borrowed_search_visit_error(error: BorrowedVisitError) -> NativeRuntimeError {
+    match error {
+        BorrowedVisitError::Tree(error) => error.into(),
+        BorrowedVisitError::Cancelled | BorrowedVisitError::LimitExceeded => {
+            NativeRuntimeError::InvalidSearchTree
+        }
+    }
 }
 
 /// Loads one live posting entry into the projection, recording any

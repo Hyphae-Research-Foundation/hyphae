@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::ControlFlow,
+    ops::{Bound, ControlFlow},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,8 +18,8 @@ use hyphae_native_ann::{
     VectorRecord,
 };
 use hyphae_native_btree::{
-    BTree, BTreeError, KeyValue, PrefixReplacementBatch, PrefixReplacementStructuralLimits,
-    PrefixReplacementStructuralPlan,
+    BTree, BTreeError, BorrowedVisitError, BorrowedVisitLimits, KeyValue, PrefixReplacementBatch,
+    PrefixReplacementStructuralLimits, PrefixReplacementStructuralPlan,
 };
 use hyphae_native_catalog::{
     CatalogObject, IncrementalVectorLifecycle, SearchCollectionDefinition, VectorMetric,
@@ -71,6 +71,9 @@ pub(crate) const ANN_INDEX_META_PREFIX: u8 = 5;
 pub(crate) const ANN_VECTOR_PREFIX: u8 = 6;
 pub(crate) const ANN_GRAPH_LAYER_PREFIX: u8 = 7;
 pub(crate) const ANN_DELTA_PREFIX: u8 = 8;
+const ANN_OVERLAY_MANIFEST_PREFIX: u8 = 9;
+const ANN_OVERLAY_DELTA_PREFIX: u8 = 10;
+const ANN_OVERLAY_NODE_PREFIX: u8 = 11;
 
 /// Maximum object-keyed mutations retained above one ANN base generation.
 pub const MAX_ANN_DELTA_RECORDS: usize = 4_096;
@@ -83,13 +86,18 @@ const ANN_INDEX_META_MAGIC_V1: &[u8; 8] = b"HYANNM01";
 const ANN_INDEX_META_MAGIC_V2: &[u8; 8] = b"HYANNM02";
 const ANN_INDEX_META_MAGIC_V3: &[u8; 8] = b"HYANNM03";
 const ANN_INDEX_META_MAGIC_V4: &[u8; 8] = b"HYANNM04";
+const ANN_INDEX_META_MAGIC_V5: &[u8; 8] = b"HYANNM05";
 const ANN_VECTOR_MAGIC: &[u8; 8] = b"HYANNV01";
 const ANN_GRAPH_LAYER_MAGIC: &[u8; 8] = b"HYANNG01";
 const ANN_DELTA_MAGIC: &[u8; 8] = b"HYANND01";
+const ANN_OVERLAY_MANIFEST_MAGIC: &[u8; 8] = b"HYANNO01";
+const ANN_OVERLAY_DELTA_MAGIC: &[u8; 8] = b"HYANND02";
+const ANN_OVERLAY_NODE_MAGIC: &[u8; 8] = b"HYANNN01";
 const ANN_INDEX_META_V1_SIZE: usize = 80;
 const ANN_INDEX_META_V2_SIZE: usize = 144;
 const ANN_INDEX_META_V3_SIZE: usize = 160;
 const ANN_INDEX_META_V4_HEADER_SIZE: usize = 160;
+const ANN_INDEX_META_V5_HEADER_SIZE: usize = 280;
 const ANN_INDEX_META_V4_CHILD_SIZE: usize = 72;
 const ANN_INDEX_META_V4_RETAINED_HEADER_SIZE: usize = 40;
 const ANN_INDEX_META_KEY_SIZE: usize = 17;
@@ -98,9 +106,15 @@ const BTREE_LEAF_ENTRY_HEADER_SIZE: usize = 8;
 const ANN_VECTOR_HEADER_SIZE: usize = 24;
 const ANN_GRAPH_LAYER_HEADER_SIZE: usize = 16;
 const ANN_DELTA_HEADER_SIZE: usize = 40;
+const ANN_OVERLAY_MANIFEST_SIZE: usize = 184;
+const ANN_OVERLAY_NODE_HEADER_SIZE: usize = 56;
 const ANN_GENERATION_KEY_SIZE: usize = 65;
 const ANN_GRAPH_LAYER_KEY_SIZE: usize = 67;
 const ANN_DELTA_KEY_SIZE: usize = 33;
+const ANN_OVERLAY_NODE_KEY_SIZE: usize = 34;
+const ANN_OVERLAY_TREE_DEPTH: u8 = 32;
+const ANN_OVERLAY_FANOUT: usize = 16;
+const ANN_OVERLAY_MAX_NODES: u64 = (MAX_ANN_DELTA_RECORDS as u64) * 32;
 const ANN_DELTA_UPSERT: u8 = 1;
 const ANN_DELTA_TOMBSTONE: u8 = 2;
 const ANN_BASE_SINGLE: u8 = 1;
@@ -119,6 +133,10 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static ANN_SEARCH_CANCEL_POINT: std::cell::Cell<Option<AnnSearchCancellationPoint>> =
         const { std::cell::Cell::new(None) };
+    static ANN_FULL_STREAM_PHYSICAL_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANN_FULL_STREAM_NODE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANN_FULL_STREAM_OVERLAY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANN_FULL_STREAM_PEAK_FRONTIER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -455,6 +473,7 @@ struct AnnIndexState {
     view_identity: [u8; 32],
     lifecycle: IncrementalVectorLifecycle,
     retained_generations: Vec<RetainedGeneration>,
+    persisted_version: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -472,6 +491,7 @@ impl AnnIndexState {
             view_identity: [0; 32],
             lifecycle,
             retained_generations: Vec::new(),
+            persisted_version: 4,
         };
         state.refresh_view_identity();
         state
@@ -595,6 +615,9 @@ impl AnnIndexState {
         creating_csn: Csn,
         vector: Vector,
     ) -> Result<(), NativeRuntimeError> {
+        if self.persisted_version == 5 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
         validate_vector(self.definition(), &vector)?;
         let sequence = self.allocate_sequence()?;
         let previous = self.deltas.insert(
@@ -626,6 +649,9 @@ impl AnnIndexState {
         object_id: ObjectId,
         mutation_csn: Csn,
     ) -> Result<bool, NativeRuntimeError> {
+        if self.persisted_version == 5 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
         if !self.contains_effective_record(object_id) {
             return Ok(false);
         }
@@ -1419,6 +1445,9 @@ impl AnnState {
             .indexes
             .get(&index)
             .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
+        if current.persisted_version == 5 {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
         let mut prospective = current.deltas.clone();
         let mut sequence = current.next_sequence;
         for (object_id, vector) in vectors {
@@ -1480,7 +1509,10 @@ impl AnnState {
             .indexes
             .get(&index)
             .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
-        if !current.deltas.is_empty() || !current.retained_generations.is_empty() {
+        if current.persisted_version == 5
+            || !current.deltas.is_empty()
+            || !current.retained_generations.is_empty()
+        {
             return Err(NativeRuntimeError::InvalidPreparedMutation);
         }
         let mut records = current
@@ -1684,6 +1716,35 @@ struct PersistedIndexMetadata {
     lifecycle: IncrementalVectorLifecycle,
     retained_generations: Vec<RetainedGeneration>,
     version: u8,
+    overlay: Option<PersistedOverlayMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PersistedOverlayMetadata {
+    legacy_view_identity: [u8; 32],
+    overlay_root: [u8; 32],
+    overlay_count: u64,
+    overlay_bytes: u64,
+    overlay_node_count: u64,
+    effective_count: u64,
+    effective_bytes: u64,
+    legacy_next_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverlayManifest {
+    legacy_view_identity: [u8; 32],
+    overlay_root: [u8; 32],
+    view_identity: [u8; 32],
+    legacy_count: u64,
+    legacy_bytes: u64,
+    overlay_count: u64,
+    overlay_bytes: u64,
+    overlay_node_count: u64,
+    effective_count: u64,
+    effective_bytes: u64,
+    legacy_next_sequence: u64,
+    next_sequence: u64,
 }
 
 impl PersistedIndexMetadata {
@@ -1996,6 +2057,9 @@ struct AnnPhysicalLimits {
     vectors: AnnPhysicalRangeLimit,
     graph_layers: AnnPhysicalRangeLimit,
     deltas: AnnPhysicalRangeLimit,
+    overlay_manifest: AnnPhysicalRangeLimit,
+    overlay_deltas: AnnPhysicalRangeLimit,
+    overlay_nodes: AnnPhysicalRangeLimit,
 }
 
 impl AnnPhysicalLimits {
@@ -2004,6 +2068,9 @@ impl AnnPhysicalLimits {
             .entries
             .saturating_add(self.graph_layers.entries)
             .saturating_add(self.deltas.entries)
+            .saturating_add(self.overlay_manifest.entries)
+            .saturating_add(self.overlay_deltas.entries)
+            .saturating_add(self.overlay_nodes.entries)
     }
 
     fn total_bytes(self) -> u64 {
@@ -2011,6 +2078,9 @@ impl AnnPhysicalLimits {
             .bytes
             .saturating_add(self.graph_layers.bytes)
             .saturating_add(self.deltas.bytes)
+            .saturating_add(self.overlay_manifest.bytes)
+            .saturating_add(self.overlay_deltas.bytes)
+            .saturating_add(self.overlay_nodes.bytes)
     }
 }
 
@@ -2149,7 +2219,15 @@ pub(crate) fn private_mutation_csn() -> Result<Csn, NativeRuntimeError> {
 pub(crate) fn is_ann_physical_key(key: &[u8]) -> bool {
     matches!(
         key.first().copied(),
-        Some(ANN_INDEX_META_PREFIX | ANN_VECTOR_PREFIX | ANN_GRAPH_LAYER_PREFIX | ANN_DELTA_PREFIX)
+        Some(
+            ANN_INDEX_META_PREFIX
+                | ANN_VECTOR_PREFIX
+                | ANN_GRAPH_LAYER_PREFIX
+                | ANN_DELTA_PREFIX
+                | ANN_OVERLAY_MANIFEST_PREFIX
+                | ANN_OVERLAY_DELTA_PREFIX
+                | ANN_OVERLAY_NODE_PREFIX
+        )
     )
 }
 
@@ -2164,7 +2242,8 @@ pub(crate) fn capture_initial_bulk_authority(
         .indexes
         .get(&index)
         .ok_or(NativeRuntimeError::UnknownVectorIndex { index })?;
-    if !matches!(current.base, AnnBase::Single(_))
+    if current.persisted_version == 5
+        || !matches!(current.base, AnnBase::Single(_))
         || current.base.len() != 0
         || !current.deltas.is_empty()
         || !current.retained_generations.is_empty()
@@ -2234,7 +2313,8 @@ pub(crate) fn publish_initial_bulk_tree(
             index: publication.index,
         },
     )?;
-    if !matches!(current.base, AnnBase::Single(_))
+    if current.persisted_version == 5
+        || !matches!(current.base, AnnBase::Single(_))
         || current.base.len() != 0
         || !current.deltas.is_empty()
         || !current.retained_generations.is_empty()
@@ -2609,7 +2689,16 @@ pub(crate) fn load(
     root: Option<PageId>,
     catalog: &CatalogState,
 ) -> Result<AnnState, NativeRuntimeError> {
-    load_from_tree(pages, root, catalog, true)
+    load_with_memory_limit(pages, root, catalog, crate::RECOVERY_MEMORY_BYTES)
+}
+
+pub(crate) fn load_with_memory_limit(
+    pages: &PageStore,
+    root: Option<PageId>,
+    catalog: &CatalogState,
+    memory_limit: u64,
+) -> Result<AnnState, NativeRuntimeError> {
+    load_from_tree_with_memory_limit(pages, root, catalog, true, memory_limit)
 }
 
 /// Plans a bounded load of exactly one ANN index without restoring HNSW.
@@ -2658,6 +2747,9 @@ pub(crate) fn plan_delta_mutation(
         .bytes()
         .to_vec();
     let metadata = decode_metadata(&expected_metadata)?;
+    if metadata.version == 5 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
     let delta_entries =
         usize::try_from(metadata.delta_count).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
     let delta_limit = AnnPhysicalRangeLimit {
@@ -2895,7 +2987,8 @@ pub(crate) fn hydrate_owned_read_state(
     plan: &AnnIndexLoadPlan,
     cancellation: Option<&GovernorCancellation>,
 ) -> Result<(AnnOwnedReadState, AnnHydrationObservation), NativeRuntimeError> {
-    let (state, entries) = load_planned_index_with_entries(pages, buffer_pool, plan, cancellation)?;
+    let (state, entries, streamed_nodes) =
+        load_planned_index_with_entries(pages, buffer_pool, plan, cancellation)?;
     reject_cancelled_ann_search(cancellation)?;
     let physical_bytes = entries.iter().try_fold(0_u64, |total, (key, value)| {
         let entry_bytes = u64::try_from(key.len().saturating_add(value.len()))
@@ -2934,8 +3027,12 @@ pub(crate) fn hydrate_owned_read_state(
             authority,
         },
         AnnHydrationObservation {
-            physical_entries: entries.len(),
-            physical_bytes,
+            physical_entries: entries
+                .len()
+                .saturating_add(streamed_nodes.physical_entries),
+            physical_bytes: physical_bytes
+                .checked_add(streamed_nodes.physical_bytes)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
         },
     ))
 }
@@ -2946,7 +3043,8 @@ fn load_planned_index(
     plan: &AnnIndexLoadPlan,
     cancellation: Option<&GovernorCancellation>,
 ) -> Result<AnnIndexState, NativeRuntimeError> {
-    load_planned_index_with_entries(pages, buffer_pool, plan, cancellation).map(|(state, _)| state)
+    load_planned_index_with_entries(pages, buffer_pool, plan, cancellation)
+        .map(|(state, _, _)| state)
 }
 
 fn load_planned_index_with_entries(
@@ -2954,7 +3052,7 @@ fn load_planned_index_with_entries(
     buffer_pool: &BufferPool,
     plan: &AnnIndexLoadPlan,
     cancellation: Option<&GovernorCancellation>,
-) -> Result<(AnnIndexState, Vec<KeyValue>), NativeRuntimeError> {
+) -> Result<(AnnIndexState, Vec<KeyValue>, AnnHydrationObservation), NativeRuntimeError> {
     let tree = BTree::from_root(plan.root);
     let encoded_metadata = tree
         .get(pages, &meta_key(plan.index))?
@@ -2978,6 +3076,16 @@ fn load_planned_index_with_entries(
         &mut metadata,
     )?;
     validate_target_physical_entries(&entries, plan.index, plan.definition, &metadata)?;
+    let streamed_nodes = validate_overlay_nodes_in_tree(
+        tree,
+        pages,
+        buffer_pool,
+        plan.index,
+        &metadata,
+        &entries,
+        plan.physical_limits.overlay_nodes,
+        cancellation,
+    )?;
     #[cfg(test)]
     ANN_INDEX_SCOPED_RESTORES.set(ANN_INDEX_SCOPED_RESTORES.get().saturating_add(1));
     ANN_INDEX_SCOPED_RESTORES_PROCESS.fetch_add(1, Ordering::Relaxed);
@@ -2987,8 +3095,9 @@ fn load_planned_index_with_entries(
         plan.definition,
         metadata,
         cancellation,
+        true,
     )?;
-    Ok((state, entries))
+    Ok((state, entries, streamed_nodes))
 }
 
 fn scan_index_physical_entries(
@@ -3004,6 +3113,8 @@ fn scan_index_physical_entries(
         (ANN_VECTOR_PREFIX, limits.vectors),
         (ANN_GRAPH_LAYER_PREFIX, limits.graph_layers),
         (ANN_DELTA_PREFIX, limits.deltas),
+        (ANN_OVERLAY_MANIFEST_PREFIX, limits.overlay_manifest),
+        (ANN_OVERLAY_DELTA_PREFIX, limits.overlay_deltas),
     ] {
         visit_bounded_physical_range(
             tree,
@@ -3083,6 +3194,154 @@ fn visit_bounded_physical_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn validate_overlay_nodes_in_tree(
+    tree: BTree,
+    pages: &PageStore,
+    buffer_pool: &BufferPool,
+    index: ObjectId,
+    metadata: &PersistedIndexMetadata,
+    entries: &[KeyValue],
+    limit: AnnPhysicalRangeLimit,
+    cancellation: Option<&GovernorCancellation>,
+) -> Result<AnnHydrationObservation, NativeRuntimeError> {
+    let mut physical_entries = 0_usize;
+    let mut physical_bytes = 0_u64;
+    let mut failed = false;
+    let outcome = tree.visit_prefix_cached(
+        pages,
+        buffer_pool,
+        &object_prefix(ANN_OVERLAY_NODE_PREFIX, index),
+        None,
+        |key, value| {
+            if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+                return ControlFlow::Break(());
+            }
+            let encoded_bytes =
+                u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX);
+            let Some(next_entries) = physical_entries.checked_add(1) else {
+                failed = true;
+                return ControlFlow::Break(());
+            };
+            let Some(next_bytes) = physical_bytes.checked_add(encoded_bytes) else {
+                failed = true;
+                return ControlFlow::Break(());
+            };
+            if next_entries > limit.entries
+                || next_bytes > limit.bytes
+                || decode_overlay_node_key(key)
+                    .and_then(|(found, depth, _)| {
+                        if found != index {
+                            return Err(NativeRuntimeError::InvalidAnnTree);
+                        }
+                        decode_overlay_node(value, depth).map(|_| ())
+                    })
+                    .is_err()
+            {
+                failed = true;
+                return ControlFlow::Break(());
+            }
+            physical_entries = next_entries;
+            physical_bytes = next_bytes;
+            ControlFlow::Continue(())
+        },
+    )?;
+    if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+        return Err(GovernorQueueError::Cancelled.into());
+    }
+    if failed || matches!(outcome, ControlFlow::Break(())) || physical_entries != limit.entries {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let Some(overlay) = metadata.overlay else {
+        if physical_entries == 0 {
+            return Ok(AnnHydrationObservation {
+                physical_entries,
+                physical_bytes,
+            });
+        }
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    };
+    let mut frontier = BTreeMap::new();
+    for (key, value) in entries {
+        if key.first() != Some(&ANN_OVERLAY_DELTA_PREFIX) {
+            continue;
+        }
+        let (found, object_id) = decode_overlay_delta_key(key)?;
+        if found != index
+            || frontier
+                .insert(object_id.get(), overlay_leaf_hash(object_id, value))
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    if frontier.is_empty() {
+        if overlay.overlay_root != overlay_empty_hash(0) || overlay.overlay_node_count != 0 {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        return Ok(AnnHydrationObservation {
+            physical_entries,
+            physical_bytes,
+        });
+    }
+    let mut expected_node_count = 0_u64;
+    for depth in (0..ANN_OVERLAY_TREE_DEPTH).rev() {
+        reject_cancelled_ann_search(cancellation)?;
+        let (parents, expected) = expected_overlay_level(&frontier, depth)?;
+        let mut position = 0_usize;
+        let mut invalid = false;
+        let outcome = tree.visit_prefix_cached(
+            pages,
+            buffer_pool,
+            &overlay_node_prefix(index, depth),
+            None,
+            |key, value| {
+                if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+                    return ControlFlow::Break(());
+                }
+                let valid = expected.get(position).is_some_and(|expected_node| {
+                    decode_overlay_node_key(key).is_ok_and(|(found, found_depth, path)| {
+                        found == index
+                            && found_depth == depth
+                            && path == expected_node.path
+                            && decode_overlay_node(value, depth)
+                                .is_ok_and(|node| node == expected_node.node)
+                    })
+                });
+                if !valid {
+                    invalid = true;
+                    return ControlFlow::Break(());
+                }
+                position = position.saturating_add(1);
+                ControlFlow::Continue(())
+            },
+        )?;
+        if cancellation.is_some_and(GovernorCancellation::is_cancelled) {
+            return Err(GovernorQueueError::Cancelled.into());
+        }
+        if invalid || matches!(outcome, ControlFlow::Break(())) || position != expected.len() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        expected_node_count = expected_node_count
+            .checked_add(
+                u64::try_from(expected.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        frontier = parents;
+    }
+    if frontier.len() != 1
+        || frontier.get(&0) != Some(&overlay.overlay_root)
+        || expected_node_count != overlay.overlay_node_count
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(AnnHydrationObservation {
+        physical_entries,
+        physical_bytes,
+    })
+}
+
 fn index_hydration_memory_bytes(
     definition: VectorIndexDefinition,
     metadata: &PersistedIndexMetadata,
@@ -3109,6 +3368,20 @@ fn index_hydration_memory_bytes(
         .checked_add(vector_bytes)
         .and_then(|bytes| bytes.checked_add(graph_bytes))
         .and_then(|bytes| bytes.checked_add(metadata.delta_bytes.saturating_mul(2)))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                metadata
+                    .overlay
+                    .map_or(0, |overlay| overlay.overlay_bytes.saturating_mul(2)),
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                metadata
+                    .overlay
+                    .map_or(0, |overlay| overlay.overlay_count.saturating_mul(256)),
+            )
+        })
         .ok_or(NativeRuntimeError::InvalidAnnTree)
 }
 
@@ -3193,6 +3466,19 @@ fn index_physical_limits(
         .ok_or(NativeRuntimeError::InvalidAnnTree)?;
     let delta_entries =
         usize::try_from(metadata.delta_count).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let (manifest_entries, overlay_entries, overlay_bytes, overlay_node_entries) =
+        metadata.overlay.map_or((0, 0, 0, 0), |overlay| {
+            (
+                1,
+                overlay.overlay_count,
+                overlay.overlay_bytes,
+                overlay.overlay_node_count,
+            )
+        });
+    let overlay_entries =
+        usize::try_from(overlay_entries).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let overlay_node_entries =
+        usize::try_from(overlay_node_entries).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
     Ok(AnnPhysicalLimits {
         vectors: AnnPhysicalRangeLimit {
             entries: usize::try_from(vector_entries)
@@ -3217,6 +3503,33 @@ fn index_physical_limits(
                         .delta_count
                         .saturating_mul(u64::try_from(ANN_DELTA_KEY_SIZE).unwrap_or(u64::MAX)),
                 )
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        },
+        overlay_manifest: AnnPhysicalRangeLimit {
+            entries: manifest_entries,
+            bytes: u64::try_from(ANN_INDEX_META_KEY_SIZE + ANN_OVERLAY_MANIFEST_SIZE)
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                .saturating_mul(u64::try_from(manifest_entries).unwrap_or(u64::MAX)),
+        },
+        overlay_deltas: AnnPhysicalRangeLimit {
+            entries: overlay_entries,
+            bytes: overlay_bytes
+                .checked_add(
+                    u64::try_from(overlay_entries)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::try_from(ANN_DELTA_KEY_SIZE).unwrap_or(u64::MAX)),
+                )
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        },
+        overlay_nodes: AnnPhysicalRangeLimit {
+            entries: overlay_node_entries,
+            bytes: u64::try_from(ANN_OVERLAY_NODE_KEY_SIZE)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(ANN_OVERLAY_NODE_HEADER_SIZE).unwrap_or(u64::MAX))
+                .saturating_add(
+                    u64::try_from(ANN_OVERLAY_FANOUT.saturating_mul(32)).unwrap_or(u64::MAX),
+                )
+                .checked_mul(u64::try_from(overlay_node_entries).unwrap_or(u64::MAX))
                 .ok_or(NativeRuntimeError::InvalidAnnTree)?,
         },
     })
@@ -3248,6 +3561,22 @@ fn load_from_tree(
     catalog: &CatalogState,
     require_complete: bool,
 ) -> Result<AnnState, NativeRuntimeError> {
+    load_from_tree_with_memory_limit(
+        pages,
+        root,
+        catalog,
+        require_complete,
+        crate::RECOVERY_MEMORY_BYTES,
+    )
+}
+
+fn load_from_tree_with_memory_limit(
+    pages: &PageStore,
+    root: Option<PageId>,
+    catalog: &CatalogState,
+    require_complete: bool,
+    memory_limit: u64,
+) -> Result<AnnState, NativeRuntimeError> {
     if let Some(root) = root
         && pages.read(root)?.kind() == PageKind::SearchDelta
     {
@@ -3258,6 +3587,9 @@ fn load_from_tree(
         return Ok(state);
     }
     let tree = root.map_or_else(BTree::empty, BTree::from_root);
+    if tree_contains_metadata_v5(tree, pages)? {
+        return load_layered_from_tree(tree, pages, catalog, require_complete, memory_limit);
+    }
     let entries = tree.scan(pages)?;
     let mut metadata = decode_metadata_entries(&entries)?;
     enrich_legacy_retained_generations(&entries, catalog, &mut metadata)?;
@@ -3275,6 +3607,681 @@ fn load_from_tree(
         validate_catalog_coverage(catalog, &state)?;
     }
     Ok(state)
+}
+
+fn tree_contains_metadata_v5(tree: BTree, pages: &PageStore) -> Result<bool, NativeRuntimeError> {
+    let mut found = false;
+    tree.visit_range_borrowed_with_control(
+        pages,
+        Bound::Included(&[ANN_INDEX_META_PREFIX]),
+        Bound::Excluded(&[ANN_VECTOR_PREFIX]),
+        metadata_borrowed_visit_limits(crate::RECOVERY_MEMORY_BYTES),
+        || ControlFlow::Continue(()),
+        |_, value| {
+            if value.get(..8) == Some(ANN_INDEX_META_MAGIC_V5.as_slice()) {
+                found = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    )
+    .map_err(map_borrowed_ann_visit_error)?;
+    Ok(found)
+}
+
+fn load_layered_from_tree(
+    tree: BTree,
+    pages: &PageStore,
+    catalog: &CatalogState,
+    require_complete: bool,
+    memory_limit: u64,
+) -> Result<AnnState, NativeRuntimeError> {
+    let mut planned = BTreeMap::new();
+    let mut aggregate_memory = 0_u64;
+    let mut failure = None;
+    let metadata_stats = tree
+        .visit_range_borrowed_with_control(
+            pages,
+            Bound::Included(&[ANN_INDEX_META_PREFIX]),
+            Bound::Excluded(&[ANN_VECTOR_PREFIX]),
+            metadata_borrowed_visit_limits(memory_limit),
+            || ControlFlow::Continue(()),
+            |key, value| {
+                let result = (|| {
+                    let index = decode_meta_key(key)?;
+                    let metadata = decode_metadata(value)?;
+                    let definition = catalog_ann_definition(catalog, index)?;
+                    let limits = index_physical_limits(definition, &metadata)?;
+                    let memory = index_hydration_memory_bytes(definition, &metadata)?;
+                    aggregate_memory = aggregate_memory
+                        .checked_add(memory)
+                        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+                    if aggregate_memory > memory_limit
+                        || planned
+                            .insert(
+                                index,
+                                StreamingIndexRestore::new(definition, metadata, limits),
+                            )
+                            .is_some()
+                    {
+                        return Err(NativeRuntimeError::InvalidAnnTree);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    failure = Some(error);
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .map_err(map_borrowed_ann_visit_error)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !metadata_stats.complete {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+
+    let physical_limits = aggregate_streaming_physical_limits(planned.values())?;
+    let mut failure = None;
+    let physical_stats = tree
+        .visit_range_borrowed_with_control(
+            pages,
+            Bound::Included(&[ANN_VECTOR_PREFIX]),
+            Bound::Excluded(&[ANN_OVERLAY_NODE_PREFIX + 1]),
+            physical_limits,
+            || ControlFlow::Continue(()),
+            |key, value| {
+                let result = streamed_index_for_key(&mut planned, key)
+                    .and_then(|index| index.accept_physical(key, value));
+                if let Err(error) = result {
+                    failure = Some(error);
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .map_err(map_borrowed_ann_visit_error)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !physical_stats.complete {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+
+    let mut state = AnnState::default();
+    for (index, streamed) in planned {
+        if state.indexes.insert(index, streamed.finish()?).is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    if require_complete {
+        validate_catalog_coverage(catalog, &state)?;
+    }
+    Ok(state)
+}
+
+fn metadata_borrowed_visit_limits(memory_limit: u64) -> BorrowedVisitLimits {
+    let maximum_bytes = memory_limit.min(crate::RECOVERY_MEMORY_BYTES);
+    BorrowedVisitLimits {
+        maximum_entries: usize::try_from(
+            maximum_bytes / u64::try_from(ANN_INDEX_META_V1_SIZE).unwrap_or(1),
+        )
+        .unwrap_or(usize::MAX),
+        maximum_bytes,
+    }
+}
+
+fn aggregate_streaming_physical_limits<'a>(
+    indexes: impl IntoIterator<Item = &'a StreamingIndexRestore>,
+) -> Result<BorrowedVisitLimits, NativeRuntimeError> {
+    indexes.into_iter().try_fold(
+        BorrowedVisitLimits {
+            maximum_entries: 0,
+            maximum_bytes: 0,
+        },
+        |aggregate, index| {
+            Ok(BorrowedVisitLimits {
+                maximum_entries: aggregate
+                    .maximum_entries
+                    .checked_add(index.limits.total_entries())
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+                maximum_bytes: aggregate
+                    .maximum_bytes
+                    .checked_add(index.limits.total_bytes())
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+            })
+        },
+    )
+}
+
+fn map_borrowed_ann_visit_error(error: BorrowedVisitError) -> NativeRuntimeError {
+    match error {
+        BorrowedVisitError::Tree(error) => error.into(),
+        BorrowedVisitError::Cancelled | BorrowedVisitError::LimitExceeded => {
+            NativeRuntimeError::InvalidAnnTree
+        }
+    }
+}
+
+fn streamed_index_for_key<'a>(
+    planned: &'a mut BTreeMap<ObjectId, StreamingIndexRestore>,
+    key: &[u8],
+) -> Result<&'a mut StreamingIndexRestore, NativeRuntimeError> {
+    let encoded_index = key.get(1..17).ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let index = decode_index(encoded_index)?;
+    planned
+        .get_mut(&index)
+        .ok_or(NativeRuntimeError::InvalidAnnTree)
+}
+
+#[derive(Default)]
+struct AnnPhysicalRangeObservation {
+    entries: usize,
+    bytes: u64,
+}
+
+impl AnnPhysicalRangeObservation {
+    fn admit(
+        &mut self,
+        limit: AnnPhysicalRangeLimit,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let entries = self
+            .entries
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let entry_bytes = u64::try_from(key.len().saturating_add(value.len()))
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+        let bytes = self
+            .bytes
+            .checked_add(entry_bytes)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if entries > limit.entries || bytes > limit.bytes {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        self.entries = entries;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+struct StreamingIndexRestore {
+    definition: VectorIndexDefinition,
+    metadata: PersistedIndexMetadata,
+    limits: AnnPhysicalLimits,
+    children: BTreeMap<[u8; 32], RestoredChildEntries>,
+    legacy_deltas: BTreeMap<ObjectId, DeltaRecord>,
+    overlay_manifest: Option<OverlayManifest>,
+    overlay_deltas: BTreeMap<ObjectId, DeltaRecord>,
+    overlay_nodes: StreamingOverlayNodes,
+    vector_observation: AnnPhysicalRangeObservation,
+    graph_observation: AnnPhysicalRangeObservation,
+    legacy_observation: AnnPhysicalRangeObservation,
+    manifest_observation: AnnPhysicalRangeObservation,
+    overlay_observation: AnnPhysicalRangeObservation,
+    node_observation: AnnPhysicalRangeObservation,
+}
+
+impl StreamingIndexRestore {
+    fn new(
+        definition: VectorIndexDefinition,
+        metadata: PersistedIndexMetadata,
+        limits: AnnPhysicalLimits,
+    ) -> Self {
+        Self {
+            definition,
+            overlay_nodes: StreamingOverlayNodes::new(metadata.overlay),
+            metadata,
+            limits,
+            children: BTreeMap::new(),
+            legacy_deltas: BTreeMap::new(),
+            overlay_manifest: None,
+            overlay_deltas: BTreeMap::new(),
+            vector_observation: AnnPhysicalRangeObservation::default(),
+            graph_observation: AnnPhysicalRangeObservation::default(),
+            legacy_observation: AnnPhysicalRangeObservation::default(),
+            manifest_observation: AnnPhysicalRangeObservation::default(),
+            overlay_observation: AnnPhysicalRangeObservation::default(),
+            node_observation: AnnPhysicalRangeObservation::default(),
+        }
+    }
+
+    fn accept_physical(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        #[cfg(test)]
+        ANN_FULL_STREAM_PHYSICAL_VISITS
+            .set(ANN_FULL_STREAM_PHYSICAL_VISITS.get().saturating_add(1));
+        match key.first().copied() {
+            Some(ANN_VECTOR_PREFIX) => self.accept_vector(key, value),
+            Some(ANN_GRAPH_LAYER_PREFIX) => self.accept_graph_layer(key, value),
+            Some(ANN_DELTA_PREFIX) => self.accept_legacy_delta(key, value),
+            Some(ANN_OVERLAY_MANIFEST_PREFIX) => self.accept_manifest(key, value),
+            Some(ANN_OVERLAY_DELTA_PREFIX) => self.accept_overlay_delta(key, value),
+            Some(ANN_OVERLAY_NODE_PREFIX) => self.accept_overlay_node(key, value),
+            _ => Err(NativeRuntimeError::InvalidAnnTree),
+        }
+    }
+
+    fn accept_vector(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.vector_observation
+            .admit(self.limits.vectors, key, value)?;
+        let expected = ANN_VECTOR_HEADER_SIZE
+            .checked_add(usize::from(self.definition.dimension()).saturating_mul(4))
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if value.len() != expected {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let (index, build_identity, object_id) = decode_vector_key(key)?;
+        if index != self.definition.index_id()
+            || !self.metadata.owns_physical_identity(build_identity)
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let child = self.children.entry(build_identity).or_default();
+        if !child.vector_ids.insert(object_id) {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        child
+            .vectors
+            .push(decode_vector_record(value, object_id, self.definition)?);
+        Ok(())
+    }
+
+    fn accept_graph_layer(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.graph_observation
+            .admit(self.limits.graph_layers, key, value)?;
+        let maximum = ANN_GRAPH_LAYER_HEADER_SIZE
+            .checked_add(
+                usize::from(self.definition.config().m())
+                    .saturating_mul(2)
+                    .saturating_mul(16),
+            )
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if value.len() > maximum {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let (index, build_identity, object_id, layer) = decode_graph_layer_key(key)?;
+        if index != self.definition.index_id()
+            || !self.metadata.owns_physical_identity(build_identity)
+            || self
+                .children
+                .entry(build_identity)
+                .or_default()
+                .layers
+                .entry(object_id)
+                .or_default()
+                .insert(layer, decode_graph_layer(value)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+
+    fn accept_legacy_delta(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.legacy_observation
+            .admit(self.limits.deltas, key, value)?;
+        validate_delta_size_before_decode(value, self.definition, *ANN_DELTA_MAGIC)?;
+        let (index, object_id) = decode_delta_key(key)?;
+        if index != self.definition.index_id()
+            || self
+                .legacy_deltas
+                .insert(object_id, decode_delta(value, object_id, self.definition)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+
+    fn accept_manifest(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.manifest_observation
+            .admit(self.limits.overlay_manifest, key, value)?;
+        if self.metadata.overlay.is_none()
+            || decode_overlay_manifest_key(key)? != self.definition.index_id()
+            || self
+                .overlay_manifest
+                .replace(decode_overlay_manifest(value)?)
+                .is_some()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+
+    fn accept_overlay_delta(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.overlay_observation
+            .admit(self.limits.overlay_deltas, key, value)?;
+        validate_delta_size_before_decode(value, self.definition, *ANN_OVERLAY_DELTA_MAGIC)?;
+        let (index, object_id) = decode_overlay_delta_key(key)?;
+        if self.metadata.overlay.is_none() || index != self.definition.index_id() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let leaf_hash = overlay_leaf_hash(object_id, value);
+        #[cfg(test)]
+        ANN_FULL_STREAM_OVERLAY_DECODES
+            .set(ANN_FULL_STREAM_OVERLAY_DECODES.get().saturating_add(1));
+        if self
+            .overlay_deltas
+            .insert(
+                object_id,
+                decode_overlay_delta(value, object_id, self.definition)?,
+            )
+            .is_some()
+            || self
+                .overlay_nodes
+                .insert_leaf(object_id.get(), leaf_hash)
+                .is_err()
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+
+    fn accept_overlay_node(&mut self, key: &[u8], value: &[u8]) -> Result<(), NativeRuntimeError> {
+        self.node_observation
+            .admit(self.limits.overlay_nodes, key, value)?;
+        if value.len()
+            > ANN_OVERLAY_NODE_HEADER_SIZE.saturating_add(ANN_OVERLAY_FANOUT.saturating_mul(32))
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let (index, depth, path) = decode_overlay_node_key(key)?;
+        if self.metadata.overlay.is_none() || index != self.definition.index_id() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        #[cfg(test)]
+        ANN_FULL_STREAM_NODE_DECODES.set(ANN_FULL_STREAM_NODE_DECODES.get().saturating_add(1));
+        self.overlay_nodes.accept(depth, path, value)
+    }
+
+    fn finish(mut self) -> Result<AnnIndexState, NativeRuntimeError> {
+        self.overlay_nodes.finish()?;
+        enrich_streamed_retained_generations(&mut self.metadata, self.definition, &self.children)?;
+        validate_streamed_retained_generations(&self.metadata, &self.children)?;
+        let current_identities = self.metadata.current_child_identities();
+        let mut selected = BTreeMap::new();
+        for identity in current_identities {
+            if let Some(child) = self.children.remove(&identity) {
+                selected.insert(identity, child);
+            }
+        }
+        let base = restore_base_with_cancellation(&self.metadata, self.definition, selected, None)?;
+        let deltas = if let Some(overlay) = self.metadata.overlay {
+            validate_layered_deltas(
+                &self.metadata,
+                overlay,
+                self.overlay_manifest
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+                self.legacy_deltas,
+                self.overlay_deltas,
+            )?
+        } else {
+            if self.overlay_manifest.is_some() || !self.overlay_deltas.is_empty() {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            validate_restored_deltas(&self.metadata, &self.legacy_deltas)?;
+            self.legacy_deltas
+        };
+        let mut restored = AnnIndexState {
+            base,
+            deltas,
+            next_sequence: self.metadata.next_sequence,
+            view_identity: self.metadata.view_identity,
+            lifecycle: self.metadata.lifecycle,
+            retained_generations: self.metadata.retained_generations,
+            persisted_version: self.metadata.version,
+        };
+        restored.validate_delta_bounds()?;
+        let maximum_sequence = restored
+            .deltas
+            .values()
+            .map(DeltaRecord::sequence)
+            .max()
+            .unwrap_or(0);
+        if restored.next_sequence == 0 || restored.next_sequence <= maximum_sequence {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        if self.metadata.version == 1 {
+            restored.view_identity = restored.base.build_identity();
+        } else if self.metadata.version != 5
+            && restored.view_identity
+                != calculate_view_identity(
+                    restored.base.build_identity(),
+                    restored.next_sequence,
+                    &restored.deltas,
+                )
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(restored)
+    }
+}
+
+fn validate_delta_size_before_decode(
+    encoded: &[u8],
+    definition: VectorIndexDefinition,
+    magic: [u8; 8],
+) -> Result<(), NativeRuntimeError> {
+    if encoded.len() < ANN_DELTA_HEADER_SIZE || encoded.get(..8) != Some(magic.as_slice()) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let expected = match encoded[8] {
+        ANN_DELTA_UPSERT => ANN_DELTA_HEADER_SIZE
+            .checked_add(usize::from(definition.dimension()).saturating_mul(4))
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        ANN_DELTA_TOMBSTONE => ANN_DELTA_HEADER_SIZE,
+        _ => return Err(NativeRuntimeError::InvalidAnnTree),
+    };
+    if encoded.len() != expected {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(())
+}
+
+struct StreamingOverlayNodes {
+    overlay: Option<PersistedOverlayMetadata>,
+    leaves: BTreeMap<u128, [u8; 32]>,
+    current_depth: Option<u8>,
+    expected: BTreeMap<u128, [u8; 32]>,
+    next_expected: BTreeMap<u128, [u8; 32]>,
+    observed_nodes: u64,
+}
+
+impl StreamingOverlayNodes {
+    fn new(overlay: Option<PersistedOverlayMetadata>) -> Self {
+        Self {
+            overlay,
+            leaves: BTreeMap::new(),
+            current_depth: None,
+            expected: BTreeMap::new(),
+            next_expected: BTreeMap::new(),
+            observed_nodes: 0,
+        }
+    }
+
+    fn insert_leaf(&mut self, path: u128, hash: [u8; 32]) -> Result<(), NativeRuntimeError> {
+        if self.current_depth.is_some() || self.leaves.insert(path, hash).is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        #[cfg(test)]
+        ANN_FULL_STREAM_PEAK_FRONTIER
+            .set(ANN_FULL_STREAM_PEAK_FRONTIER.get().max(self.leaves.len()));
+        Ok(())
+    }
+
+    fn accept(&mut self, depth: u8, path: u128, value: &[u8]) -> Result<(), NativeRuntimeError> {
+        let overlay = self.overlay.ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        self.observed_nodes = self
+            .observed_nodes
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if self.observed_nodes > overlay.overlay_node_count || overlay.overlay_count == 0 {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        if self.current_depth.is_none() {
+            if u64::try_from(self.leaves.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                != overlay.overlay_count
+            {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            self.current_depth = Some(0);
+            self.expected.insert(0, overlay.overlay_root);
+        }
+        let current_depth = self
+            .current_depth
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if depth != current_depth {
+            if depth != current_depth.saturating_add(1) || !self.expected.is_empty() {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            self.expected = std::mem::take(&mut self.next_expected);
+            self.current_depth = Some(depth);
+        }
+        let expected_hash = self
+            .expected
+            .remove(&path)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let node = decode_overlay_node(value, depth)?;
+        if node.node_hash != expected_hash {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        let shift = u32::from(ANN_OVERLAY_TREE_DEPTH - depth - 1) * 4;
+        let mut child_hashes = node.child_hashes.iter();
+        for position in 0..ANN_OVERLAY_FANOUT {
+            if node.bitmap & (1_u16 << position) == 0 {
+                continue;
+            }
+            let child_hash = *child_hashes
+                .next()
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            let child_path = path
+                | (u128::try_from(position).map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+                    << shift);
+            if depth + 1 == ANN_OVERLAY_TREE_DEPTH {
+                if self.leaves.remove(&child_path) != Some(child_hash) {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+            } else if self.next_expected.insert(child_path, child_hash).is_some() {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            #[cfg(test)]
+            ANN_FULL_STREAM_PEAK_FRONTIER.set(
+                ANN_FULL_STREAM_PEAK_FRONTIER
+                    .get()
+                    .max(self.next_expected.len()),
+            );
+        }
+        if child_hashes.next().is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), NativeRuntimeError> {
+        let Some(overlay) = self.overlay else {
+            if self.current_depth.is_none() && self.leaves.is_empty() && self.observed_nodes == 0 {
+                return Ok(());
+            }
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        };
+        let valid_empty = overlay.overlay_count == 0
+            && self.current_depth.is_none()
+            && self.leaves.is_empty()
+            && self.observed_nodes == 0
+            && overlay.overlay_node_count == 0
+            && overlay.overlay_root == overlay_empty_hash(0);
+        let valid_nonempty = overlay.overlay_count != 0
+            && self.current_depth == Some(ANN_OVERLAY_TREE_DEPTH - 1)
+            && self.expected.is_empty()
+            && self.next_expected.is_empty()
+            && self.leaves.is_empty()
+            && self.observed_nodes == overlay.overlay_node_count;
+        if valid_empty || valid_nonempty {
+            Ok(())
+        } else {
+            Err(NativeRuntimeError::InvalidAnnTree)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_stream_observation_for_test() {
+    ANN_FULL_STREAM_PHYSICAL_VISITS.set(0);
+    ANN_FULL_STREAM_NODE_DECODES.set(0);
+    ANN_FULL_STREAM_OVERLAY_DECODES.set(0);
+    ANN_FULL_STREAM_PEAK_FRONTIER.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn full_stream_observation_for_test() -> (usize, usize, usize) {
+    (
+        ANN_FULL_STREAM_PHYSICAL_VISITS.get(),
+        ANN_FULL_STREAM_NODE_DECODES.get(),
+        ANN_FULL_STREAM_PEAK_FRONTIER.get(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn full_stream_overlay_decodes_for_test() -> usize {
+    ANN_FULL_STREAM_OVERLAY_DECODES.get()
+}
+
+fn enrich_streamed_retained_generations(
+    metadata: &mut PersistedIndexMetadata,
+    definition: VectorIndexDefinition,
+    children: &BTreeMap<[u8; 32], RestoredChildEntries>,
+) -> Result<(), NativeRuntimeError> {
+    for child in metadata
+        .retained_generations
+        .iter_mut()
+        .flat_map(|generation| &mut generation.children)
+        .filter(|child| !child.complete)
+    {
+        let entries = children
+            .get(&child.build_identity)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?
+            .clone();
+        let descriptor = infer_legacy_retained_descriptor(child.build_identity, &entries)?;
+        let snapshot = restore_child_snapshot(definition, &descriptor, entries)?;
+        let restored =
+            HnswIndex::restore_owned(snapshot).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+        if restored.build_identity() != child.build_identity {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        *child = descriptor;
+    }
+    Ok(())
+}
+
+fn validate_streamed_retained_generations(
+    metadata: &PersistedIndexMetadata,
+    children: &BTreeMap<[u8; 32], RestoredChildEntries>,
+) -> Result<(), NativeRuntimeError> {
+    for child in metadata
+        .retained_generations
+        .iter()
+        .flat_map(|generation| &generation.children)
+    {
+        let entries = children
+            .get(&child.build_identity)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let summary = PhysicalGenerationSummary {
+            vector_ids: entries.vector_ids.clone(),
+            graph_layers: entries
+                .layers
+                .iter()
+                .map(|(object_id, layers)| (*object_id, layers.keys().copied().collect()))
+                .collect(),
+        };
+        validate_retained_child_entries(child, &summary)?;
+    }
+    Ok(())
 }
 
 fn decode_metadata_entries(
@@ -3451,21 +4458,27 @@ fn restore_index_with_definition(
     definition: VectorIndexDefinition,
     metadata: PersistedIndexMetadata,
 ) -> Result<AnnIndexState, NativeRuntimeError> {
-    restore_index_with_definition_controlled(entries, index, definition, metadata, None)
+    restore_index_with_definition_controlled(entries, index, definition, metadata, None, false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn restore_index_with_definition_controlled(
     entries: &[(Vec<u8>, Vec<u8>)],
     index: ObjectId,
     definition: VectorIndexDefinition,
     metadata: PersistedIndexMetadata,
     cancellation: Option<&GovernorCancellation>,
+    overlay_nodes_prevalidated: bool,
 ) -> Result<AnnIndexState, NativeRuntimeError> {
     let delta_prefix = object_prefix(ANN_DELTA_PREFIX, index);
     let current_identities = metadata.current_child_identities();
     let retained_identities = metadata.retained_child_identities();
     let mut children = BTreeMap::<[u8; 32], RestoredChildEntries>::new();
     let mut deltas = BTreeMap::new();
+    let mut overlay_manifest = None;
+    let mut overlay_deltas = BTreeMap::new();
+    let mut overlay_leaf_hashes = BTreeMap::new();
+    let mut has_overlay_nodes = false;
     for (key, value) in entries {
         reject_cancelled_ann_search(cancellation)?;
         match key.first().copied() {
@@ -3512,10 +4525,54 @@ fn restore_index_with_definition_controlled(
                     return Err(NativeRuntimeError::InvalidAnnTree);
                 }
             }
+            Some(ANN_OVERLAY_MANIFEST_PREFIX) => {
+                let found_index = decode_overlay_manifest_key(key)?;
+                if found_index == index
+                    && overlay_manifest
+                        .replace(decode_overlay_manifest(value)?)
+                        .is_some()
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+            }
+            Some(ANN_OVERLAY_DELTA_PREFIX) => {
+                let (found_index, object_id) = decode_overlay_delta_key(key)?;
+                if found_index == index {
+                    let delta = decode_overlay_delta(value, object_id, definition)?;
+                    if overlay_deltas.insert(object_id, delta).is_some()
+                        || overlay_leaf_hashes
+                            .insert(object_id.get(), overlay_leaf_hash(object_id, value))
+                            .is_some()
+                    {
+                        return Err(NativeRuntimeError::InvalidAnnTree);
+                    }
+                }
+            }
+            Some(ANN_OVERLAY_NODE_PREFIX) => {
+                let (found_index, depth, _) = decode_overlay_node_key(key)?;
+                if found_index == index {
+                    has_overlay_nodes = true;
+                    if !overlay_nodes_prevalidated {
+                        decode_overlay_node(value, depth)?;
+                    }
+                }
+            }
             _ => {}
         }
     }
-    validate_restored_deltas(&metadata, &deltas)?;
+    let deltas = if let Some(overlay) = metadata.overlay {
+        let manifest = overlay_manifest.ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        if !overlay_nodes_prevalidated {
+            validate_overlay_nodes_in_entries(entries, index, &overlay_leaf_hashes, overlay)?;
+        }
+        validate_layered_deltas(&metadata, overlay, manifest, deltas, overlay_deltas)?
+    } else {
+        if overlay_manifest.is_some() || !overlay_deltas.is_empty() || has_overlay_nodes {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        validate_restored_deltas(&metadata, &deltas)?;
+        deltas
+    };
     let base = restore_base_with_cancellation(&metadata, definition, children, cancellation)?;
     let mut restored = AnnIndexState {
         base,
@@ -3524,6 +4581,7 @@ fn restore_index_with_definition_controlled(
         view_identity: metadata.view_identity,
         lifecycle: metadata.lifecycle,
         retained_generations: metadata.retained_generations,
+        persisted_version: metadata.version,
     };
     restored.validate_delta_bounds()?;
     let max_sequence = restored
@@ -3537,19 +4595,154 @@ fn restore_index_with_definition_controlled(
     }
     if metadata.version == 1 {
         restored.view_identity = restored.base.build_identity();
-    } else if restored.view_identity
-        != calculate_view_identity(
-            restored.base.build_identity(),
-            restored.next_sequence,
-            &restored.deltas,
-        )
+    } else if metadata.version != 5
+        && restored.view_identity
+            != calculate_view_identity(
+                restored.base.build_identity(),
+                restored.next_sequence,
+                &restored.deltas,
+            )
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     Ok(restored)
 }
 
-#[derive(Default)]
+fn validate_layered_deltas(
+    metadata: &PersistedIndexMetadata,
+    overlay: PersistedOverlayMetadata,
+    manifest: OverlayManifest,
+    legacy_deltas: BTreeMap<ObjectId, DeltaRecord>,
+    overlay_deltas: BTreeMap<ObjectId, DeltaRecord>,
+) -> Result<BTreeMap<ObjectId, DeltaRecord>, NativeRuntimeError> {
+    let expected_manifest = OverlayManifest {
+        legacy_view_identity: overlay.legacy_view_identity,
+        overlay_root: overlay.overlay_root,
+        view_identity: metadata.view_identity,
+        legacy_count: metadata.delta_count,
+        legacy_bytes: metadata.delta_bytes,
+        overlay_count: overlay.overlay_count,
+        overlay_bytes: overlay.overlay_bytes,
+        overlay_node_count: overlay.overlay_node_count,
+        effective_count: overlay.effective_count,
+        effective_bytes: overlay.effective_bytes,
+        legacy_next_sequence: overlay.legacy_next_sequence,
+        next_sequence: metadata.next_sequence,
+    };
+    if manifest != expected_manifest {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    validate_restored_deltas(metadata, &legacy_deltas)?;
+    let overlay_count =
+        u64::try_from(overlay_deltas.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let overlay_bytes = delta_map_bytes(&overlay_deltas)?;
+    if overlay_count != overlay.overlay_count || overlay_bytes != overlay.overlay_bytes {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    if calculate_view_identity(
+        metadata.build_identity,
+        overlay.legacy_next_sequence,
+        &legacy_deltas,
+    ) != overlay.legacy_view_identity
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let mut sequences = BTreeSet::new();
+    if legacy_deltas.values().any(|delta| {
+        delta.sequence() >= overlay.legacy_next_sequence || !sequences.insert(delta.sequence())
+    }) || overlay_deltas.values().any(|delta| {
+        delta.sequence() < overlay.legacy_next_sequence
+            || delta.sequence() >= metadata.next_sequence
+            || !sequences.insert(delta.sequence())
+    }) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let mut effective = legacy_deltas;
+    for (object_id, delta) in overlay_deltas {
+        effective.insert(object_id, delta);
+    }
+    if u64::try_from(effective.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?
+        != overlay.effective_count
+        || delta_map_bytes(&effective)? != overlay.effective_bytes
+        || overlay_view_identity(metadata.build_identity, manifest) != metadata.view_identity
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(effective)
+}
+
+fn delta_map_bytes(deltas: &BTreeMap<ObjectId, DeltaRecord>) -> Result<u64, NativeRuntimeError> {
+    deltas.values().try_fold(0_u64, |bytes, delta| {
+        bytes
+            .checked_add(
+                u64::try_from(delta.encoded_len())
+                    .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidAnnTree)
+    })
+}
+
+fn validate_overlay_nodes_in_entries(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    index: ObjectId,
+    leaf_hashes: &BTreeMap<u128, [u8; 32]>,
+    overlay: PersistedOverlayMetadata,
+) -> Result<(), NativeRuntimeError> {
+    let mut frontier = leaf_hashes.clone();
+    let mut node_count = 0_u64;
+    if frontier.is_empty() {
+        if entries.iter().any(|(key, _)| {
+            key.first() == Some(&ANN_OVERLAY_NODE_PREFIX)
+                && decode_overlay_node_key(key).is_ok_and(|(found, _, _)| found == index)
+        }) || overlay.overlay_node_count != 0
+            || overlay.overlay_root != overlay_empty_hash(0)
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        return Ok(());
+    }
+    for depth in (0..ANN_OVERLAY_TREE_DEPTH).rev() {
+        let (parents, expected) = expected_overlay_level(&frontier, depth)?;
+        let mut observed = entries
+            .iter()
+            .filter(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+            .filter_map(|(key, value)| match decode_overlay_node_key(key) {
+                Ok((found, found_depth, path)) if found == index && found_depth == depth => {
+                    Some(Ok((path, value)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            });
+        for expected_node in &expected {
+            let (path, value) = observed
+                .next()
+                .ok_or(NativeRuntimeError::InvalidAnnTree)??;
+            if path != expected_node.path
+                || decode_overlay_node(value, depth)? != expected_node.node
+            {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+        }
+        if observed.next().is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        node_count = node_count
+            .checked_add(
+                u64::try_from(expected.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+            )
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        frontier = parents;
+    }
+    if frontier.len() != 1
+        || frontier.get(&0) != Some(&overlay.overlay_root)
+        || node_count != overlay.overlay_node_count
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
 struct RestoredChildEntries {
     vectors: Vec<VectorRecord>,
     vector_ids: BTreeSet<ObjectId>,
@@ -3860,6 +5053,9 @@ pub(crate) fn plan_consolidation(
     }
     reject_cancelled_ann_search(execution.cancellation)?;
     let current = load_planned_index(pages, buffer_pool, load_plan, execution.cancellation)?;
+    if current.persisted_version == 5 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
     if max_delta_records
         > usize::try_from(current.lifecycle.delta_max_entries).unwrap_or(usize::MAX)
     {
@@ -4038,8 +5234,11 @@ pub(crate) fn consolidate_tree(
     let tree = BTree::from_root(root);
     let definition = plan.definition();
     let load_plan = plan_index_load(pages, buffer_pool, root, plan.index, definition)?;
-    let (mut current, physical_entries) =
+    let (mut current, physical_entries, _) =
         load_planned_index_with_entries(pages, buffer_pool, &load_plan, None)?;
+    if current.persisted_version == 5 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
     if current.base.build_identity() != plan.base_identity {
         return Err(NativeRuntimeError::AnnConsolidationStale);
     }
@@ -4212,8 +5411,9 @@ fn validate_consolidated_tree_unpublished(
     let limits = index_physical_limits(definition, &metadata)?;
     let entries = scan_index_physical_entries_unpublished(tree, unpublished, plan.index, limits)?;
     validate_target_physical_entries(&entries, plan.index, definition, &metadata)?;
-    let current =
-        restore_index_with_definition_controlled(&entries, plan.index, definition, metadata, None)?;
+    let current = restore_index_with_definition_controlled(
+        &entries, plan.index, definition, metadata, None, false,
+    )?;
     if current.base.build_identity() != plan.replacement.build_identity()
         || current.base.definition() != plan.replacement.definition()
         || current.base.len() != plan.replacement.len()
@@ -4242,6 +5442,9 @@ fn scan_index_physical_entries_unpublished(
         (ANN_VECTOR_PREFIX, limits.vectors),
         (ANN_GRAPH_LAYER_PREFIX, limits.graph_layers),
         (ANN_DELTA_PREFIX, limits.deltas),
+        (ANN_OVERLAY_MANIFEST_PREFIX, limits.overlay_manifest),
+        (ANN_OVERLAY_DELTA_PREFIX, limits.overlay_deltas),
+        (ANN_OVERLAY_NODE_PREFIX, limits.overlay_nodes),
     ] {
         let mut visited_entries = 0_usize;
         let mut visited_bytes = 0_u64;
@@ -4301,7 +5504,8 @@ pub(crate) fn inspect_consolidation_publication(
     load_plan: &AnnIndexLoadPlan,
     plan: &ConsolidationPlan,
 ) -> Result<(IndexObservation, usize), NativeRuntimeError> {
-    let (current, entries) = load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
+    let (current, entries, _) =
+        load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
     if current.base.build_identity() != plan.base_identity {
         return Err(NativeRuntimeError::AnnConsolidationStale);
     }
@@ -4323,7 +5527,8 @@ pub(crate) fn observe_planned_index(
     buffer_pool: &BufferPool,
     load_plan: &AnnIndexLoadPlan,
 ) -> Result<IndexObservation, NativeRuntimeError> {
-    let (current, entries) = load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
+    let (current, entries, _) =
+        load_planned_index_with_entries(pages, buffer_pool, load_plan, None)?;
     Ok(index_observation(&current, &entries, load_plan.index))
 }
 
@@ -4386,6 +5591,9 @@ pub(crate) fn maintenance_status(
     plan: &AnnIndexLoadPlan,
 ) -> Result<MaintenanceStatus, NativeRuntimeError> {
     let metadata = decode_metadata(&plan.encoded_metadata)?;
+    if metadata.version == 5 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
     let mut entries = Vec::new();
     visit_bounded_physical_range(
         BTree::from_root(plan.root),
@@ -4433,6 +5641,7 @@ fn maintenance_due_counts(lifecycle: IncrementalVectorLifecycle, delta_records: 
         || delta_records >= usize::try_from(lifecycle.delta_max_entries).unwrap_or(usize::MAX)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_physical_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     catalog: &CatalogState,
@@ -4490,6 +5699,41 @@ fn validate_physical_entries(
                 decode_delta(value, object_id, definition)?;
                 indexes_with_records.insert(index);
             }
+            Some(ANN_OVERLAY_MANIFEST_PREFIX) => {
+                let index = decode_overlay_manifest_key(key)?;
+                decode_overlay_manifest(value)?;
+                if metadata
+                    .get(&index)
+                    .is_none_or(|persisted| persisted.overlay.is_none())
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                indexes_with_records.insert(index);
+            }
+            Some(ANN_OVERLAY_DELTA_PREFIX) => {
+                let (index, object_id) = decode_overlay_delta_key(key)?;
+                let definition = catalog_ann_definition(catalog, index)?;
+                decode_overlay_delta(value, object_id, definition)?;
+                if metadata
+                    .get(&index)
+                    .is_none_or(|persisted| persisted.overlay.is_none())
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                indexes_with_records.insert(index);
+            }
+            Some(ANN_OVERLAY_NODE_PREFIX) => {
+                let (index, depth, _) = decode_overlay_node_key(key)?;
+                decode_overlay_node(value, depth)?;
+                catalog_ann_definition(catalog, index)?;
+                if metadata
+                    .get(&index)
+                    .is_none_or(|persisted| persisted.overlay.is_none())
+                {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                indexes_with_records.insert(index);
+            }
             _ => {}
         }
     }
@@ -4515,6 +5759,7 @@ fn validate_physical_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_target_physical_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     index: ObjectId,
@@ -4524,6 +5769,9 @@ fn validate_target_physical_entries(
     let mut generations = BTreeMap::<[u8; 32], PhysicalGenerationSummary>::new();
     let mut delta_count = 0_u64;
     let mut delta_bytes = 0_u64;
+    let mut overlay_manifest_count = 0_u64;
+    let mut overlay_delta_count = 0_u64;
+    let mut overlay_delta_bytes = 0_u64;
     for (key, value) in entries {
         match key.first().copied() {
             Some(ANN_VECTOR_PREFIX) => {
@@ -4574,11 +5822,54 @@ fn validate_target_physical_entries(
                     )
                     .ok_or(NativeRuntimeError::InvalidAnnTree)?;
             }
+            Some(ANN_OVERLAY_MANIFEST_PREFIX) => {
+                let found_index = decode_overlay_manifest_key(key)?;
+                if found_index != index || metadata.overlay.is_none() {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                decode_overlay_manifest(value)?;
+                overlay_manifest_count = overlay_manifest_count
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            }
+            Some(ANN_OVERLAY_DELTA_PREFIX) => {
+                let (found_index, object_id) = decode_overlay_delta_key(key)?;
+                if found_index != index || metadata.overlay.is_none() {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                let delta = decode_overlay_delta(value, object_id, definition)?;
+                overlay_delta_count = overlay_delta_count
+                    .checked_add(1)
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+                overlay_delta_bytes = overlay_delta_bytes
+                    .checked_add(
+                        u64::try_from(delta.encoded_len())
+                            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+                    )
+                    .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            }
+            Some(ANN_OVERLAY_NODE_PREFIX) => {
+                let (found_index, depth, _) = decode_overlay_node_key(key)?;
+                if found_index != index || metadata.overlay.is_none() {
+                    return Err(NativeRuntimeError::InvalidAnnTree);
+                }
+                decode_overlay_node(value, depth)?;
+            }
             _ => return Err(NativeRuntimeError::InvalidAnnTree),
         }
     }
     if delta_count != metadata.delta_count || delta_bytes != metadata.delta_bytes {
         return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    match metadata.overlay {
+        Some(overlay)
+            if overlay_manifest_count == 1
+                && overlay_delta_count == overlay.overlay_count
+                && overlay_delta_bytes == overlay.overlay_bytes => {}
+        None if overlay_manifest_count == 0
+            && overlay_delta_count == 0
+            && overlay_delta_bytes == 0 => {}
+        _ => return Err(NativeRuntimeError::InvalidAnnTree),
     }
     for child in metadata
         .retained_generations
@@ -4741,6 +6032,31 @@ fn delta_key(index: ObjectId, object_id: ObjectId) -> Vec<u8> {
     key
 }
 
+#[cfg(test)]
+fn overlay_manifest_key(index: ObjectId) -> Vec<u8> {
+    object_prefix(ANN_OVERLAY_MANIFEST_PREFIX, index)
+}
+
+#[cfg(test)]
+fn overlay_delta_key(index: ObjectId, object_id: ObjectId) -> Vec<u8> {
+    let mut key = object_prefix(ANN_OVERLAY_DELTA_PREFIX, index);
+    key.extend_from_slice(&object_id.get().to_be_bytes());
+    key
+}
+
+fn overlay_node_prefix(index: ObjectId, depth: u8) -> Vec<u8> {
+    let mut key = object_prefix(ANN_OVERLAY_NODE_PREFIX, index);
+    key.push(depth);
+    key
+}
+
+#[cfg(test)]
+fn overlay_node_key(index: ObjectId, depth: u8, path: u128) -> Vec<u8> {
+    let mut key = overlay_node_prefix(index, depth);
+    key.extend_from_slice(&path.to_be_bytes());
+    key
+}
+
 fn object_prefix(prefix: u8, index: ObjectId) -> Vec<u8> {
     let mut key = Vec::with_capacity(17);
     key.push(prefix);
@@ -4818,6 +6134,39 @@ fn decode_delta_key(key: &[u8]) -> Result<(ObjectId, ObjectId), NativeRuntimeErr
     Ok((decode_index(&key[1..17])?, decode_index(&key[17..33])?))
 }
 
+fn decode_overlay_manifest_key(key: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
+    if key.len() != ANN_INDEX_META_KEY_SIZE || key.first() != Some(&ANN_OVERLAY_MANIFEST_PREFIX) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    decode_index(&key[1..17])
+}
+
+fn decode_overlay_delta_key(key: &[u8]) -> Result<(ObjectId, ObjectId), NativeRuntimeError> {
+    if key.len() != ANN_DELTA_KEY_SIZE || key.first() != Some(&ANN_OVERLAY_DELTA_PREFIX) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok((decode_index(&key[1..17])?, decode_index(&key[17..33])?))
+}
+
+fn decode_overlay_node_key(key: &[u8]) -> Result<(ObjectId, u8, u128), NativeRuntimeError> {
+    if key.len() != ANN_OVERLAY_NODE_KEY_SIZE || key.first() != Some(&ANN_OVERLAY_NODE_PREFIX) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let depth = key[17];
+    if depth >= ANN_OVERLAY_TREE_DEPTH {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let path = u128::from_be_bytes(
+        key[18..34]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    );
+    if path != overlay_path_prefix(path, depth) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok((decode_index(&key[1..17])?, depth, path))
+}
+
 fn decode_index(encoded: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
     let bytes: [u8; 16] = encoded
         .try_into()
@@ -4825,10 +6174,52 @@ fn decode_index(encoded: &[u8]) -> Result<ObjectId, NativeRuntimeError> {
     ObjectId::new(u128::from_be_bytes(bytes)).map_err(|_| NativeRuntimeError::InvalidAnnTree)
 }
 
+fn decode_overlay_manifest(encoded: &[u8]) -> Result<OverlayManifest, NativeRuntimeError> {
+    if encoded.len() != ANN_OVERLAY_MANIFEST_SIZE
+        || encoded.get(..8) != Some(ANN_OVERLAY_MANIFEST_MAGIC.as_slice())
+        || encoded[176..184].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let manifest = OverlayManifest {
+        legacy_view_identity: encoded[8..40]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        overlay_root: encoded[40..72]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        view_identity: encoded[72..104]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        legacy_count: read_u64(&encoded[104..112]),
+        legacy_bytes: read_u64(&encoded[112..120]),
+        overlay_count: read_u64(&encoded[120..128]),
+        overlay_bytes: read_u64(&encoded[128..136]),
+        overlay_node_count: read_u64(&encoded[136..144]),
+        effective_count: read_u64(&encoded[144..152]),
+        effective_bytes: read_u64(&encoded[152..160]),
+        legacy_next_sequence: read_u64(&encoded[160..168]),
+        next_sequence: read_u64(&encoded[168..176]),
+    };
+    if [
+        manifest.legacy_view_identity,
+        manifest.overlay_root,
+        manifest.view_identity,
+    ]
+    .contains(&[0; 32])
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(manifest)
+}
+
 fn encode_initial_bulk_metadata(
     current: &AnnIndexState,
     snapshot: &PartitionedIndexSnapshot,
 ) -> Result<Vec<u8>, NativeRuntimeError> {
+    if current.persisted_version == 5 {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
+    }
     current
         .lifecycle
         .validate()
@@ -4994,7 +6385,7 @@ fn encode_metadata(state: &AnnIndexState) -> Result<Vec<u8>, NativeRuntimeError>
         .lifecycle
         .validate()
         .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
-    if state.next_sequence == 0 || state.view_identity == [0; 32] {
+    if state.persisted_version == 5 || state.next_sequence == 0 || state.view_identity == [0; 32] {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     let children = state.base.child_descriptors();
@@ -5215,6 +6606,11 @@ fn encode_delta_metadata(
 }
 
 fn decode_metadata(encoded: &[u8]) -> Result<PersistedIndexMetadata, NativeRuntimeError> {
+    if encoded.len() >= ANN_INDEX_META_V5_HEADER_SIZE
+        && encoded.get(..8) == Some(ANN_INDEX_META_MAGIC_V5.as_slice())
+    {
+        return decode_metadata_v5(encoded);
+    }
     if encoded.len() >= ANN_INDEX_META_V4_HEADER_SIZE
         && encoded.get(..8) == Some(ANN_INDEX_META_MAGIC_V4.as_slice())
     {
@@ -5303,6 +6699,7 @@ fn decode_metadata(encoded: &[u8]) -> Result<PersistedIndexMetadata, NativeRunti
         lifecycle,
         retained_generations,
         version,
+        overlay: None,
     })
 }
 
@@ -5384,7 +6781,168 @@ fn decode_metadata_v4(encoded: &[u8]) -> Result<PersistedIndexMetadata, NativeRu
         lifecycle,
         retained_generations,
         version: 4,
+        overlay: None,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_metadata_v5(encoded: &[u8]) -> Result<PersistedIndexMetadata, NativeRuntimeError> {
+    if encoded[153] != 0
+        || encoded[158..160].iter().any(|byte| *byte != 0)
+        || encoded[272..280].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let build_identity: [u8; 32] = encoded[8..40]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let view_identity: [u8; 32] = encoded[40..72]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let raw_input_identity: [u8; 32] = encoded[72..104]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let legacy_view_identity: [u8; 32] = encoded[160..192]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let overlay_root: [u8; 32] = encoded[192..224]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    if [
+        build_identity,
+        view_identity,
+        legacy_view_identity,
+        overlay_root,
+    ]
+    .contains(&[0; 32])
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let vector_count = read_u64(&encoded[104..112]);
+    let graph_node_count = read_u64(&encoded[112..120]);
+    let legacy_count = read_u64(&encoded[120..128]);
+    let legacy_bytes = read_u64(&encoded[128..136]);
+    let next_sequence = read_u64(&encoded[136..144]);
+    let lifecycle = decode_lifecycle(encoded, 5)?;
+    let base_kind = match encoded[152] {
+        ANN_BASE_SINGLE => PersistedBaseKind::Single,
+        ANN_BASE_PARTITIONED => PersistedBaseKind::Partitioned,
+        _ => return Err(NativeRuntimeError::InvalidAnnTree),
+    };
+    let child_count = usize::from(u16::from_le_bytes(
+        encoded[154..156]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    ));
+    let retained_count = usize::from(u16::from_le_bytes(
+        encoded[156..158]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    ));
+    let overlay = PersistedOverlayMetadata {
+        legacy_view_identity,
+        overlay_root,
+        overlay_count: read_u64(&encoded[224..232]),
+        overlay_bytes: read_u64(&encoded[232..240]),
+        overlay_node_count: read_u64(&encoded[240..248]),
+        effective_count: read_u64(&encoded[248..256]),
+        effective_bytes: read_u64(&encoded[256..264]),
+        legacy_next_sequence: read_u64(&encoded[264..272]),
+    };
+    validate_overlay_metadata(
+        legacy_count,
+        legacy_bytes,
+        next_sequence,
+        lifecycle,
+        overlay,
+    )?;
+    if child_count == 0 || retained_count > usize::from(lifecycle.retain_generations) {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let children_end = ANN_INDEX_META_V5_HEADER_SIZE
+        .checked_add(
+            child_count
+                .checked_mul(ANN_INDEX_META_V4_CHILD_SIZE)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        )
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if children_end > encoded.len() {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let children = encoded[ANN_INDEX_META_V5_HEADER_SIZE..children_end]
+        .chunks_exact(ANN_INDEX_META_V4_CHILD_SIZE)
+        .map(decode_child_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    let retained_generations =
+        decode_v4_retained_generations(encoded, children_end, retained_count)?;
+    validate_current_base_metadata(
+        base_kind,
+        build_identity,
+        raw_input_identity,
+        vector_count,
+        graph_node_count,
+        &children,
+    )?;
+    validate_retained_generations(&retained_generations, build_identity)?;
+    Ok(PersistedIndexMetadata {
+        build_identity,
+        vector_count,
+        base_kind,
+        input_identity: (base_kind == PersistedBaseKind::Partitioned).then_some(raw_input_identity),
+        children,
+        view_identity,
+        delta_count: legacy_count,
+        delta_bytes: legacy_bytes,
+        next_sequence,
+        lifecycle,
+        retained_generations,
+        version: 5,
+        overlay: Some(overlay),
+    })
+}
+
+fn validate_overlay_metadata(
+    legacy_count: u64,
+    legacy_bytes: u64,
+    next_sequence: u64,
+    lifecycle: IncrementalVectorLifecycle,
+    overlay: PersistedOverlayMetadata,
+) -> Result<(), NativeRuntimeError> {
+    let lifecycle_limit = u64::from(lifecycle.delta_max_entries);
+    let valid_empty_overlay = overlay.overlay_count != 0
+        || (overlay.overlay_bytes == 0
+            && overlay.overlay_node_count == 0
+            && overlay.overlay_root == overlay_empty_hash(0)
+            && next_sequence == overlay.legacy_next_sequence);
+    let valid_nonempty_overlay = overlay.overlay_count == 0
+        || (overlay.overlay_bytes
+            >= overlay
+                .overlay_count
+                .saturating_mul(ANN_DELTA_HEADER_SIZE as u64)
+            && overlay.overlay_node_count >= u64::from(ANN_OVERLAY_TREE_DEPTH)
+            && overlay.overlay_node_count
+                <= overlay
+                    .overlay_count
+                    .saturating_mul(u64::from(ANN_OVERLAY_TREE_DEPTH))
+            && next_sequence > overlay.legacy_next_sequence);
+    if legacy_count > lifecycle_limit
+        || legacy_bytes > MAX_ANN_DELTA_BYTES as u64
+        || legacy_bytes < legacy_count.saturating_mul(ANN_DELTA_HEADER_SIZE as u64)
+        || overlay.overlay_count > lifecycle_limit
+        || overlay.overlay_bytes > MAX_ANN_DELTA_BYTES as u64
+        || overlay.overlay_node_count > ANN_OVERLAY_MAX_NODES
+        || overlay.effective_count > lifecycle_limit
+        || overlay.effective_bytes > MAX_ANN_DELTA_BYTES as u64
+        || overlay.effective_count < legacy_count.max(overlay.overlay_count)
+        || overlay.effective_count > legacy_count.saturating_add(overlay.overlay_count)
+        || overlay.legacy_next_sequence == 0
+        || next_sequence < overlay.legacy_next_sequence
+        || !valid_empty_overlay
+        || !valid_nonempty_overlay
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(())
 }
 
 fn decode_v4_retained_generations(
@@ -5745,8 +7303,25 @@ fn decode_delta(
     object_id: ObjectId,
     definition: VectorIndexDefinition,
 ) -> Result<DeltaRecord, NativeRuntimeError> {
+    decode_delta_with_magic(encoded, object_id, definition, *ANN_DELTA_MAGIC)
+}
+
+fn decode_overlay_delta(
+    encoded: &[u8],
+    object_id: ObjectId,
+    definition: VectorIndexDefinition,
+) -> Result<DeltaRecord, NativeRuntimeError> {
+    decode_delta_with_magic(encoded, object_id, definition, *ANN_OVERLAY_DELTA_MAGIC)
+}
+
+fn decode_delta_with_magic(
+    encoded: &[u8],
+    object_id: ObjectId,
+    definition: VectorIndexDefinition,
+    magic: [u8; 8],
+) -> Result<DeltaRecord, NativeRuntimeError> {
     if encoded.len() < ANN_DELTA_HEADER_SIZE
-        || encoded.get(..8) != Some(ANN_DELTA_MAGIC.as_slice())
+        || encoded.get(..8) != Some(magic.as_slice())
         || encoded[9..16].iter().any(|byte| *byte != 0)
         || encoded[34..40].iter().any(|byte| *byte != 0)
     {
@@ -5791,6 +7366,73 @@ fn decode_delta(
         }
         _ => Err(NativeRuntimeError::InvalidAnnTree),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverlayNode {
+    depth: u8,
+    bitmap: u16,
+    node_hash: [u8; 32],
+    child_hashes: Vec<[u8; 32]>,
+}
+
+fn decode_overlay_node(encoded: &[u8], key_depth: u8) -> Result<OverlayNode, NativeRuntimeError> {
+    if encoded.len() < ANN_OVERLAY_NODE_HEADER_SIZE
+        || encoded.get(..8) != Some(ANN_OVERLAY_NODE_MAGIC.as_slice())
+        || encoded[10..16].iter().any(|byte| *byte != 0)
+        || encoded[8] != key_depth
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let child_count = usize::from(encoded[9]);
+    let bitmap = u16::from_le_bytes(
+        encoded[16..18]
+            .try_into()
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    );
+    if child_count == 0
+        || child_count > ANN_OVERLAY_FANOUT
+        || bitmap.count_ones() as usize != child_count
+        || encoded[18..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let expected = ANN_OVERLAY_NODE_HEADER_SIZE
+        .checked_add(
+            child_count
+                .checked_mul(32)
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?,
+        )
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    if encoded.len() != expected {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let node_hash = encoded[24..56]
+        .try_into()
+        .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+    let child_hashes = encoded[ANN_OVERLAY_NODE_HEADER_SIZE..]
+        .chunks_exact(32)
+        .map(|hash| {
+            hash.try_into()
+                .map_err(|_| NativeRuntimeError::InvalidAnnTree)
+        })
+        .collect::<Result<Vec<[u8; 32]>, _>>()?;
+    if child_hashes
+        .iter()
+        .any(|hash| *hash == overlay_empty_hash(key_depth.saturating_add(1)))
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let calculated = overlay_node_hash(key_depth, bitmap, &child_hashes)?;
+    if node_hash != calculated {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(OverlayNode {
+        depth: key_depth,
+        bitmap,
+        node_hash,
+        child_hashes,
+    })
 }
 
 fn encode_graph_layer(neighbors: &[ObjectId]) -> Result<Vec<u8>, NativeRuntimeError> {
@@ -5893,6 +7535,141 @@ fn calculate_view_identity_at_csn(
     *hasher.finalize().as_bytes()
 }
 
+fn overlay_empty_hash(depth: u8) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-overlay-empty-v1");
+    hasher.update(&[depth]);
+    *hasher.finalize().as_bytes()
+}
+
+fn overlay_leaf_hash(object_id: ObjectId, encoded: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-overlay-leaf-v1");
+    hasher.update(&object_id.get().to_be_bytes());
+    hasher.update(
+        &u64::try_from(encoded.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(encoded);
+    *hasher.finalize().as_bytes()
+}
+
+fn overlay_node_hash(
+    depth: u8,
+    bitmap: u16,
+    child_hashes: &[[u8; 32]],
+) -> Result<[u8; 32], NativeRuntimeError> {
+    if depth >= ANN_OVERLAY_TREE_DEPTH
+        || bitmap == 0
+        || bitmap.count_ones() as usize != child_hashes.len()
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let empty = overlay_empty_hash(depth.saturating_add(1));
+    let mut present = child_hashes.iter();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-overlay-node-v1");
+    hasher.update(&[depth]);
+    hasher.update(&bitmap.to_le_bytes());
+    for position in 0..ANN_OVERLAY_FANOUT {
+        if bitmap & (1_u16 << position) == 0 {
+            hasher.update(&empty);
+        } else {
+            let child = present.next().ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            if *child == empty {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            hasher.update(child);
+        }
+    }
+    if present.next().is_some() {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn overlay_view_identity(base_identity: [u8; 32], manifest: OverlayManifest) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-ann-overlay-view-v1");
+    hasher.update(&base_identity);
+    hasher.update(&manifest.legacy_view_identity);
+    hasher.update(&manifest.overlay_root);
+    hasher.update(&manifest.legacy_count.to_le_bytes());
+    hasher.update(&manifest.legacy_bytes.to_le_bytes());
+    hasher.update(&manifest.overlay_count.to_le_bytes());
+    hasher.update(&manifest.overlay_bytes.to_le_bytes());
+    hasher.update(&manifest.overlay_node_count.to_le_bytes());
+    hasher.update(&manifest.effective_count.to_le_bytes());
+    hasher.update(&manifest.effective_bytes.to_le_bytes());
+    hasher.update(&manifest.legacy_next_sequence.to_le_bytes());
+    hasher.update(&manifest.next_sequence.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn overlay_path_prefix(path: u128, depth: u8) -> u128 {
+    if depth == 0 {
+        0
+    } else {
+        path & (u128::MAX << (u32::from(ANN_OVERLAY_TREE_DEPTH - depth) * 4))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedOverlayNode {
+    path: u128,
+    node: OverlayNode,
+}
+
+type OverlayFrontier = BTreeMap<u128, [u8; 32]>;
+type ExpectedOverlayLevel = (OverlayFrontier, Vec<ExpectedOverlayNode>);
+
+fn expected_overlay_level(
+    frontier: &OverlayFrontier,
+    depth: u8,
+) -> Result<ExpectedOverlayLevel, NativeRuntimeError> {
+    if depth >= ANN_OVERLAY_TREE_DEPTH || frontier.is_empty() {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let mut grouped = BTreeMap::<u128, [Option<[u8; 32]>; ANN_OVERLAY_FANOUT]>::new();
+    let shift = u32::from(ANN_OVERLAY_TREE_DEPTH - depth - 1) * 4;
+    for (path, hash) in frontier {
+        let parent = overlay_path_prefix(*path, depth);
+        let position = usize::try_from((path >> shift) & 0x0f)
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+        let child = &mut grouped.entry(parent).or_insert([None; ANN_OVERLAY_FANOUT])[position];
+        if child.replace(*hash).is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    let mut parents = BTreeMap::new();
+    let mut expected = Vec::with_capacity(grouped.len());
+    for (path, children) in grouped {
+        let mut bitmap = 0_u16;
+        let mut child_hashes = Vec::new();
+        for (position, child) in children.into_iter().enumerate() {
+            if let Some(child) = child {
+                bitmap |= 1_u16 << position;
+                child_hashes.push(child);
+            }
+        }
+        let node_hash = overlay_node_hash(depth, bitmap, &child_hashes)?;
+        if parents.insert(path, node_hash).is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        expected.push(ExpectedOverlayNode {
+            path,
+            node: OverlayNode {
+                depth,
+                bitmap,
+                node_hash,
+                child_hashes,
+            },
+        });
+    }
+    Ok((parents, expected))
+}
+
 fn validate_vector(
     definition: VectorIndexDefinition,
     vector: &Vector,
@@ -5950,6 +7727,263 @@ fn read_u64(encoded: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum TestOverlayMutation {
+    Upsert(ObjectId, Vector),
+    Tombstone(ObjectId),
+}
+
+#[cfg(test)]
+pub(crate) struct TestM05Installation {
+    pub(crate) tree: BTree,
+    pub(crate) view_identity: [u8; 32],
+    pub(crate) node_count: usize,
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+pub(crate) fn install_test_m05_tree(
+    pages: &mut PageStore,
+    buffer_pool: &BufferPool,
+    root: PageId,
+    definition: VectorIndexDefinition,
+    mutation_csn: Csn,
+    mutations: &[TestOverlayMutation],
+) -> Result<TestM05Installation, NativeRuntimeError> {
+    let plan = plan_index_load(pages, buffer_pool, root, definition.index_id(), definition)?;
+    let (state, _, _) = load_planned_index_with_entries(pages, buffer_pool, &plan, None)?;
+    if state.persisted_version != 4 {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    let legacy_next_sequence = state.next_sequence;
+    let legacy_view_identity = calculate_view_identity(
+        state.base.build_identity(),
+        legacy_next_sequence,
+        &state.deltas,
+    );
+    let mut sequence = legacy_next_sequence;
+    let mut overlay_deltas = BTreeMap::new();
+    for mutation in mutations {
+        let (object_id, delta) = match mutation {
+            TestOverlayMutation::Upsert(object_id, vector) => {
+                validate_vector(definition, vector)?;
+                (
+                    *object_id,
+                    DeltaRecord::Upsert {
+                        sequence,
+                        record: VectorRecord {
+                            object_id: *object_id,
+                            creating_csn: mutation_csn,
+                            vector: vector.clone(),
+                        },
+                    },
+                )
+            }
+            TestOverlayMutation::Tombstone(object_id) => (
+                *object_id,
+                DeltaRecord::Tombstone {
+                    sequence,
+                    mutation_csn,
+                },
+            ),
+        };
+        if overlay_deltas.insert(object_id, delta).is_some() {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        sequence = sequence
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    }
+    let mut replacements = BTreeMap::new();
+    let mut frontier = BTreeMap::new();
+    for (object_id, delta) in &overlay_deltas {
+        let encoded = test_encode_overlay_delta(delta)?;
+        frontier.insert(object_id.get(), overlay_leaf_hash(*object_id, &encoded));
+        replacements.insert(
+            overlay_delta_key(definition.index_id(), *object_id),
+            encoded,
+        );
+    }
+    let mut node_count = 0_u64;
+    if !frontier.is_empty() {
+        for depth in (0..ANN_OVERLAY_TREE_DEPTH).rev() {
+            let (parents, nodes) = expected_overlay_level(&frontier, depth)?;
+            for node in &nodes {
+                replacements.insert(
+                    overlay_node_key(definition.index_id(), depth, node.path),
+                    test_encode_overlay_node(&node.node)?,
+                );
+            }
+            node_count = node_count
+                .checked_add(
+                    u64::try_from(nodes.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+                )
+                .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+            frontier = parents;
+        }
+    }
+    let overlay_root = if overlay_deltas.is_empty() {
+        overlay_empty_hash(0)
+    } else {
+        *frontier.get(&0).ok_or(NativeRuntimeError::InvalidAnnTree)?
+    };
+    let mut effective = state.deltas.clone();
+    effective.extend(overlay_deltas.clone());
+    let mut manifest = OverlayManifest {
+        legacy_view_identity,
+        overlay_root,
+        view_identity: [0; 32],
+        legacy_count: u64::try_from(state.deltas.len())
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        legacy_bytes: delta_map_bytes(&state.deltas)?,
+        overlay_count: u64::try_from(overlay_deltas.len())
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        overlay_bytes: delta_map_bytes(&overlay_deltas)?,
+        overlay_node_count: node_count,
+        effective_count: u64::try_from(effective.len())
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        effective_bytes: delta_map_bytes(&effective)?,
+        legacy_next_sequence,
+        next_sequence: sequence,
+    };
+    manifest.view_identity = overlay_view_identity(state.base.build_identity(), manifest);
+    replacements.insert(
+        meta_key(definition.index_id()),
+        test_encode_metadata_v5(&state, manifest)?,
+    );
+    replacements.insert(
+        overlay_manifest_key(definition.index_id()),
+        test_encode_overlay_manifest(manifest),
+    );
+    let tree = BTree::from_root(root)
+        .upsert_sorted_batch(pages, mutation_csn, replacements.into_iter().collect())?
+        .tree;
+    Ok(TestM05Installation {
+        tree,
+        view_identity: manifest.view_identity,
+        node_count: usize::try_from(node_count).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn verify_test_m05_rejects_initial_bulk(
+    pages: &mut PageStore,
+    root: PageId,
+    catalog: &CatalogState,
+    definition: VectorIndexDefinition,
+    creating_csn: Csn,
+) -> Result<(), NativeRuntimeError> {
+    match capture_initial_bulk_authority(pages, root, catalog, definition.index_id()) {
+        Err(NativeRuntimeError::InvalidPreparedMutation) => {}
+        Err(error) => return Err(error),
+        Ok(_) => return Err(NativeRuntimeError::InvalidAnnTree),
+    }
+    let current = load_from_tree(pages, Some(root), catalog, true)?
+        .indexes
+        .remove(&definition.index_id())
+        .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+    let record = VectorRecord {
+        object_id: ObjectId::new(u128::MAX).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+        creating_csn,
+        vector: Vector::new(std::iter::repeat_n(
+            1.0,
+            usize::from(definition.dimension()),
+        ))?,
+    };
+    let plan = HnswPartitionPlan::build(definition, [record], 1)?;
+    let candidate = PartitionedHnswIndex::build(&plan)?.export_snapshot();
+    let publication = crate::InitialAnnBulkPublication {
+        index: definition.index_id(),
+        expected_base_identity: current.base.build_identity(),
+        expected_view_identity: current.view_identity,
+        candidate_csn: creating_csn,
+        candidate,
+    };
+    let pages_before = pages.page_count();
+    match publish_initial_bulk_tree(pages, Some(root), creating_csn, catalog, &publication) {
+        Err(NativeRuntimeError::InitialAnnBulkStale) => {}
+        Err(error) => return Err(error),
+        Ok(_) => return Err(NativeRuntimeError::InvalidAnnTree),
+    }
+    if pages.page_count() != pages_before {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_encode_overlay_delta(delta: &DeltaRecord) -> Result<Vec<u8>, NativeRuntimeError> {
+    let mut encoded = encode_delta(delta)?;
+    encoded[..8].copy_from_slice(ANN_OVERLAY_DELTA_MAGIC);
+    Ok(encoded)
+}
+
+#[cfg(test)]
+fn test_encode_overlay_node(node: &OverlayNode) -> Result<Vec<u8>, NativeRuntimeError> {
+    let mut encoded = Vec::with_capacity(
+        ANN_OVERLAY_NODE_HEADER_SIZE.saturating_add(node.child_hashes.len().saturating_mul(32)),
+    );
+    encoded.extend_from_slice(ANN_OVERLAY_NODE_MAGIC);
+    encoded.push(node.depth);
+    encoded.push(
+        u8::try_from(node.child_hashes.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?,
+    );
+    encoded.extend_from_slice(&[0; 6]);
+    encoded.extend_from_slice(&node.bitmap.to_le_bytes());
+    encoded.extend_from_slice(&[0; 6]);
+    encoded.extend_from_slice(&node.node_hash);
+    for child in &node.child_hashes {
+        encoded.extend_from_slice(child);
+    }
+    Ok(encoded)
+}
+
+#[cfg(test)]
+fn test_encode_overlay_manifest(manifest: OverlayManifest) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(ANN_OVERLAY_MANIFEST_SIZE);
+    encoded.extend_from_slice(ANN_OVERLAY_MANIFEST_MAGIC);
+    encoded.extend_from_slice(&manifest.legacy_view_identity);
+    encoded.extend_from_slice(&manifest.overlay_root);
+    encoded.extend_from_slice(&manifest.view_identity);
+    encoded.extend_from_slice(&manifest.legacy_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.legacy_bytes.to_le_bytes());
+    encoded.extend_from_slice(&manifest.overlay_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.overlay_bytes.to_le_bytes());
+    encoded.extend_from_slice(&manifest.overlay_node_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.effective_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.effective_bytes.to_le_bytes());
+    encoded.extend_from_slice(&manifest.legacy_next_sequence.to_le_bytes());
+    encoded.extend_from_slice(&manifest.next_sequence.to_le_bytes());
+    encoded.extend_from_slice(&[0; 8]);
+    encoded
+}
+
+#[cfg(test)]
+fn test_encode_metadata_v5(
+    state: &AnnIndexState,
+    manifest: OverlayManifest,
+) -> Result<Vec<u8>, NativeRuntimeError> {
+    let current = encode_metadata(state)?;
+    let mut encoded = current[..ANN_INDEX_META_V4_HEADER_SIZE].to_vec();
+    encoded[..8].copy_from_slice(ANN_INDEX_META_MAGIC_V5);
+    encoded[40..72].copy_from_slice(&manifest.view_identity);
+    encoded[120..128].copy_from_slice(&manifest.legacy_count.to_le_bytes());
+    encoded[128..136].copy_from_slice(&manifest.legacy_bytes.to_le_bytes());
+    encoded[136..144].copy_from_slice(&manifest.next_sequence.to_le_bytes());
+    encoded.extend_from_slice(&manifest.legacy_view_identity);
+    encoded.extend_from_slice(&manifest.overlay_root);
+    encoded.extend_from_slice(&manifest.overlay_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.overlay_bytes.to_le_bytes());
+    encoded.extend_from_slice(&manifest.overlay_node_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.effective_count.to_le_bytes());
+    encoded.extend_from_slice(&manifest.effective_bytes.to_le_bytes());
+    encoded.extend_from_slice(&manifest.legacy_next_sequence.to_le_bytes());
+    encoded.extend_from_slice(&[0; 8]);
+    encoded.extend_from_slice(&current[ANN_INDEX_META_V4_HEADER_SIZE..]);
+    Ok(encoded)
+}
+
+#[cfg(test)]
 mod tests {
     use hyphae_native_ann::HnswPartitionPlan;
 
@@ -5991,6 +8025,7 @@ mod tests {
             next_sequence: 1,
             lifecycle: DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
             retained_generations: Vec::new(),
+            persisted_version: 4,
         })
     }
 
@@ -6046,6 +8081,927 @@ mod tests {
             encoded.extend_from_slice(&[0; 6]);
         }
         Ok(encoded)
+    }
+
+    #[derive(Clone)]
+    struct OverlayFixture {
+        definition: VectorIndexDefinition,
+        metadata: Vec<u8>,
+        entries: Vec<KeyValue>,
+        legacy_objects: BTreeSet<ObjectId>,
+        overlay_objects: BTreeSet<ObjectId>,
+    }
+
+    fn encode_overlay_delta_for_test(delta: &DeltaRecord) -> Result<Vec<u8>, NativeRuntimeError> {
+        let mut encoded = encode_delta(delta)?;
+        encoded[..8].copy_from_slice(ANN_OVERLAY_DELTA_MAGIC);
+        Ok(encoded)
+    }
+
+    fn encode_overlay_node_for_test(node: &OverlayNode) -> Result<Vec<u8>, NativeRuntimeError> {
+        let child_count = u8::try_from(node.child_hashes.len())
+            .map_err(|_| NativeRuntimeError::InvalidAnnTree)?;
+        let mut encoded = Vec::with_capacity(
+            ANN_OVERLAY_NODE_HEADER_SIZE.saturating_add(node.child_hashes.len().saturating_mul(32)),
+        );
+        encoded.extend_from_slice(ANN_OVERLAY_NODE_MAGIC);
+        encoded.push(node.depth);
+        encoded.push(child_count);
+        encoded.extend_from_slice(&[0; 6]);
+        encoded.extend_from_slice(&node.bitmap.to_le_bytes());
+        encoded.extend_from_slice(&[0; 6]);
+        encoded.extend_from_slice(&node.node_hash);
+        for child in &node.child_hashes {
+            encoded.extend_from_slice(child);
+        }
+        if encoded.len()
+            != ANN_OVERLAY_NODE_HEADER_SIZE.saturating_add(node.child_hashes.len() * 32)
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(encoded)
+    }
+
+    fn encode_overlay_manifest_for_test(manifest: OverlayManifest) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(ANN_OVERLAY_MANIFEST_SIZE);
+        encoded.extend_from_slice(ANN_OVERLAY_MANIFEST_MAGIC);
+        encoded.extend_from_slice(&manifest.legacy_view_identity);
+        encoded.extend_from_slice(&manifest.overlay_root);
+        encoded.extend_from_slice(&manifest.view_identity);
+        encoded.extend_from_slice(&manifest.legacy_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.legacy_bytes.to_le_bytes());
+        encoded.extend_from_slice(&manifest.overlay_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.overlay_bytes.to_le_bytes());
+        encoded.extend_from_slice(&manifest.overlay_node_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.effective_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.effective_bytes.to_le_bytes());
+        encoded.extend_from_slice(&manifest.legacy_next_sequence.to_le_bytes());
+        encoded.extend_from_slice(&manifest.next_sequence.to_le_bytes());
+        encoded.extend_from_slice(&[0; 8]);
+        encoded
+    }
+
+    fn encode_metadata_v5_for_test(
+        state: &AnnIndexState,
+        manifest: OverlayManifest,
+    ) -> Result<Vec<u8>, NativeRuntimeError> {
+        let current = encode_metadata(state)?;
+        let mut encoded = current[..ANN_INDEX_META_V4_HEADER_SIZE].to_vec();
+        encoded[..8].copy_from_slice(ANN_INDEX_META_MAGIC_V5);
+        encoded[40..72].copy_from_slice(&manifest.view_identity);
+        encoded[120..128].copy_from_slice(&manifest.legacy_count.to_le_bytes());
+        encoded[128..136].copy_from_slice(&manifest.legacy_bytes.to_le_bytes());
+        encoded[136..144].copy_from_slice(&manifest.next_sequence.to_le_bytes());
+        encoded.extend_from_slice(&manifest.legacy_view_identity);
+        encoded.extend_from_slice(&manifest.overlay_root);
+        encoded.extend_from_slice(&manifest.overlay_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.overlay_bytes.to_le_bytes());
+        encoded.extend_from_slice(&manifest.overlay_node_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.effective_count.to_le_bytes());
+        encoded.extend_from_slice(&manifest.effective_bytes.to_le_bytes());
+        encoded.extend_from_slice(&manifest.legacy_next_sequence.to_le_bytes());
+        encoded.extend_from_slice(&[0; 8]);
+        encoded.extend_from_slice(&current[ANN_INDEX_META_V4_HEADER_SIZE..]);
+        Ok(encoded)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn overlay_fixture() -> Result<OverlayFixture, Box<dyn std::error::Error>> {
+        let definition = definition()?;
+        let base = HnswIndex::build(
+            definition,
+            [
+                VectorRecord {
+                    object_id: ObjectId::new(1)?,
+                    creating_csn: Csn::new(1)?,
+                    vector: Vector::new([1.0, 1.0])?,
+                },
+                VectorRecord {
+                    object_id: ObjectId::new(2)?,
+                    creating_csn: Csn::new(1)?,
+                    vector: Vector::new([2.0, 2.0])?,
+                },
+                VectorRecord {
+                    object_id: ObjectId::new(3)?,
+                    creating_csn: Csn::new(1)?,
+                    vector: Vector::new([3.0, 3.0])?,
+                },
+            ],
+        )?;
+        let state = AnnIndexState::new(base, DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE);
+        let legacy_deltas = BTreeMap::from([
+            (
+                ObjectId::new(1)?,
+                DeltaRecord::Upsert {
+                    sequence: 1,
+                    record: VectorRecord {
+                        object_id: ObjectId::new(1)?,
+                        creating_csn: Csn::new(2)?,
+                        vector: Vector::new([4.0, 4.0])?,
+                    },
+                },
+            ),
+            (
+                ObjectId::new(4)?,
+                DeltaRecord::Upsert {
+                    sequence: 2,
+                    record: VectorRecord {
+                        object_id: ObjectId::new(4)?,
+                        creating_csn: Csn::new(2)?,
+                        vector: Vector::new([5.0, 5.0])?,
+                    },
+                },
+            ),
+        ]);
+        let overlay_deltas = BTreeMap::from([
+            (
+                ObjectId::new(1)?,
+                DeltaRecord::Tombstone {
+                    sequence: 3,
+                    mutation_csn: Csn::new(3)?,
+                },
+            ),
+            (
+                ObjectId::new(4)?,
+                DeltaRecord::Upsert {
+                    sequence: 4,
+                    record: VectorRecord {
+                        object_id: ObjectId::new(4)?,
+                        creating_csn: Csn::new(3)?,
+                        vector: Vector::new([0.5, 0.5])?,
+                    },
+                },
+            ),
+            (
+                ObjectId::new(5)?,
+                DeltaRecord::Upsert {
+                    sequence: 5,
+                    record: VectorRecord {
+                        object_id: ObjectId::new(5)?,
+                        creating_csn: Csn::new(3)?,
+                        vector: Vector::new([6.0, 6.0])?,
+                    },
+                },
+            ),
+        ]);
+        let legacy_next_sequence = 3;
+        let next_sequence = 6;
+        let legacy_view_identity = calculate_view_identity(
+            state.base.build_identity(),
+            legacy_next_sequence,
+            &legacy_deltas,
+        );
+        let mut entries = BTreeMap::new();
+        append_base_generation_entries(&mut entries, &state.base)?;
+        for (object_id, delta) in &legacy_deltas {
+            entries.insert(
+                delta_key(definition.index_id(), *object_id),
+                encode_delta(delta)?,
+            );
+        }
+        let mut frontier = BTreeMap::new();
+        for (object_id, delta) in &overlay_deltas {
+            let encoded = encode_overlay_delta_for_test(delta)?;
+            frontier.insert(object_id.get(), overlay_leaf_hash(*object_id, &encoded));
+            entries.insert(
+                overlay_delta_key(definition.index_id(), *object_id),
+                encoded,
+            );
+        }
+        let mut overlay_node_count = 0_u64;
+        for depth in (0..ANN_OVERLAY_TREE_DEPTH).rev() {
+            let (parents, nodes) = expected_overlay_level(&frontier, depth)?;
+            for node in &nodes {
+                entries.insert(
+                    overlay_node_key(definition.index_id(), depth, node.path),
+                    encode_overlay_node_for_test(&node.node)?,
+                );
+            }
+            overlay_node_count = overlay_node_count
+                .checked_add(u64::try_from(nodes.len())?)
+                .ok_or("overlay node count overflow")?;
+            frontier = parents;
+        }
+        let overlay_root = *frontier.get(&0).ok_or("missing overlay root")?;
+        let mut effective = legacy_deltas.clone();
+        effective.extend(overlay_deltas.clone());
+        let mut manifest = OverlayManifest {
+            legacy_view_identity,
+            overlay_root,
+            view_identity: [0; 32],
+            legacy_count: u64::try_from(legacy_deltas.len())?,
+            legacy_bytes: delta_map_bytes(&legacy_deltas)?,
+            overlay_count: u64::try_from(overlay_deltas.len())?,
+            overlay_bytes: delta_map_bytes(&overlay_deltas)?,
+            overlay_node_count,
+            effective_count: u64::try_from(effective.len())?,
+            effective_bytes: delta_map_bytes(&effective)?,
+            legacy_next_sequence,
+            next_sequence,
+        };
+        manifest.view_identity = overlay_view_identity(state.base.build_identity(), manifest);
+        entries.insert(
+            overlay_manifest_key(definition.index_id()),
+            encode_overlay_manifest_for_test(manifest),
+        );
+        Ok(OverlayFixture {
+            definition,
+            metadata: encode_metadata_v5_for_test(&state, manifest)?,
+            entries: entries.into_iter().collect(),
+            legacy_objects: legacy_deltas.keys().copied().collect(),
+            overlay_objects: overlay_deltas.keys().copied().collect(),
+        })
+    }
+
+    fn restore_overlay_fixture(
+        fixture: &OverlayFixture,
+    ) -> Result<AnnIndexState, NativeRuntimeError> {
+        restore_index_with_definition(
+            &fixture.entries,
+            fixture.definition.index_id(),
+            fixture.definition,
+            decode_metadata(&fixture.metadata)?,
+        )
+    }
+
+    #[test]
+    fn metadata_v5_composes_frozen_legacy_overlay_and_base_for_both_query_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        let metadata = decode_metadata(&fixture.metadata)?;
+        let overlay = metadata.overlay.ok_or("missing overlay metadata")?;
+        assert_eq!(metadata.version, 5);
+        assert_eq!(metadata.delta_count, 2);
+        assert_eq!(overlay.overlay_count, 3);
+        assert_eq!(overlay.effective_count, 3);
+        assert_eq!(
+            fixture.legacy_objects,
+            [ObjectId::new(1)?, ObjectId::new(4)?].into()
+        );
+        assert_eq!(
+            fixture.overlay_objects,
+            [ObjectId::new(1)?, ObjectId::new(4)?, ObjectId::new(5)?].into()
+        );
+
+        let mut restored = restore_overlay_fixture(&fixture)?;
+        let records = restored.effective_vectors();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.object_id)
+                .collect::<Vec<_>>(),
+            [
+                ObjectId::new(2)?,
+                ObjectId::new(3)?,
+                ObjectId::new(4)?,
+                ObjectId::new(5)?,
+            ]
+        );
+        assert_eq!(records[2].vector, Vector::new([0.5, 0.5])?);
+        let query = Vector::new([0.0, 0.0])?;
+        let exact = restored.search_exact(&query, 4, None)?;
+        let approximate = restored.search(&query, SearchOptions::new(4, 32, Some(32))?, None)?;
+        assert_eq!(approximate.hits, exact);
+        assert_eq!(approximate.build_identity, metadata.view_identity);
+
+        assert!(matches!(
+            restored.upsert(ObjectId::new(9)?, Csn::new(9)?, Vector::new([9.0, 9.0])?),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            restored.delete(ObjectId::new(2)?, Csn::new(9)?),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(encode_metadata(&restored).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_codecs_reject_every_header_path_truncation_and_trailing_byte()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        for length in 0..fixture.metadata.len() {
+            assert!(decode_metadata(&fixture.metadata[..length]).is_err());
+        }
+        let mut trailing_metadata = fixture.metadata.clone();
+        trailing_metadata.push(0);
+        assert!(decode_metadata(&trailing_metadata).is_err());
+        let mut unsupported_metadata = fixture.metadata.clone();
+        unsupported_metadata[7] = b'6';
+        assert!(decode_metadata(&unsupported_metadata).is_err());
+
+        let (_, manifest) = fixture
+            .entries
+            .iter()
+            .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_MANIFEST_PREFIX))
+            .ok_or("missing manifest")?;
+        for length in 0..manifest.len() {
+            assert!(decode_overlay_manifest(&manifest[..length]).is_err());
+        }
+        let mut trailing_manifest = manifest.clone();
+        trailing_manifest.push(0);
+        assert!(decode_overlay_manifest(&trailing_manifest).is_err());
+
+        let (leaf_key, leaf) = fixture
+            .entries
+            .iter()
+            .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_DELTA_PREFIX))
+            .ok_or("missing overlay leaf")?;
+        let (_, object_id) = decode_overlay_delta_key(leaf_key)?;
+        for length in 0..leaf.len() {
+            assert!(decode_overlay_delta(&leaf[..length], object_id, fixture.definition).is_err());
+        }
+        let mut trailing_leaf = leaf.clone();
+        trailing_leaf.push(0);
+        assert!(decode_overlay_delta(&trailing_leaf, object_id, fixture.definition).is_err());
+
+        let (node_key, node) = fixture
+            .entries
+            .iter()
+            .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+            .ok_or("missing overlay node")?;
+        let (_, depth, _) = decode_overlay_node_key(node_key)?;
+        for length in 0..node.len() {
+            assert!(decode_overlay_node(&node[..length], depth).is_err());
+        }
+        let mut trailing_node = node.clone();
+        trailing_node.push(0);
+        assert!(decode_overlay_node(&trailing_node, depth).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_and_manifest_corruption_matrix_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        for offset in [
+            0, 8, 40, 72, 104, 112, 120, 128, 136, 144, 148, 150, 152, 153, 154, 156, 158, 160,
+            192, 224, 232, 240, 248, 256, 264, 272, 280, 312, 320, 328, 344, 346,
+        ] {
+            let mut corrupted = fixture.clone();
+            if offset == 148 {
+                corrupted.metadata[148..150].fill(0);
+            } else {
+                corrupted.metadata[offset] ^= 1;
+            }
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "metadata offset {offset}"
+            );
+        }
+        for offset in [
+            0, 8, 40, 72, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176,
+        ] {
+            let mut corrupted = fixture.clone();
+            let manifest = corrupted
+                .entries
+                .iter_mut()
+                .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_MANIFEST_PREFIX))
+                .ok_or("missing manifest")?;
+            manifest.1[offset] ^= 1;
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "manifest offset {offset}"
+            );
+        }
+        let mut missing = fixture.clone();
+        missing
+            .entries
+            .retain(|(key, _)| key.first() != Some(&ANN_OVERLAY_MANIFEST_PREFIX));
+        assert!(restore_overlay_fixture(&missing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_leaf_corruption_matrix_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        for key_offset in [0, 1, 32] {
+            let mut corrupted = fixture.clone();
+            let leaf = corrupted
+                .entries
+                .iter_mut()
+                .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_DELTA_PREFIX))
+                .ok_or("missing overlay leaf")?;
+            leaf.0[key_offset] ^= 1;
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "leaf key {key_offset}"
+            );
+        }
+        for value_offset in [0, 8, 9, 16, 24, 32, 34, 40] {
+            let mut corrupted = fixture.clone();
+            let leaf = corrupted
+                .entries
+                .iter_mut()
+                .find(|(key, _)| {
+                    key.first() == Some(&ANN_OVERLAY_DELTA_PREFIX) && key.last() == Some(&4)
+                })
+                .ok_or("missing overlay upsert")?;
+            leaf.1[value_offset] ^= 1;
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "leaf value {value_offset}"
+            );
+        }
+        let mut duplicate_sequence = fixture.clone();
+        let leaf = duplicate_sequence
+            .entries
+            .iter_mut()
+            .find(|(key, _)| {
+                key.first() == Some(&ANN_OVERLAY_DELTA_PREFIX) && key.last() == Some(&4)
+            })
+            .ok_or("missing overlay upsert")?;
+        leaf.1[16..24].copy_from_slice(&3_u64.to_le_bytes());
+        assert!(restore_overlay_fixture(&duplicate_sequence).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_node_corruption_reachability_and_explicit_empty_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        for key_offset in [0, 1, 17, 33] {
+            let mut corrupted = fixture.clone();
+            let node = corrupted
+                .entries
+                .iter_mut()
+                .find(|(key, _)| {
+                    key.first() == Some(&ANN_OVERLAY_NODE_PREFIX) && key.get(17) == Some(&31)
+                })
+                .ok_or("missing depth-31 node")?;
+            node.0[key_offset] ^= 1;
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "node key {key_offset}"
+            );
+        }
+        for value_offset in [0, 8, 9, 10, 16, 18, 24, 56] {
+            let mut corrupted = fixture.clone();
+            let node = corrupted
+                .entries
+                .iter_mut()
+                .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+                .ok_or("missing node")?;
+            node.1[value_offset] ^= 1;
+            assert!(
+                restore_overlay_fixture(&corrupted).is_err(),
+                "node value {value_offset}"
+            );
+        }
+        let mut explicit_empty = fixture.clone();
+        let node = explicit_empty
+            .entries
+            .iter_mut()
+            .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+            .ok_or("missing node")?;
+        let (_, depth, _) = decode_overlay_node_key(&node.0)?;
+        node.1[56..88].copy_from_slice(&overlay_empty_hash(depth.saturating_add(1)));
+        assert!(restore_overlay_fixture(&explicit_empty).is_err());
+
+        let mut reordered = fixture.clone();
+        let node = reordered
+            .entries
+            .iter_mut()
+            .find(|(key, _)| {
+                key.first() == Some(&ANN_OVERLAY_NODE_PREFIX) && key.get(17) == Some(&31)
+            })
+            .ok_or("missing branching node")?;
+        let mut decoded = decode_overlay_node(&node.1, 31)?;
+        decoded.child_hashes.swap(0, 1);
+        decoded.node_hash = overlay_node_hash(31, decoded.bitmap, &decoded.child_hashes)?;
+        node.1 = encode_overlay_node_for_test(&decoded)?;
+        assert!(restore_overlay_fixture(&reordered).is_err());
+
+        let mut missing = fixture.clone();
+        let position = missing
+            .entries
+            .iter()
+            .position(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+            .ok_or("missing node")?;
+        missing.entries.remove(position);
+        assert!(restore_overlay_fixture(&missing).is_err());
+
+        let mut unreachable = fixture.clone();
+        let mut extra = unreachable
+            .entries
+            .iter()
+            .find(|(key, _)| {
+                key.first() == Some(&ANN_OVERLAY_NODE_PREFIX) && key.get(17) == Some(&31)
+            })
+            .cloned()
+            .ok_or("missing depth-31 node")?;
+        extra.0[33] = extra.0[33].wrapping_add(0x10);
+        unreachable.entries.push(extra);
+        unreachable
+            .entries
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(restore_overlay_fixture(&unreachable).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_metadata_rejects_every_overlay_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition()?;
+        let base = HnswIndex::build(
+            definition,
+            [VectorRecord {
+                object_id: ObjectId::new(2)?,
+                creating_csn: Csn::new(1)?,
+                vector: Vector::new([2.0, 2.0])?,
+            }],
+        )?;
+        let snapshot = base.export_snapshot();
+        let state = AnnIndexState::new(base, DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE);
+        let mut metadata_versions = [1, 2, 3]
+            .into_iter()
+            .map(|version| encode_legacy_metadata(&snapshot, version))
+            .collect::<Result<Vec<_>, _>>()?;
+        metadata_versions.push(encode_metadata(&state)?);
+        let mut base_entries = BTreeMap::new();
+        append_base_generation_entries(&mut base_entries, &state.base)?;
+        let fixture = overlay_fixture()?;
+        for encoded_metadata in metadata_versions {
+            let metadata = decode_metadata(&encoded_metadata)?;
+            for prefix in [
+                ANN_OVERLAY_MANIFEST_PREFIX,
+                ANN_OVERLAY_DELTA_PREFIX,
+                ANN_OVERLAY_NODE_PREFIX,
+            ] {
+                let extra = fixture
+                    .entries
+                    .iter()
+                    .find(|(key, _)| key.first() == Some(&prefix))
+                    .cloned()
+                    .ok_or("missing overlay namespace")?;
+                let mut entries = base_entries.clone();
+                entries.insert(extra.0, extra.1);
+                assert!(
+                    restore_index_with_definition(
+                        &entries.into_iter().collect::<Vec<_>>(),
+                        state.definition().index_id(),
+                        state.definition(),
+                        metadata.clone(),
+                    )
+                    .is_err(),
+                    "metadata version {} overlay prefix {prefix}",
+                    metadata.version
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_metadata_and_frontier_enforce_existing_hard_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = overlay_fixture()?;
+        for (offset, value) in [
+            (
+                120,
+                u64::from(DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE.delta_max_entries) + 1,
+            ),
+            (128, u64::try_from(MAX_ANN_DELTA_BYTES)? + 1),
+            (
+                224,
+                u64::from(DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE.delta_max_entries) + 1,
+            ),
+            (232, u64::try_from(MAX_ANN_DELTA_BYTES)? + 1),
+            (240, ANN_OVERLAY_MAX_NODES + 1),
+            (
+                248,
+                u64::from(DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE.delta_max_entries) + 1,
+            ),
+            (256, u64::try_from(MAX_ANN_DELTA_BYTES)? + 1),
+        ] {
+            let mut corrupted = fixture.metadata.clone();
+            corrupted[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                decode_metadata(&corrupted).is_err(),
+                "bound offset {offset}"
+            );
+        }
+        let mut zero_sequence = fixture.metadata;
+        zero_sequence[264..272].fill(0);
+        assert!(decode_metadata(&zero_sequence).is_err());
+
+        let mut frontier = BTreeMap::new();
+        let mut value = 0x9e37_79b9_7f4a_7c15_d1b5_4a32_d192_ed03_u128;
+        for position in 0..MAX_ANN_DELTA_RECORDS {
+            value ^= value << 17;
+            value ^= value >> 29;
+            value ^= value << 41;
+            value = value.wrapping_add(u128::try_from(position)? + 1);
+            frontier.insert(value.max(1), [u8::try_from(position % 251)? + 1; 32]);
+        }
+        assert_eq!(frontier.len(), MAX_ANN_DELTA_RECORDS);
+        let mut total_nodes = 0_usize;
+        let mut peak_level_nodes = 0_usize;
+        for depth in (0..ANN_OVERLAY_TREE_DEPTH).rev() {
+            let (parents, expected) = expected_overlay_level(&frontier, depth)?;
+            peak_level_nodes = peak_level_nodes.max(expected.len());
+            total_nodes = total_nodes
+                .checked_add(expected.len())
+                .ok_or("node count overflow")?;
+            frontier = parents;
+        }
+        assert!(total_nodes > 100_000);
+        assert!(total_nodes <= usize::try_from(ANN_OVERLAY_MAX_NODES)?);
+        assert!(peak_level_nodes <= MAX_ANN_DELTA_RECORDS);
+        Ok(())
+    }
+
+    #[test]
+    fn current_ann_writers_emit_only_m04_d01_and_allocated_legacy_prefixes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = partitioned_state()?;
+        let metadata = encode_metadata(&state)?;
+        assert_eq!(&metadata[..8], ANN_INDEX_META_MAGIC_V4);
+        let delta = DeltaRecord::Upsert {
+            sequence: 1,
+            record: VectorRecord {
+                object_id: ObjectId::new(90)?,
+                creating_csn: Csn::new(2)?,
+                vector: Vector::new([9.0, 0.0])?,
+            },
+        };
+        let encoded_delta = encode_delta(&delta)?;
+        assert_eq!(&encoded_delta[..8], ANN_DELTA_MAGIC);
+        assert_eq!(
+            meta_key(state.definition().index_id())[0],
+            ANN_INDEX_META_PREFIX
+        );
+        assert_eq!(
+            delta_key(state.definition().index_id(), ObjectId::new(90)?)[0],
+            ANN_DELTA_PREFIX
+        );
+        for forbidden in [
+            ANN_INDEX_META_MAGIC_V5,
+            ANN_OVERLAY_MANIFEST_MAGIC,
+            ANN_OVERLAY_DELTA_MAGIC,
+            ANN_OVERLAY_NODE_MAGIC,
+            b"HYANNA02",
+        ] {
+            assert!(!metadata.windows(8).any(|window| window == forbidden));
+            assert!(!encoded_delta.windows(8).any(|window| window == forbidden));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_m04_bytes_restore_and_reencode_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = partitioned_state()?;
+        let encoded = encode_metadata(&state)?;
+        let mut entries = BTreeMap::new();
+        append_base_generation_entries(&mut entries, &state.base)?;
+        let restored = restore_index_with_definition(
+            &entries.into_iter().collect::<Vec<_>>(),
+            state.definition().index_id(),
+            state.definition(),
+            decode_metadata(&encoded)?,
+        )?;
+        assert_eq!(restored, state);
+        assert_eq!(encode_metadata(&restored)?, encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn historical_m01_through_m04_restore_to_the_same_read_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = definition()?;
+        let base = HnswIndex::build(
+            definition,
+            [
+                VectorRecord {
+                    object_id: ObjectId::new(1)?,
+                    creating_csn: Csn::new(1)?,
+                    vector: Vector::new([1.0, 0.0])?,
+                },
+                VectorRecord {
+                    object_id: ObjectId::new(2)?,
+                    creating_csn: Csn::new(1)?,
+                    vector: Vector::new([2.0, 0.0])?,
+                },
+            ],
+        )?;
+        let snapshot = base.export_snapshot();
+        let state = AnnIndexState::new(base, DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE);
+        let mut entries = BTreeMap::new();
+        append_base_generation_entries(&mut entries, &state.base)?;
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        let expected = state.search_exact(&Vector::new([0.0, 0.0])?, 2, None)?;
+        let mut versions = [1, 2, 3]
+            .into_iter()
+            .map(|version| encode_legacy_metadata(&snapshot, version))
+            .collect::<Result<Vec<_>, _>>()?;
+        versions.push(encode_metadata(&state)?);
+        for (position, encoded) in versions.into_iter().enumerate() {
+            let restored = restore_index_with_definition(
+                &entries,
+                definition.index_id(),
+                definition,
+                decode_metadata(&encoded)?,
+            )?;
+            assert_eq!(restored.effective_vectors(), state.effective_vectors());
+            assert_eq!(
+                restored.search_exact(&Vector::new([0.0, 0.0])?, 2, None)?,
+                expected,
+                "metadata version {}",
+                position + 1
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_codecs_and_domain_hashes_match_fixed_goldens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let delta = DeltaRecord::Tombstone {
+            sequence: 3,
+            mutation_csn: Csn::new(3)?,
+        };
+        let encoded = encode_overlay_delta_for_test(&delta)?;
+        assert_eq!(
+            encoded,
+            [
+                72, 89, 65, 78, 78, 68, 48, 50, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+        let leaf = overlay_leaf_hash(ObjectId::new(1)?, &encoded);
+        let node = overlay_node_hash(31, 0x0012, &[leaf, [7; 32]])?;
+        let manifest = OverlayManifest {
+            legacy_view_identity: [1; 32],
+            overlay_root: node,
+            view_identity: [3; 32],
+            legacy_count: 2,
+            legacy_bytes: 96,
+            overlay_count: 3,
+            overlay_bytes: 136,
+            overlay_node_count: 34,
+            effective_count: 3,
+            effective_bytes: 136,
+            legacy_next_sequence: 3,
+            next_sequence: 6,
+        };
+        assert_eq!(
+            overlay_empty_hash(0),
+            [
+                228, 39, 167, 233, 20, 15, 12, 228, 127, 240, 182, 196, 102, 136, 197, 213, 229, 3,
+                34, 51, 95, 74, 121, 161, 197, 241, 218, 244, 167, 6, 201, 104,
+            ]
+        );
+        assert_eq!(
+            leaf,
+            [
+                145, 14, 98, 7, 25, 101, 165, 41, 183, 69, 138, 249, 90, 145, 248, 124, 104, 82,
+                186, 27, 193, 135, 124, 130, 204, 215, 137, 126, 173, 121, 254, 107,
+            ]
+        );
+        assert_eq!(
+            node,
+            [
+                85, 117, 77, 105, 7, 54, 207, 21, 253, 29, 64, 47, 152, 124, 109, 98, 13, 231, 84,
+                183, 76, 202, 140, 198, 189, 146, 228, 249, 8, 148, 14, 100,
+            ]
+        );
+        assert_eq!(
+            overlay_view_identity([9; 32], manifest),
+            [
+                200, 245, 167, 198, 238, 12, 195, 246, 87, 144, 171, 48, 194, 66, 163, 203, 108,
+                219, 182, 127, 10, 170, 76, 168, 232, 61, 171, 230, 9, 182, 126, 53,
+            ]
+        );
+        assert_eq!(
+            decode_overlay_manifest(&encode_overlay_manifest_for_test(manifest))?,
+            manifest
+        );
+        let encoded_node = encode_overlay_node_for_test(&OverlayNode {
+            depth: 31,
+            bitmap: 0x0012,
+            node_hash: node,
+            child_hashes: vec![leaf, [7; 32]],
+        })?;
+        assert_eq!(decode_overlay_node(&encoded_node, 31)?.node_hash, node);
+
+        for (mut unsupported, decoder) in [
+            (encode_overlay_manifest_for_test(manifest), 0_u8),
+            (encoded.clone(), 1),
+            (encoded_node, 2),
+        ] {
+            unsupported[7] = unsupported[7].wrapping_add(1);
+            let rejected = match decoder {
+                0 => decode_overlay_manifest(&unsupported).is_err(),
+                1 => decode_overlay_delta(&unsupported, ObjectId::new(1)?, definition()?).is_err(),
+                _ => decode_overlay_node(&unsupported, 31).is_err(),
+            };
+            assert!(rejected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_legacy_identity_preserves_historical_empty_and_nonempty_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = [9; 32];
+        let empty = BTreeMap::new();
+        assert_eq!(calculate_view_identity(base, 1, &empty), base);
+        assert_eq!(calculate_view_identity(base, u64::MAX, &empty), base);
+
+        let object_id = ObjectId::new(1)?;
+        let nonempty = BTreeMap::from([(
+            object_id,
+            DeltaRecord::Tombstone {
+                sequence: 3,
+                mutation_csn: Csn::new(3)?,
+            },
+        )]);
+        assert_eq!(
+            calculate_view_identity(base, 4, &nonempty),
+            [
+                155, 81, 196, 85, 49, 180, 231, 15, 64, 90, 121, 142, 224, 214, 2, 108, 65, 137,
+                14, 163, 227, 109, 79, 252, 121, 23, 223, 239, 66, 201, 150, 82,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planned_overlay_hydration_streams_sparse_nodes_without_retaining_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+        let fixture = overlay_fixture()?;
+        let path = std::env::temp_dir().join(format!(
+            "hyphae-ann-overlay-{}-{}.pages",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut pages = PageStore::create(&path)?;
+        let pool = BufferPool::new(64, 4)?;
+        let mut entries = fixture.entries.clone();
+        entries.push((
+            crate::SEARCH_FORMAT_KEY.to_vec(),
+            crate::SEARCH_FORMAT_VALUE_V3.to_vec(),
+        ));
+        entries.push((
+            meta_key(fixture.definition.index_id()),
+            fixture.metadata.clone(),
+        ));
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut pages, Csn::new(1)?, entries)?
+            .tree;
+        let root = tree.root().ok_or("missing root")?;
+        let plan = plan_index_load(
+            &pages,
+            &pool,
+            root,
+            fixture.definition.index_id(),
+            fixture.definition,
+        )?;
+        assert!(matches!(
+            plan_delta_mutation(
+                &pages,
+                &pool,
+                root,
+                fixture.definition.index_id(),
+                fixture.definition,
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            maintenance_status(&pages, &pool, &plan),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        assert!(matches!(
+            plan_consolidation(
+                &pages,
+                &pool,
+                &plan,
+                16,
+                MAX_ANN_DELTA_RECORDS,
+                ConsolidationBuildExecution {
+                    pool: None,
+                    permit: None,
+                    cancellation: None,
+                },
+            ),
+            Err(NativeRuntimeError::InvalidPreparedMutation)
+        ));
+        reset_index_scoped_restore_count_for_test();
+        let (owned, observed) = hydrate_owned_read_state(&pages, &pool, &plan, None)?;
+        let node_count = fixture
+            .entries
+            .iter()
+            .filter(|(key, _)| key.first() == Some(&ANN_OVERLAY_NODE_PREFIX))
+            .count();
+        assert_eq!(observed.physical_entries, fixture.entries.len());
+        assert_eq!(plan.physical_entry_limit(), fixture.entries.len());
+        assert!(index_scoped_peak_physical_entries_for_test() < node_count);
+        assert_eq!(owned.authority().delta_records, 3);
+        drop(pages);
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
@@ -6544,6 +9500,7 @@ mod tests {
             next_sequence: 1,
             lifecycle: DEFAULT_INCREMENTAL_VECTOR_LIFECYCLE,
             retained_generations: Vec::new(),
+            persisted_version: 4,
         };
         ANN_BASE_SNAPSHOT_EXPORTS.set(0);
 
