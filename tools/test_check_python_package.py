@@ -12,6 +12,7 @@ from pathlib import Path
 from tools.check_python_package import (
     ROOT,
     PythonPackageValidationError,
+    python_version_for_workspace,
     validate,
 )
 
@@ -53,8 +54,30 @@ class PythonPackageContractTests(unittest.TestCase):
     def test_checked_in_package_is_publishable(self) -> None:
         self.assertEqual(
             validate(),
-            {"name": "hyphae-sdk", "status": "passed", "version": "3.0.0"},
+            {"name": "hyphae-sdk", "status": "passed", "version": "4.0.0"},
         )
+
+    def test_alpha_version_uses_canonical_pep440_metadata(self) -> None:
+        self.assertEqual(
+            python_version_for_workspace("4.0.0-alpha.0"),
+            ("4.0.0a0", "Development Status :: 3 - Alpha"),
+        )
+        with self.fixture() as directory:
+            root = Path(directory)
+            self.replace(root, 'version = "4.0.0"', 'version = "4.0.0-alpha.0"')
+            with self.assertRaisesRegex(PythonPackageValidationError, "PEP 440"):
+                validate(root)
+
+    def test_development_classifier_must_match_the_workspace_version(self) -> None:
+        with self.fixture() as directory:
+            root = Path(directory)
+            self.replace(
+                root,
+                '"Development Status :: 5 - Production/Stable"',
+                '"Development Status :: 3 - Alpha"',
+            )
+            with self.assertRaisesRegex(PythonPackageValidationError, "development-status"):
+                validate(root)
 
     def test_python_publish_rejects_apache_1_1_0(self) -> None:
         with self.fixture() as directory:
@@ -116,7 +139,7 @@ class PythonPackageContractTests(unittest.TestCase):
     def test_python_version_must_equal_the_workspace_version(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
-            self.replace(root, 'version = "3.0.0"', 'version = "1.2.3"')
+            self.replace(root, 'version = "4.0.0"', 'version = "1.2.3"')
             with self.assertRaisesRegex(PythonPackageValidationError, "workspace"):
                 validate(root)
 

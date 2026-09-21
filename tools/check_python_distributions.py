@@ -15,6 +15,10 @@ from pathlib import Path, PurePosixPath
 
 EXPECTED_NAME = "hyphae-sdk"
 IMPORT_ROOT = "hyphae_sdk/"
+PEP440_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?\Z"
+)
 
 
 class DistributionValidationError(ValueError):
@@ -119,8 +123,8 @@ def validate_sdist(path: Path, version: str) -> int:
 
 
 def validate(directory: Path, version: str) -> dict[str, object]:
-    if re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
-        fail("expected version must be strict semver")
+    if PEP440_VERSION.fullmatch(version) is None:
+        fail("expected version must be canonical PEP 440")
     files = sorted(
         path
         for path in directory.iterdir()
