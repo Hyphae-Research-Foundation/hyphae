@@ -1,6 +1,6 @@
 {
   "name": "hyphae",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Bounded Native v2 MCP tools with an Instance-scoped Auditor API key: capabilities and redacted security metadata, lexical and integrated search, search proofs and offline verification, and Agent Memory recall, with write tools listed only when the operator allows ingest.",
   "author": {
     "name": "Hyphae Research Foundation",

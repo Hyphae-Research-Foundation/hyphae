@@ -74,6 +74,14 @@ class PythonDistributionContractTests(unittest.TestCase):
             with self.assertRaisesRegex(DistributionValidationError, "one wheel and one sdist"):
                 validate(root, "1.2.0")
 
+    def test_canonical_pep440_prerelease_is_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(DistributionValidationError, "one wheel and one sdist"):
+                validate(root, "4.0.0a0")
+            with self.assertRaisesRegex(DistributionValidationError, "PEP 440"):
+                validate(root, "4.0.0-alpha.0")
+
     def test_missing_wheel_metadata_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
