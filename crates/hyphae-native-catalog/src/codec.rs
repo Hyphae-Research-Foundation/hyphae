@@ -11,14 +11,16 @@ use super::{
     CatalogError, CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2,
     ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition, CompatibleCatalogObjectV2,
     CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance,
-    CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, FieldSourcePolicy,
-    ForeignKeyDefinition, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
-    KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
-    MAX_CATALOG_DEFINITION_BYTES, MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES,
-    NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QualifiedName, RelationDefinition,
-    SearchCollectionDefinition, SearchCollectionDefinitionV2, SearchFieldDefinition,
-    SearchFieldDefinitionV2, SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition,
-    StructureKind, StructureOwnership, VectorMetric, VectorSearchPolicy,
+    CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, EmbeddingArtifactDigest,
+    EmbeddingNormalization, EmbeddingPipelineVersion, EmbeddingPooling, EmbeddingProfileDefinition,
+    EmbeddingTruncation, FieldSourcePolicy, ForeignKeyDefinition, IncrementalVectorLifecycle,
+    KeyspaceDefinition, KeyspaceEvictionPolicy, KeyspaceMemoryClass, KeyspaceTtlPolicy,
+    LexicalIndexPolicy, LogicalCatalogObject, MAX_CATALOG_DEFINITION_BYTES,
+    MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, NamedVectorDefinition, ObjectHeader,
+    ObjectHeaderV2, QualifiedName, RelationDefinition, SearchCollectionDefinition,
+    SearchCollectionDefinitionV2, SearchFieldDefinition, SearchFieldDefinitionV2,
+    SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition, StructureKind,
+    StructureOwnership, VectorMetric, VectorSearchPolicy,
 };
 
 const DEFINITION_MAGIC_V1: [u8; 8] = *b"HYCOBJ01";
@@ -32,6 +34,8 @@ const REPRESENTATION_COMPATIBLE: u8 = 1;
 const REPRESENTATION_V2: u8 = 2;
 /// V2 envelope carrying a V3-bodied object (tuned search collections).
 const REPRESENTATION_V3: u8 = 3;
+/// V2 envelope carrying search collections with embedding-profile bindings.
+const REPRESENTATION_V4: u8 = 4;
 
 impl CatalogObject {
     /// Encodes one complete canonical catalog object definition.
@@ -133,6 +137,14 @@ impl LogicalCatalogObject {
         let representation = match self {
             Self::Compatible(_) => REPRESENTATION_COMPATIBLE,
             Self::V2(CatalogObjectV2::SearchCollection(definition))
+                if definition
+                    .vectors
+                    .iter()
+                    .any(|vector| vector.embedding_profile.is_some()) =>
+            {
+                REPRESENTATION_V4
+            }
+            Self::V2(CatalogObjectV2::SearchCollection(definition))
                 if definition.bm25.is_some() =>
             {
                 REPRESENTATION_V3
@@ -152,10 +164,23 @@ impl LogicalCatalogObject {
             Self::V2(CatalogObjectV2::Analyzer(definition)) => {
                 encoder.put_analyzer_v2(definition)?;
             }
+            Self::V2(CatalogObjectV2::EmbeddingProfile(definition)) => {
+                encoder.put_embedding_profile_v2(definition)?;
+            }
             Self::V2(CatalogObjectV2::SearchCollection(definition)) => {
                 encoder.put_search_v2(definition)?;
-                if let Some(bm25) = definition.bm25 {
-                    encoder.put_bm25(bm25)?;
+                match representation {
+                    REPRESENTATION_V3 => encoder.put_bm25(
+                        definition
+                            .bm25
+                            .ok_or(CatalogError::InvalidDefinitionEncoding)?,
+                    )?,
+                    REPRESENTATION_V4 => {
+                        encoder.put_embedding_profile_bindings(definition)?;
+                        encoder.put_optional_bm25(definition.bm25)?;
+                    }
+                    REPRESENTATION_V2 => {}
+                    _ => return Err(CatalogError::InvalidDefinitionEncoding),
                 }
             }
         }
@@ -202,6 +227,17 @@ impl LogicalCatalogObject {
                 definition.bm25 = Some(bm25);
                 Self::V2(CatalogObjectV2::SearchCollection(definition))
             }
+            REPRESENTATION_V4 => {
+                if kind != CatalogObjectKind::SearchCollection {
+                    return Err(CatalogError::InvalidDefinitionEncoding);
+                }
+                let mut definition = decoder.search_v2(header)?;
+                for vector in &mut definition.vectors {
+                    vector.embedding_profile = decoder.optional_object_id()?;
+                }
+                definition.bm25 = decoder.optional_bm25()?;
+                Self::V2(CatalogObjectV2::SearchCollection(definition))
+            }
             REPRESENTATION_V2 => Self::V2(match kind {
                 CatalogObjectKind::Database => CatalogObjectV2::Database(header),
                 CatalogObjectKind::Schema => CatalogObjectV2::Schema(header),
@@ -210,6 +246,9 @@ impl LogicalCatalogObject {
                 }
                 CatalogObjectKind::Analyzer => {
                     CatalogObjectV2::Analyzer(decoder.analyzer_v2(header)?)
+                }
+                CatalogObjectKind::EmbeddingProfile => {
+                    CatalogObjectV2::EmbeddingProfile(decoder.embedding_profile_v2(header)?)
                 }
                 CatalogObjectKind::SearchCollection => {
                     CatalogObjectV2::SearchCollection(decoder.search_v2(header)?)
@@ -534,9 +573,50 @@ impl Encoder {
         Ok(())
     }
 
+    fn put_embedding_profile_v2(
+        &mut self,
+        definition: &EmbeddingProfileDefinition,
+    ) -> Result<(), CatalogError> {
+        self.put_fixed(definition.model_weights_digest.as_bytes())?;
+        self.put_fixed(definition.model_config_digest.as_bytes())?;
+        self.put_fixed(definition.tokenizer_digest.as_bytes())?;
+        self.put_byte(definition.pipeline_version as u8)?;
+        self.put_byte(definition.vector_type.element() as u8)?;
+        self.put_fixed(&definition.vector_type.dimension().to_le_bytes())?;
+        self.put_fixed(&definition.max_position_tokens.to_le_bytes())?;
+        self.put_fixed(&definition.max_input_tokens.to_le_bytes())?;
+        self.put_fixed(&definition.max_batch_inputs.to_le_bytes())?;
+        self.put_byte(definition.pooling as u8)?;
+        self.put_byte(definition.normalization as u8)?;
+        self.put_byte(definition.truncation as u8)
+    }
+
     fn put_bm25(&mut self, parameters: Bm25Parameters) -> Result<(), CatalogError> {
         self.put_fixed(&parameters.k1_micros.to_le_bytes())?;
         self.put_fixed(&parameters.b_micros.to_le_bytes())
+    }
+
+    fn put_optional_bm25(
+        &mut self,
+        parameters: Option<Bm25Parameters>,
+    ) -> Result<(), CatalogError> {
+        match parameters {
+            Some(parameters) => {
+                self.put_byte(1)?;
+                self.put_bm25(parameters)
+            }
+            None => self.put_byte(0),
+        }
+    }
+
+    fn put_embedding_profile_bindings(
+        &mut self,
+        definition: &SearchCollectionDefinitionV2,
+    ) -> Result<(), CatalogError> {
+        for vector in &definition.vectors {
+            self.put_optional_object_id(vector.embedding_profile)?;
+        }
+        Ok(())
     }
 
     fn put_search_v2(
@@ -938,6 +1018,68 @@ impl<'encoded> Decoder<'encoded> {
         })
     }
 
+    fn embedding_profile_v2(
+        &mut self,
+        header: ObjectHeaderV2,
+    ) -> Result<EmbeddingProfileDefinition, CatalogError> {
+        let model_weights_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
+        let model_config_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
+        let tokenizer_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
+        let pipeline_version = match self.byte()? {
+            1 => EmbeddingPipelineVersion::SafetensorsBertMetadataV1,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        if self.byte()? != VectorElement::Float32 as u8 {
+            return Err(CatalogError::InvalidDefinitionEncoding);
+        }
+        let vector_type =
+            VectorType::new(VectorElement::Float32, u16::from_le_bytes(self.fixed()?))
+                .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
+        let max_position_tokens = u32::from_le_bytes(self.fixed()?);
+        let max_input_tokens = u32::from_le_bytes(self.fixed()?);
+        let max_batch_inputs = u32::from_le_bytes(self.fixed()?);
+        let pooling = match self.byte()? {
+            1 => EmbeddingPooling::FirstToken,
+            2 => EmbeddingPooling::MeanTokens,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        let normalization = match self.byte()? {
+            1 => EmbeddingNormalization::None,
+            2 => EmbeddingNormalization::L2,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        let truncation = match self.byte()? {
+            1 => EmbeddingTruncation::Reject,
+            2 => EmbeddingTruncation::KeepStart,
+            _ => return Err(CatalogError::InvalidDefinitionEncoding),
+        };
+        Ok(EmbeddingProfileDefinition {
+            header,
+            model_weights_digest,
+            model_config_digest,
+            tokenizer_digest,
+            pipeline_version,
+            vector_type,
+            max_position_tokens,
+            max_input_tokens,
+            max_batch_inputs,
+            pooling,
+            normalization,
+            truncation,
+        })
+    }
+
+    fn optional_bm25(&mut self) -> Result<Option<Bm25Parameters>, CatalogError> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(Bm25Parameters {
+                k1_micros: u64::from_le_bytes(self.fixed()?),
+                b_micros: u64::from_le_bytes(self.fixed()?),
+            })),
+            _ => Err(CatalogError::InvalidDefinitionEncoding),
+        }
+    }
+
     fn search_v2(
         &mut self,
         header: ObjectHeaderV2,
@@ -999,6 +1141,7 @@ impl<'encoded> Decoder<'encoded> {
                     consolidate_after_deltas: u16::from_le_bytes(self.fixed()?),
                     retain_generations: u16::from_le_bytes(self.fixed()?),
                 },
+                embedding_profile: None,
             });
         }
         Ok(SearchCollectionDefinitionV2 {
@@ -1150,6 +1293,7 @@ impl<'encoded> Decoder<'encoded> {
             7 => Ok(CatalogObjectKind::SearchCollection),
             8 => Ok(CatalogObjectKind::Analyzer),
             9 => Ok(CatalogObjectKind::CrossEngineLink),
+            10 => Ok(CatalogObjectKind::EmbeddingProfile),
             _ => Err(CatalogError::InvalidDefinitionEncoding),
         }
     }
@@ -1320,7 +1464,9 @@ mod tests {
         CatalogError, CatalogName, CatalogObject, CatalogObjectV2, ColumnDefinition,
         CompatibleCatalogObjectV2, CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior,
         CrossEngineLinkMaintenance, CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion,
-        FieldSourcePolicy, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
+        EmbeddingArtifactDigest, EmbeddingNormalization, EmbeddingPipelineVersion,
+        EmbeddingPooling, EmbeddingProfileDefinition, EmbeddingTruncation, FieldSourcePolicy,
+        IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
         KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
         MAX_CATALOG_DEFINITION_BYTES, NamedVectorDefinition, ObjectHeader, ObjectHeaderV2,
         QualifiedName, RelationDefinition, SearchCollectionDefinition,
@@ -1328,7 +1474,7 @@ mod tests {
         SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition, StructureKind,
         StructureOwnership, VectorMetric, VectorSearchPolicy,
     };
-    use crate::MAX_CATALOG_NAME_BYTES;
+    use crate::{MAX_CATALOG_NAME_BYTES, MAX_EMBEDDING_BATCH_INPUTS, MAX_EMBEDDING_TOKENS};
 
     const RELATION_GOLDEN_HEX: &str = concat!(
         "4859434f424a3031010100000000000000000000000000000001040000006d61696e040000006d",
@@ -1358,6 +1504,32 @@ mod tests {
         "000000646973706c61795f6e616d650c000000646973706c61795f6e616d650100000007010100",
         "000001000000"
     );
+    const SEARCH_V2_WITHOUT_PROFILE_GOLDEN_HEX: &str = concat!(
+        "4859434f424a303207020e00000000000000000000000000000003040000006d61696e04000000",
+        "6d61696e060000007075626c6963060000007075626c69630800000061727469636c6573080000",
+        "0061727469636c6573010b00000000000000000000000000000001000000000000000200000001",
+        "00000004000000626f647904000000626f64790100000007010c00000000000000000000000000",
+        "000001000203020000000c0000007075626c69736865645f61740c0000007075626c6973686564",
+        "5f6174010000000b000001020102000000030000000c0000007469746c655f766563746f720c00",
+        "00007469746c655f766563746f7201800101010004000004000200040000000b000000626f6479",
+        "5f766563746f720b000000626f64795f766563746f720100030103000100000110008000400000",
+        "0107000000000000000010000008000300"
+    );
+    const EMBEDDING_PROFILE_V2_GOLDEN_HEX: &str = concat!(
+        "4859434f424a30320a020f00000000000000000000000000000003040000006d61696e04000000",
+        "6d61696e060000007075626c6963060000007075626c69630f0000006c6f63616c5f656d6265",
+        "6464696e670f0000006c6f63616c5f656d62656464696e67010b00000000000000000000000000",
+        "000001000000000000001111111111111111111111111111111111111111111111111111111111",
+        "111111222222222222222222222222222222222222222222222222222222222222222233333333",
+        "333333333333333333333333333333333333333333333333333333330101800100020000800100",
+        "0020000000020202"
+    );
+    const SEARCH_V3_GOLDEN_HEX: &str =
+        include_str!("../../../compatibility/native-catalog-search-representation3.hex");
+    const SEARCH_V4_GOLDEN_HEX: &str =
+        include_str!("../../../compatibility/native-catalog-search-representation4.hex");
+    const PROFILE_FIXTURE_HEX: &str =
+        include_str!("../../../compatibility/native-catalog-embedding-profile-v2.hex");
 
     fn hex(encoded: &[u8]) -> Result<String, std::fmt::Error> {
         let mut output = String::with_capacity(encoded.len() * 2);
@@ -1547,6 +1719,25 @@ mod tests {
         )))
     }
 
+    fn embedding_profile_v2() -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
+        Ok(LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+            EmbeddingProfileDefinition {
+                header: header_v2(15, EngineKind::Search, "local_embedding", Some(11))?,
+                model_weights_digest: EmbeddingArtifactDigest::new([0x11; 32])?,
+                model_config_digest: EmbeddingArtifactDigest::new([0x22; 32])?,
+                tokenizer_digest: EmbeddingArtifactDigest::new([0x33; 32])?,
+                pipeline_version: EmbeddingPipelineVersion::SafetensorsBertMetadataV1,
+                vector_type: VectorType::new(VectorElement::Float32, 384)?,
+                max_position_tokens: 512,
+                max_input_tokens: 384,
+                max_batch_inputs: 32,
+                pooling: EmbeddingPooling::MeanTokens,
+                normalization: EmbeddingNormalization::L2,
+                truncation: EmbeddingTruncation::KeepStart,
+            },
+        )))
+    }
+
     fn search_v2() -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
         let ann = AnnIndexDefinition::new(VectorMetric::Cosine, 16, 128, 64, 256, 7)?;
         Ok(LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
@@ -1591,6 +1782,7 @@ mod tests {
                             consolidate_after_deltas: 4,
                             retain_generations: 2,
                         },
+                        embedding_profile: None,
                     },
                     NamedVectorDefinition {
                         id: FieldId::new(4)?,
@@ -1606,6 +1798,7 @@ mod tests {
                             consolidate_after_deltas: 8,
                             retain_generations: 3,
                         },
+                        embedding_profile: None,
                     },
                 ],
             },
@@ -1682,7 +1875,13 @@ mod tests {
     #[test]
     fn every_v2_definition_has_one_canonical_round_trip_and_digest()
     -> Result<(), Box<dyn std::error::Error>> {
-        for object in [database_v2()?, analyzer_v2()?, keyspace_v2()?, search_v2()?] {
+        for object in [
+            database_v2()?,
+            analyzer_v2()?,
+            keyspace_v2()?,
+            search_v2()?,
+            embedding_profile_v2()?,
+        ] {
             let encoded = object.encode_definition_v2()?;
             let decoded = LogicalCatalogObject::decode_definition_v2(&encoded)?;
             assert_eq!(decoded, object);
@@ -1708,7 +1907,13 @@ mod tests {
     #[test]
     fn v2_decoder_rejects_truncation_corruption_and_trailing_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
-        for object in [database_v2()?, analyzer_v2()?, keyspace_v2()?, search_v2()?] {
+        for object in [
+            database_v2()?,
+            analyzer_v2()?,
+            keyspace_v2()?,
+            search_v2()?,
+            embedding_profile_v2()?,
+        ] {
             let encoded = object.encode_definition_v2()?;
             for length in 0..encoded.len() {
                 assert!(LogicalCatalogObject::decode_definition_v2(&encoded[..length]).is_err());
@@ -1981,6 +2186,7 @@ mod tests {
         let tuned = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition));
         let tuned_bytes = tuned.encode_definition_v2()?;
         assert_eq!(tuned_bytes[9], 3);
+        assert_eq!(hex(&tuned_bytes)?, SEARCH_V3_GOLDEN_HEX.trim());
         assert_eq!(
             LogicalCatalogObject::decode_definition_v2(&tuned_bytes)?,
             tuned
@@ -2014,6 +2220,153 @@ mod tests {
                 .encode_definition_v2()
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_search_bytes_stay_canonical_and_profile_bindings_use_representation_v4()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unbound = search_v2()?;
+        let old_bytes = unbound.encode_definition_v2()?;
+        assert_eq!(hex(&old_bytes)?, SEARCH_V2_WITHOUT_PROFILE_GOLDEN_HEX);
+        let decoded = LogicalCatalogObject::decode_definition_v2(&old_bytes)?;
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(decoded_search)) = &decoded
+        else {
+            return Err("search definition expected".into());
+        };
+        assert!(
+            decoded_search
+                .vectors
+                .iter()
+                .all(|vector| vector.embedding_profile.is_none())
+        );
+        assert_eq!(decoded.encode_definition_v2()?, old_bytes);
+
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(mut definition)) = unbound
+        else {
+            return Err("search definition expected".into());
+        };
+        definition.vectors[1].embedding_profile = Some(ObjectId::new(15)?);
+        definition.bm25 = Some(Bm25Parameters {
+            k1_micros: 900_000,
+            b_micros: 500_000,
+        });
+        let bound = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition));
+        let bound_bytes = bound.encode_definition_v2()?;
+        assert_eq!(bound_bytes[9], 4);
+        assert_eq!(hex(&bound_bytes)?, SEARCH_V4_GOLDEN_HEX.trim());
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&bound_bytes)?,
+            bound
+        );
+        for length in 0..bound_bytes.len() {
+            assert!(LogicalCatalogObject::decode_definition_v2(&bound_bytes[..length]).is_err());
+        }
+        let mut malformed = bound_bytes;
+        let second_binding_tag = malformed.len() - 34;
+        malformed[second_binding_tag] = 2;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&malformed),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+
+        let mut zero_bindings = old_bytes;
+        zero_bindings[9] = 4;
+        zero_bindings.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&zero_bindings),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(mut definition)) = bound
+        else {
+            return Err("search definition expected".into());
+        };
+        definition.bm25 = None;
+        let mut invalid_bm25_tag =
+            LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition))
+                .encode_definition_v2()?;
+        let last = invalid_bm25_tag
+            .last_mut()
+            .ok_or("bound search definition is empty")?;
+        *last = 2;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&invalid_bm25_tag),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_profile_codec_and_bounds_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            EmbeddingArtifactDigest::new([0; 32]),
+            Err(CatalogError::ZeroEmbeddingArtifactDigest)
+        );
+        let profile = embedding_profile_v2()?;
+        let encoded = profile.encode_definition_v2()?;
+        assert_eq!(hex(&encoded)?, EMBEDDING_PROFILE_V2_GOLDEN_HEX);
+        assert_eq!(hex(&encoded)?, PROFILE_FIXTURE_HEX.trim());
+        assert_eq!(encoded[8], 10);
+        assert_eq!(encoded[9], 2);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&encoded)?,
+            profile
+        );
+
+        let LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(mut definition)) = profile
+        else {
+            return Err("embedding profile expected".into());
+        };
+        definition.max_position_tokens = 0;
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        definition.max_position_tokens = MAX_EMBEDDING_TOKENS;
+        definition.max_input_tokens = MAX_EMBEDDING_TOKENS + 1;
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        definition.max_input_tokens = MAX_EMBEDDING_TOKENS;
+        definition.max_batch_inputs = MAX_EMBEDDING_BATCH_INPUTS + 1;
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+
+        let digest_offset = encoded
+            .windows(32)
+            .position(|window| window == [0x11; 32])
+            .ok_or("weights digest not found")?;
+        let mut zero_digest = encoded.clone();
+        zero_digest[digest_offset..digest_offset + 32].fill(0);
+        assert!(LogicalCatalogObject::decode_definition_v2(&zero_digest).is_err());
+        let mut invalid_pipeline = encoded.clone();
+        invalid_pipeline[digest_offset + 96] = 0xff;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&invalid_pipeline),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+        let mut invalid_type = encoded.clone();
+        invalid_type[digest_offset + 97] = 0xff;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&invalid_type),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+        for offset in [
+            digest_offset + 112,
+            digest_offset + 113,
+            digest_offset + 114,
+        ] {
+            let mut invalid_semantic_tag = encoded.clone();
+            invalid_semantic_tag[offset] = 0xff;
+            assert_eq!(
+                LogicalCatalogObject::decode_definition_v2(&invalid_semantic_tag),
+                Err(CatalogError::InvalidDefinitionEncoding)
+            );
+        }
         Ok(())
     }
 }
