@@ -205,7 +205,7 @@ def validate_transcript(value: object) -> dict[str, object]:
     if (
         value.get("schema") != "hyphae-python-managed-v2-transcript-v1"
         or value.get("status") != "passed"
-        or value.get("protocol") != {"major": 1, "minor": 7}
+        or value.get("protocol") != {"major": 1, "minor": 9}
         or value.get("operations")
         != {"lifecycle": LIFECYCLE, "reads": READS, "writes": WRITES}
         or value.get("cases") != {name: True for name in CASES}
@@ -364,7 +364,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
                 "filename": fixture_binary.name,
                 "sha256": sha256(fixture_binary),
             },
-            "protocol": {"major": 1, "minor": 7},
+            "protocol": {"major": 1, "minor": 9},
             "transports": (
                 ["http-v2", "named-pipe"]
                 if lane == "windows"

@@ -10,6 +10,7 @@ from .local import LocalTransport
 from .models import (
     CancellationToken,
     ClientError,
+    EmbedAndIngestBatch,
     ProductTransactionSearchMutation,
     RequestOptions,
     Response,
@@ -160,6 +161,16 @@ class HyphaeClient:
 
     def search_ingest(self, collection: int, batch: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         return self.execute("search_ingest", {"collection": collection, "batch": batch}, options=options)
+
+    def embed_and_ingest(self, collection: int, batch: EmbedAndIngestBatch, *, options: RequestOptions | None = None) -> Response:
+        """Embed catalog-bound document text and atomically ingest the result."""
+
+        return self._execute_expected(
+            "embed_and_ingest",
+            "embed_and_ingested",
+            {"collection": collection, "batch": batch},
+            options=options,
+        )
 
     def search_document_update(self, collection: int, idempotency_id: int, document: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         return self.execute("search_document_update", {"collection": collection, "idempotency_id": idempotency_id, "document": document}, options=options)

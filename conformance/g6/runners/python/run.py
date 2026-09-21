@@ -11,7 +11,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hyphae_sdk.v2 import CancellationToken, HyphaeClient, ProductError, RequestOptions
+from hyphae_sdk.v2 import (
+    CancellationToken,
+    HttpTransport,
+    HyphaeClient,
+    LocalTransport,
+    ProductError,
+    RequestOptions,
+)
 
 
 lane = os.environ["HYPHAE_G6_LANE"]
@@ -187,13 +194,21 @@ try:
     else:
         raise RuntimeError("G6 server did not become ready")
     if lane.endswith("-local"):
-        client = HyphaeClient.local(str(endpoint))
-        denied = HyphaeClient.local(str(endpoint), client_identity="hyphae-g6-conformance-denied")
+        transport = LocalTransport(str(endpoint))
+        denied_transport = LocalTransport(
+            str(endpoint), client_identity="hyphae-g6-conformance-denied"
+        )
     else:
         origin = f"http://127.0.0.1:{port_file.read_text().strip()}"
-        client = HyphaeClient.http(origin, bearer_token="0123456789abcdef0123456789abcdef")
-        denied = HyphaeClient.http(origin)
+        transport = HttpTransport(
+            origin, bearer_token="0123456789abcdef0123456789abcdef"
+        )
+        denied_transport = HttpTransport(origin)
+    client = HyphaeClient(transport)
+    denied = HyphaeClient(denied_transport)
     start, cases = execute_cases(client, denied)
+    if transport.negotiated_minor != 9 or denied_transport.negotiated_minor != 9:
+        raise RuntimeError("Python G6 transports did not negotiate protocol minor 9")
     coverage = ["capabilities", "catalog", "sql", "structures", "search", "transactions", "administration"]
     if lane.endswith("-http"): coverage.append("proofs")
     coverage.extend(["backup", "failures"])

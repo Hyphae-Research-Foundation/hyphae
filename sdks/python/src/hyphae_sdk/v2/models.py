@@ -20,6 +20,50 @@ DEFAULT_LIMITS = {
 
 ProductDocValue: TypeAlias = bool | int | float | str | bytes
 
+CatalogObjectKind: TypeAlias = Literal[
+    "database",
+    "schema",
+    "relation",
+    "secondary_index",
+    "keyspace",
+    "structure",
+    "search_collection",
+    "analyzer",
+    "cross_engine_link",
+    "embedding_profile",
+]
+CATALOG_OBJECT_KINDS: tuple[CatalogObjectKind, ...] = (
+    "database",
+    "schema",
+    "relation",
+    "secondary_index",
+    "keyspace",
+    "structure",
+    "search_collection",
+    "analyzer",
+    "cross_engine_link",
+    "embedding_profile",
+)
+
+CatalogDependencyKind: TypeAlias = Literal[
+    "parent",
+    "secondary_index_relation",
+    "foreign_key",
+    "analyzer",
+    "link_endpoint",
+    "relation_schema",
+    "embedding_profile",
+]
+CATALOG_DEPENDENCY_KINDS: tuple[CatalogDependencyKind, ...] = (
+    "parent",
+    "secondary_index_relation",
+    "foreign_key",
+    "analyzer",
+    "link_endpoint",
+    "relation_schema",
+    "embedding_profile",
+)
+
 
 class ProductDocument(TypedDict):
     """One complete image whose map names use canonical UTF-8 byte order on wire."""
@@ -28,6 +72,40 @@ class ProductDocument(TypedDict):
     text: str
     doc_values: NotRequired[dict[str, ProductDocValue]]
     vectors: NotRequired[dict[str, list[float]]]
+
+
+class EmbedAndIngestDocument(TypedDict):
+    """One document whose vectors are produced from catalog-bound profiles."""
+
+    object_id: int
+    text: str
+    doc_values: NotRequired[dict[str, ProductDocValue]]
+
+
+class EmbedAndIngestBatch(TypedDict):
+    idempotency_id: int
+    documents: list[EmbedAndIngestDocument]
+
+
+class EmbeddingExecutionProfile(TypedDict):
+    """The selected executor reported by an embed-and-ingest response."""
+
+    embedding_profile: int
+    backend: Literal["cpu", "cuda"]
+    device: str
+    driver: str
+    runtime: str
+    precision: Literal["f32"]
+    kernels: list[str]
+    fallback: bool
+
+
+class EmbedAndIngestResult(TypedDict):
+    snapshot: dict[str, Any]
+    documents: int
+    idempotent_replay: bool
+    execution_profile: EmbeddingExecutionProfile
+    commit: dict[str, Any] | None
 
 
 class ProductTransactionSearchIndexMutation(TypedDict):
@@ -241,9 +319,17 @@ class Response:
 
 
 __all__ = [
+    "CATALOG_DEPENDENCY_KINDS",
+    "CATALOG_OBJECT_KINDS",
     "CancellationToken",
+    "CatalogDependencyKind",
+    "CatalogObjectKind",
     "ClientError",
     "DEFAULT_LIMITS",
+    "EmbedAndIngestBatch",
+    "EmbedAndIngestDocument",
+    "EmbedAndIngestResult",
+    "EmbeddingExecutionProfile",
     "ProductError",
     "ProductErrorFields",
     "RequestOptions",

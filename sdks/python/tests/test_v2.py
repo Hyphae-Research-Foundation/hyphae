@@ -62,7 +62,8 @@ class FakeTransport:
 
     def execute(self, operation: str, arguments: dict[str, object], options: RequestOptions) -> Response:
         self.calls.append((operation, arguments, options))
-        return Response("fake", arguments, options.checked_request_id())
+        kind = "embed_and_ingested" if operation == "embed_and_ingest" else "fake"
+        return Response(kind, arguments, options.checked_request_id())
 
 
 class StructureBatchResponseTests(unittest.TestCase):
@@ -154,6 +155,9 @@ class FakeHttpResponse:
 
 class FakeHttpConnection:
     last_path = ""
+    last_body = b""
+    last_headers: dict[str, str] = {}
+    requests = 0
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         del args, kwargs
@@ -165,9 +169,12 @@ class FakeHttpConnection:
         pass
 
     def request(self, method: str, path: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        del method, kwargs
+        del method
         self.path = path
         type(self).last_path = path
+        type(self).last_body = kwargs["body"]
+        type(self).last_headers = kwargs["headers"]
+        type(self).requests += 1
 
     def getresponse(self) -> FakeHttpResponse:
         body = bytearray(72)
@@ -225,6 +232,194 @@ class ShortWriteStream:
 
 
 class V2Tests(unittest.TestCase):
+    def test_minor_eight_embedding_profile_content_is_gated(self) -> None:
+        import struct
+
+        profile = b"HYCOBJ02" + bytes((10, 2))
+        bound_search = b"HYCOBJ02" + bytes((7, 4))
+        for definition in (profile, bound_search):
+            arguments = {"definition": definition}
+            self.assertEqual(operation_required_minor("catalog_create", arguments), 8)
+            with self.assertRaisesRegex(ClientError, "protocol minor"):
+                encode_product_request(
+                    "catalog_create",
+                    arguments,
+                    RequestOptions(),
+                    negotiated_minor=7,
+                )
+            encode_product_request(
+                "catalog_create", arguments, RequestOptions(), negotiated_minor=8
+            )
+            response_body = struct.pack("<B3xI", 1, len(definition)) + definition
+            with self.assertRaisesRegex(ClientError, "protocol minor"):
+                decode_product_response(
+                    _response(15, response_body), 1, negotiated_minor=7
+                )
+            self.assertEqual(
+                decode_product_response(
+                    _response(15, response_body), 1, negotiated_minor=8
+                ).value,
+                definition,
+            )
+            snapshot = bytes(24) + struct.pack("<QQ", 1, 1) + bytes(32) + struct.pack("<q", 0)
+            object_body = snapshot + struct.pack("<I", len(definition)) + definition
+            with self.assertRaisesRegex(ClientError, "protocol minor"):
+                decode_product_response(
+                    _response(12, object_body), 1, negotiated_minor=7
+                )
+            self.assertEqual(
+                decode_product_response(
+                    _response(12, object_body), 1, negotiated_minor=8
+                ).value["definition"],
+                definition,
+            )
+
+        listing = {
+            "parent": None,
+            "kind": "embedding_profile",
+            "cursor": None,
+            "item_limit": 1,
+            "visit_limit": 1,
+            "byte_limit": 4096,
+        }
+        self.assertEqual(operation_required_minor("catalog_list", listing), 8)
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            encode_product_request(
+                "catalog_list", listing, RequestOptions(), negotiated_minor=7
+            )
+
+        body = (
+            struct.pack("<II", 0, 1)
+            + (12).to_bytes(16, "little")
+            + struct.pack("<BB6x", 10, 0)
+            + _qualified_name()
+        )
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            decode_product_response(_response(42, body), 1, negotiated_minor=7)
+        self.assertEqual(
+            decode_product_response(
+                _response(42, body), 1, negotiated_minor=8
+            ).value["items"][0]["object_kind"],
+            10,
+        )
+
+    def test_embed_and_ingest_minor_nine_codec_is_bounded_and_canonical(self) -> None:
+        import struct
+
+        private_use = "\ue000"
+        supplementary = "\U0001f600"
+        arguments = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [
+                    {
+                        "object_id": 201,
+                        "text": "rust database",
+                        "doc_values": {
+                            supplementary: "supplementary",
+                            private_use: "private-use",
+                        },
+                    }
+                ],
+            },
+        }
+        self.assertEqual(operation_required_minor("embed_and_ingest", arguments), 9)
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            encode_product_request(
+                "embed_and_ingest",
+                arguments,
+                RequestOptions(),
+                negotiated_minor=8,
+            )
+        encoded = encode_product_request(
+            "embed_and_ingest", arguments, RequestOptions(), negotiated_minor=9
+        )
+        self.assertEqual(struct.unpack_from("<H", encoded, 12)[0], 69)
+        operation, decoded, _ = decode_product_request(encoded, negotiated_minor=9)
+        self.assertEqual(operation, "embed_and_ingest")
+        self.assertEqual(
+            list(decoded["batch"]["documents"][0]["doc_values"]),
+            [private_use, supplementary],
+        )
+        self.assertEqual(
+            encode_product_request(
+                operation, decoded, RequestOptions(), negotiated_minor=9
+            ),
+            encoded,
+        )
+
+        forged = bytearray(encoded)
+        struct.pack_into("<I", forged, 112, 0xFFFFFFFF)
+        with self.assertRaisesRegex(ClientError, "document count"):
+            decode_product_request(bytes(forged), negotiated_minor=9)
+
+        for forbidden in ("model_path", "backend", "device"):
+            invalid = {**arguments, forbidden: "not-on-wire"}
+            with self.subTest(forbidden=forbidden), self.assertRaisesRegex(
+                ClientError, "request fields"
+            ):
+                encode_product_request(
+                    "embed_and_ingest",
+                    invalid,
+                    RequestOptions(),
+                    negotiated_minor=9,
+                )
+
+    def test_embed_and_ingest_response_reports_execution_profile_and_replay(self) -> None:
+        import struct
+
+        def text(value: str) -> bytes:
+            encoded = value.encode()
+            return struct.pack("<I", len(encoded)) + encoded
+
+        snapshot = (
+            bytes((1,)) * 24
+            + struct.pack("<QQ", 7, 8)
+            + bytes((2,)) * 32
+            + struct.pack("<q", 10)
+        )
+        profile = (
+            (17).to_bytes(16, "little")
+            + struct.pack("<BBB5x", 1, 1, 1)
+            + text("NVIDIA H100")
+            + text("driver-1")
+            + text("cuda-1")
+            + struct.pack("<I", 2)
+            + text("tokenize-v1")
+            + text("qwen3-f32-v1")
+        )
+        body = snapshot + struct.pack("<BB6xQ", 0, 1, 1) + profile
+        encoded = _response(47, body)
+        response = decode_product_response(encoded, 19, negotiated_minor=9)
+        self.assertEqual(response.kind, "embed_and_ingested")
+        self.assertTrue(response.value["idempotent_replay"])
+        self.assertIsNone(response.value["commit"])
+        self.assertEqual(
+            response.value["execution_profile"],
+            {
+                "embedding_profile": 17,
+                "backend": "cuda",
+                "device": "NVIDIA H100",
+                "driver": "driver-1",
+                "runtime": "cuda-1",
+                "precision": "f32",
+                "kernels": ["tokenize-v1", "qwen3-f32-v1"],
+                "fallback": True,
+            },
+        )
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            decode_product_response(encoded, 19, negotiated_minor=8)
+        for prefix in range(len(encoded)):
+            with self.subTest(prefix=prefix), self.assertRaises(ClientError):
+                decode_product_response(encoded[:prefix], 19, negotiated_minor=9)
+
+        excessive = bytearray(encoded)
+        kernel_count_offset = len(encoded) - len(text("tokenize-v1")) - len(text("qwen3-f32-v1")) - 4
+        struct.pack_into("<I", excessive, kernel_count_offset, 0xFFFFFFFF)
+        with self.assertRaisesRegex(ClientError, "kernel count"):
+            decode_product_response(bytes(excessive), 19, negotiated_minor=9)
+
     def test_completion_blake3_matches_published_vectors(self) -> None:
         self.assertEqual(
             blake3(b"").hex(),
@@ -904,6 +1099,65 @@ class V2Tests(unittest.TestCase):
         response = transport.execute("capabilities", {}, RequestOptions(request_id=17))
         self.assertEqual(response.kind, "capabilities")
         self.assertEqual(FakeHttpConnection.last_path, "/v2/execute")
+
+    @patch("http.client.HTTPSConnection", FakeHttpConnection)
+    def test_fresh_http_client_sends_minor_nine_operation_on_first_request(self) -> None:
+        original = FakeHttpResponse.getheader
+
+        def minor_nine(response: FakeHttpResponse, name: str) -> str | None:
+            if name == "X-Hyphae-Protocol-Minor":
+                return "9"
+            return original(response, name)
+
+        FakeHttpConnection.requests = 0
+        arguments = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [{"object_id": 201, "text": "rust"}],
+            },
+        }
+        with patch.object(FakeHttpResponse, "getheader", minor_nine):
+            HttpTransport("https://example.test").execute(
+                "embed_and_ingest", arguments, RequestOptions(request_id=17)
+            )
+
+        self.assertEqual(FakeHttpConnection.requests, 1)
+        self.assertEqual(
+            FakeHttpConnection.last_headers["X-Hyphae-Protocol-Minor"],
+            "3,4,5,6,7,8,9",
+        )
+        self.assertEqual(
+            int.from_bytes(FakeHttpConnection.last_body[12:14], "little"), 69
+        )
+
+    @patch("http.client.HTTPSConnection", FakeHttpConnection)
+    def test_http_client_preflights_minor_nine_after_server_downgrade(self) -> None:
+        original = FakeHttpResponse.getheader
+
+        def minor_eight(response: FakeHttpResponse, name: str) -> str | None:
+            if name == "X-Hyphae-Protocol-Minor":
+                return "8"
+            return original(response, name)
+
+        FakeHttpConnection.requests = 0
+        with patch.object(FakeHttpResponse, "getheader", minor_eight):
+            transport = HttpTransport("https://example.test")
+            transport.execute("capabilities", {}, RequestOptions(request_id=17))
+            with self.assertRaisesRegex(ClientError, "protocol minor"):
+                transport.execute(
+                    "embed_and_ingest",
+                    {
+                        "collection": 13,
+                        "batch": {
+                            "idempotency_id": 7,
+                            "documents": [{"object_id": 201, "text": "rust"}],
+                        },
+                    },
+                    RequestOptions(request_id=18),
+                )
+        self.assertEqual(transport.negotiated_minor, 8)
+        self.assertEqual(FakeHttpConnection.requests, 1)
 
     @patch("http.client.HTTPSConnection", FakeHttpConnection)
     def test_http_client_rejects_nonexact_selected_minor_before_decoding(self) -> None:

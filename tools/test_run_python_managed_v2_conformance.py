@@ -53,7 +53,7 @@ class PythonManagedV2RunnerTests(unittest.TestCase):
         valid = {
             "schema": "hyphae-python-managed-v2-transcript-v1",
             "status": "passed",
-            "protocol": {"major": 1, "minor": 7},
+            "protocol": {"major": 1, "minor": 9},
             "operations": {
                 "lifecycle": [
                     "security_api_key_issue_abort",
