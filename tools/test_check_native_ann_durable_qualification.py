@@ -108,7 +108,8 @@ def qualify(payload: dict) -> dict:
 def receipt() -> dict:
     published = "1" * 64
     delta_view = "2" * 64
-    consolidated = "3" * 64
+    consolidated_base = "3" * 64
+    consolidated_view = "8" * 64
     default_results = "4" * 64
     return {
         "schema": "hyphae-native-ann-durable-qualification-v1",
@@ -173,8 +174,8 @@ def receipt() -> dict:
             "consolidation": {
                 "before_base_identity": published,
                 "before_view_identity": delta_view,
-                "after_base_identity": consolidated,
-                "after_view_identity": consolidated,
+                "after_base_identity": consolidated_base,
+                "after_view_identity": consolidated_view,
                 "remaining_delta_records": 0,
                 "view_preserved": True,
                 "visible_result_identity": "7" * 64,
@@ -183,8 +184,8 @@ def receipt() -> dict:
                 "total_partitions_after": 64,
             },
             "final_reopen": {
-                "base_identity": consolidated,
-                "view_identity": consolidated,
+                "base_identity": consolidated_base,
+                "view_identity": consolidated_view,
                 "delta_records": 0,
                 "view_preserved": True,
                 "visible_result_identity": "7" * 64,
@@ -212,6 +213,15 @@ class NativeAnnDurableQualificationTests(unittest.TestCase):
         self.assertEqual(audit["certified_selected_queries"], 128)
         self.assertEqual(audit["full_fanout_fallback_queries"], 0)
         self.assertEqual(audit["maximum_searched_partitions"], 32)
+
+    def test_allows_equal_consolidated_base_and_view_identity_values(self) -> None:
+        payload = receipt()
+        consolidated = payload["lifecycle"]["consolidation"]
+        final = payload["lifecycle"]["final_reopen"]
+        consolidated["after_view_identity"] = consolidated["after_base_identity"]
+        final["view_identity"] = final["base_identity"]
+
+        self.assertEqual(qualify(payload)["status"], "passed")
 
     def test_diagnostic_discloses_missing_evidence_without_closure(self) -> None:
         payload = receipt()
@@ -356,7 +366,7 @@ class NativeAnnDurableQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "oneOf branches"):
             assert_schema_value(payload, schema, schema, "receipt")
 
-    def test_rejects_broken_reopen_delta_or_consolidation_chain(self) -> None:
+    def test_rejects_broken_initial_reopen_delta_or_routing_chain(self) -> None:
         payload = receipt()
         payload["lifecycle"]["initial_reopen"]["view_identity"] = "8" * 64
         with self.assertRaisesRegex(GateFailure, "initial reopen"):
@@ -364,10 +374,6 @@ class NativeAnnDurableQualificationTests(unittest.TestCase):
         payload = copy.deepcopy(receipt())
         payload["lifecycle"]["delta"]["after_base_identity"] = "8" * 64
         with self.assertRaisesRegex(GateFailure, "delta base"):
-            qualify(payload)
-        payload = copy.deepcopy(receipt())
-        payload["lifecycle"]["consolidation"]["view_preserved"] = False
-        with self.assertRaisesRegex(GateFailure, "consolidation"):
             qualify(payload)
         payload = copy.deepcopy(receipt())
         payload["lifecycle"]["consolidation"]["partitioned_base_preserved"] = False
@@ -378,16 +384,44 @@ class NativeAnnDurableQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(GateFailure, "partition"):
             qualify(payload)
         payload = copy.deepcopy(receipt())
-        payload["lifecycle"]["final_reopen"]["base_identity"] = "8" * 64
-        with self.assertRaisesRegex(GateFailure, "final reopen"):
-            qualify(payload)
-        payload = copy.deepcopy(receipt())
         payload["lifecycle"]["final_reopen"]["routing_outcome"] = (
             "single-generation-fallback"
         )
         payload["lifecycle"]["final_reopen"]["total_partitions"] = 1
         with self.assertRaisesRegex(GateFailure, "final reopen partitions"):
             qualify(payload)
+
+    def test_rejects_failed_consolidation_invariants(self) -> None:
+        mutations = (
+            ("after_base_identity", "before_base_identity", "replacement base"),
+            ("remaining_delta_records", 1, "drain all delta records"),
+            ("view_preserved", False, "view preservation"),
+            ("visible_result_identity", "9" * 64, "exact delta view"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                consolidation = payload["lifecycle"]["consolidation"]
+                if field == "after_base_identity":
+                    value = consolidation[value]
+                consolidation[field] = value
+                with self.assertRaisesRegex(GateFailure, message):
+                    qualify(payload)
+
+    def test_final_reopen_reproduces_each_consolidated_field(self) -> None:
+        mutations = (
+            ("base_identity", "9" * 64, "consolidated base"),
+            ("view_identity", "9" * 64, "consolidated view"),
+            ("visible_result_identity", "9" * 64, "consolidated results"),
+            ("delta_records", 1, "residual delta records"),
+            ("view_preserved", False, "view preservation"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field):
+                payload = receipt()
+                payload["lifecycle"]["final_reopen"][field] = value
+                with self.assertRaisesRegex(GateFailure, message):
+                    qualify(payload)
 
     def test_rejects_hidden_missing_evidence_and_closure_claim(self) -> None:
         payload = receipt()

@@ -301,11 +301,14 @@ consolidation neither allocates nor renumbers a sequence. D02 leaves, ordered
 sparse-Merkle nodes, counts, bytes, root, and final view identity are rebuilt
 canonically from exactly that preserved set.
 
-Retention starts with the publication-time retained-generation list, appends
-the publication-time selected nonempty base at the end only when it differs
-from the replacement and is not already retained, and drops oldest descriptors
-only as needed to satisfy `retain_generations`. Every surviving selected or
-retained child must retain its complete vector and graph records. Existing
+Retention starts with the publication-time retained-generation list and removes
+the replacement identity from that list while preserving survivor order. It
+then appends the publication-time selected nonempty base at the end only when
+it differs from the replacement and is not already retained, and drops oldest
+descriptors only as needed to satisfy `retain_generations`. This promotes a
+retained generation selected again by an A-to-B-to-A cycle without duplicating
+it. Every surviving selected or retained child must retain its complete vector
+and graph records. Existing
 surviving generation bytes are
 copied byte-for-byte, while exactly the retired generations are removed. The
 B+tree replacement checks the exact current key set under the format key and

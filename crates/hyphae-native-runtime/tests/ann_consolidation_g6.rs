@@ -457,6 +457,149 @@ fn configured_retention_survives_consolidation_then_pin_safe_vacuum_collection()
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn assert_two_consolidation_identity_cycle(metric: VectorMetric) -> Result<(), TestError> {
+    let temporary = TestDirectory::new();
+    let path = temporary.path().join(format!("data-cycle-{metric:?}"));
+    fs::create_dir_all(temporary.path())?;
+    let index = ObjectId::new(100)?;
+    let added = ObjectId::new(4)?;
+    let query = Vector::new([1.0, 0.0])?;
+    let mut database = NativeDatabase::create(&path)?;
+    let mut create = database.begin(1, DurabilityClass::Strict)?;
+    create.create_vector_index_with_lifecycle(
+        index,
+        "identity-cycle",
+        2,
+        metric,
+        config()?,
+        IncrementalVectorLifecycle {
+            delta_max_entries: 8,
+            consolidate_after_deltas: 1,
+            retain_generations: 1,
+        },
+    )?;
+    create.upsert_vectors(
+        index,
+        [
+            (ObjectId::new(1)?, Vector::new([1.0, 0.0])?),
+            (ObjectId::new(2)?, Vector::new([0.0, 1.0])?),
+            (ObjectId::new(3)?, Vector::new([-1.0, 0.0])?),
+        ],
+    )?;
+    create.commit()?;
+
+    let initial = database.observe_ann_index(index)?;
+    assert_eq!(initial.base_vector_count, 3);
+    assert_eq!(
+        initial.generation_records,
+        initial.selected_generation_records
+    );
+    let initial_exact = database.search_vector_exact_latest(index, &query, 3)?;
+    let initial_ids = initial_exact
+        .iter()
+        .map(|hit| hit.object_id)
+        .collect::<Vec<_>>();
+    let pin = SnapshotPinId::new(901)?;
+    database.pin_current(pin, 1)?;
+
+    let mut add = database.begin(2, DurabilityClass::Strict)?;
+    add.upsert_vector(index, added, Vector::new([1.0, 1.0])?)?;
+    add.commit()?;
+    let first_plan = database
+        .plan_due_ann_consolidation(index, 8)?
+        .ok_or("first cycle maintenance was not due")?;
+    assert_eq!(first_plan.base_identity(), initial.base_identity);
+    assert_ne!(first_plan.replacement_identity(), initial.base_identity);
+    database.consolidate_ann(first_plan, DurabilityClass::Strict)?;
+    let middle = database.observe_ann_index(index)?;
+    assert_ne!(middle.base_identity, initial.base_identity);
+    assert_eq!(middle.delta_records, 0);
+    assert!(!middle.maintenance_due);
+    assert_eq!(
+        middle.generation_records,
+        middle.selected_generation_records + initial.selected_generation_records
+    );
+
+    let mut remove = database.begin(3, DurabilityClass::Strict)?;
+    assert!(remove.delete_vector(index, added)?);
+    remove.commit()?;
+    let second_plan = database
+        .plan_due_ann_consolidation(index, 8)?
+        .ok_or("second cycle maintenance was not due")?;
+    assert_eq!(second_plan.base_identity(), middle.base_identity);
+    assert_eq!(second_plan.replacement_identity(), initial.base_identity);
+    database.consolidate_ann(second_plan, DurabilityClass::Strict)?;
+
+    let cycled = database.observe_ann_index(index)?;
+    assert_eq!(cycled.base_identity, initial.base_identity);
+    assert_eq!(cycled.base_vector_count, 3);
+    assert_eq!(cycled.effective_vector_count, 3);
+    assert_eq!(cycled.delta_records, 0);
+    assert_eq!(cycled.lifecycle.retain_generations, 1);
+    assert!(!cycled.maintenance_due);
+    assert_eq!(
+        cycled.selected_generation_records,
+        initial.selected_generation_records
+    );
+    assert_eq!(
+        cycled.generation_records,
+        cycled.selected_generation_records + middle.selected_generation_records
+    );
+    assert!(!database.ann_maintenance_status(index)?.due);
+    assert!(database.plan_due_ann_consolidation(index, 8)?.is_none());
+    assert_eq!(
+        database.search_vector_exact_latest(index, &query, 3)?,
+        initial_exact
+    );
+    assert_eq!(
+        database
+            .search_ann_latest(index, &query, AnnSearchOptions::new(3, 32, Some(3))?)?
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        initial_ids
+    );
+
+    let historical = database.open_pinned_snapshot(pin)?;
+    assert_eq!(
+        historical.search_vector_exact(index, &query, 3)?,
+        initial_exact
+    );
+    database.unpin(pin)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&path)?;
+    assert_eq!(reopened.observe_ann_index(index)?, cycled);
+    assert!(!reopened.ann_maintenance_status(index)?.due);
+    assert!(reopened.plan_due_ann_consolidation(index, 8)?.is_none());
+    assert_eq!(
+        reopened.search_vector_exact_latest(index, &query, 3)?,
+        initial_exact
+    );
+    assert_eq!(
+        reopened
+            .search_ann_latest(index, &query, AnnSearchOptions::new(3, 32, Some(3))?)?
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        initial_ids
+    );
+    Ok(())
+}
+
+#[test]
+fn squared_l2_consolidation_promotes_a_retained_a_b_a_cycle() -> Result<(), TestError> {
+    assert_two_consolidation_identity_cycle(VectorMetric::SquaredL2)
+}
+
+#[test]
+fn cosine_consolidation_promotes_a_retained_a_b_a_cycle() -> Result<(), TestError> {
+    assert_two_consolidation_identity_cycle(VectorMetric::Cosine)
+}
+
 #[test]
 fn partitioned_consolidation_preserves_kind_count_and_routing_after_reopen() -> Result<(), TestError>
 {

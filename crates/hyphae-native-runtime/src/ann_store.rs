@@ -4045,7 +4045,7 @@ pub(crate) fn delta_record_identity_for_test(
     Ok((
         creating_csn,
         metadata.view_identity,
-        overlay_view_identity(metadata.build_identity, manifest),
+        overlay_view_identity(index, metadata.build_identity, manifest),
     ))
 }
 
@@ -5161,6 +5161,7 @@ impl StreamingIndexRestore {
         let base = restore_base_with_cancellation(&self.metadata, self.definition, selected, None)?;
         let deltas = if let Some(overlay) = self.metadata.overlay {
             validate_layered_deltas(
+                self.definition.index_id(),
                 &self.metadata,
                 overlay,
                 self.overlay_manifest
@@ -5668,7 +5669,7 @@ fn restore_index_with_definition_controlled(
         if !overlay_nodes_prevalidated {
             validate_overlay_nodes_in_entries(entries, index, &overlay_leaf_hashes, overlay)?;
         }
-        validate_layered_deltas(&metadata, overlay, manifest, deltas, overlay_deltas)?
+        validate_layered_deltas(index, &metadata, overlay, manifest, deltas, overlay_deltas)?
     } else {
         if overlay_manifest.is_some() || !overlay_deltas.is_empty() || has_overlay_nodes {
             return Err(NativeRuntimeError::InvalidAnnTree);
@@ -5714,6 +5715,7 @@ fn restore_index_with_definition_controlled(
 }
 
 fn validate_layered_deltas(
+    index: ObjectId,
     metadata: &PersistedIndexMetadata,
     overlay: PersistedOverlayMetadata,
     manifest: OverlayManifest,
@@ -5769,7 +5771,7 @@ fn validate_layered_deltas(
     if u64::try_from(effective.len()).map_err(|_| NativeRuntimeError::InvalidAnnTree)?
         != overlay.effective_count
         || delta_map_bytes(&effective)? != overlay.effective_bytes
-        || overlay_view_identity(metadata.build_identity, manifest) != metadata.view_identity
+        || overlay_view_identity(index, metadata.build_identity, manifest) != metadata.view_identity
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
@@ -6625,6 +6627,9 @@ pub(crate) fn consolidate_tree_c01_for_test(
             current.deltas.remove(object_id);
         }
     }
+    current
+        .retained_generations
+        .retain(|generation| generation.build_identity != plan.replacement.build_identity());
     let previous = current.base.retention_descriptor();
     if current.base.len() != 0
         && previous.build_identity != plan.replacement.build_identity()
@@ -6722,6 +6727,9 @@ fn apply_consolidation_plan(
             _ => return Err(NativeRuntimeError::AnnConsolidationStale),
         }
     }
+    current
+        .retained_generations
+        .retain(|generation| generation.build_identity != plan.replacement.build_identity());
     let previous = current.base.retention_descriptor();
     if current.base.len() != 0
         && previous.build_identity != plan.replacement.build_identity()
@@ -6823,7 +6831,7 @@ fn canonical_consolidated_overlay(
         legacy_next_sequence,
         next_sequence,
     };
-    manifest.view_identity = overlay_view_identity(base_identity, manifest);
+    manifest.view_identity = overlay_view_identity(index, base_identity, manifest);
     entries.insert(
         overlay_manifest_key(index),
         encode_overlay_manifest(manifest),
@@ -7077,6 +7085,7 @@ pub(crate) fn inspect_consolidation_publication(
         || effective_record_digest(plan.index, &reconstructed.effective)
             != plan.captured_record_digest
         || reconstructed_capture_view(
+            plan.index,
             plan.captured_format,
             plan.base_identity,
             plan.captured_next_sequence,
@@ -7813,7 +7822,11 @@ fn encode_consolidated_metadata(
         || manifest.effective_count != manifest.overlay_count
         || manifest.effective_bytes != manifest.overlay_bytes
         || manifest.next_sequence != current.next_sequence
-        || overlay_view_identity(replacement.build_identity(), manifest) != manifest.view_identity
+        || overlay_view_identity(
+            current.definition().index_id(),
+            replacement.build_identity(),
+            manifest,
+        ) != manifest.view_identity
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
@@ -7906,7 +7919,7 @@ fn encode_consolidated_metadata(
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     let decoded = decode_metadata(&encoded)?;
-    validate_point_manifest_matches_metadata(&decoded, manifest)?;
+    validate_point_manifest_matches_metadata(current.definition().index_id(), &decoded, manifest)?;
     Ok(encoded)
 }
 
@@ -9227,12 +9240,13 @@ fn plan_overlay_upserts_from_projection(
             mutation_fingerprint: point_mutation_fingerprint(mutations),
         });
     }
-    manifest.view_identity = overlay_view_identity(metadata.build_identity, manifest);
+    manifest.view_identity = overlay_view_identity(index, metadata.build_identity, manifest);
     if manifest.view_identity == prior_view_identity || manifest.overlay_root == prior_overlay_root
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
-    let encoded_metadata = encode_point_metadata_v5(&metadata, &expected_metadata, manifest)?;
+    let encoded_metadata =
+        encode_point_metadata_v5(index, &metadata, &expected_metadata, manifest)?;
     let result_metadata = decode_metadata(&encoded_metadata)?;
     let recovery_memory_bytes = index_hydration_memory_bytes(definition, &result_metadata)?;
     replacements.insert(meta_key(index), encoded_metadata);
@@ -9364,7 +9378,7 @@ fn point_manifest(
             let encoded = projected_value(pages, tree, inherited, &overlay_manifest_key(index))?
                 .ok_or(NativeRuntimeError::InvalidAnnTree)?;
             let manifest = decode_overlay_manifest(&encoded)?;
-            validate_point_manifest_matches_metadata(metadata, manifest)?;
+            validate_point_manifest_matches_metadata(index, metadata, manifest)?;
             Ok(manifest)
         }
         None if metadata.version == 4 => {
@@ -9391,6 +9405,7 @@ fn point_manifest(
 }
 
 fn validate_point_manifest_matches_metadata(
+    index: ObjectId,
     metadata: &PersistedIndexMetadata,
     manifest: OverlayManifest,
 ) -> Result<(), NativeRuntimeError> {
@@ -9410,7 +9425,7 @@ fn validate_point_manifest_matches_metadata(
         next_sequence: metadata.next_sequence,
     };
     if manifest != expected
-        || overlay_view_identity(metadata.build_identity, manifest) != metadata.view_identity
+        || overlay_view_identity(index, metadata.build_identity, manifest) != metadata.view_identity
     {
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
@@ -9681,6 +9696,7 @@ fn encode_overlay_manifest(manifest: OverlayManifest) -> Vec<u8> {
 }
 
 fn encode_point_metadata_v5(
+    index: ObjectId,
     metadata: &PersistedIndexMetadata,
     expected_metadata: &[u8],
     manifest: OverlayManifest,
@@ -9746,7 +9762,7 @@ fn encode_point_metadata_v5(
     encoded.extend_from_slice(&[0; 8]);
     encoded.extend_from_slice(descriptors);
     let decoded = decode_metadata(&encoded)?;
-    validate_point_manifest_matches_metadata(&decoded, manifest)?;
+    validate_point_manifest_matches_metadata(index, &decoded, manifest)?;
     Ok(encoded)
 }
 
@@ -9771,6 +9787,7 @@ fn validate_point_metadata_manifest(
                 .get_cached_pinned(pages, buffer_pool, &overlay_manifest_key(index))?
                 .ok_or(NativeRuntimeError::InvalidAnnTree)?;
             validate_point_manifest_matches_metadata(
+                index,
                 metadata,
                 decode_overlay_manifest(encoded.bytes())?,
             )?;
@@ -10522,7 +10539,7 @@ fn effective_delta_records_at_root(
         return Err(NativeRuntimeError::InvalidAnnTree);
     }
     overlay_nodes.finish()?;
-    validate_layered_deltas(metadata, overlay, manifest, legacy, overlay_records)
+    validate_layered_deltas(index, metadata, overlay, manifest, legacy, overlay_records)
 }
 
 struct FilteredCaptureRecords {
@@ -10654,6 +10671,7 @@ fn overlay_root_and_node_count(
 }
 
 fn reconstructed_capture_view(
+    index: ObjectId,
     captured_format: u8,
     captured_base: [u8; 32],
     captured_next_sequence: u64,
@@ -10698,7 +10716,7 @@ fn reconstructed_capture_view(
                 legacy_next_sequence: frozen.legacy_next_sequence,
                 next_sequence: captured_next_sequence,
             };
-            manifest.view_identity = overlay_view_identity(captured_base, manifest);
+            manifest.view_identity = overlay_view_identity(index, captured_base, manifest);
             Ok(manifest.view_identity)
         }
         _ => Err(NativeRuntimeError::InvalidAnnTree),
@@ -10995,6 +11013,7 @@ pub(crate) fn validate_recovered_consolidation_transition(
         || effective_record_digest(definition.index_id(), &captured.effective)
             != certificate.captured_record_digest
         || reconstructed_capture_view(
+            definition.index_id(),
             certificate.captured_format,
             certificate.captured_base,
             certificate.captured_next_sequence,
@@ -11144,8 +11163,14 @@ fn validate_recovered_consolidation_v1_transition(
         .collect::<BTreeMap<_, _>>();
     if result_deltas != expected_preserved
         || u64::try_from(captured.effective.len()).ok() != Some(captured_count)
-        || reconstructed_capture_view(4, captured_base, captured_next_sequence, prior, &captured)?
-            != captured_view
+        || reconstructed_capture_view(
+            definition.index_id(),
+            4,
+            captured_base,
+            captured_next_sequence,
+            prior,
+            &captured,
+        )? != captured_view
     {
         return Err(NativeRuntimeError::InvalidCommittedRoot);
     }
@@ -11198,6 +11223,7 @@ fn retained_generations_after_consolidation(
     replacement_base: [u8; 32],
 ) -> Vec<RetainedGeneration> {
     let mut retained = prior.retained_generations.clone();
+    retained.retain(|generation| generation.build_identity != replacement_base);
     if prior.vector_count != 0
         && prior.build_identity != replacement_base
         && !retained
@@ -12117,9 +12143,14 @@ fn overlay_node_hash(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn overlay_view_identity(base_identity: [u8; 32], manifest: OverlayManifest) -> [u8; 32] {
+fn overlay_view_identity(
+    index: ObjectId,
+    base_identity: [u8; 32],
+    manifest: OverlayManifest,
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"hyphae-ann-overlay-view-v1");
+    hasher.update(&index.get().to_be_bytes());
     hasher.update(&base_identity);
     hasher.update(&manifest.legacy_view_identity);
     hasher.update(&manifest.overlay_root);
@@ -12490,7 +12521,8 @@ pub(crate) fn install_test_m05_tree(
         legacy_next_sequence,
         next_sequence: sequence,
     };
-    manifest.view_identity = overlay_view_identity(state.base.build_identity(), manifest);
+    manifest.view_identity =
+        overlay_view_identity(definition.index_id(), state.base.build_identity(), manifest);
     replacements.insert(
         meta_key(definition.index_id()),
         test_encode_metadata_v5(&state, manifest)?,
@@ -12890,7 +12922,8 @@ mod tests {
             legacy_next_sequence,
             next_sequence,
         };
-        manifest.view_identity = overlay_view_identity(state.base.build_identity(), manifest);
+        manifest.view_identity =
+            overlay_view_identity(definition.index_id(), state.base.build_identity(), manifest);
         entries.insert(
             overlay_manifest_key(definition.index_id()),
             encode_overlay_manifest_for_test(manifest),
@@ -12925,6 +12958,21 @@ mod tests {
         assert_eq!(metadata.delta_count, 2);
         assert_eq!(overlay.overlay_count, 3);
         assert_eq!(overlay.effective_count, 3);
+        let manifest = fixture
+            .entries
+            .iter()
+            .find(|(key, _)| key.first() == Some(&ANN_OVERLAY_MANIFEST_PREFIX))
+            .map(|(_, value)| decode_overlay_manifest(value))
+            .ok_or("missing overlay manifest")??;
+        validate_point_manifest_matches_metadata(
+            fixture.definition.index_id(),
+            &metadata,
+            manifest,
+        )?;
+        assert!(
+            validate_point_manifest_matches_metadata(ObjectId::new(12)?, &metadata, manifest)
+                .is_err()
+        );
         assert_eq!(
             fixture.legacy_objects,
             [ObjectId::new(1)?, ObjectId::new(4)?].into()
@@ -14188,11 +14236,16 @@ mod tests {
                 183, 76, 202, 140, 198, 189, 146, 228, 249, 8, 148, 14, 100,
             ]
         );
+        let view_identity = overlay_view_identity(ObjectId::new(11)?, [9; 32], manifest);
+        assert_ne!(
+            view_identity,
+            overlay_view_identity(ObjectId::new(12)?, [9; 32], manifest)
+        );
         assert_eq!(
-            overlay_view_identity([9; 32], manifest),
+            view_identity,
             [
-                200, 245, 167, 198, 238, 12, 195, 246, 87, 144, 171, 48, 194, 66, 163, 203, 108,
-                219, 182, 127, 10, 170, 76, 168, 232, 61, 171, 230, 9, 182, 126, 53,
+                136, 120, 128, 164, 89, 195, 135, 9, 148, 17, 150, 131, 164, 44, 165, 123, 181, 31,
+                0, 186, 100, 52, 41, 147, 242, 224, 135, 224, 33, 56, 113, 192,
             ]
         );
         assert_eq!(

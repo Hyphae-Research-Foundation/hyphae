@@ -349,11 +349,10 @@ def _validate_lifecycle(
         if (
             consolidation["after_base_identity"]
             == consolidation["before_base_identity"]
-            or consolidation["after_view_identity"]
-            != consolidation["after_base_identity"]
-            or consolidation["remaining_delta_records"] != 0
         ):
-            raise GateFailure("consolidation did not publish a clean replacement view")
+            raise GateFailure("consolidation did not publish a replacement base")
+        if consolidation["remaining_delta_records"] != 0:
+            raise GateFailure("consolidation did not drain all delta records")
 
     final = lifecycle["final_reopen"]
     if final is not None:
@@ -382,14 +381,24 @@ def _validate_lifecycle(
             or total_partitions != build["logical_partitions"]
         ):
             raise GateFailure("final reopen did not preserve the reopened partitioned route")
-        if consolidation is not None and (
-            final["base_identity"] != consolidation["after_base_identity"]
-            or final["view_identity"] != consolidation["after_view_identity"]
-            or final["visible_result_identity"]
-            != consolidation["visible_result_identity"]
-            or final["delta_records"] != 0
-        ):
-            raise GateFailure("final reopen does not reproduce the consolidated view")
+        if consolidation is not None:
+            if final["base_identity"] != consolidation["after_base_identity"]:
+                raise GateFailure(
+                    "final reopen does not reproduce the consolidated base"
+                )
+            if final["view_identity"] != consolidation["after_view_identity"]:
+                raise GateFailure(
+                    "final reopen does not reproduce the consolidated view"
+                )
+            if (
+                final["visible_result_identity"]
+                != consolidation["visible_result_identity"]
+            ):
+                raise GateFailure(
+                    "final reopen does not reproduce the consolidated results"
+                )
+            if final["delta_records"] != 0:
+                raise GateFailure("final reopen reproduces residual delta records")
     return lifecycle
 
 

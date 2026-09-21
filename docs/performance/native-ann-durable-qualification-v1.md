@@ -27,9 +27,14 @@ evidence produces an explicit `no closure` diagnostic and a non-zero exit.
 - byte-identical full-fanout and default-route result identities;
 - initial reopen reproducing the published build and selected results;
 - visible upserts and deletes that change the view without replacing the base;
-- consolidation consuming that exact delta view and publishing a clean base;
+- consolidation consuming that exact delta view, publishing a replacement base,
+  draining all delta records, and preserving the visible results;
   and
-- final reopen reproducing the consolidated identities and visible results.
+- final reopen independently reproducing the consolidated base identity, view
+  identity, and visible results.
+
+Base and view identities remain independent fields after consolidation. The
+gate neither requires their values to be equal nor requires them to differ.
 
 The full-fanout comparison is against the existing default approximate route.
 The flat exact oracle remains a separate identity used to calculate selected

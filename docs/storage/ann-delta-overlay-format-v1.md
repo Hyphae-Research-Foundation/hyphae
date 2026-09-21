@@ -213,13 +213,18 @@ field, avoiding a circular definition:
 ```text
 view_identity =
   BLAKE3("hyphae-ann-overlay-view-v1" ||
-         base_build_identity || frozen_legacy_view_identity || overlay_root ||
+         u128be(index_object_id) || base_build_identity ||
+         frozen_legacy_view_identity || overlay_root ||
          u64le(legacy_count) || u64le(legacy_bytes) ||
          u64le(overlay_count) || u64le(overlay_bytes) ||
          u64le(overlay_node_count) ||
          u64le(effective_count) || u64le(effective_bytes) ||
          u64le(legacy_next_sequence) || u64le(next_sequence))
 ```
+
+The index `ObjectId` is encoded as its unsigned 128-bit big-endian value. Thus,
+identical base and overlay bytes in different indexes have different final view
+identities.
 
 The frozen legacy identity is exactly piecewise under the unchanged M02 through
 M04 rule. If the D01 map is empty, the identity is the base build identity for
@@ -452,14 +457,17 @@ The result always has this one canonical M05 shape:
 - the manifest, complete ordered sparse-Merkle tree, root, and final view
   identity are regenerated from exactly those D02 records.
 
-The publication-time retained-generation list remains in order. The prior
-selected nonempty base is appended at the end only when it differs from the
-replacement and is not already retained; otherwise its existing position is
-unchanged. Oldest entries are then removed only to satisfy
-`retain_generations`. Each surviving selected or retained descriptor must own
-the complete vector and graph records for every child. Existing surviving
-generation records, including every graph layer, are preserved byte-for-byte;
-retired generations and only retired generations are removed.
+The publication-time retained-generation list remains in order. The descriptor
+whose identity equals the replacement is first removed, promoting that
+generation to selected while preserving the order of all other retained
+descriptors. The prior selected nonempty base is then appended at the end only
+when it differs from the replacement and is not already retained. Oldest
+entries are removed only to satisfy `retain_generations`. The resulting list is
+ordered and unique and never contains the selected identity. Each surviving
+selected or retained descriptor must own the complete vector and graph records
+for every child. Existing surviving generation records, including every graph
+layer, are preserved byte-for-byte; retired generations and only retired
+generations are removed.
 
 Publication admission covers every simultaneously live owner additively:
 target-index hydration and validation, the replacement base when its build
