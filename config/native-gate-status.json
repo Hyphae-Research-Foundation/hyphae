@@ -123,5 +123,11 @@
       "registry_run": 33859889168,
       "retained_evidence": "docs/gates/evidence/closures/native-g8-24bce1a.json"
     }
-  ]
+  ],
+  "release_candidate": {
+    "version": "4.0.0",
+    "status": "prepared",
+    "exact_sha_g8": "open",
+    "publication": "blocked"
+  }
 }

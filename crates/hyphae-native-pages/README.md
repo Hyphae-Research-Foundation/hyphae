@@ -2,7 +2,7 @@
 
 ```toml
 [dependencies]
-hyphae-native-pages = "=3.0.0"
+hyphae-native-pages = "=4.0.0"
 ```
 
 The workspace pins every internal crate, including this one, to this exact

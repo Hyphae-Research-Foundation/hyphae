@@ -40,10 +40,20 @@ commit path. The closed G7 profile therefore certifies the operational-scale
 matrix of the engine without per-operation authorization; the 1.2 access
 control, and every commit and read path added in the releases since, adds
 work to the measured paths that G7 did not observe. Performance claims for
-1.2.x and later releases — including 2.2.0 and 3.0.0 — must either cite this
+1.2.x and later releases, including the 4.0.0 candidate, must either cite this
 scoped profile explicitly or wait for a G7 re-execution on a release commit
-that carries the added work, and in every case remain bound to a receipt
-under the vocabulary of [`docs/product/claims.md`](../product/claims.md).
+that carries the added work, and in every case remain bound to a receipt under
+the vocabulary of [`docs/product/claims.md`](../product/claims.md).
+
+## 4.0.0 release-candidate status
+
+The source and package inventories are prepared at `4.0.0`. No 4.0.0 release
+tag, signed release, exact-SHA G8 closure, or publication receipt exists yet,
+so 4.0.0 is deliberately absent from the historical closure table below.
+Publication remains blocked until a selected integration commit completes the
+full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
+row and registry receipt remain historical authority and are not rewritten by
+candidate preparation.
 
 ## Exact-SHA G8 release closures per release
 

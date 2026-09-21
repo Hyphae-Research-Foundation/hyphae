@@ -8,10 +8,10 @@
 The single `hyphae` executable: local data engine, operations CLI, `/v1`
 server, remote client, offline proof verifier, and MCP stdio adapter.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```bash
-cargo install hyphae-cli --version 3.0.0 --locked
+cargo install hyphae-cli --version 4.0.0 --locked
 hyphae version --json
 ```
 

@@ -3,6 +3,11 @@
 Do not install an archive until its digest, identity, and provenance all
 verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
+The current source tree is prepared as a `4.0.0` release candidate, not as a
+published release. Until its exact commit has a signed release and G8 closure,
+use this procedure only for candidate verification. The retained `3.0.0`
+publication evidence and registry authority remain unchanged.
+
 ## Maintainer tag-target invariant
 
 The version tag targets the canonical merge commit for the reviewed release

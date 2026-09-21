@@ -4,8 +4,9 @@
 Python 3.11 or newer, uses only the standard library at runtime, and includes
 typed generated models plus a `py.typed` marker. Native v2 has source-compatible
 synchronous calls and an async adapter with an owned serial worker. The source
-package version is `3.0.0`. Per the `3.0.0` release receipt's distribution
-boundary, this package is source-only in `3.0.0`: it is not published to PyPI.
+package version is `4.0.0`. This package is source-only at `4.0.0` and is not
+published to PyPI. The `3.0.0` receipt remains the historical authority for
+that release's distribution boundary.
 
 The distribution is named `hyphae-sdk` and the import package is
 `hyphae_sdk`. The unrelated `hyphae` distribution on PyPI is not this project.

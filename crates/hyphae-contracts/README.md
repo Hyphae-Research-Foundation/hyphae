@@ -8,11 +8,11 @@
 Versioned Rust models and embedded OpenAPI 3.1 / JSON Schema 2020-12 contracts
 for the [Hyphae](https://hyphae.dev) `/v1` API.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-contracts = "=3.0.0"
+hyphae-contracts = "=4.0.0"
 ```
 
 Use this crate when implementing a client, server adapter, or conformance tool

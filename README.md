@@ -256,6 +256,10 @@ cargo build --release --locked -p hyphae-cli
 The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
 checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
 
+The checked-out source is the `4.0.0` release candidate. It is not published
+and has no inherited exact-SHA G8 closure; the commands above intentionally
+remain bound to the verified `3.0.0` release until a new release is authorized.
+
 ## Legacy 0.2.1 compatibility flow
 
 ```bash

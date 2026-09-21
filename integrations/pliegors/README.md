@@ -8,11 +8,11 @@
 Optional public-contract adapter between PliegoRS applications and the
 [Hyphae](https://hyphae.dev) `/v1` API.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-pliegors = "=3.0.0"
+hyphae-pliegors = "=4.0.0"
 ```
 
 The crate depends on `hyphae-client`, not PliegoRS internals or Hyphae storage.

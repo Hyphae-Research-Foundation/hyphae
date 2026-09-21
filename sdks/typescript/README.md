@@ -2,9 +2,9 @@
 
 `@hyphae_/hyphae` is the bounded ESM client for APIs v1 and Native v2. It requires Node.js 20
 or newer, uses the runtime `fetch`, and has no runtime package dependencies.
-The release source package version is `3.0.0`. Per the `3.0.0` release
-receipt's distribution boundary, this package is source-only in `3.0.0`: it is
-not published to npm.
+The release source package version is `4.0.0`. This package is source-only at
+`4.0.0` and is not published to npm. The `3.0.0` receipt remains the historical
+authority for that release's distribution boundary.
 
 ## Build from this repository
 

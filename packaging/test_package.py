@@ -336,10 +336,10 @@ def add_final_signature_bundles(directory: Path) -> None:
 
 
 class PackageTests(unittest.TestCase):
-    def test_apache_publication_is_blocked_until_version_1_2_2(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "3.0.0"):
-            require_final_apache_release_version("1.2.1")
-        require_final_apache_release_version("3.0.0")
+    def test_release_finalization_is_bound_to_version_4_0_0(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "4.0.0"):
+            require_final_apache_release_version("3.0.0")
+        require_final_apache_release_version("4.0.0")
 
     def test_source_package_versions_are_aligned(self) -> None:
         cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
@@ -410,7 +410,38 @@ class PackageTests(unittest.TestCase):
             npm_release["apache_publication_authority"], publication_authority
         )
         self.assertNotEqual(version, publication_authority["version"])
+        for layer in crates_release["layers"]:
+            for package in layer:
+                readme_path = (
+                    ROOT / "integrations/pliegors/README.md"
+                    if package == "hyphae-pliegors"
+                    else ROOT / "crates" / package / "README.md"
+                )
+                readme = readme_path.read_text(encoding="utf-8")
+                pin = (
+                    f"--version {version}"
+                    if package == "hyphae-cli"
+                    else f'{package} = "={version}"'
+                )
+                self.assertIn(pin, readme, readme_path.as_posix())
+        for readme_path in (
+            ROOT / "sdks/python/README.md",
+            ROOT / "sdks/typescript/README.md",
+        ):
+            self.assertIn(
+                f"version is `{version}`",
+                readme_path.read_text(encoding="utf-8"),
+                readme_path.as_posix(),
+            )
+        release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
+            "utf-8"
+        )
+        self.assertIn('test "$RELEASE_TAG" = "release-v4.0.0-crates"', release_workflow)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(
+            changelog,
+            rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
+        )
         authority_version = re.escape(publication_authority["version"])
         self.assertRegex(
             changelog,

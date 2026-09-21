@@ -9,11 +9,11 @@ Durable local storage primitives for [Hyphae](https://hyphae.dev): an
 append-only checksummed and digest-chained log, atomic/idempotent mutation,
 recovery, snapshots, compaction, backups, and verified restore.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-storage = "=3.0.0"
+hyphae-storage = "=4.0.0"
 ```
 
 This crate owns the format-2 compatibility disk format. New applications

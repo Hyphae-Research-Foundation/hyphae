@@ -3,7 +3,12 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## Unreleased — Agent Memory / Omarchy candidate
+## [4.0.0] - 2026-09-21
+
+Hyphae 4.0.0 prepares the current Agent Memory and Native data-engine source as
+one final package identity. This section records the candidate's source
+contents; it does not claim registry publication or an exact-SHA release-gate
+closure.
 
 - Make `release-vVERSION-crates` the canonical Release and Python publication
   identity while retaining validation of the previous `vVERSION` source shape.
@@ -29,6 +34,15 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Bound Native protocol collection and vector allocations before reservation
   using domain limits, remaining wire bytes, checked arithmetic, and fallible
   allocation.
+- Persist vector updates and deletes as bounded per-index physical deltas, then
+  add the authenticated ANN overlay reader, point writer, absence fences, and
+  consolidation path under the existing WAL, MVCC, and proof authorities.
+- Fix bounded SQL `LIMIT`/`OFFSET`, constraints, and catalog conflict semantics,
+  and add PostgreSQL and Valkey application-core profiles as external
+  conformance subjects rather than runtime dependencies.
+- Define the Universal Engine self-hosted program and a proposed separately
+  versioned physiological-redo contract. The roadmap and proposal do not
+  promote unimplemented domains or redo behavior to shipped capability.
 - Update reviewed Rust dependencies, including the futures memory-safety and
   waker fixes, and keep auxiliary conformance lockfiles synchronized.
 - Refresh the pinned Codex 0.153.2 and Claude Code 2.1.260 MCP hosts, executable
@@ -37,8 +51,10 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Update the isolated Tantivy benchmark baseline to 0.26.2, resolving the
   vulnerable `lru` dependency to 0.16.4.
 
-This is unshipped source on top of 3.0.0. It is not a new crate/SDK registry
-release and does not inherit an exact-commit G7/G8 closure.
+The workspace, crate graph, SDK manifests, plugin manifests, and package
+inventories now share final source version `4.0.0`. The candidate remains
+unpublished and does not inherit an exact-commit G7/G8 closure. The `3.0.0`
+release history and publication receipts remain authoritative and unchanged.
 
 ## [3.0.0] - 2026-09-03
 
