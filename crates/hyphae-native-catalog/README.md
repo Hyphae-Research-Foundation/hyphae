@@ -23,9 +23,15 @@ bytes.
 
 The additive V2 model supplies database/schema hierarchy, first-class
 keyspaces, reusable analyzers, complete stored/doc-values/source/lexical field
-policy, multiple named vectors, exact/ANN/adaptive selection, incremental
-lifecycle policy, stable definition versions and SHA-256 digests, object kinds,
-and bidirectional dependency derivation. Existing objects can be wrapped
+policy, multiple named vectors, metadata-only embedding profiles,
+exact/ANN/adaptive selection, incremental lifecycle policy, stable definition
+versions and SHA-256 digests, object kinds, and bidirectional dependency
+derivation. Existing objects can be wrapped
 losslessly with `encode_definition_v2`; logical definitions use strict
 `HYCOBJ02` decode and canonical re-encoding checks. Lifecycle policy enforces
 the durable delta ceiling, threshold ordering, and retained-generation bound.
+Embedding profiles bind safetensors weights/config/tokenizer digests and closed
+pipeline semantics but do not load a model or execute inference.
+The profile variant and named-vector field change exhaustive public 3.0.0 Rust
+types, so this unreleased source is next-major incubation and cannot ship as
+3.x.

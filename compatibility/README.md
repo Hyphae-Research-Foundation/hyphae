@@ -44,6 +44,13 @@ Regenerate it only when intentionally changing the append-only native protocol:
 cargo run -p hyphae-native-protocol --example generate_sdk_fixture
 ```
 
+The three `native-catalog-*.hex` fixtures freeze the unreleased next-major
+catalog boundary: one embedding profile, one historical representation-3
+search definition, and one representation-4 bound search definition. Rust
+strictly decodes and re-encodes them; Python and TypeScript consume the same
+bytes for content-derived minor-8 admission tests. Representation 3 remains a
+minor-7-compatible control.
+
 ## Valkey/Redis RDB migration fixture
 
 `valkey/rdb-v11.json` is one immutable RDB version-11 source payload for the
