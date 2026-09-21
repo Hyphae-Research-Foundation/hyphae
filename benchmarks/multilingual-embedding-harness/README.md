@@ -230,10 +230,11 @@ helper and succeeds only when execution is denied.
 
 The contained service unsets `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`,
 makes the user bus, user-manager private socket, system-manager private socket,
-and system D-Bus sockets inaccessible, and denies systemd's `@network-io`
-syscall group. The staged runner also attempts to connect to each management
-socket and fails if any is reachable, preventing sibling-unit launch through
-the user manager.
+and system D-Bus sockets inaccessible. `RestrictAddressFamilies=AF_UNIX` and
+`IPAddressDeny=any` deny IP networking while retaining the Unix-domain calls
+required by the CUDA runtime. The staged runner also attempts to connect to
+each management socket and fails if any is reachable, preventing sibling-unit
+launch through the user manager.
 
 Before starting the unit, the launcher streams the user manager environment
 through a 1 MiB bounded, non-persisted pipe and retains names only. Every
@@ -302,10 +303,14 @@ in the receipt; an independent checker validates those identities from the
 portable stage inventory without reopening the original executable or Python
 installation paths.
 
-Every distribution-declared file and every file-backed Python module observed
-during measurement must resolve to a matching path, size, and SHA-256 in the
-stage inventory. Built-in and frozen modules have no file path; any other
-module or distribution path outside the stage fails closed.
+Every distribution-declared file and every ordinary file-backed Python module
+observed during measurement must resolve to a matching path, size, and SHA-256
+in the stage inventory. PyTorch's exact `torch.ops` and `torch.classes` virtual
+namespace identities have no backing file. Its exact non-scriptable RPC helper
+may be generated only in a single bounded volatile temporary directory and is
+content-hashed into the receipt, removed after that capture, and retained in the
+later union. Built-in and frozen modules have no file path; any other module or
+distribution path outside the stage fails closed.
 
 Independently recheck the result and local weights with:
 

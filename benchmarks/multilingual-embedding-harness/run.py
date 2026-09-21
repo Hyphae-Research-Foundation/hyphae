@@ -106,6 +106,7 @@ FROZEN_MANAGER_ENVIRONMENT_ALLOWLIST = {
 SYSTEMD_GENERATED_ENVIRONMENT_ALLOWLIST = {
     "HOME",
     "LOGNAME",
+    "MANAGERPID",
     "USER",
     "SHELL",
     "INVOCATION_ID",
@@ -371,8 +372,6 @@ SYSTEMD_SHOW_PROPERTIES = [
     "TemporaryFileSystem",
     "UnsetEnvironment",
     "UMask",
-    "SystemCallFilter",
-    "SystemCallErrorNumber",
     "NoExecPaths",
     "ExecPaths",
 ]
@@ -612,35 +611,6 @@ def _validate_effective_containment(
     families = properties.get("RestrictAddressFamilies", "").split()
     if families != ["AF_UNIX"]:
         raise ContractError("effective systemd address-family restriction differs")
-    syscall_filter = properties.get("SystemCallFilter", "").split()
-    required_network_syscalls = {
-        "socket",
-        "socketpair",
-        "connect",
-        "bind",
-        "listen",
-        "accept",
-        "accept4",
-        "sendto",
-        "recvfrom",
-    }
-    if syscall_filter == ["~@network-io"]:
-        denied_syscalls = {"@network-io"}
-    elif (
-        not syscall_filter
-        or not syscall_filter[0].startswith("~")
-        or syscall_filter[0] == "~"
-        or any(value.startswith(("~", "@")) for value in syscall_filter[1:])
-    ):
-        raise ContractError("effective systemd network syscall deny polarity differs")
-    else:
-        denied_syscalls = {syscall_filter[0][1:], *syscall_filter[1:]}
-    if "@network-io" not in denied_syscalls and not required_network_syscalls.issubset(
-        denied_syscalls
-    ):
-        raise ContractError("effective systemd network syscall denial differs")
-    if properties.get("SystemCallErrorNumber") not in {"EPERM", "1"}:
-        raise ContractError("effective systemd syscall error policy differs")
     expected_read_only = {
         "/tmp",
         "/var/tmp",
@@ -816,8 +786,6 @@ def _containment_properties(
         "LimitNOFILE=128",
         "IPAddressDeny=any",
         "RestrictAddressFamilies=AF_UNIX",
-        "SystemCallFilter=~@network-io",
-        "SystemCallErrorNumber=EPERM",
         "NoNewPrivileges=yes",
         "RestrictSUIDSGID=yes",
         "KillMode=control-group",

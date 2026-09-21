@@ -1147,7 +1147,7 @@ class EmbeddingHarnessContractTests(unittest.TestCase):
         self.assertIn("TasksMax=64", properties)
         self.assertIn("IPAddressDeny=any", properties)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", properties)
-        self.assertIn("SystemCallFilter=~@network-io", properties)
+        self.assertFalse(any(item.startswith("SystemCallFilter=") for item in properties))
         self.assertIn("NoNewPrivileges=yes", properties)
         self.assertIn("RestrictSUIDSGID=yes", properties)
         self.assertFalse(any(item.startswith("CapabilityBoundingSet=") for item in properties))
@@ -1654,7 +1654,12 @@ class EmbeddingHarnessContractTests(unittest.TestCase):
     def test_first_staged_python_environment_has_no_extra_names(self) -> None:
         _verify_first_stage_environment(
             {"LANG"},
-            environment={"LANG": "C", "USER": "test", "INVOCATION_ID": "test"},
+            environment={
+                "LANG": "C",
+                "USER": "test",
+                "INVOCATION_ID": "test",
+                "MANAGERPID": "1",
+            },
         )
         with self.assertRaisesRegex(ContractError, "frozen policy"):
             _verify_first_stage_environment(
@@ -1685,8 +1690,6 @@ class EmbeddingHarnessContractTests(unittest.TestCase):
             "LimitNOFILE": "128",
             "IPAddressDeny": "0.0.0.0/0 ::/0",
             "RestrictAddressFamilies": "AF_UNIX",
-            "SystemCallFilter": "~@network-io",
-            "SystemCallErrorNumber": "1",
             "NoNewPrivileges": "yes",
             "RestrictSUIDSGID": "yes",
             "ProtectSystem": "strict",
@@ -1764,8 +1767,6 @@ class EmbeddingHarnessContractTests(unittest.TestCase):
             "LimitNOFILE": "128",
             "IPAddressDeny": "any",
             "RestrictAddressFamilies": "AF_UNIX",
-            "SystemCallFilter": "~@network-io",
-            "SystemCallErrorNumber": "EPERM",
             "NoNewPrivileges": "yes",
             "RestrictSUIDSGID": "yes",
             "ProtectSystem": "strict",
@@ -1812,14 +1813,6 @@ class EmbeddingHarnessContractTests(unittest.TestCase):
                 "writable tmpfs",
             ),
             ("UnsetEnvironment", "XDG_RUNTIME_DIR", "environment removal"),
-            ("SystemCallFilter", "", "deny polarity"),
-            ("SystemCallFilter", "@network-io", "deny polarity"),
-            (
-                "SystemCallFilter",
-                "~@network-io @network-io",
-                "deny polarity",
-            ),
-            ("SystemCallErrorNumber", "13", "syscall error policy"),
             ("NoExecPaths", "", "NoExecPaths"),
             (
                 "ExecPaths",

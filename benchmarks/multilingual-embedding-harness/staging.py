@@ -65,6 +65,7 @@ MAX_PYTHON_ENVIRONMENT_FILES = 90_000
 MAX_PYTHON_ENVIRONMENT_BYTES = 64 * 1024 * 1024 * 1024
 MAX_PYVENV_BYTES = 64 * 1024
 MAX_RUNTIME_LOADER_BYTES = 32 * 1024 * 1024
+MAX_STAGE_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_PYTHON_PATH_COMPONENTS = 256
 MAX_PYTHON_SYMLINKS = 16
 MAX_PYTHON_SYMLINK_BYTES = 1024
@@ -1376,7 +1377,7 @@ def validate_stage(paths: StagePaths) -> dict[str, Any]:
         raise ContractError("execution stage root is mutable or irregular")
     if paths.manifest.is_symlink() or paths.manifest.stat().st_mode & 0o222:
         raise ContractError("execution stage manifest is mutable")
-    document = load_json(paths.manifest)
+    document = load_json(paths.manifest, maximum_bytes=MAX_STAGE_MANIFEST_BYTES)
     validate_stage_document(document)
     records = _inventory(paths.root)
     if records != document["files"]:

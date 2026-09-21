@@ -82,6 +82,11 @@ DYNAMIC_QUERY_FIELDS = [
     "clocks.current.memory",
 ]
 PROCESS_QUERY_FIELDS = ["pid", "gpu_uuid"]
+VIRTUAL_PYTHON_MODULES = {
+    "torch.classes": "_classes.py",
+    "torch.ops": "_ops.py",
+}
+GENERATED_PYTHON_MODULE = "_remote_module_non_scriptable"
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +118,8 @@ def _nvidia_rows(
     ]
     if identifier is not None:
         command.append(f"--id={identifier}")
+    descriptor_match = re.match(r"\A/proc/self/fd/([0-9]+)/", str(executable))
+    pass_fds = () if descriptor_match is None else (int(descriptor_match.group(1)),)
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             process = subprocess.Popen(
@@ -122,6 +129,7 @@ def _nvidia_rows(
                 stderr=stderr,
                 shell=False,
                 env={"LC_ALL": "C"},
+                pass_fds=pass_fds,
             )
             try:
                 returncode = process.wait(timeout=15)
@@ -279,16 +287,50 @@ def _loaded_python_modules(
         value = getattr(module, "__file__", None)
         if not isinstance(value, str):
             continue
+        virtual_path = VIRTUAL_PYTHON_MODULES.get(name)
+        if virtual_path is not None:
+            if value != virtual_path:
+                raise ContractError(f"virtual Python module identity differs: {name}")
+            continue
         path = Path(value)
         if path.suffix.lower() in {".pyc", ".pyo"}:
             raise ContractError(f"loaded Python module used pre-existing bytecode: {name}")
         if not path.is_absolute():
             raise ContractError(f"loaded Python module path is not absolute: {value}")
+        if name == GENERATED_PYTHON_MODULE:
+            resolved = path.resolve(strict=True)
+            volatile_tmp = (stage_root / "volatile/tmp").resolve(strict=True)
+            try:
+                relative = resolved.relative_to(volatile_tmp)
+            except ValueError as error:
+                raise ContractError("generated Python module is outside bounded volatile storage") from error
+            if (
+                path.is_symlink()
+                or not resolved.is_file()
+                or len(relative.parts) != 2
+                or not relative.parts[0].startswith("tmp")
+                or relative.name != f"{GENERATED_PYTHON_MODULE}.py"
+            ):
+                raise ContractError("generated Python module identity differs")
+            records.append(artifact_record(resolved, f"module:{name}"))
+            continue
         _require_staged_runtime_file(
             path, stage_root, stage_files, f"loaded Python module {name}"
         )
         records.append(artifact_record(path, f"module:{name}"))
     return sorted(records, key=lambda item: item["identity"])
+
+
+def _release_generated_python_module() -> None:
+    module = sys.modules.pop(GENERATED_PYTHON_MODULE, None)
+    if module is None:
+        return
+    value = getattr(module, "__file__", None)
+    if not isinstance(value, str):
+        raise ContractError("generated Python module lost its file identity")
+    path = Path(value)
+    path.unlink()
+    path.parent.rmdir()
 
 
 def _native_identity(path: Path) -> str:
@@ -317,6 +359,8 @@ def _loaded_native_libraries() -> list[dict[str, Any]]:
         if len(fields) != 6 or not fields[5].startswith("/"):
             continue
         value = fields[5]
+        if value == "/dev/zero (deleted)":
+            continue
         if value.endswith(" (deleted)"):
             raise ContractError(f"loaded native artifact was deleted during execution: {value}")
         path = Path(value)
@@ -685,6 +729,7 @@ def measure(arguments: argparse.Namespace) -> dict[str, Any]:
     except ImportError as error:
         raise ContractError(f"reference environment import failed: {error}") from error
     artifact_capture.capture("framework-imported")
+    _release_generated_python_module()
     if not torch.cuda.is_available():
         raise ContractError("PyTorch CUDA is unavailable")
     if arguments.gpu_index >= torch.cuda.device_count():
