@@ -371,6 +371,75 @@ fn ann_hybrid_exposes_ann_receipt_and_rejects_branch_limit_mismatch()
 }
 
 #[test]
+fn ann_hybrid_ranking_uses_replacement_candidates_after_a_shadow_delete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TemporaryDirectory::create()?;
+    let mut database = NativeDatabase::create(temporary.0.join("shadow-delete-hybrid"))?;
+    let lexical = ObjectId::new(11)?;
+    let vectors = ObjectId::new(12)?;
+    let deleted = ObjectId::new(1)?;
+    let second = ObjectId::new(2)?;
+    let third = ObjectId::new(3)?;
+    let mut seed = database.begin(0, DurabilityClass::Memory)?;
+    seed.create_search_index(lexical, "shadow_delete_documents")?;
+    seed.create_vector_index(
+        vectors,
+        "shadow_delete_vectors",
+        2,
+        VectorMetric::SquaredL2,
+        config()?,
+    )?;
+    seed.index_document(lexical, second.get().to_be_bytes().to_vec(), "rust rust")?;
+    seed.index_document(lexical, third.get().to_be_bytes().to_vec(), "rust")?;
+    seed.upsert_vectors(
+        vectors,
+        [
+            (deleted, Vector::new([0.0, 0.0])?),
+            (second, Vector::new([1.0, 0.0])?),
+            (third, Vector::new([2.0, 0.0])?),
+        ],
+    )?;
+    seed.commit()?;
+    let mut deletion = database.begin_optimistic_delta(1, DurabilityClass::Strict)?;
+    assert!(database.stage_delta_vector_absence_fence(&mut deletion, vectors, deleted)?);
+    database.commit_optimistic(deletion)?;
+
+    let query = Vector::new([0.0, 0.0])?;
+    let mut hybrid = request(
+        lexical,
+        vectors,
+        &query,
+        NativeVectorBranch::Ann(AnnSearchOptions::new(2, 3, None)?),
+    );
+    hybrid.lexical_limit = 2;
+    hybrid.vector_limit = 2;
+    hybrid.fusion.limit = 2;
+    let receipt = database.retrieve_hybrid_latest(1, &hybrid)?;
+    assert_eq!(receipt.vector_candidates, 2);
+    let ann = receipt.ann.ok_or("missing ANN branch receipt")?;
+    assert_eq!(ann.ef_search, 3);
+    assert_eq!(
+        ann.strategy,
+        hyphae_native_runtime::AnnSearchStrategy::GraphTraversal
+    );
+    assert_eq!(
+        ann.hits.iter().map(|hit| hit.object_id).collect::<Vec<_>>(),
+        [second, third]
+    );
+    let NativeHybridOutcome::Matches(matches) = receipt.outcome else {
+        return Err("hybrid unexpectedly abstained".into());
+    };
+    assert_eq!(
+        matches
+            .iter()
+            .map(|matched| matched.object_id)
+            .collect::<Vec<_>>(),
+        [second, third]
+    );
+    Ok(())
+}
+
+#[test]
 fn hybrid_rejects_lexical_ids_that_cannot_join_vector_ids() -> Result<(), Box<dyn std::error::Error>>
 {
     let temporary = TemporaryDirectory::create()?;

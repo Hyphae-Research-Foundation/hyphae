@@ -24,11 +24,13 @@ import {
 import { decodeProductRequest, operationRequiredMinor } from "../dist/v2/protocol.js";
 
 const fixtureUrl = new URL("../../../compatibility/native-protocol-v1-structure-get.bin", import.meta.url);
+const transactionDocumentFixtureUrl = new URL("../../../compatibility/native-protocol-v1-transaction-document.bin", import.meta.url);
+const transactionDocumentOrderingFixtureUrl = new URL("../../../compatibility/native-protocol-v1-transaction-document-ordering.json", import.meta.url);
+const requiredMinorFixtureUrl = new URL("../../../compatibility/native-protocol-v1-required-minors.json", import.meta.url);
 
 test("v2 search content at every current shape is minor zero", () => {
-  // Every currently expressible search body is minor-0 content; the content
-  // walk exists so future operators, typed doc values, and fusion methods
-  // raise the requirement without new operations.
+  // Original search shapes and minor-0 doc-value types remain available
+  // without raising the operation's protocol minor.
   assert.equal(
     operationRequiredMinor("search_collection", {
       filter: {
@@ -58,6 +60,40 @@ test("v2 search content at every current shape is minor zero", () => {
     0,
   );
   assert.equal(operationRequiredMinor("security_status"), 1);
+});
+
+test("v2 shared required-minor fixture is exhaustive", async () => {
+  const fixture = JSON.parse(await readFile(requiredMinorFixtureUrl, "utf8"));
+  assert.equal(fixture.cases.length, 27);
+  for (const entry of fixture.cases) {
+    assert.equal(operationRequiredMinor(entry.operation, entry.arguments), entry.required_minor, entry.name);
+  }
+});
+
+test("v2 u128 bounds and nonzero identities fail closed", () => {
+  for (const value of [-1n, 1n << 128n]) {
+    assert.throws(() => encodeProductRequest("transaction_status", { transaction_id: value }), /u128|unsigned 128-bit/);
+  }
+  for (const value of [0n, -1n, 1n << 128n]) {
+    assert.throws(
+      () => encodeProductRequest("structure_read", { kind: "string_get", key: { keyspace: value, key: Uint8Array.of(1) } }),
+      /identity|u128/,
+    );
+  }
+  assert.throws(
+    () => encodeProductRequest(
+      "security_built_in_assignment_create",
+      { principal_id: 1n, role: "reader", scope: { kind: "catalog_object", object_id: 0n } },
+      { idempotencyToken: 1n },
+      3,
+    ),
+    /identity is zero/,
+  );
+  const maximum = (1n << 128n) - 1n;
+  assert.equal(
+    decodeProductRequest(encodeProductRequest("transaction_status", { transaction_id: maximum })).args.transaction_id,
+    maximum,
+  );
 });
 
 test("v2 completion BLAKE3 matches published vectors", () => {
@@ -420,6 +456,145 @@ test("v2 independent encoder matches shared fixture", async () => {
   assert.deepEqual(encodeFrame(FRAME_KIND.execute, 7, 42n, payload), fixture);
 });
 
+test("v2 transaction document matches the shared fixture", async () => {
+  const fixture = new Uint8Array(await readFile(transactionDocumentFixtureUrl));
+  const frame = decodeFrame(fixture);
+  const request = decodeProductRequest(frame.payload, 7);
+  assert.equal(request.operation, "transaction_stage_search");
+  assert.deepEqual(request.args, {
+    handle: 7n,
+    mutation: {
+      kind: "document",
+      collection: 13n,
+      document: {
+        object_id: 201n,
+        text: "rust database",
+        doc_values: {
+          blob: Uint8Array.of(7),
+          flag: true,
+          name: "a",
+          rank: 3n,
+          rating: { float: 4.5 },
+        },
+        vectors: { embedding: [1, 0] },
+      },
+    },
+  });
+  assert.throws(() => decodeProductRequest(frame.payload, 6), /protocol minor/);
+  assert.deepEqual(
+    encodeFrame(frame.kind, frame.streamId, frame.requestId, encodeProductRequest(request.operation, request.args, request.options, 7)),
+    fixture,
+  );
+});
+
+test("v2 transaction document fixture rejects forged counts before allocation", async () => {
+  const frame = decodeFrame(new Uint8Array(await readFile(transactionDocumentFixtureUrl)));
+  for (const offset of [138, 216, 233]) {
+    const excessive = frame.payload.slice();
+    new DataView(excessive.buffer).setUint32(offset, 0xffffffff, true);
+    assert.throws(() => decodeProductRequest(excessive, 7), /exceeds/);
+  }
+
+  const truncatedValues = frame.payload.slice(0, 142);
+  new DataView(truncatedValues.buffer).setUint32(8, truncatedValues.byteLength, true);
+  const truncatedVectors = frame.payload.slice(0, 220);
+  new DataView(truncatedVectors.buffer).setUint32(8, truncatedVectors.byteLength, true);
+  const truncatedDimension = frame.payload.slice(0, 241);
+  const dimensionView = new DataView(truncatedDimension.buffer);
+  dimensionView.setUint32(8, truncatedDimension.byteLength, true);
+  dimensionView.setUint32(233, 2, true);
+  for (const encoded of [truncatedValues, truncatedVectors, truncatedDimension]) {
+    assert.throws(() => decodeProductRequest(encoded, 7), /exceeds/);
+  }
+});
+
+test("v2 transaction document fixture rejects invalid Rust values", async () => {
+  const frame = decodeFrame(new Uint8Array(await readFile(transactionDocumentFixtureUrl)));
+  for (const offset of [89, 105]) {
+    const forged = frame.payload.slice();
+    forged.fill(0, offset, offset + 16);
+    assert.throws(() => decodeProductRequest(forged, 7), /zero/);
+  }
+
+  for (const bits of [0x8000000000000000n, 0x7ff0000000000001n]) {
+    const forged = frame.payload.slice();
+    new DataView(forged.buffer).setBigUint64(208, bits, true);
+    assert.throws(() => decodeProductRequest(forged, 7), /noncanonical/);
+  }
+
+  for (const value of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+    const forged = frame.payload.slice();
+    new DataView(forged.buffer).setFloat32(237, value, true);
+    assert.throws(() => decodeProductRequest(forged, 7), /nonfinite/);
+  }
+});
+
+test("v2 transaction document tag requires minor seven", () => {
+  const args = {
+    handle: 7n,
+    mutation: {
+      kind: "document",
+      collection: 13n,
+      document: {
+        object_id: 201n,
+        text: "rated",
+        doc_values: { rating: { float: 4 } },
+        vectors: {},
+      },
+    },
+  };
+  assert.throws(() => encodeProductRequest("transaction_stage_search", args, {}, 6), /protocol minor/);
+  const encoded = encodeProductRequest("transaction_stage_search", args, {}, 7);
+  assert.throws(() => decodeProductRequest(encoded, 6), /protocol minor/);
+  assert.deepEqual(decodeProductRequest(encoded, 7).args, args);
+});
+
+test("v2 transaction document names use canonical UTF-8 byte order", async () => {
+  const fixture = JSON.parse(await readFile(transactionDocumentOrderingFixtureUrl, "utf8"));
+  const canonical = Uint8Array.from(fixture.canonical_request_hex.match(/../gu), byte => Number.parseInt(byte, 16));
+  const request = decodeProductRequest(canonical, 7);
+  const privateUse = "\ue000";
+  const supplementary = "\u{1f600}";
+  assert.deepEqual(Object.keys(request.args.mutation.document.doc_values), [privateUse, supplementary]);
+  assert.deepEqual(Object.keys(request.args.mutation.document.vectors), [privateUse, supplementary]);
+
+  const reverseInsertion = {
+    handle: 7n,
+    mutation: {
+      kind: "document",
+      collection: 13n,
+      document: {
+        object_id: 201n,
+        text: "unicode",
+        doc_values: {
+          [supplementary]: "supplementary",
+          [privateUse]: "private-use",
+        },
+        vectors: {
+          [supplementary]: [0, 1],
+          [privateUse]: [1, 0],
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    encodeProductRequest("transaction_stage_search", reverseInsertion, request.options, 7),
+    canonical,
+  );
+});
+
+test("v2 transaction document rejects nonascending names before payloads", async () => {
+  const fixture = JSON.parse(await readFile(transactionDocumentOrderingFixtureUrl, "utf8"));
+  for (const [name, encodedHex] of Object.entries(fixture.malformed_requests_hex)) {
+    const encoded = Uint8Array.from(encodedHex.match(/../gu), byte => Number.parseInt(byte, 16));
+    assert.throws(
+      () => decodeProductRequest(encoded, 7),
+      { message: /strictly ascending by UTF-8 bytes/ },
+      name,
+    );
+  }
+});
+
 test("v2 attested rerank request matches the cross-language golden", () => {
   const hex = (value) => Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const name = (value) => {
@@ -540,11 +715,57 @@ test("v2 all structure read requests round trip", () => {
     { kind: "sorted_set_range", key, start: -2n, stop: 4n, order: "descending" },
     { kind: "sorted_set_cardinality", key },
     { kind: "stream_range", key, start: 2n, end: 4n, limit: 10n },
+    { kind: "sorted_set_score_range", key, lower: { exclusive: 1.5 }, upper: undefined, offset: 2n, limit: 16n, order: "descending" },
+    { kind: "hash_scan_reverse", key, start_before: new TextEncoder().encode("field"), limit: 8n },
+    { kind: "hash_scan_match", key, pattern: new TextEncoder().encode("user:*"), start_after: undefined, output_limit: 8n, visit_limit: 32n, match_step_limit: 256n },
+    { kind: "key_scan_match", keyspace: 7n, pattern: new TextEncoder().encode("app:*"), start_after: new TextEncoder().encode("app:flag"), output_limit: 8n, visit_limit: 32n, match_step_limit: 256n },
+    { kind: "string_range", key, start: -5n, end: -1n },
+    { kind: "set_random_members", key, seed: 42n, count: 3n },
   ];
   for (const args of cases) {
-    const decoded = decodeProductRequest(encodeProductRequest("structure_read", args));
+    const required = operationRequiredMinor("structure_read", args);
+    if (required === 6) assert.throws(() => encodeProductRequest("structure_read", args, {}, 5), /minor/);
+    const decoded = decodeProductRequest(encodeProductRequest("structure_read", args, {}, Math.max(required, 5)), Math.max(required, 5));
     assert.equal(decoded.operation, "structure_read");
     assert.deepEqual(decoded.args, args);
+  }
+});
+
+test("v2 minor-six search and structure mutations round trip", () => {
+  const key = { keyspace: 7n, key: new TextEncoder().encode("key") };
+  const args = {
+    collection: 13n,
+    request: {
+      lexical: { query: "rust", candidate_limit: 4n, weight: 1, phrase: true },
+      vectors: [{ target: "image", query: [0, 1], candidate_limit: 4n, weight: 1, execution: { kind: "exact" }, max_distance: 4 }],
+      filter: { kind: "match_all" }, sort: [], facets: [],
+      range_facets: [{ field: "price", ranges: [{ lower: undefined, upper: 15 }, { lower: 15, upper: undefined }] }],
+      aggregations: [{ name: "mean", kind: "average", field: "price" }],
+      limit: 4n, fusion: "relative_score", autocut: 2, offset: 1,
+    },
+  };
+  assert.throws(() => encodeProductRequest("search_collection", args, {}, 5), /minor/);
+  const encoded = encodeProductRequest("search_collection", args, {}, 6);
+  const decoded = decodeProductRequest(encoded, 6);
+  assert.equal(decoded.args.request.fusion, "relative_score");
+  assert.equal(decoded.args.request.lexical.phrase, true);
+  assert.equal(decoded.args.request.vectors[0].max_distance, 4);
+  assert.deepEqual(encodeProductRequest(decoded.operation, decoded.args, decoded.options, 6), encoded);
+
+  const mutations = [
+    { kind: "sorted_set_increment", key, delta: 2.5, member: Uint8Array.of(1) },
+    { kind: "sorted_set_pop", key, end: "highest" },
+    { kind: "string_set_conditional", key, value: Uint8Array.of(1), expires_at_micros: 99n, condition: "if_present" },
+    { kind: "string_append", key, suffix: Uint8Array.of(2) },
+    { kind: "string_set_range", key, offset: 4, patch: Uint8Array.of(3) },
+    { kind: "hash_set_if_absent", key, field: Uint8Array.of(4), value: Uint8Array.of(5) },
+    { kind: "set_pop", key, seed: 42n },
+  ];
+  for (const mutation of mutations) {
+    const request = { mutations: [mutation] };
+    assert.throws(() => encodeProductRequest("structure_mutate", request, {}, 5), /minor/);
+    const wire = encodeProductRequest("structure_mutate", request, {}, 6);
+    assert.deepEqual(decodeProductRequest(wire, 6).args, request);
   }
 });
 
@@ -577,14 +798,18 @@ test("v2 high-level API exposes explicit transactions", async () => {
   });
   await client.transactionBegin({ requestId: 20n });
   await client.transactionStageVector(7n, { kind: "delete", index: 11n, object_id: 13n }, { requestId: 21n });
+  const documentMutation = { kind: "document", collection: 13n, document: { object_id: 201n, text: "rust" } };
+  await client.transactionStageSearch(7n, documentMutation, { requestId: 24n });
   await client.explicitTransactionStatus(7n, { requestId: 22n });
   await client.transactionStatusByIdempotency(23n, { requestId: 23n });
   assert.deepEqual(calls.map(({ operation }) => operation), [
     "transaction_begin",
     "transaction_stage_vector",
+    "transaction_stage_search",
     "explicit_transaction_status",
     "transaction_status_by_idempotency",
   ]);
+  assert.deepEqual(calls[2].args.mutation, documentMutation);
 });
 
 test("v2 high-level API exposes security metadata writes and legacy revoke", async () => {
@@ -702,6 +927,31 @@ test("v2 HTTP client uses /v2 and validates correlation", async () => {
   assert.equal(response.kind, "capabilities");
   assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5,6,7" });
   assert.equal(ERROR_MEDIA_TYPE, "application/vnd.hyphae.error-v1");
+});
+
+test("v2 HTTP initial preflight encodes at the highest supported minor", async () => {
+  let seen;
+  const client = HyphaeClient.http("https://example.test", {
+    fetch: async (_url, options) => {
+      seen = {
+        minor: options.headers.get("x-hyphae-protocol-minor"),
+        body: new Uint8Array(options.body),
+      };
+      return new Response(new Uint8Array(), {
+        status: 500,
+        headers: {
+          "content-type": ERROR_MEDIA_TYPE,
+          "x-hyphae-protocol-minor": "7",
+          "x-hyphae-request-id": "88",
+        },
+      });
+    },
+  });
+  await assert.rejects(
+    client.execute("structure_read", { kind: "string_range", key: { keyspace: 1n, key: Uint8Array.of(1) }, start: 0n, end: 1n }, { requestId: 88n }),
+  );
+  assert.equal(seen.minor, "3,4,5,6,7");
+  assert.ok(seen.body.byteLength > 0);
 });
 
 test("v2 HTTP rejects a missing or nonexact selected minor before session retention and decoding", async () => {

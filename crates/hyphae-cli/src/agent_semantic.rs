@@ -1080,6 +1080,15 @@ mod tests {
             assert!(product.memory_enrich(&request, now).is_err());
             assert_eq!(count(&product, collection.get())?, 0);
         }
+        {
+            let product = NativeProduct::open(&path)?;
+            assert_eq!(count(&product, policy.collections[1])?, 0);
+        }
+        let doctor = hyphae_native_product::doctor(&hyphae_native_product::DoctorRequest::new(
+            &path,
+            crate::native::logical_time_micros(),
+        )?);
+        assert!(doctor.is_healthy(), "post-delete doctor report: {doctor:?}");
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

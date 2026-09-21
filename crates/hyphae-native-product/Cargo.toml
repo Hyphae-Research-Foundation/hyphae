@@ -18,6 +18,7 @@ readme = "README.md"
 blake3.workspace = true
 futures-channel.workspace = true
 getrandom.workspace = true
+hyphae-native-ann.workspace = true
 hyphae-native-catalog.workspace = true
 hyphae-native-runtime.workspace = true
 hyphae-native-types.workspace = true

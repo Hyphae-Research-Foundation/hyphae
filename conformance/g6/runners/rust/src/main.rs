@@ -928,8 +928,8 @@ fn failure_cases(
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let operation = ProductOperation::ExecuteSql {
-        statement: "SELECT id FROM g6_items".into(),
-        parameters: vec![],
+        statement: "SELECT id, label FROM g6_items WHERE id = ?".into(),
+        parameters: vec![ProductValue::Signed(1)],
     };
     let mut limited = context(transport.session, 6110);
     limited.limits.max_request_bytes = 1;
@@ -1002,8 +1002,8 @@ fn stable_failures() -> Result<Vec<(&'static str, ProductOperation)>, Box<dyn Er
 
 fn product_failure_operations() -> Result<Vec<ProductFailureCase>, Box<dyn Error>> {
     let operation = || ProductOperation::ExecuteSql {
-        statement: "SELECT id FROM g6_items".into(),
-        parameters: vec![],
+        statement: "SELECT id, label FROM g6_items WHERE id = ?".into(),
+        parameters: vec![ProductValue::Signed(1)],
     };
     let mut limited = options(6110);
     limited.limits.max_request_bytes = 1;
@@ -1098,12 +1098,12 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             query: "rust".into(),
             candidate_limit: 8,
             weight: 1,
-                    operator: None,
-                            prefix: false,
-                                            fields: Vec::new(),
-                                                                    fuzzy: None,
-                                                                                                            phrase: false,
-                                                                }
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }
     });
     let targets: &[&str] = match mode {
         "exact" => &["exact"],
@@ -1127,6 +1127,7 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             } else {
                 ProductVectorExecution::Exact
             }),
+            max_distance: None,
         })
         .collect();
     let filter = if mode == "filter" {
@@ -1153,6 +1154,7 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
             } else {
                 vec![]
             },
+            range_facets: vec![],
             aggregations: if mode == "metric" {
                 vec![ProductNamedAggregation {
                     name: "count".into(),
@@ -1162,6 +1164,12 @@ fn search_operation(mode: &str) -> Result<ProductOperation, Box<dyn Error>> {
                 vec![]
             },
             limit: 8,
+            fusion: None,
+            parent_dedupe: None,
+            rerank: None,
+            highlight: None,
+            autocut: None,
+            offset: 0,
         },
     })
 }
@@ -1276,7 +1284,7 @@ fn structure_outcome(family: &str, response: ProductResponse) -> Result<Value, B
 fn structure_value_json(value: hyphae_native_product::ProductStructureReadResult) -> Value {
     match value {
         hyphae_native_product::ProductStructureReadResult::Value(value) => {
-            json!({"kind": "hash_value", "value": value.map(|bytes| hex(&bytes))})
+            json!({"kind": "value", "value": value.map(|bytes| hex(&bytes))})
         }
         hyphae_native_product::ProductStructureReadResult::Values(values) => {
             json!({"kind": "values", "values": values.into_iter().map(|bytes| hex(&bytes)).collect::<Vec<_>>()})
@@ -1397,6 +1405,7 @@ fn proof_kind(kind: hyphae_native_product::proof::NativeProofKind) -> &'static s
         NativeProofKind::Ann => "ann",
         NativeProofKind::Hybrid => "hybrid",
         NativeProofKind::Catalog => "catalog",
+        NativeProofKind::Memory => "memory",
     }
 }
 
@@ -1720,6 +1729,7 @@ fn run_cli_lane(lane: &str) -> Result<(), Box<dyn Error>> {
         "--data-dir",
         &data_text,
         "list",
+        "--instance",
         "--limit",
         "64",
         "--visit-limit",
@@ -1727,7 +1737,10 @@ fn run_cli_lane(lane: &str) -> Result<(), Box<dyn Error>> {
         "--byte-limit",
         "65536",
     ])?;
-    cases.push(case("catalog/catalog-list", json!({"snapshot": listed["snapshot"], "object_ids": listed["items"].as_array().ok_or("catalog items")?.iter().map(|item| item["id"].clone()).collect::<Vec<_>>()})));
+    cases.push(case(
+        "catalog/catalog-list",
+        cli_catalog_list_outcome(&listed)?,
+    ));
     let described = call(&[
         "catalog",
         "--data-dir",
@@ -1923,7 +1936,7 @@ fn run_cli_lane(lane: &str) -> Result<(), Box<dyn Error>> {
         "--limit",
         "8",
     ])?;
-    cases.insert(cases.iter().position(|value| value["id"] == "search/filter").ok_or("filter case")?, case("search/named-vectors", json!({"mode": "named-vectors", "snapshot": named_vectors["snapshot"], "object_ids": named_vectors["hits"].as_array().ok_or("search hits")?.iter().map(|hit| hit["object_id"].clone()).collect::<Vec<_>>(), "approximate": true})));
+    cases.insert(cases.iter().position(|value| value["id"] == "search/filter").ok_or("filter case")?, case("search/named-vectors", json!({"mode": "named-vectors", "snapshot": named_vectors["snapshot"], "object_ids": named_vectors["hits"].as_array().ok_or("search hits")?.iter().map(|hit| hit["object_id"].clone()).collect::<Vec<_>>(), "approximate": named_vectors["approximate"]})));
 
     let status = call(&[
         "transaction",
@@ -1961,10 +1974,9 @@ fn run_cli_lane(lane: &str) -> Result<(), Box<dyn Error>> {
     let telemetry = call(&["telemetry", "--data-dir", &data_text])?;
     cases.push(case("administration/telemetry", json!({"registry_version": telemetry["registry_version"], "metric_names": telemetry["metrics"].as_array().ok_or("telemetry metrics")?.iter().map(|metric| metric["name"].clone()).collect::<Vec<_>>()})));
     let doctor = call(&["doctor", "--data-dir", &data_text])?;
-    let _ = doctor;
     cases.push(case(
         "administration/doctor",
-        json!({"status": "busy", "snapshot_verified": false}),
+        json!({"status": doctor["status"], "snapshot_verified": doctor["snapshot_verified"]}),
     ));
 
     let proof = work.join("cli-proof.hynproof");
@@ -2091,7 +2103,7 @@ fn cli_sql_command(value: &Value) -> Result<Value, Box<dyn Error>> {
 
 fn cli_structure_value(value: &Value) -> Value {
     match value["type"].as_str() {
-        Some("value") => json!({"kind": "hash_value", "value": value["value_hex"]}),
+        Some("value") => json!({"kind": "value", "value": value["value_hex"]}),
         Some("values") => {
             json!({"kind": "values", "values": value["values"].as_array().into_iter().flatten().map(|item| item["value_hex"].clone()).collect::<Vec<_>>()})
         }
@@ -2107,6 +2119,21 @@ fn cli_structure_value(value: &Value) -> Value {
 
 fn cli_backup_outcome(value: &Value) -> Value {
     json!({"visible_csn": value["visible_csn"], "checkpoint_digest": value["checkpoint_digest"], "file_count": value["file_count"], "total_bytes": value["total_bytes"]})
+}
+
+fn cli_catalog_list_outcome(value: &Value) -> Result<Value, Box<dyn Error>> {
+    let snapshot = value
+        .get("snapshot")
+        .filter(|snapshot| !snapshot.is_null())
+        .ok_or("catalog list omitted instance snapshot")?;
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("catalog items")?;
+    Ok(json!({
+        "snapshot": snapshot,
+        "object_ids": items.iter().map(|item| item["id"].clone()).collect::<Vec<_>>(),
+    }))
 }
 
 async fn http_transport_failure_cases(origin: &str) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -2279,6 +2306,7 @@ fn configure_search(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
                         lifecycle,
                     },
                 ],
+                bm25: None,
             },
         )),
         ProductDurability::Strict,
@@ -2370,4 +2398,30 @@ fn header(
         parent: parent.map(ObjectId::new).transpose()?,
         definition_version: DefinitionVersion::FIRST,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_catalog_list_outcome;
+    use serde_json::json;
+
+    #[test]
+    fn cli_catalog_list_rejects_a_missing_or_null_snapshot() {
+        for value in [json!({"items": []}), json!({"snapshot": null, "items": []})] {
+            assert!(cli_catalog_list_outcome(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_catalog_list_preserves_the_instance_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let snapshot = json!({"catalog_version": 7, "root_digest": "ab"});
+        let outcome = cli_catalog_list_outcome(&json!({
+            "snapshot": snapshot,
+            "items": [{"id": "10"}, {"id": "11"}],
+        }))?;
+        assert_eq!(outcome["snapshot"], snapshot);
+        assert_eq!(outcome["object_ids"], json!(["10", "11"]));
+        Ok(())
+    }
 }

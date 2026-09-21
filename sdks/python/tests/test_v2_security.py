@@ -287,9 +287,8 @@ class SecurityProtocolTests(unittest.TestCase):
         }
         self.assertTrue(all(operation_required_minor(operation) == 3 for operation in lifecycle))
         self.assertEqual(operation_required_minor("security_legacy_bearer_revoke"), 3)
-        # Every currently expressible search body is minor-0 content; the
-        # content walk exists so future operators, typed doc values, and
-        # fusion methods raise the requirement without new operations.
+        # Original search shapes and minor-0 doc-value types remain available
+        # without raising the operation's protocol minor.
         self.assertEqual(
             operation_required_minor(
                 "search_collection",

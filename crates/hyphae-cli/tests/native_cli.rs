@@ -1270,7 +1270,30 @@ fn catalog_list_round_trips_the_complete_opaque_cursor_between_processes()
 }
 
 #[test]
-fn separate_cli_transactions_use_distinct_default_idempotency() -> Result<(), Box<dyn Error>> {
+fn catalog_list_exposes_a_snapshot_only_for_explicit_instance_access() -> Result<(), Box<dyn Error>>
+{
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+
+    let visible = run(&["catalog", "--data-dir", &data_text, "list"])?;
+    assert!(visible.get("snapshot").is_none());
+
+    let instance = run(&["catalog", "--data-dir", &data_text, "list", "--instance"])?;
+    let snapshot = instance
+        .get("snapshot")
+        .filter(|value| !value.is_null())
+        .ok_or("instance catalog list omitted its snapshot")?;
+    assert!(snapshot["catalog_version"].as_u64().is_some());
+    assert!(snapshot["root_digest"].as_str().is_some());
+    assert_eq!(instance["items"], visible["items"]);
+    Ok(())
+}
+
+#[test]
+fn committing_cli_transactions_require_and_report_caller_idempotency() -> Result<(), Box<dyn Error>>
+{
     let temporary = TestDirectory::new()?;
     let data = temporary.0.join("data");
     let data_text = path(&data);
@@ -1305,7 +1328,8 @@ fn separate_cli_transactions_use_distinct_default_idempotency() -> Result<(), Bo
         "--family",
         "string",
     ])?;
-    for key in ["first", "second"] {
+    let mut first_transaction_id = None;
+    for (key, token) in [("first", "41"), ("second", "42")] {
         let steps = serde_json::json!([
             {"operation":"stage_structure","mutation":{
                 "operation":"string_set","keyspace":20,"key":key,
@@ -1314,7 +1338,7 @@ fn separate_cli_transactions_use_distinct_default_idempotency() -> Result<(), Bo
             {"operation":"commit"}
         ])
         .to_string();
-        let result = run(&[
+        let missing_token = output(&[
             "transaction",
             "--data-dir",
             &data_text,
@@ -1322,8 +1346,144 @@ fn separate_cli_transactions_use_distinct_default_idempotency() -> Result<(), Bo
             "--steps-json",
             &steps,
         ])?;
+        assert!(!missing_token.status.success());
+        let result = run(&[
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--idempotency-token",
+            token,
+            "--steps-json",
+            &steps,
+        ])?;
         assert_eq!(result["steps"][2]["status"], "committed");
+        assert_eq!(result["idempotency_token"], token);
+        assert_eq!(result["idempotent_replay"], false);
+        assert_eq!(result["recovered"], false);
+        assert_eq!(
+            result["transaction_id"],
+            result["steps"][2]["commit"]["transaction_id"]
+        );
+        if let Some(first) = &first_transaction_id {
+            assert_ne!(&result["transaction_id"], first);
+        } else {
+            first_transaction_id = Some(result["transaction_id"].clone());
+        }
     }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn transaction_execute_recovers_after_publication_before_output_without_repeating()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.recovery",
+    ])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-keyspace",
+        "--id",
+        "21",
+        "--parent",
+        "11",
+        "--name",
+        "main.public.recovery_counter",
+        "--family",
+        "counter",
+    ])?;
+    let steps = serde_json::json!([
+        {"operation":"stage_structure","mutation":{"operation":"counter_add","keyspace":21,"key":"published","delta":1}},
+        {"operation":"commit"}
+    ])
+    .to_string();
+    let token = "7001";
+    let crashed = Command::new(env!("CARGO_BIN_EXE_hyphae"))
+        .args([
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "execute",
+            "--idempotency-token",
+            token,
+            "--steps-json",
+            &steps,
+        ])
+        .env("HYPHAE_CLI_TEST_CRASH_AFTER_TRANSACTION_PUBLICATION", "1")
+        .output()?;
+    assert!(!crashed.status.success());
+    assert!(crashed.stdout.is_empty());
+
+    let status = run(&[
+        "transaction",
+        "--data-dir",
+        &data_text,
+        "status",
+        "--idempotency-token",
+        token,
+    ])?;
+    assert_eq!(status["status"], "committed");
+    assert_eq!(status["idempotency_token"], token);
+    let transaction_id = status["transaction_id"]
+        .as_str()
+        .ok_or("token status omitted the generated transaction identity")?;
+    assert_eq!(
+        run(&[
+            "transaction",
+            "--data-dir",
+            &data_text,
+            "status",
+            "--id",
+            transaction_id,
+        ])?["transaction_id"],
+        transaction_id
+    );
+
+    let retry = run(&[
+        "transaction",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--idempotency-token",
+        token,
+        "--steps-json",
+        &steps,
+    ])?;
+    assert_eq!(retry["status"], "committed");
+    assert_eq!(retry["transaction_id"], transaction_id);
+    assert_eq!(retry["idempotency_token"], token);
+    assert_eq!(retry["idempotent_replay"], true);
+    assert_eq!(retry["recovered"], true);
+
+    let counter = run(&[
+        "structure",
+        "--data-dir",
+        &data_text,
+        "read",
+        "--request-json",
+        r#"{"operation":"counter_get","keyspace":21,"key":"published"}"#,
+    ])?;
+    assert_eq!(counter["result"]["value"], 1);
     Ok(())
 }
 
@@ -2511,13 +2671,25 @@ fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(),
         "--document",
         "203",
     ])?;
+    let after_delete = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "hardware",
+    ])?;
+    assert_eq!(after_delete["total_documents"], 2);
+    assert_eq!(after_delete["hits"].as_array().map(Vec::len), Some(0));
 
     let transaction = serde_json::json!([
         {"operation":"status"},
         {"operation":"stage_sql","statement":"INSERT INTO events (id, body) VALUES (?, ?)","parameters":[2,"transaction"]},
         {"operation":"stage_structure","mutation":{"operation":"string_set","keyspace":20,"key":"transaction","value":"committed","expires_at_micros":null}},
-        {"operation":"stage_search","action":"index","index":lexical_index.parse::<u128>()?,"document_id":"transaction","text":"transaction search"},
-        {"operation":"stage_vector","action":"upsert","index":ann_index.parse::<u128>()?,"object_id":301,"vector":[0.5,0.5]},
+        {"operation":"stage_search","action":"document","collection":13,"document":{"id":301,"text":"transaction search","doc_values":{"category":"transaction","price":15},"vectors":{"exact":[0.5,0.5],"ann":[0.5,0.5]}}},
+        {"operation":"stage_vector","action":"upsert","index":ann_index.parse::<u128>()?,"object_id":101,"vector":[0.5,0.5]},
         {"operation":"commit"}
     ]).to_string();
     let committed = run(&[
@@ -2525,12 +2697,62 @@ fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(),
         "--data-dir",
         &data_text,
         "execute",
+        "--idempotency-token",
+        "5101",
         "--steps-json",
         &transaction,
     ])?;
     assert_eq!(committed["steps"][0]["status"], "active");
     assert_eq!(committed["steps"][1]["status"], "active");
     assert_eq!(committed["steps"][6]["status"], "committed");
+    let transaction_document = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "transaction",
+    ])?;
+    let transaction_hit = transaction_document["hits"]
+        .as_array()
+        .and_then(|hits| hits.iter().find(|hit| hit["object_id"] == "301"))
+        .ok_or("transaction complete-image document was not visible")?;
+    assert_eq!(transaction_hit["doc_values"]["category"], "transaction");
+    assert_eq!(transaction_hit["doc_values"]["price"], 15);
+    for lexical in [None, Some("transaction")] {
+        let mut arguments = vec![
+            "search",
+            "--data-dir",
+            &data_text,
+            "integrated",
+            "--collection",
+            "13",
+            "--vector-target",
+            "ann",
+            "--vector",
+            "0.5",
+            "--vector",
+            "0.5",
+            "--vector-strategy",
+            "ann",
+            "--ef-search",
+            "2",
+            "--candidate-limit",
+            "1",
+            "--limit",
+            "1",
+            "--max-distance",
+            "0",
+        ];
+        if let Some(query) = lexical {
+            arguments.extend(["--lexical", query]);
+        }
+        let scoped = run(&arguments)?;
+        assert_eq!(scoped["hits"].as_array().map(Vec::len), Some(1));
+        assert_eq!(scoped["hits"][0]["object_id"], "301");
+    }
     let transaction_id = committed["steps"][6]["commit"]["transaction_id"]
         .as_str()
         .ok_or("missing transaction ID")?;
@@ -2545,6 +2767,91 @@ fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(),
         ])?["status"],
         "committed"
     );
+    let replacement_transaction = serde_json::json!([
+        {"operation":"stage_search","action":"document","collection":13,"document":{"id":301,"text":"replacement complete search","doc_values":{"category":"replacement","price":25},"vectors":{"exact":[0.75,0.75]}}},
+        {"operation":"commit"}
+    ])
+    .to_string();
+    let replacement_committed = run(&[
+        "transaction",
+        "--data-dir",
+        &data_text,
+        "execute",
+        "--idempotency-token",
+        "5102",
+        "--steps-json",
+        &replacement_transaction,
+    ])?;
+    assert_eq!(replacement_committed["steps"][1]["changed"], true);
+    assert_eq!(replacement_committed["steps"][2]["status"], "committed");
+    let old_transaction_document = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "transaction",
+    ])?;
+    assert_eq!(
+        old_transaction_document["hits"].as_array().map(Vec::len),
+        Some(0)
+    );
+    let replacement_document = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "replacement",
+    ])?;
+    assert_eq!(replacement_document["hits"][0]["object_id"], "301");
+    assert_eq!(
+        replacement_document["hits"][0]["doc_values"]["category"],
+        "replacement"
+    );
+    assert_eq!(replacement_document["hits"][0]["doc_values"]["price"], 25);
+    let replacement_exact = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--vector-target",
+        "exact",
+        "--vector",
+        "0.75",
+        "--vector",
+        "0.75",
+        "--vector-strategy",
+        "exact",
+        "--max-distance",
+        "0",
+    ])?;
+    assert_eq!(replacement_exact["hits"][0]["object_id"], "301");
+    let removed_ann = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--vector-target",
+        "ann",
+        "--vector",
+        "0.5",
+        "--vector",
+        "0.5",
+        "--vector-strategy",
+        "ann",
+        "--max-distance",
+        "0",
+    ])?;
+    assert_eq!(removed_ann["hits"].as_array().map(Vec::len), Some(0));
     let rollback = serde_json::json!([
         {"operation":"stage_structure","mutation":{"operation":"string_set","keyspace":20,"key":"rollback","value":"discarded","expires_at_micros":null}},
         {"operation":"rollback"}
@@ -2629,6 +2936,219 @@ fn full_admitted_operation_corpus_runs_through_the_single_binary() -> Result<(),
         "restored"
     );
     exercise_service(&restored)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_document_update_delete_after_vector_delta_upsert_survive_reopen()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.delta_lifecycle",
+    ])?;
+    run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "13",
+    ])?;
+    let ingested = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "ingest",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "1",
+        "--documents-json",
+        r#"[
+            {"id":701,"text":"retained original token","vectors":{"exact":[1.0,0.0],"ann":[1.0,0.0]}},
+            {"id":702,"text":"deleted lifecycle token","vectors":{"exact":[2.0,0.0],"ann":[2.0,0.0]}}
+        ]"#,
+    ])?;
+    assert_eq!(ingested["status"], "committed");
+    assert_eq!(ingested["documents"], 2);
+
+    let updated = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "update",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "2",
+        "--document-json",
+        r#"{"id":701,"text":"retained updated token"}"#,
+    ])?;
+    assert_eq!(updated["status"], "committed");
+    assert_eq!(updated["documents"], 1);
+    let after_update = run(&["status", "--data-dir", &data_text])?;
+    let update_replay = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "update",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "2",
+        "--document-json",
+        r#"{"id":701,"text":"retained updated token"}"#,
+    ])?;
+    assert_eq!(update_replay["status"], "existing");
+    assert_eq!(update_replay["idempotent_replay"], true);
+    assert_eq!(update_replay["commit"], updated["commit"]);
+    assert_eq!(
+        update_replay["commit"]["transaction_id"],
+        updated["commit"]["transaction_id"]
+    );
+    assert_eq!(
+        update_replay["commit"]["commit_csn"],
+        updated["commit"]["commit_csn"]
+    );
+    let after_update_replay = run(&["status", "--data-dir", &data_text])?;
+    assert_eq!(
+        after_update_replay["physical"]["page_count"],
+        after_update["physical"]["page_count"]
+    );
+    assert_eq!(
+        after_update_replay["physical"]["wal_bytes"],
+        after_update["physical"]["wal_bytes"]
+    );
+
+    // Every CLI call reopens the directory. Exact and ANN reads must not see
+    // the vectors omitted by the replacement document.
+    for (target, strategy) in [("exact", "exact"), ("ann", "ann")] {
+        let vectors = run(&[
+            "search",
+            "--data-dir",
+            &data_text,
+            "integrated",
+            "--collection",
+            "13",
+            "--vector-target",
+            target,
+            "--vector",
+            "1",
+            "--vector",
+            "0",
+            "--vector-strategy",
+            strategy,
+            "--max-distance",
+            "0",
+        ])?;
+        assert_eq!(vectors["total_documents"], 2);
+        assert_eq!(vectors["hits"].as_array().map(Vec::len), Some(0));
+    }
+    let retained = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "updated",
+    ])?;
+    assert_eq!(retained["hits"].as_array().map(Vec::len), Some(1));
+    assert_eq!(retained["hits"][0]["object_id"], "701");
+
+    let deleted = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "delete",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "3",
+        "--document",
+        "702",
+    ])?;
+    assert_eq!(deleted["status"], "committed");
+    assert_eq!(deleted["documents"], 1);
+    let after_delete = run(&["status", "--data-dir", &data_text])?;
+    let delete_replay = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "delete",
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "3",
+        "--document",
+        "702",
+    ])?;
+    assert_eq!(delete_replay["status"], "existing");
+    assert_eq!(delete_replay["idempotent_replay"], true);
+    assert_eq!(delete_replay["commit"], deleted["commit"]);
+    assert_eq!(
+        delete_replay["commit"]["transaction_id"],
+        deleted["commit"]["transaction_id"]
+    );
+    assert_eq!(
+        delete_replay["commit"]["commit_csn"],
+        deleted["commit"]["commit_csn"]
+    );
+    let after_delete_replay = run(&["status", "--data-dir", &data_text])?;
+    assert_eq!(
+        after_delete_replay["physical"]["page_count"],
+        after_delete["physical"]["page_count"]
+    );
+    assert_eq!(
+        after_delete_replay["physical"]["wal_bytes"],
+        after_delete["physical"]["wal_bytes"]
+    );
+
+    assert_eq!(after_delete_replay["status"], "ready");
+    let remaining = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+    ])?;
+    assert_eq!(remaining["total_documents"], 1);
+    assert_eq!(remaining["hits"].as_array().map(Vec::len), Some(1));
+    assert_eq!(remaining["hits"][0]["object_id"], "701");
+    let deleted_lexical = run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "integrated",
+        "--collection",
+        "13",
+        "--lexical",
+        "deleted",
+    ])?;
+    assert_eq!(deleted_lexical["hits"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        run(&["doctor", "--data-dir", &data_text])?["status"],
+        "healthy"
+    );
     Ok(())
 }
 

@@ -130,7 +130,7 @@ async function executeCases(client, denied) {
   ];
   for (const [name, failureOptions] of productFailures) {
     try {
-      await client.sql("SELECT id FROM g6_items", [], failureOptions);
+      await client.sql("SELECT id, label FROM g6_items WHERE id = ?", [1n], failureOptions);
       throw new Error(`TypeScript failure case ${name} succeeded`);
     } catch (error) {
       if (!(error instanceof ProductError)) throw error;

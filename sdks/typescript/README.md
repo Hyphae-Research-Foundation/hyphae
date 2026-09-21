@@ -90,6 +90,11 @@ Windows and carries exact `HYPHLCL1` frames without a wrapper protocol. HTTP
 uses canonical product envelopes at `/v2/execute`. Both expose typed product
 errors, request deadlines, `AbortSignal` cancellation, and transaction state.
 
+Managed sessions negotiate Native local protocol minor 7 and support minors 3
+through 7, including the complete minor-6 surface shared with Python. Native
+`u128` object, transaction, and idempotency identities are represented as
+`bigint`; they are never narrowed to JavaScript `number`.
+
 ### Native v2 surface
 
 `@hyphae_/hyphae/v2` client methods, by area:

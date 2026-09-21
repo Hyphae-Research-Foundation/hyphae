@@ -187,7 +187,6 @@ fn test_installed_m05_root_loads_compacts_vacuums_and_rejects_corruption() -> Re
     )?;
     seed.commit()?;
     let mut legacy = database.begin(2, DurabilityClass::Strict)?;
-    legacy.upsert_vector(vectors, first, Vector::new([1.5, 0.0, 0.0])?)?;
     legacy.delete_document(lexical, b"deleted".to_vec())?;
     legacy.commit()?;
 

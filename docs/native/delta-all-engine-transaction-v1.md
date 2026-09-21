@@ -5,8 +5,9 @@
 Status: the base point-resolved execution is implemented and verified by
 [`native-delta-all-engine-transaction-linux-2026-08-03.md`](../gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md).
 The current worktree additionally gives the point-resolved SQL, scalar,
-lexical, named-vector upsert, and exact-field V3 Hash slices a conservative
-batch-wide retained-memory ledger under the 32 MiB mutation allocation.
+lexical, named-vector upsert/delete/absence-fence, and exact-field V3 Hash
+slices a conservative batch-wide retained-memory ledger under the 32 MiB
+mutation allocation.
 Hash-field state also has an 8 MiB sub-budget inside that parent bound. The
 linked evidence predates this ledger and the vector slice; exact-SHA phase
 qualification remains required. This is not allocation-exact or complete P6
@@ -79,8 +80,9 @@ The batch contains:
 - a relational overlay keyed by relation and encoded primary key;
 - a scalar-structure overlay keyed by binary structure key;
 - a lexical overlay keyed by search collection and document ID;
-- a named-vector mutation overlay containing only each target's metadata and
-  bounded durable object delta, never its immutable HNSW base;
+- a named-vector mutation overlay containing only each target's metadata,
+  bounded exact object/path intents, and physical-or-conflict-only disposition,
+  never its immutable HNSW base;
 - a conservative retained-memory ledger covering the in-scope catalog,
   relational, scalar, lexical, vector-delta, mutation, identity, and container
   capacities;
@@ -191,37 +193,214 @@ Document identities are never renamed. Deletion followed by creation may reuse
 the same exact identity; the benchmark must continue to disclose lexical
 identity growth.
 
-### Named-vector upsert
+The typed Native v2 transaction search-mutation registry is append-only:
+
+| Tag | Variant | Minimum negotiated protocol minor |
+|---:|---|---:|
+| 0 | `Index` | 0 |
+| 1 | `Replace` | 0 |
+| 2 | `Delete` | 0 |
+| 3 | `Document` | 7 |
+
+`Document` requires minor 7 regardless of which doc-value variants its
+`ProductDocument` contains. Encode and dispatch at minor 6 or earlier reject it
+as unsupported. The three historical variants retain their bytes.
+
+### Named-vector point mutation and absence fencing
 
 `stage_delta_upsert_vector` resolves one catalog-bound vector index, reads its
-metadata, and visits only that index's bounded durable object-delta range. It
-validates the vector against the existing definition and lifecycle limits
-without restoring the immutable single or partitioned HNSW base. Planning
-charges a conservative metadata, encoded-delta, decoded-vector, identity, and
-container bound before the range is allocated.
+metadata, the addressed D01/D02 values, and the exact 32-node sparse-Merkle
+path. It never scans the D01 prefix or restores the immutable single or
+partitioned HNSW base. Planning charges conservative metadata, vector, path,
+copy-on-write, and recovery-memory bounds before the intent is retained. A
+second staged operation for the same object is rejected without losing the
+first.
 
-Commit writes the target's next base-plus-delta view identity, metadata, and
-changed object records over the existing search root. Exact search observes a
-successful upsert immediately, while ANN continues to search the unchanged
-base and merge the exact object delta under the existing authority. Delta
-transactions validate a per-index authority key, so two independently staged
-delta batches cannot publish the same stale vector sequence. Materialized ANN
-transactions retain their existing disjoint-object rebase behavior.
+`stage_delta_vector_absence_fence` resolves the same bounded point authority.
+If D02-first, D01-second, base-last lookup finds a live vector, staging records
+`DeleteVector` opcode 19 and retains the authenticated path for a physical D02
+tombstone. If the object is already absent, staging records
+`FenceVectorAbsence` opcode 57 and retains conflict authority only. Prior
+absence requires the D02 leaf or authenticated non-membership path to agree
+with the overlay root, the exact D01 value to be absent or a tombstone, and the
+selected base-child vector keys to be absent when neither delta layer names the
+object. A delta tombstone suppresses lower layers; duplicate base ownership is
+corruption. Admission and recovery repeat the proof against the admitted and
+committed-prior roots respectively.
 
-Delta vector commits append one fixed 16-byte `HYANNA01` WAL metadata marker
-per target index after the ordinary mutations, in ascending index order. The
-marker is WAL-only: it never enters page or materialized-state application.
-Its target reconstructs the same per-index validation key used by live delta
-admission. Recovery requires markers to be unique, trailing, ordered, and to
-cover exactly the vector-upsert index set; malformed metadata or a recovered
-stale sequence fails closed. Legacy WAL without the marker keeps object-level
-validation, so independently prepared materialized writes to disjoint vector
-IDs retain their existing rebase semantics while still publishing the index
-authority observed by later delta batches.
+Integrated complete-image callers apply this rule to every bound named-vector
+target. Insert and replacement upsert each supplied vector and invoke
+delete-or-fence for each omission; complete document deletion invokes
+delete-or-fence for every target, including targets omitted by the prior image.
+Consequently an already-absent omission still conflicts with a same-object
+concurrent upsert instead of silently leaving that upsert live.
 
-This first vector slice supports upsert only. Point-resolved vector deletion
-and integrated document update/delete remain on their existing materialized
-transaction path.
+Commit assigns sequence and CSN to physical upserts and deletes under writer
+admission, freezes a first M04 D01 view without scanning or rewriting it, and
+writes one D02 leaf, its 32 ancestors, the manifest, and M05 metadata. A delete
+leaf is a tombstone. Exact search observes the resulting effective set
+immediately, while ANN continues to search the unchanged base and merge the
+effective layered delta. Conflict-only opcode 57 writes none of those physical
+records and consumes no M05 sequence or delta slot. Physical point transactions
+validate object and generation authority but publish only object authority, so
+disjoint batches from one snapshot may rebase and same-object batches conflict.
+Absence fences validate and publish object and lifecycle-fence authority.
+Materialized ordinary upserts and present-object deletes after
+creation use the same writer; creation and vectors in that same transaction
+retain canonical M04 base publication.
+
+Full validation retains one process-local recovery-memory authority for the
+current search root: exact lexical bytes plus exact per-index ANN charges.
+Point admission remeasures lexical bytes with the allocation-free borrowed
+lexical range, substitutes only touched-index projected charges, and rejects a
+shared total above 64 MiB before any page or WAL append. Unchanged ANN indexes
+inherit their source-root charges; no root-wide ANN metadata/catalog scan is
+performed. The retained exact path charge covers the transient point plan and
+copy-on-write publication copies. Initial-bulk and consolidation publication
+substitute their exact candidate metadata charge into this same authority and
+reject an over-limit candidate before page creation.
+
+The shared aggregate cap is conditional on M05 authority. A complete root that
+contains only M01 through M04 remains accepted through its historical bounded
+streaming load even when its aggregate lexical-plus-ANN estimate exceeds 64
+MiB, and M04 initial-bulk publication remains on that grandfathered format. A
+point publication or C02 consolidation that would make the first M04-to-M05
+transition projects the complete candidate charge, activates the shared cap,
+and fails before page or WAL growth when the candidate is too large; the
+original M04 root remains readable and unchanged.
+
+Upsert and physical-delete accounting includes complete retained state and
+post-dequeue scratch. Let `V = 4 * dimension`; one maximum encoded sparse-path
+key/value pair is `34 + 56 + 16 * 32 = 602` bytes. One upsert intent
+conservatively charges:
+
+```text
+2 * V + 4 * 32 * 602 + 4,096 +
+BTree::sorted_batch_structural_memory_bound(35)
+```
+
+This covers the staged and encoded vector, four path/publication copies, fixed
+point state, and the largest metadata/manifest/leaf/path B+tree batch structure.
+
+A physical delete uses the observed authenticated path. It charges the exact
+capacities of captured D01 and D02 values and all 32 optional encoded node
+values; its path container, option slots, point intent, allocation bookkeeping,
+and fixed 256-byte structural allowance; the largest simultaneously live
+decode, selected-base lookup, node/hash, and path-index proof workspace; and
+`BTree::sorted_batch_structural_memory_bound(35)`.
+
+An absence-fence intent retains no physical path or replacement and costs 256
+ledger bytes for its bounded conflict/proof plan. The first physical intent for
+an index additionally adds the one 2 MiB (`2,097,152`-byte) recovery reserve;
+later physical intents for that index do not add it again. Per-index metadata
+authority is separately `2 * encoded_metadata_length + 4,096` bytes. Every
+capacity, container-growth, proof, replacement, and recovery term uses checked
+arithmetic and is replayable from the retained batch.
+
+Those ANN intent charges do not replace ordinary mutation accounting. An opcode
+18, 19, or 57 mutation also contributes its retained 16-byte object key, exact
+value capacity, 192-byte mutation overhead, and exact share of mutation-vector
+capacity. Staging first authenticates the point, chooses upsert, physical
+delete, or fence, constructs the corresponding exact structural plan, and then
+replays the complete ledger before accepting the operation. Any overflow or
+parent-capacity failure restores the prior authority, mutation length, and
+ledger exactly.
+
+Queue retention is not another estimate or a fixed 32 MiB reservation. Before
+a delta batch enters the scheduler, the runtime replays the complete
+catalog/engine/overlay/mutation ledger and requires byte equality with the
+stored value. That ledger already includes each point's authentication and
+publication structural scratch above. It does not include the independently
+preflighted WAL encoder and cloned-payload peak.
+
+The queue permit is exactly:
+
+```text
+{compute_threads: 0, io_slots: 0,
+ memory_bytes: max(1, checked_add(replayed_retained_ledger,
+                                  wal_publication_peak))}
+```
+
+Point paths, vectors, one-time recovery authority, fences, keys, mutation
+capacity, and point scratch remain live while WAL record vectors and cloned
+key/value payloads are encoded. The WAL peak is therefore additive, not a
+replacement or `max` of retained memory. Commit repeats both preflights and
+subdivides the WAL peak from the combined queue permit before any publication;
+no uncharged point scratch is reacquired after dequeue. These are exact values
+in the conservative ledger model, not allocator-RSS claims.
+
+Product error conversion preserves the resource failure type. An
+`AnnDeltaLimitExceeded` or direct/queued governor `ParentCapacity` rejection is
+`LimitExceeded`/`Limit`/`Never`; direct or queued global/class-capacity
+rejection, queue-full, and queue-timeout are
+`Unavailable`/`Unavailable`/`AfterBackoff`. Raw runtime entrypoints continue to
+return their native typed errors.
+
+Point vector commits append one fixed 184-byte `HYANNA02` WAL authority body per
+physically changed target index after ordinary mutations, in ascending index
+order. Opcode 56 binds the duplicated index, exact physical operation count,
+prior/result view and Merkle root identities, prior/result `next_sequence`, and
+the M04-to-M05 flag. Its count includes opcode 18 upserts and physical opcode 19
+deletes, but excludes opcode 57 fences. Thus a mixed index has one marker whose
+count and sequence advance equal only its physical members; a fence-only index
+has no marker. Markers are unique, trailing, ordered, exact-covering, and cannot
+mix with HYANNA01. A transaction may contain at most 4,096 opcode 57 records in
+total, independently of the per-index physical marker count.
+
+Recovery replays each retained physical path transition against prior/result
+committed roots before reconstructing the same object/generation conflict
+authorities as live admission. Target discovery streams the bounded physical
+difference across all ANN prefixes, including empty/nonempty root pairs, rather
+than trusting WAL or metadata-only changes. Every point-writer-changed index
+with M05 on either side requires an exact HYANNA02 marker,
+physical-mutation cross-check, and per-index transition proof. Opcode 50 uses
+HYANNC02 and its separate exact replacement proof. Fence targets are added from
+opcode 57 even though they are absent from that physical difference. Recovery
+proves their prior
+absence, requires no physical transition for each fenced object/path beyond
+co-committed physical point mutations, and reconstructs the object and
+lifecycle-fence write keys. Legacy unmarked opcode 19 and HYANNA01 M01-M04 WAL
+retain their historical semantics.
+
+Group admission carries the projected ANN metadata version, point replacement
+values, and per-index recovery charge for every accepted cohort member before
+storage starts. Same-index points are planned and charged against the preceding
+accepted member, not the original root. Materialized legacy charges use the
+sequential candidate state. A physical point publication changes that private
+layout to M05. Disjoint physical points and absence fences compose in either
+cohort order. A stale same-object point conflicts, and the absence fence's
+lifecycle key prevents stale initial-bulk or consolidation publication from
+crossing it. Only accepted compatible members reach page or WAL staging.
+
+M05 consolidation is a separate bounded maintenance writer. It publishes
+opcode 50 with fixed 384-byte HYANNC02. Its M04/M05 capture flag,
+`captured_next_sequence`, record count, and ordered effective-record digest bind
+the complete captured delta, including index, object, sequence, kind, mutation
+CSN, and vector. Publication reconstructs the exact physical below-bound
+capture, consumes current effective records still at their captured sequences,
+preserves later records and publication-time `next_sequence`, and emits
+canonical overlay-only M05. A later D02 shadowing a captured D01 is valid because
+the D01 remains reconstructable; overwriting a captured D02 or D01 capture is
+stale. C02 is completely encoded before any page append. Historical fixed
+112-byte HYANNC01 remains authoritative only for original M01-M04 recovery,
+including legacy M01-M03 consolidation upgrades to M04, and is never emitted.
+C02's ordered captured-record digest includes the index. Its canonical
+effective-vector-set digest independently includes the same index before its
+count and commutative accumulators, and the fixed body duplicates that target.
+C02 accepts only M04/M05 capture and M05 result
+formats. Initial-bulk rewriting of M05 remains fail closed, and background
+scheduling remains outside this writer.
+
+Consolidation publication memory is one checked additive peak covering target
+hydration, any replacement base not already held by its retained build permit,
+B+tree structural work, caller-owned replacement payload, every replacement
+key/value clone, and the independently preflighted WAL encoder and cloned C02
+payload. Because the B+tree structural plan excludes payload ownership, the ANN
+contract separately charges the retained capacities of every replacement key
+clone and value clone, plus any source replacement set live at the same time.
+None of those owners may be replaced by a maximum-of calculation. Clones cannot
+be created before admission; overflow or a replayed charge mismatch rejects
+before page or WAL publication.
 
 ## Commit admission and publication
 
@@ -271,6 +450,14 @@ The authoritative recovery cut remains:
 
 No boundary may expose a mixed engine state.
 
+For a physical point delete, the seven cuts expose either the prior live vector
+or the complete authenticated tombstone with its commit authority. For a pure
+opcode 57 transaction, cuts through `PageSynchronized` expose the prior commit;
+cuts from `WalAppended` through `RootPublished` expose the durable transaction
+ID, advanced CSN, and conflict authority while retaining the exact prior four
+root page IDs, blob generation, and catalog version. A mixed transaction follows
+the same all-engine old-or-complete rule.
+
 ## Explicit non-goals
 
 This slice does not:
@@ -278,7 +465,7 @@ This slice does not:
 - add joins, scans, DDL, prepared DML, or transaction-private reads;
 - validate inbound or outbound SQL foreign keys in a delta batch;
 - expose aggregate or scanning Hash reads on a delta batch;
-- stage vector deletion on a delta batch;
+- rewrite M05 through initial-bulk publication;
 - make lexical document identities mutable;
 - change group durability;
 - remove full validation from recovery or explicit verification;
@@ -305,6 +492,9 @@ benchmark-only helper.
 - replayed conservative memory-ledger equality and parent-capacity rejection;
 - single-engine, hidden-capacity, and mixed SQL/scalar/lexical/Hash memory
   rejection before mutation, with earlier stages still committable;
+- consolidation publication admission includes every caller-owned replacement
+  key/value clone as well as structural memory and rejects before cloning on an
+  understated or overflowing peak;
 - V2 and V3 scalar replacement without hydrating an oversized old payload;
 - `HYCAT006` SQL admission and fail-closed inbound/outbound foreign-key cases;
 - same-live-handle batch ownership across staging, commit, drop, and reopen;
@@ -325,12 +515,33 @@ benchmark-only helper.
 - delta ANN WAL marker decoding is fixed-size and bounded, recovered stale
   delta-index histories are rejected, and legacy disjoint materialized writes
   still rebase and reopen;
-- V1 ANN metadata upgrades safely on delta mutation while V2 and V3 preserve
-  their format branches, with trailing or inconsistent lengths rejected;
+- M01, M02, and M03 ANN metadata remain writable through the frozen legacy path
+  and atomically upgrade to M04 on the first accepted vector mutation, while
+  reads and rejected writes preserve the original bytes and trailing or
+  inconsistent lengths are rejected;
 - one committed delta vector's creating CSN equals its commit receipt CSN and
   its persisted view identity equals the recomputed base-plus-delta identity;
 - unfiltered ANN evidence executes `GraphTraversal` over a non-empty HNSW base,
   merges an exact delta hit, and remains identical after reopen;
+- point deletion suppresses base, D01, and D02 values in exact and ANN search,
+  including reopen, while repeated materialized upsert/delete order remains
+  last-operation-wins;
+- opcode 57 proves prior absence, changes no ANN page, view identity, sequence,
+  or delta slot, and the 4,096-fence transaction bound rejects the next fence
+  without losing earlier staged mutations;
+- mixed fences and physical points count only physical members in HYANNA02,
+  same-object fence/upsert races conflict in both orders, and disjoint group
+  members compose in either order;
+- recovery rebuilds object/generation/lifecycle conflict keys and every physical
+  delete or pure-fence crash cut reopens to the specified old-or-complete
+  authority;
+- HYANNC02 consolidation accepts only M04/M05 capture and M05 result formats,
+  reconstructs both index-bound record and vector-set digests, preserves
+  captured-D01/later-D02
+  shadows, rejects captured-layer overwrites, preserves later records and
+  `next_sequence`, emits the canonical D02-only overlay above the replacement
+  base, proves complete retained vector/graph generations, and reopens old or
+  complete at every strict cut;
 - unrelated row, structure, document, and version population does not change
   the number of point identities admitted for the same three-operation
   transaction;

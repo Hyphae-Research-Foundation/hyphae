@@ -9,8 +9,10 @@ typed doc values, filters, sort, facets, aggregations, native hybrid fusion,
 legacy inline-state compatibility, rebuild, corruption, and bounded quality
 evidence are implemented. Automatic segments, page-buffered ANN and
 production-scale performance remain non-claims.
-The M05 authenticated ANN overlay is reader-only and non-emittable; it adds no
-search capability or release claim.
+The M05 authenticated ANN overlay has bounded point-upsert and point-delete
+publication, conflict-only complete-image absence fencing, and bounded
+foreground consolidation; it adds no new public search capability or release
+claim.
 
 The search engine owns documents, lexical indexes, doc values, aggregations,
 and transactional search visibility. It is not an OpenSearch REST facade.
@@ -61,13 +63,13 @@ in one immutable copy-on-write native B+tree. It stores:
 | `0x02` | collection `ObjectId` + document ID | live `HYDOCS01` or v2 `HYDOCT01` tombstone |
 | `0x03` | collection `ObjectId` + canonical UTF-8 term | live `HYTERM01` or v2 `HYTERMT1` tombstone |
 | `0x04` | collection `ObjectId` + u32 term length + term + document ID | live `HYPOST01`/`HYPOST02` or v2 `HYPOSTT1` tombstone |
-| `0x05` | vector-index `ObjectId` | readable `HYANNM01` through reader-only `HYANNM05`; current writers emit `HYANNM04` |
+| `0x05` | vector-index `ObjectId` | readable `HYANNM01` through `HYANNM05`; base creation emits M04 and a later physical point mutation emits M05 |
 | `0x06` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` | `HYANNV01` creating CSN and canonical `f32` vector |
 | `0x07` | vector-index `ObjectId` + 32-byte build identity + object `ObjectId` + u16 layer | `HYANNG01` stable neighbor IDs |
 | `0x08` | vector-index `ObjectId` + object `ObjectId` | current `HYANND01` vector upsert or tombstone |
-| `0x09` | vector-index `ObjectId` | reader-only fixed `HYANNO01` overlay manifest |
-| `0x0a` | vector-index `ObjectId` + object `ObjectId` | reader-only `HYANND02` overlay upsert or tombstone |
-| `0x0b` | vector-index `ObjectId` + depth + 128-bit high-nibble path | reader-only `HYANNN01` sparse-Merkle internal node |
+| `0x09` | vector-index `ObjectId` | fixed `HYANNO01` overlay manifest |
+| `0x0a` | vector-index `ObjectId` + object `ObjectId` | `HYANND02` overlay upsert or tombstone |
+| `0x0b` | vector-index `ObjectId` + depth + 128-bit high-nibble path | `HYANNN01` sparse-Merkle internal node |
 
 The fixed 128-bit object ID is big-endian in every key. The posting term
 length is big-endian so a prefix scan identifies exactly one term even when
@@ -100,30 +102,115 @@ v1](search-tombstone-compaction-v1.md).
 
 `CREATE ANN INDEX`, `UPSERT VECTOR`, and `DELETE VECTOR` use the same search
 root and global transaction. Creation produces the initial canonical HNSW
-base. Later vector writes update the bounded object-keyed `0x08` delta and
-`HYANNM04` view metadata without rebuilding or repersisting the base graph.
+base and M04 metadata. A later upsert or deletion of a present vector freezes
+`0x08` and updates one bounded authenticated `0x0a` path plus M05 metadata
+without rebuilding or repersisting the base graph. Delete writes a D02
+tombstone that suppresses the same object in D01 and the base.
 Exact query ranks the effective base-plus-delta set. Approximate query merges
 base graph candidates with exact live-delta candidates and suppresses every
-shadowed base object. `HYSEABT1`/`2` and `HYANNM01` remain readable.
+shadowed base object. Before suppression, its base-hit target is
+`min(base_count, ef_search, k + shadowed_base_count)`, where
+`shadowed_base_count` counts selected-base objects named by the effective delta.
+It does not first truncate the base to `k`. Graph search and reranking never
+exceed the caller's `ef_search`, even when the index permits a larger configured
+maximum. If that caller ceiling cannot supply enough unshadowed base hits and
+live delta upserts, the result may contain fewer than `k` hits. Underfill does
+not trigger a complete-corpus exact fallback or silently widen `ef_search`.
+The selected base count, 4,096-record delta ceiling, and query candidate ceiling
+remain hard bounds. `HYSEABT1`/`2` and `HYANNM01` remain readable.
 
-The passive M05 reader composes `0x0a` first, frozen `0x08` second, and the base
+The M05 reader composes `0x0a` first, frozen `0x08` second, and the base
 last. An overlay tombstone suppresses both lower layers. It validates exact
 layer counts/bytes/sequences, one manifest, all ordered radix-16 Merkle paths,
 the root, and the final view identity before either exact or ANN hydration.
 XOR, additive, and other commutative accumulators are explicitly rejected.
 The exact byte contract is [ANN delta overlay format
-v1](../storage/ann-delta-overlay-format-v1.md). Current writers never emit the
-new magic or prefixes, `HYANNA02`, or a new WAL opcode. Foreground ANN mutation,
-initial-bulk publication, and ANN consolidation fail closed; lexical compaction
-and page-generation vacuum may preserve authenticated M05 bytes unchanged.
+v1](../storage/ann-delta-overlay-format-v1.md). Foreground physical point
+upsert and delete emit those records with fixed `HYANNA02` opcode 56 authority.
+Historical unmarked `DeleteVector` opcode 19 retains its pre-M05 meaning;
+physical M05 delete is opcode 19 plus `HYANNA02`; `FenceVectorAbsence` opcode
+57 proves prior absence and emits no ANN physical record. Opcode 50 with
+`HYANNC02` publishes bounded M05 consolidation. M05 initial-bulk rewriting
+remains fail closed and background scheduling remains outside this slice;
+lexical compaction and page-generation vacuum may preserve authenticated M05
+bytes unchanged.
 
-Bounded ANN consolidation captures an effective set, constructs a replacement
+### Complete-image vector omission
+
+Integrated document ingest, replacement, and deletion are complete-image
+operations over every catalog-bound named-vector target:
+
+- insert or replacement upserts every supplied named vector;
+- an omitted target deletes it when the transaction-private view is live, or
+  emits opcode 57 when that view is already absent; and
+- document deletion applies the same delete-or-fence rule to every bound target,
+  regardless of which vectors the prior document image supplied.
+
+The absence branch proves the admitted object absent in D02-first, D01-second,
+base-last order, including the authenticated D02 path. It contributes no D02
+leaf, Merkle node, manifest, metadata, view-identity, count, byte, sequence, or
+delta-slot change. It does contribute one WAL mutation, the object conflict
+key, and the index lifecycle-fence key. Therefore a stale same-object upsert
+cannot survive an omitted or deleted complete image in either commit order;
+disjoint object operations may rebase, while initial-bulk and consolidation
+replacement race through the lifecycle fence. At most 4,096 opcode 57 records
+are admitted per transaction, independently of physical `HYANNA02` operation
+counts.
+
+A transaction containing only absence fences names unchanged root page IDs,
+blob generation, and catalog version, but its transaction ID, WAL commit, CSN,
+and global visible authority advance normally. Recovery must re-prove each
+absence from the prior committed root, require zero target physical changes,
+and rebuild the same object and lifecycle conflict keys.
+
+For M04 or M05 input, bounded ANN consolidation captures an effective set,
+source-version flag, selected base/view identities, captured `next_sequence`,
+and the complete object-ordered effective delta. It constructs a replacement
 base and publishes it through an ordinary root commit using append-only WAL
-opcode 50. A stale base rejects publication. Captured delta versions are
-consumed only if unchanged, so later object versions survive. The current root
-retains the configured number of superseded target generations; snapshot pins
-retain old page-file roots, and unpin plus page vacuum/collection reclaims them
-safely.
+opcode 50 and fixed 384-byte `HYANNC02` authority. The capture digest includes
+the index plus each effective record's object, sequence, kind, mutation CSN, and
+canonical vector components. The canonical effective-vector-set digest also
+hashes the index before the effective count and record accumulators; the fixed
+body separately duplicates that same target. No per-record tail
+follows the fixed body. C02 permits captured format M04 or M05 and result format
+M05 only. Historical fixed 112-byte
+`HYANNC01` remains authoritative for retained M01-through-M04 consolidation
+recovery and is never emitted for this path.
+
+M01 through M03 retain the historical writable ordinary-vector path. Its first
+accepted mutation atomically upgrades the target metadata to M04; reads and
+rejected mutations do not rewrite it. A retained C01 consolidation can likewise
+authorize its original M01-M03-to-M04 upgrade. Neither compatibility path
+creates M05, and M01-M03 are never encoded in a C02 format byte.
+
+At publication, physical D01 and D02 records below captured `next_sequence`
+must reconstruct the captured object/sequence map, count, digest, and view
+exactly. A current effective record at its captured sequence is consumed; a
+greater-sequence record is preserved, and a new object is later only at or
+above the boundary. A later D02 may shadow a captured D01 because the D01 still
+proves the capture. Overwriting a captured D02, or overwriting a captured D01
+in D01, destroys that proof and is stale. A stale base, changed capture
+kind/CSN/vector, missing capture record, lower later sequence, or unclassified
+record rejects before C02 is encoded or any page is appended.
+
+The result is canonical overlay-only M05: D01 is empty, the replacement base is
+the frozen legacy identity, and every surviving later record appears once in
+D02 with its sequence, mutation CSN, kind, and vector unchanged. Consolidation
+preserves publication-time `next_sequence`; its manifest, ordered sparse-Merkle
+tree, and view identity are regenerated exactly. The current root preserves the
+ordered retained-generation list, appends the superseded selected nonempty base
+at the end only when it differs from the replacement and is not already
+retained, and drops only the oldest generations beyond policy. Every surviving
+selected or retained child has its complete vector and graph records; surviving
+prior generation bytes are
+unchanged and only retired generations disappear. Strict crash cuts through
+`PageSynchronized` recover the prior root; cuts from `WalAppended` recover only
+the complete replacement after the same capture, overlay, sequence, exact
+retention transition, graph/generation, and effective-result proof. Recovery
+performs that proof against each immediately preceding retained root even when
+the result was later superseded. Snapshot pins retain old page-file roots, and
+unpin plus page vacuum/collection reclaims them safely. Initial-bulk rewriting
+of M05 and background scheduling remain non-claims.
 
 Complete-state validation rebuilds terms, document frequencies, term
 frequencies, document count, and total length from stored source text and
@@ -146,7 +233,25 @@ When an M05 root is loaded as complete product authority, measured lexical
 retention is subtracted from the shared 64 MiB recovery allowance before ANN
 metadata admission. Search and ANN cannot each consume an independent 64 MiB
 allowance. Oversized or malformed ANN values do not allocate through lexical
-materialization.
+materialization. Point, initial-bulk, and consolidation publication substitute
+the target index's exact candidate metadata charge into that same shared
+authority and reject overflow before page creation. Group point members carry
+that candidate state and charge forward in accepted commit order.
+
+Roots containing only M01 through M04 are grandfathered onto their historical
+bounded streaming load and may open, pin, back up, restore, and recover even
+when their aggregate hydration estimate exceeds that M05 shared allowance. An
+M04 initial-bulk publication remains M04 under the same rule. The first point
+publication or C02 consolidation that would introduce M05 projects the complete
+lexical-plus-ANN candidate, activates the shared cap, and rejects without page
+or WAL growth if the candidate does not fit.
+
+At the product boundary, `AnnDeltaLimitExceeded` and direct or queued governor
+`ParentCapacity` rejection map to `ProductErrorCode::LimitExceeded`, category
+`Limit`, with retry `Never`. Direct or queued global/class-capacity rejection,
+queue-full, and queue-timeout map to `ProductErrorCode::Unavailable`, category
+`Unavailable`, with retry `AfterBackoff`; they are not collapsed into an
+internal failure or an untyped generic search error.
 
 ## Query operators
 
@@ -156,10 +261,14 @@ aggregation, highlight, vector search and hybrid fusion.
 
 The implemented vertical slice is one analyzer, one text field, `MATCH`,
 exact vector ranking, approximate HNSW top-k with optional exact reranking,
-and stable-ID tie-breakers. Filtered ANN separates connector navigation from
-candidate eligibility and adaptively executes exact scoring for restrictive
-sets. Receipts name the snapshot CSN, build identity, metric, breadth, truthful
-strategy/risk, candidate counts, reranking flag and visited nodes.
+and stable-ID tie-breakers. Filtered ANN uses exact object-point evaluation when
+the complete caller allowlist contains at most `ef_search` identifiers. Larger
+allowlists use bounded filtered graph traversal; partitioned indexes route that
+work through bounded child graphs without scanning the complete base to lower
+the caller's allowlist cardinality. Either graph shape may honestly underfill
+without exact completion. Receipts name the snapshot CSN, build identity,
+metric, breadth, truthful strategy/risk, candidate counts, reranking flag and
+visited nodes.
 Bounded boolean, phrase, prefix and fuzzy execution, stable-ID vector filters,
 typed doc-value filters/sort, terms facets, metric aggregations and native RRF
 hybrid execution are implemented as embedded G4 surfaces. The integrated
@@ -189,6 +298,16 @@ envelope — sort their hits by score descending with stable-identity ties,
 unscored hits follow in their existing order, and the whole stage
 (envelope included) is bound into sealed proofs. The engine reorders
 deterministically; it never runs a model.
+
+Integrated vector execution derives one complete stable-ID allowlist from the
+collection manifest and request filter and reuses it for every vector branch.
+Thus `MatchAll` excludes a foreign vector stored in the same physical ANN index,
+and a filtered branch admits only the filtered collection members. ANN and
+adaptive-ANN branches call native filter-aware execution directly; the product
+layer adds no exact one-hit seed and reports the native candidate count, visited
+nodes, exact-rerank flag, approximation status, hits, and bounded underfill
+unchanged. A larger filtered graph request may therefore underfill without exact
+completion whether its base is single or partitioned.
 
 The lexical branch may declare weighted field boosts: an ordered list of
 `(field, weight)` pairs (weights in micros, `1..=1_000_000_000`; at most
@@ -384,5 +503,10 @@ rebuild and structured corruption matrices. Buffered ANN traversal, automatic
 background merge policy, cross-engine SQL joins and production-scale
 performance remain G7 work. G6 ANN evidence additionally covers foreground
 base-identity stability, effective exact equivalence, reopen, hard delta bounds,
-strict maintenance WAL shape, bounded consolidation, later-delta preservation,
-stale plans, interruption recovery and current-root generation cleanup.
+strict fixed HYANNC02 shape and ordered effective-record digest, M04/M05
+overlay-only consolidation, later-delta and `next_sequence` preservation,
+captured-D01 shadow preservation, captured-D02 overwrite rejection,
+interruption recovery, complete retained graph/generation cleanup,
+grandfathered M01-M04 loading with fail-before-write M05 projection,
+collection-manifest allowlisting without product-side exact seeding, and stable
+typed resource-error mapping.

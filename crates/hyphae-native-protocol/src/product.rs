@@ -1283,6 +1283,10 @@ fn ensure_operation_minor(
         ProductOperation::SearchDocumentUpdate { update, .. } => {
             document_required_minor(&update.document)
         }
+        ProductOperation::TransactionStageSearch {
+            mutation: ProductTransactionSearchMutation::Document { document, .. },
+            ..
+        } => document_required_minor(document).max(7),
         ProductOperation::StructureRead(
             ProductStructureReadRequest::SortedSetScoreRange { .. }
             | ProductStructureReadRequest::HashScanReverse { .. }
@@ -6446,9 +6450,15 @@ fn decode_product_document(
     if value_count > hyphae_native_runtime::MAX_DOC_VALUES_PER_CANDIDATE {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut doc_values = std::collections::BTreeMap::new();
+    let mut doc_values = std::collections::BTreeMap::<String, ProductDocValue>::new();
     for _ in 0..value_count {
         let name = decoder.text()?;
+        if doc_values
+            .last_key_value()
+            .is_some_and(|(previous, _)| name.as_bytes() <= previous.as_bytes())
+        {
+            return Err(ProductCodecError::InvalidValue);
+        }
         if doc_values
             .insert(name, decode_doc_value(decoder)?)
             .is_some()
@@ -6460,9 +6470,16 @@ fn decode_product_document(
     if vector_count > hyphae_native_product::MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
         return Err(ProductCodecError::LimitExceeded);
     }
-    let mut vectors = std::collections::BTreeMap::new();
+    let mut vectors =
+        std::collections::BTreeMap::<String, hyphae_native_product::ProductVector>::new();
     for _ in 0..vector_count {
         let name = decoder.text()?;
+        if vectors
+            .last_key_value()
+            .is_some_and(|(previous, _)| name.as_bytes() <= previous.as_bytes())
+        {
+            return Err(ProductCodecError::InvalidValue);
+        }
         let dimension = decoder.usize_u32()?;
         let mut values = decoder.reserve_vec(dimension, usize::from(u16::MAX), 4)?;
         for _ in 0..dimension {

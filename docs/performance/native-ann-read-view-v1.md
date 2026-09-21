@@ -2,16 +2,18 @@
 
 # Native ANN read view v1
 
-Status: planned implementation contract; no P4 or G7 closure claim. The M05
-authenticated layered-delta input is reader-only and non-emittable and creates
-no capability, performance, or release claim.
+Status: implemented qualification candidate; no P4 or G7 closure claim. The M05
+authenticated layered-delta input has bounded point-upsert/delete publication
+and conflict-only absence fencing. A separate bounded maintenance path can
+consolidate M05 into canonical overlay-only M05. Neither behavior creates a P4,
+G7, or release claim.
 
 `NativeAnnReadView` is an owned, index-scoped, immutable current-root read
 authority. It separates one governed physical hydration from the repeatable ANN
-query hot loop. The v1 consumer is selected approximate search with
-`metric-bound-adaptive-v1`; filtered, exact, hybrid, and compatibility entry
-points remain outside this vertical until they adopt the same retained-view
-authority explicitly.
+query hot loop. The v1 consumers are selected approximate search with
+`metric-bound-adaptive-v1` and the ANN child of `NativeHybridReadView`;
+filtered, exact, and compatibility entry points remain outside this vertical
+until they adopt the same retained-view authority explicitly.
 
 The view is process-local. It is not a durable format, a cache file, or an
 alternative MVCC authority. Opening or dropping one must not append WAL, move a
@@ -45,7 +47,7 @@ The last handle drop destroys the owned state and releases its retained memory.
 No borrowed page, B-tree cursor, transaction lifetime, or mutable database
 reference may escape into the view.
 
-For reader-only M05 input, "one exact delta overlay" means the effective
+For M05 input, "one exact delta overlay" means the effective
 object-keyed composition of authenticated D02 first, frozen D01 second, and the
 base last. An overlay tombstone hides both lower layers. The opener validates
 the fixed manifest, frozen legacy identity/count/bytes, overlay
@@ -91,10 +93,20 @@ subtracted from the shared 64 MiB recovery authority before the complete-root
 M05 metadata and physical borrowed visits. ANN values are never copied by the
 lexical loader.
 
-No read-view path emits M05, its manifest/leaves/nodes, `HYANNA02`, or a WAL
-opcode. Foreground ANN mutation, initial-bulk publication, and ANN consolidation
-do not adopt this reader authority in this slice. Lexical compaction and page
-vacuum may preserve its authenticated bytes unchanged.
+That aggregate shared cap is an M05 complete-root rule, not a retroactive format
+gate on historical M01-M04-only roots. Those roots retain their bounded load
+acceptance; an index-scoped view still performs its own target-derived governed
+planning and hydration. A later M04-to-M05 point-write or C02 consolidation
+candidate must pass the complete-root shared cap before publication.
+
+No read-view path emits M05. Separate foreground physical point-upsert and
+point-delete paths emit a manifest, leaf, nodes, and `HYANNA02` authority. A
+complete-image fence of an already absent vector emits opcode 57 conflict
+authority but no ANN page, sequence, slot, or view-identity transition. M05
+consolidation remains a separate HYANNC02 maintenance writer and never mutates
+an open view. M05 initial-bulk rewriting does not adopt writer authority in this
+slice. Lexical compaction and page vacuum may preserve authenticated bytes
+unchanged.
 
 The memory-only permit requests zero compute threads and zero I/O slots and
 remains live through every handle clone. A rejected, canceled, corrupt, or
@@ -128,6 +140,44 @@ and tombstones are applied. It is accepted only when the merged result still
 contains `k` hits and the next omitted lower bound is strictly greater than the
 final kth distance. A tombstone-invalidated certificate continues widening;
 the view never reports selected routing using only a pre-delta kth bound.
+
+Base output is oversampled before delta shadow suppression. With selected-base
+count `B`, effective delta count `D`, shadowed selected-base count
+`S <= min(B, D)`, requested `k`, and caller base-search ceiling
+`E = ef_search`, the base-hit target is the checked value
+`O = min(B, E, k + S)`. Base graph traversal and exact reranking, when selected,
+retain at most `E` candidates; neither may substitute the index's larger
+configured maximum for the caller's value. The merge removes every base object
+named by the effective delta, exact-scores live delta upserts, orders the
+combined candidates, and only then truncates to `k`. It must not truncate the
+base to `k` before suppression. Exact delta upserts are separately bounded by
+the durable delta contract and may make the reported total candidate count
+greater than `E`.
+
+If the base candidates available within `E` cannot replace every shadowed hit,
+the approximate result may contain fewer than `k` hits. Routed widening may
+visit more partitions under its existing partition budget, but it still uses
+the same `E`. Underfill never authorizes a complete-corpus exact scan, exact
+completion fallback, or implicit `ef_search` increase.
+
+Query scratch is exact within the conservative read-view model. Let `P` be the
+logical partition count, `C` the admitted compute-thread request,
+`W = max(1, min(C, P))`, `V = 4 * dimension`, and retain `B`, `D`, and `E` as
+defined above. The checked scratch request in bytes is:
+
+```text
+64 KiB + V + 512 * B + 256 * P * E + W * (256 * E + V) + 64 * D
+```
+
+The terms respectively cover fixed query state, query-vector bytes, the two
+worst-case full-base visited sets, retained child results, concurrent worker
+search state, and delta merge state. Overflow is a query-memory error. Before
+any pool dispatch, the one bounded FIFO admission requests exactly
+`{compute_threads: C, io_slots: 0, memory_bytes: query_scratch_bytes}`. A queued
+request does not reserve a second scratch arena, and routed child work only
+subdivides that parent. Cancellation, timeout, error, and success release that
+one scratch authority; receipt `query_scratch_bytes` must equal the admitted
+value.
 
 After a successful open, a query must perform none of the following:
 
@@ -166,6 +216,14 @@ the same authority identities and results when the durable root is unchanged.
 Prior-or-complete recovery remains the source of durable truth; no view may be
 recovered from process memory or used to conceal invalid durable state.
 
+A commit containing only conflict-only absence fences is the physically
+unchanged special case: its search root page ID and read-view identities remain
+the same, so an existing view returns identical results. The WAL records the
+transaction, the commit CSN and global visible authority advance, and recovery
+publishes the object/lifecycle conflict keys at that CSN. Latest-root selection
+must therefore compare committed root-set authority, not infer freshness from
+the search page ID alone.
+
 ## Governor reconfiguration guard
 
 The retained memory permit binds a view to one immutable governor policy and
@@ -203,8 +261,9 @@ receipt must not hide that work inside execution time.
 
 ## RED/GREEN local acceptance
 
-Implementation starts with deterministic local tests that are red against the
-current per-query restore path and green only when these conditions hold:
+The implementation is guarded by deterministic local tests that were red
+against the per-query restore path and remain green only when these conditions
+hold:
 
 1. **Target scope:** two ANN indexes plus SQL, structures, and lexical data open
    one target view under full-state/full-catalog fail guards. Target corruption
@@ -217,17 +276,24 @@ current per-query restore path and green only when these conditions hold:
 4. **Deterministic fanout:** geometric prefixes reproduce the serial oracle and
    never execute one child twice. Worker capacities 1, 2, and 4 reproduce the
    same certified prefix, requested full fanout, and budget-triggered complete
-   fallback, including exact delta upserts and tombstones.
+   fallback, including exact delta upserts and tombstones. Base candidates are
+   oversampled to the checked `min(B, E, k + S)` target before shadow
+   suppression, never exceed caller `E`, permit bounded underfill when those
+   candidates cannot replace shadows, and never exact-scan the corpus to fill.
 5. **Admission and RAII:** open rejection occurs before physical scan; retained
-   memory remains charged across clones; every query CPU/scratch allocation
-   returns after success, cancellation, error, and panic; the last view drop
-   returns retained memory exactly once.
+   memory remains charged across clones; the queued query request equals the
+   exact checked scratch formula and occurs before worker dispatch; every query
+   CPU/scratch allocation returns after success, cancellation, error, and
+   panic; the last view drop returns retained memory exactly once.
 6. **Cancellation and reuse:** cancellation during scan, restore, first wave,
    and widening returns no partial result. The same view remains usable after a
    canceled query.
 7. **Lifecycle:** root advance leaves the old view stable, a new view observes
-   the new view identity, vacuum after hydration cannot break the old view, and
-   unchanged durable state reopens to identical identities and results.
+   the new view identity, point delete removes the object without rebuilding the
+   base, a pure absence fence advances committed authority without changing the
+   search root or either view's results, vacuum after hydration cannot break the
+   old view, and unchanged durable state reopens to identical identities and
+   results.
 8. **Reconfiguration:** governor replacement/removal fails while any clone is
    live and succeeds after the last drop, with no capacity leaked in either
    generation.
@@ -245,8 +311,9 @@ separate setup evidence. Warmup and observations reuse that exact view and fail
 if a query scans pages, restores an index, changes root authority, or reports
 `hydration_performed=true`.
 
-The view does not alter the frozen corpus, 100,000 warmup count, 1,000,000
-observations, concurrency 1/8/32 matrix, exact recall oracle, control/interference
-pairing, or release-source authority. Local acceptance and a clean G7 wiring
-only make the path eligible for dedicated measurement. They do not close P4 or
-G7 without the complete accepted bare-metal evidence.
+The G7 profile, rather than this product contract, defines any intended corpus,
+seed, warmup count, observation count, concurrency matrix, exact recall oracle,
+control/interference pairing, and release-source authority. This contract does
+not assert that such a seed or corpus has been generated or completed. Local
+acceptance and clean G7 wiring only make the path eligible for dedicated
+measurement; they do not close P4 or G7 without accepted bare-metal evidence.

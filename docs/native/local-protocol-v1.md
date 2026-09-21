@@ -8,6 +8,18 @@ The unreleased Agent Memory candidate adds protocol minor 7: request `71`
 [the complete composition and wire contract](agent-memory-read-v1.md). Older
 exchanges keep their existing encoding and negotiated minor gates.
 
+Protocol minor 7 also admits transaction search-mutation tag `3` (`Document`),
+which carries a collection `ObjectId` and one complete `ProductDocument`.
+Clients and servers that negotiated minor 6 or earlier reject this tag before
+sending or dispatch; transaction search-mutation tags `0` through `2` retain
+their historical encoding and minor requirements.
+
+The canonical tag-3 binary and malformed UTF-8 map-order vectors are crate-local
+test fixtures under `crates/hyphae-native-protocol/tests/fixtures/`. Protocol
+tests consume those copies as their authority. Repository-wide cross-language
+mirrors used by SDK tests must remain byte-identical and do not replace the
+crate-local source.
+
 Response `46` contains an optional nonzero read CSN, a commit-presence byte and
 seven zero reserved bytes, a nonzero bounded `u32` result count and four zero
 reserved bytes, then one canonical changed boolean plus an existing structure

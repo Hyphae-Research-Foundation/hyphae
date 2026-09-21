@@ -118,6 +118,9 @@ fn rebuild_compaction_and_reopen_preserve_lexical_and_ann_results() -> Result<()
             b"doc-a".to_vec(),
             format!("current shared revision{revision}"),
         )?;
+        if !update.delete_vector(ann, ObjectId::new(202)?)? {
+            return Err("legacy ANN replacement object is missing".into());
+        }
         update.upsert_vector(
             ann,
             ObjectId::new(202)?,

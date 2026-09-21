@@ -17,11 +17,13 @@ use hyphae_native_catalog::{
     SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions, VectorMetric,
     VectorSearchPolicy,
 };
+use hyphae_native_manifest::RootManifestStore;
 use hyphae_native_product::{
     AnnConsolidationRequest, NativeProduct, ProductDocValue, ProductDocument, ProductDurability,
-    ProductLexicalBranch, ProductSearchCollectionBinding, ProductSearchFilter,
-    ProductSearchIngestBatch, ProductSearchOperator, ProductSearchRequest, ProductVector,
-    ProductVectorBranch, ProductVectorExecution,
+    ProductLexicalBranch, ProductSearchCollectionBinding, ProductSearchDocumentDelete,
+    ProductSearchDocumentUpdate, ProductSearchFilter, ProductSearchIngestBatch,
+    ProductSearchOperator, ProductSearchRequest, ProductVector, ProductVectorBranch,
+    ProductVectorExecution,
 };
 use hyphae_native_runtime::NativeDatabase;
 use hyphae_native_types::{
@@ -226,14 +228,19 @@ fn match_all(limit: usize) -> ProductSearchRequest {
     }
 }
 
-fn full_state_loads(product: &mut NativeProduct) -> Result<u64, Box<dyn std::error::Error>> {
-    Ok(product
+fn materialization_loads(
+    product: &mut NativeProduct,
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let physical = product
         .administration()
         .status(hyphae_native_product::StatusRequest {
             logical_time_micros: 0,
         })?
-        .physical
-        .process_full_state_loads)
+        .physical;
+    Ok((
+        physical.process_full_state_loads,
+        physical.process_full_catalog_loads,
+    ))
 }
 
 /// A vector-bearing batch must stage through the physical delta path: no
@@ -247,33 +254,178 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
     let path = temporary("delta-ingest");
     let (mut product, binding) = configure_chunked(&path)
         .map_err(|error| format!("vector collection configuration failed: {error:?}"))?;
+    let mut omitted_exact = chunk_document(302, "rust field guide")?;
+    omitted_exact.vectors.remove("exact");
     let first = ProductSearchIngestBatch {
         idempotency_id: 7,
-        documents: vec![
-            chunk_document(301, "rust database engine")?,
-            chunk_document(302, "rust field guide")?,
-        ],
+        documents: vec![chunk_document(301, "rust database engine")?, omitted_exact],
     };
-    // The first batch turns posting coverage on; the second exercises the
-    // steady state where coverage is already durable. Consolidation places
-    // the first vectors in the immutable base so the measured ingest proves
-    // base-plus-delta behavior rather than an empty-base special case.
-    product
+    // The first batch turns posting coverage on and selects M05; the second
+    // exercises the steady-state overlay path where coverage is durable.
+    let materializations = materialization_loads(&mut product)?;
+    let ann_restores = NativeDatabase::process_ann_index_restore_count();
+    let first_receipt = product
         .ingest_search_batch(binding.collection, &first, 3, ProductDurability::Strict)
         .map_err(|error| format!("first vector ingest failed: {error:?}"))?;
+    assert_eq!(materialization_loads(&mut product)?, materializations);
+    assert_eq!(
+        NativeDatabase::process_ann_index_restore_count(),
+        ann_restores,
+        "complete-image ingest restored an immutable ANN base"
+    );
+    let first_replay =
+        product.ingest_search_batch(binding.collection, &first, 3, ProductDurability::Strict)?;
+    assert!(first_replay.idempotent_replay);
+    assert_eq!(first_replay.commit, first_receipt.commit);
     let vector_index = binding
         .vectors
         .iter()
         .find(|binding| binding.name == "embedding")
         .ok_or("missing vector binding")?
         .index;
-    product
+
+    // A plain delete of an absent vector remains a mutation-free rollback.
+    // A complete-image fence of the same absence commits conflict authority
+    // without replacing the ANN root or appending any page.
+    drop(product);
+    let absent = ObjectId::new(999)?;
+    let mut runtime = NativeDatabase::open(&path)?;
+    let selected_before = runtime.observe_ann_index(vector_index)?;
+    let before = runtime.physical_observation()?;
+    let mut ordinary = runtime.begin(3, hyphae_native_types::DurabilityClass::Strict)?;
+    assert!(!ordinary.delete_vector(vector_index, absent)?);
+    ordinary.rollback();
+    assert_eq!(
+        runtime.physical_observation()?.page_count,
+        before.page_count
+    );
+    runtime.checkpoint()?;
+    let manifest_before = RootManifestStore::open(&path)?
+        .current()
+        .cloned()
+        .ok_or("missing root manifest before absence fence")?;
+    let roots_before = manifest_before
+        .to_root_set()?
+        .iter_roots()
+        .collect::<Vec<_>>();
+    let search_root_before = roots_before
+        .iter()
+        .find(|(slot, _)| slot.engine == EngineKind::Search)
+        .map(|(_, page)| *page)
+        .ok_or("missing search root before absence fence")?;
+    let before_fence = runtime.physical_observation()?;
+    let restores = NativeDatabase::process_ann_index_restore_count();
+    let mut fence =
+        runtime.begin_optimistic_delta(3, hyphae_native_types::DurabilityClass::Strict)?;
+    assert!(!runtime.stage_delta_vector_absence_fence(&mut fence, vector_index, absent,)?);
+    let fence_commit = runtime.commit_optimistic(fence)?;
+    let after = runtime.physical_observation()?;
+    assert_eq!(after.page_count, before_fence.page_count);
+    assert!(after.wal_bytes > before_fence.wal_bytes);
+    assert_eq!(
+        after.process_full_state_loads,
+        before_fence.process_full_state_loads
+    );
+    assert_eq!(
+        after.process_full_catalog_loads,
+        before_fence.process_full_catalog_loads
+    );
+    assert_eq!(NativeDatabase::process_ann_index_restore_count(), restores);
+    assert_eq!(runtime.observe_ann_index(vector_index)?, selected_before);
+    runtime.checkpoint()?;
+    let manifest_after = RootManifestStore::open(&path)?
+        .current()
+        .cloned()
+        .ok_or("missing root manifest after absence fence")?;
+    let roots_after = manifest_after
+        .to_root_set()?
+        .iter_roots()
+        .collect::<Vec<_>>();
+    let search_root_after = roots_after
+        .iter()
+        .find(|(slot, _)| slot.engine == EngineKind::Search)
+        .map(|(_, page)| *page)
+        .ok_or("missing search root after absence fence")?;
+    assert_eq!(roots_after, roots_before);
+    assert_eq!(search_root_after, search_root_before);
+    assert_eq!(manifest_after.visible_csn(), fence_commit.commit_csn);
+    assert!(manifest_after.visible_csn() > manifest_before.visible_csn());
+    assert_eq!(manifest_after.wal_anchor().lsn, fence_commit.commit_lsn);
+    assert!(manifest_after.wal_anchor().lsn > manifest_before.wal_anchor().lsn);
+    assert_ne!(
+        manifest_after.wal_anchor().digest,
+        manifest_before.wal_anchor().digest
+    );
+    drop(runtime);
+    let mut product = NativeProduct::open(&path)?;
+
+    let documents_before_consolidation = NativeProduct::search_documents_at_snapshot(
+        &product.snapshot_bounded(3)?,
+        binding.collection,
+        None,
+        16,
+    )?
+    .documents;
+    let mut ann_before_request = match_all(16);
+    ann_before_request.vectors.push(ProductVectorBranch {
+        target: "embedding".into(),
+        query: ProductVector::new([1.0, 0.0])?,
+        candidate_limit: 16,
+        weight: 1,
+        execution: Some(ProductVectorExecution::Ann {
+            ef_search: 16,
+            exact_rerank: Some(16),
+        }),
+        max_distance: None,
+    });
+    let mut exact_before_request = match_all(16);
+    exact_before_request.vectors.push(ProductVectorBranch {
+        target: "exact".into(),
+        query: ProductVector::new([1.0, 0.0])?,
+        candidate_limit: 16,
+        weight: 1,
+        execution: Some(ProductVectorExecution::Exact),
+        max_distance: None,
+    });
+    let ann_before_consolidation =
+        product.search_collection(binding.collection, &ann_before_request, 3)?;
+    let exact_before_consolidation =
+        product.search_collection(binding.collection, &exact_before_request, 3)?;
+    let consolidation = product
         .administration()
         .consolidate_ann(
             AnnConsolidationRequest::new(vector_index, 16, 16, ProductDurability::Strict)
                 .ok_or("invalid consolidation request")?,
         )
         .map_err(|error| format!("ANN consolidation failed: {error:?}"))?;
+    assert!(consolidation.consumed_delta_records >= 2);
+    assert_eq!(consolidation.effective_vector_count, 2);
+    assert_ne!(
+        consolidation.replacement_base_identity,
+        consolidation.previous_base_identity
+    );
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(3)?,
+            binding.collection,
+            None,
+            16,
+        )?
+        .documents,
+        documents_before_consolidation
+    );
+    assert_eq!(
+        product
+            .search_collection(binding.collection, &ann_before_request, 3)?
+            .hits,
+        ann_before_consolidation.hits
+    );
+    assert_eq!(
+        product
+            .search_collection(binding.collection, &exact_before_request, 3)?
+            .hits,
+        exact_before_consolidation.hits
+    );
     let second = ProductSearchIngestBatch {
         idempotency_id: 8,
         documents: vec![
@@ -281,15 +433,15 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
             chunk_document(304, "garden tools")?,
         ],
     };
-    let before = full_state_loads(&mut product)?;
+    let before = materialization_loads(&mut product)?;
     let ann_restores = NativeDatabase::process_ann_index_restore_count();
     let receipt = product
         .ingest_search_batch(binding.collection, &second, 4, ProductDurability::Strict)
         .map_err(|error| format!("second vector ingest failed: {error:?}"))?;
     assert_eq!(
-        full_state_loads(&mut product)?,
+        materialization_loads(&mut product)?,
         before,
-        "vector ingest materialized the complete all-engine state"
+        "vector ingest materialized complete all-engine or catalog state"
     );
     assert_eq!(
         NativeDatabase::process_ann_index_restore_count(),
@@ -312,10 +464,10 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
 
     // Idempotent replay resolves through the durable marker and returns the
     // original commit without materializing state.
-    let before = full_state_loads(&mut product)?;
+    let before = materialization_loads(&mut product)?;
     let replay =
         product.ingest_search_batch(binding.collection, &second, 5, ProductDurability::Strict)?;
-    assert_eq!(full_state_loads(&mut product)?, before);
+    assert_eq!(materialization_loads(&mut product)?, before);
     assert!(replay.idempotent_replay);
     assert_eq!(replay.documents, 2);
     assert_eq!(replay.commit, Some(commit));
@@ -395,10 +547,11 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
     });
     let exact = product.search_collection(binding.collection, &exact_request, 6)?;
     assert_eq!(exact.hits[0].object_id.get(), 303);
+    assert!(exact.hits.iter().all(|hit| hit.object_id.get() != 302));
     assert!(!exact.approximate);
 
-    let mut ann = match_all(16);
-    ann.vectors.push(ProductVectorBranch {
+    let mut ann_request = match_all(16);
+    ann_request.vectors.push(ProductVectorBranch {
         target: "embedding".into(),
         query: ProductVector::new([3.0, 0.0])?,
         candidate_limit: 4,
@@ -409,7 +562,7 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
         }),
         max_distance: None,
     });
-    let ann = product.search_collection(binding.collection, &ann, 6)?;
+    let ann = product.search_collection(binding.collection, &ann_request, 6)?;
     assert_eq!(ann.hits[0].object_id.get(), 303);
     assert_eq!(ann.hits.len(), 4);
 
@@ -432,6 +585,99 @@ fn vector_ingest_is_point_resolved_and_semantically_identical()
         reopened.ingest_search_batch(binding.collection, &second, 7, ProductDurability::Strict)?;
     assert!(replay.idempotent_replay);
     assert_eq!(replay.commit, Some(commit));
+    let mut replacement = chunk_document(303, "database hardware updated")?;
+    replacement.vectors.remove("embedding");
+    let update = ProductSearchDocumentUpdate {
+        idempotency_id: 10,
+        document: replacement,
+    };
+    let updated = reopened.update_search_document(
+        binding.collection,
+        &update,
+        8,
+        ProductDurability::Strict,
+    )?;
+    let update_replay = reopened.update_search_document(
+        binding.collection,
+        &update,
+        8,
+        ProductDurability::Strict,
+    )?;
+    assert!(update_replay.idempotent_replay);
+    assert_eq!(update_replay.commit, updated.commit);
+    let exact_after_omission = reopened.search_collection(binding.collection, &exact_request, 8)?;
+    assert_eq!(exact_after_omission.hits[0].object_id.get(), 303);
+    let ann_after_omission = reopened.search_collection(binding.collection, &ann_request, 8)?;
+    assert!(
+        ann_after_omission
+            .hits
+            .iter()
+            .all(|hit| hit.object_id.get() != 303)
+    );
+    let delete = ProductSearchDocumentDelete {
+        idempotency_id: 11,
+        object_id: ObjectId::new(303)?,
+    };
+    let deleted = reopened.delete_search_document(
+        binding.collection,
+        delete,
+        9,
+        ProductDurability::Strict,
+    )?;
+    let delete_replay = reopened.delete_search_document(
+        binding.collection,
+        delete,
+        9,
+        ProductDurability::Strict,
+    )?;
+    assert!(delete_replay.idempotent_replay);
+    assert_eq!(delete_replay.commit, deleted.commit);
+    assert!(
+        reopened
+            .search_collection(binding.collection, &exact_request, 9)?
+            .hits
+            .iter()
+            .all(|hit| hit.object_id.get() != 303)
+    );
+    let mut hybrid_after_delete = ann_request.clone();
+    hybrid_after_delete.lexical = Some(ProductLexicalBranch {
+        query: "database".into(),
+        candidate_limit: 16,
+        weight: 1,
+        operator: None,
+        prefix: false,
+        fields: Vec::new(),
+        fuzzy: None,
+        phrase: false,
+    });
+    assert!(
+        reopened
+            .search_collection(binding.collection, &hybrid_after_delete, 9)?
+            .hits
+            .iter()
+            .all(|hit| hit.object_id.get() != 303)
+    );
+    let documents = NativeProduct::search_documents_at_snapshot(
+        &reopened.snapshot_bounded(9)?,
+        binding.collection,
+        None,
+        16,
+    )?;
+    assert!(
+        documents
+            .documents
+            .iter()
+            .all(|document| document.object_id.get() != 303)
+    );
+    drop(reopened);
+    let reopened = NativeProduct::open(&path)?;
+    assert!(
+        reopened
+            .search_collection(binding.collection, &ann_request, 9)?
+            .hits
+            .iter()
+            .all(|hit| hit.object_id.get() != 303)
+    );
     drop(reopened);
     fs::remove_dir_all(path)?;
     Ok(())

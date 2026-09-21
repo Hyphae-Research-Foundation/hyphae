@@ -4,9 +4,10 @@
 Status: normative experimental format; copy-on-write insertion, replacement,
 ordered multi-key replacement, recursive splitting, point lookup, ordered
 scan, bounded prefix scan, reentrant buffered prefix visitation, complete
-validation, balanced-height validation, historical roots, and allocation-free
-buffer-pool point traversal are implemented or implementation-gated;
-relational, structure, and lexical-search namespaces use the native tree
+validation, balanced-height validation, historical roots, allocation-free
+buffer-pool point traversal, and exact-prefix unpublished-tail replacement are
+implemented; relational, structure, and lexical-search namespaces use the
+native tree.
 
 The native B+tree stores canonical binary keys and values directly in Hyphae
 pages. It does not wrap Redb, RocksDB, SQLite, or another tree implementation.
@@ -112,6 +113,60 @@ publication does not weaken transaction atomicity: the engine root remains
 unpublished until the owning WAL transaction and global root set commit.
 Callers that require sequential same-key semantics must coalesce those
 operations before invoking the ordered batch.
+
+A bounded immutable-root diff accepts ordered nonoverlapping prefixes and
+scalar ceilings for changed node-pair visits, returned differences, and
+retained bytes. Equal page IDs are unchanged authority and require no decode.
+For changed internal pages, the verifier partitions the requested range by the
+union of both nodes' separators, so splits, separator movement, and root-height
+changes cannot hide a leaf insertion, replacement, or removal. The result is
+the exact ordered prior/result value difference set under those prefixes; any
+bound violation fails closed. Empty/nonempty root pairs use the same bounded
+prefix traversal. A streaming form delivers borrowed differences without
+retaining values and enforces independent changed-node and changed-key ceilings.
+
+Exact-prefix replacement is the bounded base-replacement primitive used by ANN
+consolidation. Planning binds one page-file generation and immutable root and
+derives structural memory from reachable pages, leaves, maximum stack depth,
+boundary-key bytes, maximum key length, and replacement entry/key ceilings.
+The caller separately supplies ordered nonoverlapping prefixes, the exact
+ordered set of every current key under those prefixes, and the complete
+ordered replacement key/value set. Before the first page append, execution
+revisits the bound root and requires exact key equality: an omitted, added,
+duplicated, reordered, or out-of-prefix key is `PrefixContentsChanged`.
+
+The exterior-validation form writes only through an unpublished-tail
+capability. The caller validates the complete candidate root while those pages
+are private and calls `finalize` only after semantic validation; error,
+cancellation, or capability drop rolls the tail back to its opaque checkpoint.
+Candidate pages cannot enter the shared buffer pool before finalization.
+Unselected leaves are reused byte-for-byte and every rebuilt internal level is
+derived only from the verified leaf references.
+
+For HYANNC02 consolidation the fixed 384-byte WAL authority is completely
+encoded and shape-validated before the unpublished-tail capability is opened.
+The prefixes are the exact search format key plus the target index namespaces
+`0x05` through `0x0b`. The admission-time key set therefore includes the
+publication-time metadata, selected and retained vector and graph records, D01,
+manifest, D02, and sparse-Merkle nodes, including disjoint point records
+committed after plan capture. The C02 body carries no per-key tail.
+
+The replacement selects the canonical base and canonical overlay-only D02
+result. Its retained-generation transition starts from the publication-time
+ordered list, appends the superseded selected nonempty generation at the end
+only when it differs from the replacement and is not already retained, and
+removes only the oldest generations required by policy. Every surviving
+selected or retained child descriptor must have its complete vector and graph
+records. Existing surviving generation
+bytes are unchanged, and exactly the records owned only by retired generations
+are absent from the result. A descriptor without all graph layers, an orphan
+generation record, or a retained byte change fails exterior validation.
+
+Lexical keys and every unrelated ANN index remain outside the prefixes and must
+retain their page identity or byte value. The exact key-set check closes the
+race between later-record classification and physical replacement; HYANNC02
+recovery then proves every immediate prior/result value difference, including
+superseded committed roots, rather than trusting only the final metadata key.
 
 No published page is changed in place. Pages appended by an interrupted
 transaction remain unreachable until a WAL-committed root set names the new

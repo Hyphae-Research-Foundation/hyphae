@@ -580,7 +580,7 @@ An explicit transaction mixes SQL, structure, search, and vector stages,
 and commits them under one CSN:
 
 ```bash
-hyphae transaction --data-dir "$D" execute --steps-json '[
+hyphae transaction --data-dir "$D" execute --idempotency-token 3001 --steps-json '[
   {"operation":"stage_sql","statement":"INSERT INTO notes (id, body, stars) VALUES (?, ?, ?)",
    "parameters":[3,"transactional note",5]},
   {"operation":"stage_structure","mutation":{"operation":"counter_add","keyspace":20,"key":"visits","delta":1}},
@@ -590,15 +590,22 @@ hyphae transaction --data-dir "$D" execute --steps-json '[
 
 Steps: `status`, `stage_sql`, `stage_structure`, `stage_search`,
 `stage_vector`, then a terminal `commit` or `rollback`. Each stage returns
-its provisional result inside the transaction.
+its provisional result inside the transaction. Every script ending in
+`commit` requires a caller-chosen nonzero `--idempotency-token`; a rollback-only
+script may omit it. Successful output preserves both the caller token and
+Hyphae's separately generated transaction identity.
 
 If the process dies or the commit acknowledgement is lost, durable evidence
 resolves the outcome — never guess or replay the commit:
 
 ```bash
+hyphae transaction --data-dir "$D" status --idempotency-token 3001
 hyphae transaction --data-dir "$D" status --id <transaction_id>
 ```
 
+Token status works when the process died before it could print the generated
+transaction identity. Retrying the same `execute` command after publication
+returns the retained outcome without restaging or repeating side effects.
 In the SDKs a cancelled or transport-failed commit becomes terminal
 `outcome_unknown`; resolve it through the transaction-status operation.
 
@@ -793,8 +800,9 @@ async with AsyncHyphaeClient.local_authenticated(endpoint, api_key) as client:
 A transaction abandoned by its context rolls back; an uncertain commit is
 terminal `outcome_unknown` and resolves through the transaction-status
 operation. `@hyphae_/hyphae/v2` offers the same API for Node with
-deadlines, `AbortSignal`, and exact 64-bit integers (unsafe values arrive
-as `bigint`). In Rust, embed `hyphae-native-product` directly —
+deadlines, `AbortSignal`, and lossless `u64`, `i64`, and `u128` wire integers as
+`bigint`; Python exposes the same integer domains as `int`. In Rust, embed
+`hyphae-native-product` directly —
 engine-to-engine calls are typed Rust, not HTTP or JSON. See the
 [Python SDK guide](../sdks/python/README.md) and the
 [TypeScript SDK guide](../sdks/typescript/README.md).
@@ -828,7 +836,7 @@ rows for content, a hash for hot metadata, a counter, and a TTL session key
 — committed together when it matters:
 
 ```bash
-hyphae transaction --data-dir "$D" execute --steps-json '[
+hyphae transaction --data-dir "$D" execute --idempotency-token 3002 --steps-json '[
  {"operation":"stage_sql","statement":"INSERT INTO notes (id, body, stars) VALUES (?, ?, ?)","parameters":[7,"new note",0]},
  {"operation":"stage_structure","mutation":{"operation":"counter_add","keyspace":20,"key":"visits","delta":1}},
  {"operation":"commit"}]'

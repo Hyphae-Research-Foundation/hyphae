@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, NotRequired, TypeAlias, TypedDict
 
 DEFAULT_LIMITS = {
     "max_count": 4096,
@@ -16,6 +16,52 @@ DEFAULT_LIMITS = {
     "max_work_units": 1_000_000,
     "max_memory_bytes": 64 * 1024 * 1024,
 }
+
+
+ProductDocValue: TypeAlias = bool | int | float | str | bytes
+
+
+class ProductDocument(TypedDict):
+    """One complete image whose map names use canonical UTF-8 byte order on wire."""
+
+    object_id: int
+    text: str
+    doc_values: NotRequired[dict[str, ProductDocValue]]
+    vectors: NotRequired[dict[str, list[float]]]
+
+
+class ProductTransactionSearchIndexMutation(TypedDict):
+    kind: Literal["index"]
+    index: int
+    document_id: bytes
+    text: str
+
+
+class ProductTransactionSearchReplaceMutation(TypedDict):
+    kind: Literal["replace"]
+    index: int
+    document_id: bytes
+    text: str
+
+
+class ProductTransactionSearchDeleteMutation(TypedDict):
+    kind: Literal["delete"]
+    index: int
+    document_id: bytes
+
+
+class ProductTransactionSearchDocumentMutation(TypedDict):
+    kind: Literal["document"]
+    collection: int
+    document: ProductDocument
+
+
+ProductTransactionSearchMutation: TypeAlias = (
+    ProductTransactionSearchIndexMutation
+    | ProductTransactionSearchReplaceMutation
+    | ProductTransactionSearchDeleteMutation
+    | ProductTransactionSearchDocumentMutation
+)
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,7 @@ export class HttpTransport implements Transport {
   readonly #maximumPending: number;
   #pending = 0;
   #closed = false;
-  #negotiatedMinor = 4;
+  #negotiatedMinor = 7;
 
   constructor(baseUrl: string, options: HttpTransportOptions = {}) {
     let origin: URL;

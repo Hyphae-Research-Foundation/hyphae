@@ -17,6 +17,7 @@ from .models import (
     CancellationToken,
     ClientError,
     ProductError,
+    ProductTransactionSearchMutation,
     RequestOptions,
     Response,
 )
@@ -549,7 +550,7 @@ class AsyncTransaction:
 
     async def stage_search(
         self,
-        mutation: dict[str, object],
+        mutation: ProductTransactionSearchMutation,
         *,
         options: RequestOptions | None = None,
     ) -> Response:

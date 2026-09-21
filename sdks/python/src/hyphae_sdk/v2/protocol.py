@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import struct
 import unicodedata
 from dataclasses import dataclass
@@ -24,6 +25,15 @@ MAX_SECURITY_GRANTS = 256
 MAX_SECURITY_ASSIGNMENTS = 128
 MAX_CATALOG_VISIBLE_ITEMS = 4_096
 MAX_TRANSACTION_OPERATIONS = 1_024
+MAX_SEARCH_DOCUMENT_VALUES = 64
+MAX_SEARCH_DOCUMENT_VECTORS = 16
+MAX_VECTOR_DIMENSION = (1 << 16) - 1
+MAX_SEARCH_RANGE_FACETS = 8
+MAX_SEARCH_FACET_RANGES = 64
+MAX_AUTOCUT_STEEPNESS = 16
+MAX_LEXICAL_MINIMUM_MATCH = 64
+MAX_LEXICAL_FUZZY_DISTANCE = 2
+MAX_LEXICAL_FIELDS = 64
 FRAME_KINDS = {
     "hello": 1,
     "welcome": 2,
@@ -372,10 +382,7 @@ def decode_welcome(encoded: bytes) -> dict[str, int]:
 
 
 def _doc_value_required_minor(value: Any) -> int:
-    # Boolean, integer, string, and bytes doc values are minor-0 content;
-    # future typed values raise the requirement here.
-    del value
-    return 0
+    return 6 if isinstance(value, float) else 0
 
 
 def _filter_required_minor(value: Any, depth: int = 0) -> int:
@@ -413,6 +420,16 @@ def _document_required_minor(document: Any) -> int:
     )
 
 
+_MINOR_SIX_STRUCTURE_READS = frozenset({
+    "sorted_set_score_range", "hash_scan_reverse", "hash_scan_match",
+    "key_scan_match", "string_range", "set_random_members",
+})
+_MINOR_SIX_STRUCTURE_MUTATIONS = frozenset({
+    "sorted_set_increment", "sorted_set_pop", "string_set_conditional",
+    "string_append", "string_set_range", "hash_set_if_absent", "set_pop",
+})
+
+
 def operation_required_minor(
     operation: str, arguments: dict[str, Any] | None = None
 ) -> int:
@@ -438,23 +455,70 @@ def operation_required_minor(
     if operation in SECURITY_READ_OPERATIONS:
         return 1
     if arguments is not None:
+        if operation == "structure_read":
+            request = arguments.get("request", arguments)
+            if isinstance(request, dict) and request.get("kind") in _MINOR_SIX_STRUCTURE_READS:
+                return 6
+        if operation == "structure_mutate":
+            mutations = arguments.get("mutations", [])
+            if isinstance(mutations, list) and any(
+                isinstance(mutation, dict)
+                and mutation.get("kind") in _MINOR_SIX_STRUCTURE_MUTATIONS
+                for mutation in mutations
+            ):
+                return 6
+        if operation == "transaction_stage_structure":
+            mutation = arguments.get("mutation")
+            if (
+                isinstance(mutation, dict)
+                and mutation.get("kind") in _MINOR_SIX_STRUCTURE_MUTATIONS
+            ):
+                return 6
         if operation == "search_collection":
             request = arguments.get("request", arguments)
-            extended = isinstance(request, dict) and (
-                request.get("fusion") is not None
+            if not isinstance(request, dict):
+                return 0
+            fusion_method = request.get("fusion")
+            fusion = 6 if fusion_method == "relative_score" else 4 if (
+                fusion_method is not None
                 or request.get("parent_dedupe") is not None
                 or request.get("rerank") is not None
-            )
-            fusion = 4 if extended else 0
+            ) else 0
             highlight = (
-                5
-                if isinstance(request, dict) and request.get("highlight") is not None
-                else 0
+                5 if request.get("highlight") is not None else 0
             )
-            filter_minor = _filter_required_minor(
-                request.get("filter") if isinstance(request, dict) else None
+            lexical = request.get("lexical")
+            lexical_minor = 6 if isinstance(lexical, dict) and (
+                lexical.get("operator") is not None
+                or lexical.get("prefix") is True
+                or bool(lexical.get("fields"))
+                or lexical.get("fuzzy") is not None
+                or lexical.get("phrase") is True
+            ) else 0
+            vectors = request.get("vectors", [])
+            cutoff = 6 if isinstance(vectors, list) and any(
+                isinstance(vector, dict) and vector.get("max_distance") is not None
+                for vector in vectors
+            ) else 0
+            aggregations = request.get("aggregations", [])
+            average = 6 if isinstance(aggregations, list) and any(
+                isinstance(aggregation, dict) and aggregation.get("kind") == "average"
+                for aggregation in aggregations
+            ) else 0
+            minor_six = 6 if (
+                request.get("autocut") is not None
+                or request.get("offset", 0) != 0
+                or bool(request.get("range_facets"))
+            ) else 0
+            return max(
+                fusion,
+                highlight,
+                lexical_minor,
+                cutoff,
+                average,
+                minor_six,
+                _filter_required_minor(request.get("filter")),
             )
-            return max(fusion, highlight, filter_minor)
         if operation == "search_ingest":
             batch = arguments.get("batch", arguments)
             documents = batch.get("documents", []) if isinstance(batch, dict) else []
@@ -466,6 +530,10 @@ def operation_required_minor(
             )
         if operation == "search_document_update":
             return _document_required_minor(arguments.get("document"))
+        if operation == "transaction_stage_search":
+            mutation = arguments.get("mutation")
+            if isinstance(mutation, dict) and mutation.get("kind") == "document":
+                return max(7, _document_required_minor(mutation.get("document")))
     return 0
 
 
@@ -479,6 +547,36 @@ def response_required_minor(kind: int) -> int:
     if kind in SECURITY_READ_RESPONSE_KINDS:
         return 1
     return 0
+
+
+def _encode_u128(
+    value: Any,
+    name: str,
+    *,
+    nonzero: bool = False,
+    byteorder: str = "little",
+) -> bytes:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value >= 1 << 128
+        or (nonzero and value == 0)
+    ):
+        qualifier = "nonzero " if nonzero else ""
+        raise ClientError(f"{name} must be a {qualifier}unsigned 128-bit integer")
+    return value.to_bytes(16, byteorder)
+
+
+def _encode_identity(value: Any, name: str, *, byteorder: str = "little") -> bytes:
+    return _encode_u128(value, name, nonzero=True, byteorder=byteorder)
+
+
+def _decode_identity(reader: _Reader, name: str) -> int:
+    value = reader.u128()
+    if value == 0:
+        raise ClientError(f"{name} identity is zero")
+    return value
 
 
 def encode_product_request(
@@ -523,7 +621,7 @@ def encode_product_request(
         )
         context = struct.pack("<qqQQQQQ B7x", *values) if token is None else struct.pack(
             "<qq16sQQQQQ B7s",
-            values[0], values[1], token.to_bytes(16, "little"), *values[2:], b"\1\0\0\0\0\0\0",
+            values[0], values[1], _encode_identity(token, "idempotency_token"), *values[2:], b"\1\0\0\0\0\0\0",
         )
     except (KeyError, struct.error) as error:
         raise ClientError("invalid request options") from error
@@ -534,7 +632,9 @@ def encode_product_request(
     return struct.pack("<8sIHH", b"HYPREQ01", total, kind, 0) + context + body
 
 
-def decode_product_request(encoded: bytes) -> tuple[str, dict[str, Any], RequestOptions]:
+def decode_product_request(
+    encoded: bytes, *, negotiated_minor: int | None = None
+) -> tuple[str, dict[str, Any], RequestOptions]:
     kind, payload = _envelope(encoded, b"HYPREQ01")
     if len(payload) >= 80 and payload[73:80] == b"\1\0\0\0\0\0\0":
         values = struct.unpack_from("<qq16sQQQQQB", payload)
@@ -558,7 +658,12 @@ def decode_product_request(encoded: bytes) -> tuple[str, dict[str, Any], Request
         raise ClientError("security mutation requires a nonzero idempotency_token")
     if operation in API_KEY_LIFECYCLE_OPERATIONS and options.durability != "strict":
         raise ClientError("API-key lifecycle requires strict durability")
-    return operation, _decode_operation(operation, payload[offset:]), options
+    arguments = _decode_operation(operation, payload[offset:])
+    if negotiated_minor is not None and negotiated_minor < operation_required_minor(
+        operation, arguments
+    ):
+        raise ClientError("native operation is unavailable at the negotiated protocol minor")
+    return operation, arguments, options
 
 
 def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
@@ -585,7 +690,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
     if operation == "sql_execute":
         return _text(arguments["statement"]) + _encode_values(arguments.get("parameters", []))
     if operation == "transaction_status":
-        return int(arguments["transaction_id"]).to_bytes(16, "little")
+        return _encode_identity(arguments["transaction_id"], "transaction")
     if operation == "transaction_stage_sql":
         return struct.pack("<Q", arguments["handle"]) + _text(arguments["statement"]) + _encode_values(arguments.get("parameters", []))
     if operation == "transaction_stage_structure":
@@ -597,7 +702,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
     if operation in {"transaction_commit", "transaction_rollback", "explicit_transaction_status"}:
         return struct.pack("<Q", arguments["handle"])
     if operation == "transaction_status_by_idempotency":
-        return int(arguments["idempotency_token"]).to_bytes(16, "little")
+        return _encode_identity(arguments["idempotency_token"], "idempotency_token")
     if operation == "doctor":
         return b""
     if operation == "backup":
@@ -611,9 +716,9 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
             limits["max_manifest_bytes"],
         )
     if operation == "search":
-        return int(arguments["index"]).to_bytes(16, "little") + struct.pack("<Q", arguments["limit"]) + _encode_query(arguments["query"])
+        return _encode_identity(arguments["index"], "search index") + struct.pack("<Q", arguments["limit"]) + _encode_query(arguments["query"])
     if operation in {"catalog_object", "catalog_describe"}:
-        return int(arguments["id"]).to_bytes(16, "little")
+        return _encode_identity(arguments["id"], "catalog object")
     if operation in {"catalog_object_named", "catalog_resolve"}:
         return _encode_qualified_name(arguments["name"])
     if operation == "catalog_list":
@@ -621,7 +726,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         kind = arguments.get("kind")
         kind_tag = 0 if kind is None else _catalog_kind_tag(kind)
         return struct.pack("<BB6x", parent is not None, kind_tag) + (
-            int(parent).to_bytes(16, "little") if parent is not None else b""
+            _encode_identity(parent, "catalog parent") if parent is not None else b""
         ) + _encode_cursor(arguments.get("cursor")) + struct.pack(
             "<QQQ",
             arguments["item_limit"],
@@ -637,7 +742,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         return struct.pack(
             "<BB6x", parent is not None, 0 if kind is None else _catalog_kind_tag(kind)
         ) + (
-            int(parent).to_bytes(16, "little") if parent is not None else b""
+            _encode_identity(parent, "catalog parent") if parent is not None else b""
         ) + _bytes(cursor or b"") + struct.pack(
             "<QQQ",
             arguments["item_limit"],
@@ -645,7 +750,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
             arguments["byte_limit"],
         )
     if operation == "catalog_dependencies":
-        return int(arguments["object"]).to_bytes(16, "little") + struct.pack(
+        return _encode_identity(arguments["object"], "catalog object") + struct.pack(
             "<B7x", 0 if arguments["direction"] == "outgoing" else 1
         ) + _encode_cursor(arguments.get("cursor")) + struct.pack(
             "<QQQ",
@@ -674,7 +779,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
                 or not isinstance(provenance, bytes) or len(provenance) > 65536):
             raise ClientError("invalid bounded memory recall request")
         return (struct.pack("<I", len(collections))
-                + b"".join(item.to_bytes(16, "little") for item in collections)
+                + b"".join(_encode_identity(item, "memory collection") for item in collections)
                 + struct.pack("<Q", limit)
                 + _bytes(_encode_search_collection({"collection": collections[0], "request": search}))
                 + _bytes(provenance))
@@ -682,17 +787,21 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         digest = arguments["expected_envelope_digest"]
         if not isinstance(digest, bytes) or len(digest) != 32:
             raise ClientError("expected_envelope_digest must contain 32 bytes")
-        return (int(arguments["collection"]).to_bytes(16, "little") + digest
-                + int(arguments["idempotency_id"]).to_bytes(16, "little")
+        return (_encode_identity(arguments["collection"], "search collection") + digest
+                + _encode_identity(arguments["idempotency_id"], "idempotency")
                 + _encode_search_document(arguments["document"]))
     if operation == "search_collection":
         return _encode_search_collection(arguments)
     if operation == "search_ingest":
-        return int(arguments["collection"]).to_bytes(16, "little") + _encode_search_batch(arguments["batch"])
+        return _encode_identity(arguments["collection"], "search collection") + _encode_search_batch(arguments["batch"])
     if operation == "search_document_update":
-        return int(arguments["collection"]).to_bytes(16, "little") + int(arguments["idempotency_id"]).to_bytes(16, "little") + _encode_search_document(arguments["document"])
+        return (_encode_identity(arguments["collection"], "search collection")
+                + _encode_identity(arguments["idempotency_id"], "idempotency")
+                + _encode_search_document(arguments["document"]))
     if operation == "search_document_delete":
-        return int(arguments["collection"]).to_bytes(16, "little") + int(arguments["idempotency_id"]).to_bytes(16, "little") + int(arguments["object_id"]).to_bytes(16, "little")
+        return (_encode_identity(arguments["collection"], "search collection")
+                + _encode_identity(arguments["idempotency_id"], "idempotency")
+                + _encode_identity(arguments["object_id"], "search document"))
     if operation == "structure_mutate":
         mutations = arguments.get("mutations")
         if not isinstance(mutations, list) or not 0 < len(mutations) <= 4096:
@@ -802,9 +911,7 @@ def _security_limit(value: Any) -> bytes:
 
 
 def _security_id(value: Any) -> bytes:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 1 << 128:
-        raise ClientError("security identity must be a nonzero unsigned 128-bit integer")
-    return value.to_bytes(16, "big")
+    return _encode_identity(value, "security", byteorder="big")
 
 
 def _security_text(value: Any) -> bytes:
@@ -908,7 +1015,7 @@ def _encode_product_scope(scope: Any) -> bytes:
         object_id = scope.get("object_id")
         if isinstance(object_id, bool) or not isinstance(object_id, int) or not 0 < object_id < 1 << 128:
             raise ClientError("security scope object_id is invalid")
-        return bytes((1 if kind == "catalog_subtree" else 2,)) + b"\0" * 7 + object_id.to_bytes(16, "little")
+        return bytes((1 if kind == "catalog_subtree" else 2,)) + b"\0" * 7 + _encode_identity(object_id, "security scope object")
     raise ClientError("security scope kind is invalid")
 
 
@@ -974,9 +1081,9 @@ def _encode_cursor(cursor: Any) -> bytes:
         return struct.pack("<B7x", 0)
     if not isinstance(cursor, dict):
         raise ClientError("catalog cursor is invalid")
-    return struct.pack("<B7x", 1) + _encode_snapshot(cursor["snapshot"]) + int(
-        cursor["after"]
-    ).to_bytes(16, "little")
+    return (struct.pack("<B7x", 1)
+            + _encode_snapshot(cursor["snapshot"])
+            + _encode_identity(cursor["after"], "catalog cursor"))
 
 
 def _encode_snapshot(snapshot: Any) -> bytes:
@@ -1061,12 +1168,23 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
     reader = _Reader(encoded)
     if operation == "catalog_create":
         result = {"definition": reader.bytes()}
+    elif operation == "transaction_status":
+        result = {"transaction_id": _decode_identity(reader, "transaction")}
+    elif operation == "structure_mutate":
+        count = reader.u32()
+        if not 0 < count <= 4096 or count > reader.remaining:
+            raise ClientError("structure mutation count exceeds its bound")
+        result = {
+            "mutations": [_decode_structure_mutation(reader) for _ in range(count)]
+        }
     elif operation == "transaction_stage_sql":
         result = {
             "handle": reader.u64(),
             "statement": reader.text(),
             "parameters": [_decode_value(reader, 0) for _ in range(reader.u32())],
         }
+    elif operation == "search_collection":
+        result = _decode_search_collection(reader)
     elif operation == "transaction_stage_structure":
         result = {"handle": reader.u64(), "mutation": _decode_structure_mutation(reader)}
     elif operation == "transaction_stage_search":
@@ -1076,7 +1194,7 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
     elif operation in {"transaction_commit", "transaction_rollback", "explicit_transaction_status"}:
         result = {"handle": reader.u64()}
     elif operation == "transaction_status_by_idempotency":
-        result = {"idempotency_token": reader.u128()}
+        result = {"idempotency_token": _decode_identity(reader, "idempotency token")}
     elif operation == "catalog_visible_list":
         has_parent = reader.boolean()
         kind = reader.u8()
@@ -1322,7 +1440,7 @@ def _decode_security_grants(reader: _Reader) -> list[dict[str, object]]:
 
 
 def _decode_structure_key(reader: _Reader) -> dict[str, Any]:
-    return {"keyspace": reader.u128(), "key": reader.bytes()}
+    return {"keyspace": _decode_identity(reader, "keyspace"), "key": reader.bytes()}
 
 
 def _decode_structure_mutation(reader: _Reader) -> dict[str, Any]:
@@ -1331,6 +1449,8 @@ def _decode_structure_mutation(reader: _Reader) -> dict[str, Any]:
         "string_set", "string_delete", "counter_add", "create", "delete", "expire",
         "hash_set", "hash_delete", "hash_counter_add", "hash_expire_field", "list_push",
         "list_pop", "set_add", "set_remove", "sorted_set_add", "sorted_set_remove", "stream_add",
+        "sorted_set_increment", "sorted_set_pop", "string_set_conditional", "string_append",
+        "string_set_range", "hash_set_if_absent", "set_pop",
     )
     if tag >= len(kinds):
         raise ClientError("structure mutation kind is invalid")
@@ -1369,8 +1489,24 @@ def _decode_structure_mutation(reader: _Reader) -> dict[str, Any]:
             result["value"] = reader.bytes()
     elif kind in {"set_add", "set_remove", "sorted_set_remove"}:
         result["member"] = reader.bytes()
-    elif kind == "sorted_set_add":
-        result.update(score=reader.f64(), member=reader.bytes())
+    elif kind in {"sorted_set_add", "sorted_set_increment"}:
+        result["score" if kind == "sorted_set_add" else "delta"] = reader.f64()
+        result["member"] = reader.bytes()
+    elif kind == "sorted_set_pop":
+        highest = reader.boolean()
+        result["end"] = "highest" if highest else "lowest"
+    elif kind == "string_set_conditional":
+        result["value"] = reader.bytes()
+        result["expires_at_micros"] = reader.i64() if reader.boolean() else None
+        result["condition"] = "if_present" if reader.boolean() else "if_absent"
+    elif kind == "string_append":
+        result["suffix"] = reader.bytes()
+    elif kind == "string_set_range":
+        result.update(offset=reader.u32(), patch=reader.bytes())
+    elif kind == "hash_set_if_absent":
+        result.update(field=reader.bytes(), value=reader.bytes())
+    elif kind == "set_pop":
+        result["seed"] = reader.u64()
     elif kind == "stream_add":
         result["fields"] = [(reader.bytes(), reader.bytes()) for _ in range(reader.u32())]
     return result
@@ -1378,9 +1514,15 @@ def _decode_structure_mutation(reader: _Reader) -> dict[str, Any]:
 
 def _decode_transaction_search_mutation(reader: _Reader) -> dict[str, Any]:
     tag = reader.u8()
+    if tag == 3:
+        return {
+            "kind": "document",
+            "collection": _decode_identity(reader, "transaction document collection"),
+            "document": _decode_search_document(reader),
+        }
     if tag > 2:
         raise ClientError("transaction search mutation kind is invalid")
-    result = {"kind": ("index", "replace", "delete")[tag], "index": reader.u128(), "document_id": reader.bytes()}
+    result = {"kind": ("index", "replace", "delete")[tag], "index": _decode_identity(reader, "search index"), "document_id": reader.bytes()}
     if tag != 2:
         result["text"] = reader.text()
     return result
@@ -1390,7 +1532,11 @@ def _decode_transaction_vector_mutation(reader: _Reader) -> dict[str, Any]:
     tag = reader.u8()
     if tag > 1:
         raise ClientError("transaction vector mutation kind is invalid")
-    result = {"kind": ("upsert", "delete")[tag], "index": reader.u128(), "object_id": reader.u128()}
+    result = {
+        "kind": ("upsert", "delete")[tag],
+        "index": _decode_identity(reader, "vector index"),
+        "object_id": _decode_identity(reader, "vector object"),
+    }
     if tag == 0:
         result["vector"] = [reader.f32() for _ in range(reader.u32())]
     return result
@@ -1664,6 +1810,12 @@ def decode_product_response(
         )
     if kind == 24:
         value = {"snapshot": _decode_snapshot(reader), "result": _decode_structure_read(reader)}
+        if (
+            negotiated_minor is not None
+            and negotiated_minor < 6
+            and value["result"]["kind"] in {"hash_page", "key_page"}
+        ):
+            raise ClientError("native response is unavailable at the negotiated protocol minor")
         reader.finish()
         return Response("structure_read", value, request_id)
     if kind == 25:
@@ -2193,7 +2345,7 @@ def _decode_snapshot(reader: _Reader) -> dict[str, Any]:
 def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
     request = arguments["request"]
     output = bytearray()
-    output.extend(int(arguments["collection"]).to_bytes(16, "little"))
+    output.extend(_encode_identity(arguments["collection"], "search collection"))
     lexical = request.get("lexical")
     output.extend(struct.pack("<B7x", lexical is not None))
     if lexical is not None:
@@ -2246,8 +2398,8 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
         kind = aggregation["kind"]
         if kind == "count":
             output.append(0)
-        elif kind in {"sum", "min", "max"}:
-            output.append({"sum": 1, "min": 2, "max": 3}[kind])
+        elif kind in {"sum", "min", "max", "average"}:
+            output.append({"sum": 1, "min": 2, "max": 3, "average": 4}[kind])
             output.extend(_text(aggregation["field"]))
         else:
             raise ClientError("integrated aggregation is invalid")
@@ -2258,6 +2410,9 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
     if fusion == "weighted_score":
         output.append(1)
         output.append(1)
+    elif fusion == "relative_score":
+        output.append(1)
+        output.append(2)
     elif fusion is not None:
         raise ClientError("integrated fusion method is invalid")
     dedupe = request.get("parent_dedupe")
@@ -2293,7 +2448,7 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
                 or not isinstance(entry.get("score"), (int, float))
             ):
                 raise ClientError("integrated rerank stage is invalid")
-            output.extend(int(entry["object_id"]).to_bytes(16, "little"))
+            output.extend(_encode_identity(entry["object_id"], "rerank object"))
             output.extend(struct.pack("<d", float(entry["score"])))
     highlight = request.get("highlight")
     if highlight is not None:
@@ -2307,30 +2462,385 @@ def _encode_search_collection(arguments: dict[str, Any]) -> bytes:
             raise ClientError("integrated highlight budget is invalid")
         output.append(4)
         output.extend(struct.pack("<II", highlight["max_fragments"], highlight["fragment_bytes"]))
+    autocut = request.get("autocut")
+    if autocut is not None:
+        if isinstance(autocut, bool) or not isinstance(autocut, int) or not 1 <= autocut <= MAX_AUTOCUT_STEEPNESS:
+            raise ClientError("integrated autocut is invalid")
+        output.append(5)
+        output.extend(struct.pack("<I", autocut))
+    offset = request.get("offset", 0)
+    if offset:
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 < offset < 1 << 32:
+            raise ClientError("integrated search offset is invalid")
+        output.append(6)
+        output.extend(struct.pack("<I", offset))
+    range_facets = request.get("range_facets", [])
+    if range_facets:
+        if not isinstance(range_facets, list) or len(range_facets) > MAX_SEARCH_RANGE_FACETS:
+            raise ClientError("integrated range facets are invalid")
+        output.append(7)
+        output.extend(struct.pack("<I", len(range_facets)))
+        for facet in range_facets:
+            ranges = facet.get("ranges") if isinstance(facet, dict) else None
+            if not isinstance(ranges, list) or not 1 <= len(ranges) <= MAX_SEARCH_FACET_RANGES:
+                raise ClientError("integrated range facet is invalid")
+            output.extend(_text(facet["field"]))
+            output.extend(struct.pack("<I", len(ranges)))
+            for value_range in ranges:
+                for endpoint in (value_range.get("lower"), value_range.get("upper")):
+                    output.append(endpoint is not None)
+                    if endpoint is not None:
+                        output.extend(_encode_canonical_f64(endpoint, "range facet endpoint"))
+    cutoffs = [
+        (ordinal, vector.get("max_distance"))
+        for ordinal, vector in enumerate(vectors)
+        if vector.get("max_distance") is not None
+    ]
+    if cutoffs:
+        output.append(8)
+        output.extend(struct.pack("<I", len(cutoffs)))
+        for ordinal, cutoff in cutoffs:
+            output.extend(struct.pack("<I", ordinal))
+            output.extend(_encode_canonical_f64(cutoff, "vector distance cutoff", nonnegative=True))
+    if lexical is not None:
+        operator = lexical.get("operator")
+        if operator is not None:
+            output.append(9)
+            if operator == "and":
+                output.append(0)
+            elif isinstance(operator, dict):
+                minimum_match = operator.get("minimum_match")
+                if isinstance(minimum_match, bool) or not isinstance(minimum_match, int) or not 1 <= minimum_match <= MAX_LEXICAL_MINIMUM_MATCH:
+                    raise ClientError("integrated lexical operator is invalid")
+                output.append(1)
+                output.extend(struct.pack("<I", minimum_match))
+            else:
+                raise ClientError("integrated lexical operator is invalid")
+        elif lexical.get("prefix") is True:
+            output.extend(b"\x09\x02")
+        elif lexical.get("fuzzy") is not None:
+            fuzzy = lexical["fuzzy"]
+            if isinstance(fuzzy, bool) or not isinstance(fuzzy, int) or not 1 <= fuzzy <= MAX_LEXICAL_FUZZY_DISTANCE:
+                raise ClientError("integrated lexical fuzzy distance is invalid")
+            output.extend(b"\x09\x03")
+            output.extend(struct.pack("<I", fuzzy))
+        elif lexical.get("phrase") is True:
+            output.extend(b"\x09\x04")
+        fields = lexical.get("fields", [])
+        if fields:
+            if not isinstance(fields, list) or len(fields) > MAX_LEXICAL_FIELDS:
+                raise ClientError("integrated lexical fields are invalid")
+            output.append(10)
+            output.extend(struct.pack("<I", len(fields)))
+            for field in fields:
+                weight = field.get("weight_micros") if isinstance(field, dict) else None
+                if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 1_000_000_000:
+                    raise ClientError("integrated lexical field weight is invalid")
+                output.extend(_text(field["field"]))
+                output.extend(struct.pack("<I", weight))
     return bytes(output)
+
+
+def _encode_canonical_f64(value: Any, name: str, *, nonnegative: bool = False) -> bytes:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ClientError(f"{name} is invalid")
+    number = float(value)
+    if nonnegative and (not math.isfinite(number) or number < 0):
+        raise ClientError(f"{name} is invalid")
+    if math.isnan(number):
+        bits = 0x7FF8_0000_0000_0000
+    elif number == 0:
+        bits = 0
+    else:
+        bits = struct.unpack("<Q", struct.pack("<d", number))[0]
+    return struct.pack("<Q", bits)
+
+
+def _decode_canonical_f64(reader: _Reader, name: str, *, nonnegative: bool = False) -> float:
+    bits = reader.u64()
+    value = struct.unpack("<d", struct.pack("<Q", bits))[0]
+    canonical = 0x7FF8_0000_0000_0000 if math.isnan(value) else 0 if value == 0 else bits
+    if bits != canonical or (nonnegative and (not math.isfinite(value) or value < 0)):
+        raise ClientError(f"{name} is invalid")
+    return value
+
+
+def _decode_search_collection(reader: _Reader) -> dict[str, Any]:
+    collection = _decode_identity(reader, "search collection")
+    lexical = None
+    if reader.boolean():
+        reader.zeroes(7)
+        lexical = {
+            "query": reader.text(),
+            "candidate_limit": reader.u64(),
+            "weight": reader.u32(),
+            "operator": None,
+            "prefix": False,
+            "fields": [],
+            "fuzzy": None,
+            "phrase": False,
+        }
+    else:
+        reader.zeroes(7)
+    vector_count = reader.u32()
+    if vector_count > MAX_SEARCH_DOCUMENT_VECTORS or vector_count > reader.remaining // 28:
+        raise ClientError("integrated vector count exceeds its bound")
+    vectors = []
+    for _ in range(vector_count):
+        target = reader.text()
+        dimension = reader.u32()
+        if not 0 < dimension <= MAX_VECTOR_DIMENSION or dimension > reader.remaining // 4:
+            raise ClientError("integrated vector dimension exceeds its bound")
+        query = [reader.f32() for _ in range(dimension)]
+        if not all(math.isfinite(value) for value in query):
+            raise ClientError("integrated query vector is invalid")
+        candidate_limit, weight = reader.u64(), reader.u32()
+        execution_tag = reader.u8()
+        has_rerank = reader.boolean()
+        reader.zeroes(6)
+        execution = None
+        if execution_tag == 0:
+            if has_rerank:
+                raise ClientError("integrated vector execution is invalid")
+        elif execution_tag == 1:
+            if has_rerank:
+                raise ClientError("integrated vector execution is invalid")
+            execution = {"kind": "exact"}
+        elif execution_tag == 2:
+            ef_search, rerank = reader.u64(), reader.u64()
+            execution = {"kind": "ann", "ef_search": ef_search}
+            if has_rerank:
+                execution["exact_rerank"] = rerank
+            elif rerank != 0:
+                raise ClientError("integrated vector execution is noncanonical")
+        elif execution_tag == 3:
+            threshold, ef_search, rerank = reader.u64(), reader.u64(), reader.u64()
+            execution = {"kind": "adaptive", "exact_candidate_threshold": threshold, "ef_search": ef_search}
+            if has_rerank:
+                execution["exact_rerank"] = rerank
+            elif rerank != 0:
+                raise ClientError("integrated vector execution is noncanonical")
+        else:
+            raise ClientError("integrated vector execution is invalid")
+        vectors.append({
+            "target": target, "query": query, "candidate_limit": candidate_limit,
+            "weight": weight, "execution": execution, "max_distance": None,
+        })
+    filter_value = _decode_search_filter(reader)
+    sorts = []
+    for _ in range(reader.u32()):
+        source_tag = reader.u8()
+        if source_tag > 1:
+            raise ClientError("integrated sort source is invalid")
+        source = {"kind": "score"} if source_tag == 0 else {"kind": "field", "field": reader.text()}
+        direction, missing = reader.u8(), reader.u8()
+        if direction > 1 or missing > 1:
+            raise ClientError("integrated sort policy is invalid")
+        sorts.append({"source": source, "direction": ("ascending", "descending")[direction], "missing": ("first", "last")[missing]})
+    facets = [{"field": reader.text(), "limit": reader.u64()} for _ in range(reader.u32())]
+    aggregations = []
+    for _ in range(reader.u32()):
+        name, tag = reader.text(), reader.u8()
+        if tag > 4:
+            raise ClientError("integrated aggregation is invalid")
+        aggregation = {"name": name, "kind": ("count", "sum", "min", "max", "average")[tag]}
+        if tag != 0:
+            aggregation["field"] = reader.text()
+        aggregations.append(aggregation)
+    request = {
+        "lexical": lexical, "vectors": vectors, "filter": filter_value,
+        "sort": sorts, "facets": facets, "range_facets": [],
+        "aggregations": aggregations, "limit": reader.u64(), "fusion": None,
+        "parent_dedupe": None, "rerank": None, "highlight": None,
+        "autocut": None, "offset": 0,
+    }
+    previous = 0
+    while reader.remaining:
+        tag = reader.u8()
+        if tag <= previous:
+            raise ClientError("integrated search section is invalid")
+        previous = tag
+        if tag == 1:
+            fusion = reader.u8()
+            if fusion not in (1, 2):
+                raise ClientError("integrated fusion method is invalid")
+            request["fusion"] = "weighted_score" if fusion == 1 else "relative_score"
+        elif tag == 2:
+            field, first_k = reader.text(), reader.u32()
+            request["parent_dedupe"] = {"field": field, "first_k": first_k}
+        elif tag == 3:
+            attestation = reader.bytes()
+            count = reader.u32()
+            request["rerank"] = {"attestation": attestation, "scores": [
+                {"object_id": _decode_identity(reader, "rerank object"), "score": reader.f64()}
+                for _ in range(count)
+            ]}
+        elif tag == 4:
+            request["highlight"] = {"max_fragments": reader.u32(), "fragment_bytes": reader.u32()}
+        elif tag == 5:
+            steepness = reader.u32()
+            if not 1 <= steepness <= MAX_AUTOCUT_STEEPNESS:
+                raise ClientError("integrated autocut is invalid")
+            request["autocut"] = steepness
+        elif tag == 6:
+            offset = reader.u32()
+            if offset == 0:
+                raise ClientError("integrated search offset is invalid")
+            request["offset"] = offset
+        elif tag == 7:
+            count = reader.u32()
+            if not 1 <= count <= MAX_SEARCH_RANGE_FACETS:
+                raise ClientError("integrated range facets are invalid")
+            for _ in range(count):
+                field, range_count = reader.text(), reader.u32()
+                if not 1 <= range_count <= MAX_SEARCH_FACET_RANGES:
+                    raise ClientError("integrated range facet is invalid")
+                ranges = []
+                for _ in range(range_count):
+                    lower = _decode_canonical_f64(reader, "range facet endpoint") if reader.boolean() else None
+                    upper = _decode_canonical_f64(reader, "range facet endpoint") if reader.boolean() else None
+                    ranges.append({"lower": lower, "upper": upper})
+                request["range_facets"].append({"field": field, "ranges": ranges})
+        elif tag == 8:
+            count = reader.u32()
+            if not 1 <= count <= MAX_SEARCH_DOCUMENT_VECTORS:
+                raise ClientError("integrated vector cutoffs are invalid")
+            for _ in range(count):
+                ordinal = reader.u32()
+                if ordinal >= len(vectors) or vectors[ordinal]["max_distance"] is not None:
+                    raise ClientError("integrated vector cutoff ordinal is invalid")
+                vectors[ordinal]["max_distance"] = _decode_canonical_f64(reader, "vector distance cutoff", nonnegative=True)
+        elif tag == 9:
+            if lexical is None:
+                raise ClientError("integrated lexical mode has no branch")
+            mode = reader.u8()
+            if mode == 0:
+                lexical["operator"] = "and"
+            elif mode == 1:
+                minimum_match = reader.u32()
+                if not 1 <= minimum_match <= MAX_LEXICAL_MINIMUM_MATCH:
+                    raise ClientError("integrated lexical operator is invalid")
+                lexical["operator"] = {"minimum_match": minimum_match}
+            elif mode == 2:
+                lexical["prefix"] = True
+            elif mode == 3:
+                fuzzy = reader.u32()
+                if not 1 <= fuzzy <= MAX_LEXICAL_FUZZY_DISTANCE:
+                    raise ClientError("integrated lexical fuzzy distance is invalid")
+                lexical["fuzzy"] = fuzzy
+            elif mode == 4:
+                lexical["phrase"] = True
+            else:
+                raise ClientError("integrated lexical mode is invalid")
+        elif tag == 10:
+            if lexical is None:
+                raise ClientError("integrated lexical fields have no branch")
+            count = reader.u32()
+            if not 1 <= count <= MAX_LEXICAL_FIELDS:
+                raise ClientError("integrated lexical fields are invalid")
+            for _ in range(count):
+                field, weight = reader.text(), reader.u32()
+                if weight == 0 or weight > 1_000_000_000:
+                    raise ClientError("integrated lexical field weight is invalid")
+                lexical["fields"].append({"field": field, "weight_micros": weight})
+        else:
+            raise ClientError("integrated search section is invalid")
+    return {"collection": collection, "request": request}
+
+
+def _decode_search_filter(reader: _Reader, depth: int = 0) -> dict[str, Any]:
+    if depth > 32:
+        raise ClientError("integrated filter is too deep")
+    tag = reader.u8()
+    if tag == 0:
+        return {"kind": "match_all"}
+    if tag == 1:
+        return {"kind": "exists", "field": reader.text()}
+    if tag == 2:
+        field, operator = reader.text(), reader.u8()
+        if operator > 5:
+            raise ClientError("integrated comparison operator is invalid")
+        return {"kind": "compare", "field": field, "operator": ("equal", "not_equal", "less", "less_or_equal", "greater", "greater_or_equal")[operator], "value": _decode_doc_value(reader)}
+    if tag in (3, 4):
+        return {"kind": "all" if tag == 3 else "any", "filters": [_decode_search_filter(reader, depth + 1) for _ in range(reader.u32())]}
+    if tag == 5:
+        return {"kind": "not", "filter": _decode_search_filter(reader, depth + 1)}
+    if tag == 6:
+        field, count = reader.text(), reader.u32()
+        return {"kind": "in", "field": field, "values": [_decode_doc_value(reader) for _ in range(count)]}
+    if tag == 7:
+        return {"kind": "is_null", "field": reader.text()}
+    if tag == 8:
+        return {"kind": "like", "field": reader.text(), "pattern": reader.text()}
+    raise ClientError("integrated filter kind is invalid")
 
 
 def _encode_search_batch(batch: Any) -> bytes:
     documents = batch["documents"]
-    return int(batch["idempotency_id"]).to_bytes(16, "little") + struct.pack("<I", len(documents)) + b"".join(_encode_search_document(document) for document in documents)
+    return _encode_identity(batch["idempotency_id"], "idempotency") + struct.pack("<I", len(documents)) + b"".join(_encode_search_document(document) for document in documents)
 
 
 def _encode_search_document(document: Any) -> bytes:
-    output = bytearray(int(document["object_id"]).to_bytes(16, "little"))
+    output = bytearray(_encode_identity(document["object_id"], "search document"))
     output.extend(_text(document["text"]))
     values = document.get("doc_values", {})
     output.extend(struct.pack("<I", len(values)))
-    for name in sorted(values):
+    for name in sorted(values, key=lambda value: value.encode("utf-8")):
         output.extend(_text(name))
         output.extend(_encode_doc_value(values[name]))
     vectors = document.get("vectors", {})
     output.extend(struct.pack("<I", len(vectors)))
-    for name in sorted(vectors):
+    for name in sorted(vectors, key=lambda value: value.encode("utf-8")):
         vector = vectors[name]
         output.extend(_text(name))
         output.extend(struct.pack("<I", len(vector)))
         output.extend(struct.pack(f"<{len(vector)}f", *vector))
     return bytes(output)
+
+
+def _decode_search_document(reader: _Reader) -> dict[str, Any]:
+    object_id = _decode_identity(reader, "search document")
+    text = reader.text()
+    value_count = reader.u32()
+    if value_count > MAX_SEARCH_DOCUMENT_VALUES or value_count > reader.remaining // 5:
+        raise ClientError("search document value count exceeds its bound")
+    doc_values: dict[str, Any] = {}
+    previous_name: bytes | None = None
+    for _ in range(value_count):
+        name = reader.text()
+        encoded_name = name.encode("utf-8")
+        if previous_name is not None and encoded_name <= previous_name:
+            raise ClientError(
+                "search document value names must be strictly ascending by UTF-8 bytes"
+            )
+        previous_name = encoded_name
+        doc_values[name] = _decode_doc_value(reader)
+    vector_count = reader.u32()
+    if vector_count > MAX_SEARCH_DOCUMENT_VECTORS or vector_count > reader.remaining // 12:
+        raise ClientError("search document vector count exceeds its bound")
+    vectors: dict[str, list[float]] = {}
+    previous_name = None
+    for _ in range(vector_count):
+        name = reader.text()
+        encoded_name = name.encode("utf-8")
+        if previous_name is not None and encoded_name <= previous_name:
+            raise ClientError(
+                "search document vector names must be strictly ascending by UTF-8 bytes"
+            )
+        previous_name = encoded_name
+        dimension = reader.u32()
+        if not 0 < dimension <= MAX_VECTOR_DIMENSION or dimension > reader.remaining // 4:
+            raise ClientError("search document vector dimension exceeds its bound")
+        vector = [reader.f32() for _ in range(dimension)]
+        if not all(math.isfinite(value) for value in vector):
+            raise ClientError("search document vector contains a nonfinite value")
+        vectors[name] = vector
+    return {
+        "object_id": object_id,
+        "text": text,
+        "doc_values": doc_values,
+        "vectors": vectors,
+    }
 
 
 def _decode_memory_result(reader: _Reader) -> dict[str, Any]:
@@ -2393,18 +2903,8 @@ def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
         object_id, score = reader.u128(), reader.f64()
         values = {}
         for _ in range(reader.u32()):
-            name, tag = reader.text(), reader.u8()
-            if tag == 0:
-                value = reader.boolean()
-            elif tag == 1:
-                value = reader.i64()
-            elif tag == 2:
-                value = reader.text()
-            elif tag == 3:
-                value = reader.bytes()
-            else:
-                raise ClientError("integrated doc value is invalid")
-            values[name] = value
+            name = reader.text()
+            values[name] = _decode_doc_value(reader)
         hits.append({"object_id": object_id, "score": score, "doc_values": values})
     facets = []
     for _ in range(reader.u32()):
@@ -2437,19 +2937,39 @@ def _decode_integrated_search(reader: _Reader) -> dict[str, Any]:
     approximate = reader.boolean()
     reader.zeroes(7)
     counts = [reader.u64() for _ in range(5)]
-    if reader.remaining > 0:
-        # Content-derived response tail: per-hit highlight fragments.
-        if reader.u8() != 1:
+    range_facets = []
+    previous = 0
+    while reader.remaining:
+        tag = reader.u8()
+        if tag <= previous:
             raise ClientError("integrated response section is invalid")
-        for hit in hits:
-            fragments = [reader.text() for _ in range(reader.u32())]
-            if len(fragments) > 4 or any(len(f.encode("utf-8")) > 512 for f in fragments):
-                raise ClientError("integrated highlight fragments are unbounded")
-            hit["fragments"] = fragments
+        previous = tag
+        if tag == 1:
+            for hit in hits:
+                fragments = [reader.text() for _ in range(reader.u32())]
+                if len(fragments) > 4 or any(len(f.encode("utf-8")) > 512 for f in fragments):
+                    raise ClientError("integrated highlight fragments are unbounded")
+                hit["fragments"] = fragments
+        elif tag == 2:
+            count = reader.u32()
+            if not 1 <= count <= MAX_SEARCH_RANGE_FACETS:
+                raise ClientError("integrated range facets are unbounded")
+            for _ in range(count):
+                field = reader.text()
+                bucket_count = reader.u32()
+                if bucket_count > MAX_SEARCH_FACET_RANGES:
+                    raise ClientError("integrated range facets are unbounded")
+                range_facets.append({"field": field, "buckets": [
+                    {"value": _decode_doc_value(reader), "count": reader.u64()}
+                    for _ in range(bucket_count)
+                ]})
+        else:
+            raise ClientError("integrated response section is invalid")
     return {
         "snapshot": snapshot,
         "hits": hits,
         "facets": facets,
+        "range_facets": range_facets,
         "aggregations": aggregations,
         "vector_branches": branches,
         "approximate": approximate,
@@ -2509,6 +3029,14 @@ def _encode_doc_value(value: Any) -> bytes:
         return b"\x02" + _text(value)
     if isinstance(value, bytes):
         return b"\x03" + _bytes(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            bits = 0x7FF8_0000_0000_0000
+        elif value == 0.0:
+            bits = 0
+        else:
+            bits = struct.unpack("<Q", struct.pack("<d", value))[0]
+        return b"\x04" + struct.pack("<Q", bits)
     raise ClientError("integrated doc value is invalid")
 
 
@@ -2522,6 +3050,17 @@ def _decode_doc_value(reader: _Reader) -> Any:
         return reader.text()
     if tag == 3:
         return reader.bytes()
+    if tag == 4:
+        bits = reader.u64()
+        value = struct.unpack("<d", struct.pack("<Q", bits))[0]
+        canonical_bits = (
+            0x7FF8_0000_0000_0000
+            if math.isnan(value)
+            else 0 if value == 0.0 else bits
+        )
+        if bits != canonical_bits:
+            raise ClientError("integrated float doc value is noncanonical")
+        return value
     raise ClientError("integrated doc value is invalid")
 
 
@@ -2533,6 +3072,8 @@ def _decode_aggregation_value(reader: _Reader) -> dict[str, Any]:
         return {"kind": "integer", "value": reader.i128() if reader.boolean() else None}
     if tag == 2:
         return {"kind": "value", "value": _decode_doc_value(reader) if reader.boolean() else None}
+    if tag == 3:
+        return {"kind": "float", "value": reader.f64() if reader.boolean() else None}
     raise ClientError("integrated aggregation value is invalid")
 
 
@@ -2572,6 +3113,13 @@ def _encode_structure_mutation(value: Any) -> bytes:
         "sorted_set_add": 14,
         "sorted_set_remove": 15,
         "stream_add": 16,
+        "sorted_set_increment": 17,
+        "sorted_set_pop": 18,
+        "string_set_conditional": 19,
+        "string_append": 20,
+        "string_set_range": 21,
+        "hash_set_if_absent": 22,
+        "set_pop": 23,
     }
     if kind not in tags:
         raise ClientError("structure mutation kind is invalid")
@@ -2611,6 +3159,34 @@ def _encode_structure_mutation(value: Any) -> bytes:
     elif kind == "sorted_set_add":
         output.extend(struct.pack("<d", value["score"]))
         output.extend(_bytes(value["member"]))
+    elif kind == "sorted_set_increment":
+        output.extend(_encode_canonical_f64(value["delta"], "sorted-set increment"))
+        output.extend(_bytes(value["member"]))
+    elif kind == "sorted_set_pop":
+        end = value.get("end", "lowest")
+        if end not in {"lowest", "highest"}:
+            raise ClientError("sorted-set pop end is invalid")
+        output.append(end == "highest")
+    elif kind == "string_set_conditional":
+        output.extend(_bytes(value["value"]))
+        expiry = value.get("expires_at_micros")
+        output.append(expiry is not None)
+        if expiry is not None:
+            output.extend(struct.pack("<q", expiry))
+        condition = value.get("condition", "if_absent")
+        if condition not in {"if_absent", "if_present"}:
+            raise ClientError("string set condition is invalid")
+        output.append(condition == "if_present")
+    elif kind == "string_append":
+        output.extend(_bytes(value["suffix"]))
+    elif kind == "string_set_range":
+        output.extend(struct.pack("<I", value["offset"]))
+        output.extend(_bytes(value["patch"]))
+    elif kind == "hash_set_if_absent":
+        output.extend(_bytes(value["field"]))
+        output.extend(_bytes(value["value"]))
+    elif kind == "set_pop":
+        output.extend(struct.pack("<Q", value["seed"]))
     elif kind == "stream_add":
         fields = value["fields"]
         if not isinstance(fields, list) or not 0 < len(fields) <= 4096:
@@ -2650,11 +3226,15 @@ def _encode_transaction_search_mutation(value: Any) -> bytes:
     if not isinstance(value, dict):
         raise ClientError("transaction search mutation is invalid")
     kind = value.get("kind")
-    tags = {"index": 0, "replace": 1, "delete": 2}
+    tags = {"index": 0, "replace": 1, "delete": 2, "document": 3}
     if kind not in tags:
         raise ClientError("transaction search mutation kind is invalid")
     output = bytearray((tags[kind],))
-    output.extend(int(value["index"]).to_bytes(16, "little"))
+    if kind == "document":
+        output.extend(_encode_identity(value["collection"], "transaction document collection"))
+        output.extend(_encode_search_document(value["document"]))
+        return bytes(output)
+    output.extend(_encode_identity(value["index"], "search index"))
     output.extend(_bytes(value["document_id"]))
     if kind != "delete":
         output.extend(_text(value["text"]))
@@ -2668,8 +3248,8 @@ def _encode_transaction_vector_mutation(value: Any) -> bytes:
     if kind not in {"upsert", "delete"}:
         raise ClientError("transaction vector mutation kind is invalid")
     output = bytearray((0 if kind == "upsert" else 1,))
-    output.extend(int(value["index"]).to_bytes(16, "little"))
-    output.extend(int(value["object_id"]).to_bytes(16, "little"))
+    output.extend(_encode_identity(value["index"], "vector index"))
+    output.extend(_encode_identity(value["object_id"], "vector object"))
     if kind == "upsert":
         vector = value.get("vector")
         if not isinstance(vector, list) or not vector:
@@ -2687,6 +3267,8 @@ def _encode_structure_read(value: dict[str, Any]) -> bytes:
         "list_length": 8, "set_contains": 9, "set_members": 10, "set_cardinality": 11,
         "set_algebra": 12, "sorted_set_score": 13, "sorted_set_rank": 14,
         "sorted_set_range": 15, "sorted_set_cardinality": 16, "stream_range": 17,
+        "sorted_set_score_range": 18, "hash_scan_reverse": 19, "hash_scan_match": 20,
+        "key_scan_match": 21, "string_range": 22, "set_random_members": 23,
     }
     if kind not in tags:
         raise ClientError("structure read kind is invalid")
@@ -2699,11 +3281,20 @@ def _encode_structure_read(value: dict[str, Any]) -> bytes:
         keys = value.get("keys")
         if not isinstance(keys, list) or not keys:
             raise ClientError("set algebra keys must be a nonempty list")
-        output.extend(int(value["keyspace"]).to_bytes(16, "little"))
+        output.extend(_encode_identity(value["keyspace"], "keyspace"))
         output.append(operations[value["operation"]])
         output.extend(struct.pack("<I", len(keys)))
         output.extend(b"".join(_bytes(key) for key in keys))
         output.extend(struct.pack("<QQ", value["output_member_limit"], value["visit_limit"]))
+        return bytes(output)
+    if kind == "key_scan_match":
+        output.extend(_encode_identity(value["keyspace"], "keyspace"))
+        output.extend(_bytes(value["pattern"]))
+        cursor = value.get("start_after")
+        output.append(cursor is not None)
+        if cursor is not None:
+            output.extend(_bytes(cursor))
+        output.extend(struct.pack("<QQQ", value["output_limit"], value["visit_limit"], value["match_step_limit"]))
         return bytes(output)
     output.extend(_encode_structure_key(value["key"]))
     if kind == "ttl":
@@ -2727,7 +3318,41 @@ def _encode_structure_read(value: dict[str, Any]) -> bytes:
             output.append(_sorted_order_tag(value.get("order", "ascending")))
     elif kind == "stream_range":
         output.extend(struct.pack("<QQQ", value["start"], value["end"], value["limit"]))
+    elif kind == "string_range":
+        output.extend(struct.pack("<qq", value["start"], value["end"]))
+    elif kind == "set_random_members":
+        output.extend(struct.pack("<QQ", value["seed"], value["count"]))
+    elif kind == "sorted_set_score_range":
+        output.extend(_encode_score_bound(value.get("lower")))
+        output.extend(_encode_score_bound(value.get("upper")))
+        output.extend(struct.pack("<QQ", value.get("offset", 0), value["limit"]))
+        output.append(_sorted_order_tag(value.get("order", "ascending")))
+    elif kind == "hash_scan_reverse":
+        cursor = value.get("start_before")
+        output.append(cursor is not None)
+        if cursor is not None:
+            output.extend(_bytes(cursor))
+        output.extend(struct.pack("<Q", value["limit"]))
+    elif kind == "hash_scan_match":
+        output.extend(_bytes(value["pattern"]))
+        cursor = value.get("start_after")
+        output.append(cursor is not None)
+        if cursor is not None:
+            output.extend(_bytes(cursor))
+        output.extend(struct.pack("<QQQ", value["output_limit"], value["visit_limit"], value["match_step_limit"]))
     return bytes(output)
+
+
+def _encode_score_bound(value: Any) -> bytes:
+    if value is None:
+        return b"\0"
+    if not isinstance(value, dict) or len(value) != 1:
+        raise ClientError("sorted-set score bound is invalid")
+    if "inclusive" in value:
+        return b"\1" + struct.pack("<d", value["inclusive"])
+    if "exclusive" in value:
+        return b"\2" + struct.pack("<d", value["exclusive"])
+    raise ClientError("sorted-set score bound is invalid")
 
 
 def _sorted_order_tag(value: Any) -> int:
@@ -2741,7 +3366,7 @@ def _sorted_order_tag(value: Any) -> int:
 def _encode_structure_key(value: Any) -> bytes:
     if not isinstance(value, dict):
         raise ClientError("structure key is invalid")
-    return int(value["keyspace"]).to_bytes(16, "little") + _bytes(value["key"])
+    return _encode_identity(value["keyspace"], "keyspace") + _bytes(value["key"])
 
 
 def _decode_structure_read(reader: _Reader) -> dict[str, Any]:
@@ -2792,14 +3417,24 @@ def _decode_structure_read_request(reader: _Reader) -> dict[str, Any]:
         "hash_length", "list_range", "list_length", "set_contains", "set_members",
         "set_cardinality", "set_algebra", "sorted_set_score", "sorted_set_rank",
         "sorted_set_range", "sorted_set_cardinality", "stream_range",
+        "sorted_set_score_range", "hash_scan_reverse", "hash_scan_match",
+        "key_scan_match", "string_range", "set_random_members",
     )
     tag = reader.u8()
     if tag >= len(kinds):
         raise ClientError("structure read kind is invalid")
     kind = kinds[tag]
+    if kind == "key_scan_match":
+        keyspace = _decode_identity(reader, "keyspace")
+        pattern = reader.bytes()
+        return {
+            "kind": kind, "keyspace": keyspace, "pattern": pattern,
+            "start_after": reader.bytes() if reader.boolean() else None,
+            "output_limit": reader.u64(), "visit_limit": reader.u64(),
+            "match_step_limit": reader.u64(),
+        }
     if kind == "set_algebra":
-        operation_tag = reader.u8() if False else None
-        keyspace = reader.u128()
+        keyspace = _decode_identity(reader, "keyspace")
         operation_tag = reader.u8()
         if operation_tag > 2:
             raise ClientError("set algebra operation is invalid")
@@ -2838,8 +3473,38 @@ def _decode_structure_read_request(reader: _Reader) -> dict[str, Any]:
             result["order"] = ("ascending", "descending")[order]
     elif kind == "stream_range":
         result.update(start=reader.u64(), end=reader.u64(), limit=reader.u64())
+    elif kind == "string_range":
+        result.update(start=reader.i64(), end=reader.i64())
+    elif kind == "set_random_members":
+        result.update(seed=reader.u64(), count=reader.u64())
+    elif kind == "sorted_set_score_range":
+        result.update(
+            lower=_decode_score_bound(reader),
+            upper=_decode_score_bound(reader),
+            offset=reader.u64(),
+            limit=reader.u64(),
+        )
+        order = reader.u8()
+        if order > 1:
+            raise ClientError("sorted-set order is invalid")
+        result["order"] = ("ascending", "descending")[order]
+    elif kind == "hash_scan_reverse":
+        result["start_before"] = reader.bytes() if reader.boolean() else None
+        result["limit"] = reader.u64()
+    elif kind == "hash_scan_match":
+        result["pattern"] = reader.bytes()
+        result["start_after"] = reader.bytes() if reader.boolean() else None
+        result.update(output_limit=reader.u64(), visit_limit=reader.u64(), match_step_limit=reader.u64())
     return result
 
+
+def _decode_score_bound(reader: _Reader) -> dict[str, float] | None:
+    tag = reader.u8()
+    if tag == 0:
+        return None
+    if tag in (1, 2):
+        return {"inclusive" if tag == 1 else "exclusive": reader.f64()}
+    raise ClientError("sorted-set score bound is invalid")
 
 def _decode_commit_receipt(reader: _Reader) -> dict[str, Any]:
     value = {

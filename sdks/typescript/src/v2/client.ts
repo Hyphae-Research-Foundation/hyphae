@@ -2,7 +2,7 @@
 
 import { HttpTransport, type HttpTransportOptions } from "./http.js";
 import { LocalTransport, type LocalConnector, type LocalTransportOptions } from "./local.js";
-import type { RequestOptions, Response, Transport } from "./models.js";
+import type { ProductTransactionSearchMutation, RequestOptions, Response, Transport } from "./models.js";
 import { nodeLocalConnector } from "./node-local.js";
 
 /** Equivalent high-level Native v2 API over local and HTTP transports. */
@@ -181,7 +181,7 @@ export class HyphaeClient {
     return this.execute("transaction_stage_structure", { handle, mutation }, options);
   }
 
-  transactionStageSearch(handle: bigint, mutation: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
+  transactionStageSearch(handle: bigint, mutation: ProductTransactionSearchMutation, options: RequestOptions = {}): Promise<Response> {
     return this.execute("transaction_stage_search", { handle, mutation }, options);
   }
 

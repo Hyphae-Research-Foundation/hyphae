@@ -17,7 +17,7 @@ use hyphae_native_runtime::{
     AnnPartitionRoutingMode, AnnSearchOptions, CommitBoundary, GovernorClassLimit, GovernorMode,
     HardwareCpu, HardwareMemory, HardwareOperatingSystem, HardwareProfile, HardwareStorage,
     HnswConfig, NativeDatabase, NativeExecutionPool, NativeGovernorPolicy, NativeResourceGovernor,
-    NativeRuntimeError, SnapshotPinId, Vector, VectorMetric, WorkloadClass,
+    NativeRuntimeError, NativeTransaction, SnapshotPinId, Vector, VectorMetric, WorkloadClass,
 };
 use hyphae_native_types::{DurabilityClass, ObjectId};
 
@@ -66,6 +66,19 @@ fn seed(path: &Path) -> Result<(NativeDatabase, ObjectId), TestError> {
     )?;
     seed.commit()?;
     Ok((database, index))
+}
+
+fn replace_vector_on_legacy_path(
+    transaction: &mut NativeTransaction<'_>,
+    index: ObjectId,
+    object: ObjectId,
+    vector: Vector,
+) -> Result<(), TestError> {
+    if !transaction.delete_vector(index, object)? {
+        return Err("missing replacement vector".into());
+    }
+    transaction.upsert_vector(index, object, vector)?;
+    Ok(())
 }
 
 const PARTITION_COUNT: usize = 4;
@@ -207,7 +220,12 @@ fn bounded_consolidation_switches_base_and_removes_old_generation_records() -> R
     let path = temporary.path().join("data");
     let (mut database, index) = seed(&path).map_err(|error| format!("seed: {error}"))?;
     let mut update = database.begin(2, DurabilityClass::Strict)?;
-    update.upsert_vector(index, ObjectId::new(2)?, Vector::new([3.0, 0.0])?)?;
+    replace_vector_on_legacy_path(
+        &mut update,
+        index,
+        ObjectId::new(2)?,
+        Vector::new([3.0, 0.0])?,
+    )?;
     update
         .commit()
         .map_err(|error| format!("update: {error}"))?;
@@ -250,17 +268,46 @@ fn bounded_consolidation_switches_base_and_removes_old_generation_records() -> R
 }
 
 #[test]
+fn consolidation_4097_limit_rejects_before_pages_or_wal() -> Result<(), TestError> {
+    let temporary = TestDirectory::new();
+    let path = temporary.path().join("data-limit");
+    let (mut database, index) = seed(&path)?;
+    let mut update = database.begin(2, DurabilityClass::Strict)?;
+    update.upsert_vector(index, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+    update.commit()?;
+    let before = database.physical_observation()?;
+    assert!(matches!(
+        database.plan_ann_consolidation(index, 8, 4_097),
+        Err(NativeRuntimeError::InvalidAnnConsolidationLimit)
+    ));
+    let after = database.physical_observation()?;
+    assert_eq!(after.page_count, before.page_count);
+    assert_eq!(after.wal_bytes, before.wal_bytes);
+    Ok(())
+}
+
+#[test]
 fn a_plan_preserves_later_object_versions_and_rejects_a_changed_base() -> Result<(), TestError> {
     let temporary = TestDirectory::new();
     let path = temporary.path().join("data");
     let (mut database, index) = seed(&path)?;
     let mut captured = database.begin(2, DurabilityClass::Strict)?;
-    captured.upsert_vector(index, ObjectId::new(3)?, Vector::new([5.0, 0.0])?)?;
+    replace_vector_on_legacy_path(
+        &mut captured,
+        index,
+        ObjectId::new(3)?,
+        Vector::new([5.0, 0.0])?,
+    )?;
     captured.commit()?;
     let plan = database.plan_ann_consolidation(index, 10, 10)?;
 
     let mut later = database.begin(3, DurabilityClass::Strict)?;
-    later.upsert_vector(index, ObjectId::new(2)?, Vector::new([8.0, 0.0])?)?;
+    replace_vector_on_legacy_path(
+        &mut later,
+        index,
+        ObjectId::new(2)?,
+        Vector::new([8.0, 0.0])?,
+    )?;
     later.upsert_vector(index, ObjectId::new(4)?, Vector::new([1.0, 0.0])?)?;
     later.commit()?;
     let receipt = database.consolidate_ann(plan, DurabilityClass::Strict)?;
@@ -420,7 +467,12 @@ fn partitioned_consolidation_preserves_kind_count_and_routing_after_reopen() -> 
     assert_partitioned_routing(&database, index, &query)?;
 
     let mut update = database.begin(2, DurabilityClass::Strict)?;
-    update.upsert_vector(index, ObjectId::new(8)?, Vector::new([8.25, 3.25])?)?;
+    replace_vector_on_legacy_path(
+        &mut update,
+        index,
+        ObjectId::new(8)?,
+        Vector::new([8.25, 3.25])?,
+    )?;
     update.commit()?;
     let expected = database.search_vector_exact_latest(index, &query, 8)?;
     let plan = database.plan_ann_consolidation(index, 32, 8)?;
@@ -453,7 +505,7 @@ fn partitioned_consolidation_identity_is_independent_of_worker_count() -> Result
     let replacement = Vector::new([7.5, 2.5])?;
     for (database, index) in [(&mut serial, serial_index), (&mut parallel, parallel_index)] {
         let mut update = database.begin(2, DurabilityClass::Strict)?;
-        update.upsert_vector(index, ObjectId::new(7)?, replacement.clone())?;
+        replace_vector_on_legacy_path(&mut update, index, ObjectId::new(7)?, replacement.clone())?;
         update.commit()?;
     }
 
@@ -530,66 +582,36 @@ fn cancelled_partitioned_consolidation_releases_governor_without_a_candidate()
 }
 
 #[test]
-fn partitioned_consolidation_preserves_later_same_object_delta() -> Result<(), TestError> {
-    let temporary = TestDirectory::new();
-    let path = temporary.path().join("data");
-    let (mut database, index) = seed_partitioned(&path)?;
-    let object_id = ObjectId::new(8)?;
-    let mut captured = database.begin(2, DurabilityClass::Strict)?;
-    captured.upsert_vector(index, object_id, Vector::new([8.25, 3.25])?)?;
-    captured.commit()?;
-    let plan = database.plan_ann_consolidation(index, 32, 8)?;
-
-    let latest_vector = Vector::new([0.25, 0.5])?;
-    let mut later = database.begin(3, DurabilityClass::Strict)?;
-    later.upsert_vector(index, object_id, latest_vector.clone())?;
-    later.commit()?;
-    let receipt = database.consolidate_ann(plan, DurabilityClass::Strict)?;
-    assert_eq!(receipt.consumed_delta_records, 0);
-    assert_eq!(receipt.preserved_later_delta_records, 1);
-    assert_eq!(
-        database.search_vector_exact_latest(index, &latest_vector, 1)?[0].object_id,
-        object_id
-    );
-    let selected =
-        database.search_ann_selected_latest(index, &latest_vector, selected_options()?, 2)?;
-    assert_eq!(selected.exact_delta_candidates, 1);
-    assert_ne!(
-        selected.routing_mode,
-        AnnPartitionRoutingMode::SingleGenerationFallback
-    );
-    assert_eq!(selected.total_partitions, PARTITION_COUNT);
-    drop(database);
-
-    let reopened = NativeDatabase::open(&path)?;
-    assert_eq!(
-        reopened.search_vector_exact_latest(index, &latest_vector, 1)?[0].object_id,
-        object_id
-    );
-    assert_partitioned_routing(&reopened, index, &latest_vector)?;
-    Ok(())
-}
-
-#[test]
-fn consolidation_receipt_counts_only_matching_captured_sequences() -> Result<(), TestError> {
+fn captured_d02_overwrite_is_stale_but_post_overwrite_sequence_gaps_are_legal()
+-> Result<(), TestError> {
     let temporary = TestDirectory::new();
     let path = temporary.path().join("data");
     let (mut database, index) = seed(&path)?;
-    let replaced_object = ObjectId::new(2)?;
-    let consumed_object = ObjectId::new(3)?;
-    let mut captured = database.begin(2, DurabilityClass::Strict)?;
-    captured.upsert_vector(index, replaced_object, Vector::new([3.0, 0.0])?)?;
-    captured.upsert_vector(index, consumed_object, Vector::new([5.0, 0.0])?)?;
-    captured.commit()?;
-    let plan = database.plan_ann_consolidation(index, 10, 10)?;
+    let object = ObjectId::new(1)?;
 
-    let mut later = database.begin(3, DurabilityClass::Strict)?;
-    later.upsert_vector(index, replaced_object, Vector::new([9.0, 0.0])?)?;
-    later.commit()?;
-    let receipt = database.consolidate_ann(plan, DurabilityClass::Strict)?;
+    let mut first = database.begin(2, DurabilityClass::Strict)?;
+    first.upsert_vector(index, object, Vector::new([1.0, 0.0])?)?;
+    first.commit()?;
+    let stale = database.plan_ann_consolidation(index, 8, 8)?;
+
+    let mut overwrite = database.begin(3, DurabilityClass::Strict)?;
+    overwrite.upsert_vector(index, object, Vector::new([2.0, 0.0])?)?;
+    overwrite.commit()?;
+    assert!(matches!(
+        database.consolidate_ann(stale, DurabilityClass::Strict),
+        Err(NativeRuntimeError::AnnConsolidationStale)
+    ));
+
+    let gapped = database.plan_ann_consolidation(index, 8, 8)?;
+    let receipt = database.consolidate_ann(gapped, DurabilityClass::Strict)?;
     assert_eq!(receipt.consumed_delta_records, 1);
-    assert_eq!(receipt.preserved_later_delta_records, 1);
-    assert_eq!(database.observe_ann_index(index)?.delta_records, 1);
+    drop(database);
+
+    let reopened = NativeDatabase::open(path)?;
+    assert_eq!(
+        reopened.search_vector_exact_latest(index, &Vector::new([2.0, 0.0])?, 1)?[0].object_id,
+        object
+    );
     Ok(())
 }
 
@@ -610,7 +632,12 @@ fn interrupted_partitioned_consolidation_reopens_old_or_new_partitioned_view()
         let (mut database, index) = seed_partitioned(&path)?;
         let query = Vector::new([9.0, 4.0])?;
         let mut update = database.begin(2, DurabilityClass::Strict)?;
-        update.upsert_vector(index, ObjectId::new(9)?, Vector::new([9.25, 4.25])?)?;
+        replace_vector_on_legacy_path(
+            &mut update,
+            index,
+            ObjectId::new(9)?,
+            Vector::new([9.25, 4.25])?,
+        )?;
         update.commit()?;
         let old_identity = database.observe_ann_index(index)?.base_identity;
         let expected = database.search_vector_exact_latest(index, &query, 8)?;
@@ -694,7 +721,12 @@ fn lifecycle_stable_initial_caps_consolidate_and_reopen_for_r1_r2_r64() -> Resul
             selected.routing_mode,
             AnnPartitionRoutingMode::SingleGenerationFallback
         );
-        assert_eq!(selected.total_partitions, expected_partitions);
+        let expected_consolidated_partitions = if retain_generations == 1 {
+            expected_partitions - 1
+        } else {
+            expected_partitions
+        };
+        assert_eq!(selected.total_partitions, expected_consolidated_partitions);
         drop(database);
 
         let reopened = NativeDatabase::open(&path)?;
@@ -704,7 +736,10 @@ fn lifecycle_stable_initial_caps_consolidate_and_reopen_for_r1_r2_r64() -> Resul
             AnnSearchOptions::new(1, 8, Some(1))?,
             expected_partitions,
         )?;
-        assert_eq!(reopened_selected.total_partitions, expected_partitions);
+        assert_eq!(
+            reopened_selected.total_partitions,
+            expected_consolidated_partitions
+        );
         assert_eq!(
             reopened_selected.search.hits[0].object_id,
             ObjectId::new(1)?

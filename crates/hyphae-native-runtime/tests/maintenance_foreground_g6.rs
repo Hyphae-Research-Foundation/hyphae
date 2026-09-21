@@ -63,6 +63,7 @@ fn setup(path: &Path) -> Result<(NativeDatabase, ObjectId, ObjectId), TestError>
     let mut tombstones = database.begin(2, DurabilityClass::Strict)?;
     tombstones.delete_structure(b"large".to_vec())?;
     tombstones.delete_document(lexical, b"document".to_vec())?;
+    assert!(tombstones.delete_vector(ann, ObjectId::new(2)?)?);
     tombstones.upsert_vector(ann, ObjectId::new(2)?, Vector::new([3.0, 0.0])?)?;
     tombstones.commit()?;
     Ok((database, lexical, ann))

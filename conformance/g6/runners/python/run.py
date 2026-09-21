@@ -129,12 +129,12 @@ def execute_cases(client: HyphaeClient, denied: HyphaeClient) -> tuple[dict[str,
     limited = dict(RequestOptions().limits)
     limited["max_request_bytes"] = 1
     failure_calls = (
-        ("limit", lambda: client.sql("SELECT id FROM g6_items", options=RequestOptions(request_id=6110, limits=limited))),
-        ("deadline", lambda: client.sql("SELECT id FROM g6_items", options=RequestOptions(request_id=6111, deadline_micros=1))),
+        ("limit", lambda: client.sql("SELECT id, label FROM g6_items WHERE id = ?", [1], options=RequestOptions(request_id=6110, limits=limited))),
+        ("deadline", lambda: client.sql("SELECT id, label FROM g6_items WHERE id = ?", [1], options=RequestOptions(request_id=6111, deadline_micros=1))),
     )
     cancelled = CancellationToken()
     cancelled.cancel()
-    failure_calls += (("cancellation", lambda: client.sql("SELECT id FROM g6_items", options=RequestOptions(request_id=6112, cancellation=cancelled))),)
+    failure_calls += (("cancellation", lambda: client.sql("SELECT id, label FROM g6_items WHERE id = ?", [1], options=RequestOptions(request_id=6112, cancellation=cancelled))),)
     for name, call_failure in failure_calls:
         try:
             call_failure()

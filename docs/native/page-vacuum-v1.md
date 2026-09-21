@@ -21,7 +21,10 @@ before that retention floor.
 2. A `RootSet`, WAL commit manifest, and root checkpoint manifest bind both the
    page generation and a nonzero retention-floor CSN.
 3. Ordinary commits inherit both values. A vacuum commit advances the page
-   generation by exactly one and sets the retention floor to its own CSN.
+   generation by exactly one and sets the retention floor to its own CSN. A
+   generation change is valid if and only if the transaction contains the one
+   canonical `VacuumPageGeneration` mutation; that mutation under an unchanged
+   generation is equally invalid.
 4. Every commit at or above the latest retention floor references the latest
    page generation. Earlier WAL history remains authenticated input but its
    retired physical roots are not dereferenced during recovery.

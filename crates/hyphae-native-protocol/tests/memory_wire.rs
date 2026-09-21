@@ -15,9 +15,11 @@ use hyphae_native_protocol::{
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 fn golden(name: &str, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../compatibility")
-        .join(name);
+    let compatibility = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../compatibility");
+    if !compatibility.is_dir() {
+        return Ok(());
+    }
+    let path = compatibility.join(name);
     if std::env::var_os("HYPHAE_REGENERATE_MEMORY_GOLDENS").is_some() {
         std::fs::write(&path, bytes)?;
     }

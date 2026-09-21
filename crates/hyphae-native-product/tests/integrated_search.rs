@@ -19,18 +19,24 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
+    AnnConsolidationRequest, MAX_PRODUCT_SEARCH_BATCH_BYTES, MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
     NativeProduct, ProductAggregation, ProductAggregationValue, ProductAuthorization,
-    ProductDocValue, ProductDocument, ProductDurability, ProductFacetRequest, ProductHighlight,
+    ProductDocValue, ProductDocument, ProductDurability, ProductError, ProductErrorCategory,
+    ProductErrorCode, ProductExplicitTransactionStatus, ProductFacetRequest, ProductHighlight,
     ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductSearchCollectionBinding,
-    ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchFilter,
-    ProductSearchIngestBatch, ProductSearchIngestionCoordinator, ProductSearchOperator,
-    ProductSearchRequest, ProductSearchSort, ProductSession, ProductSessionId,
-    ProductSortDirection, ProductSortSource, ProductStreamEnqueueOutcome, ProductVector,
-    ProductVectorBranch, ProductVectorExecution, ProductVectorStrategy,
+    ProductPrincipal, ProductRequestContext, ProductResponse, ProductRetry,
+    ProductSearchCollectionBinding, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchFilter, ProductSearchIngestBatch, ProductSearchIngestionCoordinator,
+    ProductSearchOperator, ProductSearchRequest, ProductSearchSort, ProductSession,
+    ProductSessionId, ProductSortDirection, ProductSortSource, ProductStreamEnqueueOutcome,
+    ProductTransactionHandle, ProductTransactionSearchMutation, ProductTransactionStageResult,
+    ProductTransactionVectorMutation, ProductVector, ProductVectorBranch, ProductVectorExecution,
+    ProductVectorStrategy, commit_explicit_transaction_with_interruption_for_test,
 };
+use hyphae_native_runtime::{AnnSearchOptions, AnnSearchStrategy, CommitBoundary, NativeDatabase};
 use hyphae_native_types::{
-    EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId, VectorElement, VectorType,
+    DurabilityClass, EngineKind, FieldId, IntegerWidth, LogicalType, ObjectId, VectorElement,
+    VectorType,
 };
 
 fn temporary(name: &str) -> PathBuf {
@@ -62,22 +68,58 @@ fn header(
 fn configure(
     path: &PathBuf,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
-    configure_full(path, None, vec![AnalyzerFilter::Lowercase])
+    configure_full(path, None, vec![AnalyzerFilter::Lowercase], 2)
 }
 
 fn configure_with_bm25(
     path: &PathBuf,
     bm25: Option<Bm25Parameters>,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
-    configure_full(path, bm25, vec![AnalyzerFilter::Lowercase])
+    configure_full(path, bm25, vec![AnalyzerFilter::Lowercase], 2)
 }
 
-#[allow(clippy::too_many_lines)]
 fn configure_full(
     path: &PathBuf,
     bm25: Option<Bm25Parameters>,
     analyzer_filters: Vec<AnalyzerFilter>,
+    vector_target_count: usize,
 ) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
+    configure_full_with_delta_max(path, bm25, analyzer_filters, vector_target_count, 1_000)
+}
+
+#[allow(clippy::too_many_lines)]
+fn configure_full_with_delta_max(
+    path: &PathBuf,
+    bm25: Option<Bm25Parameters>,
+    analyzer_filters: Vec<AnalyzerFilter>,
+    vector_target_count: usize,
+    delta_max_entries: u32,
+) -> Result<(NativeProduct, ProductSearchCollectionBinding), Box<dyn std::error::Error>> {
+    let mut product = configure_catalog_full(
+        path,
+        bm25,
+        analyzer_filters,
+        vector_target_count,
+        delta_max_entries,
+    )?;
+    let collection = ObjectId::new(13)?;
+    product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
+    let binding = product.resolve_search_collection_binding(collection, 0)?;
+    Ok((product, binding))
+}
+
+fn configure_catalog(path: &PathBuf) -> Result<NativeProduct, Box<dyn std::error::Error>> {
+    configure_catalog_full(path, None, vec![AnalyzerFilter::Lowercase], 2, 1_000)
+}
+
+#[allow(clippy::too_many_lines)]
+fn configure_catalog_full(
+    path: &PathBuf,
+    bm25: Option<Bm25Parameters>,
+    analyzer_filters: Vec<AnalyzerFilter>,
+    vector_target_count: usize,
+    delta_max_entries: u32,
+) -> Result<NativeProduct, Box<dyn std::error::Error>> {
     let _ = fs::remove_dir_all(path);
     let mut product = NativeProduct::create(path)?;
     product.create_catalog_object_v2(
@@ -108,10 +150,42 @@ fn configure_full(
     )?;
     let ann = AnnIndexDefinition::new(VectorMetric::SquaredL2, 8, 32, 16, 256, 7)?;
     let lifecycle = IncrementalVectorLifecycle {
-        delta_max_entries: 1_000,
-        consolidate_after_deltas: 4,
+        delta_max_entries,
+        consolidate_after_deltas: u16::try_from(delta_max_entries.min(4))?,
         retain_generations: 2,
     };
+    let mut vectors = vec![
+        NamedVectorDefinition {
+            id: FieldId::new(4)?,
+            name: name("image")?,
+            vector_type: VectorType::new(VectorElement::Float32, 2)?,
+            metric: VectorMetric::SquaredL2,
+            policy: VectorSearchPolicy::Ann(ann),
+            lifecycle,
+        },
+        NamedVectorDefinition {
+            id: FieldId::new(5)?,
+            name: name("semantic")?,
+            vector_type: VectorType::new(VectorElement::Float32, 2)?,
+            metric: VectorMetric::SquaredL2,
+            policy: VectorSearchPolicy::Adaptive {
+                exact_candidate_threshold: 2,
+                ann,
+            },
+            lifecycle,
+        },
+    ];
+    vectors.truncate(vector_target_count);
+    for index in vectors.len()..vector_target_count {
+        vectors.push(NamedVectorDefinition {
+            id: FieldId::new(u32::try_from(100 + index)?)?,
+            name: name(&format!("target{index:02}"))?,
+            vector_type: VectorType::new(VectorElement::Float32, 2)?,
+            metric: VectorMetric::SquaredL2,
+            policy: VectorSearchPolicy::Exact,
+            lifecycle,
+        });
+    }
     product.create_catalog_object_v2(
         LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
             SearchCollectionDefinitionV2 {
@@ -167,35 +241,12 @@ fn configure_full(
                         },
                     },
                 ],
-                vectors: vec![
-                    NamedVectorDefinition {
-                        id: FieldId::new(4)?,
-                        name: name("image")?,
-                        vector_type: VectorType::new(VectorElement::Float32, 2)?,
-                        metric: VectorMetric::SquaredL2,
-                        policy: VectorSearchPolicy::Ann(ann),
-                        lifecycle,
-                    },
-                    NamedVectorDefinition {
-                        id: FieldId::new(5)?,
-                        name: name("semantic")?,
-                        vector_type: VectorType::new(VectorElement::Float32, 2)?,
-                        metric: VectorMetric::SquaredL2,
-                        policy: VectorSearchPolicy::Adaptive {
-                            exact_candidate_threshold: 2,
-                            ann,
-                        },
-                        lifecycle,
-                    },
-                ],
+                vectors,
             },
         )),
         ProductDurability::Strict,
     )?;
-    let collection = ObjectId::new(13)?;
-    product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
-    let binding = product.resolve_search_collection_binding(collection, 0)?;
-    Ok((product, binding))
+    Ok(product)
 }
 
 fn document(
@@ -239,6 +290,149 @@ fn seed() -> Result<ProductSearchIngestBatch, Box<dyn std::error::Error>> {
     })
 }
 
+fn assert_limit_error(error: &ProductError) {
+    assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+    assert_eq!(error.category(), ProductErrorCategory::Limit);
+    assert_eq!(error.retry(), ProductRetry::Never);
+    assert_eq!(error.message(), "native request exceeds a product limit");
+}
+
+#[test]
+fn ann_delta_limit_fails_closed_and_retry_succeeds_after_consolidation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("ann-delta-limit");
+    let (mut product, binding) =
+        configure_full_with_delta_max(&path, None, vec![AnalyzerFilter::Lowercase], 2, 1)
+            .map_err(|error| format!("tiny-delta configuration failed: {error:?}"))?;
+    product
+        .ingest_search_batch(
+            binding.collection,
+            &ProductSearchIngestBatch {
+                idempotency_id: 40,
+                documents: vec![document(
+                    901,
+                    "accepted delta",
+                    "book",
+                    1,
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                )?],
+            },
+            1,
+            ProductDurability::Strict,
+        )
+        .map_err(|error| format!("initial tiny-delta ingest failed: {error:?}"))?;
+    let blocked = ProductSearchIngestBatch {
+        idempotency_id: 41,
+        documents: vec![document(
+            902,
+            "blocked delta",
+            "book",
+            2,
+            [2.0, 0.0],
+            [2.0, 0.0],
+        )?],
+    };
+    let before = product.snapshot_bounded(2)?.identity();
+
+    for _ in 0..2 {
+        let error = product
+            .ingest_search_batch(binding.collection, &blocked, 2, ProductDurability::Strict)
+            .expect_err("full ANN delta admitted");
+        assert_limit_error(&error);
+        assert_eq!(product.snapshot_bounded(2)?.identity(), before);
+    }
+
+    for vector in &binding.vectors {
+        product
+            .administration()
+            .consolidate_ann(
+                AnnConsolidationRequest::new(vector.index, 1, 1, ProductDurability::Strict)
+                    .ok_or("invalid consolidation request")?,
+            )
+            .map_err(|error| format!("{} consolidation failed: {error:?}", vector.name))?;
+    }
+    let retried = product
+        .ingest_search_batch(binding.collection, &blocked, 3, ProductDurability::Strict)
+        .map_err(|error| format!("post-consolidation retry failed: {error:?}"))?;
+    assert!(!retried.idempotent_replay, "rejection persisted a marker");
+    assert_ne!(retried.snapshot.root_digest, before.root_digest);
+    let replay =
+        product.ingest_search_batch(binding.collection, &blocked, 4, ProductDurability::Strict)?;
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.commit, retried.commit);
+
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn retained_memory_rejection_keeps_root_snapshot_and_idempotency_unpublished()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("retained-memory-limit");
+    let (mut product, binding) = configure(&path)?;
+    let mut oversized = document(903, "", "book", 3, [3.0, 0.0], [3.0, 0.0])?;
+    oversized.text = "r".repeat(MAX_PRODUCT_SEARCH_BATCH_BYTES - 256);
+    let rejected = ProductSearchIngestBatch {
+        idempotency_id: 42,
+        documents: vec![oversized],
+    };
+    let mut validation_stream = ProductSearchIngestionCoordinator {
+        max_in_flight_bytes: MAX_PRODUCT_SEARCH_BATCH_BYTES,
+        max_in_flight_batches: 1,
+        max_tracked_idempotency_ids: 1,
+    }
+    .stream(binding.collection)?;
+    assert_eq!(
+        validation_stream.enqueue(rejected.clone())?,
+        ProductStreamEnqueueOutcome::Enqueued,
+        "fixture exceeded product batch validation before runtime admission"
+    );
+    drop(validation_stream);
+    let before = product.snapshot_bounded(1)?.identity();
+
+    for _ in 0..2 {
+        let error = product
+            .ingest_search_batch(binding.collection, &rejected, 1, ProductDurability::Strict)
+            .expect_err("oversized retained delta admitted");
+        assert_limit_error(&error);
+        assert_eq!(product.snapshot_bounded(1)?.identity(), before);
+    }
+
+    let corrected = ProductSearchIngestBatch {
+        idempotency_id: rejected.idempotency_id,
+        documents: vec![document(
+            903,
+            "corrected retained delta",
+            "book",
+            3,
+            [3.0, 0.0],
+            [3.0, 0.0],
+        )?],
+    };
+    let retried = product.ingest_search_batch(
+        binding.collection,
+        &corrected,
+        2,
+        ProductDurability::Strict,
+    )?;
+    assert!(!retried.idempotent_replay, "rejection persisted a marker");
+    assert_ne!(retried.snapshot.root_digest, before.root_digest);
+    let replay = product.ingest_search_batch(
+        binding.collection,
+        &corrected,
+        3,
+        ProductDurability::Strict,
+    )?;
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.commit, retried.commit);
+
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 #[test]
 fn complete_document_scan_is_stable_bounded_and_snapshot_pinned()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -277,10 +471,1304 @@ fn complete_document_scan_is_stable_bounded_and_snapshot_pinned()
     Ok(())
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn complete_image_first_insert_handles_base_point_and_absent_vectors_across_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (state, target) in [
+        ("base", "image"),
+        ("point", "semantic"),
+        ("absent", "image"),
+    ] {
+        let path = temporary(&format!("complete-image-{state}"));
+        let (product, binding) = configure(&path)?;
+        let object = ObjectId::new(700)?;
+        let vector_index = binding
+            .vectors
+            .iter()
+            .find(|candidate| candidate.name == target)
+            .ok_or("missing vector target")?
+            .index;
+        drop(product);
+
+        let mut runtime = NativeDatabase::open(&path)?;
+        match state {
+            "base" => {
+                let plan = runtime.plan_initial_ann_bulk(
+                    vector_index,
+                    vec![(object, ProductVector::new([9.0, 0.0])?)],
+                    1,
+                )?;
+                runtime.publish_initial_ann_bulk(plan, DurabilityClass::Strict)?;
+            }
+            "point" => {
+                let mut transaction = runtime.begin(1, DurabilityClass::Strict)?;
+                transaction.upsert_vector(vector_index, object, ProductVector::new([9.0, 0.0])?)?;
+                transaction.commit()?;
+            }
+            "absent" => {
+                let mut upsert = runtime.begin(1, DurabilityClass::Strict)?;
+                upsert.upsert_vector(vector_index, object, ProductVector::new([9.0, 0.0])?)?;
+                upsert.commit()?;
+                let mut delete = runtime.begin(2, DurabilityClass::Strict)?;
+                assert!(delete.delete_vector(vector_index, object)?);
+                delete.commit()?;
+            }
+            _ => return Err("unknown vector state".into()),
+        }
+        drop(runtime);
+
+        let mut product = NativeProduct::open(&path)?;
+        let mut complete = document(700, "complete image", "book", 1, [0.0, 0.0], [0.0, 0.0])?;
+        complete.vectors.remove(target);
+        let batch = ProductSearchIngestBatch {
+            idempotency_id: 90,
+            documents: vec![complete.clone()],
+        };
+        let receipt = product.ingest_search_batch(
+            binding.collection,
+            &batch,
+            2,
+            ProductDurability::Strict,
+        )?;
+        let replay = product.ingest_search_batch(
+            binding.collection,
+            &batch,
+            3,
+            ProductDurability::Strict,
+        )?;
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.commit, receipt.commit);
+
+        let removed_execution = if target == "image" {
+            Some(ProductVectorExecution::Ann {
+                ef_search: 16,
+                exact_rerank: Some(16),
+            })
+        } else {
+            None
+        };
+        let removed = vector_request(target, [9.0, 0.0], removed_execution, Some(0.0))?;
+        let supplied_target = if target == "image" {
+            "semantic"
+        } else {
+            "image"
+        };
+        let supplied = vector_request(supplied_target, [0.0, 0.0], None, Some(0.0))?;
+        let removed_result = product.search_collection(binding.collection, &removed, 3)?;
+        assert!(removed_result.hits.is_empty());
+        if target == "semantic" {
+            assert_eq!(
+                removed_result.vector_branches[0].strategy,
+                ProductVectorStrategy::AdaptiveExactFiltered
+            );
+        }
+        assert_eq!(
+            product
+                .search_collection(binding.collection, &supplied, 3)?
+                .hits[0]
+                .object_id,
+            object
+        );
+        let page = NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(3)?,
+            binding.collection,
+            None,
+            1,
+        )?;
+        assert_eq!(page.documents, [complete.clone()]);
+        let mut hybrid = lexical_request("not-in-document");
+        hybrid.vectors = removed.vectors.clone();
+        assert!(
+            product
+                .search_collection(binding.collection, &hybrid, 3)?
+                .hits
+                .is_empty()
+        );
+        drop(product);
+
+        let reopened = NativeProduct::open(&path)?;
+        assert!(
+            reopened
+                .search_collection(binding.collection, &removed, 3)?
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .search_collection(binding.collection, &supplied, 3)?
+                .hits[0]
+                .object_id,
+            object
+        );
+        let page = NativeProduct::search_documents_at_snapshot(
+            &reopened.snapshot_bounded(3)?,
+            binding.collection,
+            None,
+            1,
+        )?;
+        assert_eq!(page.documents, [complete]);
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ann_and_hybrid_match_all_exclude_foreign_vectors_across_lifecycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("ann-collection-universe");
+    let (mut product, binding) = configure_full(&path, None, vec![AnalyzerFilter::Lowercase], 1)?;
+    let image_index = binding
+        .vectors
+        .iter()
+        .find(|vector| vector.name == "image")
+        .ok_or("missing image target")?
+        .index;
+    let mut member = document(
+        760,
+        "primary collection member",
+        "book",
+        1,
+        [1.0, 0.0],
+        [1.0, 0.0],
+    )?;
+    member.vectors.remove("semantic");
+    let mut second = document(
+        761,
+        "surviving collection member",
+        "book",
+        2,
+        [2.0, 0.0],
+        [2.0, 0.0],
+    )?;
+    second.vectors.remove("semantic");
+    let mut third = document(
+        762,
+        "surviving collection member",
+        "book",
+        3,
+        [3.0, 0.0],
+        [3.0, 0.0],
+    )?;
+    third.vectors.remove("semantic");
+    product.ingest_search_batch(
+        binding.collection,
+        &ProductSearchIngestBatch {
+            idempotency_id: 90,
+            documents: vec![member.clone(), second.clone(), third.clone()],
+        },
+        1,
+        ProductDurability::Strict,
+    )?;
+    drop(product);
+
+    let foreign = ObjectId::new(759)?;
+    let mut runtime = NativeDatabase::open(&path)?;
+    let consolidation = runtime.plan_ann_consolidation(image_index, 3, 3)?;
+    runtime.consolidate_ann(consolidation, DurabilityClass::Strict)?;
+    let mut raw_insert = runtime.begin(2, DurabilityClass::Strict)?;
+    raw_insert.upsert_vector(image_index, foreign, ProductVector::new([0.0, 0.0])?)?;
+    raw_insert.commit()?;
+    let options = AnnSearchOptions::new(1, 2, None)?;
+    let raw = runtime.search_ann_latest(image_index, &ProductVector::new([0.0, 0.0])?, options)?;
+    assert_eq!(raw.hits[0].object_id, foreign);
+    assert!(!raw.exact_reranked);
+    let allowlist =
+        std::collections::BTreeSet::from([member.object_id, second.object_id, third.object_id]);
+    let scoped = runtime.search_ann_filtered_latest(
+        image_index,
+        &ProductVector::new([0.0, 0.0])?,
+        options,
+        &allowlist,
+    )?;
+    assert_eq!(scoped.hits[0].object_id, member.object_id);
+    assert_eq!(
+        scoped.strategy,
+        AnnSearchStrategy::StableIdEligibilityTraversal
+    );
+    assert!(!scoped.exact_reranked);
+    drop(runtime);
+
+    let mut product = NativeProduct::open(&path)?;
+    let mut ann = vector_request(
+        "image",
+        [0.0, 0.0],
+        Some(ProductVectorExecution::Ann {
+            ef_search: 2,
+            exact_rerank: None,
+        }),
+        None,
+    )?;
+    ann.vectors[0].candidate_limit = 1;
+    ann.limit = 1;
+    let result = product.search_collection(binding.collection, &ann, 2)?;
+    assert_eq!(result.total_documents, 3);
+    assert_eq!(result.eligible_documents, 3);
+    assert_eq!(result.hits[0].object_id, member.object_id);
+    assert_eq!(
+        result.vector_branches[0].candidate_count,
+        scoped.candidate_count
+    );
+    assert_eq!(
+        result.vector_branches[0].visited_nodes,
+        scoped.visited_nodes
+    );
+    assert!(!result.vector_branches[0].exact_reranked);
+
+    let mut hybrid = ann.clone();
+    hybrid.lexical = Some(ProductLexicalBranch {
+        query: "primary".to_owned(),
+        candidate_limit: 1,
+        weight: 1,
+        operator: None,
+        prefix: false,
+        fields: Vec::new(),
+        fuzzy: None,
+        phrase: false,
+    });
+    let hybrid_result = product.search_collection(binding.collection, &hybrid, 2)?;
+    assert_eq!(hybrid_result.hits.len(), 1);
+    assert_eq!(hybrid_result.hits[0].object_id, member.object_id);
+
+    let mut zero_distance = ann.clone();
+    zero_distance.vectors[0].max_distance = Some(hyphae_native_product::CanonicalF64::new(0.0));
+    assert!(
+        product
+            .search_collection(binding.collection, &zero_distance, 2)?
+            .hits
+            .is_empty()
+    );
+
+    let mut replacement = member.clone();
+    replacement.text = "replacement member".to_owned();
+    replacement
+        .vectors
+        .insert("image".to_owned(), ProductVector::new([0.0, 0.0])?);
+    product.update_search_document(
+        binding.collection,
+        &ProductSearchDocumentUpdate {
+            idempotency_id: 91,
+            document: replacement,
+        },
+        3,
+        ProductDurability::Strict,
+    )?;
+    let replacement_result = product.search_collection(binding.collection, &zero_distance, 3)?;
+    assert_eq!(replacement_result.hits.len(), 1);
+    assert_eq!(replacement_result.hits[0].object_id, member.object_id);
+
+    product.delete_search_document(
+        binding.collection,
+        ProductSearchDocumentDelete {
+            idempotency_id: 92,
+            object_id: member.object_id,
+        },
+        4,
+        ProductDurability::Strict,
+    )?;
+    for request in [&ann, &hybrid, &zero_distance] {
+        let deleted = product.search_collection(binding.collection, request, 4)?;
+        assert_eq!(deleted.total_documents, 2);
+        assert!(
+            deleted
+                .hits
+                .iter()
+                .all(|hit| hit.object_id != foreign && hit.object_id != member.object_id)
+        );
+    }
+    assert!(
+        product
+            .search_collection(binding.collection, &zero_distance, 4)?
+            .hits
+            .is_empty()
+    );
+    drop(product);
+
+    let reopened = NativeProduct::open(&path)?;
+    for request in [&ann, &hybrid, &zero_distance] {
+        let deleted = reopened.search_collection(binding.collection, request, 5)?;
+        assert_eq!(deleted.total_documents, 2);
+        assert!(
+            deleted
+                .hits
+                .iter()
+                .all(|hit| hit.object_id != foreign && hit.object_id != member.object_id)
+        );
+    }
+    assert!(
+        reopened
+            .search_collection(binding.collection, &zero_distance, 5)?
+            .hits
+            .is_empty()
+    );
+    drop(reopened);
+
+    let runtime = NativeDatabase::open(&path)?;
+    let raw = runtime.search_ann_latest(
+        image_index,
+        &ProductVector::new([0.0, 0.0])?,
+        AnnSearchOptions::new(1, 2, None)?,
+    )?;
+    assert_eq!(raw.hits[0].object_id, foreign);
+    drop(runtime);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn complete_image_fences_every_omitted_target_at_the_product_maximum()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("complete-image-max-targets");
+    let (mut product, binding) = configure_full(
+        &path,
+        None,
+        vec![AnalyzerFilter::Lowercase],
+        MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
+    )
+    .map_err(|error| format!("maximum-target configuration failed: {error:?}"))?;
+    assert_eq!(binding.vectors.len(), MAX_PRODUCT_SEARCH_VECTOR_TARGETS);
+    let mut expected_targets = vec!["image".to_owned(), "semantic".to_owned()];
+    for ordinal in 2..MAX_PRODUCT_SEARCH_VECTOR_TARGETS {
+        expected_targets.push(format!("target{ordinal:02}"));
+    }
+    assert_eq!(
+        binding
+            .vectors
+            .iter()
+            .map(|target| target.name.clone())
+            .collect::<Vec<_>>(),
+        expected_targets
+    );
+
+    // The first complete image inserts one physical vector and proves true
+    // absence for every other named target.
+    let mut complete = document(
+        710,
+        "maximum target image",
+        "book",
+        1,
+        [3.0, 0.0],
+        [4.0, 0.0],
+    )?;
+    complete.vectors.retain(|name, _| name == "image");
+    let batch = ProductSearchIngestBatch {
+        idempotency_id: 91,
+        documents: vec![complete.clone()],
+    };
+    let original = product
+        .ingest_search_batch(binding.collection, &batch, 1, ProductDurability::Strict)
+        .map_err(|error| format!("maximum-target complete-image ingest failed: {error:?}"))?;
+    let replay =
+        product.ingest_search_batch(binding.collection, &batch, 2, ProductDurability::Strict)?;
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.commit, original.commit);
+    assert_eq!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("image", [3.0, 0.0], None, Some(0.0))?,
+                2,
+            )?
+            .hits[0]
+            .object_id,
+        complete.object_id
+    );
+    for target in binding.vectors.iter().skip(1) {
+        assert!(
+            product
+                .search_collection(
+                    binding.collection,
+                    &vector_request(&target.name, [4.0, 0.0], None, Some(0.0))?,
+                    2,
+                )?
+                .hits
+                .is_empty(),
+            "omitted target {} remained visible",
+            target.name
+        );
+    }
+
+    // This replacement performs one physical delete for image and fifteen
+    // conflict-authoritative absence fences for the targets proven absent by
+    // the insert. Success at the product maximum guards the exact batch shape.
+    let replacement = ProductDocument {
+        object_id: complete.object_id,
+        text: "maximum target replacement".to_owned(),
+        doc_values: complete.doc_values.clone(),
+        vectors: BTreeMap::new(),
+    };
+    let updated = product.update_search_document(
+        binding.collection,
+        &ProductSearchDocumentUpdate {
+            idempotency_id: 92,
+            document: replacement.clone(),
+        },
+        3,
+        ProductDurability::Strict,
+    )?;
+    assert!(!updated.idempotent_replay);
+    assert!(updated.commit.is_some());
+    for target in &binding.vectors {
+        let query = if target.name == "image" {
+            [3.0, 0.0]
+        } else {
+            [4.0, 0.0]
+        };
+        assert!(
+            product
+                .search_collection(
+                    binding.collection,
+                    &vector_request(&target.name, query, None, Some(0.0))?,
+                    3,
+                )?
+                .hits
+                .is_empty(),
+            "complete replacement retained target {}",
+            target.name
+        );
+    }
+    let page = NativeProduct::search_documents_at_snapshot(
+        &product.snapshot_bounded(3)?,
+        binding.collection,
+        None,
+        1,
+    )?;
+    assert_eq!(page.documents, [replacement]);
+
+    // Deleting the vector-free complete image must still traverse and fence
+    // every named target while removing the document and lexical state.
+    let deleted = product.delete_search_document(
+        binding.collection,
+        ProductSearchDocumentDelete {
+            idempotency_id: 93,
+            object_id: complete.object_id,
+        },
+        4,
+        ProductDurability::Strict,
+    )?;
+    assert!(!deleted.idempotent_replay);
+    assert!(deleted.commit.is_some());
+    assert!(
+        NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(4)?,
+            binding.collection,
+            None,
+            1,
+        )?
+        .documents
+        .is_empty()
+    );
+    assert!(
+        product
+            .search_collection(
+                binding.collection,
+                &lexical_request("maximum target replacement"),
+                4,
+            )?
+            .hits
+            .is_empty()
+    );
+
+    // Exercise the delete entry point with the same maximum-width shape:
+    // image is physically present and the other fifteen targets are absent.
+    let mut direct_delete = document(
+        711,
+        "maximum target direct delete",
+        "book",
+        2,
+        [5.0, 0.0],
+        [6.0, 0.0],
+    )?;
+    direct_delete.vectors.retain(|name, _| name == "image");
+    product.ingest_search_batch(
+        binding.collection,
+        &ProductSearchIngestBatch {
+            idempotency_id: 94,
+            documents: vec![direct_delete.clone()],
+        },
+        5,
+        ProductDurability::Strict,
+    )?;
+    assert_eq!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("image", [5.0, 0.0], None, Some(0.0))?,
+                5,
+            )?
+            .hits[0]
+            .object_id,
+        direct_delete.object_id
+    );
+    let direct_deleted = product.delete_search_document(
+        binding.collection,
+        ProductSearchDocumentDelete {
+            idempotency_id: 95,
+            object_id: direct_delete.object_id,
+        },
+        6,
+        ProductDurability::Strict,
+    )?;
+    assert!(!direct_deleted.idempotent_replay);
+    assert!(direct_deleted.commit.is_some());
+    for target in &binding.vectors {
+        assert!(
+            product
+                .search_collection(
+                    binding.collection,
+                    &vector_request(&target.name, [5.0, 0.0], None, None)?,
+                    6,
+                )?
+                .hits
+                .is_empty(),
+            "direct delete retained target {}",
+            target.name
+        );
+    }
+    drop(product);
+
+    let reopened = NativeProduct::open(&path)?;
+    let page = NativeProduct::search_documents_at_snapshot(
+        &reopened.snapshot_bounded(7)?,
+        binding.collection,
+        None,
+        1,
+    )?;
+    assert!(page.documents.is_empty());
+    for target in &binding.vectors {
+        assert!(
+            reopened
+                .search_collection(
+                    binding.collection,
+                    &vector_request(&target.name, [3.0, 0.0], None, None)?,
+                    7,
+                )?
+                .hits
+                .is_empty(),
+            "deleted document survived reopen in target {}",
+            target.name
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exact_ann_and_hybrid_top_k_refill_after_complete_document_deletion()
+-> Result<(), Box<dyn std::error::Error>> {
+    const K: usize = 3;
+
+    let path = temporary("delete-refills-top-k");
+    let (mut product, binding) = configure_full(&path, None, vec![AnalyzerFilter::Lowercase], 3)?;
+    let mut documents = Vec::new();
+    for ordinal in 0..6_u128 {
+        let coordinate = f32::from(u16::try_from(ordinal)?);
+        let mut candidate = document(
+            800 + ordinal,
+            "shared deletion candidate",
+            "book",
+            i64::try_from(ordinal)?,
+            [coordinate, 0.0],
+            [coordinate, 0.0],
+        )?;
+        candidate.vectors.insert(
+            "target02".to_owned(),
+            ProductVector::new([coordinate, 0.0])?,
+        );
+        documents.push(candidate);
+    }
+    product.ingest_search_batch(
+        binding.collection,
+        &ProductSearchIngestBatch {
+            idempotency_id: 94,
+            documents,
+        },
+        1,
+        ProductDurability::Strict,
+    )?;
+
+    let vector_branch = |target: &str, execution| ProductVectorBranch {
+        target: target.to_owned(),
+        query: ProductVector::new([0.0, 0.0]).expect("valid query vector"),
+        candidate_limit: K,
+        weight: 1,
+        execution,
+        max_distance: None,
+    };
+    let mut exact = lexical_request("");
+    exact.lexical = None;
+    exact.vectors = vec![vector_branch(
+        "target02",
+        Some(ProductVectorExecution::Exact),
+    )];
+    exact.limit = K;
+    let mut ann = exact.clone();
+    ann.vectors = vec![vector_branch(
+        "image",
+        Some(ProductVectorExecution::Ann {
+            ef_search: 16,
+            exact_rerank: Some(6),
+        }),
+    )];
+    let mut hybrid = ann.clone();
+    hybrid.lexical = Some(ProductLexicalBranch {
+        query: "shared deletion".to_owned(),
+        candidate_limit: K,
+        weight: 1,
+        operator: None,
+        prefix: false,
+        fields: Vec::new(),
+        fuzzy: None,
+        phrase: false,
+    });
+
+    let deleted_id = ObjectId::new(800)?;
+    for request in [&exact, &ann, &hybrid] {
+        let before = product.search_collection(binding.collection, request, 1)?;
+        assert_eq!(before.hits.len(), K);
+        assert_eq!(before.hits[0].object_id, deleted_id);
+    }
+    product.delete_search_document(
+        binding.collection,
+        ProductSearchDocumentDelete {
+            idempotency_id: 95,
+            object_id: deleted_id,
+        },
+        2,
+        ProductDurability::Strict,
+    )?;
+
+    let assert_refilled = |result: &hyphae_native_product::ProductSearchResult| {
+        assert_eq!(result.total_documents, 5);
+        assert_eq!(result.hits.len(), K);
+        assert!(result.hits.iter().all(|hit| hit.object_id != deleted_id));
+    };
+    for request in [&exact, &ann, &hybrid] {
+        let after = product.search_collection(binding.collection, request, 2)?;
+        assert_refilled(&after);
+    }
+    drop(product);
+
+    let reopened = NativeProduct::open(&path)?;
+    for request in [&exact, &ann, &hybrid] {
+        let after = reopened.search_collection(binding.collection, request, 3)?;
+        assert_refilled(&after);
+    }
+    drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn absent_at_snapshot_complete_insert_and_vector_upsert_conflict_in_both_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    for complete_first in [true, false] {
+        let path = temporary(if complete_first {
+            "insert-race-complete-first"
+        } else {
+            "insert-race-vector-first"
+        });
+        let (mut product, binding) = configure(&path)?;
+        let mut complete_session = product_session(10)?;
+        let mut vector_session = product_session(11)?;
+        let complete_handle = begin_transaction(&mut product, &mut complete_session, 1)?;
+        let vector_handle = begin_transaction(&mut product, &mut vector_session, 1)?;
+        let mut complete = document(
+            720,
+            "concurrent complete insert",
+            "book",
+            1,
+            [2.0, 0.0],
+            [0.0, 0.0],
+        )?;
+        complete.vectors.remove("semantic");
+        dispatch_operation(
+            &mut product,
+            &mut complete_session,
+            2,
+            ProductOperation::TransactionStageSearch {
+                handle: complete_handle,
+                mutation: ProductTransactionSearchMutation::Document {
+                    collection: binding.collection,
+                    document: complete.clone(),
+                },
+            },
+        )?;
+        let semantic = binding
+            .vectors
+            .iter()
+            .find(|target| target.name == "semantic")
+            .ok_or("missing semantic target")?
+            .index;
+        dispatch_operation(
+            &mut product,
+            &mut vector_session,
+            2,
+            ProductOperation::TransactionStageVector {
+                handle: vector_handle,
+                mutation: ProductTransactionVectorMutation::Upsert {
+                    index: semantic,
+                    object_id: complete.object_id,
+                    vector: ProductVector::new([9.0, 0.0])?,
+                },
+            },
+        )?;
+
+        let rejected = if complete_first {
+            dispatch_operation(
+                &mut product,
+                &mut complete_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: complete_handle,
+                },
+            )?;
+            dispatch_operation(
+                &mut product,
+                &mut vector_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: vector_handle,
+                },
+            )
+        } else {
+            dispatch_operation(
+                &mut product,
+                &mut vector_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: vector_handle,
+                },
+            )?;
+            dispatch_operation(
+                &mut product,
+                &mut complete_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: complete_handle,
+                },
+            )
+        };
+        assert_eq!(
+            rejected
+                .expect_err("stale same-object writer committed")
+                .code(),
+            hyphae_native_product::ProductErrorCode::WriteConflict
+        );
+
+        let page = NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(0)?,
+            binding.collection,
+            None,
+            1,
+        )?;
+        if complete_first {
+            assert_eq!(page.documents, [complete.clone()]);
+            assert_eq!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("image", [2.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits[0]
+                    .object_id,
+                complete.object_id
+            );
+            assert!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("semantic", [9.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits
+                    .is_empty()
+            );
+        } else {
+            assert!(page.documents.is_empty());
+            assert!(
+                product
+                    .search_collection(binding.collection, &lexical_request("concurrent"), 0)?
+                    .hits
+                    .is_empty()
+            );
+        }
+        drop(product);
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn complete_replacement_and_vector_upsert_conflict_without_partial_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    for complete_first in [true, false] {
+        let path = temporary(if complete_first {
+            "replace-race-complete-first"
+        } else {
+            "replace-race-vector-first"
+        });
+        let (mut product, binding) = configure(&path)?;
+        let original = document(730, "original image", "book", 1, [0.0, 0.0], [0.0, 0.0])?;
+        product.ingest_search_batch(
+            binding.collection,
+            &ProductSearchIngestBatch {
+                idempotency_id: 92,
+                documents: vec![original.clone()],
+            },
+            1,
+            ProductDurability::Strict,
+        )?;
+        let mut complete_session = product_session(20)?;
+        let mut vector_session = product_session(21)?;
+        let complete_handle = begin_transaction(&mut product, &mut complete_session, 1)?;
+        let vector_handle = begin_transaction(&mut product, &mut vector_session, 1)?;
+        let mut replacement =
+            document(730, "replacement image", "gear", 2, [2.0, 0.0], [0.0, 0.0])?;
+        replacement.vectors.remove("semantic");
+        dispatch_operation(
+            &mut product,
+            &mut complete_session,
+            2,
+            ProductOperation::TransactionStageSearch {
+                handle: complete_handle,
+                mutation: ProductTransactionSearchMutation::Document {
+                    collection: binding.collection,
+                    document: replacement.clone(),
+                },
+            },
+        )?;
+        let semantic = binding
+            .vectors
+            .iter()
+            .find(|target| target.name == "semantic")
+            .ok_or("missing semantic target")?
+            .index;
+        dispatch_operation(
+            &mut product,
+            &mut vector_session,
+            2,
+            ProductOperation::TransactionStageVector {
+                handle: vector_handle,
+                mutation: ProductTransactionVectorMutation::Upsert {
+                    index: semantic,
+                    object_id: replacement.object_id,
+                    vector: ProductVector::new([9.0, 0.0])?,
+                },
+            },
+        )?;
+        let rejected = if complete_first {
+            dispatch_operation(
+                &mut product,
+                &mut complete_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: complete_handle,
+                },
+            )?;
+            dispatch_operation(
+                &mut product,
+                &mut vector_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: vector_handle,
+                },
+            )
+        } else {
+            dispatch_operation(
+                &mut product,
+                &mut vector_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: vector_handle,
+                },
+            )?;
+            dispatch_operation(
+                &mut product,
+                &mut complete_session,
+                3,
+                ProductOperation::TransactionCommit {
+                    handle: complete_handle,
+                },
+            )
+        };
+        assert_eq!(
+            rejected
+                .expect_err("stale complete replacement committed")
+                .code(),
+            hyphae_native_product::ProductErrorCode::WriteConflict
+        );
+
+        let page = NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(0)?,
+            binding.collection,
+            None,
+            1,
+        )?;
+        if complete_first {
+            assert_eq!(page.documents, [replacement.clone()]);
+            assert_eq!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("image", [2.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits[0]
+                    .object_id,
+                replacement.object_id
+            );
+            assert!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("semantic", [9.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                product
+                    .search_collection(binding.collection, &lexical_request("replacement"), 0)?
+                    .hits[0]
+                    .object_id,
+                replacement.object_id
+            );
+        } else {
+            let mut vector_winner = original.clone();
+            vector_winner
+                .vectors
+                .insert("semantic".to_owned(), ProductVector::new([9.0, 0.0])?);
+            assert_eq!(page.documents, [vector_winner]);
+            assert!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("image", [2.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                product
+                    .search_collection(
+                        binding.collection,
+                        &vector_request("semantic", [9.0, 0.0], None, Some(0.0))?,
+                        0,
+                    )?
+                    .hits[0]
+                    .object_id,
+                original.object_id
+            );
+            assert_eq!(
+                product
+                    .search_collection(binding.collection, &lexical_request("original"), 0)?
+                    .hits[0]
+                    .object_id,
+                original.object_id
+            );
+        }
+        drop(product);
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ordinary_absent_delete_is_a_noop_and_complete_replacement_rolls_back()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("complete-image-rollback");
+    let (mut product, binding) = configure(&path)?;
+    let original = document(740, "rollback original", "book", 1, [0.0, 0.0], [0.0, 0.0])?;
+    product.ingest_search_batch(
+        binding.collection,
+        &ProductSearchIngestBatch {
+            idempotency_id: 93,
+            documents: vec![original.clone()],
+        },
+        1,
+        ProductDurability::Strict,
+    )?;
+    let semantic = binding
+        .vectors
+        .iter()
+        .find(|target| target.name == "semantic")
+        .ok_or("missing semantic target")?
+        .index;
+    let before = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 1,
+        })?;
+    let mut session = product_session(30)?;
+    let handle = begin_transaction(&mut product, &mut session, 1)?;
+    let response = dispatch_operation(
+        &mut product,
+        &mut session,
+        2,
+        ProductOperation::TransactionStageVector {
+            handle,
+            mutation: ProductTransactionVectorMutation::Delete {
+                index: semantic,
+                object_id: ObjectId::new(999)?,
+            },
+        },
+    )?;
+    assert!(matches!(
+        response,
+        ProductResponse::TransactionStaged(ref receipt)
+            if !receipt.changed
+                && receipt.result == ProductTransactionStageResult::Vector(false)
+    ));
+    dispatch_operation(
+        &mut product,
+        &mut session,
+        3,
+        ProductOperation::TransactionRollback { handle },
+    )?;
+    let after_noop = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 1,
+        })?;
+    assert_eq!(after_noop.snapshot.root_digest, before.snapshot.root_digest);
+    assert_eq!(after_noop.physical.page_count, before.physical.page_count);
+
+    let handle = begin_transaction(&mut product, &mut session, 4)?;
+    let mut replacement = document(
+        740,
+        "rollback replacement",
+        "gear",
+        2,
+        [2.0, 0.0],
+        [0.0, 0.0],
+    )?;
+    replacement.vectors.remove("semantic");
+    dispatch_operation(
+        &mut product,
+        &mut session,
+        5,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: ProductTransactionSearchMutation::Document {
+                collection: binding.collection,
+                document: replacement,
+            },
+        },
+    )?;
+    assert!(matches!(
+        dispatch_operation(
+            &mut product,
+            &mut session,
+            6,
+            ProductOperation::TransactionRollback { handle },
+        )?,
+        ProductResponse::TransactionRolledBack(_)
+    ));
+    let page = NativeProduct::search_documents_at_snapshot(
+        &product.snapshot_bounded(1)?,
+        binding.collection,
+        None,
+        1,
+    )?;
+    assert_eq!(page.documents.as_slice(), std::slice::from_ref(&original));
+    for target in ["image", "semantic"] {
+        assert_eq!(
+            product
+                .search_collection(
+                    binding.collection,
+                    &vector_request(target, [0.0, 0.0], None, Some(0.0))?,
+                    1,
+                )?
+                .hits[0]
+                .object_id,
+            original.object_id
+        );
+    }
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn complete_replacement_recovers_old_or_whole_image_at_every_commit_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let boundaries = [
+        (CommitBoundary::BlobStaged, false),
+        (CommitBoundary::BlobPromoted, false),
+        (CommitBoundary::PageAppended, false),
+        (CommitBoundary::PageSynchronized, false),
+        (CommitBoundary::WalAppended, true),
+        (CommitBoundary::WalSynchronized, true),
+        (CommitBoundary::RootPublished, true),
+    ];
+    for (boundary, replacement_committed) in boundaries {
+        let path = temporary(&format!("complete-image-crash-{boundary:?}"));
+        let (mut product, binding) = configure(&path)?;
+        let original = document(750, "crash original", "book", 1, [0.0, 0.0], [0.0, 0.0])?;
+        let original_receipt = product.ingest_search_batch(
+            binding.collection,
+            &ProductSearchIngestBatch {
+                idempotency_id: 94,
+                documents: vec![original.clone()],
+            },
+            1,
+            ProductDurability::Strict,
+        )?;
+        let original_csn = original_receipt
+            .commit
+            .ok_or("missing original crash-matrix commit")?
+            .commit_csn;
+        let mut replacement =
+            document(750, "crash replacement", "gear", 2, [2.0, 0.0], [0.0, 0.0])?;
+        replacement.vectors.remove("semantic");
+        let mut session = product_session(40)?;
+        let handle = begin_transaction(&mut product, &mut session, 1)?;
+        dispatch_operation(
+            &mut product,
+            &mut session,
+            2,
+            ProductOperation::TransactionStageSearch {
+                handle,
+                mutation: ProductTransactionSearchMutation::Document {
+                    collection: binding.collection,
+                    document: replacement.clone(),
+                },
+            },
+        )?;
+        let context = proof_context(&session, 3);
+        assert!(
+            commit_explicit_transaction_with_interruption_for_test(
+                &mut product,
+                &mut session,
+                &context,
+                handle,
+                boundary,
+            )
+            .is_err()
+        );
+        drop(product);
+
+        let reopened = NativeProduct::open(&path)?;
+        let expected = if replacement_committed {
+            &replacement
+        } else {
+            &original
+        };
+        let page = NativeProduct::search_documents_at_snapshot(
+            &reopened.snapshot_bounded(1)?,
+            binding.collection,
+            None,
+            1,
+        )?;
+        assert_eq!(page.documents.as_slice(), std::slice::from_ref(expected));
+        assert_eq!(
+            page.snapshot.visible_csn.map(hyphae_native_types::Csn::get),
+            Some(original_csn + u64::from(replacement_committed)),
+            "unexpected recovered CSN at {boundary:?}"
+        );
+        assert_eq!(
+            reopened
+                .search_collection(
+                    binding.collection,
+                    &vector_request(
+                        "image",
+                        if replacement_committed {
+                            [2.0, 0.0]
+                        } else {
+                            [0.0, 0.0]
+                        },
+                        None,
+                        Some(0.0),
+                    )?,
+                    1,
+                )?
+                .hits[0]
+                .object_id,
+            expected.object_id
+        );
+        assert!(
+            reopened
+                .search_collection(
+                    binding.collection,
+                    &vector_request(
+                        "image",
+                        if replacement_committed {
+                            [0.0, 0.0]
+                        } else {
+                            [2.0, 0.0]
+                        },
+                        None,
+                        Some(0.0),
+                    )?,
+                    1,
+                )?
+                .hits
+                .is_empty(),
+            "mixed image survived at {boundary:?}"
+        );
+        let semantic = reopened.search_collection(
+            binding.collection,
+            &vector_request("semantic", [0.0, 0.0], None, Some(0.0))?,
+            1,
+        )?;
+        assert_eq!(semantic.hits.is_empty(), replacement_committed);
+        assert_eq!(
+            reopened
+                .search_collection(
+                    binding.collection,
+                    &lexical_request(if replacement_committed {
+                        "replacement"
+                    } else {
+                        "original"
+                    }),
+                    1,
+                )?
+                .hits[0]
+                .object_id,
+            expected.object_id
+        );
+        assert!(
+            reopened
+                .search_collection(
+                    binding.collection,
+                    &lexical_request(if replacement_committed {
+                        "original"
+                    } else {
+                        "replacement"
+                    }),
+                    1,
+                )?
+                .hits
+                .is_empty(),
+            "mixed lexical image survived at {boundary:?}"
+        );
+        drop(reopened);
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 fn proof_session() -> Result<ProductSession, Box<dyn std::error::Error>> {
+    product_session(1)
+}
+
+fn product_session(id: u128) -> Result<ProductSession, Box<dyn std::error::Error>> {
     let principal = ProductPrincipal::new("integrated-proof").ok_or("invalid principal")?;
     Ok(ProductSession::new(
-        ProductSessionId::new(1).ok_or("zero session")?,
+        ProductSessionId::new(id).ok_or("zero session")?,
         principal,
         ProductAuthorization::ALL,
     ))
@@ -294,6 +1782,97 @@ fn proof_context(session: &ProductSession, request_id: u128) -> ProductRequestCo
         session.principal().clone(),
         session.authorization(),
     )
+}
+
+#[allow(clippy::result_large_err)]
+fn dispatch_operation(
+    product: &mut NativeProduct,
+    session: &mut ProductSession,
+    request_id: u128,
+    operation: ProductOperation,
+) -> Result<ProductResponse, ProductError> {
+    let context = proof_context(session, request_id);
+    product.dispatch(session, &context, operation)
+}
+
+fn begin_transaction(
+    product: &mut NativeProduct,
+    session: &mut ProductSession,
+    request_id: u128,
+) -> Result<ProductTransactionHandle, Box<dyn std::error::Error>> {
+    let response = dispatch_operation(
+        product,
+        session,
+        request_id,
+        ProductOperation::TransactionBegin,
+    )?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = response
+    else {
+        return Err("transaction did not begin".into());
+    };
+    Ok(handle)
+}
+
+fn vector_request(
+    target: &str,
+    query: [f32; 2],
+    execution: Option<ProductVectorExecution>,
+    max_distance: Option<f64>,
+) -> Result<ProductSearchRequest, Box<dyn std::error::Error>> {
+    Ok(ProductSearchRequest {
+        lexical: None,
+        vectors: vec![ProductVectorBranch {
+            target: target.to_owned(),
+            query: ProductVector::new(query)?,
+            candidate_limit: 16,
+            weight: 1,
+            execution,
+            max_distance: max_distance.map(hyphae_native_product::CanonicalF64::new),
+        }],
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 16,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    })
+}
+
+fn lexical_request(query: &str) -> ProductSearchRequest {
+    ProductSearchRequest {
+        lexical: Some(ProductLexicalBranch {
+            query: query.to_owned(),
+            candidate_limit: 16,
+            weight: 1,
+            operator: None,
+            prefix: false,
+            fields: Vec::new(),
+            fuzzy: None,
+            phrase: false,
+        }),
+        vectors: Vec::new(),
+        filter: ProductSearchFilter::MatchAll,
+        sort: Vec::new(),
+        facets: Vec::new(),
+        range_facets: Vec::new(),
+        aggregations: Vec::new(),
+        limit: 16,
+        fusion: None,
+        parent_dedupe: None,
+        rerank: None,
+        highlight: None,
+        autocut: None,
+        offset: 0,
+    }
 }
 
 #[test]
@@ -492,7 +2071,9 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
             .iter()
             .all(|receipt| receipt.candidate_count > 0 && receipt.exact_reranked)
     );
-    assert!(broad.approximate);
+    // Match-all is the four-document manifest allowlist, so the native
+    // filtered path selects its established eligible-count <= ef exact mode.
+    assert!(!broad.approximate);
     assert!(broad.lexical_candidates > 0);
     assert!(broad.hits.len() >= 3);
 
@@ -566,6 +2147,248 @@ fn adaptive_exact_broad_filter_aware_ann_and_multi_target_rrf_are_reported()
         hyphae_native_product::ProductErrorCode::InvalidRequest
     );
     drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bounded_product_ann_preserves_shadow_underfill_filtered_hybrid_and_native_counters()
+-> Result<(), Box<dyn std::error::Error>> {
+    const DOCUMENT_COUNT: u16 = 128;
+    const KEPT_DOCUMENTS: u16 = 64;
+
+    let path = temporary("bounded-shadow-traversal");
+    let (mut product, binding) = configure_full(&path, None, vec![AnalyzerFilter::Lowercase], 1)?;
+    let image_index = binding
+        .vectors
+        .iter()
+        .find(|vector| vector.name == "image")
+        .ok_or("missing image vector binding")?
+        .index;
+    let documents = (0..DOCUMENT_COUNT)
+        .map(|ordinal| {
+            let mut document = document(
+                10_000 + u128::from(ordinal),
+                if ordinal == 2 { "hybrid" } else { "plain" },
+                if ordinal < KEPT_DOCUMENTS {
+                    "keep"
+                } else {
+                    "drop"
+                },
+                i64::from(ordinal),
+                [f32::from(ordinal), 0.0],
+                [f32::from(ordinal), 0.0],
+            )?;
+            document.vectors.remove("semantic");
+            Ok::<_, Box<dyn std::error::Error>>(document)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let shadowed = documents[0].object_id;
+    let second = documents[1].object_id;
+    let third = documents[2].object_id;
+    for (batch, chunk) in documents.chunks(4).enumerate() {
+        product
+            .ingest_search_batch(
+                binding.collection,
+                &ProductSearchIngestBatch {
+                    idempotency_id: u128::try_from(batch)? + 1,
+                    documents: chunk.to_vec(),
+                },
+                1,
+                ProductDurability::Strict,
+            )
+            .map_err(|error| format!("large product ingest batch {batch} failed: {error:?}"))?;
+    }
+    drop(product);
+
+    // Consolidating the product ingest's object deltas creates a real single
+    // HNSW base. The later product update then shadows its nearest vector.
+    let mut runtime = NativeDatabase::open(&path)?;
+    let consolidation = runtime.plan_ann_consolidation(
+        image_index,
+        usize::from(DOCUMENT_COUNT),
+        usize::from(DOCUMENT_COUNT),
+    )?;
+    runtime.consolidate_ann(consolidation, DurabilityClass::Strict)?;
+    let observation = runtime.observe_ann_index(image_index)?;
+    assert_eq!(observation.base_vector_count, usize::from(DOCUMENT_COUNT));
+    assert_eq!(observation.delta_records, 0);
+    drop(runtime);
+
+    let mut product = NativeProduct::open(&path)?;
+    let mut replacement = documents[0].clone();
+    assert_eq!(replacement.object_id, shadowed);
+    replacement.vectors.remove("image");
+    product
+        .update_search_document(
+            binding.collection,
+            &ProductSearchDocumentUpdate {
+                idempotency_id: 100,
+                document: replacement,
+            },
+            2,
+            ProductDurability::Strict,
+        )
+        .map_err(|error| format!("shadowing product update failed: {error:?}"))?;
+
+    let filter = ProductSearchFilter::Compare {
+        field: "category".into(),
+        operator: ProductSearchOperator::Equal,
+        value: ProductDocValue::String("keep".into()),
+    };
+    let mut low = vector_request(
+        "image",
+        [0.0, 0.0],
+        Some(ProductVectorExecution::Ann {
+            ef_search: 2,
+            exact_rerank: None,
+        }),
+        None,
+    )?;
+    low.vectors[0].candidate_limit = 2;
+    low.limit = 2;
+    let underfilled = product
+        .search_collection(binding.collection, &low, 2)
+        .map_err(|error| format!("low-breadth product search failed: {error:?}"))?;
+    assert_eq!(underfilled.eligible_documents, usize::from(DOCUMENT_COUNT));
+    assert_eq!(underfilled.hits.len(), 1);
+    assert_eq!(underfilled.hits[0].object_id, second);
+    assert!(underfilled.approximate);
+    assert_eq!(
+        underfilled.vector_branches[0].strategy,
+        ProductVectorStrategy::FilterAwareAnn
+    );
+    assert!(underfilled.vector_branches[0].visited_nodes > 0);
+    assert!(!underfilled.vector_branches[0].exact_reranked);
+
+    let mut high = low.clone();
+    high.vectors[0].execution = Some(ProductVectorExecution::Ann {
+        ef_search: 3,
+        exact_rerank: None,
+    });
+    let filled = product
+        .search_collection(binding.collection, &high, 2)
+        .map_err(|error| format!("high-breadth product search failed: {error:?}"))?;
+    assert_eq!(
+        filled
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        [second, third]
+    );
+    assert!(filled.approximate);
+
+    let mut hybrid = low.clone();
+    hybrid.filter = filter;
+    hybrid.lexical = Some(ProductLexicalBranch {
+        query: "hybrid".into(),
+        candidate_limit: 1,
+        weight: 2,
+        operator: None,
+        prefix: false,
+        fields: Vec::new(),
+        fuzzy: None,
+        phrase: false,
+    });
+    let hybrid_result = product
+        .search_collection(binding.collection, &hybrid, 2)
+        .map_err(|error| format!("hybrid product search failed: {error:?}"))?;
+    assert_eq!(
+        hybrid_result.eligible_documents,
+        usize::from(KEPT_DOCUMENTS)
+    );
+    assert_eq!(hybrid_result.lexical_candidates, 1);
+    assert_eq!(hybrid_result.retrieval_candidates, 2);
+    assert_eq!(
+        hybrid_result
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        [third, second]
+    );
+    assert!(hybrid_result.hits.iter().all(|hit| matches!(
+        hit.doc_values.get("category"),
+        Some(ProductDocValue::String(category)) if category == "keep"
+    )));
+
+    let mut single = low.clone();
+    single.vectors[0].candidate_limit = 1;
+    single.vectors[0].execution = Some(ProductVectorExecution::Ann {
+        ef_search: 1,
+        exact_rerank: None,
+    });
+    single.limit = 1;
+    let single_result = product
+        .search_collection(binding.collection, &single, 2)
+        .map_err(|error| format!("single-candidate product search failed: {error:?}"))?;
+    assert!(single_result.hits.is_empty());
+    let product_receipt = single_result.vector_branches[0].clone();
+    assert!(product_receipt.candidate_count > 0);
+    assert!(product_receipt.candidate_count < usize::from(DOCUMENT_COUNT));
+    assert_eq!(
+        product_receipt.candidate_count,
+        product_receipt.visited_nodes
+    );
+    assert!(!product_receipt.exact_reranked);
+    drop(product);
+
+    let runtime = NativeDatabase::open(&path)?;
+    let collection_allowlist = (0..DOCUMENT_COUNT)
+        .map(|ordinal| ObjectId::new(10_000 + u128::from(ordinal)))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let direct = runtime.search_ann_filtered_latest(
+        image_index,
+        &ProductVector::new([0.0, 0.0])?,
+        AnnSearchOptions::new(1, 1, None)?,
+        &collection_allowlist,
+    )?;
+    assert_eq!(
+        direct.strategy,
+        AnnSearchStrategy::StableIdEligibilityTraversal
+    );
+    assert!(direct.hits.is_empty());
+    assert_eq!(product_receipt.candidate_count, direct.candidate_count);
+    assert_eq!(product_receipt.visited_nodes, direct.visited_nodes);
+    assert_eq!(product_receipt.exact_reranked, direct.exact_reranked);
+    assert_eq!(product_receipt.approximate, direct.approximate);
+
+    let kept_allowlist = (0..KEPT_DOCUMENTS)
+        .map(|ordinal| ObjectId::new(10_000 + u128::from(ordinal)))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let direct_filtered = runtime.search_ann_filtered_latest(
+        image_index,
+        &ProductVector::new([0.0, 0.0])?,
+        AnnSearchOptions::new(2, 2, None)?,
+        &kept_allowlist,
+    )?;
+    assert_eq!(
+        direct_filtered.strategy,
+        AnnSearchStrategy::StableIdEligibilityTraversal
+    );
+    assert_eq!(
+        direct_filtered
+            .hits
+            .iter()
+            .map(|hit| hit.object_id)
+            .collect::<Vec<_>>(),
+        [second]
+    );
+    assert_eq!(
+        hybrid_result.vector_branches[0].candidate_count,
+        direct_filtered.candidate_count
+    );
+    assert_eq!(
+        hybrid_result.vector_branches[0].visited_nodes,
+        direct_filtered.visited_nodes
+    );
+    assert_eq!(
+        hybrid_result.vector_branches[0].exact_reranked,
+        direct_filtered.exact_reranked
+    );
+    drop(runtime);
     fs::remove_dir_all(path)?;
     Ok(())
 }
@@ -781,7 +2604,7 @@ fn invalid_batch_is_atomic_and_stream_enforces_backpressure_and_idempotency()
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn idempotency_conflicts_and_document_update_delete_survive_reopen()
+fn idempotency_update_and_m05_document_delete_survive_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = temporary("lifecycle");
     let (mut product, binding) = configure(&path)?;
@@ -814,15 +2637,86 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
         hyphae_native_product::ProductErrorCode::IdempotencyConflict,
     );
 
-    product.update_search_document(
+    let mut replacement = document(501, "new token", "gear", 2, [1.0, 0.0], [1.0, 0.0])?;
+    replacement.vectors.remove("semantic");
+    let update = ProductSearchDocumentUpdate {
+        idempotency_id: 42,
+        document: replacement,
+    };
+    let updated = product.update_search_document(
         binding.collection,
-        &ProductSearchDocumentUpdate {
-            idempotency_id: 42,
-            document: document(501, "new token", "gear", 2, [1.0, 0.0], [1.0, 0.0])?,
-        },
+        &update,
         0,
         ProductDurability::Strict,
     )?;
+    let update_commit = updated.commit.ok_or("missing update commit")?;
+    let after_update = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 0,
+        })?
+        .physical;
+    let update_replay = product.update_search_document(
+        binding.collection,
+        &update,
+        1,
+        ProductDurability::Strict,
+    )?;
+    assert!(update_replay.idempotent_replay);
+    assert_eq!(update_replay.commit, Some(update_commit));
+    assert_eq!(
+        update_replay.commit.map(|commit| commit.transaction_id),
+        Some(update_commit.transaction_id)
+    );
+    assert_eq!(
+        update_replay.commit.map(|commit| commit.commit_csn),
+        Some(update_commit.commit_csn)
+    );
+    let after_update_replay = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 1,
+        })?
+        .physical;
+    assert_eq!(after_update_replay.page_count, after_update.page_count);
+    assert_eq!(after_update_replay.wal_bytes, after_update.wal_bytes);
+    drop(product);
+
+    let mut product = NativeProduct::open(&path)?;
+    let before_reopened_update_replay = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 2,
+        })?
+        .physical;
+    let reopened_update_replay = product.update_search_document(
+        binding.collection,
+        &update,
+        2,
+        ProductDurability::Strict,
+    )?;
+    assert!(reopened_update_replay.idempotent_replay);
+    assert_eq!(reopened_update_replay.commit, Some(update_commit));
+    assert_eq!(
+        reopened_update_replay
+            .commit
+            .map(|commit| (commit.transaction_id, commit.commit_csn)),
+        Some((update_commit.transaction_id, update_commit.commit_csn))
+    );
+    let after_reopened_update_replay = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 2,
+        })?
+        .physical;
+    assert_eq!(
+        after_reopened_update_replay.page_count,
+        before_reopened_update_replay.page_count
+    );
+    assert_eq!(
+        after_reopened_update_replay.wal_bytes,
+        before_reopened_update_replay.wal_bytes
+    );
     let query = |text: &str| ProductSearchRequest {
         lexical: Some(ProductLexicalBranch {
             query: text.into(),
@@ -861,18 +2755,95 @@ fn idempotency_conflicts_and_document_update_delete_survive_reopen()
             .len(),
         1
     );
+    assert_eq!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("image", [1.0, 0.0], None, Some(0.0))?,
+                0,
+            )?
+            .hits[0]
+            .object_id,
+        ObjectId::new(501)?
+    );
+    assert!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("semantic", [0.0, 0.0], None, None)?,
+                0,
+            )?
+            .hits
+            .is_empty()
+    );
 
-    product.delete_search_document(
-        binding.collection,
-        ProductSearchDocumentDelete {
-            idempotency_id: 43,
-            object_id: ObjectId::new(501)?,
-        },
-        0,
-        ProductDurability::Strict,
-    )?;
+    let delete = ProductSearchDocumentDelete {
+        idempotency_id: 43,
+        object_id: ObjectId::new(501)?,
+    };
+    let deleted =
+        product.delete_search_document(binding.collection, delete, 3, ProductDurability::Strict)?;
+    let delete_commit = deleted.commit.ok_or("missing delete commit")?;
+    let after_delete = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 3,
+        })?
+        .physical;
+    let delete_replay =
+        product.delete_search_document(binding.collection, delete, 4, ProductDurability::Strict)?;
+    assert!(delete_replay.idempotent_replay);
+    assert_eq!(delete_replay.commit, Some(delete_commit));
+    assert_eq!(
+        delete_replay
+            .commit
+            .map(|commit| (commit.transaction_id, commit.commit_csn)),
+        Some((delete_commit.transaction_id, delete_commit.commit_csn))
+    );
+    let after_delete_replay = product
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 4,
+        })?
+        .physical;
+    assert_eq!(after_delete_replay.page_count, after_delete.page_count);
+    assert_eq!(after_delete_replay.wal_bytes, after_delete.wal_bytes);
     drop(product);
     let mut reopened = NativeProduct::open(&path)?;
+    let before_reopened_delete_replay = reopened
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 5,
+        })?
+        .physical;
+    let reopened_delete_replay = reopened.delete_search_document(
+        binding.collection,
+        delete,
+        5,
+        ProductDurability::Strict,
+    )?;
+    assert!(reopened_delete_replay.idempotent_replay);
+    assert_eq!(reopened_delete_replay.commit, Some(delete_commit));
+    assert_eq!(
+        reopened_delete_replay
+            .commit
+            .map(|commit| (commit.transaction_id, commit.commit_csn)),
+        Some((delete_commit.transaction_id, delete_commit.commit_csn))
+    );
+    let after_reopened_delete_replay = reopened
+        .administration()
+        .status(hyphae_native_product::StatusRequest {
+            logical_time_micros: 5,
+        })?
+        .physical;
+    assert_eq!(
+        after_reopened_delete_replay.page_count,
+        before_reopened_delete_replay.page_count
+    );
+    assert_eq!(
+        after_reopened_delete_replay.wal_bytes,
+        before_reopened_delete_replay.wal_bytes
+    );
     let reopened_replay =
         reopened.ingest_search_batch(binding.collection, &batch, 0, ProductDurability::Strict)?;
     assert_eq!(reopened_replay.commit, original.commit);
@@ -1424,6 +3395,7 @@ fn stemming_and_stop_word_analyzers_are_real_and_survive_reopen()
             AnalyzerFilter::EnglishStopV1,
             AnalyzerFilter::EnglishStemV1,
         ],
+        2,
     )?;
     let batch = ProductSearchIngestBatch {
         idempotency_id: 1,
@@ -2151,24 +4123,31 @@ fn explicit_transaction_stages_a_complete_document_atomically()
     else {
         return Err("transaction did not begin".into());
     };
-    let document = ProductDocument {
-        object_id: ObjectId::new(900)?,
-        text: "atomic staged document".to_owned(),
-        doc_values: BTreeMap::new(),
-        vectors: BTreeMap::new(),
-    };
+    let initial_document = document(
+        900,
+        "atomic staged first image",
+        "book",
+        11,
+        [0.0, 0.0],
+        [0.0, 0.0],
+    )?;
     let c2 = proof_context(&session, 2);
-    product.dispatch(
+    let staged = product.dispatch(
         &mut session,
         &c2,
         ProductOperation::TransactionStageSearch {
             handle,
             mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
                 collection: binding.collection,
-                document: document.clone(),
+                document: initial_document.clone(),
             },
         },
     )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.changed && receipt.result == ProductTransactionStageResult::Search
+    ));
     let c3 = proof_context(&session, 3);
     let committed = product.dispatch(
         &mut session,
@@ -2183,7 +4162,7 @@ fn explicit_transaction_stages_a_complete_document_atomically()
         binding.collection,
         &ProductSearchRequest {
             lexical: Some(ProductLexicalBranch {
-                query: "atomic staged".to_owned(),
+                query: "atomic staged first".to_owned(),
                 candidate_limit: 10,
                 weight: 1,
                 operator: None,
@@ -2216,6 +4195,35 @@ fn explicit_transaction_stages_a_complete_document_atomically()
             .collect::<Vec<_>>(),
         vec![900]
     );
+    assert_eq!(
+        result.hits[0].doc_values["category"],
+        ProductDocValue::String("book".to_owned())
+    );
+    assert_eq!(
+        result.hits[0].doc_values["price"],
+        ProductDocValue::Integer(11)
+    );
+    assert_eq!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("image", [0.0, 0.0], None, Some(0.0))?,
+                0,
+            )?
+            .hits[0]
+            .object_id,
+        initial_document.object_id
+    );
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(0)?,
+            binding.collection,
+            None,
+            1,
+        )?
+        .documents,
+        [initial_document]
+    );
     let c4 = proof_context(&session, 4);
     let begin = product.dispatch(&mut session, &c4, ProductOperation::TransactionBegin)?;
     let hyphae_native_product::ProductResponse::ExplicitTransactionStatus(
@@ -2224,28 +4232,312 @@ fn explicit_transaction_stages_a_complete_document_atomically()
     else {
         return Err("replacement transaction did not begin".into());
     };
+    let mut replacement = document(
+        900,
+        "atomic staged replacement image",
+        "gear",
+        22,
+        [2.0, 0.0],
+        [2.0, 0.0],
+    )?;
+    replacement.vectors.remove("semantic");
     let c5 = proof_context(&session, 5);
-    product.dispatch(
+    let staged = product.dispatch(
         &mut session,
         &c5,
         ProductOperation::TransactionStageSearch {
             handle,
             mutation: hyphae_native_product::ProductTransactionSearchMutation::Document {
                 collection: binding.collection,
-                document,
+                document: replacement.clone(),
             },
         },
     )?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.changed && receipt.result == ProductTransactionStageResult::Search
+    ));
     let c6 = proof_context(&session, 6);
-    product.dispatch(
+    let committed = product.dispatch(
         &mut session,
         &c6,
         ProductOperation::TransactionCommit { handle },
     )?;
+    assert!(matches!(
+        committed,
+        ProductResponse::TransactionCommitted(ref receipt) if receipt.staged_operations == 1
+    ));
+    assert!(
+        product
+            .search_collection(binding.collection, &lexical_request("first"), 0)?
+            .hits
+            .is_empty()
+    );
+    let replacement_result =
+        product.search_collection(binding.collection, &lexical_request("replacement"), 0)?;
+    assert_eq!(replacement_result.hits.len(), 1);
+    assert_eq!(replacement_result.hits[0].object_id, replacement.object_id);
+    assert_eq!(
+        replacement_result.hits[0].doc_values["category"],
+        ProductDocValue::String("gear".to_owned())
+    );
+    assert_eq!(
+        replacement_result.hits[0].doc_values["price"],
+        ProductDocValue::Integer(22)
+    );
+    assert_eq!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("image", [2.0, 0.0], None, Some(0.0))?,
+                0,
+            )?
+            .hits[0]
+            .object_id,
+        replacement.object_id
+    );
+    assert!(
+        product
+            .search_collection(
+                binding.collection,
+                &vector_request("semantic", [0.0, 0.0], None, Some(0.0))?,
+                0,
+            )?
+            .hits
+            .is_empty()
+    );
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(
+            &product.snapshot_bounded(0)?,
+            binding.collection,
+            None,
+            1,
+        )?
+        .documents,
+        [replacement.clone()]
+    );
     drop(product);
     let reopened = NativeProduct::open(&path)?;
     reopened.resolve_search_collection_binding(binding.collection, 0)?;
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(
+            &reopened.snapshot_bounded(0)?,
+            binding.collection,
+            None,
+            1,
+        )?
+        .documents,
+        [replacement]
+    );
+    assert!(
+        reopened
+            .search_collection(binding.collection, &lexical_request("first"), 0)?
+            .hits
+            .is_empty()
+    );
     drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn transaction_started_before_provisioning_never_observes_the_new_binding_or_manifest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("transaction-provisioning-snapshot");
+    let mut product = configure_catalog(&path)?;
+    let collection = ObjectId::new(13)?;
+    let mut session = proof_session()?;
+    let c1 = proof_context(&session, 1);
+    let begin = product.dispatch(&mut session, &c1, ProductOperation::TransactionBegin)?;
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        read_csn,
+        staged_operations: 0,
+        ..
+    }) = begin
+    else {
+        return Err("transaction did not begin".into());
+    };
+
+    product.provision_search_collection(collection, 0, ProductDurability::Strict)?;
+    let document = ProductDocument {
+        object_id: ObjectId::new(901)?,
+        text: "provisioned after begin".to_owned(),
+        doc_values: BTreeMap::new(),
+        vectors: BTreeMap::new(),
+    };
+    let c2 = proof_context(&session, 2);
+    let error = product
+        .dispatch(
+            &mut session,
+            &c2,
+            ProductOperation::TransactionStageSearch {
+                handle,
+                mutation: ProductTransactionSearchMutation::Document {
+                    collection,
+                    document: document.clone(),
+                },
+            },
+        )
+        .expect_err("transaction observed a binding provisioned after its snapshot");
+    assert_eq!(error.code(), ProductErrorCode::ObjectNotFound);
+    assert_eq!(error.object_id(), Some(collection));
+    assert_eq!(error.retry(), ProductRetry::Never);
+    let c3 = proof_context(&session, 3);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &c3,
+            ProductOperation::ExplicitTransactionStatus { handle },
+        )?,
+        ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+            read_csn: current_read_csn,
+            staged_operations: 0,
+            ..
+        }) if current_read_csn == read_csn
+    ));
+
+    let c4 = proof_context(&session, 4);
+    let empty_commit = product
+        .dispatch(
+            &mut session,
+            &c4,
+            ProductOperation::TransactionCommit { handle },
+        )
+        .expect_err("failed stage became committable");
+    assert_eq!(empty_commit.code(), ProductErrorCode::InvalidRequest);
+    let c5 = proof_context(&session, 5);
+    assert!(matches!(
+        product.dispatch(
+            &mut session,
+            &c5,
+            ProductOperation::TransactionRollback { handle },
+        )?,
+        ProductResponse::TransactionRolledBack(receipt) if receipt.discarded_operations == 0
+    ));
+
+    let c6 = proof_context(&session, 6);
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        ..
+    }) = product.dispatch(&mut session, &c6, ProductOperation::TransactionBegin)?
+    else {
+        return Err("post-provisioning transaction did not begin".into());
+    };
+    let c7 = proof_context(&session, 7);
+    product.dispatch(
+        &mut session,
+        &c7,
+        ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: ProductTransactionSearchMutation::Document {
+                collection,
+                document,
+            },
+        },
+    )?;
+    let c8 = proof_context(&session, 8);
+    let ProductResponse::TransactionCommitted(committed) = product.dispatch(
+        &mut session,
+        &c8,
+        ProductOperation::TransactionCommit { handle },
+    )?
+    else {
+        return Err("post-provisioning transaction did not commit".into());
+    };
+    assert_eq!(committed.staged_operations, 1);
+
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn transaction_document_stage_stays_on_its_catalog_epoch_across_a_disjoint_catalog_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("transaction-catalog-epoch");
+    let (mut product, binding) = configure(&path)?;
+    let mut session = proof_session()?;
+    let c1 = proof_context(&session, 1);
+    let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
+        handle,
+        read_csn,
+        ..
+    }) = product.dispatch(&mut session, &c1, ProductOperation::TransactionBegin)?
+    else {
+        return Err("transaction did not begin".into());
+    };
+    product
+        .create_catalog_object_v2(
+            LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
+                header: header(10_000, EngineKind::Search, "concurrent", Some(11))?,
+                tokenizer: AnalyzerTokenizer::UnicodeWord,
+                filters: vec![AnalyzerFilter::Lowercase, AnalyzerFilter::AsciiFolding],
+            })),
+            ProductDurability::Strict,
+        )
+        .map_err(|error| format!("concurrent catalog commit failed: {error:?}"))?;
+    let latest_csn = product
+        .snapshot_bounded(0)?
+        .identity()
+        .visible_csn
+        .map(hyphae_native_types::Csn::get);
+    assert!(latest_csn > read_csn);
+
+    let c2 = proof_context(&session, 2);
+    let staged = product
+        .dispatch(
+            &mut session,
+            &c2,
+            ProductOperation::TransactionStageSearch {
+                handle,
+                mutation: ProductTransactionSearchMutation::Document {
+                    collection: binding.collection,
+                    document: ProductDocument {
+                        object_id: ObjectId::new(902)?,
+                        text: "catalog epoch".to_owned(),
+                        doc_values: BTreeMap::new(),
+                        vectors: BTreeMap::new(),
+                    },
+                },
+            },
+        )
+        .map_err(|error| format!("snapshot-bound document stage failed: {error:?}"))?;
+    assert!(matches!(
+        staged,
+        ProductResponse::TransactionStaged(ref receipt)
+            if receipt.operation_ordinal == 1 && receipt.changed
+    ));
+    let c3 = proof_context(&session, 3);
+    let ProductResponse::TransactionCommitted(committed) = product
+        .dispatch(
+            &mut session,
+            &c3,
+            ProductOperation::TransactionCommit { handle },
+        )
+        .map_err(|error| format!("snapshot-bound document commit failed: {error:?}"))?
+    else {
+        return Err("transaction did not commit across disjoint catalog change".into());
+    };
+    assert_eq!(committed.staged_operations, 1);
+    let catalog = product.catalog_snapshot()?;
+    assert!(matches!(
+        product.catalog_describe(&catalog, ObjectId::new(10_000)?)?,
+        Some(LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(_)))
+    ));
+    let snapshot = product.snapshot_bounded(0)?;
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(&snapshot, binding.collection, None, 5)?
+            .documents
+            .iter()
+            .map(|document| document.object_id.get())
+            .collect::<Vec<_>>(),
+        vec![902]
+    );
+
+    drop(product);
     fs::remove_dir_all(path)?;
     Ok(())
 }

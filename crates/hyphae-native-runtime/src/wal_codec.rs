@@ -6,7 +6,7 @@ use hyphae_native_types::{
     CatalogVersion, Csn, DurabilityClass, EngineKind, Lsn, ManifestGeneration, ObjectId,
     PageGeneration, PageId, TransactionId,
 };
-use hyphae_native_wal::{PendingRecord, RecordKind, WalRecord};
+use hyphae_native_wal::{PendingRecord, RecordKind, WAL_RECORD_BODY_SIZE, WalRecord};
 use thiserror::Error;
 
 const BEGIN_MAGIC: &[u8; 8] = b"HYBGN001";
@@ -21,8 +21,17 @@ const OUTCOME_MAGIC: &[u8; 8] = b"HYOUT001";
 const OUTCOME_BODY_SIZE: usize = 120;
 const ANN_DELTA_AUTHORITY_MAGIC_V1: &[u8; 8] = b"HYANNA01";
 const ANN_DELTA_AUTHORITY_V1_SIZE: usize = 16;
+const ANN_DELTA_AUTHORITY_MAGIC_V2: &[u8; 8] = b"HYANNA02";
+pub(crate) const ANN_DELTA_AUTHORITY_V2_SIZE: usize = 184;
+const ANN_DELTA_AUTHORITY_V2_M04_TO_M05: u8 = 1;
+const ANN_DELTA_AUTHORITY_V2_MAX_OPERATIONS: u32 = 4_096;
+const ANN_CONSOLIDATION_V1_SIZE: usize = 112;
+const ANN_CONSOLIDATION_V2_SIZE: usize = 384;
 const ROOT_COUNT: usize = 4;
 const MUTATION_HAS_EXPIRY: u8 = 1;
+const MUTATION_BODY_HEADER_SIZE: usize = 44;
+const MAX_TRANSACTION_MUTATION_BYTES: u64 = 64 * 1_024 * 1_024;
+const MAX_TRANSACTION_MUTATIONS: u64 = MAX_TRANSACTION_MUTATION_BYTES / 44;
 
 #[derive(Debug, Error)]
 pub(crate) enum WalSemanticError {
@@ -98,6 +107,8 @@ pub(crate) enum Opcode {
     PublishInitialAnnBulk = 53,
     MigrateCatalogV7 = 54,
     AnnDeltaAuthorityV1 = 55,
+    AnnDeltaAuthorityV2 = 56,
+    FenceVectorAbsence = 57,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,7 +123,11 @@ pub(crate) struct Mutation {
 
 impl Mutation {
     fn encode(&self) -> Result<Vec<u8>, WalSemanticError> {
-        let mut bytes = Vec::new();
+        let capacity = MUTATION_BODY_HEADER_SIZE
+            .checked_add(self.key.len())
+            .and_then(|bytes| bytes.checked_add(self.value.len()))
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(MUTATION_MAGIC);
         bytes.push(self.opcode as u8);
         bytes.push(self.engine as u8);
@@ -128,6 +143,7 @@ impl Mutation {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ann_delta_authority_marker_v1(index: ObjectId) -> Mutation {
     let mut value = Vec::with_capacity(ANN_DELTA_AUTHORITY_V1_SIZE);
     value.extend_from_slice(ANN_DELTA_AUTHORITY_MAGIC_V1);
@@ -140,6 +156,56 @@ pub(crate) fn ann_delta_authority_marker_v1(index: ObjectId) -> Mutation {
         value,
         expires_at_micros: None,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnnDeltaAuthorityV2 {
+    pub(crate) index: ObjectId,
+    pub(crate) operation_count: u32,
+    pub(crate) prior_view_identity: [u8; 32],
+    pub(crate) result_view_identity: [u8; 32],
+    pub(crate) prior_overlay_root: [u8; 32],
+    pub(crate) result_overlay_root: [u8; 32],
+    pub(crate) prior_next_sequence: u64,
+    pub(crate) result_next_sequence: u64,
+    pub(crate) m04_to_m05: bool,
+}
+
+pub(crate) fn ann_delta_authority_marker_v2(authority: AnnDeltaAuthorityV2) -> Mutation {
+    let mut value = Vec::with_capacity(ANN_DELTA_AUTHORITY_V2_SIZE);
+    value.extend_from_slice(ANN_DELTA_AUTHORITY_MAGIC_V2);
+    value.push(u8::from(authority.m04_to_m05) * ANN_DELTA_AUTHORITY_V2_M04_TO_M05);
+    value.extend_from_slice(&[0; 7]);
+    value.extend_from_slice(&authority.index.get().to_be_bytes());
+    value.extend_from_slice(&authority.operation_count.to_le_bytes());
+    value.extend_from_slice(&[0; 4]);
+    value.extend_from_slice(&authority.prior_view_identity);
+    value.extend_from_slice(&authority.result_view_identity);
+    value.extend_from_slice(&authority.prior_overlay_root);
+    value.extend_from_slice(&authority.result_overlay_root);
+    value.extend_from_slice(&authority.prior_next_sequence.to_le_bytes());
+    value.extend_from_slice(&authority.result_next_sequence.to_le_bytes());
+    Mutation {
+        engine: EngineKind::Search,
+        opcode: Opcode::AnnDeltaAuthorityV2,
+        target: Some(authority.index),
+        key: Vec::new(),
+        value,
+        expires_at_micros: None,
+    }
+}
+
+pub(crate) fn ann_delta_authority_v2(
+    mutation: &Mutation,
+) -> Result<AnnDeltaAuthorityV2, WalSemanticError> {
+    if mutation.engine != EngineKind::Search
+        || mutation.opcode != Opcode::AnnDeltaAuthorityV2
+        || !mutation.key.is_empty()
+        || mutation.expires_at_micros.is_some()
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    decode_ann_delta_authority_v2(&mutation.value, mutation.target)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -300,36 +366,140 @@ pub(crate) struct TransactionPlan<'mutations> {
     pub(crate) retention_floor_csn: Csn,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransactionWalPreflight {
+    mutation_count: u32,
+    mutation_bytes: u64,
+    peak_memory_bytes: u64,
+}
+
+impl TransactionWalPreflight {
+    pub(crate) fn mutation_count(self) -> usize {
+        usize::try_from(self.mutation_count).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) const fn peak_memory_bytes(self) -> u64 {
+        self.peak_memory_bytes
+    }
+
+    #[cfg(test)]
+    const fn mutation_bytes(self) -> u64 {
+        self.mutation_bytes
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TransactionWalPreflightBuilder {
+    mutation_count: u32,
+    mutation_bytes: u64,
+    cloned_payload_bytes: u64,
+}
+
+impl TransactionWalPreflightBuilder {
+    pub(crate) fn push(
+        &mut self,
+        key_length: usize,
+        value_length: usize,
+    ) -> Result<(), WalSemanticError> {
+        u32::try_from(key_length).map_err(|_| WalSemanticError::LengthOverflow)?;
+        u32::try_from(value_length).map_err(|_| WalSemanticError::LengthOverflow)?;
+        let body_length = MUTATION_BODY_HEADER_SIZE
+            .checked_add(key_length)
+            .and_then(|length| length.checked_add(value_length))
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        if body_length > WAL_RECORD_BODY_SIZE {
+            return Err(WalSemanticError::LengthOverflow);
+        }
+        self.mutation_count = self
+            .mutation_count
+            .checked_add(1)
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        self.mutation_bytes = self
+            .mutation_bytes
+            .checked_add(u64::try_from(body_length).map_err(|_| WalSemanticError::LengthOverflow)?)
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        self.cloned_payload_bytes = self
+            .cloned_payload_bytes
+            .checked_add(u64::try_from(key_length).map_err(|_| WalSemanticError::LengthOverflow)?)
+            .and_then(|bytes| bytes.checked_add(u64::try_from(value_length).ok()?))
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<TransactionWalPreflight, WalSemanticError> {
+        validate_transaction_bounds(self.mutation_count, self.mutation_bytes)?;
+        let count = u64::from(self.mutation_count);
+        let mutation_slots = count
+            .checked_mul(
+                u64::try_from(std::mem::size_of::<Mutation>())
+                    .map_err(|_| WalSemanticError::LengthOverflow)?,
+            )
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        let encoded_slots = count
+            .checked_mul(
+                u64::try_from(std::mem::size_of::<Vec<u8>>())
+                    .map_err(|_| WalSemanticError::LengthOverflow)?,
+            )
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        let pending_slots = count
+            .checked_add(2)
+            .and_then(|records| {
+                records.checked_mul(u64::try_from(std::mem::size_of::<PendingRecord>()).ok()?)
+            })
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        let peak_memory_bytes = self
+            .cloned_payload_bytes
+            .checked_add(mutation_slots)
+            .and_then(|bytes| bytes.checked_add(self.mutation_bytes))
+            .and_then(|bytes| bytes.checked_add(encoded_slots))
+            .and_then(|bytes| bytes.checked_add(pending_slots))
+            .and_then(|bytes| bytes.checked_add(52 + COMMIT_V2_SIZE as u64))
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        Ok(TransactionWalPreflight {
+            mutation_count: self.mutation_count,
+            mutation_bytes: self.mutation_bytes,
+            peak_memory_bytes,
+        })
+    }
+}
+
 pub(crate) fn encode_transaction(
     plan: &TransactionPlan<'_>,
 ) -> Result<Vec<PendingRecord>, WalSemanticError> {
-    if plan.mutations.is_empty() {
-        return Err(WalSemanticError::InvalidSequence);
-    }
     validate_storage_state(
         plan.page_generation,
         plan.retention_floor_csn,
         plan.commit_csn,
     )?;
+    let mutation_count =
+        u32::try_from(plan.mutations.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
+    let mutation_bytes = plan.mutations.iter().try_fold(0_u64, |total, mutation| {
+        let body_length = MUTATION_BODY_HEADER_SIZE
+            .checked_add(mutation.key.len())
+            .and_then(|length| length.checked_add(mutation.value.len()))
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        if body_length > WAL_RECORD_BODY_SIZE {
+            return Err(WalSemanticError::LengthOverflow);
+        }
+        u32::try_from(mutation.key.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
+        u32::try_from(mutation.value.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
+        total
+            .checked_add(u64::try_from(body_length).map_err(|_| WalSemanticError::LengthOverflow)?)
+            .ok_or(WalSemanticError::LengthOverflow)
+    })?;
+    validate_transaction_bounds(mutation_count, mutation_bytes)?;
     validate_ann_delta_authority_markers(plan.mutations.iter())?;
     let encoded_mutations = plan
         .mutations
         .iter()
         .map(Mutation::encode)
         .collect::<Result<Vec<_>, _>>()?;
-    let mutation_bytes = encoded_mutations.iter().try_fold(0_u64, |total, body| {
-        total
-            .checked_add(u64::try_from(body.len()).map_err(|_| WalSemanticError::LengthOverflow)?)
-            .ok_or(WalSemanticError::LengthOverflow)
-    })?;
     let digest = mutation_digest(
         plan.mutations
             .iter()
             .zip(encoded_mutations.iter())
             .map(|(mutation, body)| (mutation.engine, body.as_slice())),
     )?;
-    let mutation_count =
-        u32::try_from(plan.mutations.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
     let begin = encode_begin(
         plan.read_csn,
         plan.catalog_version,
@@ -386,6 +556,40 @@ fn validate_storage_state(
     let first_generation = page_generation == PageGeneration::FIRST;
     let first_floor = retention_floor_csn == Csn::FIRST;
     if retention_floor_csn > commit_csn || first_generation != first_floor {
+        return Err(WalSemanticError::InvalidSequence);
+    }
+    Ok(())
+}
+
+fn validate_transaction_bounds(
+    mutation_count: u32,
+    mutation_bytes: u64,
+) -> Result<(), WalSemanticError> {
+    let minimum_bytes = u64::from(mutation_count)
+        .checked_mul(
+            u64::try_from(MUTATION_BODY_HEADER_SIZE)
+                .map_err(|_| WalSemanticError::LengthOverflow)?,
+        )
+        .ok_or(WalSemanticError::LengthOverflow)?;
+    let maximum_bytes = u64::from(mutation_count)
+        .checked_mul(
+            u64::try_from(WAL_RECORD_BODY_SIZE).map_err(|_| WalSemanticError::LengthOverflow)?,
+        )
+        .ok_or(WalSemanticError::LengthOverflow)?;
+    let decoded_mutation_slots = u64::from(mutation_count)
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<Mutation>())
+                .map_err(|_| WalSemanticError::LengthOverflow)?,
+        )
+        .ok_or(WalSemanticError::LengthOverflow)?;
+    let decoded_mutation_memory = mutation_bytes.saturating_add(decoded_mutation_slots);
+    if mutation_count == 0
+        || u64::from(mutation_count) > MAX_TRANSACTION_MUTATIONS
+        || mutation_bytes < minimum_bytes
+        || mutation_bytes > maximum_bytes
+        || mutation_bytes > MAX_TRANSACTION_MUTATION_BYTES
+        || decoded_mutation_memory > MAX_TRANSACTION_MUTATION_BYTES
+    {
         return Err(WalSemanticError::InvalidSequence);
     }
     Ok(())
@@ -471,10 +675,15 @@ pub(crate) fn recover_wal_after(
                 if active.is_some() || record.engine() != EngineKind::Kernel {
                     return Err(WalSemanticError::InvalidSequence);
                 }
+                let begin = decode_begin(record.body())?;
+                let mutation_capacity = usize::try_from(begin.mutation_count)
+                    .map_err(|_| WalSemanticError::LengthOverflow)?;
                 active = Some(ActiveTransaction {
                     transaction_id: record.transaction_id(),
-                    begin: decode_begin(record.body())?,
-                    mutations: Vec::new(),
+                    begin,
+                    mutations: Vec::with_capacity(mutation_capacity),
+                    mutation_bytes: 0,
+                    mutation_hasher: mutation_digest_hasher(),
                 });
             }
             RecordKind::Mutation => {
@@ -482,10 +691,9 @@ pub(crate) fn recover_wal_after(
                 if transaction.transaction_id != record.transaction_id() {
                     return Err(WalSemanticError::InvalidSequence);
                 }
+                transaction.admit_mutation_body(record.engine(), record.body())?;
                 let mutation = decode_mutation(record.engine(), record.body())?;
-                transaction
-                    .mutations
-                    .push((mutation, record.body().to_vec()));
+                transaction.mutations.push(mutation);
             }
             RecordKind::Commit => {
                 let transaction = active.take().ok_or(WalSemanticError::InvalidSequence)?;
@@ -510,11 +718,7 @@ pub(crate) fn recover_wal_after(
                     commit_lsn: record.lsn(),
                     durability: transaction.begin.durability,
                     manifest,
-                    mutations: transaction
-                        .mutations
-                        .into_iter()
-                        .map(|(mutation, _)| mutation)
-                        .collect(),
+                    mutations: transaction.mutations,
                 });
             }
             RecordKind::Abort => {
@@ -726,7 +930,7 @@ fn decode_begin(body: &[u8]) -> Result<Begin, WalSemanticError> {
         3 => DurabilityClass::Memory,
         _ => return Err(WalSemanticError::InvalidBody),
     };
-    Ok(Begin {
+    let begin = Begin {
         read_csn: optional_csn(read_u64(&body[8..16]))?,
         catalog_version: CatalogVersion::new(read_u64(&body[16..24]))
             .map_err(|_| WalSemanticError::InvalidIdentity)?,
@@ -734,26 +938,50 @@ fn decode_begin(body: &[u8]) -> Result<Begin, WalSemanticError> {
         durability,
         mutation_count: read_u32(&body[40..44]),
         mutation_bytes: read_u64(&body[44..52]),
-    })
+    };
+    validate_transaction_bounds(begin.mutation_count, begin.mutation_bytes)?;
+    Ok(begin)
 }
 
 impl ActiveTransaction {
+    fn admit_mutation_body(
+        &mut self,
+        engine: EngineKind,
+        body: &[u8],
+    ) -> Result<(), WalSemanticError> {
+        let next_count = u64::try_from(self.mutations.len())
+            .map_err(|_| WalSemanticError::LengthOverflow)?
+            .checked_add(1)
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        let next_bytes = self
+            .mutation_bytes
+            .checked_add(u64::try_from(body.len()).map_err(|_| WalSemanticError::LengthOverflow)?)
+            .ok_or(WalSemanticError::LengthOverflow)?;
+        if next_count > u64::from(self.begin.mutation_count)
+            || next_bytes > self.begin.mutation_bytes
+            || next_count > MAX_TRANSACTION_MUTATIONS
+            || next_bytes > MAX_TRANSACTION_MUTATION_BYTES
+        {
+            return Err(WalSemanticError::ContentMismatch);
+        }
+        let body_length =
+            u32::try_from(body.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
+        self.mutation_hasher.update(&[engine as u8]);
+        self.mutation_hasher.update(&body_length.to_le_bytes());
+        self.mutation_hasher.update(body);
+        self.mutation_bytes = next_bytes;
+        Ok(())
+    }
+
     fn validate(&self, commit: &CommitManifest) -> Result<(), WalSemanticError> {
-        validate_ann_delta_authority_markers(self.mutations.iter().map(|(mutation, _)| mutation))?;
+        if self.mutations.is_empty() {
+            return Err(WalSemanticError::InvalidSequence);
+        }
+        validate_ann_delta_authority_markers(self.mutations.iter())?;
         let count =
             u32::try_from(self.mutations.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
-        let bytes = self.mutations.iter().try_fold(0_u64, |total, (_, body)| {
-            total
-                .checked_add(
-                    u64::try_from(body.len()).map_err(|_| WalSemanticError::LengthOverflow)?,
-                )
-                .ok_or(WalSemanticError::LengthOverflow)
-        })?;
-        let digest = mutation_digest(
-            self.mutations
-                .iter()
-                .map(|(mutation, body)| (mutation.engine, body.as_slice())),
-        )?;
+        let bytes = self.mutation_bytes;
+        let digest = *self.mutation_hasher.clone().finalize().as_bytes();
         if self.begin.read_csn != commit.read_csn
             || self.begin.catalog_version != commit.catalog_version
             || self.begin.logical_time_micros != commit.logical_time_micros
@@ -772,7 +1000,9 @@ impl ActiveTransaction {
 struct ActiveTransaction {
     transaction_id: TransactionId,
     begin: Begin,
-    mutations: Vec<(Mutation, Vec<u8>)>,
+    mutations: Vec<Mutation>,
+    mutation_bytes: u64,
+    mutation_hasher: blake3::Hasher,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -901,6 +1131,12 @@ fn decode_opcode(value: u8) -> Result<(Opcode, EngineKind), WalSemanticError> {
         value if value == Opcode::AnnDeltaAuthorityV1 as u8 => {
             (Opcode::AnnDeltaAuthorityV1, EngineKind::Search)
         }
+        value if value == Opcode::AnnDeltaAuthorityV2 as u8 => {
+            (Opcode::AnnDeltaAuthorityV2, EngineKind::Search)
+        }
+        value if value == Opcode::FenceVectorAbsence as u8 => {
+            (Opcode::FenceVectorAbsence, EngineKind::Search)
+        }
         _ => return Err(WalSemanticError::InvalidBody),
     })
 }
@@ -962,7 +1198,7 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
             return Err(WalSemanticError::InvalidBody);
         }
     }
-    if opcode == Opcode::ConsolidateAnn && !valid_ann_consolidation(value) {
+    if opcode == Opcode::ConsolidateAnn && !valid_ann_consolidation(value, target) {
         return Err(WalSemanticError::InvalidBody);
     }
     if opcode == Opcode::PublishInitialAnnBulk && !valid_initial_ann_bulk_publication(value) {
@@ -970,6 +1206,9 @@ fn decode_mutation(engine: EngineKind, body: &[u8]) -> Result<Mutation, WalSeman
     }
     if opcode == Opcode::AnnDeltaAuthorityV1 && !valid_ann_delta_authority_v1(value) {
         return Err(WalSemanticError::InvalidBody);
+    }
+    if opcode == Opcode::AnnDeltaAuthorityV2 {
+        decode_ann_delta_authority_v2(value, target)?;
     }
     Ok(Mutation {
         engine,
@@ -989,14 +1228,35 @@ fn validate_mutation_shape(
     expires_at_micros: Option<i64>,
     key: &[u8],
 ) -> Result<(), WalSemanticError> {
-    if opcode == Opcode::AnnDeltaAuthorityV1 {
+    if matches!(
+        opcode,
+        Opcode::AnnDeltaAuthorityV1 | Opcode::AnnDeltaAuthorityV2
+    ) {
         return validate_targeted_ann_maintenance_shape(
             has_target,
             value_length,
-            ANN_DELTA_AUTHORITY_V1_SIZE,
+            if opcode == Opcode::AnnDeltaAuthorityV1 {
+                ANN_DELTA_AUTHORITY_V1_SIZE
+            } else {
+                ANN_DELTA_AUTHORITY_V2_SIZE
+            },
             expires_at_micros,
             key,
         );
+    }
+    if opcode == Opcode::ConsolidateAnn {
+        return if has_target
+            && key.is_empty()
+            && matches!(
+                value_length,
+                ANN_CONSOLIDATION_V1_SIZE | ANN_CONSOLIDATION_V2_SIZE
+            )
+            && expires_at_micros.is_none()
+        {
+            Ok(())
+        } else {
+            Err(WalSemanticError::InvalidBody)
+        };
     }
     if let Some(expected_length) = targeted_ann_maintenance_length(opcode) {
         return validate_targeted_ann_maintenance_shape(
@@ -1038,7 +1298,12 @@ fn validate_mutation_shape(
         {
             return Err(WalSemanticError::InvalidBody);
         }
-        Opcode::DeleteRow | Opcode::DeleteVector | Opcode::DeleteDocument if value_length != 0 => {
+        Opcode::DeleteRow
+        | Opcode::DeleteVector
+        | Opcode::FenceVectorAbsence
+        | Opcode::DeleteDocument
+            if value_length != 0 =>
+        {
             return Err(WalSemanticError::InvalidBody);
         }
         Opcode::DeleteValue
@@ -1091,6 +1356,7 @@ fn validate_mutation_shape(
         | Opcode::CreateAnnIndex
         | Opcode::UpsertVector
         | Opcode::DeleteVector
+        | Opcode::FenceVectorAbsence
             if expires_at_micros.is_some() =>
         {
             return Err(WalSemanticError::InvalidBody);
@@ -1102,7 +1368,6 @@ fn validate_mutation_shape(
 
 fn targeted_ann_maintenance_length(opcode: Opcode) -> Option<usize> {
     match opcode {
-        Opcode::ConsolidateAnn => Some(112),
         Opcode::PublishInitialAnnBulk => Some(160),
         _ => None,
     }
@@ -1139,13 +1404,46 @@ fn validate_targeted_ann_maintenance_shape(
     }
 }
 
-fn valid_ann_consolidation(value: &[u8]) -> bool {
-    value.len() == 112
-        && value.get(..8) == Some(b"HYANNC01")
-        && value[8..40].iter().any(|byte| *byte != 0)
-        && value[40..72].iter().any(|byte| *byte != 0)
-        && value[72..104].iter().any(|byte| *byte != 0)
-        && (1..=4_096).contains(&read_u64(&value[104..112]))
+fn valid_ann_consolidation(value: &[u8], target: Option<ObjectId>) -> bool {
+    if value.len() == ANN_CONSOLIDATION_V1_SIZE && value.get(..8) == Some(b"HYANNC01") {
+        return value[8..40].iter().any(|byte| *byte != 0)
+            && value[40..72].iter().any(|byte| *byte != 0)
+            && value[72..104].iter().any(|byte| *byte != 0)
+            && matches!(read_u64(&value[104..112]), 1..=4_096);
+    }
+    if value.len() != ANN_CONSOLIDATION_V2_SIZE
+        || value.get(..8) != Some(b"HYANNC02")
+        || value[26..32].iter().any(|byte| *byte != 0)
+        || value[376..384].iter().any(|byte| *byte != 0)
+        || !matches!(value[24], 4 | 5)
+        || value[25] != 5
+        || value[32..320]
+            .chunks_exact(32)
+            .any(|field| field.iter().all(|byte| *byte == 0))
+    {
+        return false;
+    }
+    let Ok(index_bytes) = <[u8; 16]>::try_from(&value[8..24]) else {
+        return false;
+    };
+    let Ok(index) = ObjectId::new(u128::from_be_bytes(index_bytes)) else {
+        return false;
+    };
+    let captured_next_sequence = read_u64(&value[320..328]);
+    let captured_count = read_u64(&value[328..336]);
+    let prior_next_sequence = read_u64(&value[336..344]);
+    let result_next_sequence = read_u64(&value[344..352]);
+    let consumed_count = read_u64(&value[352..360]);
+    let preserved_count = read_u64(&value[360..368]);
+    let effective_count = read_u64(&value[368..376]);
+    target == Some(index)
+        && (1..=4_096).contains(&captured_count)
+        && consumed_count <= captured_count
+        && preserved_count <= 4_096
+        && effective_count <= 1_000_000
+        && captured_next_sequence != 0
+        && prior_next_sequence >= captured_next_sequence
+        && result_next_sequence == prior_next_sequence
 }
 
 fn valid_initial_ann_bulk_publication(value: &[u8]) -> bool {
@@ -1169,38 +1467,177 @@ fn valid_ann_delta_authority_v1(value: &[u8]) -> bool {
         && value[8..].iter().all(|byte| *byte == 0)
 }
 
+fn decode_ann_delta_authority_v2(
+    value: &[u8],
+    target: Option<ObjectId>,
+) -> Result<AnnDeltaAuthorityV2, WalSemanticError> {
+    if value.len() != ANN_DELTA_AUTHORITY_V2_SIZE
+        || value.get(..8) != Some(ANN_DELTA_AUTHORITY_MAGIC_V2.as_slice())
+        || value[8] & !ANN_DELTA_AUTHORITY_V2_M04_TO_M05 != 0
+        || value[9..16].iter().any(|byte| *byte != 0)
+        || value[36..40].iter().any(|byte| *byte != 0)
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    let index = ObjectId::new(u128::from_be_bytes(
+        value[16..32]
+            .try_into()
+            .map_err(|_| WalSemanticError::InvalidBody)?,
+    ))
+    .map_err(|_| WalSemanticError::InvalidIdentity)?;
+    let operation_count = read_u32(&value[32..36]);
+    let prior_view_identity = value[40..72]
+        .try_into()
+        .map_err(|_| WalSemanticError::InvalidBody)?;
+    let result_view_identity = value[72..104]
+        .try_into()
+        .map_err(|_| WalSemanticError::InvalidBody)?;
+    let prior_overlay_root = value[104..136]
+        .try_into()
+        .map_err(|_| WalSemanticError::InvalidBody)?;
+    let result_overlay_root = value[136..168]
+        .try_into()
+        .map_err(|_| WalSemanticError::InvalidBody)?;
+    let prior_next_sequence = read_u64(&value[168..176]);
+    let result_next_sequence = read_u64(&value[176..184]);
+    if target != Some(index)
+        || !(1..=ANN_DELTA_AUTHORITY_V2_MAX_OPERATIONS).contains(&operation_count)
+        || [
+            prior_view_identity,
+            result_view_identity,
+            prior_overlay_root,
+            result_overlay_root,
+        ]
+        .contains(&[0; 32])
+        || prior_next_sequence == 0
+        || prior_next_sequence.checked_add(u64::from(operation_count)) != Some(result_next_sequence)
+        || prior_view_identity == result_view_identity
+        || prior_overlay_root == result_overlay_root
+    {
+        return Err(WalSemanticError::InvalidBody);
+    }
+    Ok(AnnDeltaAuthorityV2 {
+        index,
+        operation_count,
+        prior_view_identity,
+        result_view_identity,
+        prior_overlay_root,
+        result_overlay_root,
+        prior_next_sequence,
+        result_next_sequence,
+        m04_to_m05: value[8] == ANN_DELTA_AUTHORITY_V2_M04_TO_M05,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn validate_ann_delta_authority_markers<'a>(
     mutations: impl IntoIterator<Item = &'a Mutation>,
 ) -> Result<(), WalSemanticError> {
-    let mut vector_indexes = BTreeSet::new();
-    let mut authority_indexes = BTreeSet::new();
+    let mut upsert_counts = std::collections::BTreeMap::<ObjectId, u32>::new();
+    let mut vector_mutation_counts = std::collections::BTreeMap::<ObjectId, u32>::new();
+    let mut absence_fence_indexes = BTreeSet::new();
+    let mut absence_fence_count = 0_u32;
+    let mut created_indexes = BTreeSet::new();
+    let mut legacy_mutation_indexes = BTreeSet::new();
+    let mut authority_v1_indexes = BTreeSet::new();
+    let mut authority_v2_indexes = BTreeSet::new();
     let mut markers_started = false;
     let mut previous_marker = None;
+    let mut marker_version = None;
     for mutation in mutations {
-        if mutation.opcode == Opcode::AnnDeltaAuthorityV1 {
+        if matches!(
+            mutation.opcode,
+            Opcode::AnnDeltaAuthorityV1 | Opcode::AnnDeltaAuthorityV2
+        ) {
             markers_started = true;
             let index = mutation.target.ok_or(WalSemanticError::InvalidBody)?;
-            if mutation.engine != EngineKind::Search
+            let version = if mutation.opcode == Opcode::AnnDeltaAuthorityV1 {
+                1
+            } else {
+                2
+            };
+            if marker_version
+                .replace(version)
+                .is_some_and(|prior| prior != version)
+                || mutation.engine != EngineKind::Search
                 || !mutation.key.is_empty()
                 || mutation.expires_at_micros.is_some()
-                || !valid_ann_delta_authority_v1(&mutation.value)
                 || previous_marker.is_some_and(|previous| previous >= index)
-                || !authority_indexes.insert(index)
             {
                 return Err(WalSemanticError::InvalidBody);
+            }
+            if version == 1 {
+                if !valid_ann_delta_authority_v1(&mutation.value)
+                    || !authority_v1_indexes.insert(index)
+                {
+                    return Err(WalSemanticError::InvalidBody);
+                }
+            } else {
+                let authority = ann_delta_authority_v2(mutation)?;
+                if authority.operation_count
+                    != vector_mutation_counts.get(&index).copied().unwrap_or(0)
+                    || created_indexes.contains(&index)
+                    || legacy_mutation_indexes.contains(&index)
+                    || !authority_v2_indexes.insert(index)
+                {
+                    return Err(WalSemanticError::InvalidSequence);
+                }
             }
             previous_marker = Some(index);
         } else {
             if markers_started {
                 return Err(WalSemanticError::InvalidSequence);
             }
-            if mutation.opcode == Opcode::UpsertVector {
-                vector_indexes.insert(mutation.target.ok_or(WalSemanticError::InvalidBody)?);
+            if matches!(mutation.opcode, Opcode::UpsertVector | Opcode::DeleteVector) {
+                let count = vector_mutation_counts
+                    .entry(mutation.target.ok_or(WalSemanticError::InvalidBody)?)
+                    .or_insert(0);
+                *count = count
+                    .checked_add(1)
+                    .ok_or(WalSemanticError::LengthOverflow)?;
+                if mutation.opcode == Opcode::UpsertVector {
+                    let count = upsert_counts
+                        .entry(mutation.target.ok_or(WalSemanticError::InvalidBody)?)
+                        .or_insert(0);
+                    *count = count
+                        .checked_add(1)
+                        .ok_or(WalSemanticError::LengthOverflow)?;
+                }
+            } else if mutation.opcode == Opcode::FenceVectorAbsence {
+                absence_fence_count = absence_fence_count
+                    .checked_add(1)
+                    .ok_or(WalSemanticError::LengthOverflow)?;
+                if absence_fence_count > ANN_DELTA_AUTHORITY_V2_MAX_OPERATIONS {
+                    return Err(WalSemanticError::InvalidSequence);
+                }
+                absence_fence_indexes.insert(mutation.target.ok_or(WalSemanticError::InvalidBody)?);
+            } else if mutation.opcode == Opcode::CreateAnnIndex {
+                created_indexes.insert(mutation.target.ok_or(WalSemanticError::InvalidBody)?);
+            } else if matches!(
+                mutation.opcode,
+                Opcode::ConsolidateAnn | Opcode::PublishInitialAnnBulk
+            ) {
+                legacy_mutation_indexes
+                    .insert(mutation.target.ok_or(WalSemanticError::InvalidBody)?);
             }
         }
     }
-    if markers_started && vector_indexes != authority_indexes {
-        return Err(WalSemanticError::InvalidSequence);
+    if marker_version == Some(1) {
+        let vector_indexes = upsert_counts.keys().copied().collect::<BTreeSet<_>>();
+        if vector_indexes != authority_v1_indexes || !absence_fence_indexes.is_empty() {
+            return Err(WalSemanticError::InvalidSequence);
+        }
+    } else if marker_version == Some(2) {
+        let expected = vector_mutation_counts
+            .keys()
+            .filter(|index| {
+                !created_indexes.contains(index) && !legacy_mutation_indexes.contains(index)
+            })
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected != authority_v2_indexes {
+            return Err(WalSemanticError::InvalidSequence);
+        }
     }
     Ok(())
 }
@@ -1257,9 +1694,11 @@ fn validate_mutation_target_shape(
             | Opcode::CreateAnnIndex
             | Opcode::UpsertVector
             | Opcode::DeleteVector
+            | Opcode::FenceVectorAbsence
             | Opcode::ConsolidateAnn
             | Opcode::PublishInitialAnnBulk
             | Opcode::AnnDeltaAuthorityV1
+            | Opcode::AnnDeltaAuthorityV2
             | Opcode::CreateCatalogObjectV2
             | Opcode::UpdateRow
             | Opcode::DeleteRow
@@ -1289,7 +1728,11 @@ fn validate_mutation_identity(
     {
         return Err(WalSemanticError::InvalidBody);
     }
-    if matches!(opcode, Opcode::UpsertVector | Opcode::DeleteVector) && key.len() != 16 {
+    if matches!(
+        opcode,
+        Opcode::UpsertVector | Opcode::DeleteVector | Opcode::FenceVectorAbsence
+    ) && key.len() != 16
+    {
         return Err(WalSemanticError::InvalidBody);
     }
     if opcode == Opcode::UpsertVector && (value_length == 0 || !value_length.is_multiple_of(4)) {
@@ -1334,8 +1777,7 @@ fn valid_collection_member_identity(encoded: &[u8]) -> bool {
 fn mutation_digest<'body>(
     mutations: impl Iterator<Item = (EngineKind, &'body [u8])>,
 ) -> Result<[u8; 32], WalSemanticError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"hyphae-native-mutation-set-v1");
+    let mut hasher = mutation_digest_hasher();
     for (engine, body) in mutations {
         hasher.update(&[engine as u8]);
         let length = u32::try_from(body.len()).map_err(|_| WalSemanticError::LengthOverflow)?;
@@ -1343,6 +1785,12 @@ fn mutation_digest<'body>(
         hasher.update(body);
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+fn mutation_digest_hasher() -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyphae-native-mutation-set-v1");
+    hasher
 }
 
 fn put_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), WalSemanticError> {
@@ -1401,12 +1849,15 @@ mod tests {
         CatalogVersion, Csn, DurabilityClass, EngineKind, ManifestGeneration, ObjectId,
         PageGeneration, PageId, TransactionId,
     };
-    use hyphae_native_wal::WalBlock;
+    use hyphae_native_wal::{PendingRecord, RecordKind, WAL_RECORD_BODY_SIZE, WalBlock};
 
     use super::{
-        CommitManifest, Mutation, Opcode, TransactionPlan, WalSemanticError,
-        ann_delta_authority_marker_v1, decode_mutation, decode_opcode, encode_checkpoint,
-        encode_transaction, recover_wal, validate_mutation_shape,
+        ANN_CONSOLIDATION_V1_SIZE, ANN_CONSOLIDATION_V2_SIZE, ANN_DELTA_AUTHORITY_V2_SIZE,
+        AnnDeltaAuthorityV2, CommitManifest, Mutation, Opcode, TransactionPlan,
+        TransactionWalPreflightBuilder, WalSemanticError, ann_delta_authority_marker_v1,
+        ann_delta_authority_marker_v2, ann_delta_authority_v2, decode_begin, decode_mutation,
+        decode_opcode, encode_begin, encode_checkpoint, encode_transaction, recover_wal,
+        validate_mutation_shape,
     };
 
     fn mutation(
@@ -1593,6 +2044,177 @@ mod tests {
     }
 
     #[test]
+    fn hostile_begin_counts_and_body_totals_fail_before_transaction_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let valid = encode_begin(
+            None,
+            CatalogVersion::new(1)?,
+            1,
+            DurabilityClass::Strict,
+            1,
+            u64::try_from(super::MUTATION_BODY_HEADER_SIZE)?,
+        );
+        assert!(decode_begin(&valid).is_ok());
+
+        for (count, bytes) in [
+            (0, 0),
+            (u32::MAX, u64::MAX),
+            (1, u64::try_from(super::MUTATION_BODY_HEADER_SIZE - 1)?),
+            (1, super::MAX_TRANSACTION_MUTATION_BYTES + 1),
+        ] {
+            let mut hostile = valid.clone();
+            hostile[40..44].copy_from_slice(&count.to_le_bytes());
+            hostile[44..52].copy_from_slice(&bytes.to_le_bytes());
+            assert!(matches!(
+                decode_begin(&hostile),
+                Err(WalSemanticError::InvalidSequence)
+            ));
+        }
+        let decoded_slot = u64::try_from(std::mem::size_of::<Mutation>())?;
+        let decoded_overflow_count = u32::try_from(
+            super::MAX_TRANSACTION_MUTATION_BYTES
+                .checked_div(u64::try_from(super::MUTATION_BODY_HEADER_SIZE)? + decoded_slot)
+                .ok_or("zero decoded mutation divisor")?
+                + 1,
+        )?;
+        let mut decoded_overflow = valid;
+        decoded_overflow[40..44].copy_from_slice(&decoded_overflow_count.to_le_bytes());
+        decoded_overflow[44..52].copy_from_slice(
+            &(u64::from(decoded_overflow_count) * u64::try_from(super::MUTATION_BODY_HEADER_SIZE)?)
+                .to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_begin(&decoded_overflow),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_rejects_zero_mutations_and_declared_prefix_overruns_incrementally()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transaction_id = TransactionId::new(1)?;
+        let zero = PendingRecord::new(
+            RecordKind::Begin,
+            EngineKind::Kernel,
+            0,
+            transaction_id,
+            encode_begin(
+                None,
+                CatalogVersion::new(1)?,
+                1,
+                DurabilityClass::Strict,
+                0,
+                0,
+            ),
+        )?;
+        let block = WalBlock::build(1, [0; 32], vec![zero])?;
+        let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
+        assert!(matches!(
+            recover_wal(decoded.records()),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+        assert!(matches!(
+            encode_test_transaction(&[]),
+            Err(error) if matches!(error.downcast_ref::<WalSemanticError>(),
+                Some(WalSemanticError::InvalidSequence))
+        ));
+
+        let empty_commit = CommitManifest {
+            read_csn: None,
+            commit_csn: Csn::FIRST,
+            catalog_version: CatalogVersion::new(1)?,
+            blob_generation: 0,
+            mutation_count: 1,
+            mutation_bytes: u64::try_from(super::MUTATION_BODY_HEADER_SIZE)?,
+            logical_time_micros: 1,
+            mutation_digest: [1; 32],
+            roots: test_roots()?,
+            page_generation: PageGeneration::FIRST,
+            retention_floor_csn: Csn::FIRST,
+        };
+        let empty = vec![
+            PendingRecord::new(
+                RecordKind::Begin,
+                EngineKind::Kernel,
+                0,
+                transaction_id,
+                encode_begin(
+                    None,
+                    CatalogVersion::new(1)?,
+                    1,
+                    DurabilityClass::Strict,
+                    1,
+                    u64::try_from(super::MUTATION_BODY_HEADER_SIZE)?,
+                ),
+            )?,
+            PendingRecord::new(
+                RecordKind::Commit,
+                EngineKind::Kernel,
+                0,
+                transaction_id,
+                empty_commit.encode(),
+            )?,
+        ];
+        let block = WalBlock::build(1, [0; 32], empty)?;
+        let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
+        assert!(matches!(
+            recover_wal(decoded.records()),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+
+        let mutation = structure_mutation(Opcode::SetValue, b"k", b"v", None);
+        let body = mutation.encode()?;
+        let body_bytes = u64::try_from(body.len())?;
+        let catalog_version = CatalogVersion::new(1)?;
+        let begin = |count, bytes| {
+            PendingRecord::new(
+                RecordKind::Begin,
+                EngineKind::Kernel,
+                0,
+                transaction_id,
+                encode_begin(
+                    None,
+                    catalog_version,
+                    1,
+                    DurabilityClass::Strict,
+                    count,
+                    bytes,
+                ),
+            )
+        };
+        let record = || {
+            PendingRecord::new(
+                RecordKind::Mutation,
+                EngineKind::Structure,
+                0,
+                transaction_id,
+                body.clone(),
+            )
+        };
+        for pending in [
+            vec![
+                begin(1, body_bytes.saturating_mul(2))?,
+                record()?,
+                record()?,
+            ],
+            vec![
+                begin(1, u64::try_from(super::MUTATION_BODY_HEADER_SIZE)?)?,
+                record()?,
+            ],
+        ] {
+            let block = WalBlock::build(1, [0; 32], pending)?;
+            let decoded = WalBlock::decode(1, [0; 32], &block.encode()?)?;
+            assert!(matches!(
+                recover_wal(decoded.records()),
+                Err(WalSemanticError::ContentMismatch)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ann_delta_authority_marker_is_append_only_fixed_and_bounded()
     -> Result<(), Box<dyn std::error::Error>> {
         let index = ObjectId::new(7)?;
@@ -1704,6 +2326,355 @@ mod tests {
         ] {
             assert!(encode_test_transaction(&invalid).is_err());
         }
+        Ok(())
+    }
+
+    fn authority_v2(index: ObjectId, operation_count: u32) -> AnnDeltaAuthorityV2 {
+        AnnDeltaAuthorityV2 {
+            index,
+            operation_count,
+            prior_view_identity: [1; 32],
+            result_view_identity: [2; 32],
+            prior_overlay_root: [3; 32],
+            result_overlay_root: [4; 32],
+            prior_next_sequence: 9,
+            result_next_sequence: 9 + u64::from(operation_count),
+            m04_to_m05: true,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ann_delta_authority_v2_has_fixed_golden_bytes_and_strict_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = ObjectId::new(7)?;
+        let authority = authority_v2(index, 2);
+        let marker = ann_delta_authority_marker_v2(authority);
+        assert_eq!(Opcode::AnnDeltaAuthorityV2 as u8, 56);
+        assert_eq!(
+            decode_opcode(56)?,
+            (Opcode::AnnDeltaAuthorityV2, EngineKind::Search)
+        );
+        assert_eq!(marker.value.len(), super::ANN_DELTA_AUTHORITY_V2_SIZE);
+        assert_eq!(&marker.value[..8], b"HYANNA02");
+        assert_eq!(marker.value[8], 1);
+        assert_eq!(&marker.value[9..16], &[0; 7]);
+        assert_eq!(&marker.value[16..32], &7_u128.to_be_bytes());
+        assert_eq!(&marker.value[32..36], &2_u32.to_le_bytes());
+        assert_eq!(&marker.value[36..40], &[0; 4]);
+        assert_eq!(&marker.value[40..72], &[1; 32]);
+        assert_eq!(&marker.value[72..104], &[2; 32]);
+        assert_eq!(&marker.value[104..136], &[3; 32]);
+        assert_eq!(&marker.value[136..168], &[4; 32]);
+        assert_eq!(&marker.value[168..176], &9_u64.to_le_bytes());
+        assert_eq!(&marker.value[176..184], &11_u64.to_le_bytes());
+        assert_eq!(
+            marker.value,
+            [
+                b"HYANNA02".as_slice(),
+                &[1, 0, 0, 0, 0, 0, 0, 0],
+                &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7],
+                &[2, 0, 0, 0, 0, 0, 0, 0],
+                &[1; 32],
+                &[2; 32],
+                &[3; 32],
+                &[4; 32],
+                &[9, 0, 0, 0, 0, 0, 0, 0],
+                &[11, 0, 0, 0, 0, 0, 0, 0],
+            ]
+            .concat()
+        );
+        let encoded = marker.encode()?;
+        assert_eq!(encoded.len(), 44 + super::ANN_DELTA_AUTHORITY_V2_SIZE);
+        assert_eq!(encoded[8], 56);
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, marker);
+        assert_eq!(ann_delta_authority_v2(&marker)?, authority);
+
+        for invalid_value in [
+            marker.value[..183].to_vec(),
+            [marker.value.as_slice(), &[0]].concat(),
+            {
+                let mut value = marker.value.clone();
+                value[8] = 2;
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[9] = 1;
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[36] = 1;
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[16..32].fill(0);
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[32..36].fill(0);
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[32..36].copy_from_slice(&4_097_u32.to_le_bytes());
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[40..72].fill(0);
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[136..168].copy_from_slice(&[3; 32]);
+                value
+            },
+            {
+                let mut value = marker.value.clone();
+                value[176..184].copy_from_slice(&12_u64.to_le_bytes());
+                value
+            },
+        ] {
+            let mut invalid = marker.clone();
+            invalid.value = invalid_value;
+            assert!(matches!(
+                decode_mutation(EngineKind::Search, &invalid.encode()?),
+                Err(WalSemanticError::InvalidBody | WalSemanticError::InvalidIdentity)
+            ));
+        }
+        for range in [40..72, 72..104, 104..136, 136..168] {
+            let mut invalid = marker.clone();
+            invalid.value[range].fill(0);
+            assert!(decode_mutation(EngineKind::Search, &invalid.encode()?).is_err());
+        }
+        for range in [168..176, 176..184] {
+            let mut invalid = marker.clone();
+            invalid.value[range].fill(0);
+            assert!(decode_mutation(EngineKind::Search, &invalid.encode()?).is_err());
+        }
+        let mut wrong_target = marker.clone();
+        wrong_target.target = Some(ObjectId::new(8)?);
+        assert!(decode_mutation(EngineKind::Search, &wrong_target.encode()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ann_delta_authority_v2_is_trailing_sorted_unique_exact_and_never_mixes_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = ObjectId::new(7)?;
+        let second = ObjectId::new(8)?;
+        let upsert = |index, object: u128| {
+            mutation(
+                EngineKind::Search,
+                Opcode::UpsertVector,
+                Some(index),
+                &object.to_be_bytes(),
+                &[0, 0, 128, 63],
+                None,
+            )
+        };
+        let valid = vec![
+            upsert(first, 1),
+            upsert(first, 2),
+            upsert(second, 3),
+            ann_delta_authority_marker_v2(authority_v2(first, 2)),
+            ann_delta_authority_marker_v2(authority_v2(second, 1)),
+        ];
+        encode_test_transaction(&valid)?;
+        for invalid in [
+            vec![
+                upsert(first, 1),
+                ann_delta_authority_marker_v2(authority_v2(first, 1)),
+                upsert(second, 2),
+            ],
+            vec![
+                upsert(first, 1),
+                ann_delta_authority_marker_v2(authority_v2(first, 2)),
+            ],
+            vec![
+                upsert(first, 1),
+                ann_delta_authority_marker_v2(authority_v2(first, 1)),
+                ann_delta_authority_marker_v2(authority_v2(first, 1)),
+            ],
+            vec![
+                upsert(first, 1),
+                upsert(second, 2),
+                ann_delta_authority_marker_v2(authority_v2(second, 1)),
+                ann_delta_authority_marker_v2(authority_v2(first, 1)),
+            ],
+            vec![
+                upsert(first, 1),
+                ann_delta_authority_marker_v1(first),
+                ann_delta_authority_marker_v2(authority_v2(first, 1)),
+            ],
+        ] {
+            assert!(encode_test_transaction(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_absence_fence_has_fixed_golden_and_strict_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = ObjectId::new(7)?;
+        let object = ObjectId::new(9)?;
+        let fence = mutation(
+            EngineKind::Search,
+            Opcode::FenceVectorAbsence,
+            Some(index),
+            &object.get().to_be_bytes(),
+            &[],
+            None,
+        );
+        assert_eq!(Opcode::FenceVectorAbsence as u8, 57);
+        assert_eq!(
+            decode_opcode(57)?,
+            (Opcode::FenceVectorAbsence, EngineKind::Search)
+        );
+        assert_eq!(
+            fence.encode()?,
+            [
+                b"HYMUT001".as_slice(),
+                &[57, 3, 0, 0],
+                &[7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[255, 255, 255, 255, 255, 255, 255, 127],
+                &[16, 0, 0, 0],
+                &[0, 0, 0, 0],
+                &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+            ]
+            .concat()
+        );
+        encode_test_transaction(std::slice::from_ref(&fence))?;
+        for invalid in [
+            Mutation {
+                target: None,
+                ..fence.clone()
+            },
+            Mutation {
+                key: vec![0; 15],
+                ..fence.clone()
+            },
+            Mutation {
+                value: vec![1],
+                ..fence.clone()
+            },
+            Mutation {
+                expires_at_micros: Some(1),
+                ..fence.clone()
+            },
+            Mutation {
+                engine: EngineKind::Structure,
+                ..fence
+            },
+        ] {
+            assert!(decode_mutation(invalid.engine, &invalid.encode()?).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delete_vector_and_absence_fence_have_distinct_marker_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = ObjectId::new(7)?;
+        let delete = |object: u128| {
+            mutation(
+                EngineKind::Search,
+                Opcode::DeleteVector,
+                Some(index),
+                &object.to_be_bytes(),
+                &[],
+                None,
+            )
+        };
+        let fence = |object: u128| {
+            mutation(
+                EngineKind::Search,
+                Opcode::FenceVectorAbsence,
+                Some(index),
+                &object.to_be_bytes(),
+                &[],
+                None,
+            )
+        };
+        encode_test_transaction(&[delete(1)])?;
+        encode_test_transaction(&[fence(1)])?;
+        encode_test_transaction(&[
+            delete(1),
+            ann_delta_authority_marker_v2(authority_v2(index, 1)),
+        ])?;
+        encode_test_transaction(&[
+            delete(1),
+            fence(2),
+            ann_delta_authority_marker_v2(authority_v2(index, 1)),
+        ])?;
+        encode_test_transaction(&[delete(1), fence(2)])?;
+        assert!(
+            encode_test_transaction(&[
+                delete(1),
+                delete(2),
+                ann_delta_authority_marker_v2(authority_v2(index, 1)),
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_test_transaction(&[
+                fence(1),
+                ann_delta_authority_marker_v2(authority_v2(index, 1)),
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_test_transaction(&[ann_delta_authority_marker_v2(authority_v2(index, 1))])
+                .is_err()
+        );
+        assert!(
+            encode_test_transaction(&[
+                delete(1),
+                ann_delta_authority_marker_v2(authority_v2(index, 2)),
+            ])
+            .is_err()
+        );
+        let mut bounded_fences = (1..=super::ANN_DELTA_AUTHORITY_V2_MAX_OPERATIONS)
+            .map(|object| fence(u128::from(object)))
+            .collect::<Vec<_>>();
+        encode_test_transaction(&bounded_fences)?;
+        bounded_fences.push(fence(
+            u128::from(super::ANN_DELTA_AUTHORITY_V2_MAX_OPERATIONS) + 1,
+        ));
+        assert!(encode_test_transaction(&bounded_fences).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_preflight_streams_ordinary_and_generated_ann_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut preflight = TransactionWalPreflightBuilder::default();
+        preflight.push(16, 0)?;
+        preflight.push(0, ANN_DELTA_AUTHORITY_V2_SIZE)?;
+        preflight.push(0, ANN_CONSOLIDATION_V2_SIZE)?;
+        let preflight = preflight.finish()?;
+        assert_eq!(preflight.mutation_count(), 3);
+        assert_eq!(preflight.mutation_bytes(), 60 + 228 + 428);
+        assert!(preflight.peak_memory_bytes() > preflight.mutation_bytes());
+
+        let mut oversized = TransactionWalPreflightBuilder::default();
+        for _ in 0..8_200 {
+            oversized.push(1, 8_216)?;
+        }
+        assert!(matches!(
+            oversized.finish(),
+            Err(WalSemanticError::InvalidSequence)
+        ));
+
+        let mut record_too_large = TransactionWalPreflightBuilder::default();
+        assert!(matches!(
+            record_too_large.push(0, WAL_RECORD_BODY_SIZE),
+            Err(WalSemanticError::LengthOverflow)
+        ));
         Ok(())
     }
 
@@ -2140,29 +3111,50 @@ mod tests {
             decode_opcode(50)?,
             (Opcode::ConsolidateAnn, EngineKind::Search)
         );
-        let mut value = Vec::with_capacity(112);
-        value.extend_from_slice(b"HYANNC01");
-        value.extend_from_slice(&[1; 32]);
-        value.extend_from_slice(&[2; 32]);
-        value.extend_from_slice(&[3; 32]);
+        let index = ObjectId::new(3)?;
+        let mut value = Vec::with_capacity(ANN_CONSOLIDATION_V2_SIZE);
+        value.extend_from_slice(b"HYANNC02");
+        value.extend_from_slice(&index.get().to_be_bytes());
+        value.extend_from_slice(&[4, 5]);
+        value.extend_from_slice(&[0; 6]);
+        for byte in 1..=9 {
+            value.extend_from_slice(&[byte; 32]);
+        }
+        value.extend_from_slice(&8_u64.to_le_bytes());
         value.extend_from_slice(&1_u64.to_le_bytes());
-        let mutation = mutation(
+        value.extend_from_slice(&9_u64.to_le_bytes());
+        value.extend_from_slice(&9_u64.to_le_bytes());
+        value.extend_from_slice(&1_u64.to_le_bytes());
+        value.extend_from_slice(&0_u64.to_le_bytes());
+        value.extend_from_slice(&2_u64.to_le_bytes());
+        value.extend_from_slice(&[0; 8]);
+        assert_eq!(value.len(), ANN_CONSOLIDATION_V2_SIZE);
+        let consolidation = mutation(
             EngineKind::Search,
             Opcode::ConsolidateAnn,
-            Some(ObjectId::new(3)?),
+            Some(index),
             b"",
             &value,
             None,
         );
-        let encoded = mutation.encode()?;
+        let encoded = consolidation.encode()?;
         assert_eq!(encoded[8], 50);
-        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, mutation);
+        assert_eq!(
+            decode_mutation(EngineKind::Search, &encoded)?,
+            consolidation
+        );
 
         for invalid in [
-            validate_mutation_shape(Opcode::ConsolidateAnn, false, 112, None, b""),
-            validate_mutation_shape(Opcode::ConsolidateAnn, true, 111, None, b""),
-            validate_mutation_shape(Opcode::ConsolidateAnn, true, 112, None, b"key"),
-            validate_mutation_shape(Opcode::ConsolidateAnn, true, 112, Some(1), b""),
+            validate_mutation_shape(Opcode::ConsolidateAnn, false, value.len(), None, b""),
+            validate_mutation_shape(
+                Opcode::ConsolidateAnn,
+                true,
+                ANN_CONSOLIDATION_V2_SIZE - 1,
+                None,
+                b"",
+            ),
+            validate_mutation_shape(Opcode::ConsolidateAnn, true, value.len(), None, b"key"),
+            validate_mutation_shape(Opcode::ConsolidateAnn, true, value.len(), Some(1), b""),
         ] {
             assert!(matches!(invalid, Err(WalSemanticError::InvalidBody)));
         }
@@ -2170,6 +3162,48 @@ mod tests {
         bad_magic[44] ^= 1;
         assert!(matches!(
             decode_mutation(EngineKind::Search, &bad_magic),
+            Err(WalSemanticError::InvalidBody)
+        ));
+        for offset in [24_usize, 25] {
+            for format in 1..=3 {
+                let mut historical = value.clone();
+                historical[offset] = format;
+                let rejected = mutation(
+                    EngineKind::Search,
+                    Opcode::ConsolidateAnn,
+                    Some(index),
+                    b"",
+                    &historical,
+                    None,
+                );
+                let rejected = rejected.encode()?;
+                assert!(matches!(
+                    decode_mutation(EngineKind::Search, &rejected),
+                    Err(WalSemanticError::InvalidBody)
+                ));
+            }
+        }
+
+        let mut legacy = Vec::with_capacity(ANN_CONSOLIDATION_V1_SIZE);
+        legacy.extend_from_slice(b"HYANNC01");
+        legacy.extend_from_slice(&[1; 32]);
+        legacy.extend_from_slice(&[2; 32]);
+        legacy.extend_from_slice(&[3; 32]);
+        legacy.extend_from_slice(&1_u64.to_le_bytes());
+        let legacy = mutation(
+            EngineKind::Search,
+            Opcode::ConsolidateAnn,
+            Some(index),
+            b"",
+            &legacy,
+            None,
+        );
+        let encoded = legacy.encode()?;
+        assert_eq!(decode_mutation(EngineKind::Search, &encoded)?, legacy);
+        let mut zero_count = legacy;
+        zero_count.value[104..112].fill(0);
+        assert!(matches!(
+            decode_mutation(EngineKind::Search, &zero_count.encode()?),
             Err(WalSemanticError::InvalidBody)
         ));
         Ok(())

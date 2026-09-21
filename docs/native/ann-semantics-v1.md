@@ -9,8 +9,9 @@ stable-ID eligibility traversal, adaptive exact filtering, durable lifecycle
 policy, maintenance due signaling, retained generations, and fail-closed
 recovery are implemented. Page-buffered traversal and a background scheduler
 remain production non-claims. The authenticated M05 layered-delta format has a
-passive reader/validator only; it is non-emittable and adds no capability or
-release claim.
+bounded foreground point-upsert and point-delete writer, conflict-only
+complete-image absence fencing, and bounded foreground consolidation. M05
+initial-bulk rewriting remains a non-claim and fails closed.
 
 ANN is a Hyphae-owned search-engine capability. Exact vector execution remains
 the quality oracle.
@@ -63,8 +64,9 @@ neighbors. The same rule selects insertion links from the
 identity hashes a version tag (`2` for this rule; `1` was plain
 truncate-to-`M`), so graphs persisted under the previous rule fail closed
 as corrupt rather than validating against the wrong canonical form.
-Foreground update and delete do not rebuild this graph. They replace one
-object-keyed delta record above it.
+Foreground update and delete do not rebuild this graph. A point upsert or point
+delete publishes one authenticated overlay path. A conflict-only absence fence
+authenticates the admitted path but publishes no ANN physical change.
 
 `IndexSnapshot` exports definition, vectors with creating CSNs, graph nodes,
 entry point, maximum level and build identity. Restore reconstructs the graph
@@ -77,18 +79,19 @@ The native runtime stores ANN in the same copy-on-write search B+tree as
 lexical state:
 
 - `0x05 + index ObjectId` selects readable `HYANNM01` through `HYANNM05`
-  generation metadata; current writers emit `HYANNM04`;
+  generation metadata; base creation emits M04 and a later physical point
+  mutation emits M05;
 - `0x06 + index ObjectId + build identity + object ObjectId` stores one
   `HYANNV01` vector with its creating CSN; and
 - `0x07 + index ObjectId + build identity + object ObjectId + u16 layer`
   stores one `HYANNG01` neighbor list; and
 - `0x08 + index ObjectId + object ObjectId` stores one current `HYANND01`
   upsert or tombstone with a monotonic per-index sequence and mutation CSN;
-- reader-only `0x09 + index ObjectId` stores the one fixed `HYANNO01` overlay
+- `0x09 + index ObjectId` stores the one fixed `HYANNO01` overlay
   manifest;
-- reader-only `0x0a + index ObjectId + object ObjectId` stores one `HYANND02`
+- `0x0a + index ObjectId + object ObjectId` stores one `HYANND02`
   overlay upsert or tombstone; and
-- reader-only `0x0b + index ObjectId + depth + high-nibble path` stores one
+- `0x0b + index ObjectId + depth + high-nibble path` stores one
   `HYANNN01` fixed-depth radix-16 sparse-Merkle internal node.
 
 Every identity component is big-endian in the key. The 32-byte build identity
@@ -101,21 +104,38 @@ delta record/byte counts and next sequence. M03 adds durable lifecycle and
 retention policy; M04 adds partitioned child and retained-generation
 descriptors. `HYANNM01`, `HYANNV01`, and `HYANNG01` remain readable. The v2
 envelope includes and validates `HYANNM01` as its predecessor-lineage tag.
+M01 through M03 also retain their historical writable compatibility path: the
+first accepted ordinary vector mutation reconstructs the legacy target and
+atomically emits M04, while reads, rejected mutations, and failed commits leave
+its bytes unchanged. Retained C01 consolidation WAL remains authoritative for
+its original M01-through-M04 transition, including an M01-M03 upgrade to M04;
+new C02 authority cannot name M01, M02, or M03.
+
+A complete root containing only M01 through M04 metadata retains its historical
+load, pin, backup, restore, and recovery acceptance even when the aggregate
+lexical-plus-ANN hydration estimate exceeds the M05 64 MiB shared authority.
+Metadata-derived per-index and physical namespace bounds still apply. The M04
+initial-bulk path likewise remains M04 and does not activate the M05 aggregate
+cap. A first physical point mutation or C02 consolidation projects the complete
+candidate root with M05 present, substitutes the candidate target charge, and
+enforces the shared cap before appending a page or WAL byte; rejection leaves
+the grandfathered source root unchanged.
 `HYSEABT1` and `HYSEABT2` remain readable; the first base-plus-delta mutation
 selects `HYSEABT3`.
 
 Index creation, including vectors staged in the same transaction, constructs
-the initial canonical base. Every later foreground upsert or delete validates
-against the effective set and rewrites only metadata plus the affected
-object-keyed `HYANND01` record. Repeated writes to one object replace that
-record. The base build identity and its vector/graph records therefore remain
-unchanged across foreground mutation commits. Each index durably selects a
+the initial canonical M04 base. A later foreground upsert or deletion of a
+present vector freezes D01 and publishes one M05 D02 leaf, its 32
+sparse-Merkle ancestors, the manifest, and metadata. Deletion publishes a D02
+tombstone that suppresses a base, D01, or prior D02 upsert. The base build
+identity and its vector/graph records remain unchanged across foreground
+mutation commits. Each index durably selects a
 `delta_max_entries` no larger than the 4,096-record format ceiling, a
 `consolidate_after_deltas` threshold no larger than that capacity, and one to
 64 retained generations. Encoded delta data remains capped at 64 MiB. A
 mutation exceeding its per-index or byte bound fails before publication.
 
-M05 is the passive authenticated layered representation defined by [ANN delta
+M05 is the authenticated layered representation defined by [ANN delta
 overlay format v1](../storage/ann-delta-overlay-format-v1.md). It freezes the
 complete D01 map and its unchanged legacy view identity, then authenticates an
 object-keyed D02 overlay with an ordered sparse-Merkle tree. Lookup takes the
@@ -126,14 +146,53 @@ ranges, complete tree reachability and node count, its root, and the final view
 identity. XOR and additive/commutative accumulators are invalid substitutes for
 these ordered hashes.
 
-No ANN creation, foreground mutation, initial-bulk publication, consolidation,
-WAL, API, protocol, catalog, backup, or proof writer synthesizes M05, D02,
-overlay manifests/nodes, `HYANNA02`, or a new opcode. Those ANN write paths fail
-closed against M05 independently of identity equality. Lexical search
-compaction and page-generation vacuum may preserve already validated ANN bytes
-byte-for-byte. Normal WAL recovery cannot generate M05; page-backed tests
-install an already committed test root instead of claiming WAL emission. This
-reader status creates no capability or performance claim.
+### Point deletion and absence fencing
+
+The append-only WAL meanings are distinct:
+
+- a historical unmarked `DeleteVector` opcode 19 retains its M01-through-M04
+  physical and generation-conflict semantics;
+- a physical M05 `DeleteVector` opcode 19 requires the object to be present,
+  writes one D02 tombstone and its authenticated path, and is covered by one
+  trailing fixed `HYANNA02` opcode 56 marker for the index; and
+- `FenceVectorAbsence` opcode 57 requires the object already to be absent and
+  records conflict authority only. It does not write D02, metadata, manifest,
+  or Merkle nodes and does not change an ANN root, view identity, count, byte
+  count, `next_sequence`, or base identity.
+
+An admitted absence is proved in overlay-first order. The writer validates the
+exact D02 leaf or its authenticated non-membership path against the overlay
+root, then the exact D01 record, then the selected base-child vector keys when
+neither delta layer names the object. A D02 or D01 tombstone is absence and
+suppresses a lower live value. More than one selected child containing the
+object is corruption. Writer admission repeats this proof against the admitted
+root, and recovery repeats it against the committed prior root; opcode 57
+against a present prior object or any physical change attributable to that
+fenced object/path fails closed.
+
+Ordinary and physical-delta point upsert and present-object delete synthesize
+M05, D02, overlay manifests/nodes, and fixed `HYANNA02` WAL opcode 56. Sequence
+and mutation CSN are assigned under writer admission. `HYANNA02.operation_count`
+counts only physical upserts and deletes, so a mixed transaction may carry
+opcode 57 records without counting them in the marker or consuming M05
+sequences or delta slots. A transaction admits at most 4,096 opcode 57 records
+in total; they remain ordinary WAL mutations and therefore still count toward
+the transaction mutation body. A pure-fence transaction appends its transaction
+ID and commit to WAL and advances commit CSN and global visibility while naming
+the unchanged four root page IDs, blob generation, and catalog version.
+
+Physical point operations validate an object conflict key and index-generation
+authority but publish only the object key, allowing disjoint point writers to
+rebase. An absence fence validates and publishes its object key and the index
+lifecycle-fence key, not the generation key, so same-object upsert/delete races
+conflict in either commit order and stale initial-bulk or consolidation plans
+cannot cross the omission. Disjoint fences and physical points compose.
+Creation and vectors in the same transaction remain canonical M04. M05
+initial-bulk rewriting remains fail closed. Consolidation is the separately
+bounded maintenance writer specified below; it adds no protocol, catalog,
+backup/proof version, background scheduler, release, or broad performance
+claim. Lexical compaction and page-generation vacuum may preserve authenticated
+bytes byte-for-byte.
 
 Open and snapshot materialization scan the selected base and delta, validate
 every ANN physical key/value, reconstruct the base `IndexSnapshot`, and require
@@ -144,46 +203,137 @@ count divergence, bad neighbors or a noncanonical build fail the complete root.
 Queries currently traverse this validated in-memory materialization, not
 buffer-pool pages directly.
 
+Recovery discovers changed ANN indexes from a bounded immutable B+tree diff over
+all physical prefixes `0x05` through `0x0b`, including an absent prior root. It
+does not rely on WAL targets or metadata-only differences. Metadata from both
+roots bounds changed-key, changed-index, and node work. Any point-writer-changed
+index with M05 on either side requires exact HYANNA02, physical vector-mutation
+agreement, and the complete per-index point-transition proof. Opcode 50 instead
+requires exact HYANNC02 consolidation authority and the replacement proof
+below. Unchanged M05 beside lexical-only work is inherited by shared page
+identity. Opcode 57 indexes are also replayed
+from the committed prior root even though they are absent from the physical
+diff and marker count. Recovery reconstructs their object and lifecycle-fence
+conflict keys. A commit containing only opcode 57 must retain every root page
+ID, blob generation, and catalog version exactly while its WAL commit and CSN
+remain authoritative.
+
 ## MVCC and mutation
 
-New/updated vectors and tombstones enter the transaction-private object delta.
-`upsert_vectors` admits a duplicate-free batch atomically without rebuilding
-the base. Single-vector upsert and delete preserve read-your-writes. At commit,
-all records receive the assigned CSN and are published with the all-engine root.
-Retained root sets preserve historical base-plus-delta views.
+New/updated vectors and physical tombstones enter the transaction-private object
+delta. `upsert_vectors` admits a duplicate-free batch atomically without
+rebuilding the base. Single-vector upsert and delete preserve read-your-writes.
+An absence fence changes no private or durable ANN value; it preserves the
+already-absent read result while retaining commit-time conflict authority. At
+commit, physical records receive the assigned CSN and are published with the
+all-engine root. Retained root sets preserve historical base-plus-delta views.
 
 The exact oracle ranks the effective set: start with base vectors, replace or
 remove every object named by the delta, then apply metric order and object-ID
 tie breaking. Approximate execution traverses the base graph, removes base hits
 shadowed by any delta, scores every live delta upsert exactly, merges those
-candidates and truncates to `k`. The receipt's build identity is the selected
-view identity; without a delta it equals the canonical base identity. This is
-honestly approximate because delta candidates are exact while base candidates
-remain bounded by graph traversal.
+candidates and truncates to `k`.
+
+The base query must oversample before that suppression instead of first
+truncating the base to `k`. Let `B` be the selected base vector count, `D` the
+effective object-keyed delta count, `S <= min(B, D)` the number of selected-base
+objects shadowed by that delta, and `Q` the caller's `ef_search`. Its base-hit
+target is the checked value `min(B, Q, k + S)`, and both graph search and
+optional exact reranking remain at or below `Q`. The implementation must not
+replace `Q` with the index's larger configured maximum.
+
+Suppression then runs before final top-k truncation. If the base candidates
+admitted by `Q`, together with live exact delta upserts, cannot replace all
+shadowed hits, the approximate result is allowed to contain fewer than `k`
+hits. Underfill does not authorize a complete-corpus exact scan, an exact
+fallback, or an increase in `ef_search`; callers that need a wider attempt must
+request a larger legal `Q`. Base count, the 4,096-record delta limit, and `Q`
+are independent hard bounds.
+
+The receipt's build identity is the selected view identity; without a delta it
+equals the canonical base identity. This is honestly approximate because delta
+candidates are exact while base candidates remain bounded by graph traversal.
 
 ## Bounded consolidation
 
-`plan_ann_consolidation` captures one current effective set and constructs a
-canonical replacement base outside writer admission. Both effective vectors
-and captured delta records have caller-supplied hard bounds; the implementation
-also caps those requests at 1,000,000 vectors and 4,096 delta records. An empty
-delta is not a consolidation candidate.
+For M04 or M05 input, `plan_ann_consolidation` captures one current effective
+set and constructs a canonical replacement base outside writer admission. The
+capture binds the source-version flag, selected base and view identities,
+captured `next_sequence`, and the complete object-ordered effective delta. Its
+fixed-body captured-record digest includes the index, each object's sequence,
+kind, mutation CSN, and canonical vector bytes. The canonical effective-vector-
+set digest also includes the index before its count and commutative record
+accumulators. The enclosing fixed body duplicates the same target index, and
+publication and recovery require the two authorities to agree. Both formulas
+are fixed by the WAL contract. Both effective vectors and captured delta
+records have caller-supplied hard bounds; the implementation also caps those
+requests at 1,000,000 vectors and 4,096 delta records. An empty delta is not a
+consolidation candidate. New C02 capture/result format bytes are exactly
+M04-or-M05/M05.
+Historical fixed 112-byte `HYANNC01` remains authoritative only for its original
+M01-through-M04 transitions; it cannot authorize M05 and is not emitted.
 
 `consolidate_ann` publishes a captured plan through an ordinary root commit and
-the append-only search maintenance opcode 50. Publication requires the captured
-base still to be selected. It consumes a captured object delta only when that
-object still has the captured sequence, preserving any later replacement or
-tombstone. The replacement search B+tree is written from current entries and
-retains only the configured number of obsolete target generations. The new root
-is selected atomically by the normal page, WAL and MVCC protocol, so recovery
-observes the old or complete new view. Historical roots and snapshot pins keep
-their normal page-generation safety; physical reclamation remains the existing
-page vacuum operation rather than an ANN-specific reclaimer.
+append-only search maintenance opcode 50 with fixed 384-byte `HYANNC02`
+authority. Publication requires the captured base and index definition still
+to be selected. Physical D01 and D02 records below captured `next_sequence`
+must reconstruct the captured object/sequence map, count, ordered
+effective-record digest, and format-specific view exactly. A current effective
+record still at its captured sequence is consumed; a greater-sequence record is
+preserved, while a new object is later only at or above the boundary.
+
+A later D02 may shadow a captured D01 because the D01 still reconstructs the
+capture. Overwriting a captured D02, or overwriting a captured D01 in D01,
+removes or changes that proof and makes the plan stale even when the new
+sequence is greater. A missing record, changed capture kind/CSN/vector, lower
+later sequence, or unclassified record is also stale. The complete C02 body is
+encoded and validated before any page is appended.
+
+The result is canonical M05 with the replacement base selected and an
+overlay-only delta. It contains no D01 key. Every preserved later upsert or
+tombstone is represented once in D02 with its object, sequence, mutation CSN,
+kind, and vector bytes unchanged; no captured-equal record remains. Metadata
+and `HYANNO01` set frozen D01 count and bytes to zero, set the frozen legacy
+view identity to the replacement base, and set frozen `next_sequence` to the
+minimum preserved sequence or the final `next_sequence` when the overlay is
+empty. The final `next_sequence` equals the publication-time prior value:
+consolidation neither allocates nor renumbers a sequence. D02 leaves, ordered
+sparse-Merkle nodes, counts, bytes, root, and final view identity are rebuilt
+canonically from exactly that preserved set.
+
+Retention starts with the publication-time retained-generation list, appends
+the publication-time selected nonempty base at the end only when it differs
+from the replacement and is not already retained, and drops oldest descriptors
+only as needed to satisfy `retain_generations`. Every surviving selected or
+retained child must retain its complete vector and graph records. Existing
+surviving generation bytes are
+copied byte-for-byte, while exactly the retired generations are removed. The
+B+tree replacement checks the exact current key set under the format key and
+all target prefixes `0x05` through `0x0b` before its first append, validates the
+complete replacement and all selected/retained graphs in an unpublished tail,
+and exposes no candidate page on rejection.
+
+Strict interruption has the ordinary singleton cut: `BlobStaged` through
+`PageSynchronized` reopen the prior root; `WalAppended` through `RootPublished`
+reopen the complete replacement. Recovery validates every retained transition
+against its immediately preceding committed root, including superseded result
+roots. It derives the below-bound capture cohort, recomputes the C02 count and
+ordered digest, and requires exactly the canonical overlay-only result,
+unchanged `next_sequence`, lifecycle policy, retained-generation transition,
+complete selected/retained vectors and graphs, and logical effective vectors. A
+mixed base, D01/D02 result, omitted later record, consumed later record, extra
+record, noncanonical overlay, descriptor without its graph, orphan generation,
+or unrelated target change is an invalid committed root. Historical roots and
+snapshot pins retain normal page-generation safety; physical reclamation
+remains page vacuum rather than an ANN-specific reclaimer. Initial-bulk
+rewriting of M05 and automatic background scheduling remain non-claims.
 
 A query traverses the visible graph and may exact-rerank a declared candidate
-count. Stable-ID eligibility participates during layer-zero graph traversal;
-restrictive admitted sets no larger than `ef_search` use exact filtered
-execution. Typed predicate construction remains outside this API.
+count. A complete caller allowlist containing at most `ef_search` identifiers
+uses exact object-point evaluation. A larger allowlist uses bounded filtered
+graph traversal; a partitioned base routes that work through its bounded child
+graphs rather than scanning the complete base to count visible eligibility.
+Typed predicate construction remains outside this API.
 
 ## Filtering
 
@@ -191,14 +341,30 @@ Stable-ID bitmaps and typed doc-value predicates may run before, during, or
 after graph traversal according to the physical plan. The explanation records
 which strategy ran and whether it can reduce recall.
 
-The current bounded implementation accepts a stable `ObjectId` allowlist.
-Navigation may visit admitted and non-admitted connector nodes, but a distinct
-eligible set is maintained during layer-zero expansion, so disallowed nodes do
-not consume eligible candidate capacity. Receipts report
-`StableIdEligibilityTraversal` and `FilteredApproximateTraversal`. When the
-complete visible allowlist cardinality is at most `ef_search`, execution scores
-that set exactly and reports `StableIdAdaptiveExact` and
-`ExactFilteredCandidates`.
+The current bounded implementation accepts a stable `ObjectId` allowlist. When
+the caller supplies more identifiers than `ef_search`, navigation may visit
+admitted and non-admitted connector nodes, but disallowed nodes never become
+hits. A single base reports `StableIdEligibilityTraversal` and
+`FilteredApproximateTraversal`; a partitioned base reports its bounded graph
+strategy and approximation risk. Either graph path may honestly underfill when
+its bounded candidates cannot supply `k` eligible, unshadowed hits. It never
+fills from a complete exact scan or silently increases `ef_search`.
+
+When the complete caller allowlist cardinality is at most `ef_search`, both
+single and partitioned bases perform direct point evaluation of exactly those
+identifiers and report `StableIdAdaptiveExact` and `ExactFilteredCandidates`.
+The decision uses caller allowlist cardinality, including absent identifiers;
+it does not scan the base to lower that count. Exact point evaluation may return
+fewer than `k` only because fewer than `k` live eligible objects exist.
+
+Integrated collection search materializes one exact allowlist for all vector
+branches from the collection manifest and the request filter. `MatchAll` means
+the manifest membership, not every object that happens to share the physical
+ANN index. Each ANN branch returns the native filtered result and receipt
+directly; the product layer does not add an exact seed, merge a post-filter
+oracle hit, or rewrite the runtime's candidate, visit, rerank, approximation,
+or underfill evidence. Consequently either bounded graph shape can underfill,
+while a point-evaluated branch remains labelled exact.
 
 ## Result contract
 
@@ -263,11 +429,21 @@ distribution across at least ten deterministic query sets.
 
 ## Verification
 
-Current tests additionally prove unchanged base identity and generation-record
-counts across foreground mutations, reopen and effective exact equivalence,
-strict maintenance WAL decoding, bounded consolidation, preservation of later
-object versions, stale-base rejection, old-or-new interruption recovery and
-configured retention, policy bounds, due-plan generation, pin-safe old-root
-retention, unpin plus page-vacuum collection, and filter-aware recall against
-the exact oracle. Background scheduling and page-buffered traversal remain
-future production work.
+Verification for this contract must additionally cover unchanged base identity
+and generation-record counts across foreground mutations, base/D01/D02 point
+deletion, prior-absence proof, mixed physical/fence marker counts, the 4,096
+fence bound, sequence and slot non-consumption, same-object races in both
+orders, disjoint group composition, unchanged-root pure-fence recovery, reopen
+and effective exact equivalence, strict HYANNC02 maintenance WAL decoding,
+the index-bound captured-record and effective-vector-set digest formulas,
+M04/M05 capture with M05 result, retained C01 authority for
+legacy transitions, M01-M03 write-to-M04 upgrade and M01-M04 grandfathered
+load with candidate M05 rejection,
+canonical overlay-only output, preservation of later objects and
+`next_sequence`, captured-D01 shadow preservation, captured-D02 overwrite and
+stale-base rejection, old-or-new interruption recovery, complete retained graph
+generations, configured retention, policy
+bounds, due-plan generation, pin-safe old-root retention, unpin plus
+page-vacuum collection, and filter-aware recall against the exact oracle.
+Background scheduling and page-buffered traversal remain future production
+work.
