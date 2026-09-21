@@ -21,12 +21,69 @@ export type TransactionState = "none" | "active" | "rolled-back" | "committed" |
 
 export type ProductDocValue = boolean | bigint | number | string | Uint8Array | { readonly float: number };
 
+export const CATALOG_OBJECT_KINDS = [
+  "database",
+  "schema",
+  "relation",
+  "secondary_index",
+  "keyspace",
+  "structure",
+  "search_collection",
+  "analyzer",
+  "cross_engine_link",
+  "embedding_profile",
+] as const;
+export type CatalogObjectKind = typeof CATALOG_OBJECT_KINDS[number];
+
+export const CATALOG_DEPENDENCY_KINDS = [
+  "parent",
+  "secondary_index_relation",
+  "foreign_key",
+  "analyzer",
+  "link_endpoint",
+  "relation_schema",
+  "embedding_profile",
+] as const;
+export type CatalogDependencyKind = typeof CATALOG_DEPENDENCY_KINDS[number];
+
 /** One complete image whose map names use canonical UTF-8 byte order on wire. */
 export interface ProductDocument {
   readonly object_id: bigint;
   readonly text: string;
   readonly doc_values?: Readonly<Record<string, ProductDocValue>>;
   readonly vectors?: Readonly<Record<string, readonly number[]>>;
+}
+
+/** One document whose vectors are produced from catalog-bound profiles. */
+export interface EmbedAndIngestDocument {
+  readonly object_id: bigint;
+  readonly text: string;
+  readonly doc_values?: Readonly<Record<string, ProductDocValue>>;
+}
+
+export interface EmbedAndIngestBatch {
+  readonly idempotency_id: bigint;
+  readonly documents: readonly EmbedAndIngestDocument[];
+}
+
+/** The selected executor reported by an embed-and-ingest response. */
+export interface EmbeddingExecutionProfile {
+  readonly embeddingProfile: bigint;
+  readonly backend: "cpu" | "cuda";
+  readonly device: string;
+  readonly driver: string;
+  readonly runtime: string;
+  readonly precision: "f32";
+  readonly kernels: readonly string[];
+  readonly fallback: boolean;
+}
+
+export interface EmbedAndIngestResult {
+  readonly snapshot: Readonly<Record<string, unknown>>;
+  readonly documents: bigint;
+  readonly idempotentReplay: boolean;
+  readonly executionProfile: EmbeddingExecutionProfile;
+  readonly commit: Readonly<Record<string, unknown>> | undefined;
 }
 
 export type ProductTransactionSearchMutation =

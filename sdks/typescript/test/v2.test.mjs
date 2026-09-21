@@ -5,9 +5,12 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  CATALOG_DEPENDENCY_KINDS,
+  CATALOG_OBJECT_KINDS,
   ERROR_MEDIA_TYPE,
   FRAME_KIND,
   HyphaeClient,
+  HttpTransport,
   LocalTransport,
   PRODUCT_MEDIA_TYPE,
   ProductError,
@@ -27,6 +30,32 @@ const fixtureUrl = new URL("../../../compatibility/native-protocol-v1-structure-
 const transactionDocumentFixtureUrl = new URL("../../../compatibility/native-protocol-v1-transaction-document.bin", import.meta.url);
 const transactionDocumentOrderingFixtureUrl = new URL("../../../compatibility/native-protocol-v1-transaction-document-ordering.json", import.meta.url);
 const requiredMinorFixtureUrl = new URL("../../../compatibility/native-protocol-v1-required-minors.json", import.meta.url);
+
+const joinBytes = (...values) => {
+  const output = new Uint8Array(values.reduce((total, value) => total + value.byteLength, 0));
+  let offset = 0;
+  for (const value of values) {
+    output.set(value, offset);
+    offset += value.byteLength;
+  }
+  return output;
+};
+const lengthPrefixed = (value) => {
+  const output = new Uint8Array(4 + value.byteLength);
+  new DataView(output.buffer).setUint32(0, value.byteLength, true);
+  output.set(value, 4);
+  return output;
+};
+const encodedText = (value) => lengthPrefixed(new TextEncoder().encode(value));
+const productResponse = (kind, body) => {
+  const output = new Uint8Array(16 + body.byteLength);
+  output.set(new TextEncoder().encode("HYPRSP01"));
+  const view = new DataView(output.buffer);
+  view.setUint32(8, output.byteLength, true);
+  view.setUint16(12, kind, true);
+  output.set(body, 16);
+  return output;
+};
 
 test("v2 search content at every current shape is minor zero", () => {
   // Original search shapes and minor-0 doc-value types remain available
@@ -158,6 +187,150 @@ test("v2 negotiated minor rejects unavailable operations before writing", () => 
     /negotiated protocol minor/,
   );
   assert.throws(() => encodeProductRequest("security_status", {}, {}, 0), /negotiated protocol minor/);
+});
+
+test("v2 minor-eight embedding profile content is gated", () => {
+  assert.equal(CATALOG_OBJECT_KINDS.at(-1), "embedding_profile");
+  assert.equal(CATALOG_DEPENDENCY_KINDS.at(-1), "embedding_profile");
+  const magic = new TextEncoder().encode("HYCOBJ02");
+  const definitions = [
+    joinBytes(magic, Uint8Array.of(10, 2)),
+    joinBytes(magic, Uint8Array.of(7, 4)),
+  ];
+  for (const definition of definitions) {
+    const args = { definition };
+    assert.equal(operationRequiredMinor("catalog_create", args), 8);
+    assert.throws(() => encodeProductRequest("catalog_create", args, {}, 7), /protocol minor/);
+    assert.doesNotThrow(() => encodeProductRequest("catalog_create", args, {}, 8));
+
+    const definitionBody = joinBytes(Uint8Array.of(1, 0, 0, 0), lengthPrefixed(definition));
+    assert.throws(() => decodeProductResponse(productResponse(15, definitionBody), 1n, 7), /protocol minor/);
+    assert.deepEqual(decodeProductResponse(productResponse(15, definitionBody), 1n, 8).value, definition);
+
+    const objectBody = joinBytes(new Uint8Array(80), lengthPrefixed(definition));
+    assert.throws(() => decodeProductResponse(productResponse(12, objectBody), 1n, 7), /protocol minor/);
+    assert.deepEqual(decodeProductResponse(productResponse(12, objectBody), 1n, 8).value.definition, definition);
+  }
+
+  const listing = {
+    parent: undefined,
+    kind: "embedding_profile",
+    cursor: undefined,
+    item_limit: 1n,
+    visit_limit: 1n,
+    byte_limit: 4096n,
+  };
+  assert.equal(operationRequiredMinor("catalog_list", listing), 8);
+  assert.throws(() => encodeProductRequest("catalog_list", listing, {}, 7), /protocol minor/);
+
+  const visibleBody = new Uint8Array(56);
+  const visibleView = new DataView(visibleBody.buffer);
+  visibleView.setUint32(4, 1, true);
+  visibleView.setBigUint64(8, 12n, true);
+  visibleBody[24] = 10;
+  const visible = productResponse(42, visibleBody);
+  assert.throws(() => decodeProductResponse(visible, 1n, 7), /protocol minor/);
+  assert.equal(decodeProductResponse(visible, 1n, 8).value.items[0].objectKind, 10);
+});
+
+test("v2 embed-and-ingest minor-nine codec is bounded and canonical", () => {
+  const privateUse = "\ue000";
+  const supplementary = "\u{1f600}";
+  const args = {
+    collection: 13n,
+    batch: {
+      idempotency_id: 7n,
+      documents: [{
+        object_id: 201n,
+        text: "rust database",
+        doc_values: {
+          [supplementary]: "supplementary",
+          [privateUse]: "private-use",
+        },
+      }],
+    },
+  };
+  assert.equal(operationRequiredMinor("embed_and_ingest", args), 9);
+  assert.throws(() => encodeProductRequest("embed_and_ingest", args, {}, 8), /protocol minor/);
+  const encoded = encodeProductRequest("embed_and_ingest", args, {}, 9);
+  assert.equal(new DataView(encoded.buffer).getUint16(12, true), 69);
+  const decoded = decodeProductRequest(encoded, 9);
+  assert.equal(decoded.operation, "embed_and_ingest");
+  assert.deepEqual(Object.keys(decoded.args.batch.documents[0].doc_values), [privateUse, supplementary]);
+  assert.deepEqual(encodeProductRequest(decoded.operation, decoded.args, decoded.options, 9), encoded);
+
+  const forged = encoded.slice();
+  new DataView(forged.buffer).setUint32(112, 0xffffffff, true);
+  assert.throws(() => decodeProductRequest(forged, 9), /document count/);
+
+  for (const forbidden of ["model_path", "backend", "device"]) {
+    assert.throws(
+      () => encodeProductRequest("embed_and_ingest", { ...args, [forbidden]: "not-on-wire" }, {}, 9),
+      /request fields/,
+    );
+  }
+});
+
+test("v2 embed-and-ingest response reports execution profile and replay", () => {
+  const snapshot = new Uint8Array(80);
+  snapshot.fill(1, 0, 24);
+  const snapshotView = new DataView(snapshot.buffer);
+  snapshotView.setBigUint64(24, 7n, true);
+  snapshotView.setBigUint64(32, 8n, true);
+  snapshot.fill(2, 40, 72);
+  snapshotView.setBigInt64(72, 10n, true);
+
+  const resultHeader = new Uint8Array(16);
+  resultHeader[1] = 1;
+  new DataView(resultHeader.buffer).setBigUint64(8, 1n, true);
+  const profileHeader = new Uint8Array(24);
+  const profileView = new DataView(profileHeader.buffer);
+  profileView.setBigUint64(0, 17n, true);
+  profileHeader[16] = 1;
+  profileHeader[17] = 1;
+  profileHeader[18] = 1;
+  const device = encodedText("NVIDIA H100");
+  const driver = encodedText("driver-1");
+  const runtime = encodedText("cuda-1");
+  const kernelCount = new Uint8Array(4);
+  new DataView(kernelCount.buffer).setUint32(0, 2, true);
+  const encoded = productResponse(47, joinBytes(
+    snapshot,
+    resultHeader,
+    profileHeader,
+    device,
+    driver,
+    runtime,
+    kernelCount,
+    encodedText("tokenize-v1"),
+    encodedText("qwen3-f32-v1"),
+  ));
+
+  const response = decodeProductResponse(encoded, 19n, 9);
+  assert.equal(response.kind, "embed_and_ingested");
+  assert.equal(response.value.documents, 1n);
+  assert.equal(response.value.idempotentReplay, true);
+  assert.equal(response.value.commit, undefined);
+  assert.deepEqual(response.value.executionProfile, {
+    embeddingProfile: 17n,
+    backend: "cuda",
+    device: "NVIDIA H100",
+    driver: "driver-1",
+    runtime: "cuda-1",
+    precision: "f32",
+    kernels: ["tokenize-v1", "qwen3-f32-v1"],
+    fallback: true,
+  });
+  assert.throws(() => decodeProductResponse(encoded, 19n, 8), /protocol minor/);
+  for (let prefix = 0; prefix < encoded.byteLength; prefix += 1) {
+    assert.throws(() => decodeProductResponse(encoded.slice(0, prefix), 19n, 9));
+  }
+
+  const excessive = encoded.slice();
+  const kernelCountOffset = 16 + snapshot.byteLength + resultHeader.byteLength + profileHeader.byteLength +
+    device.byteLength + driver.byteLength + runtime.byteLength;
+  new DataView(excessive.buffer).setUint32(kernelCountOffset, 0xffffffff, true);
+  assert.throws(() => decodeProductResponse(excessive, 19n, 9), /kernel count/);
 });
 
 test("v2 structure batch no-op response is minor seven and bounded", () => {
@@ -788,6 +961,24 @@ test("v2 high-level API is transport independent", async () => {
   assert.equal(calls[0].operation, "structure_get");
 });
 
+test("v2 high-level API exposes typed embed-and-ingest", async () => {
+  const calls = [];
+  const client = new HyphaeClient({
+    async execute(operation, args, options) {
+      calls.push({ operation, args, options });
+      return { kind: "embed_and_ingested", value: args, requestId: 9n };
+    },
+  });
+  const batch = {
+    idempotency_id: 7n,
+    documents: [{ object_id: 201n, text: "rust" }],
+  };
+  const response = await client.embedAndIngest(13n, batch, { requestId: 9n });
+  assert.equal(response.kind, "embed_and_ingested");
+  assert.equal(calls[0].operation, "embed_and_ingest");
+  assert.deepEqual(calls[0].args, { collection: 13n, batch });
+});
+
 test("v2 high-level API exposes explicit transactions", async () => {
   const calls = [];
   const client = new HyphaeClient({
@@ -925,8 +1116,66 @@ test("v2 HTTP client uses /v2 and validates correlation", async () => {
   });
   const response = await client.capabilities({ requestId: 17n });
   assert.equal(response.kind, "capabilities");
-  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5,6,7" });
+  assert.deepEqual(seen, { url: "https://example.test/v2/execute", contentType: PRODUCT_MEDIA_TYPE, minor: "3,4,5,6,7,8,9" });
   assert.equal(ERROR_MEDIA_TYPE, "application/vnd.hyphae.error-v1");
+});
+
+test("v2 fresh HTTP transport sends minor-nine embed-and-ingest on its first request", async () => {
+  let seen;
+  let requests = 0;
+  const transport = new HttpTransport("https://example.test", {
+    fetch: async (_url, options) => {
+      requests += 1;
+      seen = {
+        minor: options.headers.get("x-hyphae-protocol-minor"),
+        body: new Uint8Array(options.body),
+      };
+      return new Response(new Uint8Array(), {
+        status: 500,
+        headers: {
+          "content-type": ERROR_MEDIA_TYPE,
+          "x-hyphae-protocol-minor": "9",
+          "x-hyphae-request-id": "17",
+        },
+      });
+    },
+  });
+  const args = {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: "rust" }] },
+  };
+  await assert.rejects(transport.execute("embed_and_ingest", args, { requestId: 17n }));
+  assert.equal(requests, 1);
+  assert.equal(seen.minor, "3,4,5,6,7,8,9");
+  assert.equal(new DataView(seen.body.buffer).getUint16(12, true), 69);
+});
+
+test("v2 HTTP transport rejects minor-nine work locally after a server downgrade", async () => {
+  let requests = 0;
+  const capabilities = productResponse(1, new Uint8Array(56));
+  const transport = new HttpTransport("https://example.test", {
+    fetch: async (_url, options) => {
+      requests += 1;
+      return new Response(capabilities, {
+        status: 200,
+        headers: {
+          "content-type": PRODUCT_MEDIA_TYPE,
+          "x-hyphae-protocol-minor": "8",
+          "x-hyphae-request-id": options.headers.get("x-hyphae-request-id"),
+        },
+      });
+    },
+  });
+  await transport.execute("capabilities", {}, { requestId: 18n });
+  assert.equal(transport.negotiatedMinor, 8);
+  await assert.rejects(
+    transport.execute("embed_and_ingest", {
+      collection: 13n,
+      batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: "rust" }] },
+    }, { requestId: 19n }),
+    /protocol minor/,
+  );
+  assert.equal(requests, 1);
 });
 
 test("v2 HTTP initial preflight encodes at the highest supported minor", async () => {
@@ -941,7 +1190,7 @@ test("v2 HTTP initial preflight encodes at the highest supported minor", async (
         status: 500,
         headers: {
           "content-type": ERROR_MEDIA_TYPE,
-          "x-hyphae-protocol-minor": "7",
+          "x-hyphae-protocol-minor": "9",
           "x-hyphae-request-id": "88",
         },
       });
@@ -950,7 +1199,7 @@ test("v2 HTTP initial preflight encodes at the highest supported minor", async (
   await assert.rejects(
     client.execute("structure_read", { kind: "string_range", key: { keyspace: 1n, key: Uint8Array.of(1) }, start: 0n, end: 1n }, { requestId: 88n }),
   );
-  assert.equal(seen.minor, "3,4,5,6,7");
+  assert.equal(seen.minor, "3,4,5,6,7,8,9");
   assert.ok(seen.body.byteLength > 0);
 });
 
@@ -1077,6 +1326,6 @@ test("v2 HTTP routes all API-key lifecycle phases through the dedicated family",
   }
   assert.deepEqual(seen, operations.map(() => ({
     url: "https://example.test/v2/security/keys",
-    minor: "3,4,5,6,7",
+    minor: "3,4,5,6,7,8,9",
   })));
 });

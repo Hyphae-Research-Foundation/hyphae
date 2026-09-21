@@ -5,7 +5,7 @@ import { decodeProductError, decodeProductResponse, encodeProductRequest, operat
 
 /** Every protocol minor this build speaks, ascending. The request offers the
  * whole set and the server echoes its selection, which must be a member. */
-const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3, 4, 5, 6, 7];
+const SUPPORTED_PROTOCOL_MINORS: readonly number[] = [3, 4, 5, 6, 7, 8, 9];
 
 export const PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1";
 export const ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1";
@@ -27,7 +27,7 @@ export class HttpTransport implements Transport {
   readonly #maximumPending: number;
   #pending = 0;
   #closed = false;
-  #negotiatedMinor = 7;
+  #negotiatedMinor = 9;
 
   constructor(baseUrl: string, options: HttpTransportOptions = {}) {
     let origin: URL;
@@ -58,6 +58,10 @@ export class HttpTransport implements Transport {
     if (!Number.isSafeInteger(this.#maximumPending) || this.#maximumPending <= 0 || this.#maximumPending > 4096) {
       throw new ClientError("invalid HTTP v2 pending request bound");
     }
+  }
+
+  get negotiatedMinor(): number {
+    return this.#negotiatedMinor;
   }
 
   async execute(

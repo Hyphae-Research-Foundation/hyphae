@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { ClientError, DEFAULT_LIMITS, SensitiveBytes, type ProductErrorFields, type RequestOptions, type Response } from "./models.js";
+import { CATALOG_DEPENDENCY_KINDS, CATALOG_OBJECT_KINDS, ClientError, DEFAULT_LIMITS, SensitiveBytes, type ProductErrorFields, type RequestOptions, type Response } from "./models.js";
 
 export const MAX_PAYLOAD = 16 * 1024 * 1024;
 export const FRAME_HEADER_SIZE = 32;
+export const PROTOCOL_MINOR = 9;
 export const FRAME_KIND = {
   hello: 1,
   welcome: 2,
@@ -86,6 +87,7 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   security_api_key_rotate_abort: 66,
   security_api_key_revoke_self: 67,
   security_api_key_revoke: 68,
+  embed_and_ingest: 69,
   security_legacy_bearer_revoke: 70,
   memory_recall: 71,
   memory_enrich: 72,
@@ -115,6 +117,9 @@ const MAX_SEARCH_FACET_RANGES = 64;
 const MAX_AUTOCUT_STEEPNESS = 16;
 const MAX_LEXICAL_FIELDS = 64;
 const MAX_LEXICAL_MINIMUM_MATCH = 64;
+const MAX_EMBED_AND_INGEST_DOCUMENTS = 4_096;
+const MAX_EMBED_EXECUTION_KERNELS = 64;
+const MAX_EMBED_EXECUTION_TEXT_BYTES = 4_096;
 
 const DEFAULT_PROOF_LIMITS = {
   result_items: 10_000n,
@@ -192,7 +197,7 @@ export function decodeFrame(encoded: Uint8Array): Frame {
 }
 
 export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximumMinor = 0): Uint8Array {
-  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > 7) throw new ClientError("native protocol minor is invalid");
+  if (!Number.isInteger(maximumMinor) || maximumMinor < 0 || maximumMinor > PROTOCOL_MINOR) throw new ClientError("native protocol minor is invalid");
   const names = [clientIdentity, "main", "public"].map((value) => new TextEncoder().encode(value));
   const encoded = new Uint8Array(58 + names.reduce((total, value) => total + value.byteLength, 0));
   encoded.set(new TextEncoder().encode("HYPHEL01"));
@@ -219,7 +224,7 @@ export function encodeHello(clientIdentity = "hyphae-typescript-sdk-v2", maximum
 export function encodeAuthenticatedHello(
   apiKey: string | Uint8Array,
   clientIdentity = "hyphae-typescript-sdk-v2",
-  maximumMinor = 7,
+  maximumMinor = PROTOCOL_MINOR,
 ): Uint8Array {
   const authentication = typeof apiKey === "string" ? new TextEncoder().encode(apiKey) : apiKey.slice();
   if (authentication.byteLength !== API_KEY_BYTES) throw new ClientError("local API-key credential is invalid");
@@ -265,7 +270,22 @@ function documentRequiredMinor(value: unknown): number {
   return Object.values(docValues).reduce((highest: number, entry) => Math.max(highest, docValueRequiredMinor(entry)), 0);
 }
 
+function catalogDefinitionRequiredMinor(definition: unknown): number {
+  if (!(definition instanceof Uint8Array) || definition.byteLength < 10 ||
+      new TextDecoder().decode(definition.subarray(0, 8)) !== "HYCOBJ02") {
+    return 0;
+  }
+  const kind = definition[8];
+  const representation = definition[9];
+  return kind === 10 || (kind === 7 && representation === 4) ? 8 : 0;
+}
+
+function isEmbeddingProfileKind(value: unknown): boolean {
+  return value === "embedding_profile" || value === 10;
+}
+
 export function operationRequiredMinor(operation: string, args: Readonly<Record<string, unknown>> = {}): number {
+  if (operation === "embed_and_ingest") return 9;
   if (operation === "memory_recall" || operation === "memory_enrich") return 7;
   if (operation === "proof_generate") {
     const nested = args.operation;
@@ -273,7 +293,10 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   }
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
-  if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "catalog_visible_list") return isEmbeddingProfileKind(args.kind) ? 8 : 3;
+  if (operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  if (operation === "catalog_list" && isEmbeddingProfileKind(args.kind)) return 8;
+  if (operation === "catalog_create") return catalogDefinitionRequiredMinor(args.definition);
   const minorSixMutations = ["sorted_set_increment", "sorted_set_pop", "string_set_conditional", "string_append", "string_set_range", "hash_set_if_absent", "set_pop"];
   if (operation === "structure_read") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
@@ -316,7 +339,27 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   return 0;
 }
 
-export function responseRequiredMinor(kind: number): number {
+export function responseRequiredMinor(kind: number, value?: unknown): number {
+  if (kind === 47) return 9;
+  if (kind === 12 && typeof value === "object" && value !== null) {
+    return catalogDefinitionRequiredMinor((value as Readonly<Record<string, unknown>>).definition);
+  }
+  if ((kind === 13 || kind === 42) && typeof value === "object" && value !== null) {
+    const items = (value as Readonly<Record<string, unknown>>).items;
+    if (Array.isArray(items) && items.some((item) => typeof item === "object" && item !== null &&
+        isEmbeddingProfileKind((item as Readonly<Record<string, unknown>>).objectKind))) {
+      return 8;
+    }
+  }
+  if (kind === 14 && typeof value === "object" && value !== null) {
+    const items = (value as Readonly<Record<string, unknown>>).items;
+    if (Array.isArray(items) && items.some((item) => typeof item === "object" && item !== null &&
+        ((item as Readonly<Record<string, unknown>>).kind === 7 ||
+         (item as Readonly<Record<string, unknown>>).kind === "embedding_profile"))) {
+      return 8;
+    }
+  }
+  if (kind === 15) return catalogDefinitionRequiredMinor(value);
   if (kind === 45 || kind === 46) return 7;
   if (kind >= 32 && kind <= 37) return 1;
   if (kind >= 38 && kind <= 41) return 2;
@@ -324,12 +367,18 @@ export function responseRequiredMinor(kind: number): number {
   return 0;
 }
 
+function requireResponseContentMinor(kind: number, value: unknown, negotiatedMinor?: number): void {
+  if (negotiatedMinor !== undefined && negotiatedMinor < responseRequiredMinor(kind, value)) {
+    throw new ClientError("native response is unavailable at the negotiated protocol minor");
+  }
+}
+
 export function decodeWelcome(encoded: Uint8Array): Readonly<Record<string, number | bigint>> {
   if (encoded.byteLength !== 94 || new TextDecoder().decode(encoded.subarray(0, 8)) !== "HYPWEL01") {
     throw new ClientError("native welcome is malformed");
   }
   const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > 7 || view.getBigUint64(24, true) === 0n) {
+  if (view.getUint32(8, true) !== 94 || view.getUint16(12, true) !== 1 || view.getUint16(14, true) > PROTOCOL_MINOR || view.getBigUint64(24, true) === 0n) {
     throw new ClientError("native welcome values are invalid");
   }
   return {
@@ -534,11 +583,13 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
   if (kind === 12) {
     const value = { snapshot: decodeSnapshot(reader), definition: reader.bytes() };
     reader.finish();
+    requireResponseContentMinor(kind, value, negotiatedMinor);
     return { kind: "catalog_object", value, requestId };
   }
   if (kind === 13 || kind === 14) {
     const value = decodeCatalogPage(reader, kind === 14);
     reader.finish();
+    requireResponseContentMinor(kind, value, negotiatedMinor);
     return { kind: kind === 13 ? "catalog_page" : "catalog_dependency_page", value, requestId };
   }
   if (kind === 15) {
@@ -547,6 +598,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
     if (present > 1) throw new ClientError("catalog definition response is malformed");
     const value = present === 0 ? undefined : reader.bytes();
     reader.finish();
+    requireResponseContentMinor(kind, value, negotiatedMinor);
     return { kind: "catalog_definition", value, requestId };
   }
   if (kind === 16) {
@@ -565,9 +617,15 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
       const objectKind = reader.u8();
       const hasParent = reader.boolean();
       reader.zeroes(6);
-      return { id, objectKind, parent: hasParent ? reader.u128() : undefined, name: decodeQualifiedName(reader) };
+      if (id === 0n || objectKind < 1 || objectKind > CATALOG_OBJECT_KINDS.length) {
+        throw new ClientError("catalog visible object is invalid");
+      }
+      const parent = hasParent ? reader.u128() : undefined;
+      if (parent === 0n) throw new ClientError("catalog visible parent identity is zero");
+      return { id, objectKind, parent, name: decodeQualifiedName(reader) };
     });
     reader.finish();
+    requireResponseContentMinor(kind, { items }, negotiatedMinor);
     return { kind: "catalog_visible_page", value: { cursor: cursor.byteLength === 0 ? undefined : cursor, items }, requestId };
   }
   if (kind === 43) {
@@ -693,6 +751,25 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
     reader.finish();
     return { kind: "search_ingested", value, requestId };
   }
+  if (kind === 47) {
+    const snapshot = decodeSnapshot(reader);
+    const hasCommit = reader.boolean();
+    const idempotentReplay = reader.boolean();
+    reader.zeroes(6);
+    const documents = reader.u64();
+    if (documents === 0n || documents > BigInt(MAX_EMBED_AND_INGEST_DOCUMENTS)) {
+      throw new ClientError("embed-and-ingest document result exceeds its bound");
+    }
+    const value = {
+      snapshot,
+      documents,
+      idempotentReplay,
+      executionProfile: decodeEmbeddingExecutionProfile(reader),
+      commit: hasCommit ? decodeCommitReceipt(reader) : undefined,
+    };
+    reader.finish();
+    return { kind: "embed_and_ingested", value, requestId };
+  }
   if (kind === 31) {
     const response = decodeProductResponse(reader.bytes(), requestId, negotiatedMinor);
     const value = {
@@ -789,12 +866,23 @@ function decodeCatalogPage(reader: Reader, dependencies: boolean): Readonly<Reco
   const count = reader.u32();
   const bounded = boundedCount(count, MAX_PRODUCT_COUNT, reader, dependencies ? 33 : 48, "catalog page item");
   const items = dependencies
-    ? Array.from({ length: bounded }, () => ({ dependent: reader.u128(), prerequisite: reader.u128(), kind: reader.u8() }))
+    ? Array.from({ length: bounded }, () => {
+      const dependent = reader.u128();
+      const prerequisite = reader.u128();
+      const kind = reader.u8();
+      if (kind < 1 || kind > CATALOG_DEPENDENCY_KINDS.length) {
+        throw new ClientError("catalog dependency kind is invalid");
+      }
+      return { dependent, prerequisite, kind };
+    })
     : Array.from({ length: bounded }, () => {
       const id = reader.u128();
       const objectKind = reader.u8();
       const hasParent = reader.boolean();
       reader.zeroes(6);
+      if (objectKind < 1 || objectKind > CATALOG_OBJECT_KINDS.length) {
+        throw new ClientError("catalog object kind is invalid");
+      }
       return { id, objectKind, parent: hasParent ? reader.u128() : undefined, name: decodeQualifiedName(reader) };
     });
   return { snapshot, cursor, stop, visited, returnedBytes, items };
@@ -894,6 +982,43 @@ function decodeCommitReceipt(reader: Reader): Readonly<Record<string, unknown>> 
     throw new ClientError("commit receipt is noncanonical");
   }
   return { transactionId, commitCsn, catalogVersion, commitLsn, walBlockDigest, durability, durabilityCohortSize, durabilityCohortPosition };
+}
+
+function decodeEmbeddingExecutionProfile(reader: Reader): Readonly<Record<string, unknown>> {
+  const embeddingProfile = readIdentity(reader, "embedding profile");
+  const backendTag = reader.u8();
+  const precisionTag = reader.u8();
+  const fallback = reader.boolean();
+  reader.zeroes(5);
+  if (backendTag > 1) throw new ClientError("embedding execution backend is invalid");
+  if (precisionTag !== 1) throw new ClientError("embedding execution precision is invalid");
+  const device = decodeBoundedText(reader, "embedding execution device");
+  const driver = decodeBoundedText(reader, "embedding execution driver");
+  const runtime = decodeBoundedText(reader, "embedding execution runtime");
+  const kernelCount = readBoundedCount(reader, MAX_EMBED_EXECUTION_KERNELS, 4, "embedding execution kernel");
+  if (kernelCount === 0) throw new ClientError("embedding execution kernel count exceeds its bound");
+  return {
+    embeddingProfile,
+    backend: (["cpu", "cuda"] as const)[backendTag],
+    device,
+    driver,
+    runtime,
+    precision: "f32",
+    kernels: Array.from({ length: kernelCount }, () => decodeBoundedText(reader, "embedding execution kernel")),
+    fallback,
+  };
+}
+
+function decodeBoundedText(reader: Reader, name: string): string {
+  const encoded = reader.bytes();
+  if (encoded.byteLength === 0 || encoded.byteLength > MAX_EMBED_EXECUTION_TEXT_BYTES) {
+    throw new ClientError(`${name} is empty or exceeds its bound`);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(encoded);
+  } catch (cause) {
+    throw new ClientError(`${name} is not valid UTF-8`, { cause });
+  }
 }
 
 function decodeOptionalApiKeyId(reader: Reader): Uint8Array | undefined {
@@ -1536,6 +1661,13 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     return join(identity128(args.collection, "search collection"), digest,
       identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
   }
+  if (operation === "embed_and_ingest") {
+    const fields = Object.keys(args);
+    if (fields.length !== 2 || !fields.includes("collection") || !fields.includes("batch")) {
+      throw new ClientError("embed-and-ingest request fields are invalid");
+    }
+    return join(identity128(args.collection, "search collection"), encodeEmbedAndIngestBatch(args.batch));
+  }
   if (operation === "search_collection") return encodeSearchCollection(args);
   if (operation === "search_ingest") return join(identity128(args.collection, "search collection"), encodeSearchBatch(args.batch));
   if (operation === "search_document_update") return join(identity128(args.collection, "search collection"), identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
@@ -1578,8 +1710,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
 }
 
 function catalogKindTag(kind: string): number {
-  const kinds = ["database", "schema", "relation", "secondary_index", "keyspace", "structure", "search_collection", "analyzer", "cross_engine_link"];
-  const index = kinds.indexOf(kind);
+  const index = CATALOG_OBJECT_KINDS.indexOf(kind as typeof CATALOG_OBJECT_KINDS[number]);
   if (index < 0) throw new ClientError("catalog object kind is invalid");
   return index + 1;
 }
@@ -1766,6 +1897,56 @@ function encodeSearchBatch(raw: unknown): Uint8Array {
   return join(identity128(batch.idempotency_id, "idempotency"), u32(documents.length), ...documents.map(encodeSearchDocument));
 }
 
+function encodeEmbedAndIngestBatch(raw: unknown): Uint8Array {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ClientError("embed-and-ingest batch fields are invalid");
+  }
+  const batch = raw as Readonly<Record<string, unknown>>;
+  const fields = Object.keys(batch);
+  if (fields.length !== 2 || !fields.includes("idempotency_id") || !fields.includes("documents")) {
+    throw new ClientError("embed-and-ingest batch fields are invalid");
+  }
+  const documents = batch.documents;
+  if (!Array.isArray(documents) || documents.length === 0 || documents.length > MAX_EMBED_AND_INGEST_DOCUMENTS) {
+    throw new ClientError("embed-and-ingest documents must be a nonempty bounded array");
+  }
+  return join(
+    identity128(batch.idempotency_id, "idempotency"),
+    u32(documents.length),
+    ...documents.map(encodeEmbedAndIngestDocument),
+  );
+}
+
+function encodeEmbedAndIngestDocument(raw: unknown): Uint8Array {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ClientError("embed-and-ingest document fields are invalid");
+  }
+  const document = raw as Readonly<Record<string, unknown>>;
+  const fields = Object.keys(document);
+  if (!fields.includes("object_id") || !fields.includes("text") ||
+      fields.some((field) => !["object_id", "text", "doc_values"].includes(field))) {
+    throw new ClientError("embed-and-ingest document fields are invalid");
+  }
+  if (typeof document.text !== "string") {
+    throw new ClientError("embed-and-ingest document text is invalid");
+  }
+  const values = document.doc_values ?? {};
+  if (typeof values !== "object" || values === null || Array.isArray(values) || values instanceof Uint8Array) {
+    throw new ClientError("embed-and-ingest document values are invalid");
+  }
+  const entries = Object.entries(values as Readonly<Record<string, unknown>>)
+    .sort(([left], [right]) => compareUtf8(left, right));
+  if (entries.length > MAX_DOC_VALUES_PER_HIT) {
+    throw new ClientError("embed-and-ingest document values exceed their bound");
+  }
+  return join(
+    identity128(document.object_id, "search document"),
+    bytes(new TextEncoder().encode(document.text)),
+    u32(entries.length),
+    ...entries.flatMap(([name, value]) => [bytes(new TextEncoder().encode(name)), encodeDocValue(value)]),
+  );
+}
+
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
   const sharedLength = Math.min(left.byteLength, right.byteLength);
   for (let index = 0; index < sharedLength; index += 1) {
@@ -1833,6 +2014,34 @@ function decodeSearchDocument(reader: Reader): Readonly<Record<string, unknown>>
     Object.defineProperty(vectors, name, { value: vector, enumerable: true });
   }
   return { object_id: objectId, text, doc_values: docValues, vectors };
+}
+
+function decodeEmbedAndIngestBatch(reader: Reader): Readonly<Record<string, unknown>> {
+  const idempotencyId = readIdentity(reader, "idempotency");
+  const count = readBoundedCount(reader, MAX_EMBED_AND_INGEST_DOCUMENTS, 24, "embed-and-ingest document");
+  if (count === 0) throw new ClientError("embed-and-ingest document count exceeds its bound");
+  return {
+    idempotency_id: idempotencyId,
+    documents: Array.from({ length: count }, () => decodeEmbedAndIngestDocument(reader)),
+  };
+}
+
+function decodeEmbedAndIngestDocument(reader: Reader): Readonly<Record<string, unknown>> {
+  const objectId = readIdentity(reader, "search document");
+  const text = reader.text();
+  const valueCount = readBoundedCount(reader, MAX_DOC_VALUES_PER_HIT, 5, "embed-and-ingest document value");
+  const docValues: Record<string, unknown> = {};
+  let previousName: Uint8Array | undefined;
+  for (let index = 0; index < valueCount; index += 1) {
+    const name = reader.text();
+    const encodedName = new TextEncoder().encode(name);
+    if (previousName !== undefined && compareBytes(encodedName, previousName) <= 0) {
+      throw new ClientError("embed-and-ingest value names must be strictly ascending by UTF-8 bytes");
+    }
+    previousName = encodedName;
+    Object.defineProperty(docValues, name, { value: decodeDocValue(reader, true), enumerable: true });
+  }
+  return { object_id: objectId, text, doc_values: docValues };
 }
 
 function encodeSearchFilter(filter: Readonly<Record<string, unknown>>, depth = 0): Uint8Array {
@@ -2463,9 +2672,12 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
     const hasParent = reader.boolean();
     const kind = reader.u8();
     reader.zeroes(6);
+    if (kind > CATALOG_OBJECT_KINDS.length) {
+      throw new ClientError("catalog object kind is invalid");
+    }
     args = {
       parent: hasParent ? reader.u128() : undefined,
-      kind: kind === 0 ? undefined : kind,
+      kind: kind === 0 ? undefined : CATALOG_OBJECT_KINDS[kind - 1],
       cursor: reader.bytes(),
       item_limit: reader.u64(),
       visit_limit: reader.u64(),
@@ -2490,6 +2702,9 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
   else if (["transaction_commit", "transaction_rollback", "explicit_transaction_status"].includes(operation)) args = { handle: reader.u64() };
   else if (operation === "transaction_status_by_idempotency") args = { idempotency_token: readIdentity(reader, "idempotency token") };
   else if (operation === "search_collection") args = decodeSearchCollection(reader);
+  else if (operation === "embed_and_ingest") {
+    args = { collection: readIdentity(reader, "search collection"), batch: decodeEmbedAndIngestBatch(reader) };
+  }
   else if (["security_principal_list", "security_role_list", "security_assignment_list", "security_key_list"].includes(operation)) {
     const family = operation.slice("security_".length, -"_list".length);
     args = { cursor: decodeSecurityCursor(reader, family), limit: decodeSecurityLimit(reader) };
