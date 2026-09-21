@@ -1,0 +1,151 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-multilingual-embedding-corpus-v1",
+  "name": "multilingual-throughput-smoke-v1",
+  "records": [
+    {
+      "id": "en-query-storage",
+      "language": "en",
+      "kind": "query",
+      "text": "How can an offline database verify a restored backup?"
+    },
+    {
+      "id": "en-passage-storage",
+      "language": "en",
+      "kind": "passage",
+      "text": "A restore verifier checks the manifest, object digests, and replay boundary before opening the recovered directory."
+    },
+    {
+      "id": "es-query-transaccion",
+      "language": "es",
+      "kind": "query",
+      "text": "¿Cómo confirma el motor que una transacción quedó guardada?"
+    },
+    {
+      "id": "es-passage-transaccion",
+      "language": "es",
+      "kind": "passage",
+      "text": "El recibo de confirmación identifica la secuencia de commit y separa la escritura lógica de la sincronización física."
+    },
+    {
+      "id": "fr-query-recherche",
+      "language": "fr",
+      "kind": "query",
+      "text": "Comment limiter une recherche vectorielle locale ?"
+    },
+    {
+      "id": "fr-passage-recherche",
+      "language": "fr",
+      "kind": "passage",
+      "text": "Le budget fixe le nombre de candidats, la mémoire de travail et le délai maximal avant l'exécution."
+    },
+    {
+      "id": "de-query-sicherung",
+      "language": "de",
+      "kind": "query",
+      "text": "Welche Daten gehören zu einer überprüfbaren Sicherung?"
+    },
+    {
+      "id": "de-passage-sicherung",
+      "language": "de",
+      "kind": "passage",
+      "text": "Eine prüfbare Sicherung enthält den Katalog, unveränderliche Objekte und einen gebundenen Wiederherstellungsnachweis."
+    },
+    {
+      "id": "pt-query-indice",
+      "language": "pt",
+      "kind": "query",
+      "text": "Quando um índice de busca pode ser reconstruído?"
+    },
+    {
+      "id": "pt-passage-indice",
+      "language": "pt",
+      "kind": "passage",
+      "text": "O índice é derivado dos registros confirmados e pode ser refeito sem substituir a autoridade do log."
+    },
+    {
+      "id": "zh-query-backup",
+      "language": "zh",
+      "kind": "query",
+      "text": "离线数据库如何验证备份完整性？"
+    },
+    {
+      "id": "zh-passage-backup",
+      "language": "zh",
+      "kind": "passage",
+      "text": "验证程序会检查清单、对象摘要和恢复边界，然后才允许打开恢复后的数据目录。"
+    },
+    {
+      "id": "ja-query-index",
+      "language": "ja",
+      "kind": "query",
+      "text": "検索インデックスを安全に再構築する条件は何ですか？"
+    },
+    {
+      "id": "ja-passage-index",
+      "language": "ja",
+      "kind": "passage",
+      "text": "確定済みログが正本であり、インデックスはその境界から決定的に再構築されます。"
+    },
+    {
+      "id": "ko-query-transaction",
+      "language": "ko",
+      "kind": "query",
+      "text": "트랜잭션의 물리적 내구성은 어떻게 보고합니까?"
+    },
+    {
+      "id": "ko-passage-transaction",
+      "language": "ko",
+      "kind": "passage",
+      "text": "커밋 영수증은 논리적 승인과 저장 장치의 동기화 완료 시간을 별도로 기록합니다."
+    },
+    {
+      "id": "ar-query-memory",
+      "language": "ar",
+      "kind": "query",
+      "text": "كيف يفرض المحرك حداً لاستهلاك الذاكرة؟"
+    },
+    {
+      "id": "ar-passage-memory",
+      "language": "ar",
+      "kind": "passage",
+      "text": "تحدد الخطة ميزانية للعمل وعدد النتائج والمهلة، وترفض التنفيذ إذا تعذر احترام الحدود."
+    },
+    {
+      "id": "hi-query-proof",
+      "language": "hi",
+      "kind": "query",
+      "text": "किसी क्वेरी परिणाम का प्रमाण किस पहचान से जुड़ा होता है?"
+    },
+    {
+      "id": "hi-passage-proof",
+      "language": "hi",
+      "kind": "passage",
+      "text": "प्रमाण कैटलॉग संस्करण, कमिट क्रम और लौटाए गए परिणाम के डाइजेस्ट को एक साथ बांधता है।"
+    },
+    {
+      "id": "ru-query-recovery",
+      "language": "ru",
+      "kind": "query",
+      "text": "Как узел восстанавливается после аварийного завершения?"
+    },
+    {
+      "id": "ru-passage-recovery",
+      "language": "ru",
+      "kind": "passage",
+      "text": "Узел открывает последний проверенный манифест и воспроизводит журнал только до подтверждённой границы."
+    },
+    {
+      "id": "tr-query-catalog",
+      "language": "tr",
+      "kind": "query",
+      "text": "Katalog kimliği neden sorgu sonucuna eklenir?"
+    },
+    {
+      "id": "tr-passage-catalog",
+      "language": "tr",
+      "kind": "passage",
+      "text": "Katalog kimliği, ad çözümlemesini ve yürütmede kullanılan nesne sürümünü denetlenebilir kılar."
+    }
+  ]
+}

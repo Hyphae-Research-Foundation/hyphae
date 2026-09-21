@@ -171,6 +171,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native hardware calibration v1](performance/native-hardware-calibration-v1.md)
 - [Native resource governor v1](performance/native-resource-governor-v1.md)
 - [Native scheduler authority v1](performance/native-scheduler-authority-v1.md)
+- [Multilingual embedding measurement harness v1](performance/multilingual-embedding-harness-v1.md)
 - [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
 - [Native structure execution v1](performance/native-structure-execution-v1.md)
 - [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)

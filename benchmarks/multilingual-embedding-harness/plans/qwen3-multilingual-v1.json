@@ -1,0 +1,76 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-multilingual-embedding-plan-v1",
+  "name": "qwen3-embedding-0.6b-multilingual-v1",
+  "model_repository": "Qwen/Qwen3-Embedding-0.6B",
+  "dimensions": [
+    384,
+    768,
+    1024
+  ],
+  "canonical_output": {
+    "dtype": "float32",
+    "byte_order": "little-endian",
+    "pooling": "last-token",
+    "normalization": "l2-after-dimension-truncation",
+    "normalization_epsilon": "1e-12"
+  },
+  "instruction": {
+    "task": "Given a web search query, retrieve relevant passages that answer the query",
+    "query_template": "Instruct: {task}\nQuery: {text}",
+    "passage_template": "{text}"
+  },
+  "tokenizer": {
+    "padding_side": "left",
+    "truncation_side": "right",
+    "truncation": true,
+    "max_length": 512,
+    "add_special_tokens": true
+  },
+  "chunking": {
+    "unit": "token",
+    "strategy": "truncate-right-single-chunk",
+    "max_tokens": 512,
+    "overlap_tokens": 0
+  },
+  "dataset": {
+    "repetitions": 32,
+    "max_source_records": 64,
+    "max_expanded_records": 4096
+  },
+  "measurement": {
+    "warmup_samples": 2,
+    "measured_samples": 7,
+    "subprocess_timeout_seconds": 14400,
+    "scope": "pretokenized-gpu-inference-pooling-normalization-device-to-host"
+  },
+  "lanes": [
+    {
+      "name": "fp32",
+      "inference_dtype": "float32",
+      "batch_token_budget": 4096,
+      "max_batch_size": 16
+    },
+    {
+      "name": "bf16",
+      "inference_dtype": "bfloat16",
+      "batch_token_budget": 8192,
+      "max_batch_size": 32
+    },
+    {
+      "name": "fp16",
+      "inference_dtype": "float16",
+      "batch_token_budget": 8192,
+      "max_batch_size": 32
+    }
+  ],
+  "projection_vector_counts": [
+    1000000,
+    10000000,
+    50000000,
+    100000000,
+    1000000000
+  ],
+  "claims": [],
+  "closure_declared": false
+}
