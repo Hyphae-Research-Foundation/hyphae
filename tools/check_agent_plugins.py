@@ -12,6 +12,12 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SEMVER_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
+)
 CANONICAL_MCP_ARGS = ["mcp", "--base-url", "http://127.0.0.1:8787"]
 API_KEY = re.compile(r"hyp1_[0-9a-f]{32}_[0-9a-f]{64}")
 EXPECTED_TOOL_NAMES = (
@@ -745,8 +751,8 @@ def workspace_version(root: Path) -> str:
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         fail(f"{path.relative_to(root)} is not valid TOML: {error}")
     version = document.get("workspace", {}).get("package", {}).get("version")
-    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
-        fail("Cargo.toml [workspace.package] version is missing or not strict semver")
+    if not isinstance(version, str) or SEMVER_VERSION.fullmatch(version) is None:
+        fail("Cargo.toml [workspace.package] version is missing or not SemVer")
     return version
 
 
@@ -771,8 +777,8 @@ def validate_codex(value: dict[str, Any]) -> str:
     if value.get("name") != "hyphae" or value.get("mcpServers") != "./.mcp.json":
         fail("Codex plugin identity or MCP binding is invalid")
     version = value.get("version")
-    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
-        fail("Codex plugin version must be strict semver")
+    if not isinstance(version, str) or SEMVER_VERSION.fullmatch(version) is None:
+        fail("Codex plugin version must be SemVer")
     if value.get("license") != "Apache-2.0":
         fail("Codex plugin license must match the repository")
     interface = value.get("interface")

@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-ann"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-blobs"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-btree"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "hyphae-native-pages",
  "hyphae-native-types",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-catalog"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-manifest"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-mvcc"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "hyphae-native-types",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-pages"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-records"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "hyphae-native-types",
  "thiserror",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-runtime"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1072,14 +1072,14 @@ dependencies = [
 
 [[package]]
 name = "hyphae-native-types"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "hyphae-native-wal"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "blake3",
  "crc32c",

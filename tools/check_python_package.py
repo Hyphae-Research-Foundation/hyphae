@@ -20,6 +20,20 @@ EXPECTED_NAME = "hyphae-sdk"
 REQUIRED_URLS = {"Homepage", "Documentation", "Repository", "Issues", "Changelog"}
 PYPI_ACTION = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 APACHE_RELEASE_VERSION = "3.0.0"
+WORKSPACE_VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(alpha|beta|rc)\.(0|[1-9][0-9]*))?\Z"
+)
+PYTHON_VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:(a|b|rc)(0|[1-9][0-9]*))?\Z"
+)
+DEVELOPMENT_CLASSIFIERS = {
+    None: "Development Status :: 5 - Production/Stable",
+    "alpha": "Development Status :: 3 - Alpha",
+    "beta": "Development Status :: 4 - Beta",
+    "rc": "Development Status :: 4 - Beta",
+}
 CANONICAL_TAG_GUARD = (
     '[[ "$SOURCE_TAG" =~ ^release-v[0-9]+\\.[0-9]+\\.[0-9]+-crates$ ]]'
 )
@@ -62,6 +76,18 @@ def workflow_job(workflow: str, name: str) -> str:
     return match.group(0)
 
 
+def python_version_for_workspace(version: object) -> tuple[str, str]:
+    if (
+        not isinstance(version, str)
+        or (match := WORKSPACE_VERSION.fullmatch(version)) is None
+    ):
+        fail("workspace package version must be a supported SemVer release or prerelease")
+    major, minor, patch, prerelease, serial = match.groups()
+    suffixes = {"alpha": "a", "beta": "b", "rc": "rc"}
+    suffix = "" if prerelease is None else f"{suffixes[prerelease]}{serial}"
+    return f"{major}.{minor}.{patch}{suffix}", DEVELOPMENT_CLASSIFIERS[prerelease]
+
+
 def validate(
     root: Path = ROOT, *, workflow_root: Path | None = None
 ) -> dict[str, object]:
@@ -72,16 +98,17 @@ def validate(
     if project.get("name") != EXPECTED_NAME:
         fail("Python distribution must use the reserved hyphae-sdk name")
     version = project.get("version")
-    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
-        fail("Python distribution version must be strict semver")
+    if not isinstance(version, str) or PYTHON_VERSION.fullmatch(version) is None:
+        fail("Python distribution version must be canonical PEP 440")
     workspace_version = (
         load_workspace_manifest(root)
         .get("workspace", {})
         .get("package", {})
         .get("version")
     )
-    if version != workspace_version:
-        fail("Python distribution version must equal workspace.package.version")
+    expected_version, expected_classifier = python_version_for_workspace(workspace_version)
+    if version != expected_version:
+        fail("Python distribution version must be the PEP 440 form of workspace.package.version")
     if project.get("requires-python") != ">=3.11":
         fail("Python support floor must remain explicit")
     if project.get("dependencies") != []:
@@ -96,6 +123,13 @@ def validate(
         for classifier in classifiers
     ):
         fail("PEP 639 license expression must not be duplicated by a classifier")
+    development = [
+        classifier
+        for classifier in classifiers
+        if isinstance(classifier, str) and classifier.startswith("Development Status ::")
+    ]
+    if development != [expected_classifier]:
+        fail("Python development-status classifier must match the workspace version")
     readme = project.get("readme")
     if readme != {"file": "README.md", "content-type": "text/markdown"}:
         fail("Python long description must be bound to its checked-in README")

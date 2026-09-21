@@ -1,7 +1,7 @@
 {
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": "hyphae-npm-release-v1",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "packages": [
     {
       "path": "sdks/typescript",

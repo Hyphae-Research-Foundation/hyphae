@@ -13,7 +13,7 @@
       "name": "hyphae",
       "source": "./plugins/hyphae",
       "description": "Bounded Native v2 MCP tools with an Instance-scoped Auditor API key: capabilities and redacted security metadata, lexical and integrated search, search proofs and offline verification, and Agent Memory recall, with write tools listed only when the operator allows ingest.",
-      "version": "3.0.0",
+      "version": "4.0.0",
       "license": "Apache-2.0",
       "category": "development",
       "tags": ["database", "sql", "search", "rag", "mcp"]

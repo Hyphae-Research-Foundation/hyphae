@@ -419,6 +419,15 @@ class RegistryPublishGateTests(unittest.TestCase):
             self.assertEqual(validate_publish_authority("crates-io", root, dry_run=True), [])
             self.assertEqual(validate_publish_authority("npm", root, dry_run=True), [])
 
+    def test_checked_in_identity_is_valid_for_dry_run_but_not_live_publish(self) -> None:
+        self.assertEqual(validate_publish_authority("crates-io", dry_run=True), [])
+        self.assertEqual(validate_publish_authority("npm", dry_run=True), [])
+        for ecosystem in ("crates-io", "npm"):
+            failures = validate_publish_authority(ecosystem)
+            self.assertTrue(
+                any("blocked until exact version 3.0.0" in item for item in failures)
+            )
+
     def test_live_publish_is_blocked_before_exact_1_2_2(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "tools.check_registry_publish._git"
