@@ -8,7 +8,14 @@ import unittest
 from pathlib import Path
 
 from tools.check_license_policy import (
+    BINARY_EXCEPTION_PATH_COUNT,
+    BINARY_EXCEPTION_PATHS_SHA256,
+    JSON_EXCEPTION_PATH_COUNT,
+    JSON_EXCEPTION_PATHS_SHA256,
     ROOT,
+    binary_spdx_exception_paths,
+    frozen_path_inventory_matches,
+    json_spdx_exception_paths,
     machine_files,
     normative_markdown_files,
     source_files,
@@ -104,13 +111,55 @@ class LicensePolicyTests(unittest.TestCase):
         self.assertNotIn("README.md", paths)
 
     def test_strict_json_exceptions_are_frozen_by_exact_inventory(self) -> None:
-        from tools.check_license_policy import (
-            JSON_EXCEPTION_PATH_COUNT,
-            JSON_EXCEPTION_PATHS_SHA256,
-        )
-
-        self.assertEqual(JSON_EXCEPTION_PATH_COUNT, 91)
+        self.assertEqual(JSON_EXCEPTION_PATH_COUNT, 94)
         self.assertRegex(JSON_EXCEPTION_PATHS_SHA256, r"^[0-9a-f]{64}$")
+
+    def test_binary_exceptions_are_frozen_by_exact_inventory(self) -> None:
+        self.assertEqual(BINARY_EXCEPTION_PATH_COUNT, 6)
+        self.assertRegex(BINARY_EXCEPTION_PATHS_SHA256, r"^[0-9a-f]{64}$")
+
+    def test_new_compatibility_exception_paths_fail_closed_under_mutation(self) -> None:
+        json_failures: list[str] = []
+        json_paths = json_spdx_exception_paths(ROOT, json_failures)
+        binary_paths = binary_spdx_exception_paths(ROOT)
+        self.assertEqual(json_failures, [])
+        inventories = (
+            (
+                json_paths,
+                (
+                    "compatibility/native-protocol-v1-required-minors.json",
+                    "compatibility/native-protocol-v1-transaction-document-ordering.json",
+                    "crates/hyphae-native-protocol/tests/fixtures/"
+                    "native-protocol-v1-transaction-document-ordering.json",
+                ),
+                "compatibility/native-protocol-v1-invented.json",
+                JSON_EXCEPTION_PATH_COUNT,
+                JSON_EXCEPTION_PATHS_SHA256,
+            ),
+            (
+                binary_paths,
+                (
+                    "compatibility/native-protocol-v1-transaction-document.bin",
+                    "crates/hyphae-native-protocol/tests/fixtures/"
+                    "native-protocol-v1-transaction-document.bin",
+                ),
+                "compatibility/native-protocol-v1-invented.bin",
+                BINARY_EXCEPTION_PATH_COUNT,
+                BINARY_EXCEPTION_PATHS_SHA256,
+            ),
+        )
+        for paths, additions, invented, count, digest in inventories:
+            self.assertTrue(frozen_path_inventory_matches(paths, count, digest))
+            for added in additions:
+                with self.subTest(added=added):
+                    self.assertIn(added, paths)
+                    for mutated in (
+                        [path for path in paths if path != added],
+                        [invented if path == added else path for path in paths],
+                    ):
+                        self.assertFalse(
+                            frozen_path_inventory_matches(mutated, count, digest)
+                        )
 
     def test_schema_validation_requires_the_apache_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

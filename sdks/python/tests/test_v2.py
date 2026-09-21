@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from typing import BinaryIO, cast
@@ -18,10 +19,26 @@ from hyphae_sdk.v2.protocol import (
     encode_frame,
     encode_product_request,
     blake3,
+    operation_required_minor,
 )
 
 
 FIXTURE = Path(__file__).parents[3] / "compatibility" / "native-protocol-v1-structure-get.bin"
+TRANSACTION_DOCUMENT_FIXTURE = (
+    Path(__file__).parents[3]
+    / "compatibility"
+    / "native-protocol-v1-transaction-document.bin"
+)
+TRANSACTION_DOCUMENT_ORDERING_FIXTURE = (
+    Path(__file__).parents[3]
+    / "compatibility"
+    / "native-protocol-v1-transaction-document-ordering.json"
+)
+REQUIRED_MINOR_FIXTURE = (
+    Path(__file__).parents[3]
+    / "compatibility"
+    / "native-protocol-v1-required-minors.json"
+)
 
 
 def _response(kind: int, body: bytes) -> bytes:
@@ -247,6 +264,220 @@ class V2Tests(unittest.TestCase):
         )
         self.assertEqual(encoded, FIXTURE.read_bytes())
 
+    def test_shared_required_minor_fixture_is_exhaustive(self) -> None:
+        fixture = json.loads(REQUIRED_MINOR_FIXTURE.read_text())
+        self.assertEqual(len(fixture["cases"]), 27)
+        for case in fixture["cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(
+                    operation_required_minor(case["operation"], case["arguments"]),
+                    case["required_minor"],
+                )
+
+    def test_u128_and_identity_inputs_fail_closed(self) -> None:
+        for value in (True, False, -1, 1 << 128, 1.5, "1"):
+            with self.subTest(value=value), self.assertRaises(ClientError):
+                encode_product_request(
+                    "transaction_status",
+                    {"transaction_id": value},
+                    RequestOptions(),
+                )
+        for value in (0, -1, 1 << 128):
+            with self.subTest(identity=value), self.assertRaises(ClientError):
+                encode_product_request(
+                    "structure_read",
+                    {"kind": "string_get", "key": {"keyspace": value, "key": b"k"}},
+                    RequestOptions(),
+                )
+        encoded = encode_product_request(
+            "transaction_status",
+            {"transaction_id": (1 << 128) - 1},
+            RequestOptions(),
+        )
+        self.assertEqual(decode_product_request(encoded)[1]["transaction_id"], (1 << 128) - 1)
+
+    def test_transaction_document_matches_the_shared_fixture(self) -> None:
+        encoded = TRANSACTION_DOCUMENT_FIXTURE.read_bytes()
+        frame = decode_frame(encoded)
+        operation, arguments, options = decode_product_request(
+            frame.payload, negotiated_minor=7
+        )
+        self.assertEqual(operation, "transaction_stage_search")
+        self.assertEqual(
+            arguments,
+            {
+                "handle": 7,
+                "mutation": {
+                    "kind": "document",
+                    "collection": 13,
+                    "document": {
+                        "object_id": 201,
+                        "text": "rust database",
+                        "doc_values": {
+                            "blob": b"\x07",
+                            "flag": True,
+                            "name": "a",
+                            "rank": 3,
+                            "rating": 4.5,
+                        },
+                        "vectors": {"embedding": [1.0, 0.0]},
+                    },
+                },
+            },
+        )
+        self.assertEqual(options.logical_time_micros, 10)
+        self.assertEqual(options.durability, "memory")
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            decode_product_request(frame.payload, negotiated_minor=6)
+        self.assertEqual(
+            encode_frame(
+                frame.kind,
+                frame.stream_id,
+                frame.request_id,
+                encode_product_request(
+                    operation, arguments, options, negotiated_minor=7
+                ),
+            ),
+            encoded,
+        )
+
+    def test_transaction_document_fixture_rejects_forged_counts_before_allocation(
+        self,
+    ) -> None:
+        import struct
+
+        payload = decode_frame(TRANSACTION_DOCUMENT_FIXTURE.read_bytes()).payload
+        for offset in (138, 216, 233):
+            with self.subTest(offset=offset):
+                excessive = bytearray(payload)
+                struct.pack_into("<I", excessive, offset, 0xFFFFFFFF)
+                with self.assertRaisesRegex(ClientError, "exceeds"):
+                    decode_product_request(bytes(excessive), negotiated_minor=7)
+
+        truncated_values = bytearray(payload[:142])
+        struct.pack_into("<I", truncated_values, 8, len(truncated_values))
+        truncated_vectors = bytearray(payload[:220])
+        struct.pack_into("<I", truncated_vectors, 8, len(truncated_vectors))
+        truncated_dimension = bytearray(payload[:241])
+        struct.pack_into("<I", truncated_dimension, 8, len(truncated_dimension))
+        struct.pack_into("<I", truncated_dimension, 233, 2)
+        for encoded in (
+            truncated_values,
+            truncated_vectors,
+            truncated_dimension,
+        ):
+            with self.assertRaisesRegex(ClientError, "exceeds"):
+                decode_product_request(bytes(encoded), negotiated_minor=7)
+
+    def test_transaction_document_fixture_rejects_invalid_rust_values(self) -> None:
+        import struct
+
+        payload = decode_frame(TRANSACTION_DOCUMENT_FIXTURE.read_bytes()).payload
+        for offset in (89, 105):
+            with self.subTest(zero_identity_offset=offset):
+                forged = bytearray(payload)
+                forged[offset:offset + 16] = b"\0" * 16
+                with self.assertRaisesRegex(ClientError, "zero"):
+                    decode_product_request(bytes(forged), negotiated_minor=7)
+
+        for bits in (0x8000_0000_0000_0000, 0x7FF0_0000_0000_0001):
+            with self.subTest(noncanonical_float=bits):
+                forged = bytearray(payload)
+                struct.pack_into("<Q", forged, 208, bits)
+                with self.assertRaisesRegex(ClientError, "noncanonical"):
+                    decode_product_request(bytes(forged), negotiated_minor=7)
+
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(nonfinite_vector=value):
+                forged = bytearray(payload)
+                struct.pack_into("<f", forged, 237, value)
+                with self.assertRaisesRegex(ClientError, "nonfinite"):
+                    decode_product_request(bytes(forged), negotiated_minor=7)
+
+    def test_transaction_document_tag_requires_minor_seven(self) -> None:
+        arguments = {
+            "handle": 7,
+            "mutation": {
+                "kind": "document",
+                "collection": 13,
+                "document": {
+                    "object_id": 201,
+                    "text": "rated",
+                    "doc_values": {"rating": 4.5},
+                    "vectors": {},
+                },
+            },
+        }
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            encode_product_request(
+                "transaction_stage_search",
+                arguments,
+                RequestOptions(),
+                negotiated_minor=6,
+            )
+        encoded = encode_product_request(
+            "transaction_stage_search",
+            arguments,
+            RequestOptions(),
+            negotiated_minor=7,
+        )
+        with self.assertRaisesRegex(ClientError, "protocol minor"):
+            decode_product_request(encoded, negotiated_minor=6)
+        operation, decoded, _ = decode_product_request(encoded, negotiated_minor=7)
+        self.assertEqual(operation, "transaction_stage_search")
+        self.assertEqual(decoded, arguments)
+
+    def test_transaction_document_names_use_canonical_utf8_byte_order(self) -> None:
+        fixture = json.loads(TRANSACTION_DOCUMENT_ORDERING_FIXTURE.read_text())
+        canonical = bytes.fromhex(fixture["canonical_request_hex"])
+        operation, arguments, options = decode_product_request(
+            canonical, negotiated_minor=7
+        )
+        document = arguments["mutation"]["document"]
+        private_use = "\ue000"
+        supplementary = "\U0001f600"
+        self.assertEqual(
+            list(document["doc_values"]), [private_use, supplementary]
+        )
+        self.assertEqual(list(document["vectors"]), [private_use, supplementary])
+
+        reverse_insertion = {
+            "handle": 7,
+            "mutation": {
+                "kind": "document",
+                "collection": 13,
+                "document": {
+                    "object_id": 201,
+                    "text": "unicode",
+                    "doc_values": {
+                        supplementary: "supplementary",
+                        private_use: "private-use",
+                    },
+                    "vectors": {
+                        supplementary: [0.0, 1.0],
+                        private_use: [1.0, 0.0],
+                    },
+                },
+            },
+        }
+        self.assertEqual(operation, "transaction_stage_search")
+        self.assertEqual(
+            encode_product_request(operation, reverse_insertion, options, negotiated_minor=7),
+            canonical,
+        )
+
+    def test_transaction_document_rejects_nonascending_names_before_payloads(
+        self,
+    ) -> None:
+        fixture = json.loads(TRANSACTION_DOCUMENT_ORDERING_FIXTURE.read_text())
+        for name, encoded_hex in fixture["malformed_requests_hex"].items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ClientError, "strictly ascending by UTF-8 bytes"
+            ):
+                decode_product_request(
+                    bytes.fromhex(encoded_hex), negotiated_minor=7
+                )
+
     def test_attested_rerank_request_matches_the_cross_language_golden(self) -> None:
         envelope = (
             b"HYATTS01\x02"
@@ -392,13 +623,73 @@ class V2Tests(unittest.TestCase):
             {"kind": "sorted_set_range", "key": key, "start": -2, "stop": 4, "order": "descending"},
             {"kind": "sorted_set_cardinality", "key": key},
             {"kind": "stream_range", "key": key, "start": 2, "end": 4, "limit": 10},
+            {"kind": "sorted_set_score_range", "key": key, "lower": {"exclusive": 1.5}, "upper": None, "offset": 2, "limit": 16, "order": "descending"},
+            {"kind": "hash_scan_reverse", "key": key, "start_before": b"field", "limit": 8},
+            {"kind": "hash_scan_match", "key": key, "pattern": b"user:*", "start_after": None, "output_limit": 8, "visit_limit": 32, "match_step_limit": 256},
+            {"kind": "key_scan_match", "keyspace": 7, "pattern": b"app:*", "start_after": b"app:flag", "output_limit": 8, "visit_limit": 32, "match_step_limit": 256},
+            {"kind": "string_range", "key": key, "start": -5, "end": -1},
+            {"kind": "set_random_members", "key": key, "seed": 42, "count": 3},
         )
         for arguments in cases:
             with self.subTest(kind=arguments["kind"]):
-                encoded = encode_product_request("structure_read", arguments, RequestOptions())
+                required = 6 if arguments["kind"] in {"sorted_set_score_range", "hash_scan_reverse", "hash_scan_match", "key_scan_match", "string_range", "set_random_members"} else 0
+                if required:
+                    with self.assertRaises(ClientError):
+                        encode_product_request("structure_read", arguments, RequestOptions(), negotiated_minor=5)
+                encoded = encode_product_request("structure_read", arguments, RequestOptions(), negotiated_minor=max(required, 5))
                 operation, decoded, _ = decode_product_request(encoded)
                 self.assertEqual(operation, "structure_read")
                 self.assertEqual(decoded, arguments)
+
+    def test_minor_six_search_and_structure_mutations_round_trip(self) -> None:
+        base = {
+            "collection": 13,
+            "request": {
+                "lexical": {"query": "rust", "candidate_limit": 4, "weight": 1, "phrase": True},
+                "vectors": [{"target": "image", "query": [0.0, 1.0], "candidate_limit": 4, "weight": 1, "execution": {"kind": "exact"}, "max_distance": 4.0}],
+                "filter": {"kind": "match_all"},
+                "sort": [],
+                "facets": [],
+                "range_facets": [{"field": "price", "ranges": [{"lower": None, "upper": 15.0}, {"lower": 15.0, "upper": None}]}],
+                "aggregations": [{"name": "mean", "kind": "average", "field": "price"}],
+                "limit": 4,
+                "fusion": "relative_score",
+                "autocut": 2,
+                "offset": 1,
+            },
+        }
+        with self.assertRaises(ClientError):
+            encode_product_request("search_collection", base, RequestOptions(), negotiated_minor=5)
+        encoded = encode_product_request("search_collection", base, RequestOptions(), negotiated_minor=6)
+        operation, decoded, _ = decode_product_request(encoded, negotiated_minor=6)
+        self.assertEqual(operation, "search_collection")
+        self.assertEqual(decoded["request"]["fusion"], "relative_score")
+        self.assertEqual(decoded["request"]["autocut"], 2)
+        self.assertEqual(decoded["request"]["offset"], 1)
+        self.assertEqual(decoded["request"]["lexical"]["phrase"], True)
+        self.assertEqual(decoded["request"]["vectors"][0]["max_distance"], 4.0)
+        self.assertEqual(
+            encode_product_request(operation, decoded, RequestOptions(), negotiated_minor=6),
+            encoded,
+        )
+
+        key = {"keyspace": 7, "key": b"key"}
+        mutations = (
+            {"kind": "sorted_set_increment", "key": key, "delta": 2.5, "member": b"a"},
+            {"kind": "sorted_set_pop", "key": key, "end": "highest"},
+            {"kind": "string_set_conditional", "key": key, "value": b"hello", "expires_at_micros": 99, "condition": "if_present"},
+            {"kind": "string_append", "key": key, "suffix": b" world"},
+            {"kind": "string_set_range", "key": key, "offset": 4, "patch": b"tail"},
+            {"kind": "hash_set_if_absent", "key": key, "field": b"city", "value": b"lima"},
+            {"kind": "set_pop", "key": key, "seed": 42},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation["kind"]):
+                args = {"mutations": [mutation]}
+                with self.assertRaises(ClientError):
+                    encode_product_request("structure_mutate", args, RequestOptions(), negotiated_minor=5)
+                wire = encode_product_request("structure_mutate", args, RequestOptions(), negotiated_minor=6)
+                self.assertEqual(decode_product_request(wire, negotiated_minor=6)[1], args)
 
     def test_windows_pipe_endpoint_normalization_never_doubles_prefix(self) -> None:
         self.assertEqual(_windows_pipe_namespace("hyphae-test"), "hyphae-test")
@@ -429,6 +720,16 @@ class V2Tests(unittest.TestCase):
             {"kind": "delete", "index": 11, "object_id": 13},
             options=RequestOptions(request_id=21),
         )
+        document_mutation = {
+            "kind": "document",
+            "collection": 13,
+            "document": {"object_id": 201, "text": "rust"},
+        }
+        client.transaction_stage_search(
+            7,
+            document_mutation,
+            options=RequestOptions(request_id=24),
+        )
         client.explicit_transaction_status(7, options=RequestOptions(request_id=22))
         client.transaction_status_by_idempotency(23, options=RequestOptions(request_id=23))
         self.assertEqual(
@@ -436,10 +737,12 @@ class V2Tests(unittest.TestCase):
             [
                 "transaction_begin",
                 "transaction_stage_vector",
+                "transaction_stage_search",
                 "explicit_transaction_status",
                 "transaction_status_by_idempotency",
             ],
         )
+        self.assertEqual(transport.calls[2][1]["mutation"], document_mutation)
 
     def test_transaction_stage_response_decodes_typed_result(self) -> None:
         import struct

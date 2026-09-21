@@ -41,10 +41,52 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     static OWNED_LEAF_ENTRY_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SORTED_BATCH_LEAF_SPLIT_VEC_HIGH_WATER: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static SORTED_BATCH_INTERNAL_SPLIT_VEC_HIGH_WATER: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static SORTED_BATCH_ROOT_SPLIT_VEC_HIGH_WATER: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Owned canonical binary key/value pair returned by a materialized scan.
 pub type KeyValue = (Vec<u8>, Vec<u8>);
+
+/// One exact physical key difference between two immutable B+tree roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BTreePhysicalDifference {
+    /// Canonical key whose physical value differs.
+    pub key: Vec<u8>,
+    /// Value in the prior root, or absence when the key was inserted.
+    pub prior: Option<Vec<u8>>,
+    /// Value in the result root, or absence when the key was removed.
+    pub result: Option<Vec<u8>>,
+}
+
+/// Conservative work and retained-byte ceilings for an immutable root diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BTreePhysicalDiffLimits {
+    /// Maximum changed node-pair visits after identical page IDs are skipped.
+    pub changed_node_visits: usize,
+    /// Maximum returned key differences.
+    pub differences: usize,
+    /// Maximum retained bytes across returned keys and optional values.
+    pub retained_bytes: usize,
+}
+
+/// Work ceilings for streaming immutable-root physical differences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BTreePhysicalDiffVisitLimits {
+    /// Maximum changed node-pair or one-sided node visits.
+    pub changed_node_visits: usize,
+    /// Maximum changed keys delivered to the visitor.
+    pub differences: usize,
+    /// Maximum sum of changed keys and optional prior/result values delivered.
+    pub retained_bytes: usize,
+}
 
 /// One value range pinned inside a verified immutable buffer-pool frame.
 #[derive(Clone, Debug)]
@@ -126,6 +168,9 @@ pub enum BTreeError {
     /// Prefix replacement did not observe the caller's exact expected keys.
     #[error("native B+tree prefix replacement observed unexpected existing keys")]
     PrefixContentsChanged,
+    /// An immutable structural diff exceeded its admitted work or memory bound.
+    #[error("native B+tree physical diff exceeded its admitted bound")]
+    PhysicalDiffLimitExceeded,
 }
 
 /// Result of one copy-on-write B+tree mutation.
@@ -334,6 +379,31 @@ impl BTreeSegment {
 }
 
 impl BTree {
+    /// Returns a conservative structural peak for one sorted upsert batch.
+    ///
+    /// Caller-owned keys and values are excluded. The bound covers update
+    /// headers, one decoded rewrite path, cloned leaf updates, child
+    /// references retained while parent levels are assembled, and allocator
+    /// overhead. It is independent of the current tree shape so callers can
+    /// reserve it before retaining a publication batch.
+    pub const fn sorted_batch_structural_memory_bound(maximum_updates: usize) -> usize {
+        let rewrite_path = MAX_TREE_HEIGHT
+            .saturating_mul(DECODED_NODE_MEMORY_BOUND)
+            .saturating_add(MAX_TREE_HEIGHT.saturating_mul(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES));
+        let update_headers = maximum_updates
+            .saturating_mul(size_of::<LeafEntry>())
+            .saturating_mul(3)
+            .saturating_add(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES.saturating_mul(3));
+        let child_references = maximum_updates
+            .saturating_mul(MAX_TREE_HEIGHT)
+            .saturating_mul(size_of::<ChildReference>())
+            .saturating_add(ALLOCATOR_ALLOCATION_OVERHEAD_BYTES);
+        rewrite_path
+            .saturating_add(update_headers)
+            .saturating_add(child_references)
+            .saturating_add(DECODED_NODE_MEMORY_BOUND.saturating_mul(2))
+    }
+
     /// Creates an empty tree without a physical root page.
     pub const fn empty() -> Self {
         Self { root: None }
@@ -347,6 +417,157 @@ impl BTree {
     /// Returns the immutable physical root, or `None` for an empty tree.
     pub const fn root(self) -> Option<PageId> {
         self.root
+    }
+
+    /// Computes the exact leaf-value differences below ordered key prefixes.
+    ///
+    /// Identical immutable page IDs are accepted without decoding. Changed
+    /// internal paths are partitioned by the union of their separators, so
+    /// copy-on-write splits and root-height changes cannot hide an inserted,
+    /// removed, or replaced key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for overlapping or unordered prefixes, malformed
+    /// reached nodes, excessive tree height, or a work/retained-byte bound
+    /// violation.
+    pub fn diff_prefixes_bounded(
+        self,
+        result: Self,
+        store: &PageStore,
+        prefixes: &[Vec<u8>],
+        limits: BTreePhysicalDiffLimits,
+    ) -> Result<Vec<BTreePhysicalDifference>, BTreeError> {
+        if prefixes.is_empty()
+            || prefixes.iter().any(Vec::is_empty)
+            || prefixes
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1] || pair[1].starts_with(pair[0].as_slice()))
+            || limits.changed_node_visits == 0
+        {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        if self.root == result.root {
+            return Ok(Vec::new());
+        }
+        let mut differences = Vec::new();
+        {
+            let mut context = PhysicalDiffContext {
+                store,
+                changed_node_limit: limits.changed_node_visits,
+                difference_limit: limits.differences,
+                changed_node_visits: 0,
+                difference_count: 0,
+                retained_byte_limit: limits.retained_bytes,
+                retained_bytes: 0,
+                sink: |key: &[u8], prior: Option<&[u8]>, result: Option<&[u8]>| {
+                    differences.push(BTreePhysicalDifference {
+                        key: key.to_vec(),
+                        prior: prior.map(<[u8]>::to_vec),
+                        result: result.map(<[u8]>::to_vec),
+                    });
+                    Ok(())
+                },
+            };
+            visit_physical_differences(&mut context, self.root, result.root, prefixes)?;
+        }
+        if differences
+            .windows(2)
+            .any(|pair| pair[0].key >= pair[1].key)
+        {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        Ok(differences)
+    }
+
+    /// Streams exact leaf-value differences below ordered key prefixes.
+    ///
+    /// The visitor receives borrowed key and optional prior/result values. It
+    /// must not retain those slices. Identical immutable pages are skipped,
+    /// and empty/nonempty roots are traversed only inside the requested
+    /// prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed prefixes or reached nodes, excessive
+    /// tree height, visitor cancellation, or either work-bound violation.
+    pub fn visit_prefix_differences_bounded<F>(
+        self,
+        result: Self,
+        store: &PageStore,
+        prefixes: &[Vec<u8>],
+        limits: BTreePhysicalDiffVisitLimits,
+        mut visitor: F,
+    ) -> Result<usize, BTreeError>
+    where
+        F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> ControlFlow<()>,
+    {
+        validate_physical_diff_inputs(prefixes, limits.changed_node_visits)?;
+        if self.root == result.root {
+            return Ok(0);
+        }
+        let mut context = PhysicalDiffContext {
+            store,
+            changed_node_limit: limits.changed_node_visits,
+            difference_limit: limits.differences,
+            changed_node_visits: 0,
+            difference_count: 0,
+            retained_byte_limit: limits.retained_bytes,
+            retained_bytes: 0,
+            sink: |key: &[u8], prior: Option<&[u8]>, result: Option<&[u8]>| match visitor(
+                key, prior, result,
+            ) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(()) => Err(BTreeError::Cancelled),
+            },
+        };
+        visit_physical_differences(&mut context, self.root, result.root, prefixes)?;
+        Ok(context.difference_count)
+    }
+
+    /// Streams every exact leaf-value difference between two immutable roots.
+    ///
+    /// Unlike [`Self::visit_prefix_differences_bounded`], this includes empty
+    /// keys and every possible first byte. The visitor borrows values from the
+    /// decoded nodes and must not retain them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed reached nodes, excessive tree height,
+    /// visitor cancellation, or either work-bound violation.
+    pub fn visit_differences_bounded<F>(
+        self,
+        result: Self,
+        store: &PageStore,
+        limits: BTreePhysicalDiffVisitLimits,
+        mut visitor: F,
+    ) -> Result<usize, BTreeError>
+    where
+        F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> ControlFlow<()>,
+    {
+        if limits.changed_node_visits == 0 {
+            return Err(BTreeError::NoncanonicalKeyOrder);
+        }
+        if self.root == result.root {
+            return Ok(0);
+        }
+        let mut context = PhysicalDiffContext {
+            store,
+            changed_node_limit: limits.changed_node_visits,
+            difference_limit: limits.differences,
+            changed_node_visits: 0,
+            difference_count: 0,
+            retained_byte_limit: limits.retained_bytes,
+            retained_bytes: 0,
+            sink: |key: &[u8], prior: Option<&[u8]>, result: Option<&[u8]>| match visitor(
+                key, prior, result,
+            ) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(()) => Err(BTreeError::Cancelled),
+            },
+        };
+        visit_physical_differences(&mut context, self.root, result.root, &[Vec::new()])?;
+        Ok(context.difference_count)
     }
 
     /// Plans immutable leaf segments intersecting one canonical key range.
@@ -1346,6 +1567,291 @@ impl Node {
     }
 }
 
+struct PhysicalDiffContext<'a, F> {
+    store: &'a PageStore,
+    changed_node_limit: usize,
+    difference_limit: usize,
+    changed_node_visits: usize,
+    difference_count: usize,
+    retained_byte_limit: usize,
+    retained_bytes: usize,
+    sink: F,
+}
+
+fn validate_physical_diff_inputs(
+    prefixes: &[Vec<u8>],
+    changed_node_limit: usize,
+) -> Result<(), BTreeError> {
+    if prefixes.is_empty()
+        || prefixes.iter().any(Vec::is_empty)
+        || prefixes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1] || pair[1].starts_with(pair[0].as_slice()))
+        || changed_node_limit == 0
+    {
+        return Err(BTreeError::NoncanonicalKeyOrder);
+    }
+    Ok(())
+}
+
+fn visit_physical_differences<F>(
+    context: &mut PhysicalDiffContext<'_, F>,
+    prior_root: Option<PageId>,
+    result_root: Option<PageId>,
+    prefixes: &[Vec<u8>],
+) -> Result<(), BTreeError>
+where
+    F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> Result<(), BTreeError>,
+{
+    for prefix in prefixes {
+        let upper = if prefix.is_empty() {
+            vec![u8::MAX; BTREE_MAX_KEY_SIZE.saturating_add(1)]
+        } else {
+            prefix_upper_bound(prefix).ok_or(BTreeError::NoncanonicalKeyOrder)?
+        };
+        match (prior_root, result_root) {
+            (Some(prior), Some(result)) => {
+                diff_physical_nodes(context, prior, result, prefix, &upper, 0)?;
+            }
+            (Some(prior), None) => {
+                diff_physical_one_sided(context, prior, prefix, &upper, 0, true)?;
+            }
+            (None, Some(result)) => {
+                diff_physical_one_sided(context, result, prefix, &upper, 0, false)?;
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+fn diff_physical_one_sided<F>(
+    context: &mut PhysicalDiffContext<'_, F>,
+    page: PageId,
+    lower: &[u8],
+    upper: &[u8],
+    depth: usize,
+    prior: bool,
+) -> Result<(), BTreeError>
+where
+    F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> Result<(), BTreeError>,
+{
+    if lower >= upper {
+        return Ok(());
+    }
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    context.admit_node()?;
+    match read_node(context.store, page)? {
+        Node::Leaf(entries) => {
+            let start = entries.partition_point(|entry| entry.key.as_slice() < lower);
+            let end = entries.partition_point(|entry| entry.key.as_slice() < upper);
+            for entry in &entries[start..end] {
+                if prior {
+                    context.push_difference(&entry.key, Some(&entry.value), None)?;
+                } else {
+                    context.push_difference(&entry.key, None, Some(&entry.value))?;
+                }
+            }
+        }
+        Node::Internal { keys, children } => {
+            for (index, child) in children.into_iter().enumerate() {
+                let child_lower = index
+                    .checked_sub(1)
+                    .and_then(|position| keys.get(position))
+                    .map(Vec::as_slice);
+                let child_upper = keys.get(index).map(Vec::as_slice);
+                if child_upper.is_some_and(|boundary| boundary <= lower) {
+                    continue;
+                }
+                if child_lower.is_some_and(|boundary| boundary >= upper) {
+                    break;
+                }
+                diff_physical_one_sided(context, child, lower, upper, depth + 1, prior)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<F> PhysicalDiffContext<'_, F>
+where
+    F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> Result<(), BTreeError>,
+{
+    fn admit_node(&mut self) -> Result<(), BTreeError> {
+        self.changed_node_visits = self
+            .changed_node_visits
+            .checked_add(1)
+            .ok_or(BTreeError::PhysicalDiffLimitExceeded)?;
+        if self.changed_node_visits > self.changed_node_limit {
+            return Err(BTreeError::PhysicalDiffLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn push_difference(
+        &mut self,
+        key: &[u8],
+        prior: Option<&[u8]>,
+        result: Option<&[u8]>,
+    ) -> Result<(), BTreeError> {
+        if self.difference_count >= self.difference_limit {
+            return Err(BTreeError::PhysicalDiffLimitExceeded);
+        }
+        self.difference_count = self
+            .difference_count
+            .checked_add(1)
+            .ok_or(BTreeError::PhysicalDiffLimitExceeded)?;
+        let retained = key
+            .len()
+            .checked_add(prior.map_or(0, <[u8]>::len))
+            .and_then(|bytes| bytes.checked_add(result.map_or(0, <[u8]>::len)))
+            .ok_or(BTreeError::PhysicalDiffLimitExceeded)?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_add(retained)
+            .ok_or(BTreeError::PhysicalDiffLimitExceeded)?;
+        if self.retained_bytes > self.retained_byte_limit {
+            return Err(BTreeError::PhysicalDiffLimitExceeded);
+        }
+        (self.sink)(key, prior, result)
+    }
+}
+
+fn diff_physical_nodes<F>(
+    context: &mut PhysicalDiffContext<'_, F>,
+    prior_page: PageId,
+    result_page: PageId,
+    lower: &[u8],
+    upper: &[u8],
+    depth: usize,
+) -> Result<(), BTreeError>
+where
+    F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> Result<(), BTreeError>,
+{
+    if prior_page == result_page || lower >= upper {
+        return Ok(());
+    }
+    if depth >= MAX_TREE_HEIGHT {
+        return Err(BTreeError::HeightExceeded);
+    }
+    context.admit_node()?;
+    let prior = read_node(context.store, prior_page)?;
+    let result = read_node(context.store, result_page)?;
+    if let (Node::Leaf(prior), Node::Leaf(result)) = (&prior, &result) {
+        return diff_physical_leaves(context, prior, result, lower, upper);
+    }
+
+    let mut boundaries = vec![lower.to_vec(), upper.to_vec()];
+    append_diff_boundaries(&mut boundaries, &prior, lower, upper);
+    append_diff_boundaries(&mut boundaries, &result, lower, upper);
+    boundaries.sort();
+    boundaries.dedup();
+    for interval in boundaries.windows(2) {
+        let interval_lower = interval[0].clone();
+        let interval_upper = interval[1].clone();
+        if interval_lower >= interval_upper {
+            continue;
+        }
+        let prior_child = physical_diff_child(&prior, &interval_lower);
+        let result_child = physical_diff_child(&result, &interval_lower);
+        match (prior_child, result_child) {
+            (Some(prior_child), Some(result_child)) => diff_physical_nodes(
+                context,
+                prior_child,
+                result_child,
+                &interval_lower,
+                &interval_upper,
+                depth + 1,
+            )?,
+            (None, Some(result_child)) => diff_physical_nodes(
+                context,
+                prior_page,
+                result_child,
+                &interval_lower,
+                &interval_upper,
+                depth + 1,
+            )?,
+            (Some(prior_child), None) => diff_physical_nodes(
+                context,
+                prior_child,
+                result_page,
+                &interval_lower,
+                &interval_upper,
+                depth + 1,
+            )?,
+            (None, None) => return Err(BTreeError::WrongPageKind),
+        }
+    }
+    Ok(())
+}
+
+fn append_diff_boundaries(boundaries: &mut Vec<Vec<u8>>, node: &Node, lower: &[u8], upper: &[u8]) {
+    if let Node::Internal { keys, .. } = node {
+        boundaries.extend(
+            keys.iter()
+                .filter(|key| lower < key.as_slice() && key.as_slice() < upper)
+                .cloned(),
+        );
+    }
+}
+
+fn physical_diff_child(node: &Node, lower: &[u8]) -> Option<PageId> {
+    match node {
+        Node::Leaf(_) => None,
+        Node::Internal { keys, children } => children.get(child_index(keys, lower)).copied(),
+    }
+}
+
+fn diff_physical_leaves<F>(
+    context: &mut PhysicalDiffContext<'_, F>,
+    prior: &[LeafEntry],
+    result: &[LeafEntry],
+    lower: &[u8],
+    upper: &[u8],
+) -> Result<(), BTreeError>
+where
+    F: FnMut(&[u8], Option<&[u8]>, Option<&[u8]>) -> Result<(), BTreeError>,
+{
+    let mut prior_position = prior.partition_point(|entry| entry.key.as_slice() < lower);
+    let prior_end = prior.partition_point(|entry| entry.key.as_slice() < upper);
+    let mut result_position = result.partition_point(|entry| entry.key.as_slice() < lower);
+    let result_end = result.partition_point(|entry| entry.key.as_slice() < upper);
+    while prior_position < prior_end || result_position < result_end {
+        match (
+            prior
+                .get(prior_position)
+                .filter(|_| prior_position < prior_end),
+            result
+                .get(result_position)
+                .filter(|_| result_position < result_end),
+        ) {
+            (Some(prior), Some(result)) if prior.key == result.key => {
+                if prior.value != result.value {
+                    context.push_difference(&prior.key, Some(&prior.value), Some(&result.value))?;
+                }
+                prior_position += 1;
+                result_position += 1;
+            }
+            (Some(prior), Some(result)) if prior.key < result.key => {
+                context.push_difference(&prior.key, Some(&prior.value), None)?;
+                prior_position += 1;
+            }
+            (Some(_) | None, Some(result)) => {
+                context.push_difference(&result.key, None, Some(&result.value))?;
+                result_position += 1;
+            }
+            (Some(prior), None) => {
+                context.push_difference(&prior.key, Some(&prior.value), None)?;
+                prior_position += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(())
+}
+
 enum Rewrite {
     One(PageId),
     Split {
@@ -1660,8 +2166,16 @@ fn rewrite_node_batch(
 }
 
 fn merge_leaf_updates(entries: Vec<LeafEntry>, updates: &[LeafEntry]) -> Vec<LeafEntry> {
+    #[cfg(test)]
+    let existing_capacity = entries.capacity();
     let mut existing = entries.into_iter().peekable();
     let mut merged = Vec::with_capacity(existing.len().saturating_add(updates.len()));
+    #[cfg(test)]
+    observe_sorted_batch_leaf_vec_capacity(
+        existing_capacity
+            .saturating_add(merged.capacity())
+            .saturating_mul(size_of::<LeafEntry>()),
+    );
     for update in updates {
         while existing.peek().is_some_and(|entry| entry.key < update.key) {
             if let Some(entry) = existing.next() {
@@ -1674,6 +2188,12 @@ fn merge_leaf_updates(entries: Vec<LeafEntry>, updates: &[LeafEntry]) -> Vec<Lea
         merged.push(update.clone());
     }
     merged.extend(existing);
+    #[cfg(test)]
+    observe_sorted_batch_leaf_vec_capacity(
+        existing_capacity
+            .saturating_add(merged.capacity())
+            .saturating_mul(size_of::<LeafEntry>()),
+    );
     merged
 }
 
@@ -2143,6 +2663,8 @@ fn append_leaf_level<S: BTreePageWrite>(
     if entries.is_empty() {
         return Err(BTreeError::InvalidCount);
     }
+    #[cfg(test)]
+    let input_capacity = entries.capacity();
     let mut references = Vec::new();
     let mut page_entries = Vec::new();
     let mut encoded_length = LEAF_HEADER_SIZE;
@@ -2165,6 +2687,21 @@ fn append_leaf_level<S: BTreePageWrite>(
             .checked_add(entry_length)
             .ok_or(BTreeError::LengthOverflow)?;
         page_entries.push(entry);
+        #[cfg(test)]
+        observe_sorted_batch_leaf_vec_capacity(
+            input_capacity
+                .saturating_mul(size_of::<LeafEntry>())
+                .saturating_add(
+                    page_entries
+                        .capacity()
+                        .saturating_mul(size_of::<LeafEntry>()),
+                )
+                .saturating_add(
+                    references
+                        .capacity()
+                        .saturating_mul(size_of::<ChildReference>()),
+                ),
+        );
     }
     if !page_entries.is_empty() {
         references.push(append_leaf_reference(store, creating_csn, page_entries)?);
@@ -2188,10 +2725,14 @@ fn append_leaf_level_balanced<S: BTreePageWrite>(
     if entries.is_empty() {
         return Err(BTreeError::InvalidCount);
     }
+    #[cfg(test)]
+    let input_capacity = entries.capacity();
     let lengths = entries
         .iter()
         .map(leaf_entry_encoded_length)
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(test)]
+    let lengths_capacity = lengths.capacity();
     let body = lengths
         .iter()
         .try_fold(0_usize, |total, length| total.checked_add(*length))
@@ -2221,6 +2762,22 @@ fn append_leaf_level_balanced<S: BTreePageWrite>(
         }
         used = used.checked_add(length).ok_or(BTreeError::LengthOverflow)?;
         page_entries.push(entry);
+        #[cfg(test)]
+        observe_sorted_batch_leaf_vec_capacity(
+            input_capacity
+                .saturating_mul(size_of::<LeafEntry>())
+                .saturating_add(lengths_capacity.saturating_mul(size_of::<usize>()))
+                .saturating_add(
+                    page_entries
+                        .capacity()
+                        .saturating_mul(size_of::<LeafEntry>()),
+                )
+                .saturating_add(
+                    references
+                        .capacity()
+                        .saturating_mul(size_of::<ChildReference>()),
+                ),
+        );
     }
     if !page_entries.is_empty() {
         references.push(append_leaf_reference(store, creating_csn, page_entries)?);
@@ -2247,6 +2804,10 @@ fn append_internal_level<S: BTreePageWrite>(
     references: Vec<ChildReference>,
 ) -> Result<Vec<ChildReference>, BTreeError> {
     let group_sizes = internal_group_sizes(&references)?;
+    #[cfg(test)]
+    let reference_capacity = references.capacity();
+    #[cfg(test)]
+    let split = group_sizes.len() > 1;
     let mut references = references.into_iter();
     let mut parents = Vec::with_capacity(group_sizes.len());
     for group_size in group_sizes {
@@ -2258,12 +2819,27 @@ fn append_internal_level<S: BTreePageWrite>(
             .first()
             .map(|reference| reference.minimum.clone())
             .ok_or(BTreeError::InvalidCount)?;
-        let keys = group
+        let keys: Vec<Vec<u8>> = group
             .iter()
             .skip(1)
             .map(|reference| reference.minimum.clone())
             .collect();
-        let children = group.iter().map(|reference| reference.page).collect();
+        let children: Vec<PageId> = group.iter().map(|reference| reference.page).collect();
+        #[cfg(test)]
+        if split {
+            observe_sorted_batch_internal_vec_capacity(
+                reference_capacity
+                    .saturating_mul(size_of::<ChildReference>())
+                    .saturating_add(
+                        parents
+                            .capacity()
+                            .saturating_mul(size_of::<ChildReference>()),
+                    )
+                    .saturating_add(group.capacity().saturating_mul(size_of::<ChildReference>()))
+                    .saturating_add(keys.capacity().saturating_mul(size_of::<Vec<u8>>()))
+                    .saturating_add(children.capacity().saturating_mul(size_of::<PageId>())),
+            );
+        }
         let page = append_node(store, creating_csn, &Node::Internal { keys, children })?;
         parents.push(ChildReference { minimum, page });
     }
@@ -2321,6 +2897,14 @@ fn assemble_batch_root<S: BTreePageWrite>(
     mut references: Vec<ChildReference>,
 ) -> Result<BTree, BTreeError> {
     for _ in 0..MAX_TREE_HEIGHT {
+        if references.len() > 1 {
+            #[cfg(test)]
+            observe_sorted_batch_root_vec_capacity(
+                references
+                    .capacity()
+                    .saturating_mul(size_of::<ChildReference>()),
+            );
+        }
         match references.len() {
             0 => return Err(BTreeError::InvalidCount),
             1 => return Ok(BTree::from_root(references[0].page)),
@@ -2330,6 +2914,24 @@ fn assemble_batch_root<S: BTreePageWrite>(
         }
     }
     Err(BTreeError::HeightExceeded)
+}
+
+#[cfg(test)]
+fn observe_sorted_batch_leaf_vec_capacity(bytes: usize) {
+    SORTED_BATCH_LEAF_SPLIT_VEC_HIGH_WATER
+        .set(SORTED_BATCH_LEAF_SPLIT_VEC_HIGH_WATER.get().max(bytes));
+}
+
+#[cfg(test)]
+fn observe_sorted_batch_internal_vec_capacity(bytes: usize) {
+    SORTED_BATCH_INTERNAL_SPLIT_VEC_HIGH_WATER
+        .set(SORTED_BATCH_INTERNAL_SPLIT_VEC_HIGH_WATER.get().max(bytes));
+}
+
+#[cfg(test)]
+fn observe_sorted_batch_root_vec_capacity(bytes: usize) {
+    SORTED_BATCH_ROOT_SPLIT_VEC_HIGH_WATER
+        .set(SORTED_BATCH_ROOT_SPLIT_VEC_HIGH_WATER.get().max(bytes));
 }
 
 fn append_node<S: BTreePageWrite>(
@@ -3385,8 +3987,10 @@ mod tests {
     use hyphae_native_types::{Csn, PageId};
 
     use super::{
-        BTree, BTreeError, LEAF_HEADER_SIZE, LeafEntry, Node, PREFIX_REPLACEMENT_APPENDED_PAGES,
-        PrefixReplacementBatch, PrefixReplacementStructuralLimits, encode_leaf, read_node,
+        BTree, BTreeError, BTreePhysicalDiffLimits, BTreePhysicalDiffVisitLimits,
+        BTreePhysicalDifference, LEAF_HEADER_SIZE, LeafEntry, Node,
+        PREFIX_REPLACEMENT_APPENDED_PAGES, PrefixReplacementBatch,
+        PrefixReplacementStructuralLimits, encode_leaf, read_node,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -3428,6 +4032,314 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[test]
+    fn immutable_prefix_diff_skips_shared_pages_and_detects_exact_split_differences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut entries = Vec::new();
+        for namespace in [[10, 1], [10, 2], [11, 1]] {
+            for ordinal in 0..160_u16 {
+                let mut key = namespace.to_vec();
+                key.extend_from_slice(&ordinal.to_be_bytes());
+                entries.push((key, vec![u8::try_from(ordinal % 251)?; 96]));
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let prior = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?
+            .tree;
+        let mut replaced_key = vec![10, 1];
+        replaced_key.extend_from_slice(&80_u16.to_be_bytes());
+        let mut inserted_key = vec![11, 1];
+        inserted_key.extend_from_slice(&200_u16.to_be_bytes());
+        let mut unexpected_key = vec![10, 1];
+        unexpected_key.extend_from_slice(&201_u16.to_be_bytes());
+        let result = prior
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(2)?,
+                vec![
+                    (replaced_key.clone(), b"replacement".to_vec()),
+                    (unexpected_key.clone(), b"unexpected".to_vec()),
+                    (inserted_key.clone(), b"inserted".to_vec()),
+                ],
+            )?
+            .tree;
+        let differences = prior.diff_prefixes_bounded(
+            result,
+            &store,
+            &[vec![10, 1], vec![11, 1]],
+            BTreePhysicalDiffLimits {
+                changed_node_visits: 512,
+                differences: 3,
+                retained_bytes: 1_024,
+            },
+        )?;
+        assert_eq!(
+            differences,
+            vec![
+                BTreePhysicalDifference {
+                    key: replaced_key,
+                    prior: Some(vec![80; 96]),
+                    result: Some(b"replacement".to_vec()),
+                },
+                BTreePhysicalDifference {
+                    key: unexpected_key,
+                    prior: None,
+                    result: Some(b"unexpected".to_vec()),
+                },
+                BTreePhysicalDifference {
+                    key: inserted_key,
+                    prior: None,
+                    result: Some(b"inserted".to_vec()),
+                },
+            ]
+        );
+        assert!(matches!(
+            prior.diff_prefixes_bounded(
+                result,
+                &store,
+                &[vec![10, 1], vec![11, 1]],
+                BTreePhysicalDiffLimits {
+                    changed_node_visits: 512,
+                    differences: 2,
+                    retained_bytes: 1_024,
+                },
+            ),
+            Err(BTreeError::PhysicalDiffLimitExceeded)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_prefix_diff_handles_root_height_changes_and_key_deletions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let target_key = vec![5, 1];
+        let prior = BTree::empty()
+            .upsert(
+                &mut store,
+                Csn::new(1)?,
+                target_key.clone(),
+                b"prior".to_vec(),
+            )?
+            .tree;
+        assert!(matches!(
+            read_node(&store, prior.root().ok_or("missing prior root")?)?,
+            Node::Leaf(_)
+        ));
+
+        let mut grown_entries = vec![(target_key.clone(), b"result".to_vec())];
+        for ordinal in 0..512_u16 {
+            let mut key = vec![9];
+            key.extend_from_slice(&ordinal.to_be_bytes());
+            grown_entries.push((key, vec![u8::try_from(ordinal % 251)?; 96]));
+        }
+        grown_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let grown = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(2)?, grown_entries)?
+            .tree;
+        assert!(matches!(
+            read_node(&store, grown.root().ok_or("missing grown root")?)?,
+            Node::Internal { .. }
+        ));
+        assert_eq!(
+            prior.diff_prefixes_bounded(
+                grown,
+                &store,
+                &[vec![5]],
+                BTreePhysicalDiffLimits {
+                    changed_node_visits: 128,
+                    differences: 1,
+                    retained_bytes: 64,
+                },
+            )?,
+            vec![BTreePhysicalDifference {
+                key: target_key,
+                prior: Some(b"prior".to_vec()),
+                result: Some(b"result".to_vec()),
+            }]
+        );
+
+        let deleted_key = vec![6, 2];
+        let retained_key = vec![6, 1];
+        let before_delete = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(3)?,
+                vec![
+                    (retained_key.clone(), b"retained".to_vec()),
+                    (deleted_key.clone(), b"deleted".to_vec()),
+                ],
+            )?
+            .tree;
+        let after_delete = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(4)?,
+                vec![(retained_key, b"retained".to_vec())],
+            )?
+            .tree;
+        assert_eq!(
+            before_delete.diff_prefixes_bounded(
+                after_delete,
+                &store,
+                &[vec![6]],
+                BTreePhysicalDiffLimits {
+                    changed_node_visits: 16,
+                    differences: 1,
+                    retained_bytes: 64,
+                },
+            )?,
+            vec![BTreePhysicalDifference {
+                key: deleted_key,
+                prior: Some(b"deleted".to_vec()),
+                result: None,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_prefix_diff_bounds_and_visits_empty_nonempty_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let mut entries = (0..512_u16)
+            .map(|ordinal| {
+                let mut key = vec![1];
+                key.extend_from_slice(&ordinal.to_be_bytes());
+                (key, vec![1; 96])
+            })
+            .collect::<Vec<_>>();
+        entries.extend([
+            (vec![5, 1], b"metadata".to_vec()),
+            (vec![6, 1], b"vector".to_vec()),
+        ]);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let result = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, entries)?
+            .tree;
+        let prefixes = vec![vec![5], vec![6]];
+        let mut visited = Vec::new();
+        assert_eq!(
+            BTree::empty().visit_prefix_differences_bounded(
+                result,
+                &store,
+                &prefixes,
+                BTreePhysicalDiffVisitLimits {
+                    changed_node_visits: 64,
+                    differences: 2,
+                    retained_bytes: 1_024,
+                },
+                |key, prior, value| {
+                    assert!(prior.is_none());
+                    assert!(value.is_some());
+                    visited.push(key.to_vec());
+                    ControlFlow::Continue(())
+                },
+            )?,
+            2
+        );
+        assert_eq!(visited, [vec![5, 1], vec![6, 1]]);
+        assert!(matches!(
+            BTree::empty().visit_prefix_differences_bounded(
+                result,
+                &store,
+                &prefixes,
+                BTreePhysicalDiffVisitLimits {
+                    changed_node_visits: 64,
+                    differences: 1,
+                    retained_bytes: 1_024,
+                },
+                |_, _, _| ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::PhysicalDiffLimitExceeded)
+        ));
+        assert!(matches!(
+            BTree::empty().visit_prefix_differences_bounded(
+                result,
+                &store,
+                &prefixes,
+                BTreePhysicalDiffVisitLimits {
+                    changed_node_visits: 64,
+                    differences: 2,
+                    retained_bytes: 1,
+                },
+                |_, _, _| ControlFlow::Continue(()),
+            ),
+            Err(BTreeError::PhysicalDiffLimitExceeded)
+        ));
+        let removed = result.diff_prefixes_bounded(
+            BTree::empty(),
+            &store,
+            &prefixes,
+            BTreePhysicalDiffLimits {
+                changed_node_visits: 64,
+                differences: 2,
+                retained_bytes: 64,
+            },
+        )?;
+        assert_eq!(removed.len(), 2);
+        assert!(removed.iter().all(|difference| difference.result.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn whole_tree_diff_includes_empty_and_maximum_prefix_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let prior = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(1)?,
+                vec![
+                    (Vec::new(), b"empty-prior".to_vec()),
+                    (
+                        vec![u8::MAX; super::BTREE_MAX_KEY_SIZE],
+                        b"maximum".to_vec(),
+                    ),
+                ],
+            )?
+            .tree;
+        let result = BTree::empty()
+            .upsert_sorted_batch(
+                &mut store,
+                Csn::new(2)?,
+                vec![
+                    (Vec::new(), b"empty-result".to_vec()),
+                    (vec![u8::MAX], b"high-prefix".to_vec()),
+                    (
+                        vec![u8::MAX; super::BTREE_MAX_KEY_SIZE],
+                        b"maximum".to_vec(),
+                    ),
+                ],
+            )?
+            .tree;
+        let mut differences = Vec::new();
+        assert_eq!(
+            prior.visit_differences_bounded(
+                result,
+                &store,
+                BTreePhysicalDiffVisitLimits {
+                    changed_node_visits: 16,
+                    differences: 2,
+                    retained_bytes: 1_024,
+                },
+                |key, _, _| {
+                    differences.push(key.to_vec());
+                    ControlFlow::Continue(())
+                },
+            )?,
+            2
+        );
+        assert_eq!(differences, [Vec::new(), vec![u8::MAX]]);
+        Ok(())
     }
 
     /// Random single-key batch upserts must split overflowing leaves evenly:
@@ -4069,6 +4981,60 @@ mod tests {
                 Some(vec![u8::try_from(index % 251)?; 96])
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_batch_structural_bound_covers_actual_split_vec_capacities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        super::SORTED_BATCH_LEAF_SPLIT_VEC_HIGH_WATER.set(0);
+        super::SORTED_BATCH_INTERNAL_SPLIT_VEC_HIGH_WATER.set(0);
+        super::SORTED_BATCH_ROOT_SPLIT_VEC_HIGH_WATER.set(0);
+
+        let temporary = TestDirectory::create()?;
+        let mut store = PageStore::create(temporary.page_file())?;
+        let seed = (0..64_u32)
+            .map(|ordinal| (ordinal.to_be_bytes().to_vec(), vec![1; 96]))
+            .collect::<Vec<_>>();
+        let tree = BTree::empty()
+            .upsert_sorted_batch(&mut store, Csn::new(1)?, seed)?
+            .tree;
+        let leaf_updates = (0..64_u32)
+            .map(|ordinal| (ordinal.to_be_bytes().to_vec(), vec![2; 192]))
+            .collect::<Vec<_>>();
+        tree.upsert_sorted_batch(&mut store, Csn::new(2)?, leaf_updates)?;
+
+        let wide_keys = (0..16_u8)
+            .map(|ordinal| {
+                let mut key = vec![ordinal];
+                key.resize(super::BTREE_MAX_KEY_SIZE, ordinal);
+                (key, vec![ordinal])
+            })
+            .collect::<Vec<_>>();
+        BTree::empty().upsert_sorted_batch(&mut store, Csn::new(3)?, wide_keys)?;
+
+        let leaf = super::SORTED_BATCH_LEAF_SPLIT_VEC_HIGH_WATER.get();
+        let internal = super::SORTED_BATCH_INTERNAL_SPLIT_VEC_HIGH_WATER.get();
+        let root = super::SORTED_BATCH_ROOT_SPLIT_VEC_HIGH_WATER.get();
+        let bound = BTree::sorted_batch_structural_memory_bound(64);
+        assert!(leaf > 0, "leaf split Vec capacity was not observed");
+        assert!(internal > 0, "internal split Vec capacity was not observed");
+        assert!(root > 0, "root split Vec capacity was not observed");
+        assert!(leaf <= bound, "leaf Vec high-water {leaf} exceeds {bound}");
+        assert!(
+            internal <= bound,
+            "internal Vec high-water {internal} exceeds {bound}"
+        );
+        assert!(root <= bound, "root Vec high-water {root} exceeds {bound}");
+
+        let one_target = BTree::sorted_batch_structural_memory_bound(35);
+        let two_targets = BTree::sorted_batch_structural_memory_bound(70);
+        assert!(two_targets >= one_target);
+        assert!(two_targets < one_target.saturating_mul(2));
+        assert_eq!(
+            BTree::sorted_batch_structural_memory_bound(usize::MAX),
+            usize::MAX
+        );
         Ok(())
     }
 

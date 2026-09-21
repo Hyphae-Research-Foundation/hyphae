@@ -246,7 +246,7 @@ pub enum ProductLexicalOperator {
 pub enum ProductVectorExecution {
     /// Complete exact distance ranking over the filtered set.
     Exact,
-    /// Filter-aware ANN with an exact filtered seed, avoiding post-filter-only execution.
+    /// Filter-aware bounded ANN traversal.
     Ann {
         /// HNSW traversal breadth.
         ef_search: usize,
@@ -402,9 +402,9 @@ pub enum ProductVectorStrategy {
     ExactFiltered,
     /// Adaptive policy selected the complete exact filtered oracle.
     AdaptiveExactFiltered,
-    /// Caller-selected filtered ANN augmented by an exact filtered seed.
+    /// Caller-selected bounded ANN traversal.
     FilterAwareAnn,
-    /// Adaptive policy selected filtered ANN augmented by an exact filtered seed.
+    /// Adaptive policy selected bounded ANN traversal.
     AdaptiveFilterAwareAnn,
 }
 
@@ -423,7 +423,7 @@ pub struct ProductVectorBranchReceipt {
     pub candidate_count: usize,
     /// Distinct graph nodes evaluated, zero for exact execution.
     pub visited_nodes: usize,
-    /// Whether native reranking or the exact filtered seed ran.
+    /// Whether native reranking or runtime-selected exact scoring ran.
     pub exact_reranked: bool,
 }
 
@@ -773,6 +773,7 @@ impl NativeProduct {
     }
 
     /// Point-resolved ingest across documents, postings, and named vectors.
+    #[allow(clippy::too_many_lines)]
     fn ingest_search_batch_delta(
         &mut self,
         plan: &IngestPlan<'_>,
@@ -865,6 +866,14 @@ impl NativeProduct {
                             vector.clone(),
                         )
                         .map_err(map_runtime_error)?;
+                } else {
+                    self.database
+                        .stage_delta_vector_absence_fence(
+                            &mut delta,
+                            vector_binding.index,
+                            document.object_id,
+                        )
+                        .map_err(map_runtime_error)?;
                 }
             }
         }
@@ -920,15 +929,17 @@ impl NativeProduct {
     ///
     /// Returns without mutation for any invalid document, unknown target,
     /// duplicate identity, or exhausted bound.
+    #[allow(clippy::unused_self)]
     pub fn stage_document_in_batch(
         &self,
         batch: &mut hyphae_native_runtime::NativeWriteBatch,
         collection: crate::ObjectId,
         document: &crate::ProductDocument,
-        logical_time_micros: i64,
+        _logical_time_micros: i64,
     ) -> Result<(), ProductError> {
-        let binding = self.resolve_search_collection_binding(collection, logical_time_micros)?;
-        let definition = self.search_definition(collection)?;
+        let binding = Self::search_collection_binding_in_batch(batch, collection)?;
+        let definition = Self::search_definition_in_batch(batch, collection)?;
+        validate_binding_definition(&definition, &binding)?;
         let batch_shape = ProductSearchIngestBatch {
             idempotency_id: 1,
             documents: vec![document.clone()],
@@ -971,6 +982,10 @@ impl NativeProduct {
             if let Some(vector) = document.vectors.get(&vector_binding.name) {
                 batch
                     .upsert_vector(vector_binding.index, document.object_id, vector.clone())
+                    .map_err(map_runtime_error)?;
+            } else {
+                batch
+                    .fence_vector_absence(vector_binding.index, document.object_id)
                     .map_err(map_runtime_error)?;
             }
         }
@@ -1071,7 +1086,7 @@ impl NativeProduct {
                     .map_err(map_runtime_error)?;
             } else {
                 transaction
-                    .delete_vector(vector_binding.index, update.document.object_id)
+                    .fence_vector_absence(vector_binding.index, update.document.object_id)
                     .map_err(map_runtime_error)?;
             }
         }
@@ -1166,7 +1181,7 @@ impl NativeProduct {
             .map_err(map_runtime_error)?;
         for vector in &binding.vectors {
             transaction
-                .delete_vector(vector.index, delete.object_id)
+                .fence_vector_absence(vector.index, delete.object_id)
                 .map_err(map_runtime_error)?;
         }
         transaction
@@ -1716,6 +1731,29 @@ impl NativeProduct {
         Ok(definition.clone())
     }
 
+    fn search_definition_in_batch(
+        batch: &hyphae_native_runtime::NativeWriteBatch,
+        collection: crate::ObjectId,
+    ) -> Result<SearchCollectionDefinitionV2, ProductError> {
+        let object = batch.logical_catalog_object(collection).ok_or_else(|| {
+            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
+        })?;
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition)) = object else {
+            return Err(invalid_request());
+        };
+        Ok(definition.clone())
+    }
+
+    fn search_collection_binding_in_batch(
+        batch: &hyphae_native_runtime::NativeWriteBatch,
+        collection: crate::ObjectId,
+    ) -> Result<ProductSearchCollectionBinding, ProductError> {
+        let encoded = batch.get(&binding_key(collection)).ok_or_else(|| {
+            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
+        })?;
+        decode_binding(encoded)
+    }
+
     fn search_collection_binding_at_snapshot(
         product_snapshot: &crate::ProductSnapshot,
         collection: crate::ObjectId,
@@ -2205,8 +2243,8 @@ fn execute_vector_branches(
     if branches.is_empty() {
         return Ok(receipts);
     }
-    // The runtime vector searches take an explicit allowlist, so the
-    // universe is materialized once here, never per branch.
+    // The eligibility universe is the collection manifest, not every object
+    // sharing its physical ANN index. Materialize it once for all branches.
     let allowlist = eligible.allowlist()?;
     for branch in branches {
         checkpoint()?;
@@ -2318,36 +2356,11 @@ fn execute_vector_branch(
         .inner
         .search_ann_filtered(binding.index, &branch.query, options, eligible)
         .map_err(map_runtime_error)?;
-
-    // The native graph API currently exposes an honest post-filter receipt.
-    // Seed from the complete filtered oracle so this product route is not
-    // post-filter-only while retaining ANN ranking for the remaining slots.
-    let seed_limit = usize::from(branch.candidate_limit > 0 && !eligible.is_empty());
-    let exact_seed = snapshot
-        .inner
-        .search_vector_exact_filtered(binding.index, &branch.query, seed_limit, eligible)
-        .map_err(map_runtime_error)?;
-    let mut merged = BTreeMap::<crate::ObjectId, f64>::new();
-    for hit in ann.hits.iter().chain(&exact_seed) {
-        merged
-            .entry(hit.object_id)
-            .and_modify(|distance| *distance = distance.min(hit.distance))
-            .or_insert(hit.distance);
-    }
-    let mut hits = merged
-        .into_iter()
-        .map(|(object_id, distance)| VectorHit {
-            object_id,
-            distance,
-        })
-        .collect::<Vec<_>>();
-    hits.sort_by(|left, right| {
-        left.distance
-            .total_cmp(&right.distance)
-            .then_with(|| left.object_id.cmp(&right.object_id))
-    });
-    hits.truncate(branch.candidate_limit);
-    let approximate = eligible.len() > seed_limit && branch.candidate_limit > seed_limit;
+    let approximate = ann.approximate;
+    let candidate_count = ann.candidate_count;
+    let visited_nodes = ann.visited_nodes;
+    let exact_reranked = ann.exact_reranked;
+    let hits = ann.hits;
     Ok((
         hits,
         ProductVectorBranchReceipt {
@@ -2359,9 +2372,9 @@ fn execute_vector_branch(
             },
             approximate,
             eligible_documents: eligible.len(),
-            candidate_count: ann.candidate_count.saturating_add(exact_seed.len()),
-            visited_nodes: ann.visited_nodes,
-            exact_reranked: ann.exact_reranked || !exact_seed.is_empty(),
+            candidate_count,
+            visited_nodes,
+            exact_reranked,
         },
     ))
 }
@@ -3956,12 +3969,7 @@ fn map_doc_value_error(error: &hyphae_native_runtime::DocValueError) -> ProductE
 }
 
 pub(crate) fn map_runtime_error(error: NativeRuntimeError) -> ProductError {
-    match error {
-        NativeRuntimeError::Ann(_)
-        | NativeRuntimeError::Model(_)
-        | NativeRuntimeError::InvalidPreparedMutation => invalid_request(),
-        other => other.into(),
-    }
+    error.into()
 }
 
 fn invalid_request() -> ProductError {

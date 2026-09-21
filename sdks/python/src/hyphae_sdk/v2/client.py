@@ -7,7 +7,13 @@ from typing import Any, Protocol
 
 from .http import HttpTransport
 from .local import LocalTransport
-from .models import CancellationToken, ClientError, RequestOptions, Response
+from .models import (
+    CancellationToken,
+    ClientError,
+    ProductTransactionSearchMutation,
+    RequestOptions,
+    Response,
+)
 
 
 class Transport(Protocol):
@@ -205,7 +211,7 @@ class HyphaeClient:
             options=options,
         )
 
-    def transaction_stage_search(self, handle: int, mutation: dict[str, object], *, options: RequestOptions | None = None) -> Response:
+    def transaction_stage_search(self, handle: int, mutation: ProductTransactionSearchMutation, *, options: RequestOptions | None = None) -> Response:
         return self.execute(
             "transaction_stage_search",
             {"handle": handle, "mutation": mutation},

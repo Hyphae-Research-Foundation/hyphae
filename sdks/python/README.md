@@ -83,10 +83,12 @@ or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
 `/v2/execute`. Both reconstruct `ProductError` typed fields and accept
 `RequestOptions` deadlines and cancellation.
 
-Managed local sessions negotiate Native local protocol minor 5, with minors
-3 through 5 supported (`hyphae_sdk.v2.protocol.PROTOCOL_MINOR` and
-`PROTOCOL_MINORS_SUPPORTED` in `http.py`); the TypeScript SDK's codec speaks
-minor 6. Sessions authenticate in the bounded
+Managed local sessions negotiate Native local protocol minor 7, with minors 3
+through 7 supported (`hyphae_sdk.v2.protocol.PROTOCOL_MINOR` and
+`PROTOCOL_MINORS_SUPPORTED` in `http.py`). This matches the TypeScript SDK,
+including the complete minor-6 surface. Native `u128` object, transaction, and
+idempotency identities remain lossless Python `int` values. Sessions
+authenticate in the bounded
 `HELLO` trailer. Security metadata responses contain no credential secret or
 verifier, and every security mutation requires a caller-selected nonzero
 idempotency token:

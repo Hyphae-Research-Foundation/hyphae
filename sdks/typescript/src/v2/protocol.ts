@@ -110,6 +110,11 @@ const MAX_SEARCH_FACETS = 8;
 const MAX_SEARCH_FACET_BUCKETS = 10_000;
 const MAX_SEARCH_AGGREGATIONS = 16;
 const MAX_SEARCH_VECTOR_BRANCHES = 16;
+const MAX_VECTOR_DIMENSION = (1 << 16) - 1;
+const MAX_SEARCH_FACET_RANGES = 64;
+const MAX_AUTOCUT_STEEPNESS = 16;
+const MAX_LEXICAL_FIELDS = 64;
+const MAX_LEXICAL_MINIMUM_MATCH = 64;
 
 const DEFAULT_PROOF_LIMITS = {
   result_items: 10_000n,
@@ -232,9 +237,9 @@ export function encodeAuthenticatedHello(
   return authenticated;
 }
 
-/** Boolean, integer, string, and bytes doc values are minor-0 content;
- * future typed values raise the requirement here. */
-function docValueRequiredMinor(_value: unknown): number {
+function docValueRequiredMinor(value: unknown): number {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) return 6;
+  if (typeof value === "object" && value !== null && typeof (value as { float?: unknown }).float === "number") return 6;
   return 0;
 }
 
@@ -269,16 +274,32 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
   if (["security_status", "security_principal_list", "security_role_list", "security_assignment_list", "security_key_list", "security_audit_read"].includes(operation)) return 1;
   if (["security_principal_create", "security_principal_set_enabled", "security_custom_role_create", "security_built_in_assignment_create", "security_custom_assignment_create", "security_assignment_revoke"].includes(operation)) return 2;
   if (operation === "catalog_visible_list" || operation.startsWith("security_api_key_") || operation === "security_legacy_bearer_revoke") return 3;
+  const minorSixMutations = ["sorted_set_increment", "sorted_set_pop", "string_set_conditional", "string_append", "string_set_range", "hash_set_if_absent", "set_pop"];
   if (operation === "structure_read") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
     const kind = String(request.kind ?? "");
-    if (kind === "sorted_set_score_range" || kind === "hash_scan_reverse" || kind === "hash_scan_match") return 6;
+    if (["sorted_set_score_range", "hash_scan_reverse", "hash_scan_match", "key_scan_match", "string_range", "set_random_members"].includes(kind)) return 6;
+  }
+  if (operation === "structure_mutate") {
+    const mutations = args.mutations;
+    if (Array.isArray(mutations) && mutations.some((mutation) => typeof mutation === "object" && mutation !== null && minorSixMutations.includes(String((mutation as Readonly<Record<string, unknown>>).kind)))) return 6;
+  }
+  if (operation === "transaction_stage_structure") {
+    const mutation = args.mutation;
+    if (typeof mutation === "object" && mutation !== null && minorSixMutations.includes(String((mutation as Readonly<Record<string, unknown>>).kind))) return 6;
   }
   if (operation === "search_collection") {
     const request = (typeof args.request === "object" && args.request !== null ? args.request : args) as Readonly<Record<string, unknown>>;
-    const extended = request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null);
+    const fusion = request.fusion === "relative_score" ? 6 : request.fusion !== undefined || (request.parent_dedupe !== undefined && request.parent_dedupe !== null) || (request.rerank !== undefined && request.rerank !== null) ? 4 : 0;
     const highlighted = request.highlight !== undefined && request.highlight !== null;
-    return Math.max(highlighted ? 5 : 0, extended ? 4 : 0, filterRequiredMinor(request.filter));
+    const lexical = typeof request.lexical === "object" && request.lexical !== null ? request.lexical as Readonly<Record<string, unknown>> : undefined;
+    const lexicalMinor = lexical !== undefined && (lexical.operator !== undefined && lexical.operator !== null || lexical.prefix === true || Array.isArray(lexical.fields) && lexical.fields.length > 0 || lexical.fuzzy !== undefined && lexical.fuzzy !== null || lexical.phrase === true) ? 6 : 0;
+    const vectors = Array.isArray(request.vectors) ? request.vectors : [];
+    const cutoff = vectors.some((vector) => typeof vector === "object" && vector !== null && (vector as Readonly<Record<string, unknown>>).max_distance !== undefined && (vector as Readonly<Record<string, unknown>>).max_distance !== null) ? 6 : 0;
+    const aggregations = Array.isArray(request.aggregations) ? request.aggregations : [];
+    const average = aggregations.some((aggregation) => typeof aggregation === "object" && aggregation !== null && (aggregation as Readonly<Record<string, unknown>>).kind === "average") ? 6 : 0;
+    const minorSix = request.autocut !== undefined && request.autocut !== null || Number(request.offset ?? 0) !== 0 || Array.isArray(request.range_facets) && request.range_facets.length > 0 ? 6 : 0;
+    return Math.max(highlighted ? 5 : 0, fusion, lexicalMinor, cutoff, average, minorSix, filterRequiredMinor(request.filter));
   }
   if (operation === "search_ingest") {
     const batch = (typeof args.batch === "object" && args.batch !== null ? args.batch : args) as Readonly<Record<string, unknown>>;
@@ -286,6 +307,12 @@ export function operationRequiredMinor(operation: string, args: Readonly<Record<
     return documents.reduce((highest: number, document) => Math.max(highest, documentRequiredMinor(document)), 0);
   }
   if (operation === "search_document_update") return documentRequiredMinor(args.document);
+  if (operation === "transaction_stage_search") {
+    const mutation = args.mutation;
+    if (typeof mutation === "object" && mutation !== null && (mutation as Readonly<Record<string, unknown>>).kind === "document") {
+      return Math.max(7, documentRequiredMinor((mutation as Readonly<Record<string, unknown>>).document));
+    }
+  }
   return 0;
 }
 
@@ -361,7 +388,7 @@ export function encodeProductRequest(
   return encoded;
 }
 
-export function decodeProductRequest(encoded: Uint8Array): {
+export function decodeProductRequest(encoded: Uint8Array, negotiatedMinor?: number): {
   readonly operation: string;
   readonly args: Readonly<Record<string, unknown>>;
   readonly options: RequestOptions;
@@ -391,7 +418,11 @@ export function decodeProductRequest(encoded: Uint8Array): {
   const securityMutation = (kind >= 48 && kind <= 53) || (kind >= 55 && kind <= 68) || kind === 70;
   if (securityMutation && token === 0n) throw new ClientError("security mutation requires a nonzero idempotencyToken");
   if (securityMutation && options.durability !== "strict") throw new ClientError("security mutation requires strict durability");
-  return { operation, args: decodeOperation(operation, payload.subarray(extended ? 80 : 64)), options };
+  const args = decodeOperation(operation, payload.subarray(extended ? 80 : 64));
+  if (negotiatedMinor !== undefined && negotiatedMinor < operationRequiredMinor(operation, args)) {
+    throw new ClientError("native operation is unavailable at the negotiated protocol minor");
+  }
+  return { operation, args, options };
 }
 
 export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, negotiatedMinor?: number): Response {
@@ -1365,13 +1396,13 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
   if (operation === "sql_deallocate") return u64(BigInt(args.handle as bigint | number));
   if (operation === "sql_execute_prepared") return join(u64(BigInt(args.handle as bigint | number)), encodeValues(args.parameters ?? []));
   if (operation === "sql_execute") return join(bytes(new TextEncoder().encode(String(args.statement))), encodeValues(args.parameters ?? []));
-  if (operation === "transaction_status") return u128(BigInt(args.transaction_id as bigint | number));
+  if (operation === "transaction_status") return identity128(args.transaction_id, "transaction");
   if (operation === "transaction_stage_sql") return join(u64(BigInt(args.handle as bigint | number)), bytes(new TextEncoder().encode(String(args.statement))), encodeValues(args.parameters ?? []));
   if (operation === "transaction_stage_structure") return join(u64(BigInt(args.handle as bigint | number)), encodeStructureMutation(args.mutation));
   if (operation === "transaction_stage_search") return join(u64(BigInt(args.handle as bigint | number)), encodeTransactionSearchMutation(args.mutation));
   if (operation === "transaction_stage_vector") return join(u64(BigInt(args.handle as bigint | number)), encodeTransactionVectorMutation(args.mutation));
   if (operation === "transaction_commit" || operation === "transaction_rollback" || operation === "explicit_transaction_status") return u64(BigInt(args.handle as bigint | number));
-  if (operation === "transaction_status_by_idempotency") return u128(BigInt(args.idempotency_token as bigint | number));
+  if (operation === "transaction_status_by_idempotency") return identity128(args.idempotency_token, "idempotency token");
   if (operation === "doctor") return new Uint8Array();
   if (operation === "backup") {
     const limits = args.limits as Readonly<Record<string, number>>;
@@ -1384,8 +1415,8 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
       u64(BigInt(limits.max_manifest_bytes ?? 0)),
     );
   }
-  if (operation === "search") return join(u128(BigInt(args.index as bigint | number)), u64(BigInt(args.limit as number)), encodeQuery(args.query));
-  if (operation === "catalog_object" || operation === "catalog_describe") return u128(BigInt(args.id as bigint | number));
+  if (operation === "search") return join(identity128(args.index, "search index"), u64(BigInt(args.limit as number)), encodeQuery(args.query));
+  if (operation === "catalog_object" || operation === "catalog_describe") return identity128(args.id, "catalog object");
   if (operation === "catalog_object_named" || operation === "catalog_resolve") return encodeQualifiedName(args.name);
   if (operation === "catalog_list") {
     const parent = args.parent;
@@ -1394,7 +1425,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     prefix[1] = args.kind === undefined || args.kind === null ? 0 : catalogKindTag(String(args.kind));
     return join(
       prefix,
-      ...(parent === undefined || parent === null ? [] : [u128(BigInt(parent as bigint | number))]),
+      ...(parent === undefined || parent === null ? [] : [identity128(parent, "catalog parent")]),
       encodeCursor(args.cursor),
       u64(BigInt(args.item_limit as number)),
       u64(BigInt(args.visit_limit as number)),
@@ -1412,7 +1443,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     prefix[1] = args.kind === undefined || args.kind === null ? 0 : catalogKindTag(String(args.kind));
     return join(
       prefix,
-      ...(parent === undefined || parent === null ? [] : [u128(BigInt(parent as bigint | number))]),
+      ...(parent === undefined || parent === null ? [] : [identity128(parent, "catalog parent")]),
       bytes(cursor instanceof Uint8Array ? cursor : new Uint8Array()),
       u64(BigInt(args.item_limit as number)),
       u64(BigInt(args.visit_limit as number)),
@@ -1470,7 +1501,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     const direction = new Uint8Array(8);
     direction[0] = args.direction === "outgoing" ? 0 : 1;
     return join(
-      u128(BigInt(args.object as bigint | number)),
+      identity128(args.object, "catalog object"),
       direction,
       encodeCursor(args.cursor),
       u64(BigInt(args.item_limit as number)),
@@ -1495,20 +1526,20 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
         || search === undefined || search === null || !Number.isInteger(search.limit) || Number(search.limit) < limit || Number(search.limit) > 1000
         || ["sort", "facets", "range_facets", "aggregations"].some(key => Array.isArray(search[key]) && (search[key] as unknown[]).length > 0)
         || Number(search.offset ?? 0) !== 0 || provenance.length > 65536) throw new ClientError("invalid bounded memory request");
-    return join(u32(collections.length), ...collections.map(u128), u64(BigInt(limit)),
+    return join(u32(collections.length), ...collections.map((collection) => identity128(collection, "memory collection")), u64(BigInt(limit)),
       bytes(encodeSearchCollection({collection: collections[0], request: search})),
       bytes(provenance));
   }
   if (operation === "memory_enrich") {
     const digest = requireBytes(args.expected_envelope_digest);
     if (digest.length !== 32) throw new ClientError("expected_envelope_digest must contain 32 bytes");
-    return join(u128(BigInt(args.collection as bigint | number)), digest,
-      u128(BigInt(args.idempotency_id as bigint | number)), encodeSearchDocument(args.document));
+    return join(identity128(args.collection, "search collection"), digest,
+      identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
   }
   if (operation === "search_collection") return encodeSearchCollection(args);
-  if (operation === "search_ingest") return join(u128(BigInt(args.collection as bigint | number)), encodeSearchBatch(args.batch));
-  if (operation === "search_document_update") return join(u128(BigInt(args.collection as bigint | number)), u128(BigInt(args.idempotency_id as bigint | number)), encodeSearchDocument(args.document));
-  if (operation === "search_document_delete") return join(u128(BigInt(args.collection as bigint | number)), u128(BigInt(args.idempotency_id as bigint | number)), u128(BigInt(args.object_id as bigint | number)));
+  if (operation === "search_ingest") return join(identity128(args.collection, "search collection"), encodeSearchBatch(args.batch));
+  if (operation === "search_document_update") return join(identity128(args.collection, "search collection"), identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
+  if (operation === "search_document_delete") return join(identity128(args.collection, "search collection"), identity128(args.idempotency_id, "idempotency"), identity128(args.object_id, "search document"));
   if (operation === "structure_mutate") {
     const mutations = args.mutations;
     if (!Array.isArray(mutations) || mutations.length === 0 || mutations.length > 4096) {
@@ -1562,7 +1593,7 @@ function encodeSearchCollection(args: Readonly<Record<string, unknown>>): Uint8A
   const vectorCount = new Uint8Array(4);
   new DataView(vectorCount.buffer).setUint32(0, vectors.length, true);
   return join(
-    u128(BigInt(args.collection as bigint | number)),
+    identity128(args.collection, "search collection"),
     lexicalFlag,
     ...(lexical === undefined ? [] : [bytes(new TextEncoder().encode(String(lexical.query))), u64(BigInt(lexical.candidate_limit as number)), u32(Number(lexical.weight))]),
     vectorCount,
@@ -1604,6 +1635,12 @@ function encodeLexicalOperator(lexical: Readonly<Record<string, unknown>> | unde
   const operator = lexical?.operator as Readonly<Record<string, unknown>> | string | undefined;
   if (operator === undefined || operator === null) {
     if (lexical?.prefix === true) return [Uint8Array.of(9, 2)];
+    if (lexical?.fuzzy !== undefined && lexical.fuzzy !== null) {
+      const distance = Number(lexical.fuzzy);
+      if (!Number.isInteger(distance) || distance < 1 || distance > 2) throw new ClientError("lexical fuzzy distance is invalid");
+      return [join(Uint8Array.of(9, 3), u32(distance))];
+    }
+    if (lexical?.phrase === true) return [Uint8Array.of(9, 4)];
     return [];
   }
   if (lexical?.prefix === true) throw new ClientError("lexical prefix excludes the operator");
@@ -1726,17 +1763,31 @@ function encodeIntegratedVector(vector: Readonly<Record<string, unknown>>): Uint
 function encodeSearchBatch(raw: unknown): Uint8Array {
   const batch = raw as Readonly<Record<string, unknown>>;
   const documents = batch.documents as ReadonlyArray<Readonly<Record<string, unknown>>>;
-  return join(u128(BigInt(batch.idempotency_id as bigint | number)), u32(documents.length), ...documents.map(encodeSearchDocument));
+  return join(identity128(batch.idempotency_id, "idempotency"), u32(documents.length), ...documents.map(encodeSearchDocument));
+}
+
+function compareBytes(left: Uint8Array, right: Uint8Array): number {
+  const sharedLength = Math.min(left.byteLength, right.byteLength);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return left.byteLength - right.byteLength;
+}
+
+function compareUtf8(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  return compareBytes(encoder.encode(left), encoder.encode(right));
 }
 
 function encodeSearchDocument(raw: unknown): Uint8Array {
   const document = raw as Readonly<Record<string, unknown>>;
   const values = document.doc_values as Readonly<Record<string, unknown>> ?? {};
   const vectors = document.vectors as Readonly<Record<string, readonly number[]>> ?? {};
-  const valueEntries = Object.entries(values).sort(([left], [right]) => left.localeCompare(right));
-  const vectorEntries = Object.entries(vectors).sort(([left], [right]) => left.localeCompare(right));
+  const valueEntries = Object.entries(values).sort(([left], [right]) => compareUtf8(left, right));
+  const vectorEntries = Object.entries(vectors).sort(([left], [right]) => compareUtf8(left, right));
   return join(
-    u128(BigInt(document.object_id as bigint | number)),
+    identity128(document.object_id, "search document"),
     bytes(new TextEncoder().encode(String(document.text))),
     u32(valueEntries.length),
     ...valueEntries.flatMap(([name, value]) => [bytes(new TextEncoder().encode(name)), encodeDocValue(value)]),
@@ -1747,6 +1798,41 @@ function encodeSearchDocument(raw: unknown): Uint8Array {
       return [bytes(new TextEncoder().encode(name)), u32(vector.length), encoded];
     }),
   );
+}
+
+function decodeSearchDocument(reader: Reader): Readonly<Record<string, unknown>> {
+  const objectId = reader.u128();
+  if (objectId === 0n) throw new ClientError("search document identity is zero");
+  const text = reader.text();
+  const valueCount = readBoundedCount(reader, MAX_DOC_VALUES_PER_HIT, 5, "search document value");
+  const docValues: Record<string, unknown> = {};
+  let previousName: Uint8Array | undefined;
+  for (let index = 0; index < valueCount; index += 1) {
+    const name = reader.text();
+    const encodedName = new TextEncoder().encode(name);
+    if (previousName !== undefined && compareBytes(encodedName, previousName) <= 0) {
+      throw new ClientError("search document value names must be strictly ascending by UTF-8 bytes");
+    }
+    previousName = encodedName;
+    Object.defineProperty(docValues, name, { value: decodeDocValue(reader, true), enumerable: true });
+  }
+  const vectorCount = readBoundedCount(reader, MAX_SEARCH_VECTOR_BRANCHES, 12, "search document vector");
+  const vectors: Record<string, readonly number[]> = {};
+  previousName = undefined;
+  for (let index = 0; index < vectorCount; index += 1) {
+    const name = reader.text();
+    const encodedName = new TextEncoder().encode(name);
+    if (previousName !== undefined && compareBytes(encodedName, previousName) <= 0) {
+      throw new ClientError("search document vector names must be strictly ascending by UTF-8 bytes");
+    }
+    previousName = encodedName;
+    const dimension = readBoundedCount(reader, MAX_VECTOR_DIMENSION, 4, "search document vector dimension");
+    if (dimension === 0) throw new ClientError("search document vector dimension exceeds its bound");
+    const vector = Array.from({ length: dimension }, () => reader.f32());
+    if (!vector.every(Number.isFinite)) throw new ClientError("search document vector contains a nonfinite value");
+    Object.defineProperty(vectors, name, { value: vector, enumerable: true });
+  }
+  return { object_id: objectId, text, doc_values: docValues, vectors };
 }
 
 function encodeSearchFilter(filter: Readonly<Record<string, unknown>>, depth = 0): Uint8Array {
@@ -1798,13 +1884,24 @@ function canonicalFloat(value: number): number {
   return value === 0 ? 0 : value;
 }
 
-function decodeDocValue(reader: Reader): unknown {
+function decodeDocValue(reader: Reader, preserveFloatTag = false): unknown {
   const tag = reader.u8();
   if (tag === 0) return reader.boolean();
   if (tag === 1) return reader.i64();
   if (tag === 2) return reader.text();
   if (tag === 3) return reader.bytes();
-  if (tag === 4) return reader.f64();
+  if (tag === 4) {
+    const bits = reader.u64();
+    const magnitude = bits & 0x7fffffffffffffffn;
+    const isNaN = magnitude > 0x7ff0000000000000n;
+    const canonicalBits = isNaN ? 0x7ff8000000000000n : magnitude === 0n ? 0n : bits;
+    if (bits !== canonicalBits) throw new ClientError("integrated float doc value is noncanonical");
+    const encoded = new ArrayBuffer(8);
+    const view = new DataView(encoded);
+    view.setBigUint64(0, bits, true);
+    const value = view.getFloat64(0, true);
+    return preserveFloatTag ? { float: value } : value;
+  }
   throw new ClientError("integrated doc value is invalid");
 }
 
@@ -1953,13 +2050,20 @@ function listSideTag(raw: unknown): number {
 function encodeTransactionSearchMutation(raw: unknown): Uint8Array {
   if (typeof raw !== "object" || raw === null) throw new ClientError("transaction search mutation is invalid");
   const value = raw as Readonly<Record<string, unknown>>;
-  const tags: Readonly<Record<string, number>> = { index: 0, replace: 1, delete: 2 };
+  const tags: Readonly<Record<string, number>> = { index: 0, replace: 1, delete: 2, document: 3 };
   const kind = String(value.kind);
   const tag = tags[kind];
   if (tag === undefined) throw new ClientError("transaction search mutation kind is invalid");
+  if (kind === "document") {
+    return join(
+      Uint8Array.of(tag),
+      identity128(value.collection, "transaction document collection"),
+      encodeSearchDocument(value.document),
+    );
+  }
   return join(
     Uint8Array.of(tag),
-    u128(BigInt(value.index as bigint | number)),
+    identity128(value.index, "search index"),
     bytes(requireBytes(value.document_id)),
     ...(kind === "delete" ? [] : [bytes(new TextEncoder().encode(String(value.text)))]),
   );
@@ -1972,8 +2076,8 @@ function encodeTransactionVectorMutation(raw: unknown): Uint8Array {
   if (kind !== "upsert" && kind !== "delete") throw new ClientError("transaction vector mutation kind is invalid");
   const prefix = [
     Uint8Array.of(kind === "upsert" ? 0 : 1),
-    u128(BigInt(value.index as bigint | number)),
-    u128(BigInt(value.object_id as bigint | number)),
+    identity128(value.index, "vector index"),
+    identity128(value.object_id, "vector object"),
   ];
   if (kind === "delete") return join(...prefix);
   const vector = value.vector;
@@ -1999,12 +2103,12 @@ function encodeStructureRead(value: Readonly<Record<string, unknown>>): Uint8Arr
     const keys = value.keys;
     if (operation === undefined) throw new ClientError("set algebra operation is invalid");
     if (!Array.isArray(keys) || keys.length === 0) throw new ClientError("set algebra keys must be a nonempty array");
-    return join(Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), Uint8Array.of(operation),
+    return join(Uint8Array.of(tag), identity128(value.keyspace, "keyspace"), Uint8Array.of(operation),
       u32(keys.length), ...keys.map((key) => bytes(requireBytes(key))),
       u64(BigInt(value.output_member_limit as number)), u64(BigInt(value.visit_limit as number)));
   }
   if (kind === "key_scan_match") {
-    const parts = [Uint8Array.of(tag), u128(BigInt(value.keyspace as bigint | number)), bytes(requireBytes(value.pattern))];
+    const parts = [Uint8Array.of(tag), identity128(value.keyspace, "keyspace"), bytes(requireBytes(value.pattern))];
     const cursor = value.start_after;
     parts.push(Uint8Array.of(cursor === undefined ? 0 : 1));
     if (cursor !== undefined) parts.push(bytes(requireBytes(cursor)));
@@ -2087,7 +2191,7 @@ function sortedOrderTag(raw: unknown): number {
 function encodeStructureKey(raw: unknown): Uint8Array {
   if (typeof raw !== "object" || raw === null) throw new ClientError("structure key is invalid");
   const value = raw as Readonly<Record<string, unknown>>;
-  return join(u128(BigInt(value.keyspace as bigint | number)), bytes(requireBytes(value.key)));
+  return join(identity128(value.keyspace, "keyspace"), bytes(requireBytes(value.key)));
 }
 
 function decodeStructureRead(reader: Reader): Readonly<Record<string, unknown>> {
@@ -2273,7 +2377,7 @@ function encodeCursor(raw: unknown): Uint8Array {
   const cursor = raw as Readonly<Record<string, unknown>>;
   const prefix = new Uint8Array(8);
   prefix[0] = 1;
-  return join(prefix, encodeSnapshot(cursor.snapshot), u128(BigInt(cursor.after as bigint | number)));
+  return join(prefix, encodeSnapshot(cursor.snapshot), identity128(cursor.after, "catalog cursor"));
 }
 
 function encodeSnapshot(raw: unknown): Uint8Array {
@@ -2374,11 +2478,18 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
     const parameters = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 1, "SQL parameter") }, () => decodeValue(reader, 0));
     args = { handle, statement, parameters };
   }
+  else if (operation === "transaction_status") args = { transaction_id: readIdentity(reader, "transaction") };
+  else if (operation === "structure_mutate") {
+    const count = readBoundedCount(reader, MAX_PRODUCT_COUNT, 1, "structure mutation");
+    if (count === 0) throw new ClientError("structure mutation count is invalid");
+    args = { mutations: Array.from({ length: count }, () => decodeStructureMutation(reader)) };
+  }
   else if (operation === "transaction_stage_structure") args = { handle: reader.u64(), mutation: decodeStructureMutation(reader) };
   else if (operation === "transaction_stage_search") args = { handle: reader.u64(), mutation: decodeTransactionSearchMutation(reader) };
   else if (operation === "transaction_stage_vector") args = { handle: reader.u64(), mutation: decodeTransactionVectorMutation(reader) };
   else if (["transaction_commit", "transaction_rollback", "explicit_transaction_status"].includes(operation)) args = { handle: reader.u64() };
-  else if (operation === "transaction_status_by_idempotency") args = { idempotency_token: reader.u128() };
+  else if (operation === "transaction_status_by_idempotency") args = { idempotency_token: readIdentity(reader, "idempotency token") };
+  else if (operation === "search_collection") args = decodeSearchCollection(reader);
   else if (["security_principal_list", "security_role_list", "security_assignment_list", "security_key_list"].includes(operation)) {
     const family = operation.slice("security_".length, -"_list".length);
     args = { cursor: decodeSecurityCursor(reader, family), limit: decodeSecurityLimit(reader) };
@@ -2451,15 +2562,16 @@ function decodeOperation(operation: string, encoded: Uint8Array): Readonly<Recor
 }
 
 function decodeStructureKey(reader: Reader): Readonly<Record<string, unknown>> {
-  return { keyspace: reader.u128(), key: reader.bytes() };
+  return { keyspace: readIdentity(reader, "keyspace"), key: reader.bytes() };
 }
 
 function decodeStructureReadRequest(reader: Reader): Readonly<Record<string, unknown>> {
-  const kinds = ["string_get", "counter_get", "ttl", "hash_get", "hash_field_ttl", "hash_scan", "hash_length", "list_range", "list_length", "set_contains", "set_members", "set_cardinality", "set_algebra", "sorted_set_score", "sorted_set_rank", "sorted_set_range", "sorted_set_cardinality", "stream_range"];
+  const kinds = ["string_get", "counter_get", "ttl", "hash_get", "hash_field_ttl", "hash_scan", "hash_length", "list_range", "list_length", "set_contains", "set_members", "set_cardinality", "set_algebra", "sorted_set_score", "sorted_set_rank", "sorted_set_range", "sorted_set_cardinality", "stream_range", "sorted_set_score_range", "hash_scan_reverse", "hash_scan_match", "key_scan_match", "string_range", "set_random_members"];
   const kind = kinds[reader.u8()];
   if (kind === undefined) throw new ClientError("structure read kind is invalid");
+  if (kind === "key_scan_match") return { kind, keyspace: readIdentity(reader, "keyspace"), pattern: reader.bytes(), start_after: reader.boolean() ? reader.bytes() : undefined, output_limit: reader.u64(), visit_limit: reader.u64(), match_step_limit: reader.u64() };
   if (kind === "set_algebra") {
-    const keyspace = reader.u128();
+    const keyspace = readIdentity(reader, "keyspace");
     const operation = ["union", "intersection", "difference"][reader.u8()];
     if (operation === undefined) throw new ClientError("set algebra operation is invalid");
     return { kind, keyspace, operation, keys: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "set algebra key") }, () => reader.bytes()), output_member_limit: reader.u64(), visit_limit: reader.u64() };
@@ -2496,11 +2608,36 @@ function decodeStructureReadRequest(reader: Reader): Readonly<Record<string, unk
     result.end = reader.u64();
     result.limit = reader.u64();
   }
+  else if (kind === "string_range") { result.start = reader.i64(); result.end = reader.i64(); }
+  else if (kind === "set_random_members") { result.seed = reader.u64(); result.count = reader.u64(); }
+  else if (kind === "sorted_set_score_range") {
+    result.lower = decodeScoreBound(reader);
+    result.upper = decodeScoreBound(reader);
+    result.offset = reader.u64();
+    result.limit = reader.u64();
+    const order = ["ascending", "descending"][reader.u8()];
+    if (order === undefined) throw new ClientError("sorted-set order is invalid");
+    result.order = order;
+  }
+  else if (kind === "hash_scan_reverse") { result.start_before = reader.boolean() ? reader.bytes() : undefined; result.limit = reader.u64(); }
+  else if (kind === "hash_scan_match") {
+    result.pattern = reader.bytes();
+    result.start_after = reader.boolean() ? reader.bytes() : undefined;
+    result.output_limit = reader.u64(); result.visit_limit = reader.u64(); result.match_step_limit = reader.u64();
+  }
   return result;
 }
 
+function decodeScoreBound(reader: Reader): Readonly<Record<string, number>> | undefined {
+  const tag = reader.u8();
+  if (tag === 0) return undefined;
+  if (tag === 1) return { inclusive: reader.f64() };
+  if (tag === 2) return { exclusive: reader.f64() };
+  throw new ClientError("sorted-set score bound is invalid");
+}
+
 function decodeStructureMutation(reader: Reader): Readonly<Record<string, unknown>> {
-  const kinds = ["string_set", "string_delete", "counter_add", "create", "delete", "expire", "hash_set", "hash_delete", "hash_counter_add", "hash_expire_field", "list_push", "list_pop", "set_add", "set_remove", "sorted_set_add", "sorted_set_remove", "stream_add"];
+  const kinds = ["string_set", "string_delete", "counter_add", "create", "delete", "expire", "hash_set", "hash_delete", "hash_counter_add", "hash_expire_field", "list_push", "list_pop", "set_add", "set_remove", "sorted_set_add", "sorted_set_remove", "stream_add", "sorted_set_increment", "sorted_set_pop", "string_set_conditional", "string_append", "string_set_range", "hash_set_if_absent", "set_pop"];
   const kind = kinds[reader.u8()];
   if (kind === undefined) throw new ClientError("structure mutation kind is invalid");
   const result: Record<string, unknown> = { kind, key: decodeStructureKey(reader) };
@@ -2538,20 +2675,179 @@ function decodeStructureMutation(reader: Reader): Readonly<Record<string, unknow
     result.score = reader.f64();
     result.member = reader.bytes();
   }
+  else if (kind === "sorted_set_increment") { result.delta = reader.f64(); result.member = reader.bytes(); }
+  else if (kind === "sorted_set_pop") result.end = reader.boolean() ? "highest" : "lowest";
+  else if (kind === "string_set_conditional") {
+    result.value = reader.bytes();
+    result.expires_at_micros = reader.boolean() ? reader.i64() : null;
+    result.condition = reader.boolean() ? "if_present" : "if_absent";
+  }
+  else if (kind === "string_append") result.suffix = reader.bytes();
+  else if (kind === "string_set_range") { result.offset = reader.u32(); result.patch = reader.bytes(); }
+  else if (kind === "hash_set_if_absent") { result.field = reader.bytes(); result.value = reader.bytes(); }
+  else if (kind === "set_pop") result.seed = reader.u64();
   else if (kind === "stream_add") result.fields = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 8, "stream field") }, () => [reader.bytes(), reader.bytes()]);
   return result;
 }
 
 function decodeTransactionSearchMutation(reader: Reader): Readonly<Record<string, unknown>> {
-  const kind = ["index", "replace", "delete"][reader.u8()];
+  const tag = reader.u8();
+  if (tag === 3) {
+    const collection = readIdentity(reader, "transaction document collection");
+    return { kind: "document", collection, document: decodeSearchDocument(reader) };
+  }
+  const kind = ["index", "replace", "delete"][tag];
   if (kind === undefined) throw new ClientError("transaction search mutation kind is invalid");
-  return { kind, index: reader.u128(), document_id: reader.bytes(), ...(kind === "delete" ? {} : { text: reader.text() }) };
+  return { kind, index: readIdentity(reader, "search index"), document_id: reader.bytes(), ...(kind === "delete" ? {} : { text: reader.text() }) };
 }
 
 function decodeTransactionVectorMutation(reader: Reader): Readonly<Record<string, unknown>> {
   const kind = ["upsert", "delete"][reader.u8()];
   if (kind === undefined) throw new ClientError("transaction vector mutation kind is invalid");
-  return { kind, index: reader.u128(), object_id: reader.u128(), ...(kind === "delete" ? {} : { vector: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "vector dimension") }, () => reader.f32()) }) };
+  return { kind, index: readIdentity(reader, "vector index"), object_id: readIdentity(reader, "vector object"), ...(kind === "delete" ? {} : { vector: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 4, "vector dimension") }, () => reader.f32()) }) };
+}
+
+function decodeSearchCollection(reader: Reader): Readonly<Record<string, unknown>> {
+  const collection = readIdentity(reader, "search collection");
+  const hasLexical = reader.boolean(); reader.zeroes(7);
+  const lexical: Record<string, unknown> | undefined = hasLexical ? {
+    query: reader.text(), candidate_limit: reader.u64(), weight: reader.u32(), operator: undefined,
+    prefix: false, fields: [], fuzzy: undefined, phrase: false,
+  } : undefined;
+  const vectors = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_VECTOR_BRANCHES, 28, "integrated vector") }, () => {
+    const target = reader.text();
+    const query = Array.from({ length: readBoundedCount(reader, MAX_VECTOR_DIMENSION, 4, "integrated vector dimension") }, () => reader.f32());
+    if (query.length === 0 || !query.every(Number.isFinite)) throw new ClientError("integrated query vector is invalid");
+    const candidate_limit = reader.u64(); const weight = reader.u32();
+    const tag = reader.u8(); const hasRerank = reader.boolean(); reader.zeroes(6);
+    let execution: Readonly<Record<string, unknown>> | undefined;
+    if (tag === 0 || tag === 1) {
+      if (hasRerank) throw new ClientError("integrated vector execution is invalid");
+      execution = tag === 1 ? { kind: "exact" } : undefined;
+    } else if (tag === 2) {
+      const ef_search = reader.u64(); const rerank = reader.u64();
+      if (!hasRerank && rerank !== 0n) throw new ClientError("integrated vector execution is noncanonical");
+      execution = { kind: "ann", ef_search, ...(hasRerank ? { exact_rerank: rerank } : {}) };
+    } else if (tag === 3) {
+      const exact_candidate_threshold = reader.u64(); const ef_search = reader.u64(); const rerank = reader.u64();
+      if (!hasRerank && rerank !== 0n) throw new ClientError("integrated vector execution is noncanonical");
+      execution = { kind: "adaptive", exact_candidate_threshold, ef_search, ...(hasRerank ? { exact_rerank: rerank } : {}) };
+    } else throw new ClientError("integrated vector execution is invalid");
+    return { target, query, candidate_limit, weight, execution, max_distance: undefined } as Record<string, unknown>;
+  });
+  const filter = decodeSearchFilter(reader);
+  const sort = Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 3, "integrated sort") }, () => {
+    const sourceTag = reader.u8();
+    const source = sourceTag === 0 ? { kind: "score" } : sourceTag === 1 ? { kind: "field", field: reader.text() } : undefined;
+    const direction = ["ascending", "descending"][reader.u8()]; const missing = ["first", "last"][reader.u8()];
+    if (source === undefined || direction === undefined || missing === undefined) throw new ClientError("integrated sort is invalid");
+    return { source, direction, missing };
+  });
+  const facets = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_FACETS, 12, "integrated facet") }, () => ({ field: reader.text(), limit: reader.u64() }));
+  const aggregations = Array.from({ length: readBoundedCount(reader, MAX_SEARCH_AGGREGATIONS, 5, "integrated aggregation") }, () => {
+    const name = reader.text(); const tag = reader.u8(); const kind = ["count", "sum", "min", "max", "average"][tag];
+    if (kind === undefined) throw new ClientError("integrated aggregation is invalid");
+    return { name, kind, ...(tag === 0 ? {} : { field: reader.text() }) };
+  });
+  const request: Record<string, unknown> = {
+    lexical, vectors, filter, sort, facets, range_facets: [], aggregations, limit: reader.u64(),
+    fusion: undefined, parent_dedupe: undefined, rerank: undefined, highlight: undefined,
+    autocut: undefined, offset: 0,
+  };
+  let previous = 0;
+  while (reader.remaining > 0) {
+    const tag = reader.u8();
+    if (tag <= previous) throw new ClientError("integrated search section is invalid");
+    previous = tag;
+    if (tag === 1) {
+      const fusion = [undefined, "weighted_score", "relative_score"][reader.u8()];
+      if (fusion === undefined) throw new ClientError("integrated fusion method is invalid");
+      request.fusion = fusion;
+    } else if (tag === 2) request.parent_dedupe = { field: reader.text(), first_k: reader.u32() };
+    else if (tag === 3) request.rerank = {
+      attestation: reader.bytes(),
+      scores: Array.from({ length: readBoundedCount(reader, 256, 24, "rerank score") }, () => ({ object_id: readIdentity(reader, "rerank object"), score: reader.f64() })),
+    };
+    else if (tag === 4) request.highlight = { max_fragments: reader.u32(), fragment_bytes: reader.u32() };
+    else if (tag === 5) {
+      const steepness = reader.u32();
+      if (steepness < 1 || steepness > MAX_AUTOCUT_STEEPNESS) throw new ClientError("integrated autocut is invalid");
+      request.autocut = steepness;
+    } else if (tag === 6) {
+      const offset = reader.u32(); if (offset === 0) throw new ClientError("integrated search offset is invalid"); request.offset = offset;
+    } else if (tag === 7) {
+      const count = readBoundedCount(reader, MAX_SEARCH_FACETS, 8, "range facet");
+      if (count === 0) throw new ClientError("integrated range facets are invalid");
+      request.range_facets = Array.from({ length: count }, () => {
+        const field = reader.text(); const rangeCount = readBoundedCount(reader, MAX_SEARCH_FACET_RANGES, 2, "facet range");
+        if (rangeCount === 0) throw new ClientError("integrated range facet is invalid");
+        const ranges = Array.from({ length: rangeCount }, () => ({
+          lower: reader.boolean() ? decodeCanonicalFloat(reader, "range facet endpoint") : undefined,
+          upper: reader.boolean() ? decodeCanonicalFloat(reader, "range facet endpoint") : undefined,
+        }));
+        return { field, ranges };
+      });
+    } else if (tag === 8) {
+      const count = readBoundedCount(reader, MAX_SEARCH_VECTOR_BRANCHES, 12, "vector cutoff");
+      if (count === 0) throw new ClientError("integrated vector cutoffs are invalid");
+      for (let index = 0; index < count; index += 1) {
+        const ordinal = reader.u32(); const branch = vectors[ordinal];
+        if (branch === undefined || branch.max_distance !== undefined) throw new ClientError("integrated vector cutoff ordinal is invalid");
+        branch.max_distance = decodeCanonicalFloat(reader, "vector distance cutoff", true);
+      }
+    } else if (tag === 9) {
+      if (lexical === undefined) throw new ClientError("integrated lexical mode has no branch");
+      const mode = reader.u8();
+      if (mode === 0) lexical.operator = "and";
+      else if (mode === 1) {
+        const minimum_match = reader.u32();
+        if (minimum_match < 1 || minimum_match > MAX_LEXICAL_MINIMUM_MATCH) throw new ClientError("integrated lexical operator is invalid");
+        lexical.operator = { minimum_match };
+      } else if (mode === 2) lexical.prefix = true;
+      else if (mode === 3) {
+        const fuzzy = reader.u32(); if (fuzzy < 1 || fuzzy > 2) throw new ClientError("integrated lexical fuzzy distance is invalid"); lexical.fuzzy = fuzzy;
+      } else if (mode === 4) lexical.phrase = true;
+      else throw new ClientError("integrated lexical mode is invalid");
+    } else if (tag === 10) {
+      if (lexical === undefined) throw new ClientError("integrated lexical fields have no branch");
+      const count = readBoundedCount(reader, MAX_LEXICAL_FIELDS, 8, "lexical field");
+      if (count === 0) throw new ClientError("integrated lexical fields are invalid");
+      lexical.fields = Array.from({ length: count }, () => {
+        const field = reader.text(); const weight_micros = reader.u32();
+        if (weight_micros === 0 || weight_micros > 1_000_000_000) throw new ClientError("integrated lexical field weight is invalid");
+        return { field, weight_micros };
+      });
+    } else throw new ClientError("integrated search section is invalid");
+  }
+  return { collection, request };
+}
+
+function decodeSearchFilter(reader: Reader, depth = 0): Readonly<Record<string, unknown>> {
+  if (depth > 32) throw new ClientError("integrated filter is too deep");
+  const tag = reader.u8();
+  if (tag === 0) return { kind: "match_all" };
+  if (tag === 1) return { kind: "exists", field: reader.text() };
+  if (tag === 2) {
+    const field = reader.text(); const operator = ["equal", "not_equal", "less", "less_or_equal", "greater", "greater_or_equal"][reader.u8()];
+    if (operator === undefined) throw new ClientError("integrated comparison operator is invalid");
+    return { kind: "compare", field, operator, value: decodeDocValue(reader) };
+  }
+  if (tag === 3 || tag === 4) return { kind: tag === 3 ? "all" : "any", filters: Array.from({ length: readBoundedCount(reader, MAX_PRODUCT_COUNT, 1, "filter node") }, () => decodeSearchFilter(reader, depth + 1)) };
+  if (tag === 5) return { kind: "not", filter: decodeSearchFilter(reader, depth + 1) };
+  if (tag === 6) return { kind: "in", field: reader.text(), values: Array.from({ length: readBoundedCount(reader, 256, 2, "filter member") }, () => decodeDocValue(reader)) };
+  if (tag === 7) return { kind: "is_null", field: reader.text() };
+  if (tag === 8) return { kind: "like", field: reader.text(), pattern: reader.text() };
+  throw new ClientError("integrated filter kind is invalid");
+}
+
+function decodeCanonicalFloat(reader: Reader, name: string, nonnegative = false): number {
+  const bits = reader.u64();
+  const magnitude = bits & 0x7fffffffffffffffn;
+  const canonical = magnitude > 0x7ff0000000000000n ? 0x7ff8000000000000n : magnitude === 0n ? 0n : bits;
+  const encoded = new ArrayBuffer(8); const view = new DataView(encoded); view.setBigUint64(0, bits, true);
+  const value = view.getFloat64(0, true);
+  if (bits !== canonical || nonnegative && (!Number.isFinite(value) || value < 0)) throw new ClientError(`${name} is invalid`);
+  return value;
 }
 
 function envelope(encoded: Uint8Array, expectedMagic: string): readonly [number, Uint8Array] {
@@ -2697,7 +2993,7 @@ function productScopes(value: unknown): Uint8Array {
     if (record.kind === "instance") return encoded;
     encoded[0] = record.kind === "catalog_subtree" ? 1 : record.kind === "catalog_object" ? 2 : 255;
     if (encoded[0] === 255) throw new ClientError("API key scope is invalid");
-    encoded.set(u128(BigInt(record.object_id as bigint | number)), 8);
+    encoded.set(identity128(record.object_id, "security scope object"), 8);
     return encoded;
   }));
 }
@@ -2730,7 +3026,7 @@ function encodeProductScope(value: unknown): Uint8Array {
   if (scope.kind === "instance") return encoded;
   encoded[0] = scope.kind === "catalog_subtree" ? 1 : scope.kind === "catalog_object" ? 2 : 255;
   if (encoded[0] === 255) throw new ClientError("security scope kind is invalid");
-  encoded.set(u128(BigInt(scope.object_id as bigint | number)), 8);
+  encoded.set(identity128(scope.object_id, "security scope object"), 8);
   return encoded;
 }
 
@@ -2924,6 +3220,7 @@ function readU128(encoded: Uint8Array, offset: number): bigint {
 }
 
 function u128(value: bigint): Uint8Array {
+  if (value < 0n || value >= 1n << 128n) throw new ClientError("u128 value is outside the unsigned 128-bit domain");
   const encoded = new Uint8Array(16);
   const view = new DataView(encoded.buffer);
   view.setBigUint64(0, value & ((1n << 64n) - 1n), true);
@@ -2965,6 +3262,21 @@ function u16(value: number): Uint8Array {
   const encoded = new Uint8Array(2);
   new DataView(encoded.buffer).setUint16(0, value, true);
   return encoded;
+}
+
+function identity128(value: unknown, name: string): Uint8Array {
+  let identity: bigint;
+  if (typeof value === "bigint") identity = value;
+  else if (typeof value === "number" && Number.isSafeInteger(value)) identity = BigInt(value);
+  else throw new ClientError(`${name} identity is invalid`);
+  if (identity === 0n) throw new ClientError(`${name} identity is zero`);
+  return u128(identity);
+}
+
+function readIdentity(reader: Reader, name: string): bigint {
+  const value = reader.u128();
+  if (value === 0n) throw new ClientError(`${name} identity is zero`);
+  return value;
 }
 
 function requireBytes(value: unknown): Uint8Array {

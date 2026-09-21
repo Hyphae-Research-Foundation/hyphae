@@ -10,11 +10,13 @@ use hyphae_native_product::{
     ProductSearchFilter, ProductSearchIngestBatch, ProductSearchRequest, ProductSearchResult,
     ProductSetAlgebraOperation, ProductSortedSetEntry, ProductStructureKey,
     ProductStructureMutation, ProductStructureReadRequest, ProductStructureReadResult,
-    ProductVector, ProductVectorBranch, SnapshotIdentity,
+    ProductTransactionHandle, ProductTransactionSearchMutation, ProductVector, ProductVectorBranch,
+    SnapshotIdentity,
 };
 use hyphae_native_protocol::{
-    ProductCodecError, WireRequest, decode_product_request, decode_product_response,
-    encode_product_request, encode_product_response,
+    ProductCodecError, WireRequest, decode_product_request, decode_product_request_for_minor,
+    decode_product_response, encode_product_request, encode_product_request_for_minor,
+    encode_product_response,
 };
 
 const REQUEST_BODY_OFFSET: usize = 16 + 64;
@@ -133,6 +135,101 @@ fn ingested_document_dimensions_are_bounded_before_request_allocation()
 
     assert_request_limit_error(&encoded, dimension_offset, u32::MAX);
     assert_truncated_request_count(&encoded, dimension_offset, 1)?;
+    Ok(())
+}
+
+#[test]
+fn transaction_document_counts_and_dimensions_are_bounded_before_allocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let vector_name = "vector";
+    let mut vectors = BTreeMap::new();
+    vectors.insert(vector_name.to_owned(), ProductVector::new([1.0])?);
+    let request = wire_request(ProductOperation::TransactionStageSearch {
+        handle: ProductTransactionHandle::new(7).ok_or("nonzero handle")?,
+        mutation: ProductTransactionSearchMutation::Document {
+            collection: ObjectId::new(1)?,
+            document: ProductDocument {
+                object_id: ObjectId::new(2)?,
+                text: "x".to_owned(),
+                doc_values: BTreeMap::new(),
+                vectors,
+            },
+        },
+    });
+    let encoded = encode_product_request(&request)?;
+    let document_offset = REQUEST_BODY_OFFSET + 8 + 1 + 16;
+    let value_count_offset = document_offset + 16 + 4 + 1;
+    assert_eq!(read_u32(&encoded, value_count_offset), 0);
+    assert_request_limit_error(&encoded, value_count_offset, u32::MAX);
+    assert_truncated_request_count(&encoded, value_count_offset, 1)?;
+
+    let vector_count_offset = value_count_offset + 4;
+    assert_eq!(read_u32(&encoded, vector_count_offset), 1);
+    assert_request_limit_error(&encoded, vector_count_offset, u32::MAX);
+    assert_truncated_request_count(&encoded, vector_count_offset, 2)?;
+
+    let dimension_offset = vector_count_offset + 4 + 4 + vector_name.len();
+    assert_eq!(read_u32(&encoded, dimension_offset), 1);
+    assert_request_limit_error(&encoded, dimension_offset, u32::MAX);
+    assert_truncated_request_count(&encoded, dimension_offset, 1)?;
+    Ok(())
+}
+
+#[test]
+fn document_names_are_canonical_and_rejected_before_value_allocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = include_str!("fixtures/native-protocol-v1-transaction-document-ordering.json");
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compatibility = workspace_root.join("compatibility");
+    if compatibility.is_dir() {
+        let root_fixture = std::fs::read(
+            compatibility.join("native-protocol-v1-transaction-document-ordering.json"),
+        )?;
+        assert_eq!(fixture.as_bytes(), root_fixture);
+    }
+    let canonical = decode_hex(fixture_hex(fixture, "canonical_request_hex")?)?;
+    let decoded = decode_product_request_for_minor(&canonical, 7)?;
+    let ProductOperation::TransactionStageSearch {
+        mutation: ProductTransactionSearchMutation::Document { document, .. },
+        ..
+    } = &decoded.operation
+    else {
+        return Err("canonical fixture is not a transaction document".into());
+    };
+    let expected_names = ["\u{e000}", "\u{1f600}"];
+    assert_eq!(
+        document
+            .doc_values
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected_names
+    );
+    assert_eq!(
+        document
+            .vectors
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected_names
+    );
+    assert_eq!(encode_product_request_for_minor(&decoded, 7)?, canonical);
+
+    for name in [
+        "duplicate_doc_value",
+        "duplicate_vector",
+        "out_of_order_doc_value",
+        "out_of_order_vector",
+    ] {
+        let encoded = decode_hex(fixture_hex(fixture, name)?)?;
+        assert!(
+            matches!(
+                decode_product_request_for_minor(&encoded, 7),
+                Err(ProductCodecError::InvalidValue)
+            ),
+            "{name} reached its forged value allocation"
+        );
+    }
     Ok(())
 }
 
@@ -276,4 +373,29 @@ fn read_u32(encoded: &[u8], offset: usize) -> u32 {
 
 fn write_u32(encoded: &mut [u8], offset: usize, value: u32) {
     encoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("fixture contains odd-length hexadecimal data".into());
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)?;
+            Ok(u8::from_str_radix(text, 16)?)
+        })
+        .collect()
+}
+
+fn fixture_hex<'a>(fixture: &'a str, name: &str) -> Result<&'a str, Box<dyn std::error::Error>> {
+    let marker = format!("\"{name}\": \"");
+    let (_, encoded) = fixture
+        .split_once(&marker)
+        .ok_or("fixture does not contain the named hexadecimal field")?;
+    let (encoded, _) = encoded
+        .split_once('"')
+        .ok_or("fixture hexadecimal field is unterminated")?;
+    Ok(encoded)
 }

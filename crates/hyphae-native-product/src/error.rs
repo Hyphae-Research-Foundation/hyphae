@@ -4,9 +4,10 @@
 
 use std::{fmt, io};
 
+use hyphae_native_ann::AnnError;
 use hyphae_native_runtime::{
-    MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES, NativeDirectoryError, NativeRuntimeError,
-    SqlError,
+    GovernorAdmissionError, GovernorQueueError, MAX_SQL_JOIN_CANDIDATES, MAX_SQL_SCAN_CANDIDATES,
+    NativeDirectoryError, NativeExecutionError, NativeRuntimeError, SqlError,
 };
 use hyphae_native_types::{ObjectId, TransactionId};
 
@@ -1406,6 +1407,7 @@ impl From<NativeRuntimeError> for ProductError {
             return Self::from_code(ProductErrorCode::Corruption);
         }
         match source {
+            NativeRuntimeError::Ann(source) => Self::from_code(ann_error_code(&source)),
             NativeRuntimeError::DataDirectoryExists => {
                 Self::from_code(ProductErrorCode::DataDirectoryExists)
             }
@@ -1421,7 +1423,9 @@ impl From<NativeRuntimeError> for ProductError {
             NativeRuntimeError::Directory(_) => {
                 Self::from_code(ProductErrorCode::InvalidDataDirectory)
             }
-            NativeRuntimeError::WriteConflict(_) => {
+            NativeRuntimeError::WriteConflict(_)
+            | NativeRuntimeError::AnnConsolidationStale
+            | NativeRuntimeError::InitialAnnBulkStale => {
                 Self::from_code(ProductErrorCode::WriteConflict)
             }
             NativeRuntimeError::UnknownRelation { table } => Self::not_found(table),
@@ -1461,8 +1465,33 @@ impl From<NativeRuntimeError> for ProductError {
                 requested,
             ),
             NativeRuntimeError::StructureIdentityTooLarge
-            | NativeRuntimeError::SearchIdentityTooLarge => {
+            | NativeRuntimeError::SearchIdentityTooLarge
+            | NativeRuntimeError::AnnDeltaLimitExceeded
+            | NativeRuntimeError::AnnReadViewQueryMemoryOverflow
+            | NativeRuntimeError::AnnConsolidationLimitExceeded
+            | NativeRuntimeError::InitialAnnBulkPartitionLimit { .. }
+            | NativeRuntimeError::InvalidAnnReadViewWorkerLimit { requested: 1.., .. } => {
                 Self::from_code(ProductErrorCode::LimitExceeded)
+            }
+            NativeRuntimeError::ResourceAdmission(source)
+            | NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(source))
+            | NativeRuntimeError::Execution(NativeExecutionError::Admission(source)) => {
+                governor_admission_error(source)
+            }
+            NativeRuntimeError::ResourceQueue(
+                GovernorQueueError::Full
+                | GovernorQueueError::TimedOut
+                | GovernorQueueError::Synchronization
+                | GovernorQueueError::TicketExhausted,
+            )
+            | NativeRuntimeError::AnnReadViewExecutionAuthorityRequired
+            | NativeRuntimeError::OutstandingAnnReadViews { .. }
+            | NativeRuntimeError::OutstandingWriteBatches { .. }
+            | NativeRuntimeError::AnnReadViewDatabaseClosed => {
+                Self::from_code(ProductErrorCode::Unavailable)
+            }
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Cancelled) => {
+                Self::from_code(ProductErrorCode::Cancelled)
             }
             NativeRuntimeError::UniquePrimaryKeyViolation
             | NativeRuntimeError::UniqueSecondaryIndexViolation => {
@@ -1482,7 +1511,11 @@ impl From<NativeRuntimeError> for ProductError {
             | NativeRuntimeError::SnapshotPinExists => {
                 Self::from_code(ProductErrorCode::CatalogConflict)
             }
-            NativeRuntimeError::InvalidPreparedMutation
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::ForeignCancellation)
+            | NativeRuntimeError::InvalidAnnReadViewWorkerLimit { requested: 0, .. }
+            | NativeRuntimeError::InvalidAnnConsolidationLimit
+            | NativeRuntimeError::AnnConsolidationNotNeeded
+            | NativeRuntimeError::InvalidPreparedMutation
             | NativeRuntimeError::StructureValueNotInteger
             | NativeRuntimeError::StructureIntegerOverflow
             | NativeRuntimeError::StructureKindMismatch
@@ -1508,6 +1541,41 @@ impl From<NativeRuntimeError> for ProductError {
             | NativeRuntimeError::NoncontiguousCommitSequence
             | NativeRuntimeError::FuturePage => Self::from_code(ProductErrorCode::Corruption),
             _ => Self::from_code(ProductErrorCode::Internal),
+        }
+    }
+}
+
+const fn ann_error_code(source: &AnnError) -> ProductErrorCode {
+    match source {
+        AnnError::CorruptGraph => ProductErrorCode::Corruption,
+        AnnError::SearchBreadthExceeded
+        | AnnError::LengthOverflow
+        | AnnError::RoutingBudgetInsufficient => ProductErrorCode::LimitExceeded,
+        AnnError::BuildCancelled => ProductErrorCode::Cancelled,
+        AnnError::InvalidM
+        | AnnError::InvalidEfConstruction
+        | AnnError::InvalidEfSearch
+        | AnnError::InvalidDimension
+        | AnnError::NonFiniteComponent
+        | AnnError::DimensionMismatch
+        | AnnError::InvalidQuantizerTraining
+        | AnnError::ZeroCosineVector
+        | AnnError::DuplicateObjectId
+        | AnnError::InvalidSearchOptions
+        | AnnError::InvalidPartitionCount => ProductErrorCode::InvalidRequest,
+    }
+}
+
+fn governor_admission_error(source: GovernorAdmissionError) -> ProductError {
+    match source {
+        GovernorAdmissionError::EmptyRequest => {
+            ProductError::from_code(ProductErrorCode::InvalidRequest)
+        }
+        GovernorAdmissionError::ClassLimit | GovernorAdmissionError::ParentCapacity => {
+            ProductError::from_code(ProductErrorCode::LimitExceeded)
+        }
+        GovernorAdmissionError::GlobalCapacity | GovernorAdmissionError::ClassCapacity => {
+            ProductError::from_code(ProductErrorCode::Unavailable)
         }
     }
 }
@@ -1682,6 +1750,13 @@ fn usize_to_u64(value: usize) -> u64 {
 mod tests {
     use super::*;
 
+    fn assert_redacted_mapping(source: NativeRuntimeError, expected: ProductErrorCode) {
+        assert_eq!(
+            ProductError::from(source),
+            ProductError::from_code(expected)
+        );
+    }
+
     #[test]
     fn unknown_codes_are_bounded_and_preserved() -> Result<(), Box<dyn std::error::Error>> {
         let code = ProductErrorCode::from_raw("future_failure")?;
@@ -1751,5 +1826,138 @@ mod tests {
         ));
         assert_eq!(error.message(), "native durable state is invalid");
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn ann_errors_are_exhaustively_classified_and_redacted() {
+        for source in [
+            AnnError::InvalidM,
+            AnnError::InvalidEfConstruction,
+            AnnError::InvalidEfSearch,
+            AnnError::InvalidDimension,
+            AnnError::NonFiniteComponent,
+            AnnError::DimensionMismatch,
+            AnnError::InvalidQuantizerTraining,
+            AnnError::ZeroCosineVector,
+            AnnError::DuplicateObjectId,
+            AnnError::InvalidSearchOptions,
+            AnnError::InvalidPartitionCount,
+        ] {
+            assert_redacted_mapping(
+                NativeRuntimeError::Ann(source),
+                ProductErrorCode::InvalidRequest,
+            );
+        }
+        for source in [
+            AnnError::SearchBreadthExceeded,
+            AnnError::LengthOverflow,
+            AnnError::RoutingBudgetInsufficient,
+        ] {
+            assert_redacted_mapping(
+                NativeRuntimeError::Ann(source),
+                ProductErrorCode::LimitExceeded,
+            );
+        }
+        assert_redacted_mapping(
+            NativeRuntimeError::Ann(AnnError::CorruptGraph),
+            ProductErrorCode::Corruption,
+        );
+        assert_redacted_mapping(
+            NativeRuntimeError::Ann(AnnError::BuildCancelled),
+            ProductErrorCode::Cancelled,
+        );
+    }
+
+    #[test]
+    fn durable_ann_resource_and_limit_failures_have_redacted_mappings() {
+        for source in [
+            NativeRuntimeError::InvalidAnnTree,
+            NativeRuntimeError::Model("/secret/ann.graph token=document-value".to_owned()),
+        ] {
+            assert_redacted_mapping(source, ProductErrorCode::Corruption);
+        }
+        for source in [
+            NativeRuntimeError::AnnDeltaLimitExceeded,
+            NativeRuntimeError::AnnReadViewQueryMemoryOverflow,
+            NativeRuntimeError::InvalidAnnReadViewWorkerLimit {
+                requested: 9,
+                maximum: 8,
+            },
+            NativeRuntimeError::AnnConsolidationLimitExceeded,
+            NativeRuntimeError::InitialAnnBulkPartitionLimit {
+                requested: 9,
+                maximum: 8,
+            },
+            NativeRuntimeError::ResourceAdmission(GovernorAdmissionError::ClassLimit),
+            NativeRuntimeError::ResourceAdmission(GovernorAdmissionError::ParentCapacity),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(
+                GovernorAdmissionError::ClassLimit,
+            )),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(
+                GovernorAdmissionError::ParentCapacity,
+            )),
+            NativeRuntimeError::Execution(NativeExecutionError::Admission(
+                GovernorAdmissionError::ClassLimit,
+            )),
+            NativeRuntimeError::Execution(NativeExecutionError::Admission(
+                GovernorAdmissionError::ParentCapacity,
+            )),
+        ] {
+            assert_redacted_mapping(source, ProductErrorCode::LimitExceeded);
+        }
+        for source in [
+            NativeRuntimeError::InvalidAnnReadViewWorkerLimit {
+                requested: 0,
+                maximum: 8,
+            },
+            NativeRuntimeError::InvalidAnnConsolidationLimit,
+            NativeRuntimeError::AnnConsolidationNotNeeded,
+            NativeRuntimeError::ResourceAdmission(GovernorAdmissionError::EmptyRequest),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(
+                GovernorAdmissionError::EmptyRequest,
+            )),
+            NativeRuntimeError::Execution(NativeExecutionError::Admission(
+                GovernorAdmissionError::EmptyRequest,
+            )),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::ForeignCancellation),
+        ] {
+            assert_redacted_mapping(source, ProductErrorCode::InvalidRequest);
+        }
+        for source in [
+            NativeRuntimeError::ResourceAdmission(GovernorAdmissionError::GlobalCapacity),
+            NativeRuntimeError::ResourceAdmission(GovernorAdmissionError::ClassCapacity),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(
+                GovernorAdmissionError::GlobalCapacity,
+            )),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Admission(
+                GovernorAdmissionError::ClassCapacity,
+            )),
+            NativeRuntimeError::Execution(NativeExecutionError::Admission(
+                GovernorAdmissionError::GlobalCapacity,
+            )),
+            NativeRuntimeError::Execution(NativeExecutionError::Admission(
+                GovernorAdmissionError::ClassCapacity,
+            )),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Full),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::TimedOut),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Synchronization),
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::TicketExhausted),
+            NativeRuntimeError::AnnReadViewExecutionAuthorityRequired,
+            NativeRuntimeError::OutstandingAnnReadViews { count: 3 },
+            NativeRuntimeError::OutstandingWriteBatches { count: 4 },
+            NativeRuntimeError::AnnReadViewDatabaseClosed,
+        ] {
+            assert_redacted_mapping(source, ProductErrorCode::Unavailable);
+        }
+        assert_redacted_mapping(
+            NativeRuntimeError::ResourceQueue(GovernorQueueError::Cancelled),
+            ProductErrorCode::Cancelled,
+        );
+        for source in [
+            NativeRuntimeError::AnnConsolidationStale,
+            NativeRuntimeError::InitialAnnBulkStale,
+        ] {
+            assert_redacted_mapping(source, ProductErrorCode::WriteConflict);
+        }
     }
 }

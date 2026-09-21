@@ -89,7 +89,7 @@
     },
     {
       "reference": "docs/native/local-protocol-v1.md",
-      "sha256": "6959945f20f130c1d86ebb35f82d2ac57dec4d1ae067e3d8fe6d47a77a58ff8e"
+      "sha256": "3b73c7be8447ec0d1749eec60da37f270f2fb79061d4273fa1f7ad0e7dab0ac9"
     },
     {
       "reference": "docs/native/catalog-v1.md",
@@ -97,11 +97,11 @@
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "b12244e1190a29543c1d946090eca8373f0f8be045431d616177b10a8bce6052"
+      "sha256": "e3a0991fe38b17d55ce00de6dc99e91b547cde7a8f1891f9f0b14c9c980e330f"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",
-      "sha256": "40f815a64015fbdcfbbf4edc64b2922d0ccc29fa032917784e5d653233b092fa"
+      "sha256": "63e94c514a0d90c4569a5797ab3ec65428c4da7ae052bb959670f3e3e2ae113e"
     },
     {
       "reference": "docs/native/native-backup-v1.md",

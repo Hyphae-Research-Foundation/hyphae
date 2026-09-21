@@ -539,10 +539,8 @@ fn security_read_plane_rejects_malformed_response_pages() -> Result<(), Box<dyn 
 
 #[test]
 fn search_content_at_every_current_shape_is_minor_zero() -> Result<(), Box<dyn std::error::Error>> {
-    // Every currently expressible search request body — all filter nodes,
-    // all operators, all doc-value types — is minor-0 content. The content
-    // walk exists so future operators, typed values, and fusion methods
-    // raise the requirement without new operation variants.
+    // Every original search request body shape and minor-0 doc-value type is
+    // still admitted without raising the operation's protocol minor.
     let request = security_wire_request(ProductOperation::SearchCollection {
         collection: ObjectId::new(13)?,
         request: ProductSearchRequest {
@@ -1925,6 +1923,159 @@ fn explicit_all_engine_transaction_family_has_canonical_round_trips()
         decode_product_response(&encode_product_response(&response)?)?,
         response
     );
+    Ok(())
+}
+
+#[test]
+fn transaction_document_tag_three_requires_minor_seven_and_matches_the_shared_wire_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handle = ProductTransactionHandle::new(7).ok_or("nonzero handle")?;
+    let request = WireRequest {
+        operation: ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: ProductTransactionSearchMutation::Document {
+                collection: ObjectId::new(13)?,
+                document: ProductDocument {
+                    object_id: ObjectId::new(201)?,
+                    text: "rust database".to_owned(),
+                    doc_values: [
+                        ("blob".to_owned(), ProductDocValue::Bytes(vec![7])),
+                        ("flag".to_owned(), ProductDocValue::Boolean(true)),
+                        ("name".to_owned(), ProductDocValue::String("a".to_owned())),
+                        ("rank".to_owned(), ProductDocValue::Integer(3)),
+                        (
+                            "rating".to_owned(),
+                            ProductDocValue::Float(hyphae_native_product::CanonicalF64::new(4.5)),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    vectors: [("embedding".to_owned(), ProductVector::new([1.0, 0.0])?)]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+        },
+        logical_time_micros: 10,
+        deadline_micros: None,
+        idempotency_token: None,
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::MEMORY,
+    };
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 6),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 7)?;
+    assert_eq!(encoded[16 + 64 + 8], 3);
+    let fixture = encode_frame(
+        FrameKind::Execute,
+        7,
+        43,
+        &encoded,
+        hyphae_native_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+    )?;
+    let crate_fixture = include_bytes!("fixtures/native-protocol-v1-transaction-document.bin");
+    assert_eq!(fixture.as_slice(), crate_fixture);
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compatibility = workspace_root.join("compatibility");
+    if compatibility.is_dir() {
+        let root_fixture =
+            std::fs::read(compatibility.join("native-protocol-v1-transaction-document.bin"))?;
+        assert_eq!(crate_fixture.as_slice(), root_fixture.as_slice());
+    }
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 6),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let decoded = decode_product_request_for_minor(&encoded, 7)?;
+    assert!(matches!(
+        decoded.operation,
+        ProductOperation::TransactionStageSearch {
+            handle: decoded_handle,
+            mutation: ProductTransactionSearchMutation::Document {
+                collection,
+                document,
+            },
+        } if decoded_handle == handle
+            && collection == ObjectId::new(13)?
+            && document.object_id == ObjectId::new(201)?
+            && document.text == "rust database"
+            && document.doc_values.len() == 5
+            && matches!(
+                document.doc_values.get("rating"),
+                Some(ProductDocValue::Float(value))
+                    if value.bits()
+                        == hyphae_native_product::CanonicalF64::new(4.5).bits()
+            )
+            && document.vectors.len() == 1
+    ));
+
+    for identity in [89..105, 105..121] {
+        let mut forged = encoded.clone();
+        forged[identity].fill(0);
+        assert!(decode_product_request_for_minor(&forged, 7).is_err());
+    }
+    for bits in [(-0.0_f64).to_bits(), 0x7ff0_0000_0000_0001] {
+        let mut forged = encoded.clone();
+        forged[208..216].copy_from_slice(&bits.to_le_bytes());
+        assert!(decode_product_request_for_minor(&forged, 7).is_err());
+    }
+    for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        let mut forged = encoded.clone();
+        forged[237..241].copy_from_slice(&value.to_bits().to_le_bytes());
+        assert!(decode_product_request_for_minor(&forged, 7).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_document_content_minor_never_lowers_tag_three_requirement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = WireRequest {
+        operation: ProductOperation::TransactionStageSearch {
+            handle: ProductTransactionHandle::new(7).ok_or("nonzero handle")?,
+            mutation: ProductTransactionSearchMutation::Document {
+                collection: ObjectId::new(13)?,
+                document: ProductDocument {
+                    object_id: ObjectId::new(201)?,
+                    text: "rated".to_owned(),
+                    doc_values: [(
+                        "rating".to_owned(),
+                        ProductDocValue::Float(hyphae_native_product::CanonicalF64::new(4.5)),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    vectors: std::collections::BTreeMap::new(),
+                },
+            },
+        },
+        logical_time_micros: 10,
+        deadline_micros: None,
+        idempotency_token: None,
+        limits: ProductLimits::default(),
+        durability: ProductDurabilityPolicy::MEMORY,
+    };
+    assert!(matches!(
+        encode_product_request_for_minor(&request, 6),
+        Err(ProductCodecError::Unsupported)
+    ));
+    let encoded = encode_product_request_for_minor(&request, 7)?;
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 6),
+        Err(ProductCodecError::Unsupported)
+    ));
+    assert!(matches!(
+        decode_product_request_for_minor(&encoded, 7)?.operation,
+        ProductOperation::TransactionStageSearch {
+            mutation: ProductTransactionSearchMutation::Document { document, .. },
+            ..
+        } if matches!(
+            document.doc_values.get("rating"),
+            Some(ProductDocValue::Float(value))
+                if value.bits() == hyphae_native_product::CanonicalF64::new(4.5).bits()
+        )
+    ));
     Ok(())
 }
 

@@ -903,6 +903,9 @@ enum SecurityKeyCommand {
 enum CatalogCommand {
     /// List one bounded stable-ID ordered catalog page.
     List {
+        /// Use the instance-level catalog API and include its exact snapshot.
+        #[arg(long, conflicts_with = "cursor")]
+        instance: bool,
         #[arg(long, default_value_t = 100)]
         limit: usize,
         #[arg(long, default_value_t = 1_000)]
@@ -1595,9 +1598,11 @@ enum TransactionStepInput {
     },
     StageSearch {
         action: SearchMutationAction,
-        index: JsonU128,
-        document_id: String,
+        index: Option<JsonU128>,
+        document_id: Option<String>,
         text: Option<String>,
+        collection: Option<JsonU128>,
+        document: Option<IngestDocument>,
     },
     StageVector {
         action: VectorMutationAction,
@@ -1616,6 +1621,7 @@ enum SearchMutationAction {
     Index,
     Replace,
     Delete,
+    Document,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1687,13 +1693,34 @@ enum TransactionCommand {
         /// `stage_search`, `stage_vector`, and final `commit` or `rollback` steps.
         #[arg(long)]
         steps_json: String,
+        /// Caller-stable nonzero token required by scripts ending in `commit`.
+        #[arg(
+            long,
+            alias = "idempotency-id",
+            value_parser = parse_nonzero_idempotency_token
+        )]
+        idempotency_token: Option<u128>,
         #[arg(long, value_enum, default_value_t = Durability::Strict)]
         durability: Durability,
     },
-    /// Resolve retained commit evidence by request or transaction identity.
+    /// Resolve retained commit evidence by transaction identity or caller token.
     Status {
-        #[arg(long)]
-        id: u128,
+        /// Generated transaction identity returned by a successful execute.
+        #[arg(
+            long,
+            conflicts_with = "idempotency_token",
+            required_unless_present = "idempotency_token"
+        )]
+        id: Option<u128>,
+        /// Caller-stable token supplied to execute, including when output was lost.
+        #[arg(
+            long,
+            alias = "idempotency-id",
+            conflicts_with = "id",
+            required_unless_present = "id",
+            value_parser = parse_nonzero_idempotency_token
+        )]
+        idempotency_token: Option<u128>,
     },
 }
 
@@ -3275,24 +3302,37 @@ fn dispatch(local: &LocalDirectory, operation: ProductOperation) -> Result<(), C
 fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFailure> {
     let operation = match command {
         CatalogCommand::List {
+            instance,
             limit,
             visit_limit,
             byte_limit,
             kind,
             parent,
             cursor,
-        } => ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
-            filter: CatalogVisibleListFilter {
-                parent: parent.map(object_id).transpose()?,
-                kind: kind.map(Into::into),
-            },
-            cursor: cursor
-                .map(|token| decode_catalog_cursor_token(&token))
-                .transpose()?,
-            item_limit: limit,
-            visit_limit,
-            byte_limit,
-        }),
+        } => {
+            let parent = parent.map(object_id).transpose()?;
+            let kind = kind.map(Into::into);
+            if instance {
+                ProductOperation::CatalogList(CatalogListRequest {
+                    parent,
+                    kind,
+                    cursor: None,
+                    item_limit: limit,
+                    visit_limit,
+                    byte_limit,
+                })
+            } else {
+                ProductOperation::CatalogVisibleList(CatalogVisibleListRequest {
+                    filter: CatalogVisibleListFilter { parent, kind },
+                    cursor: cursor
+                        .map(|token| decode_catalog_cursor_token(&token))
+                        .transpose()?,
+                    item_limit: limit,
+                    visit_limit,
+                    byte_limit,
+                })
+            }
+        }
         CatalogCommand::Describe { id } => ProductOperation::CatalogDescribe { id: object_id(id)? },
         CatalogCommand::Resolve { name } => ProductOperation::CatalogResolve {
             name: qualified_name(&name)?,
@@ -4025,23 +4065,54 @@ fn search(local: &LocalDirectory, command: SearchCommand) -> Result<(), CliFailu
 #[allow(clippy::needless_pass_by_value)]
 fn transaction(local: &LocalDirectory, command: TransactionCommand) -> Result<(), CliFailure> {
     match command {
-        TransactionCommand::Status { id } => dispatch(
-            local,
+        TransactionCommand::Status {
+            id,
+            idempotency_token,
+        } => transaction_status(local, id, idempotency_token),
+        TransactionCommand::Execute {
+            steps_json,
+            idempotency_token,
+            durability,
+        } => execute_transaction(local, &steps_json, idempotency_token, durability.into()),
+    }
+}
+
+fn transaction_status(
+    local: &LocalDirectory,
+    id: Option<u128>,
+    idempotency_token: Option<u128>,
+) -> Result<(), CliFailure> {
+    let (operation, requested_token) = match (id, idempotency_token) {
+        (Some(id), None) => (
             ProductOperation::TransactionStatus {
                 transaction_id: hyphae_native_product::ProductTransactionId::new(id)
                     .ok_or_else(CliFailure::invalid)?,
             },
+            None,
         ),
-        TransactionCommand::Execute {
-            steps_json,
-            durability,
-        } => execute_transaction(local, &steps_json, durability.into()),
+        (None, Some(token)) => (
+            ProductOperation::TransactionStatusByIdempotency {
+                idempotency_token: token,
+            },
+            Some(token),
+        ),
+        _ => return Err(CliFailure::invalid()),
+    };
+    let ProductResponse::TransactionStatus(status) = open_client(local)?.dispatch(operation)?
+    else {
+        return Err(CliFailure::internal());
+    };
+    let mut rendered = transaction_status_json(status);
+    if let Some(token) = requested_token {
+        rendered["idempotency_token"] = json!(token.to_string());
     }
+    print_json(&rendered)
 }
 
 fn execute_transaction(
     local: &LocalDirectory,
     steps_json: &str,
+    idempotency_token: Option<u128>,
     durability: ProductDurability,
 ) -> Result<(), CliFailure> {
     let steps = serde_json::from_str::<Vec<TransactionStepInput>>(steps_json)?;
@@ -4059,7 +4130,27 @@ fn execute_transaction(
     {
         return Err(CliFailure::invalid());
     }
+    let commits = matches!(steps.last(), Some(TransactionStepInput::Commit));
+    if commits && idempotency_token.is_none() {
+        return Err(CliFailure::invalid());
+    }
     let mut client = open_client(local)?;
+    if let Some(token) = idempotency_token.filter(|_| commits) {
+        let ProductResponse::TransactionStatus(status) =
+            client.dispatch(ProductOperation::TransactionStatusByIdempotency {
+                idempotency_token: token,
+            })?
+        else {
+            return Err(CliFailure::internal());
+        };
+        if !matches!(status, ProductTransactionStatus::Unknown) {
+            let mut recovered = transaction_status_json(status);
+            recovered["idempotency_token"] = json!(token.to_string());
+            recovered["idempotent_replay"] = json!(true);
+            recovered["recovered"] = json!(true);
+            return print_json(&recovered);
+        }
+    }
     let began = client.dispatch_with_durability(ProductOperation::TransactionBegin, durability)?;
     let ProductResponse::ExplicitTransactionStatus(ProductExplicitTransactionStatus::Active {
         handle,
@@ -4069,13 +4160,36 @@ fn execute_transaction(
         return Err(CliFailure::internal());
     };
     let mut results = vec![response_json(began)];
+    let mut transaction_id = None;
     for step in steps {
+        let commits = matches!(&step, TransactionStepInput::Commit);
         let operation = transaction_step(handle, step)?;
-        results.push(response_json(
-            client.dispatch_with_durability(operation, durability)?,
-        ));
+        let response = if commits {
+            client.dispatch_with_durability_and_idempotency(
+                operation,
+                durability,
+                idempotency_token.ok_or_else(CliFailure::invalid)?,
+            )?
+        } else {
+            client.dispatch_with_durability(operation, durability)?
+        };
+        if let ProductResponse::TransactionCommitted(receipt) = &response {
+            transaction_id = Some(receipt.commit.transaction_id);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("HYPHAE_CLI_TEST_CRASH_AFTER_TRANSACTION_PUBLICATION").is_some() {
+                std::process::exit(86);
+            }
+        }
+        results.push(response_json(response));
     }
-    print_json(&json!({ "handle": handle.get(), "steps": results }))
+    print_json(&json!({
+        "handle": handle.get(),
+        "idempotency_token": idempotency_token.map(|token| token.to_string()),
+        "idempotent_replay": false,
+        "recovered": false,
+        "transaction_id": transaction_id.map(|id| id.to_string()),
+        "steps": results,
+    }))
 }
 
 fn transaction_step(
@@ -4108,27 +4222,19 @@ fn transaction_step(
             index,
             document_id,
             text,
-        } => {
-            let index = object_id(index.0)?;
-            let document_id = document_id.into_bytes();
-            let mutation = match action {
-                SearchMutationAction::Index => ProductTransactionSearchMutation::Index {
-                    index,
-                    document_id,
-                    text: text.ok_or_else(CliFailure::invalid)?,
-                },
-                SearchMutationAction::Replace => ProductTransactionSearchMutation::Replace {
-                    index,
-                    document_id,
-                    text: text.ok_or_else(CliFailure::invalid)?,
-                },
-                SearchMutationAction::Delete if text.is_none() => {
-                    ProductTransactionSearchMutation::Delete { index, document_id }
-                }
-                SearchMutationAction::Delete => return Err(CliFailure::invalid()),
-            };
-            ProductOperation::TransactionStageSearch { handle, mutation }
-        }
+            collection,
+            document,
+        } => ProductOperation::TransactionStageSearch {
+            handle,
+            mutation: transaction_search_mutation(
+                action,
+                index,
+                document_id,
+                text,
+                collection,
+                document,
+            )?,
+        },
         TransactionStepInput::StageVector {
             action,
             index,
@@ -4154,6 +4260,45 @@ fn transaction_step(
         TransactionStepInput::Commit => ProductOperation::TransactionCommit { handle },
         TransactionStepInput::Rollback => ProductOperation::TransactionRollback { handle },
     })
+}
+
+fn transaction_search_mutation(
+    action: SearchMutationAction,
+    index: Option<JsonU128>,
+    document_id: Option<String>,
+    text: Option<String>,
+    collection: Option<JsonU128>,
+    document: Option<IngestDocument>,
+) -> Result<ProductTransactionSearchMutation, CliFailure> {
+    match (action, index, document_id, text, collection, document) {
+        (SearchMutationAction::Index, Some(index), Some(document_id), Some(text), None, None) => {
+            Ok(ProductTransactionSearchMutation::Index {
+                index: object_id(index.0)?,
+                document_id: document_id.into_bytes(),
+                text,
+            })
+        }
+        (SearchMutationAction::Replace, Some(index), Some(document_id), Some(text), None, None) => {
+            Ok(ProductTransactionSearchMutation::Replace {
+                index: object_id(index.0)?,
+                document_id: document_id.into_bytes(),
+                text,
+            })
+        }
+        (SearchMutationAction::Delete, Some(index), Some(document_id), None, None, None) => {
+            Ok(ProductTransactionSearchMutation::Delete {
+                index: object_id(index.0)?,
+                document_id: document_id.into_bytes(),
+            })
+        }
+        (SearchMutationAction::Document, None, None, None, Some(collection), Some(document)) => {
+            Ok(ProductTransactionSearchMutation::Document {
+                collection: object_id(collection.0)?,
+                document: product_document(document)?,
+            })
+        }
+        _ => Err(CliFailure::invalid()),
+    }
 }
 
 fn explain(local: &LocalDirectory, command: ExplainCommand) -> Result<(), CliFailure> {
@@ -7152,10 +7297,14 @@ mod tests {
 
     use super::{
         Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode,
-        authorization_permissions, decode_hex, encode_hex, hardware_with_writers, qualified_name,
+        TransactionStepInput, authorization_permissions, decode_hex, encode_hex,
+        hardware_with_writers, qualified_name, transaction_step,
     };
     use clap::Parser;
-    use hyphae_native_product::{ProductAuthorization, ProductPermission};
+    use hyphae_native_product::{
+        ProductAuthorization, ProductDocValue, ProductOperation, ProductPermission,
+        ProductTransactionHandle, ProductTransactionSearchMutation,
+    };
     use hyphae_native_runtime::{
         CalibrationCacheStatus, CalibrationCorrectness, CalibrationCoverage,
         CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling,
@@ -7214,6 +7363,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(permissions, known);
         assert!(ProductPermission::from_tag(u8::MAX).is_none());
+    }
+
+    #[test]
+    fn transaction_document_json_maps_the_complete_image() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let step = serde_json::from_str::<TransactionStepInput>(
+            r#"{
+                "operation":"stage_search",
+                "action":"document",
+                "collection":"13",
+                "document":{
+                    "id":"201",
+                    "text":"rust database",
+                    "doc_values":{"blob":{"bytes_hex":"07"},"flag":true,"rank":3},
+                    "vectors":{"embedding":[1.0,0.0]}
+                }
+            }"#,
+        )?;
+        let handle = ProductTransactionHandle::new(7).ok_or("nonzero handle")?;
+        let ProductOperation::TransactionStageSearch {
+            handle: mapped_handle,
+            mutation:
+                ProductTransactionSearchMutation::Document {
+                    collection,
+                    document,
+                },
+        } = transaction_step(handle, step)?
+        else {
+            return Err("transaction document did not map to tag 3".into());
+        };
+        assert_eq!(mapped_handle, handle);
+        assert_eq!(collection.get(), 13);
+        assert_eq!(document.object_id.get(), 201);
+        assert_eq!(document.text, "rust database");
+        assert_eq!(
+            document.doc_values.get("blob"),
+            Some(&ProductDocValue::Bytes(vec![7]))
+        );
+        assert_eq!(
+            document.doc_values.get("flag"),
+            Some(&ProductDocValue::Boolean(true))
+        );
+        assert_eq!(
+            document.doc_values.get("rank"),
+            Some(&ProductDocValue::Integer(3))
+        );
+        assert_eq!(
+            document
+                .vectors
+                .get("embedding")
+                .map(hyphae_native_product::ProductVector::values),
+            Some(&[1.0, 0.0][..])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_document_json_rejects_partial_or_mixed_images()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handle = ProductTransactionHandle::new(7).ok_or("nonzero handle")?;
+        for encoded in [
+            r#"{"operation":"stage_search","action":"document","collection":13}"#,
+            r#"{"operation":"stage_search","action":"document","collection":13,"index":14,"document":{"id":201,"text":"rust"}}"#,
+            r#"{"operation":"stage_search","action":"index","index":14,"document_id":"doc","text":"rust","collection":13}"#,
+        ] {
+            let step = serde_json::from_str::<TransactionStepInput>(encoded)?;
+            assert!(transaction_step(handle, step).is_err());
+        }
+        Ok(())
     }
 
     #[test]

@@ -34,10 +34,10 @@ open receipt records the root identity and CSN once, plus the lexical-index
 identity and ANN-view identity. A mismatch fails the open.
 
 `NativeLexicalReadView` is query-bound. It may retain the immutable root,
-catalog/index identity, invariant corpus counts, canonical analyzed terms, raw
-encoded posting records, raw encoded document headers, the root-derived
-physical plan, governed handles, and its retained-memory permit. The receipt
-declares this scope exactly as
+catalog/index identity, root-bound document statistics, canonical analyzed
+terms, raw encoded posting records, raw encoded document headers, the
+root-derived physical plan, governed handles, and its retained-memory permit.
+The receipt declares this scope exactly as
 `lexical_plan_scope=query-bound-encoded-postings-v1`.
 
 The view must not retain decoded term frequency, decoded document length,
@@ -149,12 +149,13 @@ decoded values, BM25 scores, rankings, hits, or results.
 Every filtered observation declares
 `decode-expiry-inline-value-filter-before-rank-v1`, re-decodes the retained
 predicate records, applies expiry and scalar equality before final ranking,
-decodes and scores only admitted postings, and constructs fresh hits. The G7
-corpus has a filter density of exactly `0.5`; the single `rare` candidate is a
-`keep` record, so measured candidate selectivity is exactly `1.0`. These are
-different quantities and the receipt must not alias one into the other. Every
-execution increments its filtered-view sequence exactly once; the one-million-
-observation interval is one gapless first/last sequence span.
+decodes and scores only admitted postings, and constructs fresh hits. A G7
+profile may require a fixture with filter density `0.5` and one `rare` candidate
+whose value is `keep`, yielding candidate selectivity `1.0` when that fixture is
+actually validated. Those are harness inputs and observations, not product
+invariants or a claim that a seed/corpus run completed. The two quantities must
+not be aliased. Every execution increments its filtered-view sequence exactly
+once; an accepted profile interval must be one gapless first/last sequence span.
 
 ## Selected-certified ANN routing
 
@@ -180,6 +181,18 @@ strictly greater than the maximum kth distance. Missing, equal, unordered,
 infinite, or NaN bounds fail closed. This aggregate condition is intentionally
 stronger than a selected-outcome label: it proves that every reported omission
 remained certified throughout the interval.
+
+For both standalone ANN and the ANN branch of hybrid, the caller's admitted
+`ef_search` is the hard base-search and rerank ceiling. Graph traversal, routed
+widening, and exact reranking must not substitute the index's larger configured
+maximum or silently increase the caller's value. Exact live-delta upserts are
+scored separately under the durable delta bound, so total reported candidates
+may exceed `ef_search`. Delta shadow suppression runs before top-k truncation.
+If the base candidates admitted by that `ef_search`, together with the exact
+live-delta upserts, cannot replace every shadowed hit, the ANN branch and
+therefore the hybrid query may return fewer than the requested limit. Underfill
+does not authorize a complete-corpus exact scan or exact-completion fallback;
+full partition fanout, when selected, still obeys the same base-search ceiling.
 
 ## Deterministic RRF and correctness oracle
 
@@ -289,8 +302,9 @@ tests prove all of the following:
    drop return the atomic peak permit and all sequential subdivisions without
    leaking or double-releasing capacity.
 
-These tests are functional authority, not performance evidence. Receipt v4
-does not change the frozen 1,000,000-document and 1,000,000-vector corpus,
-384-dimensional vectors, 100,000 warmup operations, 1,000,000 measured
-observations, latency thresholds, recall floor, matrix, or runtime budgets.
-Only accepted exact-source bare-metal receipts may close G7.
+These tests are functional authority, not performance evidence. The G7 profile,
+not this product contract, owns any corpus/vector counts, dimensions, seeds,
+warmup and observation counts, latency thresholds, recall floor, matrix, and
+runtime budgets. This contract does not claim that an exact seed or corpus has
+been built or completed. Only accepted exact-source bare-metal evidence may
+close G7.

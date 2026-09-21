@@ -81,10 +81,13 @@ CSN or any engine root.
 
 Writer admission is acquired only after the candidate is complete. Publication
 keeps the plan's memory-only `Bulk` allocation and separately requests one CPU
-and one I/O token as high-priority `Mutation` work with zero additional memory.
-Queue selection may skip an older request that cannot fit while the plan owns
-its memory, preventing a circular head-of-line wait. It must recheck, while
-holding writer admission, all of the following:
+and one I/O token as high-priority `Mutation` work with the fixed 16 MiB
+foreground publication-memory reserve. That separate reserve covers encoded
+replacement ownership, copy-on-write page construction, and prepared WAL
+scratch; it never aliases or releases the candidate's retained `Bulk`
+allocation. Queue selection may skip an older request that cannot fit both
+authorities while the plan owns its memory, preventing a circular head-of-line
+wait. It must recheck, while holding writer admission, all of the following:
 
 1. the current root set is byte-for-byte the captured root set;
 2. the current selected base and view identities are the captured identities;

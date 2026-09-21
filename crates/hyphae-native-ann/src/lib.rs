@@ -1437,7 +1437,8 @@ impl HnswIndex {
         k: usize,
         allowlist: &BTreeSet<ObjectId>,
     ) -> Result<Vec<VectorHit>, AnnError> {
-        self.search_exact_allowlist(query, k, Some(allowlist))
+        self.search_exact_filtered_points(query, k, allowlist)
+            .map(|(hits, _)| hits)
     }
 
     fn search_exact_allowlist(
@@ -1446,6 +1447,11 @@ impl HnswIndex {
         k: usize,
         allowlist: Option<&BTreeSet<ObjectId>>,
     ) -> Result<Vec<VectorHit>, AnnError> {
+        if let Some(allowlist) = allowlist {
+            return self
+                .search_exact_filtered_points(query, k, allowlist)
+                .map(|(hits, _)| hits);
+        }
         validate_vector(self.definition, query)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -1453,7 +1459,6 @@ impl HnswIndex {
         let mut hits = self
             .entries
             .iter()
-            .filter(|(object_id, _)| allowlist.is_none_or(|ids| ids.contains(object_id)))
             .map(|(object_id, entry)| {
                 Ok(VectorHit {
                     object_id: *object_id,
@@ -1464,6 +1469,34 @@ impl HnswIndex {
         hits.sort_by(compare_hits);
         hits.truncate(k);
         Ok(hits)
+    }
+
+    fn search_exact_filtered_points(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<(Vec<VectorHit>, usize), AnnError> {
+        validate_vector(self.definition, query)?;
+        let mut eligible_count = 0_usize;
+        let mut hits = Vec::with_capacity(k.min(allowlist.len()));
+        for object_id in allowlist {
+            let Some(entry) = self.entries.get(object_id) else {
+                continue;
+            };
+            eligible_count = eligible_count
+                .checked_add(1)
+                .ok_or(AnnError::CorruptGraph)?;
+            if k != 0 {
+                hits.push(VectorHit {
+                    object_id: *object_id,
+                    distance: distance(self.definition.metric, query, &entry.vector)?,
+                });
+            }
+        }
+        hits.sort_by(compare_hits);
+        hits.truncate(k);
+        Ok((hits, eligible_count))
     }
 
     /// Traverses the HNSW graph and explicitly labels the result approximate.
@@ -1487,8 +1520,8 @@ impl HnswIndex {
     /// Traverses the graph with separate navigation and allowlist eligibility.
     ///
     /// Disallowed graph nodes remain available as connectors, but do not
-    /// consume the bounded eligible candidate set. Restrictive admitted sets
-    /// no larger than `ef_search` use the complete exact filtered path.
+    /// consume the bounded eligible candidate set. Caller-bounded allowlists
+    /// no larger than `ef_search` use the point-addressed exact filtered path.
     ///
     /// # Errors
     ///
@@ -1504,12 +1537,9 @@ impl HnswIndex {
         if options.ef_search > usize::from(self.definition.config.ef_search_max) {
             return Err(AnnError::SearchBreadthExceeded);
         }
-        let eligible_count = allowlist
-            .iter()
-            .filter(|object_id| self.entries.contains_key(object_id))
-            .count();
-        if eligible_count <= options.ef_search {
-            let hits = self.search_exact_filtered(query, options.k, allowlist)?;
+        if allowlist.len() <= options.ef_search {
+            let (hits, eligible_count) =
+                self.search_exact_filtered_points(query, options.k, allowlist)?;
             return Ok(AnnSearchResult {
                 approximate: false,
                 build_identity: self.build_identity,
@@ -2526,6 +2556,90 @@ impl PartitionedHnswIndex {
         hits.sort_by(compare_hits);
         hits.truncate(k);
         Ok(hits)
+    }
+
+    /// Executes point-addressed exact fan-out over a stable-ID allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query admission.
+    pub fn search_exact_filtered(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<VectorHit>, AnnError> {
+        self.search_exact_filtered_points(query, k, allowlist)
+            .map(|(hits, _)| hits)
+    }
+
+    fn search_exact_filtered_points(
+        &self,
+        query: &Vector,
+        k: usize,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<(Vec<VectorHit>, usize), AnnError> {
+        validate_vector(self.definition, query)?;
+        let mut eligible_count = 0_usize;
+        let mut hits = Vec::with_capacity(k.min(allowlist.len()));
+        for object_id in allowlist {
+            let Some((_, _, vector)) = self.vector_record(*object_id) else {
+                continue;
+            };
+            eligible_count = eligible_count
+                .checked_add(1)
+                .ok_or(AnnError::CorruptGraph)?;
+            if k != 0 {
+                hits.push(VectorHit {
+                    object_id: *object_id,
+                    distance: distance(self.definition.metric, query, vector)?,
+                });
+            }
+        }
+        hits.sort_by(compare_hits);
+        hits.truncate(k);
+        Ok((hits, eligible_count))
+    }
+
+    /// Fans one allowlist-filtered query to every partition with bounded
+    /// per-child graph breadth and merges child top-k results canonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query or search bounds.
+    pub fn search_filtered(
+        &self,
+        query: &Vector,
+        options: SearchOptions,
+        allowlist: &BTreeSet<ObjectId>,
+    ) -> Result<AnnSearchResult, AnnError> {
+        validate_vector(self.definition, query)?;
+        if options.ef_search > usize::from(self.definition.config.ef_search_max) {
+            return Err(AnnError::SearchBreadthExceeded);
+        }
+        if allowlist.len() <= options.ef_search {
+            let (hits, eligible_count) =
+                self.search_exact_filtered_points(query, options.k, allowlist)?;
+            return Ok(AnnSearchResult {
+                approximate: false,
+                build_identity: self.build_identity,
+                metric: self.definition.metric,
+                ef_search: options.ef_search,
+                candidate_count: eligible_count,
+                eligible_candidate_count: eligible_count,
+                strategy: AnnSearchStrategy::StableIdAdaptiveExact,
+                recall_risk: AnnRecallRisk::ExactFilteredCandidates,
+                exact_reranked: true,
+                visited_nodes: eligible_count,
+                hits,
+            });
+        }
+        let children = self
+            .partitions
+            .iter()
+            .map(|partition| partition.search_allowlist(query, options, Some(allowlist)))
+            .collect::<Result<Vec<_>, _>>()?;
+        merge_partitioned_search(self, options, &children)
     }
 
     /// Fans one approximate query to every experimental partition and merges
@@ -4227,6 +4341,50 @@ mod tests {
         assert!(filtered.eligible_candidate_count >= 4);
         assert!(filtered.eligible_candidate_count <= 8);
         assert!(filtered.candidate_count >= filtered.eligible_candidate_count);
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_filtered_search_routes_by_caller_allowlist_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = VectorIndexDefinition::new(
+            object(940)?,
+            2,
+            Metric::SquaredL2,
+            HnswConfig::new(4, 24, 4, 32, 0xfeed)?,
+        )?;
+        let records = (1..=32_u16)
+            .map(|value| {
+                Ok(VectorRecord {
+                    object_id: object(u128::from(value))?,
+                    creating_csn: csn(u64::from(value))?,
+                    vector: Vector::new([f32::from(value), 0.0])?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let plan = HnswPartitionPlan::build(definition, records, 4)?;
+        let index = PartitionedHnswIndex::build(&plan)?;
+        let query = Vector::new([8.0, 0.0])?;
+        let small = BTreeSet::from([object(7)?, object(8)?, object(9)?]);
+        let exact = index.search_filtered(&query, SearchOptions::new(2, 4, None)?, &small)?;
+        assert!(!exact.approximate);
+        assert_eq!(exact.strategy, AnnSearchStrategy::StableIdAdaptiveExact);
+        assert_eq!(exact.hits, index.search_exact_filtered(&query, 2, &small)?);
+
+        let mut large = (1..=16_u128)
+            .map(object)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        large.insert(object(999)?);
+        let filtered = index.search_filtered(&query, SearchOptions::new(2, 4, None)?, &large)?;
+        assert!(filtered.approximate);
+        assert_eq!(filtered.strategy, AnnSearchStrategy::GraphTraversal);
+        assert_eq!(filtered.recall_risk, AnnRecallRisk::ApproximateTraversal);
+        assert!(
+            filtered
+                .hits
+                .iter()
+                .all(|hit| large.contains(&hit.object_id))
+        );
         Ok(())
     }
 

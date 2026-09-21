@@ -50,10 +50,45 @@ COMMENTABLE_MACHINE_SUFFIXES = frozenset(
         ".toml",
     }
 )
-JSON_EXCEPTION_PATH_COUNT = 91
+JSON_EXCEPTION_PATH_COUNT = 94
 JSON_EXCEPTION_PATHS_SHA256 = (
-    "e50c00d1a14ccb859f8201b30584c1709f6855b6a0cd7187e981e8177c22b39b"
+    "09a7b4be71efbfe8a74eb38ed88898f6c0c6237acf0c63c74981c334875838c3"
 )
+BINARY_EXCEPTION_PATH_COUNT = 6
+BINARY_EXCEPTION_PATHS_SHA256 = (
+    "b121b417b3b394e61947e08662660d1a1d869c75ca3a1eae239adfa83cc75630"
+)
+MACHINE_JSON_PREFIXES = (
+    ".agents/",
+    ".claude-plugin/",
+    "compatibility/",
+    "config/",
+    "conformance/",
+    "contracts/",
+    "crates/",
+    "examples/",
+    "integrations/",
+    "packaging/",
+    "plugins/",
+    "sdks/",
+)
+JSON_MARKER_EXCEPTIONS = {
+    "package.json": "npm manifest format",
+    "package-lock.json": "npm lock format",
+    "tsconfig.json": "TypeScript config format",
+}
+JSON_EXCEPTION_PREFIXES = {
+    ".agents/": "tool marketplace format",
+    ".claude-plugin/": "tool marketplace format",
+    "compatibility/": "immutable compatibility fixture",
+    "config/": "policy-governed machine data",
+    "conformance/": "policy-governed conformance data",
+    "contracts/": "policy-governed public contract data",
+    "crates/": "policy-governed packaged fixture data",
+    "docs/gates/evidence/": "immutable or source-bound evidence",
+    "examples/": "literal protocol example payload",
+    "plugins/": "host-defined plugin manifest format",
+}
 IGNORED_GENERATED_DIRECTORIES = frozenset(
     {"build", "dist", "node_modules", "target"}
 )
@@ -129,7 +164,7 @@ def machine_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
-def repository_machine_files(root: Path) -> list[Path]:
+def repository_files(root: Path) -> list[Path]:
     try:
         names = subprocess.run(
             [
@@ -148,22 +183,29 @@ def repository_machine_files(root: Path) -> list[Path]:
             timeout=30,
         ).stdout.decode("utf-8").split("\0")
     except (OSError, UnicodeError, subprocess.SubprocessError):
-        return machine_files(root)
-    files: list[Path] = []
-    for relative in names:
-        if not relative:
-            continue
-        path = root / relative
-        if (
-            path.is_file()
-            and (
-                path.suffix in COMMENTABLE_MACHINE_SUFFIXES
-                or path.suffix == SLT_MACHINE_SUFFIX
-                or relative in EXTENSIONLESS_MACHINE_FILES
-            )
-        ):
-            files.append(path)
-    return sorted(files)
+        return sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and not IGNORED_GENERATED_DIRECTORIES.intersection(path.parts)
+            and path.relative_to(root).parts[0] not in IGNORED_GENERATED_ROOTS
+            and ".git" not in path.relative_to(root).parts
+        )
+    return sorted(
+        root / relative
+        for relative in names
+        if relative and (root / relative).is_file()
+    )
+
+
+def repository_machine_files(root: Path) -> list[Path]:
+    return [
+        path
+        for path in repository_files(root)
+        if path.suffix in COMMENTABLE_MACHINE_SUFFIXES
+        or path.suffix == SLT_MACHINE_SUFFIX
+        or path.relative_to(root).as_posix() in EXTENSIONLESS_MACHINE_FILES
+    ]
 
 
 def normative_markdown_files(root: Path) -> list[Path]:
@@ -244,17 +286,52 @@ def literal_tuple(path: Path, name: str) -> tuple[str, ...] | None:
 def manifest_paths(root: Path, name: str) -> list[Path]:
     return sorted(
         path
-        for path in root.rglob(name)
-        if path.is_file()
-        and path.relative_to(root).parts[0] not in IGNORED_GENERATED_ROOTS
-        and not IGNORED_GENERATED_DIRECTORIES.intersection(
-            path.relative_to(root).parts
-        )
+        for path in repository_files(root)
+        if path.match(name)
     )
 
 
 def manifest_name(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def frozen_path_inventory_matches(
+    paths: list[str], expected_count: int, expected_sha256: str
+) -> bool:
+    encoded = ("\n".join(sorted(paths)) + "\n").encode("utf-8")
+    return len(paths) == expected_count and hashlib.sha256(encoded).hexdigest() == expected_sha256
+
+
+def binary_spdx_exception_paths(root: Path) -> list[str]:
+    return sorted(
+        path.relative_to(root).as_posix()
+        for path in repository_files(root)
+        if path.suffix == ".bin"
+    )
+
+
+def json_spdx_exception_paths(root: Path, failures: list[str]) -> list[str]:
+    exceptions: list[str] = []
+    for path in manifest_paths(root, "*.json"):
+        relative = manifest_name(path, root)
+        if not relative.startswith(MACHINE_JSON_PREFIXES):
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            failures.append(f"{relative}: JSON is malformed")
+            continue
+        if isinstance(document, dict) and document.get("$comment") == (
+            f"SPDX-License-Identifier: {SOFTWARE_IDENTIFIER}"
+        ):
+            continue
+        if path.name in JSON_MARKER_EXCEPTIONS or any(
+            relative.startswith(prefix) for prefix in JSON_EXCEPTION_PREFIXES
+        ):
+            exceptions.append(relative)
+            continue
+        failures.append(f"{relative}: JSON lacks canonical SPDX $comment")
+    return exceptions
 
 
 def read_toml_manifest(
@@ -529,65 +606,22 @@ def validate_repository(root: Path = ROOT) -> list[str]:
         )
     )
     rules = classification["classification"]["rules"]
-    machine_json_prefixes = (
-        ".agents/",
-        ".claude-plugin/",
-        "compatibility/",
-        "config/",
-        "conformance/",
-        "contracts/",
-        "crates/",
-        "examples/",
-        "integrations/",
-        "packaging/",
-        "plugins/",
-        "sdks/",
-    )
-    json_marker_exceptions = {
-        "package.json": "npm manifest format",
-        "package-lock.json": "npm lock format",
-        "tsconfig.json": "TypeScript config format",
-    }
-    json_exception_prefixes = {
-        ".agents/": "tool marketplace format",
-        ".claude-plugin/": "tool marketplace format",
-        "compatibility/": "immutable compatibility fixture",
-        "config/": "policy-governed machine data",
-        "conformance/": "policy-governed conformance data",
-        "contracts/": "policy-governed public contract data",
-        "crates/": "policy-governed packaged fixture data",
-        "docs/gates/evidence/": "immutable or source-bound evidence",
-        "examples/": "literal protocol example payload",
-        "plugins/": "host-defined plugin manifest format",
-    }
-    observed_json_exceptions: list[str] = []
-    for path in manifest_paths(root, "*.json"):
-        relative = manifest_name(path, root)
-        if not relative.startswith(machine_json_prefixes):
-            continue
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            failures.append(f"{relative}: JSON is malformed")
-            continue
-        if isinstance(document, dict) and document.get("$comment") == (
-            f"SPDX-License-Identifier: {SOFTWARE_IDENTIFIER}"
-        ):
-            continue
-        if path.name in json_marker_exceptions or any(
-            relative.startswith(prefix) for prefix in json_exception_prefixes
-        ):
-            observed_json_exceptions.append(relative)
-            continue
-        failures.append(f"{relative}: JSON lacks canonical SPDX $comment")
-    encoded_json_exceptions = (
-        "\n".join(sorted(observed_json_exceptions)) + "\n"
-    ).encode("utf-8")
-    if len(observed_json_exceptions) != JSON_EXCEPTION_PATH_COUNT or hashlib.sha256(
-        encoded_json_exceptions
-    ).hexdigest() != JSON_EXCEPTION_PATHS_SHA256:
+    observed_json_exceptions = json_spdx_exception_paths(root, failures)
+    if not frozen_path_inventory_matches(
+        observed_json_exceptions,
+        JSON_EXCEPTION_PATH_COUNT,
+        JSON_EXCEPTION_PATHS_SHA256,
+    ):
         failures.append(
             "strict JSON SPDX exceptions differ from the frozen exact path inventory"
+        )
+    if not frozen_path_inventory_matches(
+        binary_spdx_exception_paths(root),
+        BINARY_EXCEPTION_PATH_COUNT,
+        BINARY_EXCEPTION_PATHS_SHA256,
+    ):
+        failures.append(
+            "binary SPDX exceptions differ from the frozen exact path inventory"
         )
 
     generator = (root / "tools" / "generate_sdk_models.py").read_text(encoding="utf-8")

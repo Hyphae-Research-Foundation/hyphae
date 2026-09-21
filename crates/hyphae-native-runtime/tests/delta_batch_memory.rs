@@ -377,6 +377,251 @@ fn explicit_delta_type_stages_and_commits_without_materialized_access() -> Resul
 }
 
 #[test]
+fn absence_fences_accept_exactly_the_4096_record_bound() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("absence-fence-bound");
+    let index = ObjectId::new(700)?;
+    let mut database = NativeDatabase::create(&data)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    seed.create_vector_index(
+        index,
+        "absence-fence-bound",
+        2,
+        VectorMetric::SquaredL2,
+        HnswConfig::new(4, 16, 8, 32, 7)?,
+    )?;
+    seed.commit()?;
+
+    let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    for ordinal in 1..=4_096_u128 {
+        assert!(!database.stage_delta_vector_absence_fence(
+            &mut batch,
+            index,
+            ObjectId::new(ordinal)?,
+        )?);
+    }
+    let physical_object = ObjectId::new(5_000)?;
+    database.stage_delta_upsert_vector(
+        &mut batch,
+        index,
+        physical_object,
+        Vector::new([1.0, 0.0])?,
+    )?;
+    let retained_mutations = batch.mutation_count();
+    assert_eq!(retained_mutations, 4_097);
+    assert!(matches!(
+        database.stage_delta_vector_absence_fence(&mut batch, index, ObjectId::new(4_097)?,),
+        Err(NativeRuntimeError::AnnDeltaLimitExceeded)
+    ));
+    assert_eq!(batch.mutation_count(), retained_mutations);
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    assert_eq!(
+        reopened.search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?[0].object_id,
+        physical_object
+    );
+    Ok(())
+}
+
+#[test]
+fn two_physical_ann_targets_share_one_root_structural_peak_and_reopen() -> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("two-physical-ann-targets");
+    let indexes = [ObjectId::new(750)?, ObjectId::new(751)?];
+    let mut database = NativeDatabase::create(&data)?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.into_iter().enumerate() {
+        seed.create_vector_index(
+            index,
+            &format!("two-physical-ann-target-{ordinal}"),
+            2,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(4, 16, 8, 32, 7)?,
+        )?;
+    }
+    seed.commit()?;
+
+    let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.into_iter().enumerate() {
+        database.stage_delta_upsert_vector(
+            &mut batch,
+            index,
+            ObjectId::new(u128::try_from(ordinal)? + 1)?,
+            Vector::new([f32::from(u16::try_from(ordinal)?), 1.0])?,
+        )?;
+    }
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    for (ordinal, index) in indexes.into_iter().enumerate() {
+        assert_eq!(
+            reopened
+                .search_vector_exact_latest(
+                    index,
+                    &Vector::new([f32::from(u16::try_from(ordinal)?), 1.0])?,
+                    1,
+                )?
+                .first()
+                .map(|hit| hit.object_id),
+            Some(ObjectId::new(u128::try_from(ordinal)? + 1)?)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn one_physical_delete_and_fifteen_absence_fences_fit_the_sixteen_target_parent()
+-> Result<(), TestError> {
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("sixteen-ann-targets");
+    let mut database = NativeDatabase::create(&data)?;
+    let indexes = (0..16_u128)
+        .map(|ordinal| ObjectId::new(800 + ordinal))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seed = database.begin(1, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.iter().copied().enumerate() {
+        seed.create_vector_index(
+            index,
+            &format!("sixteen-ann-target-{ordinal}"),
+            2,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(4, 16, 8, 32, 7)?,
+        )?;
+        if ordinal == 0 {
+            seed.upsert_vector(index, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        }
+    }
+    seed.commit()?;
+
+    let deleted = ObjectId::new(1)?;
+    let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+    assert!(database.stage_delta_vector_absence_fence(&mut batch, indexes[0], deleted,)?);
+    for (ordinal, index) in indexes.iter().copied().enumerate().skip(1) {
+        assert!(!database.stage_delta_vector_absence_fence(
+            &mut batch,
+            index,
+            ObjectId::new(u128::try_from(ordinal)? + 1)?,
+        )?);
+    }
+    assert_eq!(batch.mutation_count(), 16);
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    assert!(
+        reopened
+            .search_vector_exact_latest(indexes[0], &Vector::new([1.0, 0.0])?, 1)?
+            .is_empty()
+    );
+    for index in indexes.into_iter().skip(1) {
+        assert!(
+            reopened
+                .search_vector_exact_latest(index, &Vector::new([0.0, 0.0])?, 1)?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sixteen_existing_m05_targets_share_one_root_structural_peak_and_reopen() -> Result<(), TestError>
+{
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("sixteen-physical-ann-targets");
+    let indexes = (0..16_u128)
+        .map(|ordinal| ObjectId::new(1_000 + ordinal))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut database = NativeDatabase::create(&data)?;
+    let mut create = database.begin(1, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.iter().copied().enumerate() {
+        create.create_vector_index(
+            index,
+            &format!("sixteen-physical-ann-target-{ordinal}"),
+            2,
+            VectorMetric::SquaredL2,
+            HnswConfig::new(4, 16, 8, 32, 7)?,
+        )?;
+    }
+    create.commit()?;
+    let mut select_m05 = database.begin(2, DurabilityClass::Strict)?;
+    for index in indexes.iter().copied() {
+        select_m05.upsert_vector(index, ObjectId::new(1)?, Vector::new([0.0, 1.0])?)?;
+    }
+    select_m05.commit()?;
+
+    let mut batch = database.begin_optimistic_delta(3, DurabilityClass::Strict)?;
+    for (ordinal, index) in indexes.iter().copied().enumerate() {
+        database.stage_delta_upsert_vector(
+            &mut batch,
+            index,
+            ObjectId::new(2)?,
+            Vector::new([f32::from(u16::try_from(ordinal)?), 2.0])?,
+        )?;
+    }
+    assert_eq!(batch.mutation_count(), 16);
+    database.commit_optimistic(batch)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    for (ordinal, index) in indexes.into_iter().enumerate() {
+        assert_eq!(
+            reopened
+                .search_vector_exact_latest(
+                    index,
+                    &Vector::new([f32::from(u16::try_from(ordinal)?), 2.0])?,
+                    1,
+                )?
+                .first()
+                .map(|hit| hit.object_id),
+            Some(ObjectId::new(2)?)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn physical_delete_admits_a_large_dimension_d01_and_d02_path_before_retention()
+-> Result<(), TestError> {
+    const DIMENSION: usize = 3_840;
+    let temporary = TemporaryDirectory::create()?;
+    let data = temporary.path().join("large-d01-d02-delete");
+    let index = ObjectId::new(900)?;
+    let object = ObjectId::new(1)?;
+    let mut database = NativeDatabase::create(&data)?;
+    let mut create = database.begin(1, DurabilityClass::Strict)?;
+    create.create_vector_index(
+        index,
+        "large-d01-d02-delete",
+        u16::try_from(DIMENSION)?,
+        VectorMetric::SquaredL2,
+        HnswConfig::new(4, 16, 8, 32, 7)?,
+    )?;
+    create.commit()?;
+    let mut legacy = database.begin(2, DurabilityClass::Strict)?;
+    legacy.upsert_vector(index, object, Vector::new(vec![1.0; DIMENSION])?)?;
+    legacy.commit()?;
+    let mut overlay = database.begin(3, DurabilityClass::Strict)?;
+    overlay.upsert_vector(index, object, Vector::new(vec![2.0; DIMENSION])?)?;
+    overlay.commit()?;
+
+    let mut deletion = database.begin_optimistic_delta(4, DurabilityClass::Strict)?;
+    assert!(database.stage_delta_vector_absence_fence(&mut deletion, index, object)?);
+    database.commit_optimistic(deletion)?;
+    drop(database);
+
+    let reopened = NativeDatabase::open(&data)?;
+    assert!(
+        reopened
+            .search_vector_exact_latest(index, &Vector::new(vec![2.0; DIMENSION])?, 1)?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn delta_sql_fails_closed_for_outbound_and_inbound_foreign_keys() -> Result<(), TestError> {
     let temporary = TemporaryDirectory::create()?;
     let mut database = NativeDatabase::create(temporary.path().join("data"))?;
@@ -480,7 +725,7 @@ fn ann_delta_hydration_is_rejected_before_the_parent_allocation_is_exceeded()
     let data = temporary.path().join("data");
     let mut database = NativeDatabase::create(&data)?;
     let config = HnswConfig::new(4, 16, 8, 32, 7)?;
-    let indexes = (0_u128..64)
+    let indexes = (0_u128..16)
         .map(|offset| ObjectId::new(10_000 + offset))
         .collect::<Result<Vec<_>, _>>()?;
     let mut seed = database.begin(1, DurabilityClass::Strict)?;
@@ -513,15 +758,20 @@ fn ann_delta_hydration_is_rejected_before_the_parent_allocation_is_exceeded()
                 rejected = Some((*index, object));
                 break;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(format!("ANN stage {ordinal} failed: {error:?}").into()),
         }
     }
     let (rejected_index, rejected_object) = rejected.ok_or("ANN delta capacity did not bind")?;
-    assert!(!admitted.is_empty());
-    database.commit_optimistic(delta)?;
+    assert!(admitted.len() >= 2);
+    database
+        .commit_optimistic(delta)
+        .map_err(|error| format!("ANN bounded commit failed: {error:?}"))?;
     drop(database);
 
-    let reopened = NativeDatabase::open(&data)?;
+    let admitted_count = admitted.len();
+    let reopened = NativeDatabase::open(&data).map_err(|error| {
+        format!("ANN bounded reopen failed after {admitted_count} indexes: {error:?}")
+    })?;
     for (index, object) in admitted {
         assert!(
             reopened

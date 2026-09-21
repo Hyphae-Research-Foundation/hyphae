@@ -1219,7 +1219,8 @@ fn btree_error_is_corruption(source: &BTreeError) -> bool {
         | BTreeError::DuplicateKey
         | BTreeError::ForeignSegment
         | BTreeError::Cancelled
-        | BTreeError::PrefixContentsChanged => false,
+        | BTreeError::PrefixContentsChanged
+        | BTreeError::PhysicalDiffLimitExceeded => false,
     }
 }
 
@@ -3509,6 +3510,407 @@ struct MaterializedState {
     ann: ann_store::AnnState,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SearchRecoveryMemoryAuthority {
+    root: Option<PageId>,
+    lexical_retained_bytes: u64,
+    ann_by_index: BTreeMap<ObjectId, u64>,
+    ann_retained_bytes: u64,
+    contains_m05: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SearchRecoveryMemoryProjection {
+    root: Option<PageId>,
+    lexical_retained_bytes: u64,
+    ann_retained_bytes: u64,
+    contains_m05: bool,
+    touched_ann: BTreeMap<ObjectId, u64>,
+}
+
+impl SearchRecoveryMemoryProjection {
+    fn from_authority(authority: &SearchRecoveryMemoryAuthority) -> Self {
+        Self {
+            root: authority.root,
+            lexical_retained_bytes: authority.lexical_retained_bytes,
+            ann_retained_bytes: authority.ann_retained_bytes,
+            contains_m05: authority.contains_m05,
+            touched_ann: BTreeMap::new(),
+        }
+    }
+
+    fn index_bytes(&self, source: &SearchRecoveryMemoryAuthority, index: ObjectId) -> Option<u64> {
+        self.touched_ann
+            .get(&index)
+            .copied()
+            .or_else(|| source.ann_by_index.get(&index).copied())
+    }
+
+    fn replace_index(
+        &mut self,
+        source: &SearchRecoveryMemoryAuthority,
+        index: ObjectId,
+        result_bytes: u64,
+    ) -> Result<(), NativeRuntimeError> {
+        let current = self.index_bytes(source, index).unwrap_or(0);
+        self.ann_retained_bytes = self
+            .ann_retained_bytes
+            .checked_sub(current)
+            .and_then(|bytes| bytes.checked_add(result_bytes))
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        self.touched_ann.insert(index, result_bytes);
+        Ok(())
+    }
+
+    fn validate_shared_limit(&self) -> Result<(), NativeRuntimeError> {
+        if self.contains_m05
+            && self
+                .lexical_retained_bytes
+                .checked_add(self.ann_retained_bytes)
+                .is_none_or(|bytes| bytes > RECOVERY_MEMORY_BYTES)
+        {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        Ok(())
+    }
+}
+
+struct SearchRecoveryMemoryRefresh {
+    root: PageId,
+    lexical_retained_bytes: u64,
+    ann_retained_bytes: u64,
+    contains_m05: bool,
+    touched_ann: BTreeMap<ObjectId, u64>,
+}
+
+impl SearchRecoveryMemoryAuthority {
+    fn apply_refresh(&mut self, refresh: SearchRecoveryMemoryRefresh) {
+        self.root = Some(refresh.root);
+        self.lexical_retained_bytes = refresh.lexical_retained_bytes;
+        self.ann_retained_bytes = refresh.ann_retained_bytes;
+        self.contains_m05 = refresh.contains_m05;
+        self.ann_by_index.extend(refresh.touched_ann);
+    }
+}
+
+fn staged_lexical_recovery_growth(batch: &NativeWriteBatch) -> Result<u64, NativeRuntimeError> {
+    batch
+        .mutations
+        .iter()
+        .filter(|mutation| {
+            mutation.engine == EngineKind::Search
+                && matches!(
+                    mutation.opcode,
+                    Opcode::CreateIndex | Opcode::IndexDocument | Opcode::ReplaceDocument
+                )
+        })
+        .try_fold(0_u64, |total, mutation| {
+            let index = mutation
+                .target
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            if mutation.opcode == Opcode::CreateIndex {
+                return total
+                    .checked_add(search_recovery_entry_retained_bytes(
+                        &search_index_meta_key(index),
+                        0,
+                    )?)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree);
+            }
+            let text = std::str::from_utf8(&mutation.value)
+                .map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?;
+            let document_key = search_document_key(index, &mutation.key)?;
+            let document_bytes = 512_u64
+                .checked_add(
+                    u64::try_from(document_key.len())
+                        .map_err(|_| NativeRuntimeError::InvalidSearchTree)?
+                        .checked_mul(4)
+                        .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                )
+                .and_then(|bytes| bytes.checked_add(u64::try_from(text.len()).ok()?))
+                .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            let term_bytes = analyze(text)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .try_fold(0_u64, |bytes, term| {
+                    let term_key = search_term_meta_key(index, term.as_bytes())?;
+                    let posting_key = search_posting_key(index, term.as_bytes(), &mutation.key)?;
+                    let retained = 1_024_u64
+                        .checked_add(
+                            u64::try_from(term_key.len().saturating_add(posting_key.len()))
+                                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?
+                                .checked_mul(4)
+                                .ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                        )
+                        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                    bytes
+                        .checked_add(retained)
+                        .ok_or(NativeRuntimeError::InvalidSearchTree)
+                })?;
+            total
+                .checked_add(document_bytes)
+                .and_then(|bytes| bytes.checked_add(term_bytes))
+                .ok_or(NativeRuntimeError::InvalidSearchTree)
+        })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn project_search_recovery_memory(
+    pages: &PageStore,
+    source: &SearchRecoveryMemoryAuthority,
+    current: &SearchRecoveryMemoryProjection,
+    search_root: Option<PageId>,
+    batch: &mut NativeWriteBatch,
+    commit_csn: Csn,
+    point_projection: Option<&mut ann_store::AnnPointProjection>,
+    materialized_state: Option<&MaterializedState>,
+) -> Result<SearchRecoveryMemoryProjection, NativeRuntimeError> {
+    if batch.search_format == SearchFormat::InlineStateV1 {
+        let mut authority = current.clone();
+        authority.root = search_root;
+        return Ok(authority);
+    }
+    let mut projected = current.clone();
+    projected.root = search_root;
+    let measured_lexical = search_root.map_or(Ok(0), |root| {
+        measure_search_recovery_retained_bytes(pages, root)
+    })?;
+    if source.root == search_root && source.lexical_retained_bytes != measured_lexical {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    if current.touched_ann.is_empty()
+        && current.root == source.root
+        && current.lexical_retained_bytes == source.lexical_retained_bytes
+        && current.ann_retained_bytes == source.ann_retained_bytes
+    {
+        projected.lexical_retained_bytes = measured_lexical;
+    }
+    projected.lexical_retained_bytes = projected
+        .lexical_retained_bytes
+        .checked_add(staged_lexical_recovery_growth(batch)?)
+        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+
+    let point_counts = write_batch_point_operation_counts(batch);
+    if !point_counts.is_empty() {
+        let root = search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let point_mutations = batch
+            .mutations
+            .iter()
+            .filter(|mutation| {
+                mutation
+                    .target
+                    .is_some_and(|index| point_counts.contains_key(&index))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let publications = if let Some(projection) = point_projection {
+            ann_store::plan_projected_point_publications(
+                pages,
+                root,
+                &batch.state.catalog,
+                &point_mutations,
+                commit_csn,
+                projection,
+            )?
+        } else {
+            ann_store::plan_point_publications(
+                pages,
+                root,
+                &batch.state.catalog,
+                &point_mutations,
+                commit_csn,
+            )?
+        };
+        let publishes_m05 = publications
+            .values()
+            .any(ann_store::AnnPointPublication::is_physical);
+        for (index, publication) in &publications {
+            let result_bytes = publication.recovery_memory_bytes();
+            if !source.ann_by_index.contains_key(index) {
+                return Err(NativeRuntimeError::InvalidAnnTree);
+            }
+            projected.replace_index(source, *index, result_bytes)?;
+        }
+        batch.ann_point_publications = Some(publications);
+        projected.contains_m05 |= publishes_m05;
+    }
+    if batch.mode == NativeWriteBatchMode::Materialized {
+        project_materialized_legacy_ann_memory(
+            source,
+            &mut projected,
+            batch,
+            materialized_state.unwrap_or(&batch.state),
+            commit_csn,
+        )?;
+    }
+    let physical_ann_charge = match batch.mode {
+        NativeWriteBatchMode::PhysicalInitialAnnBulkPublication => {
+            let root = search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let publication = batch
+                .ann_initial_bulk
+                .as_ref()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            Some((
+                publication.index,
+                ann_store::initial_bulk_recovery_memory_at_root(pages, root, publication)?,
+                false,
+            ))
+        }
+        NativeWriteBatchMode::PhysicalAnnConsolidation => {
+            let plan = batch
+                .ann_consolidation
+                .as_ref()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            Some((
+                plan.index(),
+                plan.publication_recovery_memory_bytes()
+                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+                true,
+            ))
+        }
+        _ => None,
+    };
+    if let Some((index, result_bytes, publishes_m05)) = physical_ann_charge {
+        if !source.ann_by_index.contains_key(&index) {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+        projected.replace_index(source, index, result_bytes)?;
+        projected.contains_m05 |= publishes_m05;
+    }
+    projected.validate_shared_limit()?;
+    Ok(projected)
+}
+
+fn project_materialized_legacy_ann_memory(
+    source: &SearchRecoveryMemoryAuthority,
+    projected: &mut SearchRecoveryMemoryProjection,
+    batch: &NativeWriteBatch,
+    state: &MaterializedState,
+    commit_csn: Csn,
+) -> Result<(), NativeRuntimeError> {
+    let point_indexes = batch
+        .ann_point_publications
+        .as_ref()
+        .map(|publications| publications.keys().copied().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let legacy_targets = batch
+        .mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::CreateAnnIndex
+                    | Opcode::UpsertVector
+                    | Opcode::DeleteVector
+                    | Opcode::FenceVectorAbsence
+            )
+        })
+        .filter_map(|mutation| mutation.target)
+        .filter(|index| !point_indexes.contains(index))
+        .collect::<BTreeSet<_>>();
+    for index in legacy_targets {
+        let result_bytes =
+            state
+                .ann
+                .publication_recovery_memory_for_index(index, &batch.mutations, commit_csn)?;
+        if source.ann_by_index.contains_key(&index) || !projected.touched_ann.contains_key(&index) {
+            projected.replace_index(source, index, result_bytes)?;
+        } else {
+            return Err(NativeRuntimeError::InvalidAnnTree);
+        }
+    }
+    Ok(())
+}
+
+fn batch_ann_definition(
+    batch: &NativeWriteBatch,
+    index: ObjectId,
+) -> Result<VectorIndexDefinition, NativeRuntimeError> {
+    if let Some(CatalogObject::Search(definition)) = batch.state.catalog.object(index) {
+        return ann_store::definition_from_search(definition);
+    }
+    if let Some(plan) = batch
+        .ann_consolidation
+        .as_ref()
+        .filter(|plan| plan.index() == index)
+    {
+        return Ok(plan.definition());
+    }
+    if let Some(publication) = batch
+        .ann_initial_bulk
+        .as_ref()
+        .filter(|publication| publication.index == index)
+    {
+        return Ok(publication.candidate.definition);
+    }
+    Err(NativeRuntimeError::InvalidPreparedMutation)
+}
+
+fn refresh_search_recovery_memory(
+    pages: &PageStore,
+    prior: &SearchRecoveryMemoryAuthority,
+    result_root: PageId,
+    batch: &NativeWriteBatch,
+) -> Result<SearchRecoveryMemoryRefresh, NativeRuntimeError> {
+    if batch.search_format == SearchFormat::InlineStateV1 {
+        return Ok(SearchRecoveryMemoryRefresh {
+            root: result_root,
+            lexical_retained_bytes: 0,
+            ann_retained_bytes: 0,
+            contains_m05: false,
+            touched_ann: BTreeMap::new(),
+        });
+    }
+    let lexical_retained_bytes = measure_search_recovery_retained_bytes(pages, result_root)?;
+    let mut refreshed = SearchRecoveryMemoryRefresh {
+        root: result_root,
+        lexical_retained_bytes,
+        ann_retained_bytes: prior.ann_retained_bytes,
+        contains_m05: prior.contains_m05,
+        touched_ann: BTreeMap::new(),
+    };
+    let targets = batch
+        .mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::CreateAnnIndex
+                    | Opcode::UpsertVector
+                    | Opcode::DeleteVector
+                    | Opcode::FenceVectorAbsence
+                    | Opcode::ConsolidateAnn
+                    | Opcode::PublishInitialAnnBulk
+            )
+        })
+        .filter_map(|mutation| mutation.target)
+        .collect::<BTreeSet<_>>();
+    for index in targets {
+        let definition = batch_ann_definition(batch, index)?;
+        let version = ann_store::persisted_metadata_version(pages, result_root, index)?
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        let result_bytes =
+            ann_store::index_recovery_memory_at_root(pages, result_root, index, definition)?;
+        let prior_bytes = prior.ann_by_index.get(&index).copied().unwrap_or(0);
+        refreshed.ann_retained_bytes = refreshed
+            .ann_retained_bytes
+            .checked_sub(prior_bytes)
+            .and_then(|bytes| bytes.checked_add(result_bytes))
+            .ok_or(NativeRuntimeError::InvalidAnnTree)?;
+        refreshed.touched_ann.insert(index, result_bytes);
+        refreshed.contains_m05 |= version == 5;
+    }
+    if refreshed.contains_m05
+        && refreshed
+            .lexical_retained_bytes
+            .checked_add(refreshed.ann_retained_bytes)
+            .is_none_or(|bytes| bytes > RECOVERY_MEMORY_BYTES)
+    {
+        return Err(NativeRuntimeError::InvalidAnnTree);
+    }
+    Ok(refreshed)
+}
+
 struct NativeBTreeSegmentPlan {
     tree: BTree,
     prefix: Vec<u8>,
@@ -5739,6 +6141,7 @@ pub struct NativeDatabase {
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    search_recovery_memory: SearchRecoveryMemoryAuthority,
     next_transaction_id: u128,
     transaction_resolutions: BTreeMap<TransactionId, DurableTransactionResolution>,
     transaction_receipts: BTreeMap<TransactionId, CommitReceipt>,
@@ -5824,6 +6227,7 @@ impl NativeDatabase {
             relational_format: RelationalFormat::VersionChainV2,
             structure_format: StructureFormat::BTreeV2,
             search_format: SearchFormat::InvertedBTreeV1,
+            search_recovery_memory: SearchRecoveryMemoryAuthority::default(),
             next_transaction_id: 1,
             transaction_resolutions: BTreeMap::new(),
             transaction_receipts: BTreeMap::new(),
@@ -6033,19 +6437,20 @@ impl NativeDatabase {
             page_generation_path(path, active_page_generation),
             active_page_generation,
         )?;
+        let (committed_roots, latest_root, search_recovery_memory, root_validation_time) =
+            recover_committed_roots_timed(
+                commits,
+                &wal_state.opened_wal.recovery,
+                &RetainedPageState {
+                    pages: &opened_pages.store,
+                    blobs: &blobs,
+                    blob_generation: blob_recovery.generation,
+                    active_generation: active_page_generation,
+                    retention_floor_csn,
+                },
+                wal_state.base_root.take(),
+            )?;
         let conflicts = replay_conflicts(commits)?;
-        let (committed_roots, latest_root, root_validation_time) = recover_committed_roots_timed(
-            commits,
-            &wal_state.opened_wal.recovery,
-            &RetainedPageState {
-                pages: &opened_pages.store,
-                blobs: &blobs,
-                blob_generation: blob_recovery.generation,
-                active_generation: active_page_generation,
-                retention_floor_csn,
-            },
-            wal_state.base_root.take(),
-        )?;
         let (relational_format, structure_format, search_format) =
             formats_for_latest_root(&opened_pages.store, latest_root.as_ref())?;
         let metadata = wal_recovery_metadata_for_open(path, retention_anchor, &wal_state)?;
@@ -6094,6 +6499,7 @@ impl NativeDatabase {
             relational_format,
             structure_format,
             search_format,
+            search_recovery_memory,
             next_transaction_id: metadata.next_transaction_id,
             transaction_resolutions: recovered.transaction_resolutions,
             transaction_receipts: recovered.transaction_receipts,
@@ -6565,13 +6971,14 @@ impl NativeDatabase {
     fn admit_ann_consolidation_publication(
         &self,
         root: PageId,
-        plan: &ann_store::ConsolidationPlan,
+        plan: &mut ann_store::ConsolidationPlan,
         candidate_memory_is_accounted: bool,
     ) -> Result<
         (
             Option<DatabaseGovernorPermit>,
             usize,
             PrefixReplacementStructuralPlan,
+            u64,
         ),
         NativeRuntimeError,
     > {
@@ -6598,20 +7005,29 @@ impl NativeDatabase {
         } else {
             partitioned_hnsw_build_memory_bytes(plan.effective_vector_count(), definition)
         };
+        let publication_memory_bytes =
+            ann_store::consolidation_publication_memory_bytes(&load_plan, plan)?;
         let memory_bytes = load_plan
             .hydration_memory_bytes()
             .saturating_add(candidate_memory_bytes)
+            .saturating_add(publication_memory_bytes)
             .saturating_add(
                 u64::try_from(structural_plan.structural_peak_memory_bytes()).unwrap_or(u64::MAX),
             );
         let permit = self.admit_initial_ann_publication(memory_bytes)?;
-        let (_, consumed_delta_records) = ann_store::inspect_consolidation_publication(
-            &self.pages,
-            &self.buffer_pool,
-            &load_plan,
-            plan,
-        )?;
-        Ok((permit, consumed_delta_records, structural_plan))
+        let (_, consumed_delta_records, recovery_memory_bytes) =
+            ann_store::inspect_consolidation_publication(
+                &self.pages,
+                &self.buffer_pool,
+                &load_plan,
+                plan,
+            )?;
+        Ok((
+            permit,
+            consumed_delta_records,
+            structural_plan,
+            recovery_memory_bytes,
+        ))
     }
 
     fn ann_consolidation_candidate_memory_is_accounted(
@@ -7726,35 +8142,7 @@ impl NativeDatabase {
         root: PageId,
         id: ObjectId,
     ) -> Result<Option<CatalogObject>, NativeRuntimeError> {
-        let frame = self.buffer_pool.get_or_load(&self.pages, root)?;
-        if frame.page().kind() == PageKind::CatalogRoot {
-            return Ok(CatalogState::decode(frame.page().payload())?
-                .object(id)
-                .cloned());
-        }
-        if !matches!(
-            frame.page().kind(),
-            PageKind::BTreeLeaf | PageKind::BTreeInternal
-        ) {
-            return Err(NativeRuntimeError::InvalidCatalogTree);
-        }
-        let Some(stored) = BTree::from_root(root).get_cached_pinned(
-            &self.pages,
-            &self.buffer_pool,
-            &catalog_object_key(id),
-        )?
-        else {
-            return Ok(None);
-        };
-        let definition = decode_catalog_definition_storage_value(stored.bytes(), &self.blobs)?;
-        if definition.starts_with(b"HYCOBJ02") {
-            return Ok(None);
-        }
-        let object = CatalogObject::decode_definition(&definition)?;
-        if object.header().id != id {
-            return Err(NativeRuntimeError::InvalidCatalogTree);
-        }
-        Ok(Some(object))
+        catalog_object_at_physical_root(&self.pages, Some(&self.buffer_pool), &self.blobs, root, id)
     }
 
     /// Materializes one immutable all-engine read snapshot.
@@ -9317,6 +9705,7 @@ impl NativeDatabase {
                 blobs: &mut self.blobs,
                 wal: &mut self.wal,
                 conflicts: &mut self.conflicts,
+                search_recovery_memory: &mut self.search_recovery_memory,
                 relational_format: self.relational_format,
                 structure_format: self.structure_format,
                 search_format: self.search_format,
@@ -9343,6 +9732,9 @@ impl NativeDatabase {
                     ann_consolidation: None,
                     ann_consolidation_structure: None,
                     ann_initial_bulk: None,
+                    ann_point_publications: None,
+                    legacy_ann_indexes: BTreeSet::new(),
+                    materialized_ann_point_publication_memory_bytes: 0,
                     resource_permit: None,
                 },
             }
@@ -9439,6 +9831,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -9465,6 +9858,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -9547,6 +9943,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -9580,6 +9977,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -9704,6 +10104,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -9737,6 +10138,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -9885,6 +10289,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -9918,6 +10323,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -10178,9 +10586,10 @@ impl NativeDatabase {
         self.consolidate_ann_at(plan, durability, Some(boundary))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn consolidate_ann_at(
         &mut self,
-        plan: AnnConsolidationPlan,
+        mut plan: AnnConsolidationPlan,
         durability: DurabilityClass,
         interruption: Option<CommitBoundary>,
     ) -> Result<AnnConsolidationReceipt, NativeRuntimeError> {
@@ -10211,17 +10620,19 @@ impl NativeDatabase {
             .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
         let candidate_memory_is_accounted =
             self.ann_consolidation_candidate_memory_is_accounted(retained_resource_permit.as_ref());
-        let (_publication_permit, consumed_delta_records, structural_plan) = self
-            .admit_ann_consolidation_publication(
+        let (_publication_permit, consumed_delta_records, structural_plan, recovery_memory_bytes) =
+            self.admit_ann_consolidation_publication(
                 root,
-                &plan.inner,
+                &mut plan.inner,
                 candidate_memory_is_accounted,
             )?;
+        plan.inner
+            .set_publication_recovery_memory_bytes(recovery_memory_bytes);
         let previous_base_identity = plan.inner.base_identity();
         let index_id = plan.inner.index();
         let replacement_base_identity = plan.inner.replacement_identity();
         let effective_vector_count = plan.inner.effective_vector_count();
-        let mutation_value = ann_store::encode_consolidation_mutation(&plan.inner);
+        let mutation_value = ann_store::encode_consolidation_mutation(&plan.inner)?;
         let transaction_id = TransactionId::new(self.next_transaction_id)
             .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
         let root_transaction = self.coordinator.begin_write()?;
@@ -10235,6 +10646,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -10268,6 +10680,9 @@ impl NativeDatabase {
                 ann_consolidation: Some(plan.inner),
                 ann_consolidation_structure: Some(structural_plan),
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -17567,6 +17982,7 @@ impl NativeDatabase {
         self.publish_initial_ann_bulk_at(plan, durability, Some(boundary))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn publish_initial_ann_bulk_at(
         &mut self,
         plan: InitialAnnBulkPlan,
@@ -17631,6 +18047,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -17667,6 +18084,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: Some(publication),
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit: None,
             },
         };
@@ -17890,6 +18310,9 @@ impl NativeDatabase {
             ann_consolidation: None,
             ann_consolidation_structure: None,
             ann_initial_bulk: None,
+            ann_point_publications: None,
+            legacy_ann_indexes: BTreeSet::new(),
+            materialized_ann_point_publication_memory_bytes: 0,
             resource_permit,
         })
     }
@@ -18054,6 +18477,9 @@ impl NativeDatabase {
                 ann_consolidation: None,
                 ann_consolidation_structure: None,
                 ann_initial_bulk: None,
+                ann_point_publications: None,
+                legacy_ann_indexes: BTreeSet::new(),
+                materialized_ann_point_publication_memory_bytes: 0,
                 resource_permit,
             },
         })
@@ -18699,6 +19125,8 @@ impl NativeDatabase {
     /// Only the target index metadata and its bounded object delta are
     /// hydrated; the immutable HNSW base and unrelated engines remain on
     /// their committed pages.
+    /// A delta batch accepts only one vector operation per `(index, object)`;
+    /// a duplicate is rejected without discarding the first staged intent.
     ///
     /// # Errors
     ///
@@ -18714,87 +19142,61 @@ impl NativeDatabase {
         let batch = &mut batch.inner;
         self.require_delta_batch(batch)?;
         let encoded = ann_store::encode_vector_mutation(&vector);
-        let candidate_charge =
-            delta_payload_retained_charge(std::mem::size_of::<u128>(), encoded.capacity(), 1, 1)
-                .saturating_add(
-                    ann_store::AnnDeltaMutationState::upsert_retained_memory_bytes(&vector),
-                )
-                .saturating_add(delta_mutation_vector_growth(batch));
-        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
-
-        let already_hydrated = batch
+        let publication_charge = batch
             .delta
             .as_ref()
-            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-            .ann_mutations
-            .contains_key(&index);
-        let mut added_catalog_object = false;
-        if !already_hydrated {
-            let catalog_candidate = self.delta_search_index_candidate(batch, index)?;
-            let search_definition = match catalog_candidate
-                .as_ref()
-                .map(|(object, _)| object)
-                .or_else(|| batch.state.catalog.object(index))
-            {
-                Some(CatalogObject::Search(definition)) if definition.ann.is_some() => definition,
-                _ => return Err(NativeRuntimeError::UnknownVectorIndex { index }),
-            };
-            let definition = ann_store::definition_from_search(search_definition)?;
-            let root = batch
-                .snapshot
-                .roots()
-                .root(SLOT_SEARCH)
-                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-            let plan = ann_store::plan_delta_mutation(
-                &self.pages,
-                &self.buffer_pool,
-                root,
-                index,
-                definition,
-            )?;
-            let catalog_charge = catalog_candidate
-                .as_ref()
-                .map_or(0, |(_, retained_bytes)| *retained_bytes);
-            Self::ensure_delta_memory_growth(
-                batch,
-                catalog_charge.saturating_add(plan.retained_memory_bytes()),
-            )?;
-            let authority = ann_store::load_delta_mutation(&self.pages, &self.buffer_pool, plan)?;
-            if let Some((object, retained_bytes)) = catalog_candidate {
-                batch.state.catalog.create(object)?;
-                batch
-                    .delta
-                    .as_mut()
-                    .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-                    .catalog_object_memory_bytes
-                    .insert(index, retained_bytes);
-                added_catalog_object = true;
-            }
-            batch
-                .delta
-                .as_mut()
-                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-                .ann_mutations
-                .insert(index, authority);
-            Self::refresh_delta_memory_ledger(batch)?;
-            if let Err(error) = Self::ensure_delta_memory_growth(batch, candidate_charge) {
-                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
-                return Err(error);
-            }
-        }
+            .and_then(|delta| delta.ann_mutations.get(&index))
+            .map_or_else(
+                || ann_store::AnnDeltaMutationState::upsert_retained_memory_bytes(&vector),
+                |authority| authority.next_upsert_retained_memory_bytes(&vector),
+            );
+        let structural_growth = Self::next_delta_ann_structural_growth(batch, index)?;
+        let intent_charge =
+            delta_payload_retained_charge(std::mem::size_of::<u128>(), encoded.capacity(), 1, 1)
+                .saturating_add(publication_charge)
+                .saturating_add(structural_growth)
+                .saturating_add(delta_mutation_vector_growth(batch));
+        Self::ensure_delta_memory_growth(batch, intent_charge)?;
 
+        let (already_hydrated, added_catalog_object) =
+            self.ensure_delta_ann_authority(batch, index, intent_charge)?;
+        let physical_recovery_charge = batch
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.ann_mutations.get(&index))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .additional_physical_recovery_memory_bytes();
+        if let Err(error) = Self::ensure_delta_memory_growth(
+            batch,
+            intent_charge.saturating_add(physical_recovery_charge),
+        ) {
+            if !already_hydrated {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
         let staged = batch
             .delta
             .as_mut()
             .and_then(|delta| delta.ann_mutations.get_mut(&index))
-            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-            .upsert(object_id, vector);
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+            .and_then(|authority| {
+                ann_store::stage_delta_upsert(
+                    &self.pages,
+                    &self.buffer_pool,
+                    authority,
+                    object_id,
+                    vector,
+                )
+            });
         if let Err(error) = staged {
             if !already_hydrated {
                 Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
             }
             return Err(error);
         }
+        let mutation_count = batch.mutations.len();
+        let dirty = batch.dirty;
         batch.mutations.push(Mutation {
             engine: EngineKind::Search,
             opcode: Opcode::UpsertVector,
@@ -18804,7 +19206,245 @@ impl NativeDatabase {
             expires_at_micros: None,
         });
         batch.dirty[3] = true;
-        Self::refresh_delta_memory_ledger(batch)
+        if let Err(error) = Self::refresh_delta_memory_ledger(batch) {
+            batch.mutations.truncate(mutation_count);
+            batch.dirty = dirty;
+            if already_hydrated {
+                ann_store::rollback_delta_upsert(
+                    batch
+                        .delta
+                        .as_mut()
+                        .and_then(|delta| delta.ann_mutations.get_mut(&index))
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+                    object_id,
+                )?;
+                Self::refresh_delta_memory_ledger(batch)?;
+            } else {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Stages one complete-image named-vector absence fence in a delta batch.
+    ///
+    /// A present vector becomes an authenticated point tombstone. An absent
+    /// vector retains only conflict authority and produces no ANN page change.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_lines)]
+    pub fn stage_delta_vector_absence_fence(
+        &self,
+        batch: &mut NativeDeltaWriteBatch,
+        index: ObjectId,
+        object_id: ObjectId,
+    ) -> Result<bool, NativeRuntimeError> {
+        let batch = &mut batch.inner;
+        self.require_delta_batch(batch)?;
+        let payload_charge = delta_payload_retained_charge(std::mem::size_of::<u128>(), 0, 1, 0)
+            .saturating_add(delta_mutation_vector_growth(batch));
+        let candidate_charge = payload_charge
+            .saturating_add(ann_store::AnnDeltaMutationState::delete_retained_memory_bytes(false));
+        Self::ensure_delta_memory_growth(batch, candidate_charge)?;
+        let (already_hydrated, added_catalog_object) =
+            self.ensure_delta_ann_authority(batch, index, candidate_charge)?;
+        let authentication_peak = batch
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.ann_mutations.get(&index))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .delete_authentication_peak_memory_bytes();
+        if let Err(error) = Self::ensure_delta_memory_growth(
+            batch,
+            payload_charge.saturating_add(authentication_peak),
+        ) {
+            if !already_hydrated {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
+        let delete_plan = ann_store::plan_delta_delete(
+            &self.pages,
+            &self.buffer_pool,
+            batch
+                .delta
+                .as_ref()
+                .and_then(|delta| delta.ann_mutations.get(&index))
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+            object_id,
+        );
+        let delete_plan = match delete_plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                if !already_hydrated {
+                    Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = Self::ensure_delta_memory_growth(
+            batch,
+            payload_charge
+                .saturating_add(delete_plan.reservation_bytes())
+                .saturating_add(if delete_plan.is_physical() {
+                    Self::next_delta_ann_structural_growth(batch, index)?
+                } else {
+                    0
+                }),
+        ) {
+            if !already_hydrated {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
+        let staged = batch
+            .delta
+            .as_mut()
+            .and_then(|delta| delta.ann_mutations.get_mut(&index))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)
+            .and_then(|authority| {
+                ann_store::stage_delta_delete(
+                    &self.pages,
+                    &self.buffer_pool,
+                    authority,
+                    delete_plan,
+                )
+            });
+        let present = match staged {
+            Ok(present) => present,
+            Err(error) => {
+                if !already_hydrated {
+                    Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+                }
+                return Err(error);
+            }
+        };
+        if !present
+            && batch
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.opcode == Opcode::FenceVectorAbsence)
+                .count()
+                >= ann_store::MAX_ANN_DELTA_RECORDS
+        {
+            if already_hydrated {
+                ann_store::rollback_delta_delete(
+                    batch
+                        .delta
+                        .as_mut()
+                        .and_then(|delta| delta.ann_mutations.get_mut(&index))
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+                    delete_plan,
+                )?;
+                Self::refresh_delta_memory_ledger(batch)?;
+            } else {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(NativeRuntimeError::AnnDeltaLimitExceeded);
+        }
+        if let Err(error) = Self::refresh_delta_memory_ledger(batch)
+            .and_then(|()| Self::ensure_delta_memory_growth(batch, payload_charge))
+        {
+            if already_hydrated {
+                ann_store::rollback_delta_delete(
+                    batch
+                        .delta
+                        .as_mut()
+                        .and_then(|delta| delta.ann_mutations.get_mut(&index))
+                        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?,
+                    delete_plan,
+                )?;
+                Self::refresh_delta_memory_ledger(batch)?;
+            } else {
+                Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            }
+            return Err(error);
+        }
+        batch.mutations.push(Mutation {
+            engine: EngineKind::Search,
+            opcode: if present {
+                Opcode::DeleteVector
+            } else {
+                Opcode::FenceVectorAbsence
+            },
+            target: Some(index),
+            key: ann_store::encode_object_identity(object_id),
+            value: Vec::new(),
+            expires_at_micros: None,
+        });
+        batch.dirty[3] = true;
+        Self::refresh_delta_memory_ledger(batch)?;
+        Ok(present)
+    }
+
+    fn ensure_delta_ann_authority(
+        &self,
+        batch: &mut NativeWriteBatch,
+        index: ObjectId,
+        candidate_charge: u64,
+    ) -> Result<(bool, bool), NativeRuntimeError> {
+        let already_hydrated = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .ann_mutations
+            .contains_key(&index);
+        if already_hydrated {
+            return Ok((true, false));
+        }
+        let catalog_candidate = self.delta_search_index_candidate(batch, index)?;
+        let search_definition = match catalog_candidate
+            .as_ref()
+            .map(|(object, _)| object)
+            .or_else(|| batch.state.catalog.object(index))
+        {
+            Some(CatalogObject::Search(definition)) if definition.ann.is_some() => definition,
+            _ => return Err(NativeRuntimeError::UnknownVectorIndex { index }),
+        };
+        let definition = ann_store::definition_from_search(search_definition)?;
+        let root = batch
+            .snapshot
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let plan = ann_store::plan_delta_mutation(
+            &self.pages,
+            &self.buffer_pool,
+            root,
+            index,
+            definition,
+        )?;
+        let catalog_charge = catalog_candidate
+            .as_ref()
+            .map_or(0, |(_, retained_bytes)| *retained_bytes);
+        Self::ensure_delta_memory_growth(
+            batch,
+            catalog_charge.saturating_add(plan.retained_memory_bytes()),
+        )?;
+        let authority = ann_store::load_delta_mutation(&self.pages, &self.buffer_pool, plan)?;
+        let mut added_catalog_object = false;
+        if let Some((object, retained_bytes)) = catalog_candidate {
+            batch.state.catalog.create(object)?;
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .catalog_object_memory_bytes
+                .insert(index, retained_bytes);
+            added_catalog_object = true;
+        }
+        batch
+            .delta
+            .as_mut()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .ann_mutations
+            .insert(index, authority);
+        Self::refresh_delta_memory_ledger(batch)?;
+        if let Err(error) = Self::ensure_delta_memory_growth(batch, candidate_charge) {
+            Self::restore_delta_ann_hydration(batch, index, added_catalog_object)?;
+            return Err(error);
+        }
+        Ok((false, added_catalog_object))
     }
 
     fn restore_delta_ann_hydration(
@@ -18823,13 +19463,7 @@ impl NativeDatabase {
                 delta.catalog_object_memory_bytes.remove(&index);
             }
         }
-        let retained = replay_delta_retained_memory_bytes(batch);
-        batch
-            .delta
-            .as_mut()
-            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
-            .retained_memory_bytes = retained;
-        Ok(())
+        Self::refresh_delta_memory_ledger(batch)
     }
 
     fn require_delta_batch(&self, batch: &NativeWriteBatch) -> Result<(), NativeRuntimeError> {
@@ -18870,9 +19504,45 @@ impl NativeDatabase {
         Ok(())
     }
 
+    fn next_delta_ann_structural_growth(
+        batch: &NativeWriteBatch,
+        index: ObjectId,
+    ) -> Result<u64, NativeRuntimeError> {
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        Ok(ann_store::next_point_publication_structural_memory_growth(
+            &delta.ann_mutations,
+            index,
+        ))
+    }
+
     fn refresh_delta_memory_ledger(batch: &mut NativeWriteBatch) -> Result<(), NativeRuntimeError> {
+        let structural_memory_bytes = {
+            let delta = batch
+                .delta
+                .as_ref()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            ann_store::point_publication_structural_memory_bound(&delta.ann_mutations)
+        };
+        let previous_structural_memory_bytes = {
+            let delta = batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            std::mem::replace(
+                &mut delta.ann_replacement_structural_memory_bytes,
+                structural_memory_bytes,
+            )
+        };
         let retained = replay_delta_retained_memory_bytes(batch);
         if retained > Self::delta_memory_capacity(batch) {
+            batch
+                .delta
+                .as_mut()
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+                .ann_replacement_structural_memory_bytes = previous_structural_memory_bytes;
             return Err(GovernorAdmissionError::ParentCapacity.into());
         }
         batch
@@ -19905,6 +20575,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -20185,6 +20856,7 @@ impl NativeDatabase {
             blobs: &mut self.blobs,
             wal: &mut self.wal,
             conflicts: &mut self.conflicts,
+            search_recovery_memory: &mut self.search_recovery_memory,
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
@@ -20229,6 +20901,7 @@ impl NativeDatabase {
                 self.search_format,
             )?;
         }
+        batch.validate_materialized_ann_point_publication_reserve()?;
         reject_unsupported_v3_structure_mutations(self.structure_format, batch)?;
         Ok(())
     }
@@ -20339,6 +21012,7 @@ impl NativeDatabase {
             next_transaction_id: self.next_transaction_id,
             structure_format: self.structure_format,
             search_format: self.search_format,
+            search_recovery_memory: &self.search_recovery_memory,
         }
         .admit(batches)?;
         let GroupCommitAdmission {
@@ -20370,6 +21044,7 @@ impl NativeDatabase {
             relational_format: self.relational_format,
             structure_format: self.structure_format,
             search_format: self.search_format,
+            search_recovery_memory: std::mem::take(&mut self.search_recovery_memory),
         }
         .commit(accepted, initial_state, interruption)?;
         let execution_time = execution_started.elapsed();
@@ -20380,6 +21055,7 @@ impl NativeDatabase {
         }
         self.conflicts = conflicts_after_commit;
         self.next_transaction_id = next_transaction_id;
+        self.search_recovery_memory = storage_receipt.search_recovery_memory;
         for (request_index, receipt) in storage_receipt.committed {
             outcomes[request_index] = Some(GroupCommitOutcome::Committed(receipt));
         }
@@ -21266,6 +21942,7 @@ struct DeltaOverlay {
     retained_memory_bytes: u64,
     search_documents: BTreeSet<(ObjectId, Vec<u8>)>,
     ann_mutations: BTreeMap<ObjectId, ann_store::AnnDeltaMutationState>,
+    ann_replacement_structural_memory_bytes: u64,
     unique_probes: BTreeSet<DeltaUniqueProbe>,
 }
 
@@ -21455,7 +22132,9 @@ fn retained_search_bytes(state: &SearchState) -> u64 {
 }
 
 fn retained_delta_overlay_bytes(delta: &DeltaOverlay) -> u64 {
-    let mut bytes = delta.structure_hash_memory_bytes;
+    let mut bytes = delta
+        .structure_hash_memory_bytes
+        .saturating_add(delta.ann_replacement_structural_memory_bytes);
     for (_, primary_key) in &delta.relational_rows {
         bytes = bytes
             .saturating_add(DELTA_TREE_ENTRY_OVERHEAD)
@@ -21679,6 +22358,9 @@ pub struct NativeWriteBatch {
     ann_consolidation: Option<ann_store::ConsolidationPlan>,
     ann_consolidation_structure: Option<PrefixReplacementStructuralPlan>,
     ann_initial_bulk: Option<InitialAnnBulkPublication>,
+    ann_point_publications: Option<BTreeMap<ObjectId, ann_store::AnnPointPublication>>,
+    legacy_ann_indexes: BTreeSet<ObjectId>,
+    materialized_ann_point_publication_memory_bytes: u64,
     resource_permit: Option<OwnedGovernorPermit>,
 }
 
@@ -21712,7 +22394,7 @@ pub struct NativeDeltaWriteBatch {
 }
 
 impl NativeDeltaWriteBatch {
-    /// Returns the number of physical mutations currently retained by this batch.
+    /// Returns the number of WAL mutations currently retained by this batch.
     pub fn mutation_count(&self) -> usize {
         self.inner.mutation_count()
     }
@@ -21844,6 +22526,8 @@ struct AdmittedGroupCommit {
     conflict_read_csn: Option<Csn>,
     commit_csn: Csn,
     catalog_version: CatalogVersion,
+    wal_preflight: wal_codec::TransactionWalPreflight,
+    _wal_memory_permit: Option<OwnedNestedGovernorPermit>,
     batch: NativeWriteBatch,
 }
 
@@ -21865,12 +22549,14 @@ struct GroupCommitStorage<'database, 'coordinator> {
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    search_recovery_memory: SearchRecoveryMemoryAuthority,
 }
 
 struct GroupCommitStorageReceipt {
     committed: Vec<(usize, CommitReceipt)>,
     page_synchronization_time: Duration,
     wal_synchronization_time: Duration,
+    search_recovery_memory: SearchRecoveryMemoryAuthority,
 }
 
 impl GroupCommitStorage<'_, '_> {
@@ -21907,9 +22593,11 @@ impl GroupCommitStorage<'_, '_> {
             committed,
             page_synchronization_time,
             wal_synchronization_time,
+            search_recovery_memory: self.search_recovery_memory,
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stage_one(
         &mut self,
         admitted: AdmittedGroupCommit,
@@ -21923,6 +22611,8 @@ impl GroupCommitStorage<'_, '_> {
             conflict_read_csn,
             commit_csn,
             catalog_version,
+            wal_preflight,
+            _wal_memory_permit,
             mut batch,
         } = admitted;
         if self.root_group.next_commit_csn()? != commit_csn {
@@ -21940,8 +22630,22 @@ impl GroupCommitStorage<'_, '_> {
                 .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
         }
 
-        let roots = roots_from_snapshot(self.root_group.base_roots());
-        let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
+        let prior_roots = roots_from_snapshot(self.root_group.base_roots());
+        let point_mutations = write_batch_point_mutations(&batch);
+        if !point_mutations.is_empty() {
+            let published_plan = ann_store::plan_point_publications(
+                self.pages,
+                prior_roots[3].ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                &batch.state.catalog,
+                &point_mutations,
+                commit_csn,
+            )?;
+            if batch.ann_point_publications.as_ref() != Some(&published_plan) {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            batch.ann_point_publications = Some(published_plan);
+        }
+        let rebuild_catalog = catalog_requires_full_rebuild(self.pages, prior_roots[0])?;
         let staged_blobs = stage_large_values(self.blobs, &batch, rebuild_catalog, true)?;
         let blob_references = publish_staged_blobs(self.blobs, staged_blobs, true)?;
         let blob_generation = self.blobs.generation()?;
@@ -21949,7 +22653,7 @@ impl GroupCommitStorage<'_, '_> {
             self.pages,
             self.buffer_pool,
             self.blobs,
-            roots,
+            prior_roots,
             self.relational_format,
             self.structure_format,
             self.search_format,
@@ -21958,12 +22662,29 @@ impl GroupCommitStorage<'_, '_> {
             &batch,
             &blob_references,
         )?;
+        let refreshed_search_recovery = if batch.dirty[3] {
+            Some(refresh_search_recovery_memory(
+                self.pages,
+                &self.search_recovery_memory,
+                roots[3].ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                &batch,
+            )?)
+        } else {
+            None
+        };
         if batch.mode == NativeWriteBatchMode::Materialized {
             *physical_state = Some(std::mem::take(&mut batch.state));
         }
 
         let concrete_roots = require_roots(roots)?;
-        let wal_mutations = wal_mutations(&batch, &blob_references)?;
+        let wal_mutations = wal_mutations(
+            self.pages,
+            prior_roots[3],
+            roots[3],
+            &batch,
+            &blob_references,
+            wal_preflight,
+        )?;
         let page_generation = self.root_group.base_roots().page_generation();
         let retention_floor_csn = self
             .root_group
@@ -21995,6 +22716,9 @@ impl GroupCommitStorage<'_, '_> {
             root_map(concrete_roots),
             blob_generation,
         )?);
+        if let Some(refreshed) = refreshed_search_recovery {
+            self.search_recovery_memory.apply_refresh(refreshed);
+        }
         Ok((
             request_index,
             CommitReceipt {
@@ -22027,6 +22751,7 @@ pub struct NativeTransaction<'database> {
     blobs: &'database mut BlobStore,
     wal: &'database mut WalFile,
     conflicts: &'database mut ConflictTable,
+    search_recovery_memory: &'database mut SearchRecoveryMemoryAuthority,
     relational_format: RelationalFormat,
     structure_format: StructureFormat,
     search_format: SearchFormat,
@@ -22056,7 +22781,7 @@ impl DerefMut for NativeTransaction<'_> {
 
 impl NativeWriteBatch {
     fn scheduler_queue_retained_memory_bytes(&self) -> Result<u64, NativeRuntimeError> {
-        match self.mode {
+        let retained = match self.mode {
             NativeWriteBatchMode::PhysicalAllEngineDelta => {
                 let measured = replay_delta_retained_memory_bytes(self);
                 let ledger = self
@@ -22067,14 +22792,23 @@ impl NativeWriteBatch {
                 if measured == u64::MAX || measured != ledger {
                     return Err(NativeRuntimeError::InvalidPreparedMutation);
                 }
-                Ok(measured.max(1))
+                measured.max(1)
             }
-            NativeWriteBatchMode::Materialized => Ok(self
-                .resource_permit
-                .as_ref()
-                .map_or(1, |permit| permit.request().memory_bytes.max(1))),
-            _ => Err(NativeRuntimeError::InvalidPreparedMutation),
+            NativeWriteBatchMode::Materialized => {
+                return Ok(self
+                    .resource_permit
+                    .as_ref()
+                    .map_or(1, |permit| permit.request().memory_bytes.max(1)));
+            }
+            _ => return Err(NativeRuntimeError::InvalidPreparedMutation),
+        };
+        if self.mutations.is_empty() {
+            return Ok(retained);
         }
+        let preflight = preflight_wal_mutations(self)?;
+        retained
+            .checked_add(preflight.peak_memory_bytes())
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)
     }
 
     fn retain_scheduler_queue_memory(mut self) -> Result<Self, NativeRuntimeError> {
@@ -22136,8 +22870,78 @@ impl NativeWriteBatch {
             ann_consolidation: self.ann_consolidation.clone(),
             ann_consolidation_structure: self.ann_consolidation_structure.clone(),
             ann_initial_bulk: self.ann_initial_bulk.clone(),
+            ann_point_publications: self.ann_point_publications.clone(),
+            legacy_ann_indexes: self.legacy_ann_indexes.clone(),
+            materialized_ann_point_publication_memory_bytes: self
+                .materialized_ann_point_publication_memory_bytes,
             resource_permit,
         }
+    }
+
+    fn materialized_mutation_memory_capacity(&self) -> u64 {
+        self.resource_permit
+            .as_ref()
+            .map_or(MUTATION_MEMORY_BYTES, |permit| {
+                permit.request().memory_bytes
+            })
+            .min(MUTATION_MEMORY_BYTES)
+    }
+
+    fn reserve_materialized_ann_point_publication<'a>(
+        &'a mut self,
+        candidates: impl IntoIterator<Item = &'a Mutation>,
+        candidate_legacy_index: Option<ObjectId>,
+    ) -> Result<u64, NativeRuntimeError> {
+        if self.mode != NativeWriteBatchMode::Materialized {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let mut legacy_indexes = self.legacy_ann_indexes.clone();
+        legacy_indexes.extend(candidate_legacy_index);
+        let prior = self.materialized_ann_point_publication_memory_bytes;
+        let required = ann_store::materialized_point_publication_memory_bound(
+            self.mutations.iter().chain(candidates),
+            &legacy_indexes,
+        )?;
+        if required > self.materialized_mutation_memory_capacity() {
+            return Err(GovernorAdmissionError::ParentCapacity.into());
+        }
+        self.materialized_ann_point_publication_memory_bytes = required;
+        Ok(prior)
+    }
+
+    fn restore_materialized_ann_point_publication_reserve(&mut self, prior: u64) {
+        self.materialized_ann_point_publication_memory_bytes = prior;
+    }
+
+    #[cfg(test)]
+    fn mark_legacy_ann_index(&mut self, index: ObjectId) -> Result<(), NativeRuntimeError> {
+        self.legacy_ann_indexes.insert(index);
+        self.materialized_ann_point_publication_memory_bytes =
+            ann_store::materialized_point_publication_memory_bound(
+                self.mutations.iter(),
+                &self.legacy_ann_indexes,
+            )?;
+        Ok(())
+    }
+
+    fn validate_materialized_ann_point_publication_reserve(
+        &self,
+    ) -> Result<(), NativeRuntimeError> {
+        if self.mode != NativeWriteBatchMode::Materialized {
+            return (self.materialized_ann_point_publication_memory_bytes == 0)
+                .then_some(())
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let replayed = ann_store::materialized_point_publication_memory_bound(
+            self.mutations.iter(),
+            &self.legacy_ann_indexes,
+        )?;
+        if replayed != self.materialized_ann_point_publication_memory_bytes
+            || replayed > self.materialized_mutation_memory_capacity()
+        {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        Ok(())
     }
 
     /// Returns the next catalog identity owned by this transaction's private
@@ -22208,7 +23012,7 @@ impl NativeWriteBatch {
         sql::execute_bound_transaction_with_checkpoint(self, bound, parameters, &mut checkpoint)
     }
 
-    /// Returns the number of physical mutations currently retained by this batch.
+    /// Returns the number of WAL mutations currently retained by this batch.
     pub fn mutation_count(&self) -> usize {
         self.mutations.len()
     }
@@ -25415,18 +26219,31 @@ impl NativeWriteBatch {
         vector: Vector,
     ) -> Result<(), NativeRuntimeError> {
         self.require_materialized_mutation_entry()?;
-        let encoded = ann_store::encode_vector_mutation(&vector);
-        self.state
-            .ann
-            .upsert(index, object_id, ann_store::private_mutation_csn()?, vector)?;
-        self.mutations.push(Mutation {
+        let legacy = self.state.ann.requires_legacy_point_writer(index)?;
+        let mutation = Mutation {
             engine: EngineKind::Search,
             opcode: Opcode::UpsertVector,
             target: Some(index),
             key: ann_store::encode_object_identity(object_id),
-            value: encoded,
+            value: ann_store::encode_vector_mutation(&vector),
             expires_at_micros: None,
-        });
+        };
+        let prior_reserve = self.reserve_materialized_ann_point_publication(
+            std::iter::once(&mutation),
+            legacy.then_some(index),
+        )?;
+        if let Err(error) =
+            self.state
+                .ann
+                .upsert(index, object_id, ann_store::private_mutation_csn()?, vector)
+        {
+            self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+            return Err(error);
+        }
+        if legacy {
+            self.legacy_ann_indexes.insert(index);
+        }
+        self.mutations.push(mutation);
         self.dirty[3] = true;
         Ok(())
     }
@@ -25480,28 +26297,43 @@ impl NativeWriteBatch {
         let initializes_index = self.mutations.iter().any(|mutation| {
             mutation.opcode == Opcode::CreateAnnIndex && mutation.target == Some(index)
         });
-        if initializes_index {
+        let legacy = !initializes_index && self.state.ann.requires_legacy_point_writer(index)?;
+        let mutations = vectors
+            .iter()
+            .map(|(object_id, vector)| Mutation {
+                engine: EngineKind::Search,
+                opcode: Opcode::UpsertVector,
+                target: Some(index),
+                key: ann_store::encode_object_identity(*object_id),
+                value: ann_store::encode_vector_mutation(vector),
+                expires_at_micros: None,
+            })
+            .collect::<Vec<_>>();
+        let prior_reserve = self.reserve_materialized_ann_point_publication(
+            mutations.iter(),
+            legacy.then_some(index),
+        )?;
+        let staged = if initializes_index {
             self.state.ann.upsert_initial_many_with_progress(
                 index,
                 ann_store::private_mutation_csn()?,
                 &vectors,
                 progress,
-            )?;
+            )
         } else {
             self.state
                 .ann
-                .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)?;
+                .upsert_many(index, ann_store::private_mutation_csn()?, &vectors)
+        };
+        if let Err(error) = staged {
+            self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+            return Err(error);
+        }
+        if legacy {
+            self.legacy_ann_indexes.insert(index);
         }
         let count = vectors.len();
-        self.mutations
-            .extend(vectors.into_iter().map(|(object_id, vector)| Mutation {
-                engine: EngineKind::Search,
-                opcode: Opcode::UpsertVector,
-                target: Some(index),
-                key: ann_store::encode_object_identity(object_id),
-                value: ann_store::encode_vector_mutation(&vector),
-                expires_at_micros: None,
-            }));
+        self.mutations.extend(mutations);
         self.dirty[3] = true;
         Ok(count)
     }
@@ -25519,19 +26351,135 @@ impl NativeWriteBatch {
         object_id: ObjectId,
     ) -> Result<bool, NativeRuntimeError> {
         self.require_materialized_mutation_entry()?;
-        if !self.state.ann.delete(index, object_id)? {
+        let legacy = self.state.ann.requires_legacy_point_writer(index)?;
+        if !self.state.ann.contains_effective_record(index, object_id)? {
             return Ok(false);
         }
-        self.mutations.push(Mutation {
+        let mutation = Mutation {
             engine: EngineKind::Search,
             opcode: Opcode::DeleteVector,
             target: Some(index),
             key: ann_store::encode_object_identity(object_id),
             value: Vec::new(),
             expires_at_micros: None,
-        });
+        };
+        let prior_reserve = self.reserve_materialized_ann_point_publication(
+            std::iter::once(&mutation),
+            legacy.then_some(index),
+        )?;
+        match self.state.ann.delete(index, object_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            Err(error) => {
+                self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+                return Err(error);
+            }
+        }
+        if legacy {
+            self.legacy_ann_indexes.insert(index);
+        }
+        self.mutations.push(mutation);
         self.dirty[3] = true;
         Ok(true)
+    }
+
+    /// Stages complete-image absence for one named vector.
+    ///
+    /// Unlike [`Self::delete_vector`], an already absent vector still emits a
+    /// conflict-only delete authority so a concurrent upsert cannot survive a
+    /// complete document image that omitted this target.
+    #[doc(hidden)]
+    pub fn fence_vector_absence(
+        &mut self,
+        index: ObjectId,
+        object_id: ObjectId,
+    ) -> Result<bool, NativeRuntimeError> {
+        self.require_materialized_mutation_entry()?;
+        let legacy = self.state.ann.requires_legacy_point_writer(index)?;
+        let present = self.state.ann.contains_effective_record(index, object_id)?;
+        if !present
+            && self
+                .mutations
+                .iter()
+                .filter(|mutation| mutation.opcode == Opcode::FenceVectorAbsence)
+                .count()
+                >= ann_store::MAX_ANN_DELTA_RECORDS
+        {
+            return Err(NativeRuntimeError::AnnDeltaLimitExceeded);
+        }
+        let mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: if present {
+                Opcode::DeleteVector
+            } else {
+                Opcode::FenceVectorAbsence
+            },
+            target: Some(index),
+            key: ann_store::encode_object_identity(object_id),
+            value: Vec::new(),
+            expires_at_micros: None,
+        };
+        let prior_reserve = self.reserve_materialized_ann_point_publication(
+            std::iter::once(&mutation),
+            legacy.then_some(index),
+        )?;
+        if present {
+            match self.state.ann.delete(index, object_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                Err(error) => {
+                    self.restore_materialized_ann_point_publication_reserve(prior_reserve);
+                    return Err(error);
+                }
+            }
+        }
+        if legacy {
+            self.legacy_ann_indexes.insert(index);
+        }
+        self.mutations.push(mutation);
+        self.dirty[3] = true;
+        Ok(present)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upsert_vector_on_legacy_path_for_test(
+        &mut self,
+        index: ObjectId,
+        object_id: ObjectId,
+        vector: Vector,
+    ) -> Result<(), NativeRuntimeError> {
+        self.upsert_vector(index, object_id, vector)?;
+        self.mark_legacy_ann_index(index)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upsert_vectors_on_legacy_path_for_test(
+        &mut self,
+        index: ObjectId,
+        vectors: impl IntoIterator<Item = (ObjectId, Vector)>,
+    ) -> Result<usize, NativeRuntimeError> {
+        self.mark_legacy_ann_index(index)?;
+        self.upsert_vectors(index, vectors)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_vector_on_legacy_path_for_test(
+        &mut self,
+        index: ObjectId,
+        object_id: ObjectId,
+    ) -> Result<bool, NativeRuntimeError> {
+        let deleted = self.delete_vector(index, object_id)?;
+        if deleted {
+            self.mark_legacy_ann_index(index)?;
+        }
+        Ok(deleted)
     }
 
     /// Executes approximate vector search over the snapshot plus private
@@ -25801,10 +26749,13 @@ impl NativeTransaction<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn commit_report_at(
         mut self,
         interruption: Option<CommitInterruption>,
     ) -> Result<SingletonCommitReport, NativeRuntimeError> {
+        self.batch
+            .validate_materialized_ann_point_publication_reserve()?;
         let execution_started = Instant::now();
         if self.batch.mutations.is_empty() {
             return Err(WalSemanticError::InvalidSequence.into());
@@ -25813,9 +26764,26 @@ impl NativeTransaction<'_> {
         let commit_csn = self.root_transaction.commit_csn()?;
         let write_keys = self.validated_write_keys()?;
         let catalog_version = self.commit_catalog_version()?;
-        let batch = self.batch;
+        let mut batch = self.batch;
         let synchronize = batch.durability != DurabilityClass::Memory;
         let roots = roots_from_snapshot(batch.snapshot.roots());
+        let current_search_projection =
+            SearchRecoveryMemoryProjection::from_authority(self.search_recovery_memory);
+        let projected_search_recovery = if batch.dirty[3] {
+            Some(project_search_recovery_memory(
+                self.pages,
+                self.search_recovery_memory,
+                &current_search_projection,
+                roots[3],
+                &mut batch,
+                commit_csn,
+                None,
+                None,
+            )?)
+        } else {
+            None
+        };
+        let (wal_preflight, _wal_memory_permit) = reserve_wal_publication_memory(&batch)?;
         let rebuild_catalog = catalog_requires_full_rebuild(self.pages, roots[0])?;
         let staged_blobs = stage_large_values(self.blobs, &batch, rebuild_catalog, synchronize)?;
         let page_commit = commit_pages_and_blobs(
@@ -25836,7 +26804,31 @@ impl NativeTransaction<'_> {
             },
         )?;
 
-        let wal_mutations = wal_mutations(&batch, &page_commit.blob_references)?;
+        let wal_mutations = wal_mutations(
+            self.pages,
+            roots[3],
+            Some(page_commit.roots[3]),
+            &batch,
+            &page_commit.blob_references,
+            wal_preflight,
+        )?;
+        let refreshed_search_recovery = if batch.dirty[3] {
+            let refreshed = refresh_search_recovery_memory(
+                self.pages,
+                self.search_recovery_memory,
+                page_commit.roots[3],
+                &batch,
+            )?;
+            if let Some(projected) = projected_search_recovery.as_ref()
+                && (refreshed.lexical_retained_bytes > projected.lexical_retained_bytes
+                    || refreshed.ann_retained_bytes > projected.ann_retained_bytes)
+            {
+                return Err(NativeRuntimeError::InvalidSearchTree);
+            }
+            Some(refreshed)
+        } else {
+            None
+        };
         let page_generation = self.root_transaction.base_roots().page_generation();
         let retention_floor_csn = self
             .root_transaction
@@ -25875,6 +26867,9 @@ impl NativeTransaction<'_> {
             WalAnchor::new(block.last_lsn, block.digest)?,
         )?;
         self.conflicts.publish_committed(commit_csn, write_keys);
+        if let Some(refreshed) = refreshed_search_recovery {
+            self.search_recovery_memory.apply_refresh(refreshed);
+        }
         *self.next_transaction_id = self
             .transaction_id
             .get()
@@ -26419,6 +27414,7 @@ fn apply_set_mutation(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_mutations_to_state(
     state: &mut MaterializedState,
     mutations: &[Mutation],
@@ -26481,7 +27477,8 @@ fn apply_mutations_to_state(
             Opcode::CreateIndex
             | Opcode::IndexDocument
             | Opcode::ReplaceDocument
-            | Opcode::DeleteDocument => apply_search_mutation_to_state(state, mutation)?,
+            | Opcode::DeleteDocument
+            | Opcode::FenceVectorAbsence => apply_search_mutation_to_state(state, mutation)?,
             Opcode::CreateAnnIndex => {
                 apply_search_mutation_to_state(state, mutation)?;
                 let index = mutation
@@ -26517,7 +27514,9 @@ fn apply_mutations_to_state(
                     apply_search_mutation_to_state(state, mutation)?;
                 }
             }
-            Opcode::PublishInitialAnnBulk | Opcode::AnnDeltaAuthorityV1 => {
+            Opcode::PublishInitialAnnBulk
+            | Opcode::AnnDeltaAuthorityV1
+            | Opcode::AnnDeltaAuthorityV2 => {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
         }
@@ -26614,7 +27613,12 @@ fn apply_search_mutation_to_state(
             ann_store::decode_vector_mutation(&mutation.value)?,
         )?,
         Opcode::DeleteVector => {
-            if !state
+            state
+                .ann
+                .delete(index, ann_store::decode_object_identity(&mutation.key)?)?;
+        }
+        Opcode::FenceVectorAbsence => {
+            if state
                 .ann
                 .delete(index, ann_store::decode_object_identity(&mutation.key)?)?
             {
@@ -26657,8 +27661,12 @@ fn validate_maintenance_mutation(mutation: &Mutation) -> Result<(), NativeRuntim
             Ok(())
         }
         Opcode::ConsolidateAnn => {
-            if mutation.target.is_none() || !mutation.key.is_empty() || mutation.value.len() != 112
-            {
+            let valid_body = matches!(
+                (mutation.value.len(), mutation.value.get(..8)),
+                (112, Some(b"HYANNC01"))
+                    | (ann_store::ANN_CONSOLIDATION_V2_SIZE, Some(b"HYANNC02"))
+            );
+            if mutation.target.is_none() || !mutation.key.is_empty() || !valid_body {
                 return Err(NativeRuntimeError::InvalidPreparedMutation);
             }
             Ok(())
@@ -26834,13 +27842,35 @@ fn catalog_object_lifecycle_write_key(object: ObjectId) -> WriteKey {
 }
 
 fn mutation_write_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
-    mutation_conflict_keys(mutations, true)
+    let point_indexes = mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::AnnDeltaAuthorityV2 | Opcode::FenceVectorAbsence
+            )
+        })
+        .filter_map(|mutation| mutation.target)
+        .collect::<BTreeSet<_>>();
+    mutation_conflict_keys_with_points(mutations, true, &point_indexes)
 }
 
 #[allow(clippy::too_many_lines)]
 fn mutation_conflict_keys(mutations: &[Mutation], publish_ann_authority: bool) -> Vec<WriteKey> {
+    mutation_conflict_keys_with_points(mutations, publish_ann_authority, &BTreeSet::new())
+}
+
+#[allow(clippy::too_many_lines)]
+fn mutation_conflict_keys_with_points(
+    mutations: &[Mutation],
+    publish_ann_authority: bool,
+    point_indexes: &BTreeSet<ObjectId>,
+) -> Vec<WriteKey> {
     let mut keys = Vec::with_capacity(mutations.len().saturating_mul(3));
     for mutation in mutations {
+        if mutation.opcode == Opcode::AnnDeltaAuthorityV2 {
+            continue;
+        }
         if mutation.opcode == Opcode::VacuumPageGeneration {
             keys.push(vacuum_write_key());
             continue;
@@ -26892,7 +27922,7 @@ fn mutation_conflict_keys(mutations: &[Mutation], publish_ann_authority: bool) -
                 identity.extend_from_slice(&mutation.key);
                 identity
             }
-            Opcode::UpsertVector | Opcode::DeleteVector => {
+            Opcode::UpsertVector | Opcode::DeleteVector | Opcode::FenceVectorAbsence => {
                 let mut identity = Vec::with_capacity(mutation.key.len().saturating_add(1));
                 identity.push(3);
                 identity.extend_from_slice(&mutation.key);
@@ -26911,18 +27941,36 @@ fn mutation_conflict_keys(mutations: &[Mutation], publish_ann_authority: bool) -
             Opcode::ConsolidateAnn => vec![7],
             Opcode::PublishInitialAnnBulk => vec![10],
             Opcode::AnnDeltaAuthorityV1 => vec![12],
+            Opcode::AnnDeltaAuthorityV2 => unreachable!(),
             _ => mutation.key.clone(),
         };
         keys.push(WriteKey::new(mutation.engine, mutation.target, identity));
         if publish_ann_authority
             && matches!(
                 mutation.opcode,
-                Opcode::CreateAnnIndex
-                    | Opcode::UpsertVector
-                    | Opcode::DeleteVector
-                    | Opcode::ConsolidateAnn
-                    | Opcode::PublishInitialAnnBulk
+                Opcode::FenceVectorAbsence | Opcode::ConsolidateAnn | Opcode::PublishInitialAnnBulk
             )
+            && let Some(index) = mutation.target
+        {
+            keys.push(ann_lifecycle_fence_write_key(index));
+        }
+        if publish_ann_authority
+            && (matches!(
+                mutation.opcode,
+                Opcode::CreateAnnIndex | Opcode::ConsolidateAnn | Opcode::PublishInitialAnnBulk
+            ) || mutation.opcode == Opcode::DeleteVector
+                && mutation
+                    .target
+                    .is_none_or(|index| !point_indexes.contains(&index)))
+            && let Some(index) = mutation.target
+        {
+            keys.push(delta_ann_write_key(index));
+        }
+        if publish_ann_authority
+            && mutation.opcode == Opcode::UpsertVector
+            && mutation
+                .target
+                .is_some_and(|index| !point_indexes.contains(&index))
             && let Some(index) = mutation.target
         {
             keys.push(delta_ann_write_key(index));
@@ -26952,8 +28000,33 @@ fn mutation_conflict_keys(mutations: &[Mutation], publish_ann_authority: bool) -
     keys
 }
 
+fn write_batch_point_operation_counts(batch: &NativeWriteBatch) -> BTreeMap<ObjectId, u32> {
+    let mut counts = ann_store::point_operation_counts(&batch.mutations);
+    counts.retain(|index, _| !batch.legacy_ann_indexes.contains(index));
+    counts
+}
+
+fn write_batch_point_mutations(batch: &NativeWriteBatch) -> Vec<Mutation> {
+    batch
+        .mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation.opcode,
+                Opcode::UpsertVector | Opcode::DeleteVector | Opcode::FenceVectorAbsence
+            ) && mutation
+                .target
+                .is_some_and(|index| !batch.legacy_ann_indexes.contains(&index))
+        })
+        .cloned()
+        .collect()
+}
+
 fn write_batch_write_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
-    let mut keys = mutation_write_keys(&batch.mutations);
+    let point_indexes = write_batch_point_operation_counts(batch)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let mut keys = mutation_conflict_keys_with_points(&batch.mutations, true, &point_indexes);
     if let Some(delta) = &batch.delta {
         keys.extend(delta.unique_probes.iter().map(delta_unique_write_key));
     }
@@ -26962,15 +28035,22 @@ fn write_batch_write_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
 
 fn write_batch_validation_keys(batch: &NativeWriteBatch) -> Vec<WriteKey> {
     let mut keys = mutation_validation_keys(&batch.mutations);
+    let point_indexes = write_batch_point_operation_counts(batch)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    keys.extend(point_indexes.into_iter().map(delta_ann_write_key));
     if let Some(delta) = &batch.delta {
         keys.extend(delta.unique_probes.iter().map(delta_unique_write_key));
-        keys.extend(delta.ann_mutations.keys().copied().map(delta_ann_write_key));
     }
     keys
 }
 
 fn delta_ann_write_key(index: ObjectId) -> WriteKey {
     WriteKey::new(EngineKind::Search, Some(index), vec![12])
+}
+
+fn ann_lifecycle_fence_write_key(index: ObjectId) -> WriteKey {
+    WriteKey::new(EngineKind::Search, Some(index), vec![13])
 }
 
 fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
@@ -26982,6 +28062,32 @@ fn delta_unique_write_key(probe: &DeltaUniqueProbe) -> WriteKey {
 
 fn mutation_validation_keys(mutations: &[Mutation]) -> Vec<WriteKey> {
     let mut keys = mutation_conflict_keys(mutations, false);
+    keys.extend(
+        mutations
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation.opcode,
+                    Opcode::AnnDeltaAuthorityV2 | Opcode::DeleteVector
+                )
+            })
+            .filter_map(|mutation| mutation.target)
+            .map(delta_ann_write_key),
+    );
+    keys.extend(
+        mutations
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation.opcode,
+                    Opcode::FenceVectorAbsence
+                        | Opcode::ConsolidateAnn
+                        | Opcode::PublishInitialAnnBulk
+                )
+            })
+            .filter_map(|mutation| mutation.target)
+            .map(ann_lifecycle_fence_write_key),
+    );
     for mutation in mutations {
         if mutation.engine == EngineKind::Relational
             && matches!(
@@ -27032,9 +28138,11 @@ struct GroupCommitAdmissionContext<'a, 'coordinator> {
     next_transaction_id: u128,
     structure_format: StructureFormat,
     search_format: SearchFormat,
+    search_recovery_memory: &'a SearchRecoveryMemoryAuthority,
 }
 
 impl GroupCommitAdmissionContext<'_, '_> {
+    #[allow(clippy::too_many_lines)]
     fn admit(
         self,
         batches: Vec<NativeWriteBatch>,
@@ -27047,6 +28155,7 @@ impl GroupCommitAdmissionContext<'_, '_> {
             next_transaction_id,
             structure_format,
             search_format,
+            search_recovery_memory,
         } = self;
         let needs_materialized_state = batches
             .iter()
@@ -27057,13 +28166,17 @@ impl GroupCommitAdmissionContext<'_, '_> {
         let mut admission_state = initial_state.clone();
         let mut catalog_version = root_group.base_roots().catalog_version();
         let mut conflicts_after_commit = conflicts.clone();
+        let mut ann_layouts = BTreeMap::new();
+        let mut current_search_recovery =
+            SearchRecoveryMemoryProjection::from_authority(search_recovery_memory);
+        let mut ann_point_projection = ann_store::AnnPointProjection::default();
         let mut next_transaction_id = next_transaction_id;
         let mut accepted = Vec::with_capacity(batches.len());
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(batches.len())
             .collect::<Vec<_>>();
 
-        for (request_index, batch) in batches.into_iter().enumerate() {
+        for (request_index, mut batch) in batches.into_iter().enumerate() {
             let rejection = group_admission_rejection(
                 root_group,
                 &conflicts_after_commit,
@@ -27078,6 +28191,16 @@ impl GroupCommitAdmissionContext<'_, '_> {
                     continue;
                 }
             };
+            let mut candidate_ann_layouts = ann_layouts.clone();
+            if let Err(error) = validate_group_ann_layout(
+                pages,
+                root_group.base_roots().root(SLOT_SEARCH),
+                &batch,
+                &mut candidate_ann_layouts,
+            ) {
+                outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+                continue;
+            }
 
             let mut candidate_state = admission_state.clone();
             if let Some(state) = candidate_state.as_mut()
@@ -27085,6 +28208,35 @@ impl GroupCommitAdmissionContext<'_, '_> {
             {
                 outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
                 continue;
+            }
+            let commit_csn = root_group.commit_csn_at_offset(accepted.len())?;
+            let mut candidate_ann_point_projection = ann_point_projection.clone();
+            let candidate_search_recovery = if batch.dirty[3] {
+                match project_search_recovery_memory(
+                    pages,
+                    search_recovery_memory,
+                    &current_search_recovery,
+                    root_group.base_roots().root(SLOT_SEARCH),
+                    &mut batch,
+                    commit_csn,
+                    Some(&mut candidate_ann_point_projection),
+                    candidate_state.as_ref(),
+                ) {
+                    Ok(authority) => Some(authority),
+                    Err(error) => {
+                        outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(publications) = &batch.ann_point_publications {
+                for (index, publication) in publications {
+                    if publication.is_physical() {
+                        candidate_ann_layouts.insert(*index, 5);
+                    }
+                }
             }
             let candidate_catalog_version = if batch.dirty[0] {
                 if let Some(version) = catalog_version.checked_next() {
@@ -27098,7 +28250,13 @@ impl GroupCommitAdmissionContext<'_, '_> {
             } else {
                 catalog_version
             };
-            let commit_csn = root_group.commit_csn_at_offset(accepted.len())?;
+            let (wal_preflight, wal_memory_permit) = match reserve_wal_publication_memory(&batch) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    outcomes[request_index] = Some(GroupCommitOutcome::Rejected(error));
+                    continue;
+                }
+            };
             let transaction_id = TransactionId::new(next_transaction_id)
                 .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
             next_transaction_id = next_transaction_id
@@ -27106,6 +28264,11 @@ impl GroupCommitAdmissionContext<'_, '_> {
                 .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
             conflicts_after_commit.publish_committed(commit_csn, write_keys.clone());
             admission_state = candidate_state;
+            ann_layouts = candidate_ann_layouts;
+            if let Some(authority) = candidate_search_recovery {
+                current_search_recovery = authority;
+            }
+            ann_point_projection = candidate_ann_point_projection;
             catalog_version = candidate_catalog_version;
             accepted.push(AdmittedGroupCommit {
                 request_index,
@@ -27113,6 +28276,8 @@ impl GroupCommitAdmissionContext<'_, '_> {
                 conflict_read_csn: batch.snapshot.visible_csn,
                 commit_csn,
                 catalog_version,
+                wal_preflight,
+                _wal_memory_permit: wal_memory_permit,
                 batch,
             });
         }
@@ -27125,6 +28290,58 @@ impl GroupCommitAdmissionContext<'_, '_> {
             initial_state,
         })
     }
+}
+
+fn validate_group_ann_layout(
+    pages: &PageStore,
+    search_root: Option<PageId>,
+    batch: &NativeWriteBatch,
+    layouts: &mut BTreeMap<ObjectId, u8>,
+) -> Result<(), NativeRuntimeError> {
+    let point_indexes = write_batch_point_operation_counts(batch)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let mut operations = BTreeMap::<ObjectId, (bool, bool)>::new();
+    for mutation in &batch.mutations {
+        if !matches!(
+            mutation.opcode,
+            Opcode::CreateAnnIndex
+                | Opcode::UpsertVector
+                | Opcode::DeleteVector
+                | Opcode::FenceVectorAbsence
+                | Opcode::ConsolidateAnn
+                | Opcode::PublishInitialAnnBulk
+        ) {
+            continue;
+        }
+        let index = mutation
+            .target
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let operation = operations.entry(index).or_default();
+        operation.0 |= mutation.opcode == Opcode::CreateAnnIndex;
+        operation.1 |= !point_indexes.contains(&index);
+    }
+    for (index, (creates, uses_legacy_layout)) in operations {
+        let current = if let Some(version) = layouts.get(&index).copied() {
+            Some(version)
+        } else if let Some(root) = search_root {
+            ann_store::persisted_metadata_version(pages, root, index)?
+        } else {
+            None
+        };
+        if creates {
+            if current.is_some() {
+                return Err(NativeRuntimeError::InvalidPreparedMutation);
+            }
+            layouts.insert(index, 4);
+        } else if current.is_none() {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        if uses_legacy_layout && current == Some(5) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+    }
+    Ok(())
 }
 
 fn group_admission_rejection(
@@ -27154,6 +28371,7 @@ fn group_admission_rejection(
             search_format,
         )?;
     }
+    batch.validate_materialized_ann_point_publication_reserve()?;
     if batch.mutations.is_empty() {
         return Err(WalSemanticError::InvalidSequence.into());
     }
@@ -27646,6 +28864,7 @@ fn commit_engine_roots(
                 ann_consolidation: batch.ann_consolidation.as_ref(),
                 ann_consolidation_structure: batch.ann_consolidation_structure.as_ref(),
                 ann_initial_bulk: batch.ann_initial_bulk.as_ref(),
+                ann_point_publications: batch.ann_point_publications.as_ref(),
             },
         )?;
     }
@@ -27677,6 +28896,41 @@ fn catalog_requires_full_rebuild(
         }
         _ => Err(NativeRuntimeError::InvalidCatalogTree),
     }
+}
+
+fn catalog_object_at_physical_root(
+    pages: &PageStore,
+    buffer_pool: Option<&BufferPool>,
+    blobs: &BlobStore,
+    root: PageId,
+    id: ObjectId,
+) -> Result<Option<CatalogObject>, NativeRuntimeError> {
+    let page = pages.read(root)?;
+    if page.kind() == PageKind::CatalogRoot {
+        return Ok(CatalogState::decode(page.payload())?.object(id).cloned());
+    }
+    if !matches!(page.kind(), PageKind::BTreeLeaf | PageKind::BTreeInternal) {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    let stored = if let Some(buffer_pool) = buffer_pool {
+        BTree::from_root(root)
+            .get_cached_pinned(pages, buffer_pool, &catalog_object_key(id))?
+            .map(|value| value.bytes().to_vec())
+    } else {
+        BTree::from_root(root).get(pages, &catalog_object_key(id))?
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let definition = decode_catalog_definition_storage_value(&stored, blobs)?;
+    if definition.starts_with(b"HYCOBJ02") {
+        return Ok(None);
+    }
+    let object = CatalogObject::decode_definition(&definition)?;
+    if object.header().id != id {
+        return Err(NativeRuntimeError::InvalidCatalogTree);
+    }
+    Ok(Some(object))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -28792,7 +30046,7 @@ fn validate_physical_ann_consolidation(
                 && mutation.opcode == Opcode::ConsolidateAnn
                 && mutation.target == Some(plan.index())
                 && mutation.key.is_empty()
-                && mutation.value == ann_store::encode_consolidation_mutation(plan)
+                && ann_store::consolidation_mutation_matches_plan(plan, &mutation.value)
                 && mutation.expires_at_micros.is_none())
     });
     if roots.iter().all(Option::is_some)
@@ -28926,8 +30180,17 @@ fn validate_delta_write_batch_shape(
                     let vector_mutation = mutation
                         .target
                         .is_some_and(|index| delta.ann_mutations.contains_key(&index))
-                        && mutation.opcode == Opcode::UpsertVector
-                        && mutation.expires_at_micros.is_none();
+                        && matches!(
+                            mutation.opcode,
+                            Opcode::UpsertVector
+                                | Opcode::DeleteVector
+                                | Opcode::FenceVectorAbsence
+                        )
+                        && mutation.expires_at_micros.is_none()
+                        && (!matches!(
+                            mutation.opcode,
+                            Opcode::DeleteVector | Opcode::FenceVectorAbsence
+                        ) || mutation.value.is_empty());
                     document_mutation || vector_mutation
                 }
                 EngineKind::Kernel => false,
@@ -28942,6 +30205,8 @@ fn validate_delta_write_batch_shape(
     let valid_hash_overlay = validate_delta_hash_overlay_shape(batch, delta)?;
     let valid_ann_overlay =
         ann_store::validate_delta_mutation_batch(&delta.ann_mutations, &batch.mutations).is_ok();
+    let valid_ann_structural_memory = delta.ann_replacement_structural_memory_bytes
+        == ann_store::point_publication_structural_memory_bound(&delta.ann_mutations);
     let replayed_memory_bytes = replay_delta_retained_memory_bytes(batch);
     let valid_memory_ledger = replayed_memory_bytes == delta.retained_memory_bytes
         && replayed_memory_bytes <= NativeDatabase::delta_memory_capacity(batch);
@@ -28952,6 +30217,7 @@ fn validate_delta_write_batch_shape(
         && valid_unique_probes
         && valid_hash_overlay
         && valid_ann_overlay
+        && valid_ann_structural_memory
         && valid_memory_ledger
         && batch.dirty == expected_dirty
         && !batch.dirty[0]
@@ -29203,6 +30469,130 @@ fn search_document_storage_value(
     Ok(encoded)
 }
 
+fn wal_storage_value_length(mutation: &Mutation) -> Result<usize, NativeRuntimeError> {
+    let length = if mutation.engine == EngineKind::Relational
+        && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
+    {
+        1_usize.checked_add(if mutation.value.len() > RELATIONAL_INLINE_VALUE_LIMIT {
+            hyphae_native_records::BLOB_REFERENCE_SIZE
+        } else {
+            mutation.value.len()
+        })
+    } else if mutation.engine == EngineKind::Structure
+        && matches!(
+            mutation.opcode,
+            Opcode::SetValue
+                | Opcode::ExpireValue
+                | Opcode::SetHashField
+                | Opcode::PushListHead
+                | Opcode::PushListTail
+                | Opcode::PopListHead
+                | Opcode::PopListTail
+        )
+    {
+        STRUCTURE_VALUE_HEADER_SIZE.checked_add(
+            if mutation.value.len() > STRUCTURE_INLINE_VALUE_LIMIT {
+                hyphae_native_records::BLOB_REFERENCE_SIZE
+            } else {
+                mutation.value.len()
+            },
+        )
+    } else if mutation.engine == EngineKind::Search
+        && matches!(
+            mutation.opcode,
+            Opcode::IndexDocument | Opcode::ReplaceDocument
+        )
+    {
+        SEARCH_DOCUMENT_HEADER_SIZE.checked_add(
+            if mutation.value.len() > SEARCH_INLINE_VALUE_LIMIT {
+                hyphae_native_records::BLOB_REFERENCE_SIZE
+            } else {
+                mutation.value.len()
+            },
+        )
+    } else {
+        Some(mutation.value.len())
+    };
+    length.ok_or(NativeRuntimeError::InvalidPreparedMutation)
+}
+
+fn preflight_wal_mutations(
+    batch: &NativeWriteBatch,
+) -> Result<wal_codec::TransactionWalPreflight, NativeRuntimeError> {
+    let mut preflight = wal_codec::TransactionWalPreflightBuilder::default();
+    for mutation in &batch.mutations {
+        preflight.push(mutation.key.len(), wal_storage_value_length(mutation)?)?;
+    }
+    if let Some(publications) = &batch.ann_point_publications {
+        for publication in publications.values() {
+            if publication.authority().is_some() {
+                preflight.push(0, wal_codec::ANN_DELTA_AUTHORITY_V2_SIZE)?;
+            }
+        }
+    } else if batch.mode == NativeWriteBatchMode::PhysicalAllEngineDelta {
+        let delta = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        for (index, authority) in &delta.ann_mutations {
+            if authority.has_physical_intent() && !batch.legacy_ann_indexes.contains(index) {
+                preflight.push(0, wal_codec::ANN_DELTA_AUTHORITY_V2_SIZE)?;
+            }
+        }
+    }
+    preflight.finish().map_err(Into::into)
+}
+
+fn reserve_wal_publication_memory(
+    batch: &NativeWriteBatch,
+) -> Result<
+    (
+        wal_codec::TransactionWalPreflight,
+        Option<OwnedNestedGovernorPermit>,
+    ),
+    NativeRuntimeError,
+> {
+    let preflight = preflight_wal_mutations(batch)?;
+    let retained = if batch.mode == NativeWriteBatchMode::PhysicalAllEngineDelta {
+        let retained = replay_delta_retained_memory_bytes(batch);
+        let ledger = batch
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+        if retained == u64::MAX || retained != ledger {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        retained.max(1)
+    } else {
+        0
+    };
+    let publication_memory_bytes = retained
+        .checked_add(preflight.peak_memory_bytes())
+        .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+    let parent_memory_bytes = batch
+        .resource_permit
+        .as_ref()
+        .map_or(MUTATION_MEMORY_BYTES, |permit| {
+            permit.request().memory_bytes
+        });
+    if publication_memory_bytes > parent_memory_bytes {
+        return Err(GovernorAdmissionError::ParentCapacity.into());
+    }
+    let permit = batch
+        .resource_permit
+        .as_ref()
+        .map(|permit| {
+            permit.try_subdivide_owned(GovernorRequest {
+                compute_threads: 0,
+                io_slots: 0,
+                memory_bytes: publication_memory_bytes,
+            })
+        })
+        .transpose()?;
+    Ok((preflight, permit))
+}
+
 fn structure_tombstone_value() -> Vec<u8> {
     let mut encoded = Vec::with_capacity(STRUCTURE_VALUE_HEADER_SIZE);
     encoded.extend_from_slice(STRUCTURE_VALUE_MAGIC);
@@ -29452,61 +30842,96 @@ fn decode_delta_structure_value(encoded: &[u8]) -> Result<Option<()>, NativeRunt
 }
 
 fn wal_mutations(
+    pages: &PageStore,
+    prior_search_root: Option<PageId>,
+    result_search_root: Option<PageId>,
     batch: &NativeWriteBatch,
     blob_references: &BTreeMap<[u8; 32], BlobReference>,
+    preflight: wal_codec::TransactionWalPreflight,
 ) -> Result<Vec<Mutation>, NativeRuntimeError> {
-    let mut mutations = batch
-        .mutations
-        .iter()
-        .cloned()
-        .map(|mut mutation| {
-            if mutation.engine == EngineKind::Relational
-                && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
-            {
-                mutation.value = relational_storage_value(&mutation.value, blob_references)?;
-            } else if mutation.engine == EngineKind::Structure
-                && matches!(
-                    mutation.opcode,
-                    Opcode::SetValue
-                        | Opcode::ExpireValue
-                        | Opcode::SetHashField
-                        | Opcode::PushListHead
-                        | Opcode::PushListTail
-                        | Opcode::PopListHead
-                        | Opcode::PopListTail
-                )
-            {
-                mutation.value = structure_storage_value(
-                    &mutation.value,
-                    mutation.expires_at_micros,
-                    blob_references,
+    let mut mutations = Vec::with_capacity(preflight.mutation_count());
+    for mutation in &batch.mutations {
+        let value = if mutation.engine == EngineKind::Relational
+            && matches!(mutation.opcode, Opcode::InsertRow | Opcode::UpdateRow)
+        {
+            relational_storage_value(&mutation.value, blob_references)?
+        } else if mutation.engine == EngineKind::Structure
+            && matches!(
+                mutation.opcode,
+                Opcode::SetValue
+                    | Opcode::ExpireValue
+                    | Opcode::SetHashField
+                    | Opcode::PushListHead
+                    | Opcode::PushListTail
+                    | Opcode::PopListHead
+                    | Opcode::PopListTail
+            )
+        {
+            structure_storage_value(&mutation.value, mutation.expires_at_micros, blob_references)?
+        } else if mutation.engine == EngineKind::Search
+            && matches!(
+                mutation.opcode,
+                Opcode::IndexDocument | Opcode::ReplaceDocument
+            )
+        {
+            let text = std::str::from_utf8(&mutation.value)
+                .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
+            search_document_storage_value(
+                &mutation.value,
+                u64::try_from(analyze(text).len())
+                    .map_err(|_| NativeRuntimeError::InvalidSearchTree)?,
+                blob_references,
+            )?
+        } else {
+            mutation.value.clone()
+        };
+        mutations.push(Mutation {
+            engine: mutation.engine,
+            opcode: mutation.opcode,
+            target: mutation.target,
+            key: mutation.key.clone(),
+            value,
+            expires_at_micros: mutation.expires_at_micros,
+        });
+    }
+    let point_counts = write_batch_point_operation_counts(batch);
+    if !point_counts.is_empty() {
+        let publications = batch
+            .ann_point_publications
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        if publications.keys().ne(point_counts.keys()) {
+            return Err(NativeRuntimeError::InvalidPreparedMutation);
+        }
+        let prior_root = prior_search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result_root = result_search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        for index in point_counts.keys().copied() {
+            let publication = publications
+                .get(&index)
+                .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+            ann_store::validate_point_publication_transition(
+                pages,
+                prior_root,
+                result_root,
+                publication,
+            )?;
+            if let Some(planned) = publication.authority() {
+                let authority = ann_store::ann_delta_authority_between_roots(
+                    pages,
+                    prior_root,
+                    result_root,
+                    index,
+                    planned.operation_count,
                 )?;
-            } else if mutation.engine == EngineKind::Search
-                && matches!(
-                    mutation.opcode,
-                    Opcode::IndexDocument | Opcode::ReplaceDocument
-                )
-            {
-                let text = std::str::from_utf8(&mutation.value)
-                    .map_err(|_| NativeRuntimeError::InvalidSearchTree)?;
-                mutation.value = search_document_storage_value(
-                    &mutation.value,
-                    u64::try_from(analyze(text).len())
-                        .map_err(|_| NativeRuntimeError::InvalidSearchTree)?,
-                    blob_references,
-                )?;
+                if planned != authority {
+                    return Err(NativeRuntimeError::InvalidPreparedMutation);
+                }
+                mutations.push(wal_codec::ann_delta_authority_marker_v2(authority));
             }
-            Ok(mutation)
-        })
-        .collect::<Result<Vec<_>, NativeRuntimeError>>()?;
-    if let Some(delta) = &batch.delta {
-        mutations.extend(
-            delta
-                .ann_mutations
-                .keys()
-                .copied()
-                .map(wal_codec::ann_delta_authority_marker_v1),
-        );
+        }
+    }
+    if mutations.len() != preflight.mutation_count() {
+        return Err(NativeRuntimeError::InvalidPreparedMutation);
     }
     Ok(mutations)
 }
@@ -34087,6 +35512,7 @@ fn search_tree_after_mutations(
         catalog,
         mutations,
         context.ann_delta,
+        context.ann_point_publications,
     )
 }
 
@@ -34504,6 +35930,7 @@ struct SearchMutationContext<'a> {
     ann_consolidation: Option<&'a ann_store::ConsolidationPlan>,
     ann_consolidation_structure: Option<&'a PrefixReplacementStructuralPlan>,
     ann_initial_bulk: Option<&'a InitialAnnBulkPublication>,
+    ann_point_publications: Option<&'a BTreeMap<ObjectId, ann_store::AnnPointPublication>>,
 }
 
 fn search_root_after_mutations(
@@ -34566,7 +35993,10 @@ fn search_root_after_mutations(
             if context.mutations.iter().any(|mutation| {
                 matches!(
                     mutation.opcode,
-                    Opcode::CreateAnnIndex | Opcode::UpsertVector | Opcode::DeleteVector
+                    Opcode::CreateAnnIndex
+                        | Opcode::UpsertVector
+                        | Opcode::DeleteVector
+                        | Opcode::FenceVectorAbsence
                 )
             }) {
                 return Err(NativeRuntimeError::InvalidAnnTree);
@@ -36427,7 +37857,17 @@ fn recover_wal_and_close_dangling(
     Ok(recovered)
 }
 
-type CommittedRootsRecovery = (BTreeMap<Csn, RootSet>, Option<RootSet>, Duration);
+type CommittedRootsRecovery = (
+    BTreeMap<Csn, RootSet>,
+    Option<RootSet>,
+    SearchRecoveryMemoryAuthority,
+    Duration,
+);
+type RecoveredRootState = (
+    BTreeMap<Csn, RootSet>,
+    Option<RootSet>,
+    SearchRecoveryMemoryAuthority,
+);
 
 fn recover_committed_roots_timed(
     commits: &[wal_codec::RecoveredCommit],
@@ -36436,8 +37876,9 @@ fn recover_committed_roots_timed(
     base_root: Option<RootSet>,
 ) -> Result<CommittedRootsRecovery, NativeRuntimeError> {
     let started = Instant::now();
-    let (committed, latest) = recover_committed_roots(commits, wal_recovery, storage, base_root)?;
-    Ok((committed, latest, started.elapsed()))
+    let (committed, latest, authority) =
+        recover_committed_roots(commits, wal_recovery, storage, base_root)?;
+    Ok((committed, latest, authority, started.elapsed()))
 }
 
 fn recover_committed_roots(
@@ -36445,9 +37886,10 @@ fn recover_committed_roots(
     wal_recovery: &WalRecovery,
     storage: &RetainedPageState<'_>,
     base_root: Option<RootSet>,
-) -> Result<(BTreeMap<Csn, RootSet>, Option<RootSet>), NativeRuntimeError> {
+) -> Result<RecoveredRootState, NativeRuntimeError> {
     let mut committed_roots = BTreeMap::new();
     let mut latest_root = base_root;
+    let mut latest_authority = None;
     if let Some(root) = latest_root.as_ref() {
         let visible_csn = root
             .visible_csn()
@@ -36465,7 +37907,12 @@ fn recover_committed_roots(
             .iter()
             .all(|recovered| recovered.manifest.commit_csn < storage.retention_floor_csn)
         {
-            validate_roots(storage.pages, storage.blobs, root, visible_csn)?;
+            latest_authority = Some(validate_roots_with_search_recovery_authority(
+                storage.pages,
+                storage.blobs,
+                root,
+                visible_csn,
+            )?);
         } else {
             validate_root_structure(storage.pages, root, visible_csn)?;
         }
@@ -36475,6 +37922,7 @@ fn recover_committed_roots(
         .last()
         .map(|recovered| recovered.manifest.commit_csn);
     for recovered in commits {
+        let prior_root = latest_root.clone();
         let anchor_digest = digest_for_lsn(wal_recovery, recovered.commit_lsn)?;
         let root = RootSet::committed_with_storage(
             recovered.manifest.commit_csn,
@@ -36498,20 +37946,436 @@ fn recover_committed_roots(
             // logical state; a superseded root is reachable to readers only
             // through a snapshot pin, which performs that decode when used.
             if Some(recovered.manifest.commit_csn) == latest_commit_csn {
-                validate_roots(
+                latest_authority = Some(validate_roots_with_search_recovery_authority(
                     storage.pages,
                     storage.blobs,
                     &root,
                     recovered.manifest.commit_csn,
-                )?;
+                )?);
             } else {
                 validate_root_structure(storage.pages, &root, recovered.manifest.commit_csn)?;
             }
+            validate_recovered_ann_overlay_transitions(
+                storage.pages,
+                storage.blobs,
+                prior_root.as_ref(),
+                &root,
+                recovered,
+            )?;
         }
         committed_roots.insert(recovered.manifest.commit_csn, root.clone());
         latest_root = Some(root);
     }
-    Ok((committed_roots, latest_root))
+    if latest_root.is_some() && latest_authority.is_none() {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    Ok((
+        committed_roots,
+        latest_root,
+        latest_authority.unwrap_or_default(),
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_recovered_ann_overlay_transitions(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    prior_roots: Option<&RootSet>,
+    result_roots: &RootSet,
+    recovered: &wal_codec::RecoveredCommit,
+) -> Result<(), NativeRuntimeError> {
+    let page_generation_changed =
+        prior_roots.is_some_and(|roots| roots.page_generation() != result_roots.page_generation());
+    if page_generation_changed {
+        if !is_exact_vacuum_page_generation_commit(recovered) {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        return validate_roots(pages, blobs, result_roots, recovered.manifest.commit_csn);
+    }
+    if recovered
+        .mutations
+        .iter()
+        .any(|mutation| mutation.opcode == Opcode::VacuumPageGeneration)
+    {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    let contains_overlay_wal = recovered.mutations.iter().any(|mutation| {
+        matches!(
+            mutation.opcode,
+            Opcode::UpsertVector
+                | Opcode::DeleteVector
+                | Opcode::AnnDeltaAuthorityV2
+                | Opcode::FenceVectorAbsence
+        )
+    });
+    let prior_search_root = prior_roots.and_then(|roots| roots.root(SLOT_SEARCH));
+    let pure_absence_fence = recovered
+        .mutations
+        .iter()
+        .all(|mutation| mutation.opcode == Opcode::FenceVectorAbsence);
+    if pure_absence_fence {
+        let prior = prior_roots.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if ROOT_SLOTS
+            .into_iter()
+            .any(|slot| prior.root(slot) != result_roots.root(slot))
+            || prior.blob_generation() != result_roots.blob_generation()
+            || prior.catalog_version() != result_roots.catalog_version()
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+    }
+    let result_search_root = result_roots
+        .root(SLOT_SEARCH)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    let result_is_btree = matches!(
+        pages.read(result_search_root)?.kind(),
+        PageKind::BTreeLeaf | PageKind::BTreeInternal
+    );
+    let prior_is_btree = prior_search_root
+        .map(|root| {
+            pages
+                .read(root)
+                .map(|page| matches!(page.kind(), PageKind::BTreeLeaf | PageKind::BTreeInternal))
+        })
+        .transpose()?
+        .unwrap_or(result_is_btree);
+    if !prior_is_btree || !result_is_btree {
+        return if contains_overlay_wal {
+            Err(NativeRuntimeError::InvalidCommittedRoot)
+        } else {
+            Ok(())
+        };
+    }
+    let physical_changes =
+        ann_store::changed_physical_indexes(pages, prior_search_root, result_search_root)
+            .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+    if (physical_changes.changed_keys == 0) != physical_changes.indexes.is_empty() {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    let mut consolidation_mutations = BTreeMap::new();
+    for mutation in recovered
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.opcode == Opcode::ConsolidateAnn)
+    {
+        let index = mutation
+            .target
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if consolidation_mutations.insert(index, mutation).is_some() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+    }
+    if !consolidation_mutations.is_empty() {
+        let prior = prior_roots.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if [SLOT_CATALOG, SLOT_RELATIONAL, SLOT_STRUCTURE]
+            .into_iter()
+            .any(|slot| prior.root(slot) != result_roots.root(slot))
+            || prior.blob_generation() != result_roots.blob_generation()
+            || prior.catalog_version() != result_roots.catalog_version()
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+    }
+    let absence_fence_targets = recovered
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.opcode == Opcode::FenceVectorAbsence)
+        .map(|mutation| {
+            mutation
+                .target
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut m05_targets = BTreeSet::new();
+    let mut legacy_point_targets = BTreeSet::new();
+    let mut consolidation_targets = BTreeSet::new();
+    let created_targets = recovered
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.opcode == Opcode::CreateAnnIndex)
+        .map(|mutation| {
+            mutation
+                .target
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let initial_bulk_targets = recovered
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.opcode == Opcode::PublishInitialAnnBulk)
+        .map(|mutation| {
+            mutation
+                .target
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let physical_wal_targets = recovered
+        .mutations
+        .iter()
+        .filter(|mutation| matches!(mutation.opcode, Opcode::UpsertVector | Opcode::DeleteVector))
+        .map(|mutation| {
+            mutation
+                .target
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for index in physical_changes.indexes.iter().copied() {
+        let prior_version = prior_search_root
+            .map(|root| ann_store::persisted_metadata_version(pages, root, index))
+            .transpose()?
+            .flatten();
+        let result_version =
+            ann_store::persisted_metadata_version(pages, result_search_root, index)?;
+        if prior_version.is_none() && result_version.is_none() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        if consolidation_mutations.contains_key(&index) {
+            consolidation_targets.insert(index);
+        } else if created_targets.contains(&index) {
+            if prior_version.is_some() || result_version.is_none() {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+        } else if initial_bulk_targets.contains(&index) {
+            if prior_version.is_none() || result_version.is_none() {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+        } else if prior_version == Some(5) || result_version == Some(5) {
+            m05_targets.insert(index);
+        } else if prior_version.is_some_and(|version| matches!(version, 1..=4))
+            && result_version == Some(4)
+        {
+            legacy_point_targets.insert(index);
+        } else {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+    }
+    for index in absence_fence_targets
+        .difference(&physical_changes.indexes)
+        .copied()
+    {
+        if created_targets.contains(&index) {
+            continue;
+        }
+        let prior_version = prior_search_root
+            .map(|root| ann_store::persisted_metadata_version(pages, root, index))
+            .transpose()?
+            .flatten();
+        let result_version =
+            ann_store::persisted_metadata_version(pages, result_search_root, index)?;
+        if prior_version.is_some_and(|version| matches!(version, 1..=4))
+            && result_version == prior_version
+        {
+            legacy_point_targets.insert(index);
+        }
+    }
+    if consolidation_targets
+        != consolidation_mutations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    if !created_targets.is_subset(&physical_changes.indexes)
+        || !initial_bulk_targets.is_subset(&physical_changes.indexes)
+        || physical_wal_targets.iter().any(|index| {
+            !created_targets.contains(index)
+                && !initial_bulk_targets.contains(index)
+                && !legacy_point_targets.contains(index)
+                && !m05_targets.contains(index)
+        })
+        || legacy_point_targets.iter().any(|index| {
+            !physical_wal_targets.contains(index) && !absence_fence_targets.contains(index)
+        })
+        || m05_targets
+            .iter()
+            .any(|index| !physical_wal_targets.contains(index))
+    {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    if !created_targets.is_disjoint(&initial_bulk_targets) {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    let mut authorities = BTreeMap::new();
+    for mutation in recovered
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.opcode == Opcode::AnnDeltaAuthorityV2)
+    {
+        let authority = wal_codec::ann_delta_authority_v2(mutation)?;
+        if authorities.insert(authority.index, authority).is_some() {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+    }
+    if authorities.keys().copied().collect::<BTreeSet<_>>() != m05_targets {
+        return Err(NativeRuntimeError::InvalidCommittedRoot);
+    }
+    let validation_targets = m05_targets
+        .union(&absence_fence_targets)
+        .copied()
+        .chain(legacy_point_targets.iter().copied())
+        .chain(created_targets.iter().copied())
+        .chain(initial_bulk_targets.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if validation_targets.is_empty() && consolidation_targets.is_empty() {
+        return Ok(());
+    }
+    let catalog_root = result_roots
+        .root(SLOT_CATALOG)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    for index in validation_targets {
+        let authority = authorities.get(&index).copied();
+        let definition =
+            match catalog_object_at_physical_root(pages, None, blobs, catalog_root, index)? {
+                Some(CatalogObject::Search(definition)) if definition.ann.is_some() => {
+                    ann_store::definition_from_search(&definition)?
+                }
+                _ => return Err(NativeRuntimeError::InvalidCommittedRoot),
+            };
+        if created_targets.contains(&index) {
+            if authority.is_some() {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+            let mutations = recovered
+                .mutations
+                .iter()
+                .filter(|mutation| {
+                    matches!(
+                        mutation.opcode,
+                        Opcode::CreateAnnIndex
+                            | Opcode::UpsertVector
+                            | Opcode::DeleteVector
+                            | Opcode::FenceVectorAbsence
+                            | Opcode::PublishInitialAnnBulk
+                            | Opcode::ConsolidateAnn
+                            | Opcode::AnnDeltaAuthorityV1
+                            | Opcode::AnnDeltaAuthorityV2
+                    ) && mutation.target == Some(index)
+                })
+                .collect::<Vec<_>>();
+            ann_store::validate_recovered_created_point_transition(
+                pages,
+                prior_search_root,
+                result_search_root,
+                definition,
+                &mutations,
+                recovered.manifest.commit_csn,
+            )
+            .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+            continue;
+        }
+        let prior_search_root =
+            prior_search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        if initial_bulk_targets.contains(&index) {
+            if authority.is_some() {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+            let mutations = recovered
+                .mutations
+                .iter()
+                .filter(|mutation| {
+                    matches!(
+                        mutation.opcode,
+                        Opcode::CreateAnnIndex
+                            | Opcode::UpsertVector
+                            | Opcode::DeleteVector
+                            | Opcode::FenceVectorAbsence
+                            | Opcode::PublishInitialAnnBulk
+                            | Opcode::ConsolidateAnn
+                            | Opcode::AnnDeltaAuthorityV1
+                            | Opcode::AnnDeltaAuthorityV2
+                    ) && mutation.target == Some(index)
+                })
+                .collect::<Vec<_>>();
+            ann_store::validate_recovered_initial_bulk_transition(
+                pages,
+                prior_search_root,
+                result_search_root,
+                definition,
+                &mutations,
+                recovered.manifest.commit_csn,
+            )
+            .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+            continue;
+        }
+        let mutations = recovered
+            .mutations
+            .iter()
+            .filter(|mutation| {
+                matches!(
+                    mutation.opcode,
+                    Opcode::UpsertVector | Opcode::DeleteVector | Opcode::FenceVectorAbsence
+                ) && mutation.target == Some(index)
+            })
+            .collect::<Vec<_>>();
+        if legacy_point_targets.contains(&index) {
+            if authority.is_some() {
+                return Err(NativeRuntimeError::InvalidCommittedRoot);
+            }
+            ann_store::validate_recovered_legacy_point_transition(
+                pages,
+                prior_search_root,
+                result_search_root,
+                definition,
+                &mutations,
+                recovered.manifest.commit_csn,
+            )
+            .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+            continue;
+        }
+        if authority.is_none()
+            && mutations
+                .iter()
+                .any(|mutation| mutation.opcode != Opcode::FenceVectorAbsence)
+        {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        ann_store::validate_recovered_point_transition(
+            pages,
+            prior_search_root,
+            result_search_root,
+            definition,
+            &mutations,
+            recovered.manifest.commit_csn,
+            authority,
+        )
+        .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+    }
+    for index in consolidation_targets {
+        let prior_search_root =
+            prior_search_root.ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let definition =
+            match catalog_object_at_physical_root(pages, None, blobs, catalog_root, index)? {
+                Some(CatalogObject::Search(definition)) if definition.ann.is_some() => {
+                    ann_store::definition_from_search(&definition)?
+                }
+                _ => return Err(NativeRuntimeError::InvalidCommittedRoot),
+            };
+        ann_store::validate_recovered_consolidation_transition(
+            pages,
+            prior_search_root,
+            result_search_root,
+            definition,
+            consolidation_mutations
+                .get(&index)
+                .copied()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        )
+        .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?;
+    }
+    Ok(())
+}
+
+fn is_exact_vacuum_page_generation_commit(recovered: &wal_codec::RecoveredCommit) -> bool {
+    recovered.durability == DurabilityClass::Strict
+        && recovered.manifest.logical_time_micros == 0
+        && matches!(recovered.mutations.as_slice(), [mutation]
+            if mutation.engine == EngineKind::Kernel
+                && mutation.opcode == Opcode::VacuumPageGeneration
+                && mutation.target.is_none()
+                && mutation.key.is_empty()
+                && mutation.value.is_empty()
+                && mutation.expires_at_micros.is_none())
 }
 
 #[cfg(test)]
@@ -36536,6 +38400,7 @@ fn validate_commit_sequence_after(
     let mut prior_page_generation = base_root.map(RootSet::page_generation);
     let mut prior_retention_floor = base_root.and_then(RootSet::retention_floor_csn);
     let mut prior_blob_generation = base_root.map_or(0, RootSet::blob_generation);
+    let mut prior_catalog_version = base_root.map(RootSet::catalog_version);
     for commit in commits {
         let page_generation = commit.manifest.page_generation;
         let retention_floor_csn = commit.manifest.retention_floor_csn;
@@ -36549,6 +38414,10 @@ fn validate_commit_sequence_after(
             (Some(prior_generation), Some(_)) => {
                 prior_generation.checked_next() == Some(page_generation)
                     && retention_floor_csn == commit.manifest.commit_csn
+                    && is_exact_vacuum_page_generation_commit(commit)
+                    && commit.manifest.read_csn == prior
+                    && prior_catalog_version == Some(commit.manifest.catalog_version)
+                    && commit.manifest.blob_generation == prior_blob_generation
             }
             _ => false,
         };
@@ -36559,6 +38428,11 @@ fn validate_commit_sequence_after(
                 .is_some_and(|read| prior.is_none_or(|published| read > published))
             || commit.manifest.blob_generation < prior_blob_generation
             || !storage_transition_valid
+            || prior_page_generation.is_none_or(|prior| prior == page_generation)
+                && commit
+                    .mutations
+                    .iter()
+                    .any(|mutation| mutation.opcode == Opcode::VacuumPageGeneration)
         {
             return Err(NativeRuntimeError::NoncontiguousCommitSequence);
         }
@@ -36566,6 +38440,7 @@ fn validate_commit_sequence_after(
         prior_page_generation = Some(page_generation);
         prior_retention_floor = Some(retention_floor_csn);
         prior_blob_generation = commit.manifest.blob_generation;
+        prior_catalog_version = Some(commit.manifest.catalog_version);
         expected = expected
             .checked_add(1)
             .ok_or(NativeRuntimeError::NoncontiguousCommitSequence)?;
@@ -36597,9 +38472,17 @@ fn validate_roots(
     roots: &RootSet,
     visible_csn: Csn,
 ) -> Result<(), NativeRuntimeError> {
+    validate_roots_with_search_recovery_authority(pages, blobs, roots, visible_csn).map(|_| ())
+}
+
+fn validate_roots_with_search_recovery_authority(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+    visible_csn: Csn,
+) -> Result<SearchRecoveryMemoryAuthority, NativeRuntimeError> {
     validate_root_structure(pages, roots, visible_csn)?;
-    load_state(pages, blobs, roots)?;
-    Ok(())
+    load_state_with_search_recovery_authority(pages, blobs, roots).map(|(_, authority)| authority)
 }
 
 /// Structurally verifies one committed root set without decoding its
@@ -36704,6 +38587,14 @@ fn load_state(
     blobs: &BlobStore,
     roots: &RootSet,
 ) -> Result<MaterializedState, NativeRuntimeError> {
+    load_state_with_search_recovery_authority(pages, blobs, roots).map(|(state, _)| state)
+}
+
+fn load_state_with_search_recovery_authority(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+) -> Result<(MaterializedState, SearchRecoveryMemoryAuthority), NativeRuntimeError> {
     record_full_state_materialization()?;
     let catalog = load_catalog_state(pages, blobs, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
@@ -36717,13 +38608,29 @@ fn load_state(
         &catalog,
         ann_memory_limit,
     )?;
-    Ok(MaterializedState {
-        catalog,
-        relational,
-        structures: load_structure_state(pages, blobs, roots)?,
-        search,
-        ann,
-    })
+    let ann_by_index = ann.recovery_memory_by_index();
+    let ann_retained_bytes = ann_by_index.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)
+    })?;
+    let authority = SearchRecoveryMemoryAuthority {
+        root: roots.root(SLOT_SEARCH),
+        lexical_retained_bytes: search_retained_bytes,
+        ann_by_index,
+        ann_retained_bytes,
+        contains_m05: ann.contains_m05(),
+    };
+    Ok((
+        MaterializedState {
+            catalog,
+            relational,
+            structures: load_structure_state(pages, blobs, roots)?,
+            search,
+            ann,
+        },
+        authority,
+    ))
 }
 
 fn load_catalog_state(
@@ -38008,6 +39915,106 @@ fn load_search_state_root(
     load_search_state_root_with_retained(pages, blobs, root).map(|(state, _)| state)
 }
 
+fn measure_search_recovery_retained_bytes(
+    pages: &PageStore,
+    root: PageId,
+) -> Result<u64, NativeRuntimeError> {
+    let tree = BTree::from_root(root);
+    let mut format = None;
+    let mut retained_bytes = 0_u64;
+    let mut failure = None;
+    let stats = tree
+        .visit_range_borrowed_with_control(
+            pages,
+            Bound::Unbounded,
+            Bound::Excluded(&[5]),
+            BorrowedVisitLimits {
+                maximum_entries: usize::try_from(RECOVERY_MEMORY_BYTES / 512).unwrap_or(usize::MAX),
+                maximum_bytes: RECOVERY_MEMORY_BYTES,
+            },
+            || ControlFlow::Continue(()),
+            |key, value| {
+                let result = (|| {
+                    let logical_value_bytes = match key.first().copied() {
+                        Some(0) if key == SEARCH_FORMAT_KEY && format.is_none() => {
+                            format = Some(PhysicalSearchFormat::decode(value)?);
+                            return Ok(());
+                        }
+                        Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
+                            decode_search_index_metadata(value)?;
+                            Some(0)
+                        }
+                        Some(SEARCH_DOCUMENT_PREFIX) => {
+                            decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
+                            search_document_logical_bytes(
+                                value,
+                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                            )?
+                        }
+                        Some(SEARCH_TERM_META_PREFIX) => {
+                            let (_, term) = decode_search_object_key(key, SEARCH_TERM_META_PREFIX)?;
+                            if !is_canonical_search_term(term) {
+                                return Err(NativeRuntimeError::InvalidSearchTree);
+                            }
+                            decode_live_search_term_metadata(
+                                value,
+                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                            )?
+                            .map(|_| 0)
+                        }
+                        Some(SEARCH_POSTING_PREFIX) => {
+                            decode_search_posting_key(key)?;
+                            decode_live_search_posting(
+                                value,
+                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                            )?
+                            .map(|_| 0)
+                        }
+                        _ => return Err(NativeRuntimeError::InvalidSearchTree),
+                    };
+                    if let Some(logical_value_bytes) = logical_value_bytes {
+                        retained_bytes = retained_bytes
+                            .checked_add(search_recovery_entry_retained_bytes(
+                                key,
+                                logical_value_bytes,
+                            )?)
+                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+                        if retained_bytes > RECOVERY_MEMORY_BYTES {
+                            return Err(NativeRuntimeError::InvalidSearchTree);
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    failure = Some(error);
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .map_err(map_borrowed_search_visit_error)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !stats.complete || format.is_none() {
+        return Err(NativeRuntimeError::InvalidSearchTree);
+    }
+    Ok(retained_bytes)
+}
+
+fn search_recovery_entry_retained_bytes(
+    key: &[u8],
+    logical_value_bytes: u64,
+) -> Result<u64, NativeRuntimeError> {
+    u64::try_from(key.len())
+        .map_err(|_| NativeRuntimeError::InvalidSearchTree)?
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(512))
+        .and_then(|bytes| bytes.checked_add(logical_value_bytes))
+        .ok_or(NativeRuntimeError::InvalidSearchTree)
+}
+
 fn load_search_state_root_with_retained(
     pages: &PageStore,
     blobs: &BlobStore,
@@ -38191,14 +40198,7 @@ impl<'a> BorrowedSearchRestore<'a> {
         key: &[u8],
         logical_value_bytes: u64,
     ) -> Result<(), NativeRuntimeError> {
-        let key_bytes = u64::try_from(key.len())
-            .map_err(|_| NativeRuntimeError::InvalidSearchTree)?
-            .checked_mul(4)
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-        let retained = 512_u64
-            .checked_add(key_bytes)
-            .and_then(|bytes| bytes.checked_add(logical_value_bytes))
-            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+        let retained = search_recovery_entry_retained_bytes(key, logical_value_bytes)?;
         let next = self
             .retained_bytes
             .checked_add(retained)
@@ -38724,14 +40724,18 @@ mod tests {
         IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition,
         StructureDefinition, StructureKind, StructureOwnership,
     };
-    use hyphae_native_mvcc::WriteKey;
+    use hyphae_native_mvcc::{RootSet, WriteKey};
     use hyphae_native_pages::PageKind;
     use hyphae_native_types::{
         CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
         Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
     };
+    use hyphae_native_wal::WalFile;
 
-    use crate::wal_codec::{CommitManifest, RecoveredCommit};
+    use crate::{
+        ann_store, wal_codec,
+        wal_codec::{CommitManifest, RecoveredCommit},
+    };
 
     use super::{
         ActiveExpiryConfig, ActiveExpiryFailure, AnnRecallRisk, AnnSearchOptions,
@@ -38742,32 +40746,35 @@ mod tests {
         CATALOG_VALUE_HEADER_SIZE, CATALOG_VALUE_INLINE, CATALOG_VALUE_MAGIC,
         CatalogDependencyRequest, CatalogListRequest, CatalogName, CatalogObject, CatalogPageStop,
         CatalogState, CheckpointBoundary, ColumnDefinition, CommitBoundary,
-        CommitCancellationOutcome, EngineKind, GovernorAdmissionError, GovernorClassLimit,
-        GovernorMode, GovernorQueueError, GovernorRequest, GroupCommitBoundary, GroupCommitConfig,
-        GroupCommitOutcome, GroupCommitSubmitError, HardwareCpu, HardwareMemory,
+        CommitCancellationOutcome, CommitReceipt, EngineKind, GovernorAdmissionError,
+        GovernorClassLimit, GovernorMode, GovernorQueueError, GovernorRequest, GroupCommitBoundary,
+        GroupCommitConfig, GroupCommitOutcome, GroupCommitSubmitError, HardwareCpu, HardwareMemory,
         HardwareOperatingSystem, HardwareProfile, HardwareStorage, HashFieldEntry,
         HashPatternError, HashPatternScanPage, HashPatternScanRequest, HashPatternScanStop,
-        HashSetOutcome, HnswConfig, ManifestError, Mutation, NativeCommitBatch, NativeCommitClient,
-        NativeCommitControl, NativeCommitScheduler, NativeDatabase, NativeDeltaWriteBatch,
-        NativeDirectoryError, NativeExecutionPool, NativeGovernorPolicy, NativeHybridFusion,
-        NativeHybridRequest, NativePendingCommit, NativeResourceGovernor, NativeRuntimeError,
-        NativeSchedulerClock, NativeTransaction, NativeVectorBranch, NativeWriteBatch,
-        ObjectHeader, Opcode, PAGE_FILE, PageStore, PromotionBoundary, QualifiedName,
-        RelationDefinition, RelationalScanRow, RootManifest, SLOT_CATALOG, SetCondition,
-        SetOutcome, SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError,
-        SqlResult, SqlValue, VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric,
-        VectorRecord, WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass,
-        ZAddOutcome, append_catalog_object_entries, binary_relation_definition,
+        HashSetOutcome, HnswConfig, InitialAnnBulkPublication, ManifestError, Mutation,
+        NativeCommitBatch, NativeCommitClient, NativeCommitControl, NativeCommitScheduler,
+        NativeDatabase, NativeDeltaWriteBatch, NativeDirectoryError, NativeExecutionPool,
+        NativeGovernorPolicy, NativeHybridFusion, NativeHybridRequest, NativePendingCommit,
+        NativeResourceGovernor, NativeRuntimeError, NativeSchedulerClock, NativeTransaction,
+        NativeVectorBranch, NativeWriteBatch, ObjectHeader, Opcode, PAGE_FILE, PageStore,
+        PromotionBoundary, QualifiedName, RECOVERY_MEMORY_BYTES, RelationDefinition,
+        RelationalScanRow, RootManifest, SLOT_CATALOG, SLOT_SEARCH, SetCondition, SetOutcome,
+        SnapshotPinBoundary, SnapshotPinError, SnapshotPinId, SortedSetEntry, SqlError, SqlResult,
+        SqlValue, VacuumBoundary, Vector, VectorIndexDefinition, VectorMetric, VectorRecord,
+        WAL_FILE, WalError, WalRetentionAnchor, WalRetentionBoundary, WorkloadClass, ZAddOutcome,
+        append_catalog_object_entries, binary_relation_definition,
         catalog_definition_storage_value, catalog_dependency_prefix, catalog_name_identity,
         catalog_name_key, catalog_object_key, catalog_relation_index_key,
         catalog_relation_index_prefix, catalog_requires_full_rebuild, catalog_root_after_mutations,
         decode_catalog_definition_storage_value, decode_catalog_dependency_entry,
         decode_logical_catalog_definition, page_generation_path,
         physical_expiry_tree_after_mutations, qualified_name, rebuild_page_generation,
-        validate_commit_sequence,
+        require_roots, roots_from_snapshot, validate_commit_sequence,
+        validate_recovered_ann_overlay_transitions,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    type AnnPhysicalEntries = Vec<(Vec<u8>, Vec<u8>)>;
     const EXTERNAL_LOCK_PROBE_PATH: &str = "HYPHAE_NATIVE_LOCK_PROBE_PATH";
 
     pub(crate) fn engine_admission_test_policy() -> NativeGovernorPolicy {
@@ -39111,8 +41118,31 @@ mod tests {
                 page_generation: PageGeneration::new(page_generation)?,
                 retention_floor_csn: Csn::new(retention_floor_csn)?,
             },
-            mutations: Vec::new(),
+            mutations: vec![Mutation {
+                engine: EngineKind::Structure,
+                opcode: Opcode::SetValue,
+                target: None,
+                key: format!("commit-{csn}").into_bytes(),
+                value: b"value".to_vec(),
+                expires_at_micros: None,
+            }],
         })
+    }
+
+    fn recovered_vacuum_commit(
+        csn: u64,
+        page_generation: u64,
+    ) -> Result<RecoveredCommit, Box<dyn std::error::Error>> {
+        let mut commit = recovered_commit(csn, page_generation, csn)?;
+        commit.mutations = vec![Mutation {
+            engine: EngineKind::Kernel,
+            opcode: Opcode::VacuumPageGeneration,
+            target: None,
+            key: Vec::new(),
+            value: Vec::new(),
+            expires_at_micros: None,
+        }];
+        Ok(commit)
     }
 
     fn wide_catalog_relation(
@@ -39150,7 +41180,7 @@ mod tests {
         let valid = [
             recovered_commit(1, 1, 1)?,
             recovered_commit(2, 1, 1)?,
-            recovered_commit(3, 2, 3)?,
+            recovered_vacuum_commit(3, 2)?,
             recovered_commit(4, 2, 3)?,
         ];
         validate_commit_sequence(&valid)?;
@@ -39165,6 +41195,33 @@ mod tests {
             validate_commit_sequence(&drifting_floor),
             Err(NativeRuntimeError::NoncontiguousCommitSequence)
         ));
+
+        let unproven = [recovered_commit(1, 1, 1)?, recovered_commit(2, 2, 2)?];
+        assert!(matches!(
+            validate_commit_sequence(&unproven),
+            Err(NativeRuntimeError::NoncontiguousCommitSequence)
+        ));
+        let mut mixed = recovered_vacuum_commit(2, 2)?;
+        let mut ordinary = recovered_commit(2, 1, 1)?;
+        mixed.mutations.push(ordinary.mutations.remove(0));
+        assert!(validate_commit_sequence(&[recovered_commit(1, 1, 1)?, mixed]).is_err());
+        let same_generation_vacuum = [recovered_vacuum_commit(1, 1)?];
+        assert!(validate_commit_sequence(&same_generation_vacuum).is_err());
+        for (forgery, mut forged) in [
+            recovered_vacuum_commit(2, 2)?,
+            recovered_vacuum_commit(2, 2)?,
+            recovered_vacuum_commit(2, 2)?,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match forgery {
+                0 => forged.durability = DurabilityClass::Memory,
+                1 => forged.manifest.logical_time_micros = 1,
+                _ => forged.manifest.blob_generation = 1,
+            }
+            assert!(validate_commit_sequence(&[recovered_commit(1, 1, 1)?, forged]).is_err());
+        }
         Ok(())
     }
 
@@ -41619,6 +43676,246 @@ mod tests {
         }
     }
 
+    fn add_empty_search_document(
+        database: &mut NativeDatabase,
+        lexical: ObjectId,
+        id: &[u8],
+        bytes: usize,
+    ) -> Result<(), NativeRuntimeError> {
+        let mut transaction = database.begin(2, DurabilityClass::Strict)?;
+        transaction.index_document(lexical, id.to_vec(), " ".repeat(bytes))?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_forged_root_commit(
+        database: &mut NativeDatabase,
+        authority: &RootSet,
+        roots: [PageId; 4],
+        read_csn: Csn,
+        commit_csn: Csn,
+        mutation_key: &[u8],
+    ) -> Result<(), NativeRuntimeError> {
+        let mutations = [Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: mutation_key.to_vec(),
+            value: b"recovery-test".to_vec(),
+            expires_at_micros: None,
+        }];
+        let records = super::encode_transaction(&super::TransactionPlan {
+            transaction_id: TransactionId::new(
+                10_000_u128.saturating_add(u128::from(commit_csn.get())),
+            )
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?,
+            read_csn: Some(read_csn),
+            catalog_version: authority.catalog_version(),
+            logical_time_micros: i64::try_from(commit_csn.get()).unwrap_or(i64::MAX),
+            durability: DurabilityClass::Strict,
+            mutations: &mutations,
+            commit_csn,
+            roots,
+            blob_generation: authority.blob_generation(),
+            page_generation: authority.page_generation(),
+            retention_floor_csn: authority
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        })?;
+        database.wal.append_records(records, true)?;
+        Ok(())
+    }
+
+    fn seed_recovery_m05(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+    ) -> Result<RootSet, NativeRuntimeError> {
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "recovery-m05",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let mut point = database.begin(2, DurabilityClass::Strict)?;
+        point.upsert_vector(
+            index,
+            ObjectId::new(1).map_err(|_| NativeRuntimeError::InvalidPreparedMutation)?,
+            Vector::new([1.0, 0.0])?,
+        )?;
+        point.commit()?;
+        Ok(database.coordinator.snapshot(3)?.roots().clone())
+    }
+
+    fn checkpoint_legacy_ann_root(
+        database: &mut NativeDatabase,
+        index: ObjectId,
+        version: u8,
+    ) -> Result<(), NativeRuntimeError> {
+        let authority = database.coordinator.snapshot(0)?.roots().clone();
+        let visible_csn = authority
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let commit_csn = visible_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let search_root = authority
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let definition =
+            VectorIndexDefinition::new(index, 2, VectorMetric::SquaredL2, ann_config()?)?;
+        let legacy = if version == 4 {
+            BTree::from_root(search_root)
+        } else {
+            ann_store::install_test_legacy_metadata_tree(
+                &mut database.pages,
+                &database.buffer_pool,
+                search_root,
+                definition,
+                version,
+                commit_csn,
+            )?
+        };
+        let mut roots = require_roots(roots_from_snapshot(&authority))?;
+        roots[3] = legacy
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let transaction_id = TransactionId::new(database.next_transaction_id)
+            .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?;
+        let mutation = Mutation {
+            engine: EngineKind::Structure,
+            opcode: Opcode::SetValue,
+            target: None,
+            key: format!("checkpoint-legacy-m0{version}").into_bytes(),
+            value: b"checkpoint-base".to_vec(),
+            expires_at_micros: None,
+        };
+        let records = super::encode_transaction(&super::TransactionPlan {
+            transaction_id,
+            read_csn: Some(visible_csn),
+            catalog_version: authority.catalog_version(),
+            logical_time_micros: i64::from(version),
+            durability: DurabilityClass::Strict,
+            mutations: std::slice::from_ref(&mutation),
+            commit_csn,
+            roots,
+            blob_generation: authority.blob_generation(),
+            page_generation: authority.page_generation(),
+            retention_floor_csn: authority
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        })?;
+        database.pages.sync_data()?;
+        let receipts = database.wal.append_records(records, true)?;
+        let block = receipts.last().ok_or(WalError::EmptyBlock)?;
+        let mut root_transaction = database.coordinator.begin_write()?;
+        if root_transaction.commit_csn()? != commit_csn {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        for (slot, root) in super::ROOT_SLOTS.into_iter().zip(roots) {
+            root_transaction.set_root(slot, root);
+        }
+        root_transaction.commit(
+            authority.catalog_version(),
+            hyphae_native_mvcc::WalAnchor::new(block.last_lsn, block.digest)?,
+        )?;
+        database.next_transaction_id = transaction_id
+            .get()
+            .checked_add(1)
+            .ok_or(NativeRuntimeError::TransactionIdExhausted)?;
+        let committed = database.coordinator.snapshot(0)?.roots().clone();
+        database.search_recovery_memory = super::validate_roots_with_search_recovery_authority(
+            &database.pages,
+            &database.blobs,
+            &committed,
+            commit_csn,
+        )?;
+        if !database.vacuum_pages()?.applied {
+            return Err(NativeRuntimeError::InvalidCommittedRoot);
+        }
+        database.checkpoint()?;
+        database.truncate_wal_at_retention_checkpoint()?;
+        Ok(())
+    }
+
+    fn append_forged_search_root_then_repair(
+        database: &mut NativeDatabase,
+        authority: &RootSet,
+        forged_search_root: PageId,
+    ) -> Result<(), NativeRuntimeError> {
+        let visible = authority
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_csn = visible
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let repaired_csn = forged_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let mut forged_roots = require_roots(roots_from_snapshot(authority))?;
+        forged_roots[3] = forged_search_root;
+        append_forged_root_commit(
+            database,
+            authority,
+            forged_roots,
+            visible,
+            forged_csn,
+            b"forged-search-root",
+        )?;
+        append_forged_root_commit(
+            database,
+            authority,
+            require_roots(roots_from_snapshot(authority))?,
+            forged_csn,
+            repaired_csn,
+            b"repaired-search-root",
+        )?;
+        database.pages.sync_data()?;
+        Ok(())
+    }
+
+    fn calibrate_search_recovery_remaining(
+        database: &mut NativeDatabase,
+        lexical: ObjectId,
+        target_remaining: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let before_calibration = database.search_recovery_memory.lexical_retained_bytes;
+        add_empty_search_document(database, lexical, b"calibration-a", 1_024)?;
+        let fixed_document_bytes = database
+            .search_recovery_memory
+            .lexical_retained_bytes
+            .checked_sub(before_calibration)
+            .and_then(|bytes| bytes.checked_sub(1_024))
+            .ok_or("invalid lexical calibration")?;
+        let remaining = RECOVERY_MEMORY_BYTES
+            .checked_sub(database.search_recovery_memory.ann_retained_bytes)
+            .and_then(|bytes| {
+                bytes.checked_sub(database.search_recovery_memory.lexical_retained_bytes)
+            })
+            .ok_or("fixture already exceeds recovery authority")?;
+        let final_document_bytes = remaining
+            .checked_sub(fixed_document_bytes)
+            .and_then(|bytes| bytes.checked_sub(target_remaining))
+            .ok_or("fixture cannot be calibrated")?;
+        add_empty_search_document(
+            database,
+            lexical,
+            b"calibration-b",
+            usize::try_from(final_document_bytes)?,
+        )?;
+        if database
+            .search_recovery_memory
+            .lexical_retained_bytes
+            .checked_add(database.search_recovery_memory.ann_retained_bytes)
+            != Some(RECOVERY_MEMORY_BYTES - target_remaining)
+        {
+            return Err("recovery calibration mismatch".into());
+        }
+        Ok(())
+    }
+
     struct FullLoadFailureGuard;
 
     impl FullLoadFailureGuard {
@@ -42845,6 +45142,950 @@ mod tests {
     }
 
     #[test]
+    fn materialized_m05_vector_batch_matches_delta_physical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let materialized_directory = TestDirectory::new();
+        let delta_directory = TestDirectory::new();
+        let index = ObjectId::new(905)?;
+        let first = ObjectId::new(1)?;
+        let second = ObjectId::new(2)?;
+        let mut materialized = NativeDatabase::create(materialized_directory.path())?;
+        let mut delta = NativeDatabase::create(delta_directory.path())?;
+        for database in [&mut materialized, &mut delta] {
+            let mut create = database.begin(1, DurabilityClass::Strict)?;
+            create.create_vector_index(
+                index,
+                "batch-equivalence",
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            create.commit()?;
+            let mut first_point = database.begin(2, DurabilityClass::Strict)?;
+            first_point.upsert_vector(index, first, Vector::new([1.0, 0.0])?)?;
+            first_point.commit()?;
+        }
+
+        let mut batch = materialized.begin(3, DurabilityClass::Strict)?;
+        assert_eq!(
+            batch.upsert_vectors(
+                index,
+                [
+                    (first, Vector::new([2.0, 0.0])?),
+                    (second, Vector::new([0.0, 2.0])?),
+                ],
+            )?,
+            2
+        );
+        batch.commit()?;
+
+        let mut point_batch = delta.begin_optimistic_delta(3, DurabilityClass::Strict)?;
+        delta.stage_delta_upsert_vector(
+            &mut point_batch,
+            index,
+            first,
+            Vector::new([2.0, 0.0])?,
+        )?;
+        delta.stage_delta_upsert_vector(
+            &mut point_batch,
+            index,
+            second,
+            Vector::new([0.0, 2.0])?,
+        )?;
+        delta.commit_optimistic(point_batch)?;
+
+        let physical =
+            |database: &NativeDatabase| -> Result<AnnPhysicalEntries, NativeRuntimeError> {
+                let root = database
+                    .coordinator
+                    .snapshot(3)?
+                    .roots()
+                    .root(SLOT_SEARCH)
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                Ok(BTree::from_root(root)
+                    .scan(&database.pages)?
+                    .into_iter()
+                    .filter(|(key, _)| ann_store::is_ann_physical_key(key))
+                    .collect())
+            };
+        assert_eq!(physical(&materialized)?, physical(&delta)?);
+        assert_eq!(
+            materialized.search_vector_exact_latest(index, &Vector::new([0.0, 0.0])?, 2)?,
+            delta.search_vector_exact_latest(index, &Vector::new([0.0, 0.0])?, 2)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_point_reserve_combines_two_targets_before_private_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let indexes = [ObjectId::new(905_100)?, ObjectId::new(905_101)?];
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        for (ordinal, index) in indexes.into_iter().enumerate() {
+            create.create_vector_index(
+                index,
+                &format!("materialized-reserve-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.commit()?;
+
+        let mut update = database.begin(2, DurabilityClass::Strict)?;
+        update.upsert_vector(indexes[0], ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        let one_target = update.materialized_ann_point_publication_memory_bytes;
+        assert!(one_target > 0);
+        update.upsert_vector(indexes[1], ObjectId::new(2)?, Vector::new([0.0, 1.0])?)?;
+        let two_targets = update.materialized_ann_point_publication_memory_bytes;
+        assert!(two_targets > one_target);
+        assert!(two_targets < one_target.saturating_mul(2));
+        assert_eq!(
+            two_targets,
+            ann_store::materialized_point_publication_memory_bound(
+                update.mutations.iter(),
+                &update.legacy_ann_indexes,
+            )?
+        );
+        assert!(two_targets <= super::MUTATION_MEMORY_BYTES);
+        update.commit()?;
+        for index in indexes {
+            assert_eq!(database.observe_ann_index(index)?.delta_records, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_point_reserve_rejects_maximum_bound_before_private_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_200)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "materialized-max-reserve",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+
+        let maximum = (0..ann_store::MAX_ANN_DELTA_RECORDS)
+            .map(|ordinal| {
+                Ok(Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::UpsertVector,
+                    target: Some(index),
+                    key: ann_store::encode_object_identity(ObjectId::new(
+                        u128::try_from(ordinal)?.saturating_add(1),
+                    )?),
+                    value: ann_store::encode_vector_mutation(&Vector::new([1.0, 0.0])?),
+                    expires_at_micros: None,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        assert!(
+            ann_store::materialized_point_publication_memory_bound(
+                maximum.iter(),
+                &BTreeSet::new(),
+            )? > super::MUTATION_MEMORY_BYTES
+        );
+
+        let mut update = database.begin(2, DurabilityClass::Strict)?;
+        let mut rejected = None;
+        for ordinal in 0..ann_store::MAX_ANN_DELTA_RECORDS {
+            let object = ObjectId::new(u128::try_from(ordinal)?.saturating_add(1))?;
+            let mutation_count = update.mutation_count();
+            match update.upsert_vector(index, object, Vector::new([1.0, 0.0])?) {
+                Ok(()) => {
+                    assert!(
+                        update.materialized_ann_point_publication_memory_bytes
+                            <= super::MUTATION_MEMORY_BYTES
+                    );
+                }
+                Err(NativeRuntimeError::ResourceAdmission(
+                    GovernorAdmissionError::ParentCapacity,
+                )) => {
+                    assert_eq!(update.mutation_count(), mutation_count);
+                    assert!(!update.state.ann.contains_effective_record(index, object)?);
+                    rejected = Some(ordinal);
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert!(
+            rejected.is_some(),
+            "maximum materialized point bound fit 32 MiB"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pure_absence_fence_advances_wal_and_csn_without_changing_any_root_or_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_001)?;
+        let object = ObjectId::new(1)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "pure-absence-fence",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let roots_before = database.coordinator.snapshot(2)?.roots().clone();
+        let physical_before = database.physical_observation()?;
+
+        let mut fence = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+        assert!(!database.stage_delta_vector_absence_fence(&mut fence, index, object)?);
+        let committed = database.commit_optimistic(fence)?;
+        let roots_after = database.coordinator.snapshot(3)?.roots().clone();
+        let physical_after = database.physical_observation()?;
+        assert_eq!(committed.commit_csn.get(), 2);
+        for slot in super::ROOT_SLOTS {
+            assert_eq!(roots_after.root(slot), roots_before.root(slot));
+        }
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert!(physical_after.wal_bytes > physical_before.wal_bytes);
+        let wal = fs::read(temporary.path().join(WAL_FILE))?;
+        assert!(wal.windows(9).any(|bytes| bytes == b"HYMUT001\x39"));
+        assert!(!wal.windows(8).any(|bytes| bytes == b"HYANNA02"));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_roots = reopened.coordinator.snapshot(3)?.roots().clone();
+        for slot in super::ROOT_SLOTS {
+            assert_eq!(reopened_roots.root(slot), roots_before.root(slot));
+        }
+        assert_eq!(reopened.recovery_report().committed_transactions, 2);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_and_created_fence_recovery_preserves_physical_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_101)?;
+        let absent = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "historical-fence-recovery",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+        let canonical = database.coordinator.snapshot(2)?.roots().clone();
+        let definition = VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+        let canonical_search = canonical
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let anchor = canonical
+            .wal_anchor()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let prior_csn = canonical
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        for version in 1..=3 {
+            let historical_search = ann_store::install_test_legacy_metadata_tree(
+                &mut database.pages,
+                &database.buffer_pool,
+                canonical_search,
+                definition,
+                version,
+                prior_csn,
+            )?
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let mut roots = require_roots(roots_from_snapshot(&canonical))?;
+            roots[3] = historical_search;
+            let prior = RootSet::committed_with_storage(
+                prior_csn,
+                canonical.catalog_version(),
+                anchor,
+                super::root_map(roots),
+                canonical.blob_generation(),
+                canonical.page_generation(),
+                canonical
+                    .retention_floor_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            )?;
+            let commit_csn = prior_csn
+                .checked_next()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let result = RootSet::committed_with_storage(
+                commit_csn,
+                prior.catalog_version(),
+                anchor,
+                prior.iter_roots().collect(),
+                prior.blob_generation(),
+                prior.page_generation(),
+                prior
+                    .retention_floor_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            )?;
+            let recovered = wal_codec::RecoveredCommit {
+                transaction_id: TransactionId::new(905_200 + u128::from(version))?,
+                commit_lsn: anchor.lsn,
+                durability: DurabilityClass::Strict,
+                manifest: wal_codec::CommitManifest {
+                    read_csn: Some(prior_csn),
+                    commit_csn,
+                    catalog_version: result.catalog_version(),
+                    blob_generation: result.blob_generation(),
+                    mutation_count: 1,
+                    mutation_bytes: 60,
+                    logical_time_micros: 2,
+                    mutation_digest: [1; 32],
+                    roots: require_roots(roots_from_snapshot(&result))?,
+                    page_generation: result.page_generation(),
+                    retention_floor_csn: result
+                        .retention_floor_csn()
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                },
+                mutations: vec![Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::FenceVectorAbsence,
+                    target: Some(index),
+                    key: ann_store::encode_object_identity(absent),
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                }],
+            };
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &recovered,
+            )?;
+        }
+
+        drop(database);
+        let created_directory = TestDirectory::new();
+        let created_index = ObjectId::new(905_301)?;
+        let present = ObjectId::new(1)?;
+        let absent = ObjectId::new(2)?;
+        let mut created_database = NativeDatabase::create(created_directory.path())?;
+        let mut create = created_database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            created_index,
+            "created-fence-recovery",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(created_index, present, Vector::new([1.0, 0.0])?)?;
+        assert!(!create.fence_vector_absence(created_index, absent)?);
+        create.commit()?;
+        drop(created_database);
+        let reopened = NativeDatabase::open(created_directory.path())?;
+        assert_eq!(
+            reopened
+                .observe_ann_index(created_index)?
+                .effective_vector_count,
+            1
+        );
+        assert_eq!(
+            reopened.search_vector_exact_latest(created_index, &Vector::new([1.0, 0.0])?, 1,)?[0]
+                .object_id,
+            present
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn creation_and_initial_bulk_recovery_require_exact_canonical_wal_transitions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_350)?;
+        let first = ObjectId::new(1)?;
+        let second = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "canonical-create-recovery",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, first, Vector::new([1.0, 0.0])?)?;
+        let create_mutations = create.batch.mutations.clone();
+        let create_receipt = create.commit()?;
+        let created_roots = database.coordinator.snapshot(2)?.roots().clone();
+        let recovered = |receipt: CommitReceipt,
+                         roots: &RootSet,
+                         mutations: Vec<Mutation>|
+         -> Result<RecoveredCommit, NativeRuntimeError> {
+            Ok(RecoveredCommit {
+                transaction_id: receipt.transaction_id,
+                commit_lsn: receipt.commit_lsn,
+                durability: receipt.durability,
+                manifest: CommitManifest {
+                    read_csn: None,
+                    commit_csn: receipt.commit_csn,
+                    catalog_version: receipt.catalog_version,
+                    blob_generation: roots.blob_generation(),
+                    mutation_count: u32::try_from(mutations.len())
+                        .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
+                    mutation_bytes: 0,
+                    logical_time_micros: 1,
+                    mutation_digest: [1; 32],
+                    roots: require_roots(roots_from_snapshot(roots))?,
+                    page_generation: roots.page_generation(),
+                    retention_floor_csn: roots
+                        .retention_floor_csn()
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                },
+                mutations,
+            })
+        };
+        let canonical_create = recovered(create_receipt, &created_roots, create_mutations.clone())?;
+        validate_recovered_ann_overlay_transitions(
+            &database.pages,
+            &database.blobs,
+            None,
+            &created_roots,
+            &canonical_create,
+        )?;
+        let mut tampered_create = canonical_create.clone();
+        tampered_create
+            .mutations
+            .first_mut()
+            .ok_or("missing create mutation")?
+            .value
+            .push(0);
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                None,
+                &created_roots,
+                &tampered_create,
+            )
+            .is_err()
+        );
+
+        let mut point = database.begin(2, DurabilityClass::Strict)?;
+        point.upsert_vector(index, second, Vector::new([0.0, 1.0])?)?;
+        let point_receipt = point.commit()?;
+        let m05_roots = database.coordinator.snapshot(3)?.roots().clone();
+        let forged_absent_to_m05 = recovered(point_receipt, &m05_roots, create_mutations)?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                None,
+                &m05_roots,
+                &forged_absent_to_m05,
+            )
+            .is_err()
+        );
+
+        let bulk_directory = TestDirectory::new();
+        let bulk_index = ObjectId::new(905_351)?;
+        let mut bulk_database = NativeDatabase::create(bulk_directory.path())?;
+        let mut create_bulk = bulk_database.begin(1, DurabilityClass::Strict)?;
+        create_bulk.create_vector_index(
+            bulk_index,
+            "canonical-bulk-recovery",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create_bulk.commit()?;
+        let bulk_prior = bulk_database.coordinator.snapshot(2)?.roots().clone();
+        let plan = bulk_database.plan_initial_ann_bulk(
+            bulk_index,
+            vec![
+                (ObjectId::new(10)?, Vector::new([1.0, 0.0])?),
+                (ObjectId::new(11)?, Vector::new([0.0, 1.0])?),
+            ],
+            1,
+        )?;
+        let publication = InitialAnnBulkPublication {
+            index: plan.index_id,
+            expected_base_identity: plan.expected_base_identity,
+            expected_view_identity: plan.expected_view_identity,
+            candidate_csn: plan.candidate_csn,
+            candidate: plan.candidate.clone().into_snapshot(),
+        };
+        let bulk_mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::PublishInitialAnnBulk,
+            target: Some(bulk_index),
+            key: Vec::new(),
+            value: ann_store::encode_initial_bulk_publication(&publication)?,
+            expires_at_micros: None,
+        };
+        let bulk_receipt = bulk_database.publish_initial_ann_bulk(plan, DurabilityClass::Strict)?;
+        let bulk_result = bulk_database.coordinator.snapshot(3)?.roots().clone();
+        let canonical_bulk = recovered(
+            bulk_receipt.commit,
+            &bulk_result,
+            vec![bulk_mutation.clone()],
+        )?;
+        validate_recovered_ann_overlay_transitions(
+            &bulk_database.pages,
+            &bulk_database.blobs,
+            Some(&bulk_prior),
+            &bulk_result,
+            &canonical_bulk,
+        )?;
+        let mut tampered_bulk = canonical_bulk.clone();
+        tampered_bulk.mutations[0].value[104] ^= 1;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &bulk_database.pages,
+                &bulk_database.blobs,
+                Some(&bulk_prior),
+                &bulk_result,
+                &tampered_bulk,
+            )
+            .is_err()
+        );
+
+        let mut bulk_point = bulk_database.begin(3, DurabilityClass::Strict)?;
+        bulk_point.upsert_vector(bulk_index, ObjectId::new(12)?, Vector::new([1.0, 1.0])?)?;
+        let bulk_point_receipt = bulk_point.commit()?;
+        let bulk_m05 = bulk_database.coordinator.snapshot(4)?.roots().clone();
+        let forged_m04_to_m05 = recovered(bulk_point_receipt, &bulk_m05, vec![bulk_mutation])?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &bulk_database.pages,
+                &bulk_database.blobs,
+                Some(&bulk_prior),
+                &bulk_m05,
+                &forged_m04_to_m05,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_legacy_delete_and_fence_reopens_without_m05_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_401)?;
+        let present = ObjectId::new(1)?;
+        let absent = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "mixed-legacy-delete-fence",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, present, Vector::new([1.0, 0.0])?)?;
+        create.commit()?;
+        let mut mixed = database.begin(2, DurabilityClass::Strict)?;
+        assert!(mixed.delete_vector_on_legacy_path_for_test(index, present)?);
+        assert!(!mixed.fence_vector_absence(index, absent)?);
+        mixed.commit()?;
+        let wal = fs::read(temporary.path().join(WAL_FILE))?;
+        assert!(!wal.windows(8).any(|bytes| bytes == b"HYANNA02"));
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.observe_ann_index(index)?.delta_records, 1);
+        assert!(
+            reopened
+                .search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    fn oversized_wal_materialized_batch(
+        database: &NativeDatabase,
+        durability: DurabilityClass,
+    ) -> Result<NativeWriteBatch, NativeRuntimeError> {
+        let mut batch = database.begin_optimistic(1, durability)?;
+        for _ in 0..8_200 {
+            batch.set(b"oversized".to_vec(), vec![b'x'; 8_192], None)?;
+        }
+        Ok(batch)
+    }
+
+    #[test]
+    fn oversized_materialized_wal_rejects_before_page_or_wal_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let pages_before = database.pages.page_count();
+        let wal_before = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+        let batch = oversized_wal_materialized_batch(&database, DurabilityClass::Strict)?;
+        assert!(database.commit_optimistic(batch).is_err());
+        assert_eq!(database.pages.page_count(), pages_before);
+        assert_eq!(
+            fs::metadata(temporary.path().join(WAL_FILE))?.len(),
+            wal_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_group_member_rejects_before_any_cohort_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let pages_before = database.pages.page_count();
+        let wal_before = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+        let batch = oversized_wal_materialized_batch(&database, DurabilityClass::Group)?;
+        let report = database.commit_group(vec![batch])?;
+        assert_eq!(report.accepted_commits, 0);
+        assert!(matches!(
+            report.outcomes.as_slice(),
+            [GroupCommitOutcome::Rejected(_)]
+        ));
+        assert_eq!(database.pages.page_count(), pages_before);
+        assert_eq!(
+            fs::metadata(temporary.path().join(WAL_FILE))?.len(),
+            wal_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_lexical_ann_limit_rejects_point_publication_before_pages_or_wal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let lexical = ObjectId::new(906)?;
+        let index = ObjectId::new(907)?;
+        let point_object = ObjectId::new(908)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(lexical, "near-limit-lexical")?;
+        for ordinal in 0..31_u128 {
+            create.create_vector_index(
+                ObjectId::new(index.get() + ordinal)?,
+                &format!("near-limit-vectors-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.commit()?;
+
+        let before_calibration = database.search_recovery_memory.lexical_retained_bytes;
+        add_empty_search_document(&mut database, lexical, b"document-a", 1_024)?;
+        let fixed_document_bytes = database
+            .search_recovery_memory
+            .lexical_retained_bytes
+            .checked_sub(before_calibration)
+            .and_then(|bytes| bytes.checked_sub(1_024))
+            .ok_or("invalid lexical calibration")?;
+        let remaining = RECOVERY_MEMORY_BYTES
+            .checked_sub(database.search_recovery_memory.ann_retained_bytes)
+            .and_then(|bytes| {
+                bytes.checked_sub(database.search_recovery_memory.lexical_retained_bytes)
+            })
+            .ok_or("near-limit fixture already exceeds recovery authority")?;
+        let target_remaining = 128_u64;
+        let final_document_bytes = remaining
+            .checked_sub(fixed_document_bytes)
+            .and_then(|bytes| bytes.checked_sub(target_remaining))
+            .ok_or("near-limit fixture cannot be calibrated")?;
+        add_empty_search_document(
+            &mut database,
+            lexical,
+            b"document-b",
+            usize::try_from(final_document_bytes)?,
+        )?;
+        assert_eq!(
+            database
+                .search_recovery_memory
+                .lexical_retained_bytes
+                .checked_add(database.search_recovery_memory.ann_retained_bytes),
+            Some(RECOVERY_MEMORY_BYTES - target_remaining)
+        );
+
+        let mut point = database.begin_optimistic_delta(3, DurabilityClass::Strict)?;
+        database.stage_delta_upsert_vector(
+            &mut point,
+            index,
+            point_object,
+            Vector::new([1.0, 0.0])?,
+        )?;
+        let physical_before = database.physical_observation()?;
+        let roots_before = database.coordinator.snapshot(3)?.roots().clone();
+        assert!(matches!(
+            database.commit_optimistic(point),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(database.coordinator.snapshot(3)?.roots(), &roots_before);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.coordinator.snapshot(3)?.roots(), &roots_before);
+        assert!(
+            reopened
+                .search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_same_index_projection_charges_members_in_sequence_at_the_shared_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (target_remaining, expected_commits) in [(400_u64, 1_usize), (800, 2)] {
+            let temporary = TestDirectory::new();
+            let lexical = ObjectId::new(920)?;
+            let index = ObjectId::new(921)?;
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut create = database.begin(1, DurabilityClass::Strict)?;
+            create.create_search_index(lexical, "group-near-limit-lexical")?;
+            for ordinal in 0..31_u128 {
+                create.create_vector_index(
+                    ObjectId::new(index.get() + ordinal)?,
+                    &format!("group-near-limit-vectors-{ordinal}"),
+                    2,
+                    VectorMetric::SquaredL2,
+                    ann_config()?,
+                )?;
+            }
+            create.commit()?;
+
+            let before_calibration = database.search_recovery_memory.lexical_retained_bytes;
+            add_empty_search_document(&mut database, lexical, b"document-a", 1_024)?;
+            let fixed_document_bytes = database
+                .search_recovery_memory
+                .lexical_retained_bytes
+                .checked_sub(before_calibration)
+                .and_then(|bytes| bytes.checked_sub(1_024))
+                .ok_or("invalid group lexical calibration")?;
+            let remaining = RECOVERY_MEMORY_BYTES
+                .checked_sub(database.search_recovery_memory.ann_retained_bytes)
+                .and_then(|bytes| {
+                    bytes.checked_sub(database.search_recovery_memory.lexical_retained_bytes)
+                })
+                .ok_or("group fixture already exceeds recovery authority")?;
+            let final_document_bytes = remaining
+                .checked_sub(fixed_document_bytes)
+                .and_then(|bytes| bytes.checked_sub(target_remaining))
+                .ok_or("group fixture cannot be calibrated")?;
+            add_empty_search_document(
+                &mut database,
+                lexical,
+                b"document-b",
+                usize::try_from(final_document_bytes)?,
+            )?;
+            assert_eq!(
+                database
+                    .search_recovery_memory
+                    .lexical_retained_bytes
+                    .checked_add(database.search_recovery_memory.ann_retained_bytes),
+                Some(RECOVERY_MEMORY_BYTES - target_remaining)
+            );
+
+            let first = ObjectId::new(1)?;
+            let second = ObjectId::new(2)?;
+            let mut left = database.begin_optimistic_delta(3, DurabilityClass::Group)?;
+            let mut right = database.begin_optimistic_delta(3, DurabilityClass::Group)?;
+            database.stage_delta_upsert_vector(
+                &mut left,
+                index,
+                first,
+                Vector::new([1.0, 0.0])?,
+            )?;
+            database.stage_delta_upsert_vector(
+                &mut right,
+                index,
+                second,
+                Vector::new([0.0, 1.0])?,
+            )?;
+            let report = database.commit_group(vec![left, right])?;
+            assert_eq!(report.accepted_commits, expected_commits);
+            assert!(matches!(
+                report.outcomes[0],
+                GroupCommitOutcome::Committed(_)
+            ));
+            if expected_commits == 1 {
+                assert!(matches!(
+                    report.outcomes[1],
+                    GroupCommitOutcome::Rejected(NativeRuntimeError::InvalidAnnTree)
+                ));
+            } else {
+                assert!(matches!(
+                    report.outcomes[1],
+                    GroupCommitOutcome::Committed(_)
+                ));
+            }
+            drop(database);
+
+            let reopened = NativeDatabase::open(temporary.path())?;
+            assert_eq!(
+                reopened
+                    .search_vector_exact_latest(index, &Vector::new([0.0, 0.0])?, 2)?
+                    .len(),
+                expected_commits
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_initial_bulk_remains_m04_above_the_m05_shared_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let lexical = ObjectId::new(970)?;
+        let index = ObjectId::new(971)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(lexical, "bulk-near-limit-lexical")?;
+        for ordinal in 0..31_u128 {
+            create.create_vector_index(
+                ObjectId::new(index.get() + ordinal)?,
+                &format!("bulk-near-limit-vectors-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.commit()?;
+        calibrate_search_recovery_remaining(&mut database, lexical, 512)?;
+
+        let plan = database.plan_initial_ann_bulk(
+            index,
+            vec![(ObjectId::new(1)?, Vector::new([1.0, 0.0])?)],
+            1,
+        )?;
+        let physical_before = database.physical_observation()?;
+        database.publish_initial_ann_bulk(plan, DurabilityClass::Strict)?;
+        let physical_after = database.physical_observation()?;
+        assert!(physical_after.page_count > physical_before.page_count);
+        assert!(physical_after.wal_bytes > physical_before.wal_bytes);
+        assert!(!database.search_recovery_memory.contains_m05);
+        assert!(
+            database
+                .search_recovery_memory
+                .lexical_retained_bytes
+                .checked_add(database.search_recovery_memory.ann_retained_bytes)
+                .is_some_and(|bytes| bytes > RECOVERY_MEMORY_BYTES)
+        );
+        let root = database
+            .coordinator
+            .snapshot(4)?
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert_eq!(
+            ann_store::persisted_metadata_version(&database.pages, root, index)?,
+            Some(4)
+        );
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?[0].object_id,
+            ObjectId::new(1)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn consolidation_shared_limit_rejects_exact_candidate_before_pages_or_wal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let lexical = ObjectId::new(1_020)?;
+        let index = ObjectId::new(1_021)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(lexical, "consolidation-near-limit-lexical")?;
+        for ordinal in 0..31_u128 {
+            create.create_vector_index(
+                ObjectId::new(index.get() + ordinal)?,
+                &format!("consolidation-near-limit-vectors-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.upsert_vector(index, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        create.upsert_vector(index, ObjectId::new(2)?, Vector::new([0.0, 1.0])?)?;
+        create.commit()?;
+        let mut update = database.begin(2, DurabilityClass::Strict)?;
+        update.upsert_vector_on_legacy_path_for_test(
+            index,
+            ObjectId::new(3)?,
+            Vector::new([1.0, 1.0])?,
+        )?;
+        assert!(update.delete_vector_on_legacy_path_for_test(index, ObjectId::new(1)?)?);
+        update.commit()?;
+        calibrate_search_recovery_remaining(&mut database, lexical, 512)?;
+
+        let plan = database.plan_ann_consolidation(index, 256, 8)?;
+        let physical_before = database.physical_observation()?;
+        let roots_before = database.coordinator.snapshot(4)?.roots().clone();
+        assert!(matches!(
+            database.consolidate_ann(plan, DurabilityClass::Strict),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(database.coordinator.snapshot(4)?.roots(), &roots_before);
+        Ok(())
+    }
+
+    #[test]
+    fn point_publication_inherits_unrelated_index_memory_without_restoring_or_rescanning_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let target = ObjectId::new(950)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        for ordinal in 0..30_u128 {
+            create.create_vector_index(
+                ObjectId::new(target.get() + ordinal)?,
+                &format!("unrelated-memory-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.commit()?;
+        assert_eq!(database.search_recovery_memory.ann_by_index.len(), 30);
+        let restores = NativeDatabase::process_ann_index_restore_count();
+        let guard = FullLoadFailureGuard::install();
+        let mut point = database.begin_optimistic_delta(2, DurabilityClass::Strict)?;
+        database.stage_delta_upsert_vector(
+            &mut point,
+            target,
+            ObjectId::new(1)?,
+            Vector::new([1.0, 0.0])?,
+        )?;
+        database.commit_optimistic(point)?;
+        drop(guard);
+        assert_eq!(NativeDatabase::process_ann_index_restore_count(), restores);
+        assert_eq!(database.search_recovery_memory.ann_by_index.len(), 30);
+        assert_eq!(
+            database.search_vector_exact_latest(target, &Vector::new([1.0, 0.0])?, 1)?[0].object_id,
+            ObjectId::new(1)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn recovery_rejects_stale_delta_ann_authority_history() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = TestDirectory::new();
@@ -42902,8 +46143,1612 @@ mod tests {
 
         assert!(matches!(
             NativeDatabase::open(temporary.path()),
-            Err(NativeRuntimeError::WriteConflict(_))
+            Err(NativeRuntimeError::InvalidCommittedRoot)
         ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_accepts_only_known_prior_absent_same_generation_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(911_001)?;
+        let present = ObjectId::new(1)?;
+        let absent = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "recovery-absence-fence",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.upsert_vector(index, present, Vector::new([1.0, 0.0])?)?;
+        seed.commit()?;
+        let prior = database.coordinator.snapshot(2)?.roots().clone();
+        let prior_csn = prior
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let commit_csn = prior_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let anchor = prior
+            .wal_anchor()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = RootSet::committed_with_storage(
+            commit_csn,
+            prior.catalog_version(),
+            anchor,
+            prior.iter_roots().collect(),
+            prior.blob_generation(),
+            prior.page_generation(),
+            prior
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        )?;
+        let recovered = |target, result: &RootSet| -> Result<RecoveredCommit, NativeRuntimeError> {
+            Ok(RecoveredCommit {
+                transaction_id: TransactionId::new(99)
+                    .map_err(|_| NativeRuntimeError::TransactionIdExhausted)?,
+                commit_lsn: anchor.lsn,
+                durability: DurabilityClass::Strict,
+                manifest: CommitManifest {
+                    read_csn: Some(prior_csn),
+                    commit_csn,
+                    catalog_version: result.catalog_version(),
+                    blob_generation: result.blob_generation(),
+                    mutation_count: 1,
+                    mutation_bytes: 0,
+                    logical_time_micros: 2,
+                    mutation_digest: [1; 32],
+                    roots: require_roots(roots_from_snapshot(result))?,
+                    page_generation: result.page_generation(),
+                    retention_floor_csn: result
+                        .retention_floor_csn()
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                },
+                mutations: vec![Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::FenceVectorAbsence,
+                    target: Some(target),
+                    key: ann_store::encode_object_identity(absent),
+                    value: Vec::new(),
+                    expires_at_micros: None,
+                }],
+            })
+        };
+        validate_recovered_ann_overlay_transitions(
+            &database.pages,
+            &database.blobs,
+            Some(&prior),
+            &result,
+            &recovered(index, &result)?,
+        )?;
+
+        let mut prior_present = recovered(index, &result)?;
+        prior_present.mutations[0].key = ann_store::encode_object_identity(present);
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &prior_present,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &recovered(ObjectId::new(911_002)?, &result)?,
+            )
+            .is_err()
+        );
+        let mixed_generation = RootSet::committed_with_storage(
+            commit_csn,
+            prior.catalog_version(),
+            anchor,
+            prior.iter_roots().collect(),
+            prior.blob_generation(),
+            prior
+                .page_generation()
+                .checked_next()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            commit_csn,
+        )?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &mixed_generation,
+                &recovered(index, &mixed_generation)?,
+            )
+            .is_err()
+        );
+        let mut mixed_generation_delete = recovered(index, &mixed_generation)?;
+        mixed_generation_delete.mutations[0].opcode = Opcode::DeleteVector;
+        mixed_generation_delete.mutations[0].key = ann_store::encode_object_identity(present);
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &mixed_generation,
+                &mixed_generation_delete,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_requires_v2_for_every_physical_m05_transition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(912)?;
+        let object = ObjectId::new(913)?;
+        let unchanged_index = ObjectId::new(915)?;
+        let vector = Vector::new([1.0, 2.0])?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "recovery-v2-authority",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.create_vector_index(
+            unchanged_index,
+            "recovery-unchanged-authority",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+        let prior = database.coordinator.snapshot(2)?.roots().clone();
+        let mut point = database.begin(2, DurabilityClass::Strict)?;
+        point.upsert_vector(index, object, vector.clone())?;
+        let committed = point.commit()?;
+        let result = database.coordinator.snapshot(3)?.roots().clone();
+        let prior_search = prior
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result_search = result
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let ordinary = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::UpsertVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(object),
+            value: ann_store::encode_vector_mutation(&vector),
+            expires_at_micros: None,
+        };
+        let authority = ann_store::ann_delta_authority_between_roots(
+            &database.pages,
+            prior_search,
+            result_search,
+            index,
+            1,
+        )?;
+        let recovered =
+            |mutations: Vec<Mutation>| -> Result<wal_codec::RecoveredCommit, NativeRuntimeError> {
+                Ok(wal_codec::RecoveredCommit {
+                    transaction_id: committed.transaction_id,
+                    commit_lsn: committed.commit_lsn,
+                    durability: DurabilityClass::Strict,
+                    manifest: wal_codec::CommitManifest {
+                        read_csn: prior.visible_csn(),
+                        commit_csn: committed.commit_csn,
+                        catalog_version: committed.catalog_version,
+                        blob_generation: result.blob_generation(),
+                        mutation_count: u32::try_from(mutations.len())
+                            .map_err(|_| NativeRuntimeError::InvalidCommittedRoot)?,
+                        mutation_bytes: 0,
+                        logical_time_micros: 2,
+                        mutation_digest: [1; 32],
+                        roots: require_roots(roots_from_snapshot(&result))?,
+                        page_generation: result.page_generation(),
+                        retention_floor_csn: result
+                            .retention_floor_csn()
+                            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                    },
+                    mutations,
+                })
+            };
+        let valid = recovered(vec![
+            ordinary.clone(),
+            wal_codec::ann_delta_authority_marker_v2(authority),
+        ])?;
+        validate_recovered_ann_overlay_transitions(
+            &database.pages,
+            &database.blobs,
+            Some(&prior),
+            &result,
+            &valid,
+        )?;
+        let stripped = recovered(vec![ordinary.clone()])?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &stripped,
+            )
+            .is_err()
+        );
+        let omitted = recovered(Vec::new())?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &omitted,
+            )
+            .is_err()
+        );
+        let mut names_unchanged = ordinary.clone();
+        names_unchanged.target = Some(unchanged_index);
+        let wrong_target = recovered(vec![
+            names_unchanged,
+            wal_codec::ann_delta_authority_marker_v2(authority),
+        ])?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &wrong_target,
+            )
+            .is_err()
+        );
+        let downgraded = recovered(vec![
+            ordinary,
+            wal_codec::ann_delta_authority_marker_v1(index),
+        ])?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &downgraded,
+            )
+            .is_err()
+        );
+        let second_object = ObjectId::new(914)?;
+        let second_vector = Vector::new([2.0, 1.0])?;
+        let mut second = database.begin(3, DurabilityClass::Strict)?;
+        second.upsert_vector(index, second_object, second_vector.clone())?;
+        let second_commit = second.commit()?;
+        let second_result = database.coordinator.snapshot(4)?.roots().clone();
+        let mut stripped_change = valid;
+        stripped_change.transaction_id = second_commit.transaction_id;
+        stripped_change.commit_lsn = second_commit.commit_lsn;
+        stripped_change.manifest.read_csn = result.visible_csn();
+        stripped_change.manifest.commit_csn = second_commit.commit_csn;
+        stripped_change.manifest.roots = require_roots(roots_from_snapshot(&second_result))?;
+        stripped_change.mutations = vec![Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::UpsertVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(second_object),
+            value: ann_store::encode_vector_mutation(&second_vector),
+            expires_at_micros: None,
+        }];
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&result),
+                &second_result,
+                &stripped_change,
+            )
+            .is_err()
+        );
+        let mut delete = database.begin(4, DurabilityClass::Strict)?;
+        assert!(delete.delete_vector(index, second_object)?);
+        let delete_commit = delete.commit()?;
+        let delete_result = database.coordinator.snapshot(5)?.roots().clone();
+        let delete_authority = ann_store::ann_delta_authority_between_roots(
+            &database.pages,
+            second_result
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            delete_result
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            index,
+            1,
+        )?;
+        let delete_mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::DeleteVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(second_object),
+            value: Vec::new(),
+            expires_at_micros: None,
+        };
+        let mut recovered_delete = stripped_change;
+        recovered_delete.transaction_id = delete_commit.transaction_id;
+        recovered_delete.commit_lsn = delete_commit.commit_lsn;
+        recovered_delete.manifest.read_csn = second_result.visible_csn();
+        recovered_delete.manifest.commit_csn = delete_commit.commit_csn;
+        recovered_delete.manifest.roots = require_roots(roots_from_snapshot(&delete_result))?;
+        recovered_delete.mutations = vec![
+            delete_mutation.clone(),
+            wal_codec::ann_delta_authority_marker_v2(delete_authority),
+        ];
+        validate_recovered_ann_overlay_transitions(
+            &database.pages,
+            &database.blobs,
+            Some(&second_result),
+            &delete_result,
+            &recovered_delete,
+        )?;
+        let mut stripped_delete = recovered_delete.clone();
+        stripped_delete.mutations = vec![delete_mutation.clone()];
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&second_result),
+                &delete_result,
+                &stripped_delete,
+            )
+            .is_err()
+        );
+        let mut tampered_authority = delete_authority;
+        tampered_authority.result_view_identity[0] ^= 1;
+        let mut tampered_delete = recovered_delete;
+        tampered_delete.mutations = vec![
+            delete_mutation,
+            wal_codec::ann_delta_authority_marker_v2(tampered_authority),
+        ];
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&second_result),
+                &delete_result,
+                &tampered_delete,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_exact_covers_unmarked_and_hyanna01_m04_vector_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(920_001)?;
+        let unchanged = ObjectId::new(920_002)?;
+        let object = ObjectId::new(1)?;
+        let vector = Vector::new([1.0, 2.0])?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "historical-m04-exact-cover",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.create_vector_index(
+            unchanged,
+            "historical-m04-unchanged",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+        let prior = database.coordinator.snapshot(2)?.roots().clone();
+        let mut update = database.begin(2, DurabilityClass::Strict)?;
+        update.upsert_vector_on_legacy_path_for_test(index, object, vector.clone())?;
+        let committed = update.commit()?;
+        let result = database.coordinator.snapshot(3)?.roots().clone();
+        let ordinary = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::UpsertVector,
+            target: Some(index),
+            key: ann_store::encode_object_identity(object),
+            value: ann_store::encode_vector_mutation(&vector),
+            expires_at_micros: None,
+        };
+        let recovered = |mutations: Vec<Mutation>,
+                         roots: &RootSet|
+         -> Result<wal_codec::RecoveredCommit, NativeRuntimeError> {
+            Ok(wal_codec::RecoveredCommit {
+                transaction_id: committed.transaction_id,
+                commit_lsn: committed.commit_lsn,
+                durability: DurabilityClass::Strict,
+                manifest: wal_codec::CommitManifest {
+                    read_csn: prior.visible_csn(),
+                    commit_csn: committed.commit_csn,
+                    catalog_version: committed.catalog_version,
+                    blob_generation: roots.blob_generation(),
+                    mutation_count: u32::try_from(mutations.len()).unwrap_or(u32::MAX),
+                    mutation_bytes: 0,
+                    logical_time_micros: 2,
+                    mutation_digest: [1; 32],
+                    roots: require_roots(roots_from_snapshot(roots))?,
+                    page_generation: roots.page_generation(),
+                    retention_floor_csn: roots
+                        .retention_floor_csn()
+                        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+                },
+                mutations,
+            })
+        };
+
+        for mutations in [
+            vec![ordinary.clone()],
+            vec![
+                ordinary.clone(),
+                wal_codec::ann_delta_authority_marker_v1(index),
+            ],
+        ] {
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &recovered(mutations, &result)?,
+            )?;
+        }
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &recovered(Vec::new(), &result)?,
+            )
+            .is_err()
+        );
+        let mut wrong_target = ordinary.clone();
+        wrong_target.target = Some(unchanged);
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &result,
+                &recovered(vec![wrong_target], &result)?,
+            )
+            .is_err()
+        );
+        let lost_result = RootSet::committed_with_storage(
+            committed.commit_csn,
+            result.catalog_version(),
+            result
+                .wal_anchor()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            prior.iter_roots().collect(),
+            prior.blob_generation(),
+            prior.page_generation(),
+            prior
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        )?;
+        assert!(
+            validate_recovered_ann_overlay_transitions(
+                &database.pages,
+                &database.blobs,
+                Some(&prior),
+                &lost_result,
+                &recovered(vec![ordinary], &lost_result)?,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn open_rejects_no_prior_m05_when_wal_evidence_is_erased_or_retargeted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for retargeted in [false, true] {
+            let temporary = TestDirectory::new();
+            let index = ObjectId::new(930)?;
+            let other = ObjectId::new(931)?;
+            let object = ObjectId::new(1)?;
+            let vector = Vector::new([1.0, 2.0])?;
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut create = database.begin(1, DurabilityClass::Strict)?;
+            create.create_vector_index(
+                index,
+                "no-prior-m05",
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            create.create_vector_index(
+                other,
+                "no-prior-retarget",
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            let created = create.commit()?;
+            let roots = database.coordinator.snapshot(2)?.roots().clone();
+            let prior_search = roots
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let definition =
+                VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+            let installed = ann_store::install_test_m05_tree(
+                &mut database.pages,
+                &database.buffer_pool,
+                prior_search,
+                definition,
+                created.commit_csn,
+                &[ann_store::TestOverlayMutation::Upsert(
+                    object,
+                    vector.clone(),
+                )],
+            )?;
+            let result_search = installed
+                .tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let mut result_roots = require_roots(roots_from_snapshot(&roots))?;
+            result_roots[3] = result_search;
+            let mutations = if retargeted {
+                let mut authority = ann_store::ann_delta_authority_between_roots(
+                    &database.pages,
+                    prior_search,
+                    result_search,
+                    index,
+                    1,
+                )?;
+                authority.index = other;
+                vec![
+                    Mutation {
+                        engine: EngineKind::Search,
+                        opcode: Opcode::UpsertVector,
+                        target: Some(other),
+                        key: ann_store::encode_object_identity(object),
+                        value: ann_store::encode_vector_mutation(&vector),
+                        expires_at_micros: None,
+                    },
+                    wal_codec::ann_delta_authority_marker_v2(authority),
+                ]
+            } else {
+                vec![Mutation {
+                    engine: EngineKind::Structure,
+                    opcode: Opcode::SetValue,
+                    target: None,
+                    key: b"erased-ann-evidence".to_vec(),
+                    value: b"value".to_vec(),
+                    expires_at_micros: None,
+                }]
+            };
+            let pending = super::encode_transaction(&super::TransactionPlan {
+                transaction_id: TransactionId::new(1)?,
+                read_csn: None,
+                catalog_version: created.catalog_version,
+                logical_time_micros: 1,
+                durability: DurabilityClass::Strict,
+                mutations: &mutations,
+                commit_csn: created.commit_csn,
+                roots: result_roots,
+                blob_generation: roots.blob_generation(),
+                page_generation: roots.page_generation(),
+                retention_floor_csn: roots
+                    .retention_floor_csn()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            })?;
+            database.pages.sync_data()?;
+            drop(database);
+
+            let wal_path = temporary.path().join(WAL_FILE);
+            let wal_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)?;
+            wal_file.set_len(0)?;
+            wal_file.sync_data()?;
+            drop(wal_file);
+            let mut wal = WalFile::open(&wal_path)?.wal;
+            wal.append_records(pending, true)?;
+            drop(wal);
+
+            assert!(matches!(
+                NativeDatabase::open(temporary.path()),
+                Err(NativeRuntimeError::InvalidCommittedRoot)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_c01_consolidation_reopens_m04_without_authorizing_m05()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(934)?;
+        let object = ObjectId::new(1)?;
+        let later_object = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "historical-c01-reopen",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, object, Vector::new([1.0, 0.0])?)?;
+        create.commit()?;
+        let mut delta = database.begin(2, DurabilityClass::Strict)?;
+        delta.upsert_vector_on_legacy_path_for_test(index, object, Vector::new([2.0, 0.0])?)?;
+        delta.commit()?;
+        let plan = database.plan_ann_consolidation(index, 8, 8)?;
+        let mut later = database.begin(3, DurabilityClass::Strict)?;
+        later.upsert_vector_on_legacy_path_for_test(
+            index,
+            later_object,
+            Vector::new([3.0, 0.0])?,
+        )?;
+        later.commit()?;
+        let prior = database.coordinator.snapshot(4)?.roots().clone();
+        let prior_search = prior
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let commit_csn = prior
+            .visible_csn()
+            .and_then(Csn::checked_next)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = ann_store::consolidate_tree_c01_for_test(
+            &mut database.pages,
+            &database.buffer_pool,
+            prior_search,
+            commit_csn,
+            &plan.inner,
+        )?;
+        let result_search = result
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::ConsolidateAnn,
+            target: Some(index),
+            key: Vec::new(),
+            value: ann_store::encode_c01_consolidation_mutation_for_test(&plan.inner),
+            expires_at_micros: None,
+        };
+        let definition = VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+        ann_store::validate_recovered_consolidation_transition(
+            &database.pages,
+            prior_search,
+            result_search,
+            definition,
+            &mutation,
+        )?;
+        let mut forged_view = mutation.clone();
+        forged_view.value[40] ^= 1;
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                result_search,
+                definition,
+                &forged_view,
+            )
+            .is_err()
+        );
+        let mut forged_count = mutation.clone();
+        forged_count.value[104..112].copy_from_slice(&2_u64.to_le_bytes());
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                result_search,
+                definition,
+                &forged_count,
+            )
+            .is_err()
+        );
+        let mut zero_count = mutation.clone();
+        zero_count.value[104..112].fill(0);
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                result_search,
+                definition,
+                &zero_count,
+            )
+            .is_err()
+        );
+        let unrelated = result
+            .upsert(
+                &mut database.pages,
+                commit_csn,
+                b"\x02forged-c01-search-key".to_vec(),
+                b"forged".to_vec(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                unrelated,
+                definition,
+                &mutation,
+            )
+            .is_err()
+        );
+        let mut roots = require_roots(roots_from_snapshot(&prior))?;
+        roots[3] = result_search;
+        let records = super::encode_transaction(&super::TransactionPlan {
+            transaction_id: TransactionId::new(19_000)?,
+            read_csn: prior.visible_csn(),
+            catalog_version: prior.catalog_version(),
+            logical_time_micros: 3,
+            durability: DurabilityClass::Strict,
+            mutations: std::slice::from_ref(&mutation),
+            commit_csn,
+            roots,
+            blob_generation: prior.blob_generation(),
+            page_generation: prior.page_generation(),
+            retention_floor_csn: prior
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        })?;
+        database.pages.sync_data()?;
+        database.wal.append_records(records, true)?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.observe_ann_index(index)?.delta_records, 1);
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, &Vector::new([2.0, 0.0])?, 1)?[0].object_id,
+            object
+        );
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, &Vector::new([3.0, 0.0])?, 1)?[0].object_id,
+            later_object
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_c01_non_search_changes_even_after_the_root_is_superseded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(934_001)?;
+        let object = ObjectId::new(1)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "superseded-forged-c01",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, object, Vector::new([1.0, 0.0])?)?;
+        create.commit()?;
+        let mut delta = database.begin(2, DurabilityClass::Strict)?;
+        delta.upsert_vector_on_legacy_path_for_test(index, object, Vector::new([2.0, 0.0])?)?;
+        delta.commit()?;
+        let plan = database.plan_ann_consolidation(index, 8, 8)?;
+        let prior = database.coordinator.snapshot(3)?.roots().clone();
+        let prior_csn = prior
+            .visible_csn()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let forged_csn = prior_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let repaired_csn = forged_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result = ann_store::consolidate_tree_c01_for_test(
+            &mut database.pages,
+            &database.buffer_pool,
+            prior
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+            forged_csn,
+            &plan.inner,
+        )?;
+        let mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::ConsolidateAnn,
+            target: Some(index),
+            key: Vec::new(),
+            value: ann_store::encode_c01_consolidation_mutation_for_test(&plan.inner),
+            expires_at_micros: None,
+        };
+        let mut forged_roots = require_roots(roots_from_snapshot(&prior))?;
+        forged_roots[3] = result
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        forged_roots[2] = BTree::from_root(
+            prior
+                .root(super::SLOT_STRUCTURE)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        )
+        .upsert(
+            &mut database.pages,
+            forged_csn,
+            super::structure_key(b"forged-c01-non-search"),
+            super::structure_storage_value(b"forged", None, &BTreeMap::new())?,
+        )?
+        .tree
+        .root()
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let records = super::encode_transaction(&super::TransactionPlan {
+            transaction_id: TransactionId::new(19_001)?,
+            read_csn: Some(prior_csn),
+            catalog_version: prior.catalog_version(),
+            logical_time_micros: 3,
+            durability: DurabilityClass::Strict,
+            mutations: std::slice::from_ref(&mutation),
+            commit_csn: forged_csn,
+            roots: forged_roots,
+            blob_generation: prior.blob_generation(),
+            page_generation: prior.page_generation(),
+            retention_floor_csn: prior
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        })?;
+        database.wal.append_records(records, true)?;
+        append_forged_root_commit(
+            &mut database,
+            &prior,
+            require_roots(roots_from_snapshot(&prior))?,
+            forged_csn,
+            repaired_csn,
+            b"supersede-forged-c01",
+        )?;
+        database.pages.sync_data()?;
+        drop(database);
+
+        assert!(matches!(
+            NativeDatabase::open(temporary.path()),
+            Err(NativeRuntimeError::InvalidCommittedRoot)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn c01_does_not_authorize_historical_metadata_downgrades()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(94_000)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "historical-c01-downgrade",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        let created = create.commit()?;
+        let prior = database.coordinator.snapshot(2)?.roots().clone();
+        let prior_search = prior
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let definition = VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+        let observation = database.observe_ann_index_unadmitted(index)?;
+        let commit_csn = created
+            .commit_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        for version in 1_u8..=3 {
+            let legacy = ann_store::install_test_legacy_metadata_tree(
+                &mut database.pages,
+                &database.buffer_pool,
+                prior_search,
+                definition,
+                version,
+                commit_csn,
+            )?;
+            let legacy_root = legacy
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let mutation = Mutation {
+                engine: EngineKind::Search,
+                opcode: Opcode::ConsolidateAnn,
+                target: Some(index),
+                key: Vec::new(),
+                value: ann_store::encode_c01_transition_for_test(
+                    observation.base_identity,
+                    observation.view_identity,
+                    observation.base_identity,
+                ),
+                expires_at_micros: None,
+            };
+            assert!(
+                ann_store::validate_recovered_consolidation_transition(
+                    &database.pages,
+                    prior_search,
+                    legacy_root,
+                    definition,
+                    &mutation,
+                )
+                .is_err(),
+                "M0{version} downgrade was accepted"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn m01_through_m04_complete_roots_open_pin_backup_and_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for version in 1_u8..=4 {
+            let temporary = TestDirectory::new();
+            let backup = temporary
+                .path()
+                .with_extension(format!("m0{version}-backup"));
+            let restored = temporary
+                .path()
+                .with_extension(format!("m0{version}-restored"));
+            let index = ObjectId::new(94_000 + u128::from(version))?;
+            let object = ObjectId::new(1)?;
+            let query = Vector::new([1.0, 0.0])?;
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let mut create = database.begin(1, DurabilityClass::Strict)?;
+            create.create_vector_index(
+                index,
+                &format!("complete-root-m0{version}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            create.upsert_vector(index, object, query.clone())?;
+            create.commit()?;
+            checkpoint_legacy_ann_root(&mut database, index, version)
+                .map_err(|error| format!("M0{version} fixture checkpoint failed: {error:?}"))?;
+            drop(database);
+
+            let mut reopened = NativeDatabase::open(temporary.path())
+                .map_err(|error| format!("M0{version} fixture reopen failed: {error:?}"))?;
+            let root = reopened
+                .coordinator
+                .snapshot(0)?
+                .roots()
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            assert_eq!(
+                ann_store::persisted_metadata_version(&reopened.pages, root, index)?,
+                Some(version)
+            );
+            assert_eq!(
+                reopened.search_vector_exact_latest(index, &query, 1)?[0].object_id,
+                object
+            );
+
+            let pin = SnapshotPinId::new(u128::from(version))?;
+            reopened
+                .pin_current(pin, i64::from(version))
+                .map_err(|error| format!("M0{version} pin failed: {error:?}"))?;
+            assert_eq!(
+                reopened
+                    .open_pinned_snapshot(pin)
+                    .map_err(|error| format!("M0{version} pinned open failed: {error:?}"))?
+                    .search_vector_exact(index, &query, 1)?[0]
+                    .object_id,
+                object
+            );
+            reopened
+                .backup(&backup, super::NativeBackupLimits::default())
+                .map_err(|error| format!("M0{version} backup failed: {error:?}"))?;
+            drop(reopened);
+
+            super::restore_native_backup(&backup, &restored)
+                .map_err(|error| format!("M0{version} restore failed: {error:?}"))?;
+            let restored_database = NativeDatabase::open(&restored)
+                .map_err(|error| format!("M0{version} restored reopen failed: {error:?}"))?;
+            let restored_root = restored_database
+                .coordinator
+                .snapshot(0)?
+                .roots()
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            assert_eq!(
+                ann_store::persisted_metadata_version(
+                    &restored_database.pages,
+                    restored_root,
+                    index,
+                )?,
+                Some(version)
+            );
+            assert_eq!(
+                restored_database.search_vector_exact_latest(index, &query, 1)?[0].object_id,
+                object
+            );
+            drop(restored_database);
+            fs::remove_dir_all(backup)?;
+            fs::remove_dir_all(restored)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn over_limit_m04_root_opens_but_m05_migration_writes_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let first = ObjectId::new(95_000)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        for ordinal in 0..33_u128 {
+            create.create_vector_index(
+                ObjectId::new(first.get() + ordinal)?,
+                &format!("historical-over-limit-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+        }
+        create.commit()?;
+        assert!(!database.search_recovery_memory.contains_m05);
+        assert!(database.search_recovery_memory.ann_retained_bytes > RECOVERY_MEMORY_BYTES);
+        drop(database);
+
+        let mut reopened = NativeDatabase::open(temporary.path())?;
+        assert!(!reopened.search_recovery_memory.contains_m05);
+        assert!(reopened.search_recovery_memory.ann_retained_bytes > RECOVERY_MEMORY_BYTES);
+        let roots_before = reopened.coordinator.snapshot(0)?.roots().clone();
+        let physical_before = reopened.physical_observation()?;
+        let mut migration = reopened.begin(2, DurabilityClass::Strict)?;
+        migration.upsert_vector(first, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        assert!(matches!(
+            migration.commit(),
+            Err(NativeRuntimeError::InvalidAnnTree)
+        ));
+        let physical_after = reopened.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        assert_eq!(reopened.coordinator.snapshot(0)?.roots(), &roots_before);
+        drop(reopened);
+
+        let stable = NativeDatabase::open(temporary.path())?;
+        assert_eq!(stable.coordinator.snapshot(0)?.roots(), &roots_before);
+        assert!(
+            stable
+                .search_vector_exact_latest(first, &Vector::new([1.0, 0.0])?, 1)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn m01_through_m04_recovery_streams_without_the_m05_shared_memory_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let lexical = ObjectId::new(94_010)?;
+        let index = ObjectId::new(94_011)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(lexical, "legacy-recovery-lexical")?;
+        create.index_document(lexical, b"document".to_vec(), "bounded recovery")?;
+        create.create_vector_index(
+            index,
+            "legacy-recovery-ann",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
+        create.commit()?;
+        let roots = database.coordinator.snapshot(2)?.roots().clone();
+        let search_root = roots
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let catalog = super::load_catalog_state(&database.pages, &database.blobs, &roots)?;
+        let definition = VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+        let lexical_bytes =
+            super::measure_search_recovery_retained_bytes(&database.pages, search_root)?;
+
+        for version in 1_u8..=4 {
+            let tree = if version == 4 {
+                BTree::from_root(search_root)
+            } else {
+                ann_store::install_test_legacy_metadata_tree(
+                    &mut database.pages,
+                    &database.buffer_pool,
+                    search_root,
+                    definition,
+                    version,
+                    Csn::new(2 + u64::from(version))?,
+                )?
+            };
+            let root = tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let ann_bytes =
+                ann_store::index_recovery_memory_at_root(&database.pages, root, index, definition)?;
+            assert!(lexical_bytes.checked_add(ann_bytes) <= Some(RECOVERY_MEMORY_BYTES));
+            ann_store::reset_full_stream_observation_for_test();
+            let restored = ann_store::load_with_memory_limit(
+                &database.pages,
+                Some(root),
+                &catalog,
+                RECOVERY_MEMORY_BYTES - lexical_bytes,
+            )?;
+            assert_eq!(
+                restored.recovery_memory_for_index_for_test(index),
+                Some(ann_bytes)
+            );
+            let (physical_visits, node_decodes, peak_frontier) =
+                ann_store::full_stream_observation_for_test();
+            assert!(
+                physical_visits > 0,
+                "M0{version} bypassed streaming restore"
+            );
+            assert_eq!(node_decodes, 0);
+            assert_eq!(peak_frontier, 0);
+            assert_eq!(
+                ann_store::load_with_memory_limit(
+                    &database.pages,
+                    Some(root),
+                    &catalog,
+                    ann_bytes - 1,
+                )?
+                .recovery_memory_for_index_for_test(index),
+                Some(ann_bytes)
+            );
+            if version < 4 {
+                let mutation = Mutation {
+                    engine: EngineKind::Search,
+                    opcode: Opcode::UpsertVector,
+                    target: Some(index),
+                    key: ann_store::encode_object_identity(ObjectId::new(
+                        10 + u128::from(version),
+                    )?),
+                    value: ann_store::encode_vector_mutation(&Vector::new([
+                        f32::from(version),
+                        1.0,
+                    ])?),
+                    expires_at_micros: None,
+                };
+                ann_store::reset_full_stream_observation_for_test();
+                let upgraded = ann_store::apply_tree_mutations(
+                    &mut database.pages,
+                    tree,
+                    Csn::new(10 + u64::from(version))?,
+                    &catalog,
+                    std::slice::from_ref(&mutation),
+                    None,
+                    None,
+                )?;
+                let upgraded_root = upgraded
+                    .root()
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                assert_eq!(
+                    ann_store::persisted_metadata_version(&database.pages, upgraded_root, index)?,
+                    Some(4)
+                );
+                assert!(ann_store::full_stream_observation_for_test().0 > 0);
+                let upgraded_ann_bytes = ann_store::index_recovery_memory_at_root(
+                    &database.pages,
+                    upgraded_root,
+                    index,
+                    definition,
+                )?;
+                ann_store::load_with_memory_limit(
+                    &database.pages,
+                    Some(upgraded_root),
+                    &catalog,
+                    RECOVERY_MEMORY_BYTES - lexical_bytes,
+                )?;
+                assert!(
+                    lexical_bytes.checked_add(upgraded_ann_bytes) <= Some(RECOVERY_MEMORY_BYTES)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn consolidation_recovery_rejects_forged_subset_graph_retention_and_unrelated_search()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(935)?;
+        let superseded = ObjectId::new(1)?;
+        let consumed = ObjectId::new(2)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "consolidation-recovery-inventory",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vectors(
+            index,
+            [
+                (superseded, Vector::new([1.0, 0.0])?),
+                (consumed, Vector::new([2.0, 0.0])?),
+            ],
+        )?;
+        create.commit()?;
+        let mut captured = database.begin(2, DurabilityClass::Strict)?;
+        captured.upsert_vector_on_legacy_path_for_test(
+            index,
+            superseded,
+            Vector::new([1.5, 0.0])?,
+        )?;
+        captured.upsert_vector_on_legacy_path_for_test(
+            index,
+            consumed,
+            Vector::new([2.5, 0.0])?,
+        )?;
+        captured.commit()?;
+        let mut plan = database.plan_ann_consolidation(index, 8, 8)?;
+        let replacement_identity = plan.replacement_identity();
+        let mut later = database.begin(3, DurabilityClass::Strict)?;
+        later.upsert_vector(index, superseded, Vector::new([9.0, 0.0])?)?;
+        later.commit()?;
+
+        let prior = database.coordinator.snapshot(4)?.roots().clone();
+        let prior_search = prior
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let (_permit, consumed_count, structural, recovery_memory) =
+            database.admit_ann_consolidation_publication(prior_search, &mut plan.inner, false)?;
+        assert_eq!(consumed_count, 1);
+        plan.inner
+            .set_publication_recovery_memory_bytes(recovery_memory);
+        let commit_csn = prior
+            .visible_csn()
+            .and_then(Csn::checked_next)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let result_tree = ann_store::consolidate_tree(
+            &mut database.pages,
+            &database.buffer_pool,
+            Some(prior_search),
+            commit_csn,
+            &plan.inner,
+            &structural,
+        )?;
+        let result_search = result_tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let definition = VectorIndexDefinition::new(index, 2, Metric::SquaredL2, ann_config()?)?;
+        let mutation = Mutation {
+            engine: EngineKind::Search,
+            opcode: Opcode::ConsolidateAnn,
+            target: Some(index),
+            key: Vec::new(),
+            value: ann_store::encode_consolidation_mutation(&plan.inner)?,
+            expires_at_micros: None,
+        };
+        ann_store::validate_recovered_consolidation_transition(
+            &database.pages,
+            prior_search,
+            result_search,
+            definition,
+            &mutation,
+        )?;
+
+        let mut forged = mutation.clone();
+        forged.value[328..336].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                result_search,
+                definition,
+                &forged,
+            )
+            .is_err()
+        );
+
+        let legacy = Mutation {
+            value: ann_store::encode_c01_consolidation_mutation_for_test(&plan.inner),
+            ..mutation.clone()
+        };
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                result_search,
+                definition,
+                &legacy,
+            )
+            .is_err()
+        );
+
+        let result = BTree::from_root(result_search);
+        let (graph_key, mut graph_value) = result
+            .scan(&database.pages)?
+            .into_iter()
+            .find(|(key, _)| {
+                key.first() == Some(&ann_store::ANN_GRAPH_LAYER_PREFIX)
+                    && key.get(17..49) == Some(replacement_identity.as_slice())
+            })
+            .ok_or("missing replacement graph record")?;
+        *graph_value.last_mut().ok_or("empty graph record")? ^= 1;
+        let forged_graph = result
+            .upsert(&mut database.pages, commit_csn, graph_key, graph_value)?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                forged_graph,
+                definition,
+                &mutation,
+            )
+            .is_err()
+        );
+
+        let metadata_key = ann_store::meta_key(index);
+        let mut metadata = result
+            .get(&database.pages, &metadata_key)?
+            .ok_or("missing result metadata")?;
+        let retained_offset = 280 + 72;
+        metadata[retained_offset] ^= 1;
+        let forged_retained = result
+            .upsert(&mut database.pages, commit_csn, metadata_key, metadata)?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                forged_retained,
+                definition,
+                &mutation,
+            )
+            .is_err()
+        );
+
+        let unrelated = result
+            .upsert(
+                &mut database.pages,
+                commit_csn,
+                b"\x02unrelated-search-key".to_vec(),
+                b"forged".to_vec(),
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        assert!(
+            ann_store::validate_recovered_consolidation_transition(
+                &database.pages,
+                prior_search,
+                unrelated,
+                definition,
+                &mutation,
+            )
+            .is_err()
+        );
+
+        let mut forged_roots = require_roots(roots_from_snapshot(&prior))?;
+        forged_roots[3] = result_search;
+        let prior_structure = prior
+            .root(super::SLOT_STRUCTURE)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        forged_roots[2] = BTree::from_root(prior_structure)
+            .upsert(
+                &mut database.pages,
+                commit_csn,
+                super::structure_key(b"unrelated-consolidation-root"),
+                super::structure_storage_value(b"forged", None, &BTreeMap::new())?,
+            )?
+            .tree
+            .root()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let records = super::encode_transaction(&super::TransactionPlan {
+            transaction_id: TransactionId::new(20_000)?,
+            read_csn: prior.visible_csn(),
+            catalog_version: prior.catalog_version(),
+            logical_time_micros: 4,
+            durability: DurabilityClass::Strict,
+            mutations: std::slice::from_ref(&mutation),
+            commit_csn,
+            roots: forged_roots,
+            blob_generation: prior.blob_generation(),
+            page_generation: prior.page_generation(),
+            retention_floor_csn: prior
+                .retention_floor_csn()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?,
+        })?;
+        database.wal.append_records(records, true)?;
+        let repaired_csn = commit_csn
+            .checked_next()
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        append_forged_root_commit(
+            &mut database,
+            &prior,
+            require_roots(roots_from_snapshot(&prior))?,
+            commit_csn,
+            repaired_csn,
+            b"repair-forged-consolidation",
+        )?;
+        database.pages.sync_data()?;
+        drop(database);
+
+        assert!(matches!(
+            NativeDatabase::open(temporary.path()),
+            Err(NativeRuntimeError::InvalidCommittedRoot)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn historical_c02_fixture_consolidates_4096_records_across_object_255_256_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(4_500)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "historical-c02-n4096",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.commit()?;
+        let vectors = (1..=4_096_u16)
+            .map(|value| {
+                Ok((
+                    ObjectId::new(u128::from(value))?,
+                    Vector::new([f32::from(value), 0.0])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut delta = database.begin(2, DurabilityClass::Strict)?;
+        delta.upsert_vectors_on_legacy_path_for_test(index, vectors)?;
+        delta.commit()?;
+        let plan = database.plan_ann_consolidation(index, 4_096, 4_096)?;
+        assert_eq!(plan.captured_delta_count(), 4_096);
+        let receipt = database.consolidate_ann(plan, DurabilityClass::Strict)?;
+        assert_eq!(receipt.consumed_delta_records, 4_096);
+        assert_eq!(receipt.preserved_later_delta_records, 0);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let observed = reopened.observe_ann_index(index)?;
+        assert_eq!(observed.base_vector_count, 4_096);
+        assert_eq!(observed.delta_records, 0);
+        for value in [255_u16, 256] {
+            assert_eq!(
+                reopened.search_vector_exact_latest(
+                    index,
+                    &Vector::new([f32::from(value), 0.0])?,
+                    1,
+                )?[0]
+                    .object_id,
+                ObjectId::new(u128::from(value))?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_stable_m05_leaf_or_node_change_even_when_later_repaired()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for prefix in [0x0a_u8, 0x0b] {
+            let temporary = TestDirectory::new();
+            let index = ObjectId::new(940)?;
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let authority = seed_recovery_m05(&mut database, index)?;
+            let search_root = authority
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let tree = BTree::from_root(search_root);
+            let (key, mut value) = tree
+                .scan(&database.pages)?
+                .into_iter()
+                .find(|(key, _)| key.first() == Some(&prefix))
+                .ok_or("missing M05 physical key")?;
+            let byte = value.last_mut().ok_or("empty M05 physical value")?;
+            *byte ^= 1;
+            let forged = tree
+                .upsert(&mut database.pages, Csn::new(3)?, key, value)?
+                .tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            append_forged_search_root_then_repair(&mut database, &authority, forged)?;
+            drop(database);
+
+            assert!(matches!(
+                NativeDatabase::open(temporary.path()),
+                Err(NativeRuntimeError::InvalidCommittedRoot)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_excess_changed_ann_indexes_and_keys_before_a_later_repair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for excess_indexes in [false, true] {
+            let temporary = TestDirectory::new();
+            let index = ObjectId::new(950)?;
+            let mut database = NativeDatabase::create(temporary.path())?;
+            let authority = seed_recovery_m05(&mut database, index)?;
+            let search_root = authority
+                .root(SLOT_SEARCH)
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            let count = if excess_indexes { 4_u128 } else { 80 };
+            let mut additions = (0..count)
+                .map(|ordinal| {
+                    let target = if excess_indexes {
+                        ObjectId::new(10_000 + ordinal)?
+                    } else {
+                        index
+                    };
+                    let mut key = vec![0x0a];
+                    key.extend_from_slice(&target.get().to_be_bytes());
+                    key.extend_from_slice(&(10_000 + ordinal).to_be_bytes());
+                    Ok((key, vec![u8::try_from(ordinal % 251)?; 40]))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            additions.sort_by(|left, right| left.0.cmp(&right.0));
+            let forged = BTree::from_root(search_root)
+                .upsert_sorted_batch(&mut database.pages, Csn::new(3)?, additions)?
+                .tree
+                .root()
+                .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+            append_forged_search_root_then_repair(&mut database, &authority, forged)?;
+            drop(database);
+
+            assert!(matches!(
+                NativeDatabase::open(temporary.path()),
+                Err(NativeRuntimeError::InvalidCommittedRoot)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_accepts_lexical_only_commit_beside_unchanged_m05()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(960)?;
+        let lexical = ObjectId::new(961)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        seed_recovery_m05(&mut database, index)?;
+        let mut lexical_only = database.begin(3, DurabilityClass::Strict)?;
+        lexical_only.create_search_index(lexical, "unchanged-m05-lexical")?;
+        lexical_only.index_document(lexical, b"document".to_vec(), "lexical only")?;
+        lexical_only.commit()?;
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened
+                .snapshot(4)?
+                .search_document_text(lexical, b"document"),
+            Some("lexical only")
+        );
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?[0].object_id,
+            ObjectId::new(1)?
+        );
         Ok(())
     }
 
@@ -51757,6 +56602,255 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_ann_delete_retains_its_exact_ledger_including_publication_peak()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(77_001)?;
+        let object = ObjectId::new(1)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "scheduled-delete-ledger",
+            2,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.upsert_vector(index, object, Vector::new([1.0, 0.0])?)?;
+        seed.commit()
+            .map_err(|error| format!("scheduled ANN delete seed failed: {error:?}"))?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1))?;
+        let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Group)?;
+        assert!(
+            database
+                .stage_delta_vector_absence_fence(&mut batch, index, object)
+                .map_err(|error| format!("scheduled ANN delete stage failed: {error:?}"))?
+        );
+        let ledger = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+        let structural = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .ann_replacement_structural_memory_bytes;
+        assert_eq!(
+            structural,
+            u64::try_from(BTree::sorted_batch_structural_memory_bound(35))?
+        );
+        assert!(
+            ledger
+                > u64::try_from(BTree::sorted_batch_structural_memory_bound(35))
+                    .unwrap_or(u64::MAX)
+        );
+        let publication_memory = batch.inner.scheduler_queue_retained_memory_bytes()?;
+        assert!(publication_memory > ledger);
+
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(1, Duration::ZERO, 1)?
+                .with_execution_admission_wait(Duration::from_secs(1))?,
+        )?;
+        let client = scheduler.client();
+        let retained = client
+            .retain_cohort_batch(batch)
+            .map_err(|error| format!("scheduled ANN delete retention failed: {error:?}"))?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, publication_memory);
+        let pending = client
+            .enqueue_cohort(vec![retained])?
+            .pop()
+            .ok_or("missing scheduled ANN delete")?;
+        assert_eq!(
+            pending
+                .wait()
+                .map_err(|error| format!("scheduled ANN delete commit failed: {error:?}"))?
+                .commit_csn,
+            Csn::new(2)?
+        );
+        scheduler.shutdown()?;
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        let reopened = NativeDatabase::open(temporary.path())
+            .map_err(|error| format!("scheduled ANN delete reopen failed: {error:?}"))?;
+        assert!(
+            reopened
+                .search_vector_exact_latest(index, &Vector::new([1.0, 0.0])?, 1)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_multi_index_ann_plan_retains_one_combined_structural_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let indexes = [ObjectId::new(77_010)?, ObjectId::new(77_011)?];
+        let objects = [ObjectId::new(1)?, ObjectId::new(2)?];
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        for (ordinal, (index, object)) in indexes.into_iter().zip(objects).enumerate() {
+            seed.create_vector_index(
+                index,
+                &format!("scheduled-multi-index-{ordinal}"),
+                2,
+                VectorMetric::SquaredL2,
+                ann_config()?,
+            )?;
+            seed.upsert_vector(
+                index,
+                object,
+                Vector::new([f32::from(u16::try_from(ordinal)?), 1.0])?,
+            )?;
+        }
+        seed.commit()?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1))?;
+        let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Group)?;
+        for (index, object) in indexes.into_iter().zip(objects) {
+            assert!(database.stage_delta_vector_absence_fence(&mut batch, index, object)?);
+        }
+        let delta = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?;
+        let combined = delta.ann_replacement_structural_memory_bytes;
+        assert_eq!(
+            combined,
+            u64::try_from(BTree::sorted_batch_structural_memory_bound(70))?
+        );
+        assert!(
+            combined
+                < u64::try_from(BTree::sorted_batch_structural_memory_bound(35))?.saturating_mul(2)
+        );
+        let ledger = delta.retained_memory_bytes;
+        let publication_memory = batch.inner.scheduler_queue_retained_memory_bytes()?;
+        assert!(publication_memory > ledger);
+
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(1, Duration::ZERO, 1)?
+                .with_execution_admission_wait(Duration::from_secs(1))?,
+        )?;
+        let client = scheduler.client();
+        let retained = client.retain_cohort_batch(batch)?;
+        assert_eq!(governor.usage_snapshot().memory_bytes, publication_memory);
+        let pending = client
+            .enqueue_cohort(vec![retained])?
+            .pop()
+            .ok_or("missing scheduled multi-index ANN batch")?;
+        assert_eq!(pending.wait()?.commit_csn, Csn::new(2)?);
+        scheduler.shutdown()?;
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        for (index, object) in indexes.into_iter().zip(objects) {
+            assert!(
+                reopened
+                    .search_vector_exact_latest(index, &Vector::new([0.0, 0.0])?, 1)?
+                    .iter()
+                    .all(|hit| hit.object_id != object)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worst_case_ann_replacement_memory_remains_charged_after_dequeue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DIMENSION: usize = 3_840;
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(77_002)?;
+        let object = ObjectId::new(1)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut seed = database.begin(1, DurabilityClass::Strict)?;
+        seed.create_vector_index(
+            index,
+            "scheduled-upsert-ledger",
+            u16::try_from(DIMENSION)?,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        seed.commit()?;
+        let governor = Arc::new(NativeResourceGovernor::new(engine_admission_test_policy()));
+        database
+            .set_resource_governor_with_queue_wait(Arc::clone(&governor), Duration::from_secs(1))?;
+        let mut batch = database.begin_optimistic_delta(2, DurabilityClass::Group)?;
+        database.stage_delta_upsert_vector(
+            &mut batch,
+            index,
+            object,
+            Vector::new(vec![1.0; DIMENSION])?,
+        )?;
+        let payload_peak = batch
+            .inner
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.ann_mutations.get(&index))
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .point_publication_payload_peak_memory_bytes();
+        let ledger = batch
+            .inner
+            .delta
+            .as_ref()
+            .ok_or(NativeRuntimeError::InvalidPreparedMutation)?
+            .retained_memory_bytes;
+        assert!(
+            ledger
+                > u64::try_from(BTree::sorted_batch_structural_memory_bound(35))
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(payload_peak)
+        );
+        let publication_memory = batch.inner.scheduler_queue_retained_memory_bytes()?;
+        assert!(publication_memory > ledger);
+
+        let scheduler = NativeCommitScheduler::start(
+            database,
+            GroupCommitConfig::new(1, Duration::ZERO, 1)?
+                .with_execution_admission_wait(Duration::from_secs(1))?,
+        )?;
+        let client = scheduler.client();
+        let retained = client.retain_cohort_batch(batch)?;
+        assert_eq!(governor.usage_snapshot().compute_threads, 0);
+        assert_eq!(governor.usage_snapshot().io_slots, 0);
+        assert_eq!(governor.usage_snapshot().memory_bytes, publication_memory);
+        let execution_gate = client.block_commit_execution_for_test()?;
+        let pending = client
+            .enqueue_cohort(vec![retained])?
+            .pop()
+            .ok_or("missing scheduled ANN upsert")?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while governor.usage_snapshot().compute_threads == 0 {
+            if Instant::now() >= deadline {
+                return Err("scheduled ANN replacement was not dequeued".into());
+            }
+            std::thread::yield_now();
+        }
+        let dequeued = governor.usage_snapshot();
+        assert_eq!(dequeued.compute_threads, 1);
+        assert_eq!(dequeued.io_slots, 1);
+        assert_eq!(dequeued.memory_bytes, publication_memory);
+        drop(execution_gate);
+        assert_eq!(pending.wait()?.commit_csn, Csn::new(2)?);
+        scheduler.shutdown()?;
+        assert_eq!(governor.usage_snapshot().memory_bytes, 0);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(
+            reopened.search_vector_exact_latest(index, &Vector::new(vec![1.0; DIMENSION])?, 1,)?[0]
+                .object_id,
+            object
+        );
+        Ok(())
+    }
+
+    #[test]
     fn retained_cohort_batches_are_idempotent_through_atomic_enqueue()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -60203,6 +65297,90 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn consolidation_publication_pre_admits_large_encoded_vectors_and_graphs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DIMENSION: usize = 3_840;
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(74_001)?;
+        let definition = VectorIndexDefinition::new(
+            index,
+            u16::try_from(DIMENSION)?,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_vector_index(
+            index,
+            "encoded-consolidation-memory",
+            u16::try_from(DIMENSION)?,
+            VectorMetric::SquaredL2,
+            ann_config()?,
+        )?;
+        create.upsert_vector(index, ObjectId::new(1)?, Vector::new(vec![1.0; DIMENSION])?)?;
+        create.commit()?;
+        let mut update = database.begin(2, DurabilityClass::Strict)?;
+        update.upsert_vector_on_legacy_path_for_test(
+            index,
+            ObjectId::new(1)?,
+            Vector::new(vec![2.0; DIMENSION])?,
+        )?;
+        update.commit()?;
+        let plan = database.plan_ann_consolidation(index, 8, 8)?;
+        let root = database
+            .coordinator
+            .snapshot(3)?
+            .roots()
+            .root(SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let load_plan = ann_store::plan_index_load(
+            &database.pages,
+            &database.buffer_pool,
+            root,
+            index,
+            definition,
+        )?;
+        let structural_limits =
+            ann_store::consolidation_prefix_replacement_limits(&load_plan, &plan.inner)?;
+        let structural_plan = BTree::from_root(root)
+            .plan_prefixes_sorted_batch_replacement_with_limits_and_control(
+                &database.pages,
+                structural_limits,
+                || std::ops::ControlFlow::Continue(()),
+            )?;
+        let previously_admitted = load_plan
+            .hydration_memory_bytes()
+            .saturating_add(super::partitioned_hnsw_build_memory_bytes(
+                plan.effective_vector_count(),
+                definition,
+            ))
+            .saturating_add(
+                u64::try_from(structural_plan.structural_peak_memory_bytes()).unwrap_or(u64::MAX),
+            );
+        let encoded = ann_store::consolidation_encoded_replacement_memory_bytes(&plan.inner)?;
+        assert!(encoded > u64::try_from(DIMENSION)?.saturating_mul(4));
+
+        let mut policy = engine_admission_test_policy();
+        policy.memory_bytes = previously_admitted.saturating_add(RECOVERY_MEMORY_BYTES);
+        for limit in &mut policy.class_limits {
+            limit.memory_bytes = previously_admitted;
+        }
+        let governor = Arc::new(NativeResourceGovernor::new(policy));
+        database.set_resource_governor_with_queue_wait(governor, Duration::ZERO)?;
+        let physical_before = database.physical_observation()?;
+        assert!(matches!(
+            database.consolidate_ann(plan, DurabilityClass::Strict),
+            Err(NativeRuntimeError::ResourceAdmission(
+                GovernorAdmissionError::ClassLimit
+            ))
+        ));
+        let physical_after = database.physical_observation()?;
+        assert_eq!(physical_after.page_count, physical_before.page_count);
+        assert_eq!(physical_after.wal_bytes, physical_before.wal_bytes);
+        Ok(())
+    }
+
     fn assert_ann_consolidation_plan_accounting_and_reconfiguration(
         database: &mut NativeDatabase,
         consolidation: super::AnnConsolidationPlan,
@@ -60309,12 +65487,12 @@ mod tests {
         );
         let inserted = ObjectId::new(129)?;
         let mut update = database.begin(0, DurabilityClass::Strict)?;
-        update.upsert_vector(
+        update.upsert_vector_on_legacy_path_for_test(
             index,
             inserted,
             Vector::new([64.0, 1.0, 4.0, 1.0, 9.0, 12.0, 13.0, 1.0])?,
         )?;
-        assert!(update.delete_vector(index, ObjectId::new(1)?)?);
+        assert!(update.delete_vector_on_legacy_path_for_test(index, ObjectId::new(1)?)?);
         update.commit()?;
         let with_deltas = database.observe_ann_index(index)?;
         assert_eq!(with_deltas.base_identity, evidence.build_identity);
@@ -60359,89 +65537,6 @@ mod tests {
         assert_eq!(
             reopened.search_vector_exact_latest(index, query, 8)?,
             expected_after_delta
-        );
-        Ok(())
-    }
-
-    fn consolidate_and_assert_ann_routing_receipt(
-        database: &mut NativeDatabase,
-        index: ObjectId,
-        expected_base_identity: [u8; 32],
-        expected_view_identity: [u8; 32],
-    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-        let consolidation = database.plan_ann_consolidation(index, 256, 4)?;
-        let captured_base_identity = consolidation.base_identity();
-        let captured_view_identity = consolidation.captured_view_identity();
-        let captured_delta_count = consolidation.captured_delta_count();
-        let effective_vector_count = consolidation.effective_vector_count();
-        let replacement_identity = consolidation.replacement_identity();
-        assert_eq!(captured_base_identity, expected_base_identity);
-        assert_eq!(captured_view_identity, expected_view_identity);
-        assert_eq!(captured_delta_count, 1);
-        assert_eq!(effective_vector_count, 129);
-        let consolidation_receipt =
-            database.consolidate_ann(consolidation, DurabilityClass::Memory)?;
-        assert_eq!(
-            consolidation_receipt.previous_base_identity,
-            captured_base_identity
-        );
-        assert_eq!(
-            consolidation_receipt.replacement_base_identity,
-            replacement_identity
-        );
-        assert_eq!(consolidation_receipt.consumed_delta_records, 1);
-        assert_eq!(consolidation_receipt.preserved_later_delta_records, 0);
-        assert_eq!(consolidation_receipt.effective_vector_count, 129);
-        Ok(replacement_identity)
-    }
-
-    fn assert_consolidated_partitioned_routing_reopens(
-        database: NativeDatabase,
-        data_directory: &std::path::Path,
-        index: ObjectId,
-        query: &Vector,
-        options: AnnSearchOptions,
-        inserted: ObjectId,
-        replacement_identity: [u8; 32],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let consolidated = without_full_state_or_catalog_materialization(|| {
-            database.search_ann_selected_latest(index, query, options, 3)
-        })?;
-        assert_eq!(
-            consolidated.routing_mode,
-            super::AnnPartitionRoutingMode::SelectedPartitions
-        );
-        assert_eq!(consolidated.selected_partitions.len(), 2);
-        assert_eq!(consolidated.total_partitions, 4);
-        assert_eq!(
-            consolidated.routing_outcome,
-            super::AnnPartitionRoutingOutcome::SelectedCertified
-        );
-        assert_eq!(consolidated.base_build_identity, replacement_identity);
-        assert_eq!(consolidated.view_identity, replacement_identity);
-        assert_eq!(consolidated.search.build_identity, replacement_identity);
-        assert_eq!(consolidated.exact_delta_candidates, 0);
-        assert_eq!(consolidated.search.hits[0].object_id, inserted);
-
-        let default_after_consolidation = database.search_ann_latest(index, query, options)?;
-        let full_after_consolidation = without_full_state_or_catalog_materialization(|| {
-            database.search_ann_selected_latest(index, query, options, 4)
-        })?;
-        assert_full_fanout_routing_receipt(&full_after_consolidation, &default_after_consolidation);
-
-        drop(database);
-        let reopened = NativeDatabase::open(data_directory)?;
-        assert_eq!(
-            without_full_state_or_catalog_materialization(|| {
-                reopened.search_ann_selected_latest(index, query, options, 3)
-            })?,
-            consolidated
-        );
-        assert_eq!(
-            without_full_state_or_catalog_materialization(|| {
-                reopened.search_ann_selected_latest(index, query, options, 4)
-            })?,
-            full_after_consolidation
         );
         Ok(())
     }
@@ -60551,7 +65646,7 @@ mod tests {
     }
 
     #[test]
-    fn ann_maintenance_status_and_due_planning_are_target_scoped()
+    fn m05_maintenance_and_consolidation_remain_target_scoped()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
         let mut database = NativeDatabase::create(temporary.path())?;
@@ -60574,18 +65669,21 @@ mod tests {
         super::FAIL_FULL_STATE_LOAD.set(true);
         super::FAIL_FULL_CATALOG_STATE_LOAD.set(true);
         let status = database.ann_maintenance_status(target)?;
-        let due = database
+        assert!(status.due);
+        assert_eq!(status.delta_records, 1);
+        let consolidation = database
             .plan_due_ann_consolidation(target, 256)?
-            .ok_or("target consolidation was not planned when due")?;
-        let receipt = database.consolidate_ann(due, DurabilityClass::Memory)?;
+            .ok_or("missing M05 consolidation")?;
         super::FAIL_FULL_CATALOG_STATE_LOAD.set(false);
         super::FAIL_FULL_STATE_LOAD.set(false);
 
-        assert_eq!(status.delta_records, 1);
-        assert!(status.delta_bytes > 0);
-        assert!(status.due);
-        assert_eq!(receipt.consumed_delta_records, 1);
+        let expected = database.search_vector_exact_latest(target, &Vector::new([2.0; 8])?, 8)?;
+        database.consolidate_ann(consolidation, DurabilityClass::Memory)?;
         assert_eq!(database.observe_ann_index(target)?.delta_records, 0);
+        assert_eq!(
+            database.search_vector_exact_latest(target, &Vector::new([2.0; 8])?, 8)?,
+            expected
+        );
         Ok(())
     }
 
@@ -61089,21 +66187,23 @@ mod tests {
         assert_eq!(with_delta.view_identity, with_delta.search.build_identity);
         assert_eq!(with_delta.exact_delta_candidates, 1);
 
-        let replacement_identity = consolidate_and_assert_ann_routing_receipt(
-            &mut reopened,
-            index,
-            selected.base_build_identity,
-            with_delta.view_identity,
-        )?;
-        assert_consolidated_partitioned_routing_reopens(
-            reopened,
-            temporary.path(),
-            index,
-            &delta_query,
-            options,
-            inserted,
-            replacement_identity,
-        )
+        let consolidation = reopened.plan_ann_consolidation(index, 256, 4)?;
+        assert_eq!(consolidation.captured_delta_count(), 1);
+        reopened.consolidate_ann(consolidation, DurabilityClass::Memory)?;
+        let consolidated = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &delta_query, options, 3)
+        })?;
+        assert_eq!(consolidated.search.hits[0].object_id, inserted);
+        assert_eq!(consolidated.exact_delta_candidates, 0);
+        assert_eq!(reopened.observe_ann_index(index)?.delta_records, 0);
+        drop(reopened);
+        let reopened = NativeDatabase::open(temporary.path())?;
+        let reopened_delta = without_full_state_or_catalog_materialization(|| {
+            reopened.search_ann_selected_latest(index, &delta_query, options, 3)
+        })?;
+        assert_eq!(reopened_delta, consolidated);
+        assert_eq!(reopened_delta.search.hits[0].object_id, inserted);
+        Ok(())
     }
 
     #[test]
@@ -64313,6 +69413,9 @@ mod tests {
             ann_consolidation: None,
             ann_consolidation_structure: None,
             ann_initial_bulk: None,
+            ann_point_publications: None,
+            legacy_ann_indexes: BTreeSet::new(),
+            materialized_ann_point_publication_memory_bytes: 0,
             resource_permit: None,
         };
         let compacted = super::commit_engine_roots(

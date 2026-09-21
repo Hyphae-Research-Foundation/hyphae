@@ -190,7 +190,14 @@ fn durable_policy_marks_maintenance_due_and_builds_a_scheduler_plan() -> Result<
         config()?,
         policy,
     )?;
-    create.upsert_vector(index, ObjectId::new(1)?, Vector::new([0.0, 0.0])?)?;
+    create.upsert_vectors(
+        index,
+        [
+            (ObjectId::new(1)?, Vector::new([0.0, 0.0])?),
+            (ObjectId::new(2)?, Vector::new([1.0, 0.0])?),
+            (ObjectId::new(3)?, Vector::new([1.5, 0.0])?),
+        ],
+    )?;
     create.commit()?;
 
     assert_eq!(database.ann_maintenance_status(index)?.lifecycle, policy);
@@ -198,7 +205,9 @@ fn durable_policy_marks_maintenance_due_and_builds_a_scheduler_plan() -> Result<
     assert!(database.plan_due_ann_consolidation(index, 16)?.is_none());
     for (object, value) in [(2, 2.0), (3, 3.0)] {
         let mut update = database.begin(2, DurabilityClass::Strict)?;
-        update.upsert_vector(index, ObjectId::new(object)?, Vector::new([value, 0.0])?)?;
+        let object = ObjectId::new(object)?;
+        assert!(update.delete_vector(index, object)?);
+        update.upsert_vector(index, object, Vector::new([value, 0.0])?)?;
         update.commit()?;
     }
     let due = database.ann_maintenance_status(index)?;

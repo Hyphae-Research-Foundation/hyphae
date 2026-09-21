@@ -553,13 +553,17 @@ deduplication, plus one mutually exclusive lexical-operator selector:
 ## `transaction`
 
 ```text
-hyphae transaction --data-dir <NATIVE_DIRECTORY> execute --steps-json <ARRAY> [--durability <CLASS>]
-hyphae transaction --data-dir <NATIVE_DIRECTORY> status --id <U128>
+hyphae transaction --data-dir <NATIVE_DIRECTORY> execute --idempotency-token <U128> --steps-json <ARRAY> [--durability <CLASS>]
+hyphae transaction --data-dir <NATIVE_DIRECTORY> status <--id <U128>|--idempotency-token <U128>>
 ```
 
 The script retains one explicit transaction session for SQL, structure,
-search, and vector stages followed by commit or rollback. `status` resolves
-durable outcome evidence after disconnect or an uncertain commit response.
+search, and vector stages followed by commit or rollback. Scripts ending in
+`commit` require a caller-stable nonzero idempotency token; rollback-only
+scripts may omit it. Output preserves both that token and Hyphae's generated
+transaction identity. `status` resolves durable outcome evidence by either
+identity after disconnect or an uncertain commit response. Retrying `execute`
+with a committed token returns the retained outcome without restaging effects.
 
 ## `explain`, `status`, and `telemetry`
 

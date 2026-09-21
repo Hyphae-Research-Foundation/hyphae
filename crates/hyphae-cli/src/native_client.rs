@@ -244,17 +244,25 @@ impl EmbeddedClient {
         operation: ProductOperation,
         idempotency_token: u128,
     ) -> Result<ProductResponse, Box<ProductError>> {
+        self.dispatch_with_durability_and_idempotency(
+            operation,
+            ProductDurability::Strict,
+            idempotency_token,
+        )
+    }
+
+    pub(crate) fn dispatch_with_durability_and_idempotency(
+        &mut self,
+        operation: ProductOperation,
+        durability: ProductDurability,
+        idempotency_token: u128,
+    ) -> Result<ProductResponse, Box<ProductError>> {
         if idempotency_token == 0 {
             return Err(Box::new(ProductError::from_code(
                 ProductErrorCode::InvalidRequest,
             )));
         }
-        self.dispatch_request(
-            operation,
-            ProductDurability::Strict,
-            Some(idempotency_token),
-            None,
-        )
+        self.dispatch_request(operation, durability, Some(idempotency_token), None)
     }
 
     fn dispatch_request(

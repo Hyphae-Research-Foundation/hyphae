@@ -19,6 +19,40 @@ export const DEFAULT_LIMITS: ProductLimits = {
 export type Durability = "strict" | "group" | "memory";
 export type TransactionState = "none" | "active" | "rolled-back" | "committed" | "outcome-unknown";
 
+export type ProductDocValue = boolean | bigint | number | string | Uint8Array | { readonly float: number };
+
+/** One complete image whose map names use canonical UTF-8 byte order on wire. */
+export interface ProductDocument {
+  readonly object_id: bigint;
+  readonly text: string;
+  readonly doc_values?: Readonly<Record<string, ProductDocValue>>;
+  readonly vectors?: Readonly<Record<string, readonly number[]>>;
+}
+
+export type ProductTransactionSearchMutation =
+  | {
+      readonly kind: "index";
+      readonly index: bigint;
+      readonly document_id: Uint8Array;
+      readonly text: string;
+    }
+  | {
+      readonly kind: "replace";
+      readonly index: bigint;
+      readonly document_id: Uint8Array;
+      readonly text: string;
+    }
+  | {
+      readonly kind: "delete";
+      readonly index: bigint;
+      readonly document_id: Uint8Array;
+    }
+  | {
+      readonly kind: "document";
+      readonly collection: bigint;
+      readonly document: ProductDocument;
+    };
+
 export interface ProductErrorFields {
   readonly code: string;
   readonly category: string;

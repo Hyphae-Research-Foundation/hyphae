@@ -1,0 +1,180 @@
+{
+  "cases": [
+    {
+      "name": "legacy search",
+      "operation": "search_collection",
+      "arguments": { "request": { "filter": { "kind": "match_all" } } },
+      "required_minor": 0
+    },
+    {
+      "name": "weighted score fusion",
+      "operation": "search_collection",
+      "arguments": { "request": { "fusion": "weighted_score" } },
+      "required_minor": 4
+    },
+    {
+      "name": "relative score fusion",
+      "operation": "search_collection",
+      "arguments": { "request": { "fusion": "relative_score" } },
+      "required_minor": 6
+    },
+    {
+      "name": "autocut",
+      "operation": "search_collection",
+      "arguments": { "request": { "autocut": 2 } },
+      "required_minor": 6
+    },
+    {
+      "name": "offset",
+      "operation": "search_collection",
+      "arguments": { "request": { "offset": 8 } },
+      "required_minor": 6
+    },
+    {
+      "name": "range facets",
+      "operation": "search_collection",
+      "arguments": {
+        "request": {
+          "range_facets": [
+            { "field": "price", "ranges": [{ "lower": null, "upper": 15.0 }] }
+          ]
+        }
+      },
+      "required_minor": 6
+    },
+    {
+      "name": "average aggregation",
+      "operation": "search_collection",
+      "arguments": {
+        "request": { "aggregations": [{ "name": "mean", "kind": "average", "field": "price" }] }
+      },
+      "required_minor": 6
+    },
+    {
+      "name": "vector distance cutoff",
+      "operation": "search_collection",
+      "arguments": { "request": { "vectors": [{ "max_distance": 4.0 }] } },
+      "required_minor": 6
+    },
+    {
+      "name": "lexical and operator",
+      "operation": "search_collection",
+      "arguments": { "request": { "lexical": { "operator": "and" } } },
+      "required_minor": 6
+    },
+    {
+      "name": "lexical prefix",
+      "operation": "search_collection",
+      "arguments": { "request": { "lexical": { "prefix": true } } },
+      "required_minor": 6
+    },
+    {
+      "name": "lexical field boosts",
+      "operation": "search_collection",
+      "arguments": {
+        "request": { "lexical": { "fields": [{ "field": "body", "weight_micros": 1000000 }] } }
+      },
+      "required_minor": 6
+    },
+    {
+      "name": "lexical fuzzy expansion",
+      "operation": "search_collection",
+      "arguments": { "request": { "lexical": { "fuzzy": 2 } } },
+      "required_minor": 6
+    },
+    {
+      "name": "lexical phrase matching",
+      "operation": "search_collection",
+      "arguments": { "request": { "lexical": { "phrase": true } } },
+      "required_minor": 6
+    },
+    {
+      "name": "float doc value",
+      "operation": "search_collection",
+      "arguments": {
+        "request": {
+          "filter": { "kind": "compare", "field": "rating", "operator": "greater", "value": 4.5 }
+        }
+      },
+      "required_minor": 6
+    },
+    {
+      "name": "sorted set score range",
+      "operation": "structure_read",
+      "arguments": { "kind": "sorted_set_score_range" },
+      "required_minor": 6
+    },
+    {
+      "name": "reverse hash scan",
+      "operation": "structure_read",
+      "arguments": { "kind": "hash_scan_reverse" },
+      "required_minor": 6
+    },
+    {
+      "name": "matching hash scan",
+      "operation": "structure_read",
+      "arguments": { "kind": "hash_scan_match" },
+      "required_minor": 6
+    },
+    {
+      "name": "matching key scan",
+      "operation": "structure_read",
+      "arguments": { "kind": "key_scan_match" },
+      "required_minor": 6
+    },
+    {
+      "name": "string range",
+      "operation": "structure_read",
+      "arguments": { "kind": "string_range" },
+      "required_minor": 6
+    },
+    {
+      "name": "seeded set members",
+      "operation": "structure_read",
+      "arguments": { "kind": "set_random_members" },
+      "required_minor": 6
+    },
+    {
+      "name": "sorted set increment",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "sorted_set_increment" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "sorted set pop",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "sorted_set_pop" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "conditional string set",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "string_set_conditional" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "string append",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "string_append" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "string set range",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "string_set_range" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "hash set if absent",
+      "operation": "structure_mutate",
+      "arguments": { "mutations": [{ "kind": "hash_set_if_absent" }] },
+      "required_minor": 6
+    },
+    {
+      "name": "seeded set pop",
+      "operation": "transaction_stage_structure",
+      "arguments": { "mutation": { "kind": "set_pop" } },
+      "required_minor": 6
+    }
+  ]
+}
