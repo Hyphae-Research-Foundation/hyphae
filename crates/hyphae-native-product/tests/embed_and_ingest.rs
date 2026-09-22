@@ -25,10 +25,12 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_product::{
     CustomRoleGrant, NativeProduct, ProductAuthorization, ProductDocument, ProductDurability,
-    ProductEmbeddingBatchOutput, ProductEmbeddingExecutor, ProductLocalEmbedAndIngestReceipt,
-    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode, ProductOperation,
-    ProductPermission, ProductPrincipal, ProductRequestContext, ProductResponse, ProductScope,
-    ProductSearchIngestBatch, ProductSession, ProductSessionId, ProductVector,
+    ProductEmbedAndIngestBatch, ProductEmbedAndIngestDocument, ProductEmbedAndIngestReceipt,
+    ProductEmbeddingBatchOutput, ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest,
+    ProductError, ProductErrorCode, ProductLocalEmbedAndIngestReceipt,
+    ProductLocalEmbeddingExecutionProfile, ProductOperation, ProductPermission, ProductPrincipal,
+    ProductRequestContext, ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSession,
+    ProductSessionId, ProductVector,
 };
 use hyphae_native_types::{EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType};
 
@@ -259,6 +261,23 @@ impl ProductEmbeddingExecutor for FakeExecutor {
             input_tokens: vec![self.tokens; request.documents.len()],
         })
     }
+
+    fn execution_profile(
+        &self,
+        profile: &EmbeddingProfileDefinition,
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
+        ProductLocalEmbeddingExecutionProfile::new(
+            "candle-qwen3",
+            "0.9.2",
+            "cpu",
+            "float32",
+            "x86_64-unknown-linux-gnu",
+            "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+            *profile.artifact_manifest_digest.as_bytes(),
+            32,
+        )
+        .map(Some)
+    }
 }
 
 fn receipt(response: ProductResponse) -> Result<ProductLocalEmbedAndIngestReceipt, Box<dyn Error>> {
@@ -266,6 +285,52 @@ fn receipt(response: ProductResponse) -> Result<ProductLocalEmbedAndIngestReceip
         return Err("wrong embedding response".into());
     };
     Ok(receipt)
+}
+
+fn wire_receipt(response: ProductResponse) -> Result<ProductEmbedAndIngestReceipt, Box<dyn Error>> {
+    let ProductResponse::EmbedAndIngested(receipt) = response else {
+        return Err("wrong wire embedding response".into());
+    };
+    Ok(receipt)
+}
+
+#[test]
+fn path_free_operation_reports_commit_profile_and_exact_replay() -> Result<(), Box<dyn Error>> {
+    let path = temporary("wire-replay");
+    let mut product = configured(&path)?;
+    let executor = Arc::new(FakeExecutor::new(0, 3));
+    product.set_embedding_executor(executor.clone());
+    let mut owner = session(91)?;
+    let operation = || ProductOperation::EmbedAndIngest {
+        collection: ObjectId::new(14).expect("nonzero collection"),
+        batch: ProductEmbedAndIngestBatch {
+            idempotency_id: 87,
+            documents: vec![ProductEmbedAndIngestDocument {
+                object_id: ObjectId::new(101).expect("nonzero object"),
+                text: "bounded passage".to_owned(),
+                doc_values: BTreeMap::new(),
+            }],
+        },
+    };
+    let first_context = context(&owner, 1);
+    let committed = wire_receipt(product.dispatch(&mut owner, &first_context, operation())?)?;
+    assert!(!committed.idempotent_replay);
+    assert_eq!(committed.documents, 1);
+    assert_eq!(
+        committed.execution_profile.embedding_profile,
+        ObjectId::new(13)?
+    );
+    assert_eq!(executor.calls(), 1);
+
+    let replay_context = context(&owner, 2);
+    let replay = wire_receipt(product.dispatch(&mut owner, &replay_context, operation())?)?;
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.commit, committed.commit);
+    assert_eq!(replay.execution_profile, committed.execution_profile);
+    assert_eq!(executor.calls(), 1);
+    drop(product);
+    fs::remove_dir_all(path)?;
+    Ok(())
 }
 
 #[test]
