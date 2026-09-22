@@ -1319,9 +1319,6 @@ fn catalog_error_is_corruption(source: &CatalogError) -> bool {
         | CatalogError::InvalidEmbeddingProfileBinding
         | CatalogError::InvalidVectorPolicy
         | CatalogError::InvalidKeyspacePolicy
-        | CatalogError::ZeroEmbeddingArtifactManifestDigest
-        | CatalogError::InvalidEmbeddingProfile
-        | CatalogError::InvalidEmbeddingProfileBinding
         | CatalogError::MissingDependencyTarget(_) => true,
         CatalogError::NativeType(source) => native_type_error_is_corruption(*source),
         CatalogError::VersionExhausted => false,
