@@ -117,7 +117,7 @@ const MAX_SEARCH_FACET_RANGES = 64;
 const MAX_AUTOCUT_STEEPNESS = 16;
 const MAX_LEXICAL_FIELDS = 64;
 const MAX_LEXICAL_MINIMUM_MATCH = 64;
-const MAX_EMBED_AND_INGEST_DOCUMENTS = 4_096;
+const MAX_EMBED_AND_INGEST_DOCUMENTS = 256;
 const MAX_EMBED_EXECUTION_KERNELS = 64;
 const MAX_EMBED_EXECUTION_TEXT_BYTES = 4_096;
 
@@ -409,9 +409,11 @@ export function encodeProductRequest(
   const securityMutation = (kind >= 48 && kind <= 53) || (kind >= 55 && kind <= 68) || kind === 70;
   if (securityMutation && options.idempotencyToken === undefined) throw new ClientError("security mutation requires a nonzero idempotencyToken");
   if (securityMutation && (options.durability ?? "strict") !== "strict") throw new ClientError("security mutation requires strict durability");
-  const body = encodeOperation(operation, args);
   const extended = options.idempotencyToken !== undefined;
   const contextBytes = extended ? 80 : 64;
+  const maximumBodyBytes = MAX_PAYLOAD - 16 - contextBytes;
+  const body = encodeOperation(operation, args, maximumBodyBytes);
+  if (body.byteLength > maximumBodyBytes) throw new ClientError("native request exceeds the 16 MiB protocol maximum");
   const encoded = new Uint8Array(16 + contextBytes + body.byteLength);
   encoded.set(new TextEncoder().encode("HYPREQ01"));
   const view = new DataView(encoded.buffer);
@@ -757,6 +759,9 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
     const idempotentReplay = reader.boolean();
     reader.zeroes(6);
     const documents = reader.u64();
+    if (!hasCommit) {
+      throw new ClientError("embed-and-ingest success is missing commit evidence");
+    }
     if (documents === 0n || documents > BigInt(MAX_EMBED_AND_INGEST_DOCUMENTS)) {
       throw new ClientError("embed-and-ingest document result exceeds its bound");
     }
@@ -765,7 +770,7 @@ export function decodeProductResponse(encoded: Uint8Array, requestId: bigint, ne
       documents,
       idempotentReplay,
       executionProfile: decodeEmbeddingExecutionProfile(reader),
-      commit: hasCommit ? decodeCommitReceipt(reader) : undefined,
+      commit: decodeCommitReceipt(reader),
     };
     reader.finish();
     return { kind: "embed_and_ingested", value, requestId };
@@ -1502,7 +1507,11 @@ export function blake3(input: Uint8Array): Uint8Array {
   return root(output);
 }
 
-function encodeOperation(operation: string, args: Readonly<Record<string, unknown>>): Uint8Array {
+function encodeOperation(
+  operation: string,
+  args: Readonly<Record<string, unknown>>,
+  maximumBytes = MAX_PAYLOAD,
+): Uint8Array {
   if (["capabilities", "admin_status", "admin_checkpoint", "telemetry", "transaction_begin", "security_status", "security_legacy_bearer_revoke"].includes(operation)) return new Uint8Array();
   if (operation === "structure_get" || operation === "structure_ttl") return bytes(requireBytes(args.key));
   if (operation === "structure_set") {
@@ -1661,13 +1670,7 @@ function encodeOperation(operation: string, args: Readonly<Record<string, unknow
     return join(identity128(args.collection, "search collection"), digest,
       identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
   }
-  if (operation === "embed_and_ingest") {
-    const fields = Object.keys(args);
-    if (fields.length !== 2 || !fields.includes("collection") || !fields.includes("batch")) {
-      throw new ClientError("embed-and-ingest request fields are invalid");
-    }
-    return join(identity128(args.collection, "search collection"), encodeEmbedAndIngestBatch(args.batch));
-  }
+  if (operation === "embed_and_ingest") return encodeEmbedAndIngestRequest(args, maximumBytes);
   if (operation === "search_collection") return encodeSearchCollection(args);
   if (operation === "search_ingest") return join(identity128(args.collection, "search collection"), encodeSearchBatch(args.batch));
   if (operation === "search_document_update") return join(identity128(args.collection, "search collection"), identity128(args.idempotency_id, "idempotency"), encodeSearchDocument(args.document));
@@ -1897,54 +1900,131 @@ function encodeSearchBatch(raw: unknown): Uint8Array {
   return join(identity128(batch.idempotency_id, "idempotency"), u32(documents.length), ...documents.map(encodeSearchDocument));
 }
 
-function encodeEmbedAndIngestBatch(raw: unknown): Uint8Array {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+function encodeEmbedAndIngestRequest(raw: Readonly<Record<string, unknown>>, maximumBytes: number): Uint8Array {
+  const fields: string[] = [];
+  for (const field in raw) {
+    if (Object.prototype.hasOwnProperty.call(raw, field)) fields.push(field);
+    if (fields.length > 2) break;
+  }
+  if (fields.length !== 2 || !fields.includes("collection") || !fields.includes("batch")) {
+    throw new ClientError("embed-and-ingest request fields are invalid");
+  }
+  const collection = checkedIdentity128(raw.collection, "search collection");
+  if (typeof raw.batch !== "object" || raw.batch === null || Array.isArray(raw.batch)) {
     throw new ClientError("embed-and-ingest batch fields are invalid");
   }
-  const batch = raw as Readonly<Record<string, unknown>>;
-  const fields = Object.keys(batch);
+  const batch = raw.batch as Readonly<Record<string, unknown>>;
+  fields.length = 0;
+  for (const field in batch) {
+    if (Object.prototype.hasOwnProperty.call(batch, field)) fields.push(field);
+    if (fields.length > 2) break;
+  }
   if (fields.length !== 2 || !fields.includes("idempotency_id") || !fields.includes("documents")) {
     throw new ClientError("embed-and-ingest batch fields are invalid");
   }
+  const idempotencyId = checkedIdentity128(batch.idempotency_id, "idempotency");
   const documents = batch.documents;
   if (!Array.isArray(documents) || documents.length === 0 || documents.length > MAX_EMBED_AND_INGEST_DOCUMENTS) {
     throw new ClientError("embed-and-ingest documents must be a nonempty bounded array");
   }
+  const prepared: Array<{
+    readonly objectId: bigint;
+    readonly text: string;
+    readonly entries: ReadonlyArray<readonly [string, unknown]>;
+  }> = [];
+  let encodedLength = 16 + 16 + 4;
+  if (encodedLength > maximumBytes) throw new ClientError("embed-and-ingest request exceeds the 16 MiB bound");
+  for (const rawDocument of documents) {
+    if (typeof rawDocument !== "object" || rawDocument === null || Array.isArray(rawDocument)) {
+      throw new ClientError("embed-and-ingest document fields are invalid");
+    }
+    const document = rawDocument as Readonly<Record<string, unknown>>;
+    fields.length = 0;
+    for (const field in document) {
+      if (Object.prototype.hasOwnProperty.call(document, field)) fields.push(field);
+      if (fields.length > 3) break;
+    }
+    if (!fields.includes("object_id") || !fields.includes("text") ||
+        fields.some((field) => !["object_id", "text", "doc_values"].includes(field))) {
+      throw new ClientError("embed-and-ingest document fields are invalid");
+    }
+    const objectId = checkedIdentity128(document.object_id, "search document");
+    const text = document.text;
+    if (typeof text !== "string") throw new ClientError("embed-and-ingest document text is invalid");
+    const values = document.doc_values ?? {};
+    if (typeof values !== "object" || values === null || Array.isArray(values) || values instanceof Uint8Array) {
+      throw new ClientError("embed-and-ingest document values are invalid");
+    }
+    const names: string[] = [];
+    for (const name in values) {
+      if (!Object.prototype.hasOwnProperty.call(values, name)) continue;
+      names.push(name);
+      if (names.length > MAX_DOC_VALUES_PER_HIT) {
+        throw new ClientError("embed-and-ingest document values exceed their bound");
+      }
+    }
+    encodedLength = addEmbedAndIngestBytes(encodedLength, 16, maximumBytes);
+    encodedLength = addEmbedAndIngestBytes(encodedLength, 4 + utf8ByteLength(text), maximumBytes);
+    encodedLength = addEmbedAndIngestBytes(encodedLength, 4, maximumBytes);
+    const entries: Array<readonly [string, unknown]> = [];
+    for (const name of names) {
+      const [value, valueBytes] = prepareEmbedDocValue((values as Readonly<Record<string, unknown>>)[name]);
+      encodedLength = addEmbedAndIngestBytes(encodedLength, 4 + utf8ByteLength(name), maximumBytes);
+      encodedLength = addEmbedAndIngestBytes(encodedLength, valueBytes, maximumBytes);
+      entries.push([name, value]);
+    }
+    prepared.push({ objectId, text, entries });
+  }
+  const encodedDocuments = prepared.map((document) => {
+    const entries = document.entries.map(([name, value]) => [new TextEncoder().encode(name), value] as const)
+      .sort(([left], [right]) => compareBytes(left, right));
+    return join(
+      u128(document.objectId),
+      bytes(new TextEncoder().encode(document.text)),
+      u32(entries.length),
+      ...entries.flatMap(([name, value]) => [bytes(name), encodeDocValue(value)]),
+    );
+  });
   return join(
-    identity128(batch.idempotency_id, "idempotency"),
-    u32(documents.length),
-    ...documents.map(encodeEmbedAndIngestDocument),
+    u128(collection),
+    u128(idempotencyId),
+    u32(encodedDocuments.length),
+    ...encodedDocuments,
   );
 }
 
-function encodeEmbedAndIngestDocument(raw: unknown): Uint8Array {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    throw new ClientError("embed-and-ingest document fields are invalid");
+function addEmbedAndIngestBytes(total: number, added: number, maximumBytes: number): number {
+  const next = total + added;
+  if (next > maximumBytes) throw new ClientError("embed-and-ingest request exceeds the 16 MiB bound");
+  return next;
+}
+
+function prepareEmbedDocValue(value: unknown): readonly [unknown, number] {
+  if (typeof value === "boolean") return [value, 2];
+  if (typeof value === "bigint") return [value, 9];
+  if (typeof value === "number" && (Number.isSafeInteger(value) || Number.isFinite(value))) return [value, 9];
+  if (typeof value === "object" && value !== null) {
+    const float = (value as { readonly float?: unknown }).float;
+    if (typeof float === "number") return [{ float }, 9];
   }
-  const document = raw as Readonly<Record<string, unknown>>;
-  const fields = Object.keys(document);
-  if (!fields.includes("object_id") || !fields.includes("text") ||
-      fields.some((field) => !["object_id", "text", "doc_values"].includes(field))) {
-    throw new ClientError("embed-and-ingest document fields are invalid");
+  if (typeof value === "string") return [value, 5 + utf8ByteLength(value)];
+  if (value instanceof Uint8Array) return [value, 5 + value.byteLength];
+  throw new ClientError("integrated doc value is invalid");
+}
+
+function utf8ByteLength(value: string): number {
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) length += 1;
+    else if (code <= 0x7ff) length += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length &&
+             value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+      length += 4;
+      index += 1;
+    } else length += 3;
   }
-  if (typeof document.text !== "string") {
-    throw new ClientError("embed-and-ingest document text is invalid");
-  }
-  const values = document.doc_values ?? {};
-  if (typeof values !== "object" || values === null || Array.isArray(values) || values instanceof Uint8Array) {
-    throw new ClientError("embed-and-ingest document values are invalid");
-  }
-  const entries = Object.entries(values as Readonly<Record<string, unknown>>)
-    .sort(([left], [right]) => compareUtf8(left, right));
-  if (entries.length > MAX_DOC_VALUES_PER_HIT) {
-    throw new ClientError("embed-and-ingest document values exceed their bound");
-  }
-  return join(
-    identity128(document.object_id, "search document"),
-    bytes(new TextEncoder().encode(document.text)),
-    u32(entries.length),
-    ...entries.flatMap(([name, value]) => [bytes(new TextEncoder().encode(name)), encodeDocValue(value)]),
-  );
+  return length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
@@ -3479,13 +3559,20 @@ function u16(value: number): Uint8Array {
   return encoded;
 }
 
-function identity128(value: unknown, name: string): Uint8Array {
+function checkedIdentity128(value: unknown, name: string): bigint {
   let identity: bigint;
   if (typeof value === "bigint") identity = value;
   else if (typeof value === "number" && Number.isSafeInteger(value)) identity = BigInt(value);
   else throw new ClientError(`${name} identity is invalid`);
   if (identity === 0n) throw new ClientError(`${name} identity is zero`);
-  return u128(identity);
+  if (identity < 0n || identity >= 1n << 128n) {
+    throw new ClientError("u128 value is outside the unsigned 128-bit domain");
+  }
+  return identity;
+}
+
+function identity128(value: unknown, name: string): Uint8Array {
+  return u128(checkedIdentity128(value, name));
 }
 
 function readIdentity(reader: Reader, name: string): bigint {

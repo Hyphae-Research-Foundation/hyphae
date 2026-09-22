@@ -66,7 +66,7 @@ export interface EmbedAndIngestBatch {
   readonly documents: readonly EmbedAndIngestDocument[];
 }
 
-/** The selected executor reported by an embed-and-ingest response. */
+/** The selected executor for the collection's single profile-bound vector target. */
 export interface EmbeddingExecutionProfile {
   readonly embeddingProfile: bigint;
   readonly backend: "cpu" | "cuda";
@@ -83,7 +83,7 @@ export interface EmbedAndIngestResult {
   readonly documents: bigint;
   readonly idempotentReplay: boolean;
   readonly executionProfile: EmbeddingExecutionProfile;
-  readonly commit: Readonly<Record<string, unknown>> | undefined;
+  readonly commit: Readonly<Record<string, unknown>>;
 }
 
 export type ProductTransactionSearchMutation =

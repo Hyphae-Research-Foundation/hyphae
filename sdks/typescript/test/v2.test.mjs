@@ -12,6 +12,7 @@ import {
   HyphaeClient,
   HttpTransport,
   LocalTransport,
+  MAX_PAYLOAD,
   PRODUCT_MEDIA_TYPE,
   ProductError,
   blake3,
@@ -55,6 +56,48 @@ const productResponse = (kind, body) => {
   view.setUint16(12, kind, true);
   output.set(body, 16);
   return output;
+};
+
+const maximumU128 = (1n << 128n) - 1n;
+const commitReceipt = () => {
+  const receipt = new Uint8Array(96);
+  const view = new DataView(receipt.buffer);
+  view.setBigUint64(0, maximumU128 & ((1n << 64n) - 1n), true);
+  view.setBigUint64(8, maximumU128 >> 64n, true);
+  view.setBigUint64(16, 7n, true);
+  view.setBigUint64(24, 8n, true);
+  view.setBigUint64(32, 9n, true);
+  receipt.fill(3, 40, 72);
+  view.setBigUint64(80, 1n, true);
+  return receipt;
+};
+const embedAndIngestResponse = ({ replay = true, hasCommit = true } = {}) => {
+  const snapshot = new Uint8Array(80);
+  snapshot.fill(1, 0, 24);
+  const snapshotView = new DataView(snapshot.buffer);
+  snapshotView.setBigUint64(24, 7n, true);
+  snapshotView.setBigUint64(32, 8n, true);
+  snapshot.fill(2, 40, 72);
+  snapshotView.setBigInt64(72, 10n, true);
+  const resultHeader = new Uint8Array(16);
+  resultHeader[0] = Number(hasCommit);
+  resultHeader[1] = Number(replay);
+  new DataView(resultHeader.buffer).setBigUint64(8, 1n, true);
+  const profileHeader = new Uint8Array(24);
+  const profileView = new DataView(profileHeader.buffer);
+  profileView.setBigUint64(0, maximumU128 & ((1n << 64n) - 1n), true);
+  profileView.setBigUint64(8, maximumU128 >> 64n, true);
+  profileHeader[16] = 1;
+  profileHeader[17] = 1;
+  profileHeader[18] = 1;
+  const kernelCount = new Uint8Array(4);
+  new DataView(kernelCount.buffer).setUint32(0, 2, true);
+  return productResponse(47, joinBytes(
+    snapshot, resultHeader, profileHeader,
+    encodedText("NVIDIA H100"), encodedText("driver-1"), encodedText("cuda-1"),
+    kernelCount, encodedText("tokenize-v1"), encodedText("qwen3-f32-v1"),
+    ...(hasCommit ? [commitReceipt()] : []),
+  ));
 };
 
 test("v2 search content at every current shape is minor zero", () => {
@@ -118,10 +161,9 @@ test("v2 u128 bounds and nonzero identities fail closed", () => {
     ),
     /identity is zero/,
   );
-  const maximum = (1n << 128n) - 1n;
   assert.equal(
-    decodeProductRequest(encodeProductRequest("transaction_status", { transaction_id: maximum })).args.transaction_id,
-    maximum,
+    decodeProductRequest(encodeProductRequest("transaction_status", { transaction_id: maximumU128 })).args.transaction_id,
+    maximumU128,
   );
 });
 
@@ -260,10 +302,33 @@ test("v2 embed-and-ingest minor-nine codec is bounded and canonical", () => {
   assert.deepEqual(encodeProductRequest(decoded.operation, decoded.args, decoded.options, 9), encoded);
 
   const forged = encoded.slice();
-  new DataView(forged.buffer).setUint32(112, 0xffffffff, true);
+  new DataView(forged.buffer).setUint32(112, 257, true);
   assert.throws(() => decodeProductRequest(forged, 9), /document count/);
 
-  for (const forbidden of ["model_path", "backend", "device"]) {
+  assert.throws(() => encodeProductRequest("embed_and_ingest", {
+    collection: 13n,
+    batch: {
+      idempotency_id: 7n,
+      documents: Array.from({ length: 257 }, (_, index) => ({ object_id: BigInt(index + 1), text: "x" })),
+    },
+  }, {}, 9), /bounded array/);
+
+  const minimal = encodeProductRequest("embed_and_ingest", {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: "" }] },
+  }, {}, 9);
+  const maximumText = "x".repeat(MAX_PAYLOAD - minimal.byteLength);
+  const maximum = encodeProductRequest("embed_and_ingest", {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: maximumText }] },
+  }, {}, 9);
+  assert.equal(maximum.byteLength, MAX_PAYLOAD);
+  assert.throws(() => encodeProductRequest("embed_and_ingest", {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: `${maximumText}x` }] },
+  }, {}, 9), /16 MiB/);
+
+  for (const forbidden of ["model_path", "backend", "device", "target", "embedding_profile", "targets", "profiles"]) {
     assert.throws(
       () => encodeProductRequest("embed_and_ingest", { ...args, [forbidden]: "not-on-wire" }, {}, 9),
       /request fields/,
@@ -272,47 +337,14 @@ test("v2 embed-and-ingest minor-nine codec is bounded and canonical", () => {
 });
 
 test("v2 embed-and-ingest response reports execution profile and replay", () => {
-  const snapshot = new Uint8Array(80);
-  snapshot.fill(1, 0, 24);
-  const snapshotView = new DataView(snapshot.buffer);
-  snapshotView.setBigUint64(24, 7n, true);
-  snapshotView.setBigUint64(32, 8n, true);
-  snapshot.fill(2, 40, 72);
-  snapshotView.setBigInt64(72, 10n, true);
-
-  const resultHeader = new Uint8Array(16);
-  resultHeader[1] = 1;
-  new DataView(resultHeader.buffer).setBigUint64(8, 1n, true);
-  const profileHeader = new Uint8Array(24);
-  const profileView = new DataView(profileHeader.buffer);
-  profileView.setBigUint64(0, 17n, true);
-  profileHeader[16] = 1;
-  profileHeader[17] = 1;
-  profileHeader[18] = 1;
-  const device = encodedText("NVIDIA H100");
-  const driver = encodedText("driver-1");
-  const runtime = encodedText("cuda-1");
-  const kernelCount = new Uint8Array(4);
-  new DataView(kernelCount.buffer).setUint32(0, 2, true);
-  const encoded = productResponse(47, joinBytes(
-    snapshot,
-    resultHeader,
-    profileHeader,
-    device,
-    driver,
-    runtime,
-    kernelCount,
-    encodedText("tokenize-v1"),
-    encodedText("qwen3-f32-v1"),
-  ));
-
+  const encoded = embedAndIngestResponse();
   const response = decodeProductResponse(encoded, 19n, 9);
   assert.equal(response.kind, "embed_and_ingested");
   assert.equal(response.value.documents, 1n);
   assert.equal(response.value.idempotentReplay, true);
-  assert.equal(response.value.commit, undefined);
+  assert.equal(response.value.commit.transactionId, maximumU128);
   assert.deepEqual(response.value.executionProfile, {
-    embeddingProfile: 17n,
+    embeddingProfile: maximumU128,
     backend: "cuda",
     device: "NVIDIA H100",
     driver: "driver-1",
@@ -321,14 +353,17 @@ test("v2 embed-and-ingest response reports execution profile and replay", () => 
     kernels: ["tokenize-v1", "qwen3-f32-v1"],
     fallback: true,
   });
+  for (const replay of [false, true]) {
+    assert.throws(() => decodeProductResponse(embedAndIngestResponse({ replay, hasCommit: false }), 19n, 9), /commit evidence/);
+  }
   assert.throws(() => decodeProductResponse(encoded, 19n, 8), /protocol minor/);
   for (let prefix = 0; prefix < encoded.byteLength; prefix += 1) {
     assert.throws(() => decodeProductResponse(encoded.slice(0, prefix), 19n, 9));
   }
 
   const excessive = encoded.slice();
-  const kernelCountOffset = 16 + snapshot.byteLength + resultHeader.byteLength + profileHeader.byteLength +
-    device.byteLength + driver.byteLength + runtime.byteLength;
+  const kernelCountOffset = 16 + 80 + 16 + 24 + encodedText("NVIDIA H100").byteLength +
+    encodedText("driver-1").byteLength + encodedText("cuda-1").byteLength;
   new DataView(excessive.buffer).setUint32(kernelCountOffset, 0xffffffff, true);
   assert.throws(() => decodeProductResponse(excessive, 19n, 9), /kernel count/);
 });
@@ -1148,6 +1183,56 @@ test("v2 fresh HTTP transport sends minor-nine embed-and-ingest on its first req
   assert.equal(requests, 1);
   assert.equal(seen.minor, "3,4,5,6,7,8,9");
   assert.equal(new DataView(seen.body.buffer).getUint16(12, true), 69);
+});
+
+test("v2 concurrent HTTP responses decode with their response-local selected minor", async () => {
+  let releaseHigh;
+  const highReleased = new Promise((resolve) => { releaseHigh = resolve; });
+  let markHighReading;
+  const highReading = new Promise((resolve) => { markHighReading = resolve; });
+  const capabilities = productResponse(1, new Uint8Array(56));
+  const transport = new HttpTransport("https://example.test", {
+    fetch: async (_url, options) => {
+      const requestId = options.headers.get("x-hyphae-request-id");
+      if (requestId === "31") {
+        let started = false;
+        const body = new ReadableStream({
+          async pull(controller) {
+            if (started) return;
+            started = true;
+            markHighReading();
+            await highReleased;
+            controller.enqueue(embedAndIngestResponse({ replay: false }));
+            controller.close();
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: {
+            "content-type": PRODUCT_MEDIA_TYPE,
+            "x-hyphae-protocol-minor": "9",
+            "x-hyphae-request-id": requestId,
+          },
+        });
+      }
+      return new Response(capabilities, {
+        status: 200,
+        headers: {
+          "content-type": PRODUCT_MEDIA_TYPE,
+          "x-hyphae-protocol-minor": "8",
+          "x-hyphae-request-id": requestId,
+        },
+      });
+    },
+  });
+  const high = transport.execute("embed_and_ingest", {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{ object_id: 201n, text: "rust" }] },
+  }, { requestId: 31n });
+  await highReading;
+  assert.equal((await transport.execute("capabilities", {}, { requestId: 32n })).kind, "capabilities");
+  releaseHigh();
+  assert.equal((await high).value.executionProfile.embeddingProfile, maximumU128);
 });
 
 test("v2 HTTP transport rejects minor-nine work locally after a server downgrade", async () => {

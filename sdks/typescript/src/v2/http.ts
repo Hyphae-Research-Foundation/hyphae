@@ -147,7 +147,7 @@ export class HttpTransport implements Transport {
         if (response.status !== 200 || mediaType !== PRODUCT_MEDIA_TYPE) {
           throw new ClientError("HTTP v2 returned an unexpected status or media type");
         }
-        return decodeProductResponse(encoded, requestId, this.#negotiatedMinor);
+        return decodeProductResponse(encoded, requestId, negotiatedMinor);
       }
       if (mediaType !== ERROR_MEDIA_TYPE) {
         throw new ClientError("HTTP v2 failure did not contain a typed product error");
