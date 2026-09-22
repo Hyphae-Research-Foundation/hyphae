@@ -2,7 +2,7 @@
 [package]
 name = "hyphae-native-embed-cpu"
 autoexamples = false
-description = "Optional in-process Qwen3 CPU embedding executor for Hyphae Native"
+description = "Optional in-process Qwen3 CPU and H100 CUDA embedding executor for Hyphae Native"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,10 +14,20 @@ documentation = "https://docs.rs/hyphae-native-embed-cpu"
 publish.workspace = true
 readme = "README.md"
 
+[features]
+default = []
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "dep:cudarc",
+]
+
 [dependencies]
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
+cudarc = { workspace = true, optional = true }
 hyphae-native-catalog.workspace = true
 hyphae-native-product.workspace = true
 serde.workspace = true
@@ -25,6 +35,9 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
+
+[dev-dependencies]
+fs4.workspace = true
 
 [lints]
 workspace = true

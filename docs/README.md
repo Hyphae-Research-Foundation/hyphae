@@ -354,3 +354,4 @@ relevant contract, guide, example, and gate evidence in the same change.
 
 - [Explicit semantic memory retrieval](adr/0031-explicit-semantic-memory-retrieval.md) — selectable vector-only recall, profile defaults and lexical fallback.
 - [ADR-0033: Version physiological redo separately from WAL v1](adr/0033-versioned-physiological-redo.md)
+- [ADR-0034: Bound optional CUDA execution to validated H100 profiles](adr/0034-validated-h100-cuda-execution.md)

@@ -158,6 +158,25 @@ manifest revision, Candle version, CPU/f32 selection, compilation target, and
 checkpoint chunk size. Absence of the optional crate or a loaded matching
 model remains `unavailable`; it never triggers acquisition or a fallback.
 
+The same optional crate has a default-off `cuda` feature. Its
+`Qwen3AcceleratorExecutor` enumerates visible devices and automatically selects
+the first device with the exact `NVIDIA H100 80GB HBM3` identity, compute
+capability 9.0, and at least 79 GiB of device memory. The reported execution
+profile binds the CUDA ordinal, exact name, `sm90`, driver UUID, PCI identity,
+Candle version, selected BF16 or FP16 model-compute dtype, FP32 output,
+whole-batch CPU/f32 fallback, target, model revision, manifest digest, and
+checkpoint chunk size.
+
+Accelerator selection is fixed before model loading. If no validated H100 can
+be selected, the whole registry uses the existing CPU/f32 path and reports its
+CPU profile. A selected CUDA registry preloads the same descriptor-verified
+model on CPU. An `unavailable` CUDA result discards all GPU output and reruns
+every input as one complete CPU/f32 batch. Cancellation, deadline, validation,
+and limit errors return immediately without fallback. Product publication
+begins only after one complete GPU or CPU batch returns and validates, so CUDA
+failure never publishes partial state or a CPU/GPU mixture. ADR-0034 defines
+the dependency and unsafe-FFI boundary.
+
 ## Canonical encoding and compatibility
 
 The profile body uses `HYCOBJ02` representation `2` under logical catalog codec
