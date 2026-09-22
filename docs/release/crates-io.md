@@ -8,12 +8,14 @@ Conformance runners and independent verifiers remain private workspace tools
 and are not registry packages.
 
 The checked-in package inventory is prepared at `4.0.0` for package and
-release-candidate verification. That version is not live-publication
-authority: `apache_publication_authority`, the registry control plane, and the
-historical receipt remain pinned to `release-v3.0.0-crates`. Promoting 4.0.0
-requires a later exact-SHA control-plane update after the hosted release matrix
-and G8 closure pass. Do not create a release tag or dispatch a live publication
-from this preparation commit.
+release-candidate verification and selects integration
+`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`. That version is not
+live-publication authority: `apache_publication_authority`, the registry control
+plane, and the historical receipt remain pinned to
+`release-v3.0.0-crates`. Promoting 4.0.0 requires a later exact-SHA
+control-plane update after the hosted release matrix and G8 closure pass. Do
+not create a release tag or dispatch a live publication from this preparation
+commit.
 
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion

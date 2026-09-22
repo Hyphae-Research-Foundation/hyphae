@@ -210,7 +210,7 @@ pub trait ProductEmbeddingExecutor: Debug + Send + Sync {
 
 /// Definite result of one embedded-and-ingested batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProductLocalEmbedAndIngestReceipt {
+pub struct ProductEmbedAndIngestBatchReceipt {
     /// Snapshot containing the atomically accepted documents and vectors.
     pub snapshot: SnapshotIdentity,
     /// Original native commit evidence, including on durable replay.
@@ -313,7 +313,7 @@ impl NativeProduct {
         durability: ProductDurability,
         mut reauthorize: impl FnMut(&NativeProduct) -> Result<(), ProductError>,
         mut checkpoint: impl FnMut() -> Result<(), ProductError>,
-    ) -> Result<ProductLocalEmbedAndIngestReceipt, ProductError> {
+    ) -> Result<ProductEmbedAndIngestBatchReceipt, ProductError> {
         validate_embedding_batch_shape(target, batch, limits)?;
         let profile = self.embedding_profile_for_target(collection, target)?;
         let digest = embedding_request_digest(collection, target, batch, &profile)?;
@@ -326,7 +326,7 @@ impl NativeProduct {
             if marker.digest != digest || marker.profile != profile.header.id {
                 return Err(idempotency_conflict());
             }
-            return Ok(ProductLocalEmbedAndIngestReceipt {
+            return Ok(ProductEmbedAndIngestBatchReceipt {
                 snapshot: self.snapshot_bounded(logical_time_micros)?.identity(),
                 commit: self.original_search_receipt(marker.transaction_id)?,
                 profile: marker.profile,
@@ -398,7 +398,7 @@ impl NativeProduct {
                 reauthorize(product)
             },
         )?;
-        Ok(ProductLocalEmbedAndIngestReceipt {
+        Ok(ProductEmbedAndIngestBatchReceipt {
             snapshot,
             commit,
             profile: profile.header.id,

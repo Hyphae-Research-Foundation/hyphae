@@ -19,6 +19,17 @@ closure.
 - Add conditional `MemoryEnrich` (wire 72) so delayed inference cannot revive
   expired, changed or forgotten sources. Reuse the existing Candle
   `hyphae-embed` implementation through its persistent local worker.
+- Add catalogued Qwen3 embedding profiles, persistent runtime bindings, and the
+  atomic catalog-bound embed-and-ingest operation. Native protocol minor 9
+  carries it through Rust, Python, and TypeScript with bounded codecs, durable
+  commit evidence, actual execution-profile reporting, and replay status.
+- Add the offline `hyphae-native-embed-cpu` executor and CLI model/profile/
+  ingestion commands. The source candidate contains 25 publishable crates. No
+  CUDA crate or implementation is present or claimed.
+- Add the multilingual embedding measurement harness with controlled model
+  acquisition, containment, legal review, and receipt validation. Its checked-in
+  result remains `unverified-no-measurement`; it grants no model or performance
+  claim.
 - Add optional semantic profiles, verified-backup migration, crash recovery,
   background enrichment, durable capture queue, project/global pause controls,
   and the bounded `hyphae agent ui` operator interface.
@@ -51,10 +62,11 @@ closure.
 - Update the isolated Tantivy benchmark baseline to 0.26.2, resolving the
   vulnerable `lru` dependency to 0.16.4.
 
-The workspace, crate graph, SDK manifests, plugin manifests, and package
-inventories now share final source version `4.0.0`. The candidate remains
-unpublished and does not inherit an exact-commit G7/G8 closure. The `3.0.0`
-release history and publication receipts remain authoritative and unchanged.
+The workspace, 25-crate graph, SDK manifests, plugin manifests, and package
+inventories now share final source version `4.0.0`. The candidate selects
+integration `d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`, remains unpublished,
+and does not inherit an exact-commit G7/G8 closure. The `3.0.0` release history
+and publication receipts remain authoritative and unchanged.
 
 ## [3.0.0] - 2026-09-03
 

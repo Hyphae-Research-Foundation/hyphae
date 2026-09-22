@@ -40,6 +40,8 @@ class RecordingTransport:
         kind = (
             "security_mutated"
             if operation == "security_legacy_bearer_revoke"
+            else "embed_and_ingested"
+            if operation == "embed_and_ingest"
             else operation
         )
         return Response(kind, arguments, options.checked_request_id())
@@ -300,6 +302,21 @@ class SyncLifecycleTests(unittest.TestCase):
 
 
 class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_embed_and_ingest_matches_the_sync_surface(self) -> None:
+        transport = RecordingTransport()
+        batch = {
+            "idempotency_id": 7,
+            "documents": [{"object_id": 201, "text": "rust"}],
+        }
+        async with AsyncHyphaeClient(transport) as client:
+            response = await client.embed_and_ingest(
+                13, batch, options=RequestOptions(request_id=2)
+            )
+        self.assertEqual(response.kind, "embed_and_ingested")
+        self.assertEqual(
+            transport.calls[0][1], {"collection": 13, "batch": batch}
+        )
+
     async def test_owner_legacy_bearer_revoke_is_typed(self) -> None:
         transport = RecordingTransport()
         async with AsyncHyphaeClient(transport) as client:

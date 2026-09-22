@@ -55,18 +55,21 @@ full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
 row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
-Lane 12 composes release-preparation head
-`5aad997023e765a8935e7acbd61101525ced9b88` with Lane 10 CLI consumer
-`84de293d49331859edf45cc268d0aeba743bd0d2`. Its CPU crate metadata, README,
-and legal files match Lane 05 `dbcc464912877b2dcc4e765337e3e15001179f32`.
-Cargo metadata and the release config agree on 25 publishable packages; the
+Lane 12 selects complete integration
+`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976` and composes it with release
+preparation parent `1560988a67899926055864635fa2aee21b02ef8a`. The selected
+integration carries the catalog, product/runtime, Rust wire, CPU, CLI, Python,
+TypeScript, and multilingual-harness lanes. Its CPU crate metadata, README, and
+legal files match Lane 05 `dbcc464912877b2dcc4e765337e3e15001179f32`. Cargo
+metadata and the release config agree on 25 publishable packages; the
 package-content audit and the build from all 25 extracted archives pass.
 
 Lane 06 `b36f929ea89f0388f9d75fd7c5de3423ddfc16fe` is tree-identical to Lane 05,
 so it contributes no additional package or CUDA implementation. No CUDA claim
-is made. The SDK, harness, complete integration, hosted matrix, and exact-SHA
-G8 closure remain open. Exact dependencies, commands, measured package results,
-and non-claims are recorded in the
+is made. The checked-in harness retains an explicit unverified placeholder, not
+a model/result receipt. The hosted matrix, verified model/result receipt, and
+exact-SHA G8 closure remain open. Exact dependencies, commands, measured
+package results, and non-claims are recorded in the
 [`4.0.0` dependency ledger](../release/4.0.0-dependency-ledger.md). None of
 these package observations closes a release gate or expands shipped behavior.
 

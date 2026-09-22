@@ -26,8 +26,10 @@ reproduction steps, impact, and any proposed mitigation.
   limits.
 - External providers are optional and cannot enter the core dependency path.
 
-These guarantees are release requirements. The `4.0.0` source candidate must
-complete a new exact-SHA G8 closure before publication. It does not inherit the
-`3.0.0` release evidence. The signed `3.0.0` archives, SBOMs, provenance, and
-G8 closure remain bound to their exact historical release commit; see
-`docs/release/verification.md` for how to verify them.
+These guarantees are release requirements. The `4.0.0` source candidate
+composes selected integration `d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`
+but must complete a new exact-SHA hosted security matrix and G8 closure before
+publication. It does not inherit the `3.0.0` release evidence. The signed
+`3.0.0` archives, SBOMs, provenance, and G8 closure remain bound to their exact
+historical release commit; see `docs/release/verification.md` for how to verify
+them.

@@ -44,6 +44,13 @@ commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
 
+**Source release candidate:** `4.0.0` composes selected integration
+`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`. Its 25-crate graph adds the
+offline CPU embedding executor and carries the minor-9 Rust, Python, and
+TypeScript embed-and-ingest surfaces plus the measurement harness. It is not
+published and has no inherited exact-SHA G8 or verified model-result receipt.
+No CUDA implementation or CUDA package is present or claimed.
+
 **What changed in 3.0.0:** the bounded SQL slice grows into its analytics
 form (`HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,
 aliases), the keyspace gains the Valkey-shaped conditional and range commands
@@ -330,6 +337,10 @@ scheduling), `hyphae-native-protocol`/`hyphae-native-daemon` (local transport),
 and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,manifest,ann}`
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
+
+The `4.0.0` source candidate has 25 publishable crates. It adds
+`hyphae-native-embed-cpu` to the graph below; package audit and extracted-crate
+verification are local candidate evidence, not registry publication authority.
 
 Version `3.0.0` publishes the complete 24-crate graph:
 

@@ -76,7 +76,7 @@ def receipt(platform: str) -> dict[str, object]:
             ),
             "sha256": "f" * 64,
         },
-        "protocol": {"major": 1, "minor": 7},
+        "protocol": {"major": 1, "minor": 9},
         "transports": transports,
         "operations": {"lifecycle": LIFECYCLE, "reads": READS, "writes": WRITES},
         "cases": {

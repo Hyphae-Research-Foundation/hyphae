@@ -42,15 +42,16 @@ use crate::{
     CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt,
     DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
-    ProductDocument, ProductDurability, ProductError, ProductErrorCode, ProductExplain,
-    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
-    ProductHashEntry, ProductHashScanStop, ProductKeyEntry, ProductLimits, ProductListSide,
-    ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
-    ProductRollbackReceipt, ProductScope, ProductScoreBound, ProductSearchDocumentDelete,
-    ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
-    ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
-    ProductSortedSetEntry, ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry,
-    ProductStructureKey, ProductStructureMutation, ProductStructureMutationBatchReceipt,
+    ProductDocument, ProductDurability, ProductEmbedAndIngestBatchReceipt, ProductError,
+    ProductErrorCode, ProductExplain, ProductExplicitCommitReceipt,
+    ProductExplicitTransactionStatus, ProductFailureBoundary, ProductHashEntry,
+    ProductHashScanStop, ProductKeyEntry, ProductLimits, ProductListSide, ProductPermission,
+    ProductPreparedHandle, ProductPrincipal, ProductRead, ProductRollbackReceipt, ProductScope,
+    ProductScoreBound, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
+    ProductSearchIngestBatch, ProductSearchIngestReceipt, ProductSearchRequest,
+    ProductSearchResult, ProductSession, ProductSessionId, ProductSortedSetEntry,
+    ProductSortedSetOrder, ProductSqlResult, ProductStreamEntry, ProductStructureKey,
+    ProductStructureMutation, ProductStructureMutationBatchReceipt,
     ProductStructureMutationOutcome, ProductStructureMutationResult, ProductStructureRead,
     ProductStructureReadRequest, ProductStructureReadResult, ProductTransactionHandle,
     ProductTransactionId, ProductTransactionSearchMutation, ProductTransactionSqlMutation,
@@ -402,13 +403,6 @@ pub enum ProductOperation {
         /// Complete bounded idempotent batch.
         batch: ProductSearchIngestBatch,
     },
-    /// Embed catalog-bound source text and atomically ingest the documents.
-    EmbedAndIngest {
-        /// Logical Catalog V2 collection identity.
-        collection: ObjectId,
-        /// Vector-free documents and their stable retry identity.
-        batch: crate::ProductEmbedAndIngestBatch,
-    },
     /// Embed passage text into one catalog-bound target and atomically ingest it.
     EmbedAndIngestBatch {
         /// Logical Catalog V2 collection identity.
@@ -417,6 +411,13 @@ pub enum ProductOperation {
         target: String,
         /// Complete bounded idempotent batch with empty input vector maps.
         batch: ProductSearchIngestBatch,
+    },
+    /// Embed catalog-bound source text and atomically ingest the documents.
+    EmbedAndIngest {
+        /// Logical Catalog V2 collection identity.
+        collection: ObjectId,
+        /// Vector-free documents and their stable retry identity.
+        batch: crate::ProductEmbedAndIngestBatch,
     },
     /// Atomically replaces one integrated document across every branch.
     SearchDocumentUpdate {
@@ -705,10 +706,10 @@ pub enum ProductResponse {
     MemoryRecall(crate::ProductMemoryRecallResult),
     /// Atomic integrated ingestion outcome.
     SearchIngested(ProductSearchIngestReceipt),
+    /// Atomic catalog-bound embedding and ingestion outcome.
+    EmbeddedAndIngested(ProductEmbedAndIngestBatchReceipt),
     /// Catalog-bound embedding and atomic ingestion outcome.
     EmbedAndIngested(crate::ProductEmbedAndIngestReceipt),
-    /// Process-local embedding and ingestion outcome.
-    EmbeddedAndIngested(crate::ProductLocalEmbedAndIngestReceipt),
     /// Current administration status.
     AdminStatus(AdminStatus),
     /// Synchronized checkpoint receipt.
@@ -1405,9 +1406,8 @@ fn dispatch_inner(
                     })
                     .collect(),
             };
-            let requirement = embed_and_ingest_target_authorization_requirement(
-                product, collection, &target, None,
-            )?;
+            let requirement =
+                wire_embed_and_ingest_authorization_requirement(product, collection, None)?;
             let receipt = product.embed_and_ingest_batch(
                 collection,
                 &target,
@@ -1434,9 +1434,8 @@ fn dispatch_inner(
             target,
             batch,
         } => {
-            let requirement = embed_and_ingest_target_authorization_requirement(
-                product, collection, &target, None,
-            )?;
+            let requirement =
+                embed_and_ingest_authorization_requirement(product, collection, &target, None)?;
             ProductResponse::EmbeddedAndIngested(product.embed_and_ingest_batch(
                 collection,
                 &target,
@@ -1876,6 +1875,7 @@ fn dispatch_inner(
                 || matches!(
                     operation.as_ref(),
                     ProductOperation::EmbedAndIngestBatch { .. }
+                        | ProductOperation::EmbedAndIngest { .. }
                 )
             {
                 return Err(context.error(ProductErrorCode::InvalidRequest));
@@ -2088,7 +2088,7 @@ fn validate_durable_authority(
     Ok(Some(current))
 }
 
-fn embed_and_ingest_target_authorization_requirement(
+fn embed_and_ingest_authorization_requirement(
     product: &NativeProduct,
     collection: ObjectId,
     target: &str,
@@ -2107,6 +2107,62 @@ fn embed_and_ingest_target_authorization_requirement(
     requirement.union(&ProductAuthorizationRequirement::object(
         authorization([ProductPermission::CatalogRead]),
         profile.header.id,
+    ));
+    Ok(requirement)
+}
+
+fn wire_embed_and_ingest_authorization_requirement(
+    product: &NativeProduct,
+    collection: ObjectId,
+    authority: Option<&crate::AuthenticatedAuthority>,
+) -> Result<ProductAuthorizationRequirement, ProductError> {
+    let mut requirement = ProductAuthorizationRequirement::object(
+        authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
+        collection,
+    );
+    if let Some(authority) = authority
+        && !authority_satisfies_requirement(product, authority, &requirement)?
+    {
+        return Ok(requirement);
+    }
+
+    let snapshot = product.catalog_snapshot()?;
+    let object = product
+        .catalog_describe(&snapshot, collection)?
+        .ok_or_else(|| {
+            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
+        })?;
+    let LogicalCatalogObject::V2(hyphae_native_catalog::CatalogObjectV2::SearchCollection(
+        definition,
+    )) = object
+    else {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    };
+    let [target] = definition.vectors.as_slice() else {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    };
+    let profile_id = target
+        .embedding_profile
+        .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    let profile = product
+        .catalog_describe(&snapshot, profile_id)?
+        .ok_or_else(|| {
+            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(profile_id)
+        })?;
+    let LogicalCatalogObject::V2(hyphae_native_catalog::CatalogObjectV2::EmbeddingProfile(profile)) =
+        profile
+    else {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    };
+    target
+        .validate_embedding_profile(&profile)
+        .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
+    requirement.union(&ProductAuthorizationRequirement::object(
+        authorization([
+            ProductPermission::CatalogRead,
+            ProductPermission::SearchExecute,
+        ]),
+        profile_id,
     ));
     Ok(requirement)
 }
@@ -2343,9 +2399,6 @@ fn operation_authorization_requirement(
             }
             requirement
         }
-        ProductOperation::EmbedAndIngest { collection, .. } => {
-            embed_and_ingest_authorization_requirement(product, *collection, authority)?
-        }
         ProductOperation::SearchCollection { collection, .. }
         | ProductOperation::SearchIngest { collection, .. }
         | ProductOperation::SearchDocumentUpdate { collection, .. }
@@ -2354,12 +2407,10 @@ fn operation_authorization_requirement(
         }
         ProductOperation::EmbedAndIngestBatch {
             collection, target, ..
-        } => embed_and_ingest_target_authorization_requirement(
-            product,
-            *collection,
-            target,
-            authority,
-        )?,
+        } => embed_and_ingest_authorization_requirement(product, *collection, target, authority)?,
+        ProductOperation::EmbedAndIngest { collection, .. } => {
+            wire_embed_and_ingest_authorization_requirement(product, *collection, authority)?
+        }
         ProductOperation::TransactionStageStructure { mutation, .. } => {
             ProductAuthorizationRequirement::object(permissions, mutation.structure_key().keyspace)
         }
@@ -2416,62 +2467,6 @@ fn operation_authorization_requirement(
         // also fail closed at the instance boundary.
         _ => ProductAuthorizationRequirement::instance(permissions),
     };
-    Ok(requirement)
-}
-
-fn embed_and_ingest_authorization_requirement(
-    product: &NativeProduct,
-    collection: ObjectId,
-    authority: Option<&crate::AuthenticatedAuthority>,
-) -> Result<ProductAuthorizationRequirement, ProductError> {
-    let mut requirement = ProductAuthorizationRequirement::object(
-        authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
-        collection,
-    );
-    if let Some(authority) = authority
-        && !authority_satisfies_requirement(product, authority, &requirement)?
-    {
-        return Ok(requirement);
-    }
-
-    let snapshot = product.catalog_snapshot()?;
-    let object = product
-        .catalog_describe(&snapshot, collection)?
-        .ok_or_else(|| {
-            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
-        })?;
-    let LogicalCatalogObject::V2(hyphae_native_catalog::CatalogObjectV2::SearchCollection(
-        definition,
-    )) = object
-    else {
-        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
-    };
-    let [target] = definition.vectors.as_slice() else {
-        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
-    };
-    let profile_id = target
-        .embedding_profile
-        .ok_or_else(|| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
-    let profile = product
-        .catalog_describe(&snapshot, profile_id)?
-        .ok_or_else(|| {
-            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(profile_id)
-        })?;
-    let LogicalCatalogObject::V2(hyphae_native_catalog::CatalogObjectV2::EmbeddingProfile(profile)) =
-        profile
-    else {
-        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
-    };
-    target
-        .validate_embedding_profile(&profile)
-        .map_err(|_| ProductError::from_code(ProductErrorCode::InvalidRequest))?;
-    requirement.union(&ProductAuthorizationRequirement::object(
-        authorization([
-            ProductPermission::CatalogRead,
-            ProductPermission::SearchExecute,
-        ]),
-        profile_id,
-    ));
     Ok(requirement)
 }
 

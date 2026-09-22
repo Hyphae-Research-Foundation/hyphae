@@ -33,10 +33,10 @@ complete shape at runtime. Applications that require runtime success validation
 must add it at their trust boundary. Native `/v2` additionally validates its
 typed binary and product-envelope contracts at the SDK boundary.
 
-The Python and TypeScript Native codecs both negotiate the current protocol
-minor 7 and retain support for minors 3 through 6. Native `u128` identities and
-idempotency values are lossless in both SDKs: Python exposes `int`, while
-TypeScript exposes `bigint` and does not narrow those fields to `number`.
+The Python and TypeScript Native codecs both negotiate protocol minor 9 and
+retain support for minors 3 through 8. Native `u128` identities and idempotency
+values are lossless in both SDKs: Python exposes `int`, while TypeScript exposes
+`bigint` and does not narrow those fields to `number`.
 
 TypeScript/Python models are generated from canonical JSON Schema and checked
 in. Regenerate after contract changes and verify no drift:

@@ -438,11 +438,11 @@ class PackageTests(unittest.TestCase):
         )
         self.assertIn('test "$RELEASE_TAG" = "release-v4.0.0-crates"', release_workflow)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        authority_version = re.escape(publication_authority["version"])
         self.assertRegex(
             changelog,
             rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         )
-        authority_version = re.escape(publication_authority["version"])
         self.assertRegex(
             changelog,
             rf"(?m)^## \[{authority_version}\] - \d{{4}}-\d{{2}}-\d{{2}}$",

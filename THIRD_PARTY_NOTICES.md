@@ -58,3 +58,25 @@ The Python SDK has no runtime dependency. Its exact build dependency is
 `setuptools==84.0.0`, licensed MIT. Build dependency identity is recorded in
 `sdks/python/pyproject.toml`; release wheels and sdists contain Hyphae's own
 license documents and do not bundle setuptools.
+
+## Optional multilingual embedding measurement boundary
+
+The standalone multilingual embedding harness names
+`Qwen/Qwen3-Embedding-0.6B`, PyTorch, Transformers, Tokenizers, Safetensors,
+CUDA, and NVIDIA tooling only as external measurement subjects. None is
+bundled in Hyphae or enters its workspace, product dependency graph, or
+runtime. The checked-in model manifest is deliberately unverified and contains
+no weight or license digest. A measurement is refused until an operator binds
+an asserted full commit through checksummed responses retained from
+commit-specific Hugging Face model/tree API URLs and every local file digest.
+This operator-retained record preserves the observed response bytes but is not
+an independent authenticity anchor for the historical HTTPS exchange. The API's
+`Apache-2.0` declaration is recorded separately from whether license text is
+bundled, and an independently checksummed legal-review record controls whether
+the operator's policy would otherwise allow claims. This harness has no
+approved signed legal, acquisition, or hardware trust anchor, so its receipts
+remain non-authoritative and cannot unlock product claims. Measurement receipts
+inventory files declared by installed Python distributions and native artifacts
+observed at declared capture phases; they do not redistribute those files. All
+external files retain their own terms as recorded in the populated measurement
+manifest and receipt.

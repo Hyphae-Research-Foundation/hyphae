@@ -90,8 +90,9 @@ Windows and carries exact `HYPHLCL1` frames without a wrapper protocol. HTTP
 uses canonical product envelopes at `/v2/execute`. Both expose typed product
 errors, request deadlines, `AbortSignal` cancellation, and transaction state.
 
-Managed sessions negotiate Native local protocol minor 7 and support minors 3
-through 7, including the complete minor-6 surface shared with Python. Native
+Managed local sessions negotiate Native protocol minor 9, and managed HTTP
+sessions support minors 3 through 9. `PROTOCOL_MINOR` reports the local maximum.
+This matches the Python SDK, including the complete minor-6 surface. Native
 `u128` object, transaction, and idempotency identities are represented as
 `bigint`; they are never narrowed to JavaScript `number`.
 
@@ -102,7 +103,7 @@ through 7, including the complete minor-6 surface shared with Python. Native
 - SQL: `sql`, `prepareSql`, `executePrepared`, `deallocatePrepared`.
 - Structures: `structureGet`, `structureSet`, `structureTtl`,
   `structureMutate`, `structureRead`.
-- Search: `search`, `searchCollection`, `searchIngest`,
+- Search: `search`, `searchCollection`, `searchIngest`, `embedAndIngest`,
   `searchDocumentUpdate`, `searchDocumentDelete`.
 - Transactions: `transactionStatus`, `transactionBegin`,
   `transactionStageSql`, `transactionStageStructure`,
@@ -112,7 +113,17 @@ through 7, including the complete minor-6 surface shared with Python. Native
 - Proofs: `verifyProof`, `prove`, `proveSql`.
 - Backup/restore: `backup`, `restore`.
 
-The codec implements the following `3.0.0` search features: relative-score
+`embedAndIngest` accepts only a logical collection, a nonzero idempotency
+identity, and bounded text/doc-value documents. Catalog bindings select the
+minor-8 embedding profile; model paths, providers, devices, and backend
+preferences are not request fields. Its minor-9 response reports the actual
+execution profile, fallback status, durable commit receipt, and whether the
+result was an idempotent replay. The collection must expose exactly one named
+vector target bound to exactly one embedding profile; an ambiguous or absent
+binding fails closed instead of accepting a target or profile override in the
+request. Batches are limited to 256 documents and a 16 MiB encoded request.
+
+The codec implements the following `4.0.0` search features: relative-score
 fusion, autocut knee truncation, range facets, lexical minimum-match, a
 per-branch vector `max_distance`, highlighting, fuzzy/prefix/phrase queries,
 BM25F field boosts, and offset pagination over the final ranking.

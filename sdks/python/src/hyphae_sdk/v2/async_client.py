@@ -16,6 +16,7 @@ from .local import LocalTransport
 from .models import (
     CancellationToken,
     ClientError,
+    EmbedAndIngestBatch,
     ProductError,
     ProductTransactionSearchMutation,
     RequestOptions,
@@ -239,6 +240,16 @@ class AsyncHyphaeClient:
     async def memory_enrich(self, collection: int, expected_envelope_digest: bytes, idempotency_id: int, document: dict[str, object], *, options: RequestOptions | None = None) -> Response:
         """Enrich an unchanged live source; requires operator maintenance authority."""
         return await self.execute("memory_enrich", {"collection": collection, "expected_envelope_digest": expected_envelope_digest, "idempotency_id": idempotency_id, "document": document}, options=options)
+
+    async def embed_and_ingest(self, collection: int, batch: EmbedAndIngestBatch, *, options: RequestOptions | None = None) -> Response:
+        """Embed catalog-bound document text and atomically ingest the result."""
+
+        return await self._execute_expected(
+            "embed_and_ingest",
+            "embed_and_ingested",
+            {"collection": collection, "batch": batch},
+            options=options,
+        )
 
     async def security_api_key_issue_start(
         self,

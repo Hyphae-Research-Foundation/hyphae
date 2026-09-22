@@ -84,8 +84,8 @@ or a Windows `\\.\pipe\...` path; HTTP uses canonical product envelopes at
 `/v2/execute`. Both reconstruct `ProductError` typed fields and accept
 `RequestOptions` deadlines and cancellation.
 
-Managed local sessions negotiate Native local protocol minor 7, with minors 3
-through 7 supported (`hyphae_sdk.v2.protocol.PROTOCOL_MINOR` and
+Managed local sessions negotiate Native local protocol minor 9, with minors 3
+through 9 supported (`hyphae_sdk.v2.protocol.PROTOCOL_MINOR` and
 `PROTOCOL_MINORS_SUPPORTED` in `http.py`). This matches the TypeScript SDK,
 including the complete minor-6 surface. Native `u128` object, transaction, and
 idempotency identities remain lossless Python `int` values. Sessions
@@ -139,7 +139,7 @@ and `security_assignment_revoke`.
 - SQL: `sql`, `prepare_sql`, `execute_prepared`, `deallocate_prepared`.
 - Structures: `structure_get`, `structure_set`, `structure_ttl`,
   `structure_mutate`, `structure_read`.
-- Search: `search`, `search_collection`, `search_ingest`,
+- Search: `search`, `search_collection`, `search_ingest`, `embed_and_ingest`,
   `search_document_update`, `search_document_delete`.
 - Transactions: `transaction_status`, `transaction_begin`,
   `transaction_stage_sql`, `transaction_stage_structure`,
@@ -148,6 +148,16 @@ and `security_assignment_revoke`.
   `explicit_transaction_status`, `transaction_status_by_idempotency`.
 - Proofs: `verify_proof`, `prove`, `prove_sql`.
 - Backup/restore: `backup`, `restore`.
+
+`embed_and_ingest` accepts only a logical collection, a nonzero idempotency
+identity, and bounded text/doc-value documents. Catalog bindings select the
+embedding profile; model paths, providers, devices, and backend preferences are
+not request fields. Its minor-9 response reports the actual execution profile,
+fallback status, durable commit receipt, and whether the result was an
+idempotent replay. The collection must expose exactly one named vector target
+bound to exactly one embedding profile; an ambiguous or absent binding fails
+closed instead of accepting a target or profile override in the request.
+Batches are limited to 256 documents and a 16 MiB encoded request.
 
 ### Native v2 lifecycle and async use
 

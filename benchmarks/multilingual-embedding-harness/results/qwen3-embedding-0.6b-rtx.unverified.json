@@ -1,0 +1,17 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-multilingual-embedding-result-metadata-v1",
+  "status": "unverified-no-measurement",
+  "model": {
+    "repository": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": null,
+    "manifest_sha256": null,
+    "acquisition_record_sha256": null,
+    "legal_evidence_sha256": null
+  },
+  "hardware": null,
+  "execution_environment_sha256": null,
+  "receipt_sha256": null,
+  "claims": [],
+  "closure_declared": false
+}

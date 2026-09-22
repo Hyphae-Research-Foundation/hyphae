@@ -4,6 +4,7 @@ import { ClientError, ProductError, productError, type RequestOptions, type Resp
 import {
   FRAME_HEADER_SIZE,
   FRAME_KIND,
+  PROTOCOL_MINOR,
   blake3,
   decodeEnd,
   decodeFrame,
@@ -225,8 +226,8 @@ export class LocalTransport implements Transport {
     }
     try {
       const hello = this.#apiKey === undefined
-        ? encodeHello(this.#clientIdentity, 7)
-        : encodeAuthenticatedHello(this.#apiKey, this.#clientIdentity, 7);
+        ? encodeHello(this.#clientIdentity, PROTOCOL_MINOR)
+        : encodeAuthenticatedHello(this.#apiKey, this.#clientIdentity, PROTOCOL_MINOR);
       try {
         await abortable(stream.write(encodeFrame(FRAME_KIND.hello, 0, requestId, hello), signal), signal);
         if (terminalRequest !== undefined) {

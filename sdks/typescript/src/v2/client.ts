@@ -2,7 +2,7 @@
 
 import { HttpTransport, type HttpTransportOptions } from "./http.js";
 import { LocalTransport, type LocalConnector, type LocalTransportOptions } from "./local.js";
-import type { ProductTransactionSearchMutation, RequestOptions, Response, Transport } from "./models.js";
+import { ClientError, type EmbedAndIngestBatch, type EmbedAndIngestResult, type ProductTransactionSearchMutation, type RequestOptions, type Response, type Transport } from "./models.js";
 import { nodeLocalConnector } from "./node-local.js";
 
 /** Equivalent high-level Native v2 API over local and HTTP transports. */
@@ -123,6 +123,14 @@ export class HyphaeClient {
 
   searchIngest(collection: bigint, batch: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {
     return this.execute("search_ingest", { collection, batch }, options);
+  }
+
+  async embedAndIngest(collection: bigint, batch: EmbedAndIngestBatch, options: RequestOptions = {}): Promise<Response<EmbedAndIngestResult>> {
+    const response = await this.execute("embed_and_ingest", { collection, batch }, options);
+    if (response.kind !== "embed_and_ingested") {
+      throw new ClientError("embed-and-ingest returned an unexpected response kind");
+    }
+    return response as Response<EmbedAndIngestResult>;
   }
 
   searchDocumentUpdate(collection: bigint, idempotencyId: bigint, document: Readonly<Record<string, unknown>>, options: RequestOptions = {}): Promise<Response> {

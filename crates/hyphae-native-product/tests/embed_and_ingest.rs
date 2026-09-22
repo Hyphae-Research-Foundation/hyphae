@@ -25,9 +25,9 @@ use hyphae_native_catalog::{
 };
 use hyphae_native_product::{
     CustomRoleGrant, NativeProduct, ProductAuthorization, ProductDocument, ProductDurability,
-    ProductEmbedAndIngestBatch, ProductEmbedAndIngestDocument, ProductEmbedAndIngestReceipt,
-    ProductEmbeddingBatchOutput, ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest,
-    ProductError, ProductErrorCode, ProductLocalEmbedAndIngestReceipt,
+    ProductEmbedAndIngestBatch, ProductEmbedAndIngestBatchReceipt, ProductEmbedAndIngestDocument,
+    ProductEmbedAndIngestReceipt, ProductEmbeddingBatchOutput, ProductEmbeddingExecutor,
+    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
     ProductLocalEmbeddingExecutionProfile, ProductOperation, ProductPermission, ProductPrincipal,
     ProductRequestContext, ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSession,
     ProductSessionId, ProductVector,
@@ -280,7 +280,7 @@ impl ProductEmbeddingExecutor for FakeExecutor {
     }
 }
 
-fn receipt(response: ProductResponse) -> Result<ProductLocalEmbedAndIngestReceipt, Box<dyn Error>> {
+fn receipt(response: ProductResponse) -> Result<ProductEmbedAndIngestBatchReceipt, Box<dyn Error>> {
     let ProductResponse::EmbeddedAndIngested(receipt) = response else {
         return Err("wrong embedding response".into());
     };
