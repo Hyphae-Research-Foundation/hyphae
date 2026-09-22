@@ -13,6 +13,7 @@ from hyphae_sdk.v2.http import HttpTransport, PRODUCT_MEDIA_TYPE
 from hyphae_sdk.v2.local import _windows_pipe_namespace, _write_all
 from hyphae_sdk.v2.protocol import (
     FRAME_KINDS,
+    MAX_PAYLOAD,
     decode_frame,
     decode_product_request,
     decode_product_response,
@@ -53,6 +54,55 @@ def _qualified_name() -> bytes:
     return b"".join(
         struct.pack("<I", len(value)) + value
         for value in (b"main", b"main", b"public", b"public", b"item", b"item")
+    )
+
+
+def _commit_receipt() -> bytes:
+    import struct
+
+    return b"".join(
+        [
+            (9).to_bytes(16, "little"),
+            struct.pack("<QQQ", 7, 8, 9),
+            bytes((3,)) * 32,
+            b"\0" * 8,
+            struct.pack("<QQ", 1, 0),
+        ]
+    )
+
+
+def _embed_and_ingest_response(
+    *, replay: bool = True, has_commit: bool = True
+) -> bytes:
+    import struct
+
+    def text(value: str) -> bytes:
+        encoded = value.encode()
+        return struct.pack("<I", len(encoded)) + encoded
+
+    snapshot = (
+        bytes((1,)) * 24
+        + struct.pack("<QQ", 7, 8)
+        + bytes((2,)) * 32
+        + struct.pack("<q", 10)
+    )
+    profile = (
+        (17).to_bytes(16, "little")
+        + struct.pack("<BBB5x", 1, 1, 1)
+        + text("NVIDIA H100")
+        + text("driver-1")
+        + text("cuda-1")
+        + struct.pack("<I", 2)
+        + text("tokenize-v1")
+        + text("qwen3-f32-v1")
+    )
+    commit = _commit_receipt() if has_commit else b""
+    return _response(
+        47,
+        snapshot
+        + struct.pack("<BB6xQ", has_commit, replay, 1)
+        + profile
+        + commit,
     )
 
 
@@ -354,7 +404,70 @@ class V2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ClientError, "document count"):
             decode_product_request(bytes(forged), negotiated_minor=9)
 
-        for forbidden in ("model_path", "backend", "device"):
+        too_many = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [
+                    {"object_id": index + 1, "text": "x"}
+                    for index in range(257)
+                ],
+            },
+        }
+        with self.assertRaisesRegex(ClientError, "bounded list"):
+            encode_product_request(
+                "embed_and_ingest",
+                too_many,
+                RequestOptions(),
+                negotiated_minor=9,
+            )
+
+        minimal_arguments = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [{"object_id": 201, "text": ""}],
+            },
+        }
+        minimal = encode_product_request(
+            "embed_and_ingest",
+            minimal_arguments,
+            RequestOptions(),
+            negotiated_minor=9,
+        )
+        maximum_text = "x" * (MAX_PAYLOAD - len(minimal))
+        maximum_arguments = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [{"object_id": 201, "text": maximum_text}],
+            },
+        }
+        maximum = encode_product_request(
+            "embed_and_ingest",
+            maximum_arguments,
+            RequestOptions(),
+            negotiated_minor=9,
+        )
+        self.assertEqual(len(maximum), MAX_PAYLOAD)
+        maximum_arguments["batch"]["documents"][0]["text"] += "x"
+        with self.assertRaisesRegex(ClientError, "16 MiB"):
+            encode_product_request(
+                "embed_and_ingest",
+                maximum_arguments,
+                RequestOptions(),
+                negotiated_minor=9,
+            )
+
+        for forbidden in (
+            "model_path",
+            "backend",
+            "device",
+            "target",
+            "embedding_profile",
+            "targets",
+            "profiles",
+        ):
             invalid = {**arguments, forbidden: "not-on-wire"}
             with self.subTest(forbidden=forbidden), self.assertRaisesRegex(
                 ClientError, "request fields"
@@ -369,32 +482,11 @@ class V2Tests(unittest.TestCase):
     def test_embed_and_ingest_response_reports_execution_profile_and_replay(self) -> None:
         import struct
 
-        def text(value: str) -> bytes:
-            encoded = value.encode()
-            return struct.pack("<I", len(encoded)) + encoded
-
-        snapshot = (
-            bytes((1,)) * 24
-            + struct.pack("<QQ", 7, 8)
-            + bytes((2,)) * 32
-            + struct.pack("<q", 10)
-        )
-        profile = (
-            (17).to_bytes(16, "little")
-            + struct.pack("<BBB5x", 1, 1, 1)
-            + text("NVIDIA H100")
-            + text("driver-1")
-            + text("cuda-1")
-            + struct.pack("<I", 2)
-            + text("tokenize-v1")
-            + text("qwen3-f32-v1")
-        )
-        body = snapshot + struct.pack("<BB6xQ", 0, 1, 1) + profile
-        encoded = _response(47, body)
+        encoded = _embed_and_ingest_response()
         response = decode_product_response(encoded, 19, negotiated_minor=9)
         self.assertEqual(response.kind, "embed_and_ingested")
         self.assertTrue(response.value["idempotent_replay"])
-        self.assertIsNone(response.value["commit"])
+        self.assertEqual(response.value["commit"]["transaction_id"], 9)
         self.assertEqual(
             response.value["execution_profile"],
             {
@@ -408,6 +500,17 @@ class V2Tests(unittest.TestCase):
                 "fallback": True,
             },
         )
+        for replay in (False, True):
+            with self.subTest(replay=replay), self.assertRaisesRegex(
+                ClientError, "commit evidence"
+            ):
+                decode_product_response(
+                    _embed_and_ingest_response(
+                        replay=replay, has_commit=False
+                    ),
+                    19,
+                    negotiated_minor=9,
+                )
         with self.assertRaisesRegex(ClientError, "protocol minor"):
             decode_product_response(encoded, 19, negotiated_minor=8)
         for prefix in range(len(encoded)):
@@ -415,7 +518,13 @@ class V2Tests(unittest.TestCase):
                 decode_product_response(encoded[:prefix], 19, negotiated_minor=9)
 
         excessive = bytearray(encoded)
-        kernel_count_offset = len(encoded) - len(text("tokenize-v1")) - len(text("qwen3-f32-v1")) - 4
+        kernel_count_offset = (
+            16
+            + 80
+            + 16
+            + 24
+            + sum(4 + len(value) for value in ("NVIDIA H100", "driver-1", "cuda-1"))
+        )
         struct.pack_into("<I", excessive, kernel_count_offset, 0xFFFFFFFF)
         with self.assertRaisesRegex(ClientError, "kernel count"):
             decode_product_response(bytes(excessive), 19, negotiated_minor=9)
@@ -1129,6 +1238,109 @@ class V2Tests(unittest.TestCase):
         )
         self.assertEqual(
             int.from_bytes(FakeHttpConnection.last_body[12:14], "little"), 69
+        )
+
+    def test_concurrent_http_responses_decode_with_response_local_minor(self) -> None:
+        import struct
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        high_reading = threading.Event()
+        release_high = threading.Event()
+        capabilities = bytearray(72)
+        capabilities[:8] = b"HYPRSP01"
+        struct.pack_into(
+            "<IHHHHHH", capabilities, 8, len(capabilities), 1, 0, 1, 1, 2, 6
+        )
+
+        class ConcurrentResponse:
+            status = 200
+
+            def __init__(
+                self, body: bytes, request_id: str, minor: int, block: bool
+            ) -> None:
+                self._body = body
+                self._request_id = request_id
+                self._minor = minor
+                self._block = block
+
+            def getheader(self, name: str) -> str | None:
+                return {
+                    "Content-Length": str(len(self._body)),
+                    "Content-Type": PRODUCT_MEDIA_TYPE,
+                    "X-Hyphae-Protocol-Minor": str(self._minor),
+                    "X-Hyphae-Request-Id": self._request_id,
+                }.get(name)
+
+            def read(self, size: int = -1) -> bytes:
+                if self._block:
+                    high_reading.set()
+                    if not release_high.wait(5):
+                        raise TimeoutError("concurrent response was not released")
+                return self._body[:size]
+
+            def close(self) -> None:
+                pass
+
+        class ConcurrentConnection:
+            def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                del args, kwargs
+                self.auto_open = 1
+                self.sock = None
+                self.request_id = ""
+
+            def connect(self) -> None:
+                pass
+
+            def request(
+                self, method: str, path: str, **kwargs
+            ) -> None:  # type: ignore[no-untyped-def]
+                del method, path
+                self.request_id = kwargs["headers"]["X-Hyphae-Request-Id"]
+
+            def getresponse(self) -> ConcurrentResponse:
+                if self.request_id == "31":
+                    return ConcurrentResponse(
+                        _embed_and_ingest_response(replay=False),
+                        self.request_id,
+                        9,
+                        True,
+                    )
+                return ConcurrentResponse(
+                    bytes(capabilities), self.request_id, 8, False
+                )
+
+            def close(self) -> None:
+                pass
+
+        arguments = {
+            "collection": 13,
+            "batch": {
+                "idempotency_id": 7,
+                "documents": [{"object_id": 201, "text": "rust"}],
+            },
+        }
+        with patch("http.client.HTTPSConnection", ConcurrentConnection):
+            transport = HttpTransport("https://example.test")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                high = executor.submit(
+                    transport.execute,
+                    "embed_and_ingest",
+                    arguments,
+                    RequestOptions(request_id=31),
+                )
+                try:
+                    self.assertTrue(high_reading.wait(5))
+                    low = transport.execute(
+                        "capabilities", {}, RequestOptions(request_id=32)
+                    )
+                    self.assertEqual(low.kind, "capabilities")
+                    self.assertEqual(transport.negotiated_minor, 8)
+                finally:
+                    release_high.set()
+                high_response = high.result(timeout=5)
+        self.assertEqual(
+            high_response.value["execution_profile"]["embedding_profile"], 17
         )
 
     @patch("http.client.HTTPSConnection", FakeHttpConnection)

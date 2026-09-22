@@ -88,7 +88,7 @@ class EmbedAndIngestBatch(TypedDict):
 
 
 class EmbeddingExecutionProfile(TypedDict):
-    """The selected executor reported by an embed-and-ingest response."""
+    """The selected executor for the collection's single profile-bound target."""
 
     embedding_profile: int
     backend: Literal["cpu", "cuda"]
@@ -105,7 +105,7 @@ class EmbedAndIngestResult(TypedDict):
     documents: int
     idempotent_replay: bool
     execution_profile: EmbeddingExecutionProfile
-    commit: dict[str, Any] | None
+    commit: dict[str, Any]
 
 
 class ProductTransactionSearchIndexMutation(TypedDict):

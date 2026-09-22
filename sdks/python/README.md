@@ -151,7 +151,11 @@ and `security_assignment_revoke`.
 identity, and bounded text/doc-value documents. Catalog bindings select the
 embedding profile; model paths, providers, devices, and backend preferences are
 not request fields. Its minor-9 response reports the actual execution profile,
-fallback status, and whether the durable result was an idempotent replay.
+fallback status, durable commit receipt, and whether the result was an
+idempotent replay. The collection must expose exactly one named vector target
+bound to exactly one embedding profile; an ambiguous or absent binding fails
+closed instead of accepting a target or profile override in the request.
+Batches are limited to 256 documents and a 16 MiB encoded request.
 
 ### Native v2 lifecycle and async use
 

@@ -42,7 +42,7 @@ MAX_AUTOCUT_STEEPNESS = 16
 MAX_LEXICAL_MINIMUM_MATCH = 64
 MAX_LEXICAL_FUZZY_DISTANCE = 2
 MAX_LEXICAL_FIELDS = 64
-MAX_EMBED_AND_INGEST_DOCUMENTS = 4_096
+MAX_EMBED_AND_INGEST_DOCUMENTS = 256
 MAX_EMBED_EXECUTION_KERNELS = 64
 MAX_EMBED_EXECUTION_TEXT_BYTES = 4_096
 FRAME_KINDS = {
@@ -690,7 +690,12 @@ def encode_product_request(
         )
     except (KeyError, struct.error) as error:
         raise ClientError("invalid request options") from error
-    body = _encode_operation(operation, arguments)
+    maximum_body_bytes = MAX_PAYLOAD - 16 - len(context)
+    body = _encode_operation(
+        operation, arguments, maximum_bytes=maximum_body_bytes
+    )
+    if len(body) > maximum_body_bytes:
+        raise ClientError("native request exceeds the 16 MiB protocol maximum")
     total = 16 + len(context) + len(body)
     if total > MAX_PAYLOAD:
         raise ClientError("product request exceeds the protocol maximum")
@@ -731,7 +736,12 @@ def decode_product_request(
     return operation, arguments, options
 
 
-def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
+def _encode_operation(
+    operation: str,
+    arguments: dict[str, Any],
+    *,
+    maximum_bytes: int = MAX_PAYLOAD,
+) -> bytes:
     if operation in {
         "capabilities",
         "admin_status",
@@ -856,12 +866,7 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
                 + _encode_identity(arguments["idempotency_id"], "idempotency")
                 + _encode_search_document(arguments["document"]))
     if operation == "embed_and_ingest":
-        if set(arguments) != {"collection", "batch"}:
-            raise ClientError("embed-and-ingest request fields are invalid")
-        return (
-            _encode_identity(arguments["collection"], "search collection")
-            + _encode_embed_and_ingest_batch(arguments["batch"])
-        )
+        return _encode_embed_and_ingest_request(arguments, maximum_bytes)
     if operation == "search_collection":
         return _encode_search_collection(arguments)
     if operation == "search_ingest":
@@ -1880,10 +1885,12 @@ def decode_product_response(
         has_commit, replay = reader.boolean(), reader.boolean()
         reader.zeroes(6)
         documents = reader.u64()
+        if not has_commit:
+            raise ClientError("embed-and-ingest success is missing commit evidence")
         if not 0 < documents <= MAX_EMBED_AND_INGEST_DOCUMENTS:
             raise ClientError("embed-and-ingest document result exceeds its bound")
         execution_profile = _decode_embedding_execution_profile(reader)
-        commit = _decode_commit_receipt(reader) if has_commit else None
+        commit = _decode_commit_receipt(reader)
         reader.finish()
         return Response(
             "embed_and_ingested",
@@ -2868,8 +2875,23 @@ def _encode_search_batch(batch: Any) -> bytes:
     return _encode_identity(batch["idempotency_id"], "idempotency") + struct.pack("<I", len(documents)) + b"".join(_encode_search_document(document) for document in documents)
 
 
-def _encode_embed_and_ingest_batch(batch: Any) -> bytes:
-    if not isinstance(batch, dict) or set(batch) != {"idempotency_id", "documents"}:
+def _encode_embed_and_ingest_request(
+    arguments: Any, maximum_bytes: int
+) -> bytes:
+    if (
+        not isinstance(arguments, dict)
+        or len(arguments) != 2
+        or "collection" not in arguments
+        or "batch" not in arguments
+    ):
+        raise ClientError("embed-and-ingest request fields are invalid")
+    batch = arguments["batch"]
+    if (
+        not isinstance(batch, dict)
+        or len(batch) != 2
+        or "idempotency_id" not in batch
+        or "documents" not in batch
+    ):
         raise ClientError("embed-and-ingest batch fields are invalid")
     documents = batch["documents"]
     if (
@@ -2877,33 +2899,144 @@ def _encode_embed_and_ingest_batch(batch: Any) -> bytes:
         or not 0 < len(documents) <= MAX_EMBED_AND_INGEST_DOCUMENTS
     ):
         raise ClientError("embed-and-ingest documents must be a nonempty bounded list")
-    return (
-        _encode_identity(batch["idempotency_id"], "idempotency")
-        + struct.pack("<I", len(documents))
-        + b"".join(_encode_embed_and_ingest_document(document) for document in documents)
+
+    output = bytearray()
+    _extend_embed_and_ingest(
+        output,
+        _encode_identity(arguments["collection"], "search collection"),
+        maximum_bytes,
     )
+    _extend_embed_and_ingest(
+        output,
+        _encode_identity(batch["idempotency_id"], "idempotency"),
+        maximum_bytes,
+    )
+    _extend_embed_and_ingest(
+        output, struct.pack("<I", len(documents)), maximum_bytes
+    )
+    for document in tuple(documents):
+        _encode_embed_and_ingest_document(output, document, maximum_bytes)
+    return bytes(output)
 
 
-def _encode_embed_and_ingest_document(document: Any) -> bytes:
-    if not isinstance(document, dict) or not set(document).issubset(
-        {"object_id", "text", "doc_values"}
-    ) or not {"object_id", "text"}.issubset(document):
+def _encode_embed_and_ingest_document(
+    output: bytearray, document: Any, maximum_bytes: int
+) -> None:
+    if (
+        not isinstance(document, dict)
+        or len(document) not in (2, 3)
+        or "object_id" not in document
+        or "text" not in document
+        or any(
+            field not in {"object_id", "text", "doc_values"}
+            for field in document
+        )
+    ):
         raise ClientError("embed-and-ingest document fields are invalid")
+    text = document["text"]
     values = document.get("doc_values", {})
     if (
-        not isinstance(document["text"], str)
+        not isinstance(text, str)
         or not isinstance(values, dict)
         or len(values) > MAX_SEARCH_DOCUMENT_VALUES
-        or any(not isinstance(name, str) for name in values)
     ):
         raise ClientError("embed-and-ingest document values exceed their bound")
-    output = bytearray(_encode_identity(document["object_id"], "search document"))
-    output.extend(_text(document["text"]))
-    output.extend(struct.pack("<I", len(values)))
-    for name in sorted(values, key=lambda value: value.encode("utf-8")):
-        output.extend(_text(name))
-        output.extend(_encode_doc_value(values[name]))
-    return bytes(output)
+
+    object_id = _encode_identity(document["object_id"], "search document")
+    text_bytes = _encode_embed_and_ingest_text(
+        text,
+        maximum_bytes - len(output) - len(object_id) - 8,
+        "embed-and-ingest document text",
+    )
+    projected = len(output) + len(object_id) + 4 + len(text_bytes) + 4
+    if projected > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+
+    entries: list[tuple[bytes, bytes]] = []
+    for name, value in values.items():
+        if not isinstance(name, str):
+            raise ClientError("embed-and-ingest document values exceed their bound")
+        name_bytes = _encode_embed_and_ingest_text(
+            name,
+            maximum_bytes - projected - 4,
+            "embed-and-ingest document value name",
+        )
+        projected += 4 + len(name_bytes)
+        value_bytes = _encode_embed_and_ingest_doc_value(
+            value, maximum_bytes - projected
+        )
+        projected += len(value_bytes)
+        entries.append((name_bytes, value_bytes))
+
+    output.extend(object_id)
+    output.extend(struct.pack("<I", len(text_bytes)))
+    output.extend(text_bytes)
+    output.extend(struct.pack("<I", len(entries)))
+    for name_bytes, value_bytes in sorted(entries, key=lambda entry: entry[0]):
+        output.extend(struct.pack("<I", len(name_bytes)))
+        output.extend(name_bytes)
+        output.extend(value_bytes)
+
+
+def _extend_embed_and_ingest(
+    output: bytearray, encoded: bytes, maximum_bytes: int
+) -> None:
+    if len(encoded) > maximum_bytes - len(output):
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    output.extend(encoded)
+
+
+def _encode_embed_and_ingest_text(
+    value: str, maximum_bytes: int, name: str
+) -> bytes:
+    if value.isascii():
+        length = len(value)
+    else:
+        length = 0
+        for character in value:
+            codepoint = ord(character)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                raise ClientError(f"{name} is not valid UTF-8")
+            length += (
+                1
+                if codepoint <= 0x7F
+                else 2
+                if codepoint <= 0x7FF
+                else 3
+                if codepoint <= 0xFFFF
+                else 4
+            )
+            if length > maximum_bytes:
+                break
+    if length > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    return value.encode("utf-8")
+
+
+def _encode_embed_and_ingest_doc_value(value: Any, maximum_bytes: int) -> bytes:
+    if isinstance(value, bool):
+        length = 2
+    elif isinstance(value, int) and -(1 << 63) <= value < 1 << 63:
+        length = 9
+    elif isinstance(value, str):
+        if maximum_bytes < 5:
+            raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+        length = 5 + len(
+            _encode_embed_and_ingest_text(
+                value,
+                maximum_bytes - 5,
+                "embed-and-ingest document value",
+            )
+        )
+    elif isinstance(value, bytes):
+        length = 5 + len(value)
+    elif isinstance(value, float):
+        length = 9
+    else:
+        raise ClientError("integrated doc value is invalid")
+    if length > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    return _encode_doc_value(value)
 
 
 def _decode_embed_and_ingest_batch(reader: _Reader) -> dict[str, Any]:

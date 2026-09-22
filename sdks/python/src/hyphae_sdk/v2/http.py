@@ -185,7 +185,7 @@ class HttpTransport:
         with self._state_lock:
             if self._closed:
                 raise ClientError("HTTP transport is closed")
-            negotiated_minor = self._negotiated_minor
+            request_minor = self._negotiated_minor
         request_id = options.checked_request_id()
         if options.cancellation.cancelled:
             raise product_error("cancelled", request_id)
@@ -195,7 +195,7 @@ class HttpTransport:
             else None
         )
         body = encode_product_request(
-            operation, arguments, options, negotiated_minor=negotiated_minor
+            operation, arguments, options, negotiated_minor=request_minor
         )
         key_lifecycle = operation.startswith("security_api_key_") or operation == (
             "security_legacy_bearer_revoke"
@@ -305,7 +305,7 @@ class HttpTransport:
                 or int(selected_minor) not in PROTOCOL_MINORS_SUPPORTED
             ):
                 raise ClientError("HTTP v2 protocol minor is missing or unsupported")
-            negotiated_minor = int(selected_minor)
+            response_minor = int(selected_minor)
             if response_request_id != str(request_id):
                 raise ClientError("HTTP v2 response request ID mismatch")
             if session_id is not None and (
@@ -314,7 +314,7 @@ class HttpTransport:
                 or session_id == "0" * 32
             ):
                 raise ClientError("HTTP v2 response session ID is invalid")
-            if negotiated_minor < operation_required_minor(operation, arguments):
+            if response_minor < operation_required_minor(operation, arguments):
                 raise ClientError(
                     "native operation is unavailable at the negotiated protocol minor"
                 )
@@ -336,7 +336,7 @@ class HttpTransport:
                 raise self._interrupted_error(context, request_id)
             with self._state_lock:
                 if not self._closed:
-                    self._negotiated_minor = negotiated_minor
+                    self._negotiated_minor = response_minor
                     if session_id is not None:
                         self._session_id = session_id
             declared = response.getheader("Content-Length")
@@ -368,7 +368,7 @@ class HttpTransport:
                         "HTTP v2 returned an unexpected status or media type"
                     )
                 return decode_product_response(
-                    encoded, request_id, negotiated_minor=negotiated_minor
+                    encoded, request_id, negotiated_minor=response_minor
                 )
             if media_type == ERROR_MEDIA_TYPE:
                 raise ProductError(
