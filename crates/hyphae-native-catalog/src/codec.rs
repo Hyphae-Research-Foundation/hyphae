@@ -1493,15 +1493,15 @@ mod tests {
         "0107000000000000000010000008000300"
     );
     const SEARCH_V3_GOLDEN_HEX: &str =
-        include_str!("../../../compatibility/native-catalog-search-representation3.hex");
+        include_str!("../compatibility/native-catalog-search-representation3.hex");
     const SEARCH_V4_GOLDEN_HEX: &str =
-        include_str!("../../../compatibility/native-catalog-search-representation4.hex");
+        include_str!("../compatibility/native-catalog-search-representation4.hex");
     const PROFILE_FIXTURE_HEX: &str =
-        include_str!("../../../compatibility/native-catalog-embedding-profile-v2.hex");
+        include_str!("../compatibility/native-catalog-embedding-profile-v2.hex");
     const QWEN3_ARTIFACT_MANIFEST: &[u8] =
-        include_bytes!("../../../compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json");
+        include_bytes!("../compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json");
     const QWEN3_QUERY_INSTRUCTION_HEX: &str =
-        include_str!("../../../compatibility/qwen3-embedding-query-instruction-v1.hex");
+        include_str!("../compatibility/qwen3-embedding-query-instruction-v1.hex");
     const QWEN3_ARTIFACT_MANIFEST_SHA256: [u8; 32] = [
         0xbe, 0xfe, 0xcd, 0xb4, 0x6c, 0x39, 0x1a, 0x8e, 0xa2, 0x05, 0xc5, 0x0a, 0x00, 0xb5, 0x47,
         0x65, 0xa4, 0x6a, 0x44, 0x8c, 0x6d, 0xb0, 0x93, 0x96, 0xa4, 0x92, 0x7a, 0x51, 0xd2, 0xb8,

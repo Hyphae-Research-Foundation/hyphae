@@ -1,0 +1,232 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-embedding-model-manifest-v1",
+  "status": "verified",
+  "model": {
+    "repository": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+    "model_type": "qwen3",
+    "parameter_class": "0.6B",
+    "native_dimensions": 1024,
+    "supported_output_dimensions": [
+      384,
+      768,
+      1024
+    ]
+  },
+  "license": {
+    "expected_declared_spdx": "Apache-2.0",
+    "declared_spdx": "Apache-2.0",
+    "declaration_source": "hugging-face-model-api.cardData.license",
+    "bundled_license_text": {
+      "status": "absent-in-upstream-snapshot",
+      "path": null,
+      "sha256": null
+    },
+    "legal_evidence_sha256": "4a7b723f5f7a5aca855b78e7a74b941bde8d5ebcf53a35d62b61351a2103e647",
+    "product_claims_allowed": false
+  },
+  "runtime_policy": {
+    "automatic_network": false,
+    "local_files_only": true,
+    "trust_remote_code": false,
+    "weights_format": "safetensors-only",
+    "canonical_output_dtype": "float32"
+  },
+  "acquisition_provenance": {
+    "evidence_kind": "operator-retained-hugging-face-commit-responses-v1",
+    "repository": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+    "capture": {
+      "tool": "acquire_evidence.py",
+      "tool_path": "acquisition-tool.py",
+      "tool_sha256": "482cec7a413354fdbf7425f720805ded42fb4b53ec1355c5e26cc3c3dbc13854",
+      "https_validation": "python-default-context-hostname-and-certificate",
+      "authentication": "public-read-no-credentials"
+    },
+    "acquisition_record_sha256": "bb7150384633f9b81a970a9d052fb12fe16d8e624320d0592636fd2cc5996cd5",
+    "model_metadata_response": {
+      "purpose": "commit-specific-model-metadata",
+      "source_url": "https://huggingface.co/api/models/Qwen/Qwen3-Embedding-0.6B/revision/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3?expand=cardData&expand=sha",
+      "body_path": "model-api.json",
+      "body_size_bytes": 309,
+      "body_sha256": "d0dfce9347bbef21fff5408bd6c4eaa6e4dc1e199e9bd184fe02d6edd939f2e1"
+    },
+    "model_card_response": {
+      "purpose": "commit-specific-model-card",
+      "source_url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/raw/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/README.md",
+      "body_path": "model-card.md",
+      "body_size_bytes": 17237,
+      "body_sha256": "c34d9b7e5a267ad3fdd13227a253686bc90844ff4744a2a6a86c7c905e3d06f3"
+    },
+    "tree_metadata_responses": [
+      {
+        "purpose": "commit-specific-tree-metadata",
+        "source_url": "https://huggingface.co/api/models/Qwen/Qwen3-Embedding-0.6B/tree/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3?recursive=true&expand=true",
+        "body_path": "tree-api-0001.json",
+        "body_size_bytes": 12213,
+        "body_sha256": "5a3fc692109a6183efba4363d45d1cb81c8c35c80d80bad7f99bcdc67ac73612"
+      }
+    ],
+    "files": [
+      {
+        "path": ".gitattributes",
+        "source_oid": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+        "storage": "git-blob",
+        "size_bytes": 1570,
+        "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+      },
+      {
+        "path": "1_Pooling/config.json",
+        "source_oid": "b6291baabbc39f9792d6759883a47d7d5bd0fbcf",
+        "storage": "git-blob",
+        "size_bytes": 313,
+        "sha256": "37bf193fa101f19101bfad9c31d3eb0f786e247b7b1e5cb7f007d730eed1ddbd"
+      },
+      {
+        "path": "README.md",
+        "source_oid": "00a82ea60dfb1d8aed899c16e2b4f12673cd2f79",
+        "storage": "git-blob",
+        "size_bytes": 17237,
+        "sha256": "c34d9b7e5a267ad3fdd13227a253686bc90844ff4744a2a6a86c7c905e3d06f3"
+      },
+      {
+        "path": "config.json",
+        "source_oid": "cef2749ee93607b8f9a58ec72f4f6bfaf874e71d",
+        "storage": "git-blob",
+        "size_bytes": 727,
+        "sha256": "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"
+      },
+      {
+        "path": "config_sentence_transformers.json",
+        "source_oid": "76aef3ade63553ebb698fe3c2a3264040ed093f8",
+        "storage": "git-blob",
+        "size_bytes": 215,
+        "sha256": "10667c72ddb772627bf1780cb7f86af8e2ae0032b8c243c731172064105c6961"
+      },
+      {
+        "path": "generation_config.json",
+        "source_oid": "d46f1983345269c582611bbedb3ca0a13f8e5f7b",
+        "storage": "git-blob",
+        "size_bytes": 117,
+        "sha256": "28396d421a2108acce96383f6a7de78008f7f1b17f807958f3c14c51dbfb65fb"
+      },
+      {
+        "path": "merges.txt",
+        "source_oid": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7",
+        "storage": "git-blob",
+        "size_bytes": 1671853,
+        "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+      },
+      {
+        "path": "model.safetensors",
+        "source_oid": "9116264a405846ebfe4e95556b63b1ca07c892a0",
+        "storage": "git-lfs-sha256",
+        "size_bytes": 1191586416,
+        "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"
+      },
+      {
+        "path": "modules.json",
+        "source_oid": "952a9b81c0bfd99800fabf352f69c7ccd46c5e43",
+        "storage": "git-blob",
+        "size_bytes": 349,
+        "sha256": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf"
+      },
+      {
+        "path": "tokenizer.json",
+        "source_oid": "18a4abbf4a408dc534006a455544dcc195f356d2",
+        "storage": "git-lfs-sha256",
+        "size_bytes": 11423705,
+        "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "source_oid": "7345216a0785dc7086e8c245b2a9d3896ce2b756",
+        "storage": "git-blob",
+        "size_bytes": 9706,
+        "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+      },
+      {
+        "path": "vocab.json",
+        "source_oid": "4783fe10ac3adce15ac8f358ef5462739852c569",
+        "storage": "git-blob",
+        "size_bytes": 2776833,
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": ".gitattributes",
+      "role": "metadata",
+      "size_bytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    },
+    {
+      "path": "1_Pooling/config.json",
+      "role": "metadata",
+      "size_bytes": 313,
+      "sha256": "37bf193fa101f19101bfad9c31d3eb0f786e247b7b1e5cb7f007d730eed1ddbd"
+    },
+    {
+      "path": "README.md",
+      "role": "documentation",
+      "size_bytes": 17237,
+      "sha256": "c34d9b7e5a267ad3fdd13227a253686bc90844ff4744a2a6a86c7c905e3d06f3"
+    },
+    {
+      "path": "config.json",
+      "role": "model-config",
+      "size_bytes": 727,
+      "sha256": "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"
+    },
+    {
+      "path": "config_sentence_transformers.json",
+      "role": "metadata",
+      "size_bytes": 215,
+      "sha256": "10667c72ddb772627bf1780cb7f86af8e2ae0032b8c243c731172064105c6961"
+    },
+    {
+      "path": "generation_config.json",
+      "role": "metadata",
+      "size_bytes": 117,
+      "sha256": "28396d421a2108acce96383f6a7de78008f7f1b17f807958f3c14c51dbfb65fb"
+    },
+    {
+      "path": "merges.txt",
+      "role": "tokenizer",
+      "size_bytes": 1671853,
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+    },
+    {
+      "path": "model.safetensors",
+      "role": "weights",
+      "size_bytes": 1191586416,
+      "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"
+    },
+    {
+      "path": "modules.json",
+      "role": "metadata",
+      "size_bytes": 349,
+      "sha256": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf"
+    },
+    {
+      "path": "tokenizer.json",
+      "role": "tokenizer",
+      "size_bytes": 11423705,
+      "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "role": "tokenizer",
+      "size_bytes": 9706,
+      "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+    },
+    {
+      "path": "vocab.json",
+      "role": "tokenizer",
+      "size_bytes": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    }
+  ]
+}
