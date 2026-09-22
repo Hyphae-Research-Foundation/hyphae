@@ -26,10 +26,19 @@ pub const MAX_CATALOG_DEFINITION_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INCREMENTAL_VECTOR_DELTA_ENTRIES: u32 = 4_096;
 /// Maximum obsolete ANN generations retained by one vector definition.
 pub const MAX_INCREMENTAL_VECTOR_RETAINED_GENERATIONS: u16 = 64;
-/// Maximum position or input-token bound admitted by an embedding profile.
-pub const MAX_EMBEDDING_TOKENS: u32 = 1_048_576;
-/// Maximum input count admitted by one future embedding batch.
-pub const MAX_EMBEDDING_BATCH_INPUTS: u32 = 4_096;
+/// Maximum complete artifact-manifest byte length admitted by an embedding profile.
+pub const MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum input-token bound admitted by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_MAX_INPUT_TOKENS: u32 = 32 * 1024;
+/// Native hidden-state dimension produced by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_NATIVE_DIMENSION: u16 = 1_024;
+/// Closed output dimensions admitted by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_OUTPUT_DIMENSIONS: [u16; 3] = [384, 768, 1_024];
+/// Exact retrieval instruction prepended to every `Qwen3EmbeddingV1` query.
+pub const QWEN3_EMBEDDING_QUERY_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+/// FP32 denominator floor used by `Qwen3EmbeddingV1` L2 normalization.
+pub const QWEN3_EMBEDDING_L2_EPSILON: f32 = 1e-12;
 
 /// Catalog construction or lookup failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -145,9 +154,9 @@ pub enum CatalogError {
     /// A named vector policy or lifecycle is invalid.
     #[error("named vector policy or lifecycle is invalid")]
     InvalidVectorPolicy,
-    /// An embedding artifact digest is all zeroes.
-    #[error("embedding artifact digest must be nonzero")]
-    ZeroEmbeddingArtifactDigest,
+    /// An embedding artifact-manifest digest is all zeroes.
+    #[error("embedding artifact-manifest digest must be nonzero")]
+    ZeroEmbeddingArtifactManifestDigest,
     /// An embedding profile pipeline, bound, or semantic combination is invalid.
     #[error("embedding profile definition is invalid")]
     InvalidEmbeddingProfile,
@@ -957,19 +966,19 @@ pub struct NamedVectorDefinition {
     pub embedding_profile: Option<ObjectId>,
 }
 
-/// Nonzero SHA-256 identity of one complete embedding artifact.
+/// Nonzero SHA-256 identity of one complete embedding artifact manifest.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EmbeddingArtifactDigest([u8; 32]);
+pub struct EmbeddingArtifactManifestDigest([u8; 32]);
 
-impl EmbeddingArtifactDigest {
-    /// Constructs one checked SHA-256 artifact identity.
+impl EmbeddingArtifactManifestDigest {
+    /// Constructs one checked SHA-256 artifact-manifest identity.
     ///
     /// # Errors
     ///
     /// Returns an error for the reserved all-zero digest.
     pub fn new(bytes: [u8; 32]) -> Result<Self, CatalogError> {
         if bytes == [0; 32] {
-            return Err(CatalogError::ZeroEmbeddingArtifactDigest);
+            return Err(CatalogError::ZeroEmbeddingArtifactManifestDigest);
         }
         Ok(Self(bytes))
     }
@@ -984,38 +993,11 @@ impl EmbeddingArtifactDigest {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum EmbeddingPipelineVersion {
-    /// BERT-family stage choices and safetensors artifact identity.
-    SafetensorsBertMetadataV1 = 1,
-}
-
-/// Token-hidden-state pooling fixed by an embedding profile.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub enum EmbeddingPooling {
-    /// Select the first non-padding token hidden state.
-    FirstToken = 1,
-    /// Arithmetic mean over attention-mask-selected token hidden states.
-    MeanTokens = 2,
-}
-
-/// Output normalization fixed by an embedding profile.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub enum EmbeddingNormalization {
-    /// Preserve the pooled output without normalization.
-    None = 1,
-    /// Divide by its L2 norm; a zero norm is an execution error.
-    L2 = 2,
-}
-
-/// Over-limit input handling fixed by an embedding profile.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub enum EmbeddingTruncation {
-    /// Reject input whose tokenized positions exceed the input bound.
-    Reject = 1,
-    /// Retain the first bounded positions and discard the remaining suffix.
-    KeepStart = 2,
+    /// Qwen3-Embedding-0.6B with fixed query/passage formatting, special-token
+    /// insertion, left padding, right truncation to one chunk, last-token
+    /// pooling, leading projection from 1024 FP32 values to 384, 768, or 1024,
+    /// then L2 normalization with epsilon `1e-12`.
+    Qwen3EmbeddingV1 = 1,
 }
 
 /// Versioned metadata contract for one local embedding pipeline identity.
@@ -1026,49 +1008,39 @@ pub enum EmbeddingTruncation {
 pub struct EmbeddingProfileDefinition {
     /// Shared V2 metadata.
     pub header: ObjectHeaderV2,
-    /// Complete safetensors weights byte digest.
-    pub model_weights_digest: EmbeddingArtifactDigest,
-    /// Complete model configuration byte digest.
-    pub model_config_digest: EmbeddingArtifactDigest,
-    /// Complete tokenizer configuration byte digest.
-    pub tokenizer_digest: EmbeddingArtifactDigest,
+    /// SHA-256 of the complete artifact-manifest bytes.
+    pub artifact_manifest_digest: EmbeddingArtifactManifestDigest,
+    /// Exact complete artifact-manifest byte length.
+    pub artifact_manifest_byte_length: u64,
     /// Versioned pipeline metadata and stage-choice identity.
     pub pipeline_version: EmbeddingPipelineVersion,
     /// Fixed output element representation and dimension.
     pub vector_type: VectorType,
-    /// Maximum positional extent admitted by the model contract.
-    pub max_position_tokens: u32,
     /// Maximum tokenized positions admitted for one input.
     pub max_input_tokens: u32,
-    /// Maximum input count admitted by one future batch.
-    pub max_batch_inputs: u32,
-    /// Hidden-state pooling semantics.
-    pub pooling: EmbeddingPooling,
-    /// Output normalization semantics.
-    pub normalization: EmbeddingNormalization,
-    /// Over-limit token handling semantics.
-    pub truncation: EmbeddingTruncation,
+    /// Exact retrieval instruction used by query formatting.
+    pub query_instruction: String,
 }
 
 impl EmbeddingProfileDefinition {
-    /// Validates the closed local safetensors metadata contract.
+    /// Validates the closed Qwen3 embedding metadata contract.
     ///
     /// # Errors
     ///
-    /// Returns an error for wrong ownership, unsupported output types, or
-    /// zero, inverted, or oversized position/input/batch bounds.
+    /// Returns an error for wrong ownership, unsupported output dimensions,
+    /// manifest or token bounds, or instruction drift.
     pub fn validate(&self) -> Result<(), CatalogError> {
         if self.header.owner != EngineKind::Search {
             return Err(CatalogError::WrongObjectOwner);
         }
-        if self.pipeline_version != EmbeddingPipelineVersion::SafetensorsBertMetadataV1
+        if self.pipeline_version != EmbeddingPipelineVersion::Qwen3EmbeddingV1
+            || self.artifact_manifest_byte_length == 0
+            || self.artifact_manifest_byte_length > MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES
             || self.vector_type.element() != hyphae_native_types::VectorElement::Float32
-            || self.max_position_tokens < 2
-            || self.max_position_tokens > MAX_EMBEDDING_TOKENS
-            || self.max_input_tokens < 2
-            || self.max_input_tokens > self.max_position_tokens
-            || self.max_batch_inputs == 0
-            || self.max_batch_inputs > MAX_EMBEDDING_BATCH_INPUTS
+            || !QWEN3_EMBEDDING_OUTPUT_DIMENSIONS.contains(&self.vector_type.dimension())
+            || self.max_input_tokens == 0
+            || self.max_input_tokens > QWEN3_EMBEDDING_MAX_INPUT_TOKENS
+            || self.query_instruction != QWEN3_EMBEDDING_QUERY_INSTRUCTION
         {
             return Err(CatalogError::InvalidEmbeddingProfile);
         }
@@ -2256,13 +2228,12 @@ mod tests {
         AnalyzerDefinition, AnalyzerTokenizer, CatalogError, CatalogName, CatalogObject,
         CatalogObjectV2, CatalogSnapshot, CatalogTransaction, ColumnDefinition,
         CompatibleCatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind,
-        EmbeddingArtifactDigest, EmbeddingNormalization, EmbeddingPipelineVersion,
-        EmbeddingPooling, EmbeddingProfileDefinition, EmbeddingTruncation, FieldSourcePolicy,
-        IncrementalVectorLifecycle, LexicalIndexPolicy, LogicalCatalogObject,
-        NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QualifiedName, RelationDefinition,
-        SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions,
-        SecondaryIndexDefinition, VectorMetric, VectorSearchPolicy, dependency_edges_for,
-        derive_logical_dependency_edges,
+        EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+        FieldSourcePolicy, IncrementalVectorLifecycle, LexicalIndexPolicy, LogicalCatalogObject,
+        NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
+        QualifiedName, RelationDefinition, SearchCollectionDefinitionV2, SearchFieldDefinitionV2,
+        SearchFieldOptions, SecondaryIndexDefinition, VectorMetric, VectorSearchPolicy,
+        dependency_edges_for, derive_logical_dependency_edges,
     };
 
     fn relation(id: u128, name: &str) -> Result<CatalogObject, Box<dyn std::error::Error>> {
@@ -2581,17 +2552,12 @@ mod tests {
         )?));
         let profile_definition = EmbeddingProfileDefinition {
             header: header(12, EngineKind::Search, "embedding", Some(11))?,
-            model_weights_digest: EmbeddingArtifactDigest::new([1; 32])?,
-            model_config_digest: EmbeddingArtifactDigest::new([2; 32])?,
-            tokenizer_digest: EmbeddingArtifactDigest::new([3; 32])?,
-            pipeline_version: EmbeddingPipelineVersion::SafetensorsBertMetadataV1,
-            vector_type: VectorType::new(VectorElement::Float32, 3)?,
-            max_position_tokens: 512,
+            artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([1; 32])?,
+            artifact_manifest_byte_length: 8_323,
+            pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+            vector_type: VectorType::new(VectorElement::Float32, 384)?,
             max_input_tokens: 256,
-            max_batch_inputs: 16,
-            pooling: EmbeddingPooling::MeanTokens,
-            normalization: EmbeddingNormalization::L2,
-            truncation: EmbeddingTruncation::KeepStart,
+            query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
         };
         let profile = LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
             profile_definition.clone(),
@@ -2602,7 +2568,7 @@ mod tests {
             vectors: vec![NamedVectorDefinition {
                 id: FieldId::new(1)?,
                 name: CatalogName::unquoted("embedding")?,
-                vector_type: VectorType::new(VectorElement::Float32, 3)?,
+                vector_type: VectorType::new(VectorElement::Float32, 384)?,
                 metric: VectorMetric::Cosine,
                 policy: VectorSearchPolicy::Exact,
                 lifecycle: IncrementalVectorLifecycle {
@@ -2639,7 +2605,7 @@ mod tests {
         );
 
         let mut mismatched_profile = profile_definition;
-        mismatched_profile.vector_type = VectorType::new(VectorElement::Float32, 4)?;
+        mismatched_profile.vector_type = VectorType::new(VectorElement::Float32, 768)?;
         let mismatched_profile =
             LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(mismatched_profile));
         assert_eq!(
