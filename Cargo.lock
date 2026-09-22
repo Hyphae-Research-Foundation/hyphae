@@ -966,6 +966,7 @@ dependencies = [
  "hyphae-native-catalog",
  "hyphae-native-product",
  "hyphae-native-runtime",
+ "hyphae-native-types",
  "thiserror",
  "tokio",
 ]

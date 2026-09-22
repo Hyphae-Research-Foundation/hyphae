@@ -358,6 +358,7 @@ impl ProofOperationClass for ProductOperation {
             | ProductOperation::MemoryEnrich(_)
             | ProductOperation::StructureSet { .. }
             | ProductOperation::StructureMutate { .. }
+            | ProductOperation::EmbedAndIngest { .. }
             | ProductOperation::SearchIngest { .. }
             | ProductOperation::SearchDocumentUpdate { .. }
             | ProductOperation::SearchDocumentDelete { .. }

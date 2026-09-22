@@ -46,6 +46,10 @@ const RRF_CONSTANT: f64 = 60.0;
 pub const MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS: usize = 256;
 /// Maximum logical input bytes accepted by one atomic integrated ingestion.
 pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum kernel identities reported by one embedding execution profile.
+pub const MAX_PRODUCT_EMBED_EXECUTION_KERNELS: usize = 64;
+/// Maximum UTF-8 bytes in one embedding execution-profile text field.
+pub const MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES: usize = 4 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
 /// Raised from 10,000 on the R-track evidence chain (posting-index
 /// eligibility, pinned posting scorer, cached snapshot state, and the
@@ -158,6 +162,78 @@ pub struct ProductSearchIngestReceipt {
     pub documents: usize,
     /// Whether an existing durable idempotency record suppressed publication.
     pub idempotent_replay: bool,
+}
+
+/// One document whose vector is produced by its catalog-bound profile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductEmbedAndIngestDocument {
+    /// Stable identity shared by the lexical and generated-vector branches.
+    pub object_id: crate::ObjectId,
+    /// Canonical source text embedded and indexed by native BM25.
+    pub text: String,
+    /// Typed filter, sort, facet, and aggregation values.
+    pub doc_values: BTreeMap<String, ProductDocValue>,
+}
+
+/// One bounded vector-free embedding and ingestion request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductEmbedAndIngestBatch {
+    /// Stable caller identity for retry suppression.
+    pub idempotency_id: u128,
+    /// Documents embedded and committed together or not at all.
+    pub documents: Vec<ProductEmbedAndIngestDocument>,
+}
+
+/// Closed embedding execution backend reported to the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductEmbeddingBackend {
+    /// Native CPU execution.
+    Cpu,
+    /// Validated CUDA execution.
+    Cuda,
+}
+
+/// Closed embedding arithmetic precision reported to the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductEmbeddingPrecision {
+    /// IEEE-754 binary32 execution.
+    F32,
+}
+
+/// Exact executor selected for one catalog-bound embedding batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEmbeddingExecutionProfile {
+    /// Catalogued embedding profile used by the single vector target.
+    pub embedding_profile: crate::ObjectId,
+    /// Selected execution backend.
+    pub backend: ProductEmbeddingBackend,
+    /// Stable device description.
+    pub device: String,
+    /// Stable driver description.
+    pub driver: String,
+    /// Stable runtime description.
+    pub runtime: String,
+    /// Arithmetic precision used by every reported kernel.
+    pub precision: ProductEmbeddingPrecision,
+    /// Ordered kernel identities for the executed pipeline.
+    pub kernels: Vec<String>,
+    /// Whether automatic validation selected the CPU fallback.
+    pub fallback: bool,
+}
+
+/// Durable result of one embed-and-ingest attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEmbedAndIngestReceipt {
+    /// All-engine snapshot containing the accepted batch.
+    pub snapshot: SnapshotIdentity,
+    /// Original durable commit evidence, retained identically on replay.
+    pub commit: ProductCommitReceipt,
+    /// Number of documents represented by the idempotency record.
+    pub documents: usize,
+    /// Whether an existing durable idempotency record suppressed publication.
+    pub idempotent_replay: bool,
+    /// Exact backend and kernels used for the original publication.
+    pub execution_profile: ProductEmbeddingExecutionProfile,
 }
 
 /// One idempotent integrated document replacement.

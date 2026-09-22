@@ -760,6 +760,7 @@ fn migrate_semantic_at(
                 consolidate_after_deltas: 256,
                 retain_generations: 2,
             },
+            embedding_profile: None,
         });
         definition.fields.sort_by_key(|field| field.id);
         definition.vectors.sort_by_key(|vector| vector.id);

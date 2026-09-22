@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use hyphae_native_catalog::{
-    CatalogName, CatalogObject, CatalogObjectKind, DependencyDirection, DependencyEdge,
-    DependencyKind, LogicalCatalogObject, QualifiedName,
+    CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2, DependencyDirection,
+    DependencyEdge, DependencyKind, LogicalCatalogObject, QualifiedName,
 };
 use hyphae_native_product::proof::{
     AdmittedProofLimits, ExternalTrustedAnchor, NativeOperationProofArtifact,
@@ -20,7 +20,9 @@ use hyphae_native_product::{
     ProductAnnRecallRisk, ProductAnnStrategy, ProductAuthorization, ProductCheckpointReceipt,
     ProductCommitOutcome, ProductCommitReceipt, ProductConvergenceExplanation,
     ProductConvergenceStrategy, ProductDocValue, ProductDocument, ProductDurability,
-    ProductDurabilityPolicy, ProductError, ProductErrorCodecError, ProductExplain,
+    ProductDurabilityPolicy, ProductEmbedAndIngestBatch, ProductEmbedAndIngestDocument,
+    ProductEmbedAndIngestReceipt, ProductEmbeddingBackend, ProductEmbeddingExecutionProfile,
+    ProductEmbeddingPrecision, ProductError, ProductErrorCodecError, ProductExplain,
     ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductHashEntry,
     ProductHashScanStop, ProductHybridExplanation, ProductHybridVectorStrategy,
     ProductIntegratedSearchHit, ProductLexicalBranch, ProductLimits, ProductListSide,
@@ -131,6 +133,7 @@ const REQUEST_SECURITY_API_KEY_REVOKE: u16 = 68;
 const REQUEST_SECURITY_LEGACY_BEARER_REVOKE: u16 = 70;
 const REQUEST_MEMORY_RECALL: u16 = 71;
 const REQUEST_MEMORY_ENRICH: u16 = 72;
+const REQUEST_EMBED_AND_INGEST: u16 = 73;
 
 const RESPONSE_CAPABILITIES: u16 = 1;
 const RESPONSE_PREPARED_SQL: u16 = 2;
@@ -178,6 +181,7 @@ const RESPONSE_SECURITY_API_KEY_STARTED: u16 = 43;
 const RESPONSE_SECURITY_API_KEY_ACTIVATED: u16 = 44;
 const RESPONSE_MEMORY_RECALL: u16 = 45;
 const RESPONSE_STRUCTURE_MUTATION_BATCH: u16 = 46;
+const RESPONSE_EMBED_AND_INGESTED: u16 = 47;
 
 /// Decoded product request and execution metadata.
 #[derive(Clone, Debug)]
@@ -566,6 +570,11 @@ pub fn encode_product_response(response: &ProductResponse) -> Result<Vec<u8>, Pr
             let mut body = Vec::new();
             encode_search_ingest_receipt(&mut body, value)?;
             (RESPONSE_SEARCH_INGESTED, body)
+        }
+        ProductResponse::EmbedAndIngested(value) => {
+            let mut body = Vec::new();
+            encode_embed_and_ingest_receipt(&mut body, value)?;
+            (RESPONSE_EMBED_AND_INGESTED, body)
         }
         ProductResponse::ExplicitTransactionStatus(value) => {
             let mut body = Vec::new();
@@ -1057,6 +1066,9 @@ pub fn decode_product_response(encoded: &[u8]) -> Result<ProductResponse, Produc
         RESPONSE_SEARCH_INGESTED => {
             ProductResponse::SearchIngested(decode_search_ingest_receipt(&mut decoder)?)
         }
+        RESPONSE_EMBED_AND_INGESTED => {
+            ProductResponse::EmbedAndIngested(decode_embed_and_ingest_receipt(&mut decoder)?)
+        }
         RESPONSE_EXPLICIT_TRANSACTION_STATUS => ProductResponse::ExplicitTransactionStatus(
             decode_explicit_transaction_status(&mut decoder)?,
         ),
@@ -1167,6 +1179,21 @@ fn document_required_minor(document: &ProductDocument) -> u16 {
         .unwrap_or(0)
 }
 
+fn catalog_definition_required_minor(object: &LogicalCatalogObject) -> u16 {
+    match object {
+        LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(_)) => 8,
+        LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition))
+            if definition
+                .vectors
+                .iter()
+                .any(|vector| vector.embedding_profile.is_some()) =>
+        {
+            8
+        }
+        _ => 0,
+    }
+}
+
 /// Lowest protocol minor whose codec admits every part of this search
 /// request. Future request content (fusion methods, new operators, new
 /// doc-value types) raises the requirement here rather than adding a new
@@ -1239,6 +1266,18 @@ fn ensure_operation_minor(
     negotiated_minor: u16,
 ) -> Result<(), ProductCodecError> {
     let required_minor = match operation {
+        ProductOperation::CatalogList(request)
+            if request.kind == Some(CatalogObjectKind::EmbeddingProfile) =>
+        {
+            8
+        }
+        ProductOperation::CatalogVisibleList(request)
+            if request.filter.kind == Some(CatalogObjectKind::EmbeddingProfile) =>
+        {
+            8
+        }
+        ProductOperation::CatalogCreate { object } => catalog_definition_required_minor(object),
+        ProductOperation::EmbedAndIngest { .. } => 9,
         ProductOperation::SecurityStatus
         | ProductOperation::SecurityPrincipalList(_)
         | ProductOperation::SecurityRoleList(_)
@@ -1319,6 +1358,34 @@ fn ensure_response_minor(
     negotiated_minor: u16,
 ) -> Result<(), ProductCodecError> {
     let required_minor = match response {
+        ProductResponse::CatalogPage(page)
+            if page
+                .items
+                .iter()
+                .any(|item| item.kind == CatalogObjectKind::EmbeddingProfile) =>
+        {
+            8
+        }
+        ProductResponse::CatalogVisiblePage(page)
+            if page
+                .items
+                .iter()
+                .any(|item| item.kind == CatalogObjectKind::EmbeddingProfile) =>
+        {
+            8
+        }
+        ProductResponse::CatalogDependencyPage(page)
+            if page
+                .items
+                .iter()
+                .any(|edge| edge.kind == DependencyKind::EmbeddingProfile) =>
+        {
+            8
+        }
+        ProductResponse::CatalogDefinition(Some(object)) => {
+            catalog_definition_required_minor(object)
+        }
+        ProductResponse::EmbedAndIngested(_) => 9,
         ProductResponse::SecurityStatus(_)
         | ProductResponse::SecurityPrincipalPage(_)
         | ProductResponse::SecurityRolePage(_)
@@ -1626,6 +1693,11 @@ fn encode_operation(operation: &ProductOperation) -> Result<(u16, Vec<u8>), Prod
             body.extend_from_slice(&request.update.idempotency_id.to_le_bytes());
             encode_product_document(&mut body, &request.update.document)?;
             REQUEST_MEMORY_ENRICH
+        }
+        ProductOperation::EmbedAndIngest { collection, batch } => {
+            body.extend_from_slice(&collection.get().to_le_bytes());
+            encode_embed_and_ingest_batch(&mut body, batch)?;
+            REQUEST_EMBED_AND_INGEST
         }
         ProductOperation::MemoryRecall(request) => {
             encode_memory_request(&mut body, request)?;
@@ -2141,6 +2213,11 @@ fn decode_operation(kind: u16, encoded: &[u8]) -> Result<ProductOperation, Produ
                 },
             })
         }
+        REQUEST_EMBED_AND_INGEST => ProductOperation::EmbedAndIngest {
+            collection: ObjectId::new(decoder.u128()?)
+                .map_err(|_| ProductCodecError::InvalidValue)?,
+            batch: decode_embed_and_ingest_batch(&mut decoder)?,
+        },
         REQUEST_MEMORY_RECALL => {
             ProductOperation::MemoryRecall(decode_memory_request(&mut decoder)?)
         }
@@ -6382,6 +6459,82 @@ fn decode_search_filter(
     })
 }
 
+fn encode_embed_and_ingest_batch(
+    encoded: &mut Vec<u8>,
+    batch: &ProductEmbedAndIngestBatch,
+) -> Result<(), ProductCodecError> {
+    if batch.idempotency_id == 0
+        || batch.documents.is_empty()
+        || batch.documents.len() > hyphae_native_product::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    encoded.extend_from_slice(&batch.idempotency_id.to_le_bytes());
+    put_u32(encoded, batch.documents.len())?;
+    for document in &batch.documents {
+        if document.doc_values.len() > hyphae_native_runtime::MAX_DOC_VALUES_PER_CANDIDATE {
+            return Err(ProductCodecError::LimitExceeded);
+        }
+        encoded.extend_from_slice(&document.object_id.get().to_le_bytes());
+        put_text(encoded, &document.text)?;
+        put_u32(encoded, document.doc_values.len())?;
+        for (name, value) in &document.doc_values {
+            put_text(encoded, name)?;
+            encode_doc_value(encoded, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_embed_and_ingest_batch(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductEmbedAndIngestBatch, ProductCodecError> {
+    let idempotency_id = decoder.u128()?;
+    let count = decoder.usize_u32()?;
+    if idempotency_id == 0 || count == 0 {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let mut documents = decoder.reserve_vec(
+        count,
+        hyphae_native_product::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS,
+        24,
+    )?;
+    for _ in 0..count {
+        let object_id =
+            ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+        let text = decoder.text()?;
+        let value_count = decoder.usize_u32()?;
+        if value_count > hyphae_native_runtime::MAX_DOC_VALUES_PER_CANDIDATE {
+            return Err(ProductCodecError::LimitExceeded);
+        }
+        let minimum_value_bytes = value_count
+            .checked_mul(5)
+            .ok_or(ProductCodecError::LimitExceeded)?;
+        if minimum_value_bytes > decoder.remaining.len() {
+            return Err(ProductCodecError::Truncated);
+        }
+        let mut doc_values = std::collections::BTreeMap::new();
+        for _ in 0..value_count {
+            let name = decoder.text()?;
+            if doc_values.last_key_value().is_some_and(
+                |(previous, _): (&String, &ProductDocValue)| name.as_bytes() <= previous.as_bytes(),
+            ) {
+                return Err(ProductCodecError::InvalidValue);
+            }
+            doc_values.insert(name, decode_doc_value(decoder)?);
+        }
+        documents.push(ProductEmbedAndIngestDocument {
+            object_id,
+            text,
+            doc_values,
+        });
+    }
+    Ok(ProductEmbedAndIngestBatch {
+        idempotency_id,
+        documents,
+    })
+}
+
 fn encode_search_ingest_batch(
     encoded: &mut Vec<u8>,
     batch: &ProductSearchIngestBatch,
@@ -6531,6 +6684,165 @@ fn decode_search_ingest_receipt(
         documents,
         idempotent_replay,
     })
+}
+
+fn encode_embed_and_ingest_receipt(
+    encoded: &mut Vec<u8>,
+    receipt: &ProductEmbedAndIngestReceipt,
+) -> Result<(), ProductCodecError> {
+    if receipt.documents == 0
+        || receipt.documents > hyphae_native_product::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    validate_embedding_execution_profile(&receipt.execution_profile)?;
+    validate_embed_commit_receipt(receipt.commit)?;
+    encode_snapshot(encoded, receipt.snapshot);
+    encoded.push(1);
+    encoded.push(u8::from(receipt.idempotent_replay));
+    encoded.extend_from_slice(&[0; 6]);
+    put_u64(encoded, receipt.documents)?;
+    encode_embedding_execution_profile(encoded, &receipt.execution_profile)?;
+    encode_receipt(encoded, receipt.commit)?;
+    Ok(())
+}
+
+fn decode_embed_and_ingest_receipt(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductEmbedAndIngestReceipt, ProductCodecError> {
+    let snapshot = decode_snapshot(decoder)?;
+    if !decoder.boolean()? {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let idempotent_replay = decoder.boolean()?;
+    if decoder.bytes(6)? != [0; 6] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let documents = decoder.usize()?;
+    if documents == 0 || documents > hyphae_native_product::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let execution_profile = decode_embedding_execution_profile(decoder)?;
+    let commit = decode_receipt(decoder)?;
+    validate_embed_commit_receipt(commit)?;
+    Ok(ProductEmbedAndIngestReceipt {
+        snapshot,
+        documents,
+        idempotent_replay,
+        execution_profile,
+        commit,
+    })
+}
+
+fn encode_embedding_execution_profile(
+    encoded: &mut Vec<u8>,
+    profile: &ProductEmbeddingExecutionProfile,
+) -> Result<(), ProductCodecError> {
+    encoded.extend_from_slice(&profile.embedding_profile.get().to_le_bytes());
+    encoded.push(match profile.backend {
+        ProductEmbeddingBackend::Cpu => 0,
+        ProductEmbeddingBackend::Cuda => 1,
+    });
+    encoded.push(match profile.precision {
+        ProductEmbeddingPrecision::F32 => 1,
+    });
+    encoded.push(u8::from(profile.fallback));
+    encoded.extend_from_slice(&[0; 5]);
+    put_text(encoded, &profile.device)?;
+    put_text(encoded, &profile.driver)?;
+    put_text(encoded, &profile.runtime)?;
+    put_u32(encoded, profile.kernels.len())?;
+    for kernel in &profile.kernels {
+        put_text(encoded, kernel)?;
+    }
+    Ok(())
+}
+
+fn decode_embedding_execution_profile(
+    decoder: &mut Decoder<'_>,
+) -> Result<ProductEmbeddingExecutionProfile, ProductCodecError> {
+    let embedding_profile =
+        ObjectId::new(decoder.u128()?).map_err(|_| ProductCodecError::InvalidValue)?;
+    let backend = match decoder.u8()? {
+        0 => ProductEmbeddingBackend::Cpu,
+        1 => ProductEmbeddingBackend::Cuda,
+        _ => return Err(ProductCodecError::InvalidValue),
+    };
+    let precision = match decoder.u8()? {
+        1 => ProductEmbeddingPrecision::F32,
+        _ => return Err(ProductCodecError::InvalidValue),
+    };
+    let fallback = decoder.boolean()?;
+    if decoder.bytes(5)? != [0; 5] {
+        return Err(ProductCodecError::Malformed);
+    }
+    let device = decode_embedding_execution_text(decoder)?;
+    let driver = decode_embedding_execution_text(decoder)?;
+    let runtime = decode_embedding_execution_text(decoder)?;
+    let count = decoder.usize_u32()?;
+    if count == 0 {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    let mut kernels = decoder.reserve_vec(
+        count,
+        hyphae_native_product::MAX_PRODUCT_EMBED_EXECUTION_KERNELS,
+        5,
+    )?;
+    for _ in 0..count {
+        kernels.push(decode_embedding_execution_text(decoder)?);
+    }
+    let profile = ProductEmbeddingExecutionProfile {
+        embedding_profile,
+        backend,
+        device,
+        driver,
+        runtime,
+        precision,
+        kernels,
+        fallback,
+    };
+    validate_embedding_execution_profile(&profile)?;
+    Ok(profile)
+}
+
+fn decode_embedding_execution_text(decoder: &mut Decoder<'_>) -> Result<String, ProductCodecError> {
+    let length = decoder.usize_u32()?;
+    if length == 0 || length > hyphae_native_product::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    String::from_utf8(decoder.bytes(length)?.to_vec()).map_err(|_| ProductCodecError::InvalidValue)
+}
+
+fn validate_embedding_execution_profile(
+    profile: &ProductEmbeddingExecutionProfile,
+) -> Result<(), ProductCodecError> {
+    let valid_text = |value: &str| {
+        !value.is_empty()
+            && value.len() <= hyphae_native_product::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES
+    };
+    if !valid_text(&profile.device)
+        || !valid_text(&profile.driver)
+        || !valid_text(&profile.runtime)
+        || profile.kernels.is_empty()
+        || profile.kernels.len() > hyphae_native_product::MAX_PRODUCT_EMBED_EXECUTION_KERNELS
+        || profile.kernels.iter().any(|kernel| !valid_text(kernel))
+    {
+        return Err(ProductCodecError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn validate_embed_commit_receipt(receipt: ProductCommitReceipt) -> Result<(), ProductCodecError> {
+    if receipt.commit_csn == 0
+        || receipt.catalog_version == 0
+        || receipt.commit_lsn == 0
+        || receipt.wal_block_digest == [0; 32]
+        || receipt.durability_cohort_size == 0
+        || receipt.durability_cohort_position >= receipt.durability_cohort_size
+    {
+        return Err(ProductCodecError::InvalidValue);
+    }
+    Ok(())
 }
 
 fn encode_aggregation_value(
@@ -7005,6 +7317,7 @@ fn decode_catalog_kind(tag: u8) -> Result<CatalogObjectKind, ProductCodecError> 
         7 => Ok(CatalogObjectKind::SearchCollection),
         8 => Ok(CatalogObjectKind::Analyzer),
         9 => Ok(CatalogObjectKind::CrossEngineLink),
+        10 => Ok(CatalogObjectKind::EmbeddingProfile),
         _ => Err(ProductCodecError::InvalidValue),
     }
 }
@@ -7161,6 +7474,7 @@ fn decode_dependency_page(
             4 => DependencyKind::Analyzer,
             5 => DependencyKind::LinkEndpoint,
             6 => DependencyKind::RelationSchema,
+            7 => DependencyKind::EmbeddingProfile,
             _ => return Err(ProductCodecError::InvalidValue),
         };
         items.push(DependencyEdge::new(dependent, prerequisite, kind));

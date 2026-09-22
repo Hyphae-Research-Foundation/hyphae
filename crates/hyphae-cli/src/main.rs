@@ -3547,6 +3547,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                             metric: VectorMetric::SquaredL2,
                             policy: VectorSearchPolicy::Exact,
                             lifecycle,
+                            embedding_profile: None,
                         },
                         NamedVectorDefinition {
                             id: field_id(8)?,
@@ -3555,6 +3556,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                             metric: VectorMetric::SquaredL2,
                             policy: VectorSearchPolicy::Ann(ann),
                             lifecycle,
+                            embedding_profile: None,
                         },
                     ],
                 },
@@ -7189,6 +7191,7 @@ fn catalog_kind(kind: CatalogObjectKind) -> &'static str {
         CatalogObjectKind::SearchCollection => "search_collection",
         CatalogObjectKind::Analyzer => "analyzer",
         CatalogObjectKind::CrossEngineLink => "cross_engine_link",
+        CatalogObjectKind::EmbeddingProfile => "embedding_profile",
     }
 }
 
@@ -7237,6 +7240,7 @@ const fn dependency_kind(kind: DependencyKind) -> &'static str {
         DependencyKind::Analyzer => "analyzer",
         DependencyKind::LinkEndpoint => "link_endpoint",
         DependencyKind::RelationSchema => "relation_schema",
+        DependencyKind::EmbeddingProfile => "embedding_profile",
     }
 }
 

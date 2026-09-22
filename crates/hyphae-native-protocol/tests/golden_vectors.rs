@@ -1294,7 +1294,7 @@ fn strip_request_idempotency(encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::err
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn protocol_minor_negotiation_preserves_older_peers_and_selects_1_7()
+fn protocol_minor_negotiation_preserves_older_peers_and_selects_1_9()
 -> Result<(), Box<dyn std::error::Error>> {
     let legacy = Hello {
         maximum_minor: 0,
@@ -1387,6 +1387,36 @@ fn protocol_minor_negotiation_preserves_older_peers_and_selects_1_7()
         .minor,
         5
     );
+    let minor_seven = Hello {
+        maximum_minor: 7,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_seven,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        7
+    );
+    let minor_eight = Hello {
+        maximum_minor: 8,
+        ..Hello::default()
+    };
+    assert_eq!(
+        negotiate(
+            &minor_eight,
+            NegotiationPolicy::default(),
+            1,
+            hyphae_native_product::capabilities(),
+            1
+        )?
+        .minor,
+        8
+    );
     assert_eq!(
         negotiate(
             &current,
@@ -1396,12 +1426,12 @@ fn protocol_minor_negotiation_preserves_older_peers_and_selects_1_7()
             1
         )?
         .minor,
-        7
+        9
     );
 
     let incompatible = Hello {
-        minimum_minor: 8,
-        maximum_minor: 8,
+        minimum_minor: 10,
+        maximum_minor: 10,
         ..Hello::default()
     };
     assert_eq!(
