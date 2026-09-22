@@ -130,29 +130,37 @@
     "release_preparation_commit": "d07c7fb81d5d972a11a04dbecc9f839e5142a024",
     "dependency_ledger": "docs/release/4.0.0-dependency-ledger.md",
     "integration_commit": null,
-    "observed_partial_integration_commit": "efdcd4c21036aa6c5a0da5d7c1ece96db3e85eb8",
-    "observed_core_chain_commit": "29e36cc699ebecf38646de09f4b2298cea117ca2",
+    "observed_partial_integration_commit": "f92a5ef21431e33b4d5a8503d1f81bc30479b8ef",
+    "observed_core_chain_commit": "dbcc464912877b2dcc4e765337e3e15001179f32",
     "observed_rust_wire_commit": "e014925cc6b329e947a37120ac985644a5df12ca",
+    "observed_cli_consumer_commit": "84de293d49331859edf45cc268d0aeba743bd0d2",
+    "observed_accelerator_lane_commit": "b36f929ea89f0388f9d75fd7c5de3423ddfc16fe",
     "integrated_scope": [
-      "final-package-identity"
+      "final-package-identity",
+      "embedding-profile-catalog-codec-4-minor-8",
+      "profile-runtime-binding",
+      "embed-and-ingest-minor-9",
+      "rust-wire-minor-8-9",
+      "cpu-backend-package",
+      "cli-consumer"
     ],
     "required_dependency_status": {
-      "embedding-profile-catalog-codec-4-minor-8": "observed-core-chain-not-selected",
-      "embed-and-ingest-minor-9": "product-and-wire-on-separate-unselected-lanes",
-      "python-minor-8-9": "latest-bounds-fix-not-integrated",
-      "typescript-minor-8-9": "latest-bounds-fix-not-in-partial-integration",
-      "product-runtime": "observed-core-chain-not-selected",
-      "qwen-profile-execution": "profile-binding-observed-executor-not-committed",
-      "cpu-backend": "no-committed-executor-crate",
-      "cuda-backend": "no-committed-crate-binary-only-if-produced"
+      "embedding-profile-catalog-codec-4-minor-8": "composed-package-verified",
+      "embed-and-ingest-minor-9": "product-wire-cli-composed-package-verified",
+      "python-minor-8-9": "latest-bounds-fix-not-composed-in-release-lane",
+      "typescript-minor-8-9": "latest-bounds-fix-not-composed-in-release-lane",
+      "product-runtime": "composed-package-verified",
+      "qwen-profile-execution": "cpu-executor-package-verified-model-result-evidence-open",
+      "cpu-backend": "publishable-crate-composed-extracted-build-passed",
+      "cuda-backend": "no-cuda-implementation-commit-no-claim"
     },
     "crate_inventory": {
-      "declared_publishable_packages": 24,
-      "core_chain_metadata_publishable_packages": 24,
+      "declared_publishable_packages": 25,
+      "composed_metadata_publishable_packages": 25,
       "order_config": "config/crates-io-release.json",
       "backend_package_policy": "publishable-crates-only; binary-only-accelerators-excluded",
-      "core_chain_package_audit": "blocked-catalog-fixtures-outside-owning-crate",
-      "core_chain_exact_package_verification": "blocked-cli-catalog-exhaustiveness"
+      "package_audit": "passed-25-packages-47-compile-time-assets",
+      "exact_package_verification": "passed-25-extracted-packages-rust-1.96.0"
     },
     "exact_sha_g8": "open",
     "publication": "blocked"

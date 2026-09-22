@@ -11,8 +11,9 @@ use std::{
 };
 
 use hyphae_native_catalog::{
-    CatalogName, CatalogObjectV2, DefinitionVersion, LogicalCatalogObject, ObjectHeaderV2,
-    QualifiedName,
+    CatalogName, CatalogObjectKind, CatalogObjectV2, DefinitionVersion,
+    EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+    LogicalCatalogObject, ObjectHeaderV2, QWEN3_EMBEDDING_QUERY_INSTRUCTION, QualifiedName,
 };
 use hyphae_native_product::proof::{
     AdmittedProofLimits, AnnFilterStrategy, AnnProofMetadata, ApproximationLabel, CanonicalBytes,
@@ -29,7 +30,7 @@ use hyphae_native_product::{
     ProductRequestContext, ProductSession, ProductSessionId, ProductValue,
 };
 use hyphae_native_runtime::BoundedSearchQuery;
-use hyphae_native_types::{EngineKind, ObjectId};
+use hyphae_native_types::{EngineKind, ObjectId, VectorElement, VectorType};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -270,7 +271,7 @@ fn catalog_proofs_retain_full_128_bit_object_ids_and_reexecute_list_and_describe
     let path = temporary("semantic-catalog-high-id");
     let mut product = NativeProduct::create(&path)?;
     let high = (u128::from(u64::MAX) << 32) | 0xfeed;
-    let object = LogicalCatalogObject::V2(CatalogObjectV2::Database(ObjectHeaderV2 {
+    let database = LogicalCatalogObject::V2(CatalogObjectV2::Database(ObjectHeaderV2 {
         id: ObjectId::new(high)?,
         owner: EngineKind::Kernel,
         name: QualifiedName::new(
@@ -281,21 +282,57 @@ fn catalog_proofs_retain_full_128_bit_object_ids_and_reexecute_list_and_describe
         parent: None,
         definition_version: DefinitionVersion::FIRST,
     }));
-    product.create_catalog_object_v2(object, hyphae_native_product::ProductDurability::Strict)?;
+    let schema = LogicalCatalogObject::V2(CatalogObjectV2::Schema(ObjectHeaderV2 {
+        id: ObjectId::new(high + 1)?,
+        owner: EngineKind::Kernel,
+        name: QualifiedName::new(
+            CatalogName::unquoted("main")?,
+            CatalogName::unquoted("public")?,
+            CatalogName::unquoted("high_schema")?,
+        ),
+        parent: Some(ObjectId::new(high)?),
+        definition_version: DefinitionVersion::FIRST,
+    }));
+    let profile_id = high + 2;
+    let profile = LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+        EmbeddingProfileDefinition {
+            header: ObjectHeaderV2 {
+                id: ObjectId::new(profile_id)?,
+                owner: EngineKind::Search,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted("high_qwen_profile")?,
+                ),
+                parent: Some(ObjectId::new(high + 1)?),
+                definition_version: DefinitionVersion::FIRST,
+            },
+            artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([7; 32])?,
+            artifact_manifest_byte_length: 8_323,
+            pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+            vector_type: VectorType::new(VectorElement::Float32, 384)?,
+            max_input_tokens: 256,
+            query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+        },
+    ));
+    product.create_catalog_objects_v2(
+        vec![database, schema, profile],
+        hyphae_native_product::ProductDurability::Strict,
+    )?;
     let mut session = session();
 
     for (request_id, operation) in [
         (
             1,
             ProductOperation::CatalogDescribe {
-                id: ObjectId::new(high)?,
+                id: ObjectId::new(profile_id)?,
             },
         ),
         (
             2,
             ProductOperation::CatalogList(CatalogListRequest {
                 parent: None,
-                kind: None,
+                kind: Some(CatalogObjectKind::EmbeddingProfile),
                 cursor: None,
                 item_limit: 10,
                 visit_limit: 10,
@@ -317,7 +354,7 @@ fn catalog_proofs_retain_full_128_bit_object_ids_and_reexecute_list_and_describe
                 .content()
                 .objects
                 .iter()
-                .any(|binding| binding.object_id == high)
+                .any(|binding| binding.object_id == profile_id)
         );
         let report = verify_native_proof_offline(
             &artifact.proof_bytes,

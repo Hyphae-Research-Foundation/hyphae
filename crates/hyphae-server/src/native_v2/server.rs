@@ -1487,7 +1487,10 @@ pub(super) fn family_accepts(family: OperationFamily, operation: &ProductOperati
             matches!(operation, ProductOperation::SearchCollection { .. })
         }
         OperationFamily::SearchIngest => {
-            matches!(operation, ProductOperation::SearchIngest { .. })
+            matches!(
+                operation,
+                ProductOperation::SearchIngest { .. } | ProductOperation::EmbedAndIngest { .. }
+            )
         }
         OperationFamily::SearchDocument => matches!(
             operation,

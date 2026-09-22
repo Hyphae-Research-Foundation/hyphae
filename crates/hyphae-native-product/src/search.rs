@@ -46,6 +46,10 @@ const RRF_CONSTANT: f64 = 60.0;
 pub const MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS: usize = 256;
 /// Maximum logical input bytes accepted by one atomic integrated ingestion.
 pub const MAX_PRODUCT_SEARCH_BATCH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum kernel identities reported by one embedding execution profile.
+pub const MAX_PRODUCT_EMBED_EXECUTION_KERNELS: usize = 64;
+/// Maximum UTF-8 bytes in one embedding execution-profile text field.
+pub const MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES: usize = 4 * 1024;
 /// Maximum durable documents admitted by one product collection manifest.
 /// Raised from 10,000 on the R-track evidence chain (posting-index
 /// eligibility, pinned posting scorer, cached snapshot state, and the
@@ -158,6 +162,78 @@ pub struct ProductSearchIngestReceipt {
     pub documents: usize,
     /// Whether an existing durable idempotency record suppressed publication.
     pub idempotent_replay: bool,
+}
+
+/// One document whose vector is produced by its catalog-bound profile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductEmbedAndIngestDocument {
+    /// Stable identity shared by the lexical and generated-vector branches.
+    pub object_id: crate::ObjectId,
+    /// Canonical source text embedded and indexed by native BM25.
+    pub text: String,
+    /// Typed filter, sort, facet, and aggregation values.
+    pub doc_values: BTreeMap<String, ProductDocValue>,
+}
+
+/// One bounded vector-free embedding and ingestion request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductEmbedAndIngestBatch {
+    /// Stable caller identity for retry suppression.
+    pub idempotency_id: u128,
+    /// Documents embedded and committed together or not at all.
+    pub documents: Vec<ProductEmbedAndIngestDocument>,
+}
+
+/// Closed embedding execution backend reported to the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductEmbeddingBackend {
+    /// Native CPU execution.
+    Cpu,
+    /// Validated CUDA execution.
+    Cuda,
+}
+
+/// Closed embedding arithmetic precision reported to the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductEmbeddingPrecision {
+    /// IEEE-754 binary32 execution.
+    F32,
+}
+
+/// Exact executor selected for one catalog-bound embedding batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEmbeddingExecutionProfile {
+    /// Catalogued embedding profile used by the single vector target.
+    pub embedding_profile: crate::ObjectId,
+    /// Selected execution backend.
+    pub backend: ProductEmbeddingBackend,
+    /// Stable device description.
+    pub device: String,
+    /// Stable driver description.
+    pub driver: String,
+    /// Stable runtime description.
+    pub runtime: String,
+    /// Arithmetic precision used by every reported kernel.
+    pub precision: ProductEmbeddingPrecision,
+    /// Ordered kernel identities for the executed pipeline.
+    pub kernels: Vec<String>,
+    /// Whether automatic validation selected the CPU fallback.
+    pub fallback: bool,
+}
+
+/// Durable result of one embed-and-ingest attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEmbedAndIngestReceipt {
+    /// All-engine snapshot containing the accepted batch.
+    pub snapshot: SnapshotIdentity,
+    /// Original durable commit evidence, retained identically on replay.
+    pub commit: ProductCommitReceipt,
+    /// Number of documents represented by the idempotency record.
+    pub documents: usize,
+    /// Whether an existing durable idempotency record suppressed publication.
+    pub idempotent_replay: bool,
+    /// Exact backend and kernels used for the original publication.
+    pub execution_profile: ProductEmbeddingExecutionProfile,
 }
 
 /// One idempotent integrated document replacement.
@@ -738,11 +814,12 @@ impl NativeProduct {
             batch,
             digest,
             marker_key,
+            completion: None,
             transform,
             logical_time_micros,
             durability,
         };
-        let commit = self.ingest_search_batch_delta(&plan)?;
+        let commit = self.ingest_search_batch_delta(&plan, |_| Ok(()))?;
         self.observe_commit(&commit);
         Ok(ProductSearchIngestReceipt {
             snapshot: self.snapshot_identity_bounded(logical_time_micros)?,
@@ -750,6 +827,57 @@ impl NativeProduct {
             documents: batch.documents.len(),
             idempotent_replay: false,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private commit boundary keeps every atomic ingest input explicit"
+    )]
+    pub(crate) fn ingest_search_batch_with_completion(
+        &mut self,
+        collection: crate::ObjectId,
+        batch: &ProductSearchIngestBatch,
+        logical_time_micros: i64,
+        durability: ProductDurability,
+        completion_key: Vec<u8>,
+        completion_prefix: Vec<u8>,
+        before_commit: impl FnOnce(&Self) -> Result<(), ProductError>,
+    ) -> Result<(SnapshotIdentity, ProductCommitReceipt), ProductError> {
+        let binding = self.resolve_search_collection_binding(collection, logical_time_micros)?;
+        let definition = self.search_definition(collection)?;
+        validate_documents(&definition, &binding, batch)?;
+        let digest = ingest_digest(batch)?;
+        let marker_key = idempotency_key(collection, batch.idempotency_id);
+        if self
+            .structure_point_read(&marker_key, logical_time_micros)?
+            .is_some()
+        {
+            return Err(idempotency_conflict());
+        }
+        let catalog = self.catalog_snapshot()?;
+        let transform = collection_lexical_transform(&definition, |id| {
+            self.catalog_describe(&catalog, id).ok().flatten()
+        })?;
+        let plan = IngestPlan {
+            collection,
+            binding: &binding,
+            batch,
+            digest,
+            marker_key,
+            completion: Some(IngestCompletion {
+                key: completion_key,
+                value_prefix: completion_prefix,
+            }),
+            transform,
+            logical_time_micros,
+            durability,
+        };
+        let commit = self.ingest_search_batch_delta(&plan, before_commit)?;
+        self.observe_commit(&commit);
+        Ok((
+            self.snapshot_identity_bounded(logical_time_micros)?,
+            commit.into(),
+        ))
     }
 
     /// Resolves the manifest for one ingest through the caller's point reads
@@ -777,6 +905,7 @@ impl NativeProduct {
     fn ingest_search_batch_delta(
         &mut self,
         plan: &IngestPlan<'_>,
+        before_commit: impl FnOnce(&Self) -> Result<(), ProductError>,
     ) -> Result<hyphae_native_runtime::CommitReceipt, ProductError> {
         let (manifest_writes, collection_was_empty) =
             Self::ingest_manifest(plan.collection, plan.batch, &|key: &[u8]| {
@@ -843,6 +972,11 @@ impl NativeProduct {
                 transaction_id: transaction_id.get(),
             })?,
         )?;
+        if let Some(completion) = &plan.completion {
+            let mut value = completion.value_prefix.clone();
+            value.extend_from_slice(&transaction_id.get().to_le_bytes());
+            set(completion.key.clone(), value)?;
+        }
         for document in &plan.batch.documents {
             let text = match &plan.transform {
                 None => document.text.clone(),
@@ -877,6 +1011,7 @@ impl NativeProduct {
                 }
             }
         }
+        before_commit(self)?;
         let commit = self
             .database
             .commit_optimistic(delta)
@@ -1235,7 +1370,7 @@ impl NativeProduct {
         }))
     }
 
-    fn original_search_receipt(
+    pub(crate) fn original_search_receipt(
         &self,
         transaction_id: u128,
     ) -> Result<ProductCommitReceipt, ProductError> {
@@ -2928,9 +3063,15 @@ struct IngestPlan<'a> {
     batch: &'a ProductSearchIngestBatch,
     digest: [u8; 32],
     marker_key: Vec<u8>,
+    completion: Option<IngestCompletion>,
     transform: Option<crate::lexical_analyzer::LexicalTransform>,
     logical_time_micros: i64,
     durability: ProductDurability,
+}
+
+struct IngestCompletion {
+    key: Vec<u8>,
+    value_prefix: Vec<u8>,
 }
 
 pub(crate) fn manifest_key(collection: crate::ObjectId) -> Vec<u8> {

@@ -2,7 +2,7 @@
 
 //! Explicit native local daemon and optional HTTP v2 edge sharing one owner.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use hyphae_native_daemon::{NativeDaemon, NativeDaemonConfig};
 use hyphae_native_product::{NativeProduct, NativeProductService, NativeProductServiceConfig};
@@ -17,8 +17,12 @@ pub(crate) async fn serve(
     http_bind: Option<SocketAddr>,
     native_api_key_auth: bool,
     native_legacy_bearer_file: Option<PathBuf>,
+    embedding_executor: Option<Arc<hyphae_native_embed_cpu::Qwen3CpuExecutor>>,
 ) -> Result<(), CliFailure> {
-    let product = NativeProduct::open(&data_dir)?;
+    let mut product = NativeProduct::open(&data_dir)?;
+    if let Some(executor) = embedding_executor {
+        executor.install(&mut product);
+    }
     let service = NativeProductService::start(product, NativeProductServiceConfig::default())?;
     let handle = service.handle();
     let managed = native_api_key_auth || handle.access_control_bootstrapped();

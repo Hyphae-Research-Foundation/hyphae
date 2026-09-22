@@ -1024,7 +1024,7 @@ impl NativeProductClient {
         operation: ProductOperation,
         protocol_minor: u16,
     ) -> Result<NativeProductPendingAsyncResponse, ProductError> {
-        if protocol_minor > 7 {
+        if protocol_minor > 9 {
             return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)
                 .with_request_id(context.request_id));
         }
@@ -1082,7 +1082,7 @@ impl NativeProductClient {
         operation: ProductOperation,
         protocol_minor: u16,
     ) -> Result<NativeProductPendingResponse, ProductError> {
-        if protocol_minor > 7 {
+        if protocol_minor > 9 {
             return Err(ProductError::from_code(ProductErrorCode::InvalidRequest)
                 .with_request_id(context.request_id));
         }

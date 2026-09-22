@@ -154,6 +154,7 @@ fn configure_chunked(
                             consolidate_after_deltas: 2,
                             retain_generations: 1,
                         },
+                        embedding_profile: None,
                     },
                     NamedVectorDefinition {
                         id: FieldId::new(8)?,
@@ -166,6 +167,7 @@ fn configure_chunked(
                             consolidate_after_deltas: 2,
                             retain_generations: 1,
                         },
+                        embedding_profile: None,
                     },
                 ],
             },

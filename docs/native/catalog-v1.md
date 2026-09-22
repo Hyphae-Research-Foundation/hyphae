@@ -121,7 +121,8 @@ truncated ANN tail cannot be accepted as a legacy exact-vector definition.
 `encode_definition`/`decode_definition` APIs retain exact `HYCOBJ01` behavior
 for `HYCAT005` runtime compatibility. Existing objects may be losslessly wrapped
 with a parent and nonzero logical definition version. V2-native objects encode
-database, schema, keyspace, analyzer, and richer search-collection definitions.
+database, schema, keyspace, analyzer, embedding profile, and richer
+search-collection definitions.
 
 One canonical `HYCOBJ02` definition contains:
 
@@ -155,15 +156,31 @@ Logical V2 includes:
 - optional per-collection BM25 `k1`/`b` scoring parameters as bounded
   micro-unit integers. Search collections without tuned parameters keep the
   representation-2 bytes exactly; tuned collections encode representation 3,
-  which appends the two parameters after the representation-2 body.
+  which appends the two parameters after the representation-2 body; and
+- metadata-only `Qwen3EmbeddingV1` profiles that bind one complete artifact
+  manifest by nonzero SHA-256 and byte length, exact query instruction, output
+  vector shape, and finite input-token bound. Pipeline semantics fix query and
+  passage formatting, special-token insertion, left padding, right truncation
+  to one chunk, last-token pooling, leading projection from native dimension
+  1024 to FP32 dimension 384, 768, or 1024, then L2 normalization with epsilon
+  `1e-12`. An optional named-vector profile binding uses search representation
+  4. Unbound representation-2 and tuned representation-3 bytes remain
+  unchanged.
 
 Each complete canonical `HYCOBJ02` definition has a stable SHA-256 digest.
 Dependency derivation emits canonical directed edges from dependent to
 prerequisite for hierarchy parents, secondary indexes, foreign keys, analyzers,
-link endpoints, and relation-valued keyspaces. Helpers provide both outgoing
+link endpoints, relation-valued keyspaces, and named-vector embedding profiles.
+Helpers provide both outgoing
 dependencies and incoming dependents. Logical-set derivation checks target
 existence and database/schema parent kinds. `HYCAT006` persists the general
 edge set in both directions.
+
+Embedding-profile kind `10`, dependency kind `7`, and search representation
+`4` are specified by [embedding profile metadata v1](embedding-profile-v1.md).
+They are unreleased next-major incubation and add catalog authority only. No
+embedding executor, model path, provider, job, GPU path, embedding product
+operation, or embedding WAL opcode exists.
 
 ## Implemented runtime persistence
 

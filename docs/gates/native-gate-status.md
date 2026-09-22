@@ -55,19 +55,20 @@ full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
 row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
-The release-preparation tree contains the final package identity but is not an
-integration tree for the embedding work. The current committed core chain at
-`29e36cc699ebecf38646de09f4b2298cea117ca2` contains the catalog contract,
-profile binding, and product operation, while the Rust wire and SDK work remain
-on separate lane commits. No CPU executor crate or accelerator crate is
-committed; dirty worktree drafts are not release inputs. Cargo metadata confirms
-the existing 24-package graph, but package
-verification fails closed on catalog fixture ownership and CLI exhaustiveness.
-Their exact dependencies, dry-run commands, observed failures, and non-claims
-are recorded in the
+Lane 12 composes release-preparation head
+`5aad997023e765a8935e7acbd61101525ced9b88` with Lane 10 CLI consumer
+`84de293d49331859edf45cc268d0aeba743bd0d2`. Its CPU crate metadata, README,
+and legal files match Lane 05 `dbcc464912877b2dcc4e765337e3e15001179f32`.
+Cargo metadata and the release config agree on 25 publishable packages; the
+package-content audit and the build from all 25 extracted archives pass.
+
+Lane 06 `b36f929ea89f0388f9d75fd7c5de3423ddfc16fe` is tree-identical to Lane 05,
+so it contributes no additional package or CUDA implementation. No CUDA claim
+is made. The SDK, harness, complete integration, hosted matrix, and exact-SHA
+G8 closure remain open. Exact dependencies, commands, measured package results,
+and non-claims are recorded in the
 [`4.0.0` dependency ledger](../release/4.0.0-dependency-ledger.md). None of
-those observations closes a release gate or expands the candidate's shipped
-behavior.
+these package observations closes a release gate or expands shipped behavior.
 
 ## Exact-SHA G8 release closures per release
 

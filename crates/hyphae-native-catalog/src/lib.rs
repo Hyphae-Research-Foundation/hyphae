@@ -26,6 +26,19 @@ pub const MAX_CATALOG_DEFINITION_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INCREMENTAL_VECTOR_DELTA_ENTRIES: u32 = 4_096;
 /// Maximum obsolete ANN generations retained by one vector definition.
 pub const MAX_INCREMENTAL_VECTOR_RETAINED_GENERATIONS: u16 = 64;
+/// Maximum complete artifact-manifest byte length admitted by an embedding profile.
+pub const MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum input-token bound admitted by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_MAX_INPUT_TOKENS: u32 = 32 * 1024;
+/// Native hidden-state dimension produced by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_NATIVE_DIMENSION: u16 = 1_024;
+/// Closed output dimensions admitted by `Qwen3EmbeddingV1`.
+pub const QWEN3_EMBEDDING_OUTPUT_DIMENSIONS: [u16; 3] = [384, 768, 1_024];
+/// Exact retrieval instruction prepended to every `Qwen3EmbeddingV1` query.
+pub const QWEN3_EMBEDDING_QUERY_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+/// FP32 denominator floor used by `Qwen3EmbeddingV1` L2 normalization.
+pub const QWEN3_EMBEDDING_L2_EPSILON: f32 = 1e-12;
 
 /// Catalog construction or lookup failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -141,6 +154,15 @@ pub enum CatalogError {
     /// A named vector policy or lifecycle is invalid.
     #[error("named vector policy or lifecycle is invalid")]
     InvalidVectorPolicy,
+    /// An embedding artifact-manifest digest is all zeroes.
+    #[error("embedding artifact-manifest digest must be nonzero")]
+    ZeroEmbeddingArtifactManifestDigest,
+    /// An embedding profile pipeline, bound, or semantic combination is invalid.
+    #[error("embedding profile definition is invalid")]
+    InvalidEmbeddingProfile,
+    /// A named vector does not match its referenced embedding profile.
+    #[error("named vector does not match its embedding profile")]
+    InvalidEmbeddingProfileBinding,
     /// A keyspace TTL, memory, or eviction policy is contradictory.
     #[error("keyspace policy is invalid")]
     InvalidKeyspacePolicy,
@@ -329,6 +351,8 @@ pub enum CatalogObjectKind {
     Analyzer = 8,
     /// Explicit cross-engine link.
     CrossEngineLink = 9,
+    /// Versioned local embedding-pipeline metadata identity.
+    EmbeddingProfile = 10,
 }
 
 /// Shared metadata for native V2-only catalog definitions.
@@ -938,6 +962,109 @@ pub struct NamedVectorDefinition {
     pub policy: VectorSearchPolicy,
     /// Incremental delta/consolidation/reclamation policy.
     pub lifecycle: IncrementalVectorLifecycle,
+    /// Optional catalogued embedding pipeline that produces this vector shape.
+    pub embedding_profile: Option<ObjectId>,
+}
+
+/// Nonzero SHA-256 identity of one complete embedding artifact manifest.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EmbeddingArtifactManifestDigest([u8; 32]);
+
+impl EmbeddingArtifactManifestDigest {
+    /// Constructs one checked SHA-256 artifact-manifest identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the reserved all-zero digest.
+    pub fn new(bytes: [u8; 32]) -> Result<Self, CatalogError> {
+        if bytes == [0; 32] {
+            return Err(CatalogError::ZeroEmbeddingArtifactManifestDigest);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the canonical digest bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Closed embedding pipeline metadata identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum EmbeddingPipelineVersion {
+    /// Qwen3-Embedding-0.6B with fixed query/passage formatting, special-token
+    /// insertion, left padding, right truncation to one chunk, last-token
+    /// pooling, leading projection from 1024 FP32 values to 384, 768, or 1024,
+    /// then L2 normalization with epsilon `1e-12`.
+    Qwen3EmbeddingV1 = 1,
+}
+
+/// Versioned metadata contract for one local embedding pipeline identity.
+///
+/// This definition binds artifact content and execution semantics. It does not
+/// contain a filesystem path and does not execute model inference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbeddingProfileDefinition {
+    /// Shared V2 metadata.
+    pub header: ObjectHeaderV2,
+    /// SHA-256 of the complete artifact-manifest bytes.
+    pub artifact_manifest_digest: EmbeddingArtifactManifestDigest,
+    /// Exact complete artifact-manifest byte length.
+    pub artifact_manifest_byte_length: u64,
+    /// Versioned pipeline metadata and stage-choice identity.
+    pub pipeline_version: EmbeddingPipelineVersion,
+    /// Fixed output element representation and dimension.
+    pub vector_type: VectorType,
+    /// Maximum tokenized positions admitted for one input.
+    pub max_input_tokens: u32,
+    /// Exact retrieval instruction used by query formatting.
+    pub query_instruction: String,
+}
+
+impl EmbeddingProfileDefinition {
+    /// Validates the closed Qwen3 embedding metadata contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for wrong ownership, unsupported output dimensions,
+    /// manifest or token bounds, or instruction drift.
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if self.header.owner != EngineKind::Search {
+            return Err(CatalogError::WrongObjectOwner);
+        }
+        if self.pipeline_version != EmbeddingPipelineVersion::Qwen3EmbeddingV1
+            || self.artifact_manifest_byte_length == 0
+            || self.artifact_manifest_byte_length > MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES
+            || self.vector_type.element() != hyphae_native_types::VectorElement::Float32
+            || !QWEN3_EMBEDDING_OUTPUT_DIMENSIONS.contains(&self.vector_type.dimension())
+            || self.max_input_tokens == 0
+            || self.max_input_tokens > QWEN3_EMBEDDING_MAX_INPUT_TOKENS
+            || self.query_instruction != QWEN3_EMBEDDING_QUERY_INSTRUCTION
+        {
+            return Err(CatalogError::InvalidEmbeddingProfile);
+        }
+        Ok(())
+    }
+}
+
+impl NamedVectorDefinition {
+    /// Validates the output shape of a referenced embedding profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is invalid or its output type or
+    /// dimension differs from this named vector.
+    pub fn validate_embedding_profile(
+        &self,
+        profile: &EmbeddingProfileDefinition,
+    ) -> Result<(), CatalogError> {
+        profile.validate()?;
+        if self.vector_type != profile.vector_type {
+            return Err(CatalogError::InvalidEmbeddingProfileBinding);
+        }
+        Ok(())
+    }
 }
 
 /// Native V2 search collection with complete field policy and named vectors.
@@ -1451,6 +1578,8 @@ pub enum CatalogObjectV2 {
     Analyzer(AnalyzerDefinition),
     /// Search collection with complete field and vector policy.
     SearchCollection(SearchCollectionDefinitionV2),
+    /// Versioned local embedding-pipeline metadata identity.
+    EmbeddingProfile(EmbeddingProfileDefinition),
 }
 
 /// V1-compatible object promoted into the logical V2 hierarchy.
@@ -1580,6 +1709,7 @@ impl CatalogObjectV2 {
             Self::Keyspace(definition) => &definition.header,
             Self::Analyzer(definition) => &definition.header,
             Self::SearchCollection(definition) => &definition.header,
+            Self::EmbeddingProfile(definition) => &definition.header,
         }
     }
 
@@ -1591,6 +1721,7 @@ impl CatalogObjectV2 {
             Self::Keyspace(_) => CatalogObjectKind::Keyspace,
             Self::Analyzer(_) => CatalogObjectKind::Analyzer,
             Self::SearchCollection(_) => CatalogObjectKind::SearchCollection,
+            Self::EmbeddingProfile(_) => CatalogObjectKind::EmbeddingProfile,
         }
     }
 
@@ -1629,6 +1760,10 @@ impl CatalogObjectV2 {
                 validate_parent(header)?;
                 definition.validate()
             }
+            Self::EmbeddingProfile(definition) => {
+                validate_parent(header)?;
+                definition.validate()
+            }
         }
     }
 
@@ -1661,8 +1796,20 @@ impl CatalogObjectV2 {
                         DependencyKind::Analyzer,
                     ));
                 }
+                for profile in definition
+                    .vectors
+                    .iter()
+                    .filter_map(|vector| vector.embedding_profile)
+                {
+                    edges.insert(DependencyEdge::new(
+                        dependent,
+                        profile,
+                        DependencyKind::EmbeddingProfile,
+                    ));
+                }
             }
-            Self::Database(_) | Self::Schema(_) | Self::Analyzer(_) => {}
+            Self::Database(_) | Self::Schema(_) | Self::Analyzer(_) | Self::EmbeddingProfile(_) => {
+            }
         }
         edges.into_iter().collect()
     }
@@ -1691,6 +1838,8 @@ pub enum DependencyKind {
     LinkEndpoint = 5,
     /// Keyspace relation-valued schema.
     RelationSchema = 6,
+    /// Named-vector embedding profile.
+    EmbeddingProfile = 7,
 }
 
 /// Canonical directed edge from a dependent to its prerequisite.
@@ -1777,11 +1926,11 @@ pub fn derive_logical_dependency_edges<'a>(
     objects: impl IntoIterator<Item = &'a LogicalCatalogObject>,
 ) -> Result<Vec<DependencyEdge>, CatalogError> {
     let objects: Vec<_> = objects.into_iter().collect();
-    let kinds: BTreeMap<_, _> = objects
+    let by_id: BTreeMap<_, _> = objects
         .iter()
-        .map(|object| (object.id(), object.kind()))
+        .map(|object| (object.id(), *object))
         .collect();
-    if kinds.len() != objects.len() {
+    if by_id.len() != objects.len() {
         return Err(CatalogError::InvalidObjectHierarchy);
     }
     let mut edges = BTreeSet::new();
@@ -1791,10 +1940,11 @@ pub fn derive_logical_dependency_edges<'a>(
             if edge.dependent == edge.prerequisite {
                 return Err(CatalogError::InvalidObjectHierarchy);
             }
-            let target_kind = kinds
+            let target = by_id
                 .get(&edge.prerequisite)
                 .copied()
                 .ok_or(CatalogError::MissingDependencyTarget(edge.prerequisite))?;
+            let target_kind = target.kind();
             let valid_target = match edge.kind {
                 DependencyKind::Parent => match object.kind() {
                     CatalogObjectKind::Database => false,
@@ -1809,6 +1959,9 @@ pub fn derive_logical_dependency_edges<'a>(
                     CatalogObjectKind::Relation | CatalogObjectKind::SecondaryIndex
                 ),
                 DependencyKind::Analyzer => target_kind == CatalogObjectKind::Analyzer,
+                DependencyKind::EmbeddingProfile => {
+                    target_kind == CatalogObjectKind::EmbeddingProfile
+                }
                 DependencyKind::LinkEndpoint => !matches!(
                     target_kind,
                     CatalogObjectKind::Database
@@ -1819,10 +1972,35 @@ pub fn derive_logical_dependency_edges<'a>(
             if !valid_target {
                 return Err(CatalogError::InvalidObjectHierarchy);
             }
+            if edge.kind == DependencyKind::EmbeddingProfile {
+                validate_embedding_profile_edge(object, target, edge.prerequisite)?;
+            }
             edges.insert(edge);
         }
     }
     Ok(edges.into_iter().collect())
+}
+
+fn validate_embedding_profile_edge(
+    dependent: &LogicalCatalogObject,
+    prerequisite: &LogicalCatalogObject,
+    profile_id: ObjectId,
+) -> Result<(), CatalogError> {
+    let (
+        LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(collection)),
+        LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(profile)),
+    ) = (dependent, prerequisite)
+    else {
+        return Err(CatalogError::InvalidObjectHierarchy);
+    };
+    for vector in collection
+        .vectors
+        .iter()
+        .filter(|vector| vector.embedding_profile == Some(profile_id))
+    {
+        vector.validate_embedding_profile(profile)?;
+    }
+    Ok(())
 }
 
 /// Immutable catalog snapshot.
@@ -2050,11 +2228,12 @@ mod tests {
         AnalyzerDefinition, AnalyzerTokenizer, CatalogError, CatalogName, CatalogObject,
         CatalogObjectV2, CatalogSnapshot, CatalogTransaction, ColumnDefinition,
         CompatibleCatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind,
+        EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
         FieldSourcePolicy, IncrementalVectorLifecycle, LexicalIndexPolicy, LogicalCatalogObject,
-        NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QualifiedName, RelationDefinition,
-        SearchCollectionDefinitionV2, SearchFieldDefinitionV2, SearchFieldOptions,
-        SecondaryIndexDefinition, VectorMetric, VectorSearchPolicy, dependency_edges_for,
-        derive_logical_dependency_edges,
+        NamedVectorDefinition, ObjectHeader, ObjectHeaderV2, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
+        QualifiedName, RelationDefinition, SearchCollectionDefinitionV2, SearchFieldDefinitionV2,
+        SearchFieldOptions, SecondaryIndexDefinition, VectorMetric, VectorSearchPolicy,
+        dependency_edges_for, derive_logical_dependency_edges,
     };
 
     fn relation(id: u128, name: &str) -> Result<CatalogObject, Box<dyn std::error::Error>> {
@@ -2204,6 +2383,7 @@ mod tests {
                     consolidate_after_deltas: 4,
                     retain_generations: 2,
                 },
+                embedding_profile: None,
             }],
             bm25: None,
         };
@@ -2331,6 +2511,108 @@ mod tests {
         assert_eq!(
             derive_logical_dependency_edges([&relation]),
             Err(CatalogError::MissingDependencyTarget(ObjectId::new(99)?))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_profile_dependencies_restrict_drop_and_validate_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let header = |id: u128,
+                      owner: EngineKind,
+                      name: &str,
+                      parent: Option<u128>|
+         -> Result<_, CatalogError> {
+            Ok(ObjectHeaderV2 {
+                id: ObjectId::new(id).map_err(CatalogError::from)?,
+                owner,
+                name: QualifiedName::new(
+                    CatalogName::unquoted("main")?,
+                    CatalogName::unquoted("public")?,
+                    CatalogName::unquoted(name)?,
+                ),
+                parent: parent
+                    .map(ObjectId::new)
+                    .transpose()
+                    .map_err(CatalogError::from)?,
+                definition_version: DefinitionVersion::FIRST,
+            })
+        };
+        let database = LogicalCatalogObject::V2(CatalogObjectV2::Database(header(
+            10,
+            EngineKind::Kernel,
+            "database",
+            None,
+        )?));
+        let schema = LogicalCatalogObject::V2(CatalogObjectV2::Schema(header(
+            11,
+            EngineKind::Kernel,
+            "schema",
+            Some(10),
+        )?));
+        let profile_definition = EmbeddingProfileDefinition {
+            header: header(12, EngineKind::Search, "embedding", Some(11))?,
+            artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([1; 32])?,
+            artifact_manifest_byte_length: 8_323,
+            pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+            vector_type: VectorType::new(VectorElement::Float32, 384)?,
+            max_input_tokens: 256,
+            query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+        };
+        let profile = LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+            profile_definition.clone(),
+        ));
+        let collection_definition = SearchCollectionDefinitionV2 {
+            header: header(13, EngineKind::Search, "documents", Some(11))?,
+            fields: Vec::new(),
+            vectors: vec![NamedVectorDefinition {
+                id: FieldId::new(1)?,
+                name: CatalogName::unquoted("embedding")?,
+                vector_type: VectorType::new(VectorElement::Float32, 384)?,
+                metric: VectorMetric::Cosine,
+                policy: VectorSearchPolicy::Exact,
+                lifecycle: IncrementalVectorLifecycle {
+                    delta_max_entries: 64,
+                    consolidate_after_deltas: 4,
+                    retain_generations: 2,
+                },
+                embedding_profile: Some(ObjectId::new(12)?),
+            }],
+            bm25: None,
+        };
+        let collection = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+            collection_definition.clone(),
+        ));
+        let objects = [&database, &schema, &profile, &collection];
+        let edges = derive_logical_dependency_edges(objects)?;
+        let incoming =
+            dependency_edges_for(&edges, ObjectId::new(12)?, DependencyDirection::Incoming);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].kind, DependencyKind::EmbeddingProfile);
+
+        assert_eq!(
+            derive_logical_dependency_edges([&database, &schema, &collection]),
+            Err(CatalogError::MissingDependencyTarget(ObjectId::new(12)?))
+        );
+        let wrong_kind = LogicalCatalogObject::V2(CatalogObjectV2::Analyzer(AnalyzerDefinition {
+            header: header(12, EngineKind::Search, "wrong_kind", Some(11))?,
+            tokenizer: AnalyzerTokenizer::Keyword,
+            filters: Vec::new(),
+        }));
+        assert_eq!(
+            derive_logical_dependency_edges([&database, &schema, &wrong_kind, &collection]),
+            Err(CatalogError::InvalidObjectHierarchy)
+        );
+
+        let mut mismatched_profile = profile_definition;
+        mismatched_profile.vector_type = VectorType::new(VectorElement::Float32, 768)?;
+        let mismatched_profile =
+            LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(mismatched_profile));
+        assert_eq!(
+            derive_logical_dependency_edges(
+                [&database, &schema, &mismatched_profile, &collection,]
+            ),
+            Err(CatalogError::InvalidEmbeddingProfileBinding)
         );
         Ok(())
     }
