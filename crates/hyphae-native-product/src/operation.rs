@@ -42,10 +42,10 @@ use crate::{
     CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt,
     DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
-    ProductDurability, ProductError, ProductErrorCode, ProductExplain,
-    ProductExplicitCommitReceipt, ProductExplicitTransactionStatus, ProductFailureBoundary,
-    ProductHashEntry, ProductHashScanStop, ProductKeyEntry, ProductLimits, ProductListSide,
-    ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
+    ProductDurability, ProductEmbedAndIngestReceipt, ProductError, ProductErrorCode,
+    ProductExplain, ProductExplicitCommitReceipt, ProductExplicitTransactionStatus,
+    ProductFailureBoundary, ProductHashEntry, ProductHashScanStop, ProductKeyEntry, ProductLimits,
+    ProductListSide, ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
     ProductRollbackReceipt, ProductScope, ProductScoreBound, ProductSearchDocumentDelete,
     ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
     ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
@@ -409,6 +409,15 @@ pub enum ProductOperation {
         /// Vector-free documents and their stable retry identity.
         batch: crate::ProductEmbedAndIngestBatch,
     },
+    /// Embed passage text into one catalog-bound target and atomically ingest it.
+    EmbedAndIngestBatch {
+        /// Logical Catalog V2 collection identity.
+        collection: ObjectId,
+        /// Exact normalized named-vector target with an embedding profile.
+        target: String,
+        /// Complete bounded idempotent batch with empty input vector maps.
+        batch: ProductSearchIngestBatch,
+    },
     /// Atomically replaces one integrated document across every branch.
     SearchDocumentUpdate {
         /// Logical Catalog V2 collection identity.
@@ -698,6 +707,8 @@ pub enum ProductResponse {
     SearchIngested(ProductSearchIngestReceipt),
     /// Catalog-bound embedding and atomic ingestion outcome.
     EmbedAndIngested(crate::ProductEmbedAndIngestReceipt),
+    /// Process-local embedding and ingestion outcome.
+    EmbeddedAndIngested(crate::ProductLocalEmbedAndIngestReceipt),
     /// Current administration status.
     AdminStatus(AdminStatus),
     /// Synchronized checkpoint receipt.
@@ -1376,8 +1387,27 @@ fn dispatch_inner(
                 context.durability.durability,
             )?)
         }
-        ProductOperation::EmbedAndIngest { .. } => {
-            return Err(context.error(ProductErrorCode::Unavailable));
+    ProductOperation::EmbedAndIngest { .. } => {
+        return Err(context.error(ProductErrorCode::Unavailable));
+    }
+    ProductOperation::EmbedAndIngestBatch {
+            collection,
+            target,
+            batch,
+        } => {
+            let requirement = embed_and_ingest_target_authorization_requirement(
+                product, collection, &target, None,
+            )?;
+        ProductResponse::EmbeddedAndIngested(product.embed_and_ingest_batch(
+                collection,
+                &target,
+                &batch,
+                context.limits,
+                context.logical_time_micros,
+                context.durability.durability,
+                |product| reauthorize_requirement(product, session, context, &requirement),
+                || context.checkpoint(),
+        )?)
         }
         ProductOperation::SearchDocumentUpdate { collection, update } => {
             ProductResponse::SearchIngested(product.update_search_document(
@@ -1802,7 +1832,13 @@ fn dispatch_inner(
             })
         }
         ProductOperation::Prove { operation, limits } => {
-            if operation.requires_managed_authority() || operation.is_key_lifecycle() {
+            if operation.requires_managed_authority()
+                || operation.is_key_lifecycle()
+                || matches!(
+                    operation.as_ref(),
+                    ProductOperation::EmbedAndIngestBatch { .. }
+                )
+            {
                 return Err(context.error(ProductErrorCode::InvalidRequest));
             }
             let started = Instant::now();
@@ -2013,6 +2049,49 @@ fn validate_durable_authority(
     Ok(Some(current))
 }
 
+fn embed_and_ingest_target_authorization_requirement(
+    product: &NativeProduct,
+    collection: ObjectId,
+    target: &str,
+    authority: Option<&crate::AuthenticatedAuthority>,
+) -> Result<ProductAuthorizationRequirement, ProductError> {
+    let mut requirement = ProductAuthorizationRequirement::object(
+        authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite]),
+        collection,
+    );
+    if let Some(authority) = authority
+        && !authority_satisfies_requirement(product, authority, &requirement)?
+    {
+        return Ok(requirement);
+    }
+    let profile = product.embedding_profile_for_target(collection, target)?;
+    requirement.union(&ProductAuthorizationRequirement::object(
+        authorization([ProductPermission::CatalogRead]),
+        profile.header.id,
+    ));
+    Ok(requirement)
+}
+
+fn reauthorize_requirement(
+    product: &NativeProduct,
+    session: &ProductSession,
+    context: &ProductRequestContext,
+    requirement: &ProductAuthorizationRequirement,
+) -> Result<(), ProductError> {
+    context.checkpoint()?;
+    let authority = validate_durable_authority(product, session)?;
+    let authorized = match authority.as_ref() {
+        Some(authority) => authority_satisfies_requirement(product, authority, requirement)?,
+        None => session
+            .authorization()
+            .allows_all(requirement.permissions()),
+    };
+    if !authorized {
+        return Err(context.error(ProductErrorCode::AuthorizationDenied));
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one exhaustive operation-to-scope mapping is the fail-closed authorization boundary"
@@ -2167,6 +2246,14 @@ fn operation_authorization_requirement(
         | ProductOperation::SearchDocumentDelete { collection, .. } => {
             ProductAuthorizationRequirement::object(permissions, *collection)
         }
+        ProductOperation::EmbedAndIngestBatch {
+            collection, target, ..
+        } => embed_and_ingest_target_authorization_requirement(
+            product,
+            *collection,
+            target,
+            authority,
+        )?,
         ProductOperation::TransactionStageStructure { mutation, .. } => {
             ProductAuthorizationRequirement::object(permissions, mutation.structure_key().keyspace)
         }
@@ -4053,6 +4140,9 @@ impl ProductOperation {
     }
 
     fn validate_limits(&self, limits: ProductLimits) -> Result<(), ProductError> {
+        if let Self::EmbedAndIngestBatch { target, batch, .. } = self {
+            return crate::validate_embedding_batch_shape(target, batch, limits);
+        }
         let valid = match self {
             Self::CatalogList(request) => {
                 request.byte_limit <= limits.max_response_bytes
@@ -4163,6 +4253,7 @@ impl ProductOperation {
             | Self::TransactionStageSearch { .. }
             | Self::TransactionStageVector { .. }
             | Self::SearchIngest { .. }
+            | Self::EmbedAndIngestBatch { .. }
             | Self::SearchDocumentUpdate { .. }
             | Self::SearchDocumentDelete { .. } => {
                 authorization([ProductPermission::CatalogRead, ProductPermission::DataWrite])
@@ -4297,6 +4388,7 @@ impl ProductOperation {
             | Self::TransactionRollback { .. }
             | Self::EmbedAndIngest { .. }
             | Self::SearchIngest { .. }
+            | Self::EmbedAndIngestBatch { .. }
             | Self::SearchDocumentUpdate { .. }
             | Self::SearchDocumentDelete { .. }
             | Self::AdminCheckpoint
@@ -4371,6 +4463,7 @@ impl ProductOperation {
                 | Self::TransactionCommit { .. }
                 | Self::EmbedAndIngest { .. }
                 | Self::SearchIngest { .. }
+                | Self::EmbedAndIngestBatch { .. }
                 | Self::SearchDocumentUpdate { .. }
                 | Self::SearchDocumentDelete { .. }
                 | Self::AdminCheckpoint
@@ -4435,6 +4528,9 @@ impl ProductOperation {
     }
 
     fn request_cost(&self) -> (usize, usize, usize, usize) {
+        if let Self::EmbedAndIngestBatch { target, batch, .. } = self {
+            return crate::embedding_batch_request_cost(target, batch);
+        }
         let (count, bytes, work) = self.request_cost_parts();
         (count, bytes, work, bytes)
     }
@@ -4538,6 +4634,10 @@ impl ProductOperation {
                     bytes.max(batch.documents.len()),
                 )
             }
+            Self::EmbedAndIngestBatch { target, batch, .. } => {
+                let (count, bytes, work, _) = crate::embedding_batch_request_cost(target, batch);
+                (count, bytes, work)
+            }
             Self::SearchDocumentUpdate { update, .. } => {
                 let bytes = format!("{update:?}").len().saturating_add(16);
                 (1, bytes, bytes)
@@ -4635,6 +4735,7 @@ impl ProductOperation {
             | Self::TransactionCommit { .. }
             | Self::TransactionRollback { .. }
             | Self::SearchIngest { .. }
+            | Self::EmbedAndIngestBatch { .. }
             | Self::SearchDocumentUpdate { .. }
             | Self::SearchDocumentDelete { .. }
             | Self::AdminCheckpoint
@@ -4769,6 +4870,7 @@ impl ProductResponse {
             | Self::TransactionRolledBack(_)
             | Self::AdminCheckpoint(_)
             | Self::SearchIngested(_)
+            | Self::EmbeddedAndIngested(_)
             | Self::ProofVerification(_)
             | Self::SecurityPrincipalMutated(_)
             | Self::SecurityCustomRoleMutated(_)
