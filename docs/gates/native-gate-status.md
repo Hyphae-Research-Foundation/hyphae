@@ -55,6 +55,16 @@ full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
 row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
+The release-preparation tree contains the final package identity but is not an
+integration tree for the embedding work. Profile codec 4 and the minor-8
+catalog contract, minor-9 embed-and-ingest execution, Python and TypeScript
+minor-8/9 support, a Qwen execution profile, and CPU/CUDA backends remain open
+or observed only on unmerged lane commits. Their exact observed state and
+non-claims are recorded in the
+[`4.0.0` dependency ledger](../release/4.0.0-dependency-ledger.md). None of
+those observations closes a release gate or expands the candidate's shipped
+behavior.
+
 ## Exact-SHA G8 release closures per release
 
 Each release since 1.2.0 repeated the nine-requirement exact-SHA G8 closure

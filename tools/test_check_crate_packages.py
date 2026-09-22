@@ -32,7 +32,11 @@ class ReleaseGraphTests(unittest.TestCase):
         self.assertIn('"THIRD_PARTY_NOTICES.md"', source)
 
     def test_accepts_exact_acyclic_release_graph(self) -> None:
-        release = {"version": "1.2.0", "layers": [["base"], ["product"]]}
+        release = {
+            "version": "1.2.0",
+            "package_count": 2,
+            "layers": [["base"], ["product"]],
+        }
         packages = {
             "base": package("base", "1.2.0"),
             "product": package(
@@ -46,6 +50,27 @@ class ReleaseGraphTests(unittest.TestCase):
         )
         self.assertEqual(ordered, ("base", "product"))
         self.assertEqual(failures, [])
+
+    def test_rejects_declared_package_count_drift(self) -> None:
+        release = {
+            "version": "1.2.0",
+            "package_count": 1,
+            "layers": [["base"], ["product"]],
+        }
+        packages = {
+            "base": package("base", "1.2.0"),
+            "product": package("product", "1.2.0"),
+        }
+        _, failures = validate_release_graph(
+            release, packages, ("base", "product")
+        )
+        self.assertEqual(
+            failures,
+            [
+                "declared package count does not match the release layers; "
+                "declared=1, actual=2"
+            ],
+        )
 
     def test_rejects_version_requirement_and_layer_drift(self) -> None:
         release = {"version": "1.2.0", "layers": [["base", "product"]]}

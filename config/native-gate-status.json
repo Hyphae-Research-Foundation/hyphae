@@ -127,6 +127,28 @@
   "release_candidate": {
     "version": "4.0.0",
     "status": "prepared",
+    "release_preparation_commit": "d07c7fb81d5d972a11a04dbecc9f839e5142a024",
+    "dependency_ledger": "docs/release/4.0.0-dependency-ledger.md",
+    "integration_commit": null,
+    "observed_partial_integration_commit": "efdcd4c21036aa6c5a0da5d7c1ece96db3e85eb8",
+    "integrated_scope": [
+      "final-package-identity"
+    ],
+    "required_dependency_status": {
+      "embedding-profile-catalog-codec-4-minor-8": "observed-partial-integration-not-selected",
+      "embed-and-ingest-minor-9": "missing-product-runtime-wire-integration",
+      "python-minor-8-9": "observed-partial-integration-not-selected",
+      "typescript-minor-8-9": "observed-partial-integration-not-selected",
+      "product-runtime": "not-committed",
+      "qwen-profile-execution": "not-committed",
+      "cpu-backend": "not-committed",
+      "cuda-backend": "not-committed"
+    },
+    "crate_inventory": {
+      "verified_publishable_packages": 24,
+      "order_config": "config/crates-io-release.json",
+      "backend_package_policy": "recompute-from-selected-integration-tree"
+    },
     "exact_sha_g8": "open",
     "publication": "blocked"
   }

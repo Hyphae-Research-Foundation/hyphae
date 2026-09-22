@@ -76,6 +76,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Run doctor and diagnose recovery](operations/doctor.md)
 - [Troubleshoot common failures](operations/troubleshooting.md)
 - [Verify a release](release/verification.md)
+- [4.0.0 release dependency ledger](release/4.0.0-dependency-ledger.md)
 - [0.2.1 publication receipt](release/receipts/0.2.1.md)
 - [1.1.0 publication receipt](release/receipts/1.1.0.md)
 - [3.0.0 publication receipt](release/receipts/3.0.0.md)

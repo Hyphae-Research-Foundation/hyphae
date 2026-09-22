@@ -114,6 +114,12 @@ to expose that exact version before starting the next layer:
 7. `hyphae-client`, `hyphae-native-daemon`, `hyphae-server`
 8. `hyphae-cli`, `hyphae-pliegors`
 
+These eight layers currently contain exactly 24 publishable crates. The
+`package_count` in `config/crates-io-release.json` is checked against the
+flattened layers, and the package audit separately requires that set to equal
+Cargo's complete publishable workspace set. The number is a candidate-tree
+fact, not a permanent product constant.
+
 Any development dependency between crates in the same layer must be path-only,
 without a version requirement. Cargo strips those dependencies from the
 published manifest. A versioned development dependency remains part of the
@@ -122,6 +128,26 @@ same-layer or forward edges before publication.
 The dependency policy permits wildcard requirements only when Cargo metadata
 also identifies the edge as a local path; registry wildcard requirements
 remain denied.
+
+### CPU and CUDA backend crates
+
+Do not reserve package names or publication layers for backend crates that are
+not in the selected integration tree. If an accepted CPU or CUDA backend is a
+dependency, including an optional dependency, of any published Hyphae crate,
+the backend must also be publishable at the exact release version and must be
+added to an earlier layer determined from the merged Cargo metadata. The
+declared package count must increase in the same change. A private backend with
+`publish = false` cannot remain a dependency of a published package because its
+generated registry package would not be independently resolvable.
+
+The CPU implementation remains the offline default. A CUDA backend remains
+optional and outside the default dependency graph; publishing its Rust crate
+does not by itself authorize distribution of a CUDA-linked binary. Such a
+binary requires the separate license review, target-specific build, and
+receipt required by the native acceleration roadmap. If backend code is
+merged into an existing published crate instead of introducing a package, the
+24-crate inventory may remain unchanged, but the package audit and full
+verification still run on the selected integration commit.
 
 Use the `Registry publish` workflow. Pull requests and manual dry runs remain
 unprivileged and execute package audits plus exact crate tarball verification

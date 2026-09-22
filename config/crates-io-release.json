@@ -2,6 +2,7 @@
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": 2,
   "version": "4.0.0",
+  "package_count": 24,
   "apache_publication_authority": {
     "version": "3.0.0",
     "tag": "release-v3.0.0-crates",
