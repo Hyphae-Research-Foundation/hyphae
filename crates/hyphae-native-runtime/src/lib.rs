@@ -1314,9 +1314,6 @@ fn catalog_error_is_corruption(source: &CatalogError) -> bool {
         | CatalogError::InvalidSearchFieldPolicy
         | CatalogError::DuplicateVectorId(_)
         | CatalogError::DuplicateVectorName(_)
-        | CatalogError::ZeroEmbeddingArtifactManifestDigest
-        | CatalogError::InvalidEmbeddingProfile
-        | CatalogError::InvalidEmbeddingProfileBinding
         | CatalogError::InvalidVectorPolicy
         | CatalogError::InvalidKeyspacePolicy
         | CatalogError::MissingDependencyTarget(_) => true,

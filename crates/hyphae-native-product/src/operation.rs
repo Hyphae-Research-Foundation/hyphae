@@ -42,10 +42,11 @@ use crate::{
     CatalogVisibleListRequest, CatalogVisiblePage, CustomRoleGrant, CustomRoleMutationReceipt,
     DoctorReport, DoctorRequest, MetricId, NativeProduct, ObjectId, ProductAuthorization,
     ProductCancellationToken, ProductCapabilities, ProductCheckpointReceipt, ProductCommitReceipt,
-    ProductDurability, ProductEmbedAndIngestBatchReceipt, ProductError, ProductErrorCode,
-    ProductExplain, ProductExplicitCommitReceipt, ProductExplicitTransactionStatus,
-    ProductFailureBoundary, ProductHashEntry, ProductHashScanStop, ProductKeyEntry, ProductLimits,
-    ProductListSide, ProductPermission, ProductPreparedHandle, ProductPrincipal, ProductRead,
+    ProductDocument, ProductDurability, ProductEmbedAndIngestBatchReceipt, ProductError,
+    ProductErrorCode, ProductExplain, ProductExplicitCommitReceipt,
+    ProductExplicitTransactionStatus, ProductFailureBoundary, ProductHashEntry,
+    ProductHashScanStop, ProductKeyEntry, ProductLimits, ProductListSide, ProductPermission,
+    ProductPreparedHandle, ProductPrincipal, ProductRead,
     ProductRollbackReceipt, ProductScope, ProductScoreBound, ProductSearchDocumentDelete,
     ProductSearchDocumentUpdate, ProductSearchIngestBatch, ProductSearchIngestReceipt,
     ProductSearchRequest, ProductSearchResult, ProductSession, ProductSessionId,
@@ -1387,6 +1388,47 @@ fn dispatch_inner(
                 context.durability.durability,
             )?)
         }
+        ProductOperation::EmbedAndIngest { collection, batch } => {
+            let target = embed_and_ingest_target_name(product, collection)?;
+            let execution_profile = product
+                .embedding_execution_profile(collection, &target)?
+                .ok_or_else(|| context.error(ProductErrorCode::Unavailable))?;
+            let local_batch = ProductSearchIngestBatch {
+                idempotency_id: batch.idempotency_id,
+                documents: batch
+                    .documents
+                    .into_iter()
+                    .map(|document| ProductDocument {
+                        object_id: document.object_id,
+                        text: document.text,
+                        doc_values: document.doc_values,
+                        vectors: BTreeMap::new(),
+                    })
+                    .collect(),
+            };
+            let requirement =
+                wire_embed_and_ingest_authorization_requirement(product, collection, None)?;
+            let receipt = product.embed_and_ingest_batch(
+                collection,
+                &target,
+                &local_batch,
+                context.limits,
+                context.logical_time_micros,
+                context.durability.durability,
+                |product| reauthorize_requirement(product, session, context, &requirement),
+                || context.checkpoint(),
+            )?;
+            ProductResponse::EmbedAndIngested(crate::ProductEmbedAndIngestReceipt {
+                snapshot: receipt.snapshot,
+                commit: receipt.commit,
+                documents: receipt.documents,
+                idempotent_replay: receipt.idempotent_replay,
+                execution_profile: wire_embedding_execution_profile(
+                    receipt.profile,
+                    &execution_profile,
+                )?,
+            })
+        }
         ProductOperation::EmbedAndIngestBatch {
             collection,
             target,
@@ -1404,9 +1446,6 @@ fn dispatch_inner(
                 |product| reauthorize_requirement(product, session, context, &requirement),
                 || context.checkpoint(),
             )?)
-        }
-        ProductOperation::EmbedAndIngest { .. } => {
-            return Err(context.error(ProductErrorCode::Unavailable));
         }
         ProductOperation::SearchDocumentUpdate { collection, update } => {
             ProductResponse::SearchIngested(product.update_search_document(
@@ -2126,6 +2165,73 @@ fn wire_embed_and_ingest_authorization_requirement(
         profile_id,
     ));
     Ok(requirement)
+}
+
+fn embed_and_ingest_target_name(
+    product: &NativeProduct,
+    collection: ObjectId,
+) -> Result<String, ProductError> {
+    let snapshot = product.catalog_snapshot()?;
+    let object = product
+        .catalog_describe(&snapshot, collection)?
+        .ok_or_else(|| {
+            ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
+        })?;
+    let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition)) = object else {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    };
+    let [target] = definition.vectors.as_slice() else {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    };
+    if target.embedding_profile.is_none() {
+        return Err(ProductError::from_code(ProductErrorCode::InvalidRequest));
+    }
+    Ok(target.name.lookup().to_owned())
+}
+
+fn wire_embedding_execution_profile(
+    profile: ObjectId,
+    local: &crate::ProductLocalEmbeddingExecutionProfile,
+) -> Result<crate::ProductEmbeddingExecutionProfile, ProductError> {
+    if local.backend() != "candle-qwen3"
+        || local.compute_dtype() != "float32"
+        || local.device() != "cpu"
+    {
+        return Err(ProductError::from_code(ProductErrorCode::Unavailable));
+    }
+    let runtime = format!(
+        "{}/{};model={};manifest={};checkpoint_tokens={}",
+        local.backend(),
+        local.backend_version(),
+        local.model_revision(),
+        encode_sha256_hex(&local.artifact_manifest_digest()),
+        local.checkpoint_chunk_tokens(),
+    );
+    Ok(crate::ProductEmbeddingExecutionProfile {
+        embedding_profile: profile,
+        backend: crate::ProductEmbeddingBackend::Cpu,
+        device: format!("cpu:{}", local.target()),
+        driver: "not-applicable".to_owned(),
+        runtime,
+        precision: crate::ProductEmbeddingPrecision::F32,
+        kernels: vec![
+            "qwen3-forward".to_owned(),
+            "last-token-pooling".to_owned(),
+            "leading-dimension-projection".to_owned(),
+            "l2-normalization-f32".to_owned(),
+        ],
+        fallback: false,
+    })
+}
+
+fn encode_sha256_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        let _ignored = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn reauthorize_requirement(

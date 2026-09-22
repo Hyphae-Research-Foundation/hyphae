@@ -45,7 +45,7 @@ pub const MAX_PRODUCT_EMBEDDING_EXECUTION_PROFILE_FIELD_BYTES: usize = 128;
 
 /// Exact process-local backend identity used for numeric embedding execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProductEmbeddingExecutionProfile {
+pub struct ProductLocalEmbeddingExecutionProfile {
     backend: String,
     backend_version: String,
     device: String,
@@ -56,7 +56,7 @@ pub struct ProductEmbeddingExecutionProfile {
     checkpoint_chunk_tokens: u32,
 }
 
-impl ProductEmbeddingExecutionProfile {
+impl ProductLocalEmbeddingExecutionProfile {
     /// Constructs one bounded execution profile.
     ///
     /// # Errors
@@ -203,7 +203,7 @@ pub trait ProductEmbeddingExecutor: Debug + Send + Sync {
     fn execution_profile(
         &self,
         _profile: &EmbeddingProfileDefinition,
-    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
         Ok(None)
     }
 }
@@ -257,7 +257,7 @@ impl NativeProduct {
         &self,
         collection: ObjectId,
         target: &str,
-    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
         let profile = self.embedding_profile_for_target(collection, target)?;
         self.embedding_executor
             .as_ref()

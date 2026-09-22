@@ -25,9 +25,9 @@ use hyphae_native_catalog::{
     QWEN3_EMBEDDING_OUTPUT_DIMENSIONS, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
 };
 use hyphae_native_product::{
-    NativeProduct, ProductEmbeddingBatchOutput, ProductEmbeddingExecutionProfile,
-    ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
-    ProductVector,
+    NativeProduct, ProductEmbeddingBatchOutput, ProductEmbeddingExecutor,
+    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
+    ProductLocalEmbeddingExecutionProfile, ProductVector,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -475,8 +475,8 @@ impl LoadedModel {
     fn execution_profile(
         &self,
         checkpoint_chunk_tokens: usize,
-    ) -> Result<ProductEmbeddingExecutionProfile, ProductError> {
-        ProductEmbeddingExecutionProfile::new(
+    ) -> Result<ProductLocalEmbeddingExecutionProfile, ProductError> {
+        ProductLocalEmbeddingExecutionProfile::new(
             "candle-qwen3",
             CANDLE_VERSION,
             "cpu",
@@ -523,7 +523,7 @@ impl Qwen3CpuExecutor {
     pub fn load_and_register(
         &self,
         descriptors: Qwen3ArtifactDescriptors,
-    ) -> Result<ProductEmbeddingExecutionProfile, Qwen3CpuError> {
+    ) -> Result<ProductLocalEmbeddingExecutionProfile, Qwen3CpuError> {
         let loaded = Arc::new(load_model(descriptors, self.limits)?);
         let profile = loaded
             .execution_profile(self.limits.checkpoint_chunk_tokens)
@@ -562,7 +562,7 @@ impl Qwen3CpuExecutor {
         &self,
         manifest_digest: [u8; 32],
         manifest_bytes: u64,
-    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
         let models = self
             .models
             .read()
@@ -636,7 +636,7 @@ impl ProductEmbeddingExecutor for Qwen3CpuExecutor {
     fn execution_profile(
         &self,
         profile: &EmbeddingProfileDefinition,
-    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
         self.execution_profile_for(
             *profile.artifact_manifest_digest.as_bytes(),
             profile.artifact_manifest_byte_length,
