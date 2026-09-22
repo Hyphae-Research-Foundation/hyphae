@@ -114,6 +114,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native reverse hash scan v1](native/native-hash-reverse-scan-v1.md)
 - [Native hash pattern scan v1](native/native-hash-pattern-scan-v1.md)
 - [Native catalog v1](native/catalog-v1.md)
+- [Native embedding profile metadata v1](native/embedding-profile-v1.md)
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)
 - [Native search-engine semantics v1](native/search-semantics-v1.md)

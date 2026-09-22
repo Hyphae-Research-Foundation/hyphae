@@ -157,11 +157,15 @@ Logical V2 includes:
   micro-unit integers. Search collections without tuned parameters keep the
   representation-2 bytes exactly; tuned collections encode representation 3,
   which appends the two parameters after the representation-2 body; and
-- metadata-only embedding profiles that bind nonzero weights/config/tokenizer
-  SHA-256 digests, safetensors pipeline version, output vector shape, finite
-  token/batch bounds, pooling, normalization, and truncation semantics. An
-  optional named-vector profile binding uses search representation 4. Unbound
-  representation-2 and tuned representation-3 bytes remain unchanged.
+- metadata-only `Qwen3EmbeddingV1` profiles that bind one complete artifact
+  manifest by nonzero SHA-256 and byte length, exact query instruction, output
+  vector shape, and finite input-token bound. Pipeline semantics fix query and
+  passage formatting, special-token insertion, left padding, right truncation
+  to one chunk, last-token pooling, leading projection from native dimension
+  1024 to FP32 dimension 384, 768, or 1024, then L2 normalization with epsilon
+  `1e-12`. An optional named-vector profile binding uses search representation
+  4. Unbound representation-2 and tuned representation-3 bytes remain
+  unchanged.
 
 Each complete canonical `HYCOBJ02` definition has a stable SHA-256 digest.
 Dependency derivation emits canonical directed edges from dependent to

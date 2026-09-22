@@ -11,11 +11,10 @@ use super::{
     CatalogError, CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2,
     ColumnCheckConstraint, ColumnCheckOperator, ColumnDefinition, CompatibleCatalogObjectV2,
     CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance,
-    CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, EmbeddingArtifactDigest,
-    EmbeddingNormalization, EmbeddingPipelineVersion, EmbeddingPooling, EmbeddingProfileDefinition,
-    EmbeddingTruncation, FieldSourcePolicy, ForeignKeyDefinition, IncrementalVectorLifecycle,
-    KeyspaceDefinition, KeyspaceEvictionPolicy, KeyspaceMemoryClass, KeyspaceTtlPolicy,
-    LexicalIndexPolicy, LogicalCatalogObject, MAX_CATALOG_DEFINITION_BYTES,
+    CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion, EmbeddingArtifactManifestDigest,
+    EmbeddingPipelineVersion, EmbeddingProfileDefinition, FieldSourcePolicy, ForeignKeyDefinition,
+    IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy, KeyspaceMemoryClass,
+    KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject, MAX_CATALOG_DEFINITION_BYTES,
     MAX_CATALOG_DEFINITION_ITEMS, MAX_CATALOG_NAME_BYTES, NamedVectorDefinition, ObjectHeader,
     ObjectHeaderV2, QualifiedName, RelationDefinition, SearchCollectionDefinition,
     SearchCollectionDefinitionV2, SearchFieldDefinition, SearchFieldDefinitionV2,
@@ -577,18 +576,13 @@ impl Encoder {
         &mut self,
         definition: &EmbeddingProfileDefinition,
     ) -> Result<(), CatalogError> {
-        self.put_fixed(definition.model_weights_digest.as_bytes())?;
-        self.put_fixed(definition.model_config_digest.as_bytes())?;
-        self.put_fixed(definition.tokenizer_digest.as_bytes())?;
+        self.put_fixed(definition.artifact_manifest_digest.as_bytes())?;
+        self.put_fixed(&definition.artifact_manifest_byte_length.to_le_bytes())?;
         self.put_byte(definition.pipeline_version as u8)?;
         self.put_byte(definition.vector_type.element() as u8)?;
         self.put_fixed(&definition.vector_type.dimension().to_le_bytes())?;
-        self.put_fixed(&definition.max_position_tokens.to_le_bytes())?;
         self.put_fixed(&definition.max_input_tokens.to_le_bytes())?;
-        self.put_fixed(&definition.max_batch_inputs.to_le_bytes())?;
-        self.put_byte(definition.pooling as u8)?;
-        self.put_byte(definition.normalization as u8)?;
-        self.put_byte(definition.truncation as u8)
+        self.put_bytes(definition.query_instruction.as_bytes())
     }
 
     fn put_bm25(&mut self, parameters: Bm25Parameters) -> Result<(), CatalogError> {
@@ -1022,11 +1016,10 @@ impl<'encoded> Decoder<'encoded> {
         &mut self,
         header: ObjectHeaderV2,
     ) -> Result<EmbeddingProfileDefinition, CatalogError> {
-        let model_weights_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
-        let model_config_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
-        let tokenizer_digest = EmbeddingArtifactDigest::new(self.fixed()?)?;
+        let artifact_manifest_digest = EmbeddingArtifactManifestDigest::new(self.fixed()?)?;
+        let artifact_manifest_byte_length = u64::from_le_bytes(self.fixed()?);
         let pipeline_version = match self.byte()? {
-            1 => EmbeddingPipelineVersion::SafetensorsBertMetadataV1,
+            1 => EmbeddingPipelineVersion::Qwen3EmbeddingV1,
             _ => return Err(CatalogError::InvalidDefinitionEncoding),
         };
         if self.byte()? != VectorElement::Float32 as u8 {
@@ -1035,37 +1028,18 @@ impl<'encoded> Decoder<'encoded> {
         let vector_type =
             VectorType::new(VectorElement::Float32, u16::from_le_bytes(self.fixed()?))
                 .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
-        let max_position_tokens = u32::from_le_bytes(self.fixed()?);
         let max_input_tokens = u32::from_le_bytes(self.fixed()?);
-        let max_batch_inputs = u32::from_le_bytes(self.fixed()?);
-        let pooling = match self.byte()? {
-            1 => EmbeddingPooling::FirstToken,
-            2 => EmbeddingPooling::MeanTokens,
-            _ => return Err(CatalogError::InvalidDefinitionEncoding),
-        };
-        let normalization = match self.byte()? {
-            1 => EmbeddingNormalization::None,
-            2 => EmbeddingNormalization::L2,
-            _ => return Err(CatalogError::InvalidDefinitionEncoding),
-        };
-        let truncation = match self.byte()? {
-            1 => EmbeddingTruncation::Reject,
-            2 => EmbeddingTruncation::KeepStart,
-            _ => return Err(CatalogError::InvalidDefinitionEncoding),
-        };
+        let query_instruction = str::from_utf8(self.bytes()?)
+            .map(str::to_owned)
+            .map_err(|_| CatalogError::InvalidDefinitionEncoding)?;
         Ok(EmbeddingProfileDefinition {
             header,
-            model_weights_digest,
-            model_config_digest,
-            tokenizer_digest,
+            artifact_manifest_digest,
+            artifact_manifest_byte_length,
             pipeline_version,
             vector_type,
-            max_position_tokens,
             max_input_tokens,
-            max_batch_inputs,
-            pooling,
-            normalization,
-            truncation,
+            query_instruction,
         })
     }
 
@@ -1464,9 +1438,8 @@ mod tests {
         CatalogError, CatalogName, CatalogObject, CatalogObjectV2, ColumnDefinition,
         CompatibleCatalogObjectV2, CrossEngineLinkDefinition, CrossEngineLinkDeleteBehavior,
         CrossEngineLinkMaintenance, CrossEngineLinkMapping, DefinitionDigest, DefinitionVersion,
-        EmbeddingArtifactDigest, EmbeddingNormalization, EmbeddingPipelineVersion,
-        EmbeddingPooling, EmbeddingProfileDefinition, EmbeddingTruncation, FieldSourcePolicy,
-        IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
+        EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+        FieldSourcePolicy, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
         KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
         MAX_CATALOG_DEFINITION_BYTES, NamedVectorDefinition, ObjectHeader, ObjectHeaderV2,
         QualifiedName, RelationDefinition, SearchCollectionDefinition,
@@ -1474,7 +1447,11 @@ mod tests {
         SearchFieldOptions, SecondaryIndexDefinition, StructureDefinition, StructureKind,
         StructureOwnership, VectorMetric, VectorSearchPolicy,
     };
-    use crate::{MAX_CATALOG_NAME_BYTES, MAX_EMBEDDING_BATCH_INPUTS, MAX_EMBEDDING_TOKENS};
+    use crate::{
+        MAX_CATALOG_NAME_BYTES, MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES, QWEN3_EMBEDDING_L2_EPSILON,
+        QWEN3_EMBEDDING_MAX_INPUT_TOKENS, QWEN3_EMBEDDING_NATIVE_DIMENSION,
+        QWEN3_EMBEDDING_OUTPUT_DIMENSIONS, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
+    };
 
     const RELATION_GOLDEN_HEX: &str = concat!(
         "4859434f424a3031010100000000000000000000000000000001040000006d61696e040000006d",
@@ -1515,21 +1492,21 @@ mod tests {
         "5f766563746f720b000000626f64795f766563746f720100030103000100000110008000400000",
         "0107000000000000000010000008000300"
     );
-    const EMBEDDING_PROFILE_V2_GOLDEN_HEX: &str = concat!(
-        "4859434f424a30320a020f00000000000000000000000000000003040000006d61696e04000000",
-        "6d61696e060000007075626c6963060000007075626c69630f0000006c6f63616c5f656d6265",
-        "6464696e670f0000006c6f63616c5f656d62656464696e67010b00000000000000000000000000",
-        "000001000000000000001111111111111111111111111111111111111111111111111111111111",
-        "111111222222222222222222222222222222222222222222222222222222222222222233333333",
-        "333333333333333333333333333333333333333333333333333333330101800100020000800100",
-        "0020000000020202"
-    );
     const SEARCH_V3_GOLDEN_HEX: &str =
         include_str!("../../../compatibility/native-catalog-search-representation3.hex");
     const SEARCH_V4_GOLDEN_HEX: &str =
         include_str!("../../../compatibility/native-catalog-search-representation4.hex");
     const PROFILE_FIXTURE_HEX: &str =
         include_str!("../../../compatibility/native-catalog-embedding-profile-v2.hex");
+    const QWEN3_ARTIFACT_MANIFEST: &[u8] =
+        include_bytes!("../../../compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json");
+    const QWEN3_QUERY_INSTRUCTION_HEX: &str =
+        include_str!("../../../compatibility/qwen3-embedding-query-instruction-v1.hex");
+    const QWEN3_ARTIFACT_MANIFEST_SHA256: [u8; 32] = [
+        0xbe, 0xfe, 0xcd, 0xb4, 0x6c, 0x39, 0x1a, 0x8e, 0xa2, 0x05, 0xc5, 0x0a, 0x00, 0xb5, 0x47,
+        0x65, 0xa4, 0x6a, 0x44, 0x8c, 0x6d, 0xb0, 0x93, 0x96, 0xa4, 0x92, 0x7a, 0x51, 0xd2, 0xb8,
+        0xd3, 0x57,
+    ];
 
     fn hex(encoded: &[u8]) -> Result<String, std::fmt::Error> {
         let mut output = String::with_capacity(encoded.len() * 2);
@@ -1723,17 +1700,14 @@ mod tests {
         Ok(LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
             EmbeddingProfileDefinition {
                 header: header_v2(15, EngineKind::Search, "local_embedding", Some(11))?,
-                model_weights_digest: EmbeddingArtifactDigest::new([0x11; 32])?,
-                model_config_digest: EmbeddingArtifactDigest::new([0x22; 32])?,
-                tokenizer_digest: EmbeddingArtifactDigest::new([0x33; 32])?,
-                pipeline_version: EmbeddingPipelineVersion::SafetensorsBertMetadataV1,
+                artifact_manifest_digest: EmbeddingArtifactManifestDigest::new(
+                    QWEN3_ARTIFACT_MANIFEST_SHA256,
+                )?,
+                artifact_manifest_byte_length: QWEN3_ARTIFACT_MANIFEST.len() as u64,
+                pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
                 vector_type: VectorType::new(VectorElement::Float32, 384)?,
-                max_position_tokens: 512,
-                max_input_tokens: 384,
-                max_batch_inputs: 32,
-                pooling: EmbeddingPooling::MeanTokens,
-                normalization: EmbeddingNormalization::L2,
-                truncation: EmbeddingTruncation::KeepStart,
+                max_input_tokens: 512,
+                query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
             },
         )))
     }
@@ -2300,12 +2274,27 @@ mod tests {
     #[test]
     fn embedding_profile_codec_and_bounds_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
-            EmbeddingArtifactDigest::new([0; 32]),
-            Err(CatalogError::ZeroEmbeddingArtifactDigest)
+            EmbeddingArtifactManifestDigest::new([0; 32]),
+            Err(CatalogError::ZeroEmbeddingArtifactManifestDigest)
         );
+        assert_eq!(QWEN3_ARTIFACT_MANIFEST.len(), 8_323);
+        assert_eq!(
+            super::sha256(QWEN3_ARTIFACT_MANIFEST),
+            QWEN3_ARTIFACT_MANIFEST_SHA256
+        );
+        let manifest = str::from_utf8(QWEN3_ARTIFACT_MANIFEST)?;
+        assert!(manifest.contains("\"repository\": \"Qwen/Qwen3-Embedding-0.6B\""));
+        assert!(manifest.contains("\"revision\": \"97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3\""));
+        assert!(manifest.contains("\"native_dimensions\": 1024"));
+        assert_eq!(QWEN3_EMBEDDING_NATIVE_DIMENSION, 1_024);
+        assert_eq!(QWEN3_EMBEDDING_L2_EPSILON.to_bits(), 1e-12_f32.to_bits());
+        assert_eq!(
+            hex(QWEN3_EMBEDDING_QUERY_INSTRUCTION.as_bytes())?,
+            QWEN3_QUERY_INSTRUCTION_HEX.trim()
+        );
+
         let profile = embedding_profile_v2()?;
         let encoded = profile.encode_definition_v2()?;
-        assert_eq!(hex(&encoded)?, EMBEDDING_PROFILE_V2_GOLDEN_HEX);
         assert_eq!(hex(&encoded)?, PROFILE_FIXTURE_HEX.trim());
         assert_eq!(encoded[8], 10);
         assert_eq!(encoded[9], 2);
@@ -2318,55 +2307,96 @@ mod tests {
         else {
             return Err("embedding profile expected".into());
         };
-        definition.max_position_tokens = 0;
+        for dimension in QWEN3_EMBEDDING_OUTPUT_DIMENSIONS {
+            definition.vector_type = VectorType::new(VectorElement::Float32, dimension)?;
+            definition.validate()?;
+        }
+        definition.vector_type = VectorType::new(VectorElement::Float32, 512)?;
         assert_eq!(
             definition.validate(),
             Err(CatalogError::InvalidEmbeddingProfile)
         );
-        definition.max_position_tokens = MAX_EMBEDDING_TOKENS;
-        definition.max_input_tokens = MAX_EMBEDDING_TOKENS + 1;
+        definition.vector_type = VectorType::new(VectorElement::Float32, 384)?;
+        definition.artifact_manifest_byte_length = 0;
         assert_eq!(
             definition.validate(),
             Err(CatalogError::InvalidEmbeddingProfile)
         );
-        definition.max_input_tokens = MAX_EMBEDDING_TOKENS;
-        definition.max_batch_inputs = MAX_EMBEDDING_BATCH_INPUTS + 1;
+        definition.artifact_manifest_byte_length = MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES + 1;
         assert_eq!(
             definition.validate(),
             Err(CatalogError::InvalidEmbeddingProfile)
         );
+        definition.artifact_manifest_byte_length = QWEN3_ARTIFACT_MANIFEST.len() as u64;
+        definition.max_input_tokens = QWEN3_EMBEDDING_MAX_INPUT_TOKENS + 1;
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        definition.max_input_tokens = 512;
+        definition.query_instruction.push('.');
+        assert_eq!(
+            definition.validate(),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn embedding_profile_decoder_rejects_malformed_body() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let encoded = embedding_profile_v2()?.encode_definition_v2()?;
         let digest_offset = encoded
             .windows(32)
-            .position(|window| window == [0x11; 32])
-            .ok_or("weights digest not found")?;
+            .position(|window| window == QWEN3_ARTIFACT_MANIFEST_SHA256)
+            .ok_or("artifact-manifest digest not found")?;
         let mut zero_digest = encoded.clone();
         zero_digest[digest_offset..digest_offset + 32].fill(0);
         assert!(LogicalCatalogObject::decode_definition_v2(&zero_digest).is_err());
+        let mut zero_manifest_length = encoded.clone();
+        zero_manifest_length[digest_offset + 32..digest_offset + 40].fill(0);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&zero_manifest_length),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
         let mut invalid_pipeline = encoded.clone();
-        invalid_pipeline[digest_offset + 96] = 0xff;
+        invalid_pipeline[digest_offset + 40] = 0xff;
         assert_eq!(
             LogicalCatalogObject::decode_definition_v2(&invalid_pipeline),
             Err(CatalogError::InvalidDefinitionEncoding)
         );
         let mut invalid_type = encoded.clone();
-        invalid_type[digest_offset + 97] = 0xff;
+        invalid_type[digest_offset + 41] = 0xff;
         assert_eq!(
             LogicalCatalogObject::decode_definition_v2(&invalid_type),
             Err(CatalogError::InvalidDefinitionEncoding)
         );
-        for offset in [
-            digest_offset + 112,
-            digest_offset + 113,
-            digest_offset + 114,
-        ] {
-            let mut invalid_semantic_tag = encoded.clone();
-            invalid_semantic_tag[offset] = 0xff;
-            assert_eq!(
-                LogicalCatalogObject::decode_definition_v2(&invalid_semantic_tag),
-                Err(CatalogError::InvalidDefinitionEncoding)
-            );
-        }
+        let mut invalid_dimension = encoded.clone();
+        invalid_dimension[digest_offset + 42..digest_offset + 44]
+            .copy_from_slice(&512_u16.to_le_bytes());
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&invalid_dimension),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        let mut zero_input_tokens = encoded.clone();
+        zero_input_tokens[digest_offset + 44..digest_offset + 48].fill(0);
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&zero_input_tokens),
+            Err(CatalogError::InvalidEmbeddingProfile)
+        );
+        let mut invalid_instruction_utf8 = encoded.clone();
+        invalid_instruction_utf8[digest_offset + 52] = 0xff;
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&invalid_instruction_utf8),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
+        let mut truncated_instruction = encoded;
+        truncated_instruction[digest_offset + 48..digest_offset + 52]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            LogicalCatalogObject::decode_definition_v2(&truncated_instruction),
+            Err(CatalogError::InvalidDefinitionEncoding)
+        );
         Ok(())
     }
 }

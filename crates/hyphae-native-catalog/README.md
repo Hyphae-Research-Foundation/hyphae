@@ -30,8 +30,10 @@ derivation. Existing objects can be wrapped
 losslessly with `encode_definition_v2`; logical definitions use strict
 `HYCOBJ02` decode and canonical re-encoding checks. Lifecycle policy enforces
 the durable delta ceiling, threshold ordering, and retained-generation bound.
-Embedding profiles bind safetensors weights/config/tokenizer digests and closed
-pipeline semantics but do not load a model or execute inference.
+Embedding profiles bind one complete Qwen3-Embedding-0.6B artifact manifest by
+SHA-256 and byte length, an exact query instruction, output dimension, input
+bound, and closed formatting/tokenization/pooling/projection/normalization
+semantics. They do not load a model or execute inference.
 The profile variant and named-vector field change exhaustive public 3.0.0 Rust
 types, so this unreleased source is next-major incubation and cannot ship as
 3.x.
