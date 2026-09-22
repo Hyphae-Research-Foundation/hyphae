@@ -5,14 +5,17 @@
 use std::{fs, path::PathBuf};
 
 use hyphae_native_catalog::{
-    CatalogName, CatalogObjectV2, DefinitionVersion, DependencyDirection, LogicalCatalogObject,
-    ObjectHeaderV2, QualifiedName,
+    CatalogName, CatalogObjectV2, DefinitionVersion, DependencyDirection,
+    EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+    IncrementalVectorLifecycle, LogicalCatalogObject, NamedVectorDefinition, ObjectHeaderV2,
+    QWEN3_EMBEDDING_QUERY_INSTRUCTION, QualifiedName, SearchCollectionDefinitionV2, VectorMetric,
+    VectorSearchPolicy,
 };
 use hyphae_native_product::{
-    CatalogDependencyRequest, CatalogListRequest, NativeProduct, ProductDurability,
-    ProductErrorCategory, ProductErrorCode,
+    BackupRequest, CatalogDependencyRequest, CatalogListRequest, NativeProduct, ProductDurability,
+    ProductErrorCategory, ProductErrorCode, ProgressControl, RestoreRequest, restore,
 };
-use hyphae_native_types::{EngineKind, ObjectId};
+use hyphae_native_types::{EngineKind, FieldId, ObjectId, VectorElement, VectorType};
 
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -37,6 +40,57 @@ fn header(
         parent: parent.map(ObjectId::new).transpose()?,
         definition_version: DefinitionVersion::FIRST,
     })
+}
+
+fn qwen_objects() -> Result<Vec<LogicalCatalogObject>, Box<dyn std::error::Error>> {
+    let database =
+        LogicalCatalogObject::V2(CatalogObjectV2::Database(header(10, "database", None)?));
+    let schema = LogicalCatalogObject::V2(CatalogObjectV2::Schema(header(11, "schema", Some(10))?));
+    let search_header = |id, name| -> Result<_, Box<dyn std::error::Error>> {
+        Ok(ObjectHeaderV2 {
+            id: ObjectId::new(id)?,
+            owner: EngineKind::Search,
+            name: QualifiedName::new(
+                CatalogName::unquoted("main")?,
+                CatalogName::unquoted("public")?,
+                CatalogName::unquoted(name)?,
+            ),
+            parent: Some(ObjectId::new(11)?),
+            definition_version: DefinitionVersion::FIRST,
+        })
+    };
+    let profile = LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+        EmbeddingProfileDefinition {
+            header: search_header(12, "qwen3_embedding_0_6b")?,
+            artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([7; 32])?,
+            artifact_manifest_byte_length: 8_323,
+            pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+            vector_type: VectorType::new(VectorElement::Float32, 384)?,
+            max_input_tokens: 256,
+            query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+        },
+    ));
+    let collection = LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+        SearchCollectionDefinitionV2 {
+            header: search_header(13, "documents")?,
+            fields: Vec::new(),
+            vectors: vec![NamedVectorDefinition {
+                id: FieldId::new(1)?,
+                name: CatalogName::unquoted("embedding")?,
+                vector_type: VectorType::new(VectorElement::Float32, 384)?,
+                metric: VectorMetric::Cosine,
+                policy: VectorSearchPolicy::Exact,
+                lifecycle: IncrementalVectorLifecycle {
+                    delta_max_entries: 64,
+                    consolidate_after_deltas: 4,
+                    retain_generations: 2,
+                },
+                embedding_profile: Some(ObjectId::new(12)?),
+            }],
+            bm25: None,
+        },
+    ));
+    Ok(vec![database, schema, profile, collection])
 }
 
 #[test]
@@ -154,5 +208,62 @@ fn product_catalog_pages_bind_cursor_to_snapshot_and_apply_limits()
 
     drop(product);
     fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn qwen_profile_binding_survives_product_reopen_and_backup_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temporary("qwen-backup");
+    let source = root.join("source");
+    let backup = root.join("backup");
+    let restored = root.join("restored");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root)?;
+
+    let objects = qwen_objects()?;
+    let mut product = NativeProduct::create(&source)?;
+    product.create_catalog_objects_v2(objects.clone(), ProductDurability::Strict)?;
+    drop(product);
+
+    let mut reopened = NativeProduct::open(&source)?;
+    let snapshot = reopened.catalog_snapshot()?;
+    assert_eq!(
+        reopened.catalog_describe(&snapshot, ObjectId::new(12)?)?,
+        Some(objects[2].clone())
+    );
+    let dependencies = reopened.catalog_dependencies(
+        &snapshot,
+        CatalogDependencyRequest {
+            object: ObjectId::new(12)?,
+            direction: DependencyDirection::Incoming,
+            cursor: None,
+            item_limit: 1,
+            visit_limit: 1,
+            byte_limit: 64,
+        },
+    )?;
+    assert_eq!(dependencies.items.len(), 1);
+    assert_eq!(dependencies.items[0].dependent, ObjectId::new(13)?);
+    reopened
+        .administration()
+        .backup(&BackupRequest::new(&backup)?, |_| ProgressControl::Continue)?;
+    drop(reopened);
+
+    restore(&RestoreRequest::new(&backup, &restored)?, |_| {
+        ProgressControl::Continue
+    })?;
+    let restored_product = NativeProduct::open(&restored)?;
+    let snapshot = restored_product.catalog_snapshot()?;
+    assert_eq!(
+        restored_product.catalog_describe(&snapshot, ObjectId::new(12)?)?,
+        Some(objects[2].clone())
+    );
+    assert_eq!(
+        restored_product.catalog_describe(&snapshot, ObjectId::new(13)?)?,
+        Some(objects[3].clone())
+    );
+    drop(restored_product);
+    fs::remove_dir_all(root)?;
     Ok(())
 }
