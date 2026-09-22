@@ -1316,6 +1316,9 @@ fn catalog_error_is_corruption(source: &CatalogError) -> bool {
         | CatalogError::DuplicateVectorName(_)
         | CatalogError::InvalidVectorPolicy
         | CatalogError::InvalidKeyspacePolicy
+        | CatalogError::ZeroEmbeddingArtifactManifestDigest
+        | CatalogError::InvalidEmbeddingProfile
+        | CatalogError::InvalidEmbeddingProfileBinding
         | CatalogError::MissingDependencyTarget(_) => true,
         CatalogError::NativeType(source) => native_type_error_is_corruption(*source),
         CatalogError::VersionExhausted => false,
@@ -29328,6 +29331,7 @@ fn decode_catalog_dependency_entry(
         4 => DependencyKind::Analyzer,
         5 => DependencyKind::LinkEndpoint,
         6 => DependencyKind::RelationSchema,
+        7 => DependencyKind::EmbeddingProfile,
         _ => return Err(NativeRuntimeError::InvalidCatalogTree),
     };
     let edge = match direction {
@@ -40721,14 +40725,18 @@ mod tests {
         CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
         CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
         DefinitionVersion, DependencyDirection, DependencyEdge, DependencyKind,
-        IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition,
+        EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+        IncrementalVectorLifecycle, LogicalCatalogObject, NamedVectorDefinition, ObjectHeaderV2,
+        QWEN3_EMBEDDING_QUERY_INSTRUCTION, SearchCollectionDefinitionV2, SecondaryIndexDefinition,
         StructureDefinition, StructureKind, StructureOwnership,
+        VectorMetric as CatalogVectorMetric, VectorSearchPolicy,
     };
     use hyphae_native_mvcc::{RootSet, WriteKey};
     use hyphae_native_pages::PageKind;
     use hyphae_native_types::{
-        CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
-        Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
+        CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, FieldId, IntegerWidth,
+        LogicalType, Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
+        VectorElement, VectorType,
     };
     use hyphae_native_wal::WalFile;
 
@@ -41911,9 +41919,18 @@ mod tests {
         name: &str,
         parent: Option<u128>,
     ) -> Result<ObjectHeaderV2, Box<dyn std::error::Error>> {
+        logical_header_with_owner(id, name, parent, EngineKind::Kernel)
+    }
+
+    fn logical_header_with_owner(
+        id: u128,
+        name: &str,
+        parent: Option<u128>,
+        owner: EngineKind,
+    ) -> Result<ObjectHeaderV2, Box<dyn std::error::Error>> {
         Ok(ObjectHeaderV2 {
             id: ObjectId::new(id)?,
-            owner: EngineKind::Kernel,
+            owner,
             name: QualifiedName::new(
                 CatalogName::unquoted("main")?,
                 CatalogName::unquoted("public")?,
@@ -41922,6 +41939,222 @@ mod tests {
             parent: parent.map(ObjectId::new).transpose()?,
             definition_version: DefinitionVersion::FIRST,
         })
+    }
+
+    fn qwen_profile(dimension: u16) -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
+        Ok(LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+            EmbeddingProfileDefinition {
+                header: logical_header_with_owner(
+                    12,
+                    "qwen3_embedding_0_6b",
+                    Some(11),
+                    EngineKind::Search,
+                )?,
+                artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([7; 32])?,
+                artifact_manifest_byte_length: 8_323,
+                pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+                vector_type: VectorType::new(VectorElement::Float32, dimension)?,
+                max_input_tokens: 256,
+                query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+            },
+        )))
+    }
+
+    fn qwen_collection(
+        profile: ObjectId,
+        dimension: u16,
+    ) -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
+        Ok(LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+            SearchCollectionDefinitionV2 {
+                header: logical_header_with_owner(13, "documents", Some(11), EngineKind::Search)?,
+                fields: Vec::new(),
+                vectors: vec![NamedVectorDefinition {
+                    id: FieldId::new(1)?,
+                    name: CatalogName::unquoted("embedding")?,
+                    vector_type: VectorType::new(VectorElement::Float32, dimension)?,
+                    metric: CatalogVectorMetric::Cosine,
+                    policy: VectorSearchPolicy::Exact,
+                    lifecycle: IncrementalVectorLifecycle {
+                        delta_max_entries: 64,
+                        consolidate_after_deltas: 4,
+                        retain_generations: 2,
+                    },
+                    embedding_profile: Some(profile),
+                }],
+                bm25: None,
+            },
+        )))
+    }
+
+    fn qwen_catalog_batch(
+        profile_dimension: u16,
+        binding: ObjectId,
+        vector_dimension: u16,
+    ) -> Result<Vec<LogicalCatalogObject>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            LogicalCatalogObject::V2(CatalogObjectV2::Database(logical_header(
+                10, "database", None,
+            )?)),
+            LogicalCatalogObject::V2(CatalogObjectV2::Schema(logical_header(
+                11,
+                "schema",
+                Some(10),
+            )?)),
+            qwen_profile(profile_dimension)?,
+            qwen_collection(binding, vector_dimension)?,
+        ])
+    }
+
+    #[test]
+    fn qwen_profile_create_bind_is_atomic_and_replays_with_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let profile_id = ObjectId::new(12)?;
+        let collection_id = ObjectId::new(13)?;
+
+        let wrong_kind = database
+            .create_catalog_objects_v2(
+                qwen_catalog_batch(384, ObjectId::new(11)?, 384)?,
+                DurabilityClass::Strict,
+            )
+            .err()
+            .ok_or("schema accepted as an embedding profile")?;
+        assert!(matches!(wrong_kind, NativeRuntimeError::Model(_)));
+        let snapshot = database.catalog_snapshot()?;
+        assert!(
+            database
+                .catalog_describe(&snapshot, profile_id)?
+                .object
+                .is_none()
+        );
+        assert!(
+            database
+                .catalog_describe(&snapshot, collection_id)?
+                .object
+                .is_none()
+        );
+
+        let wrong_dimension = database
+            .create_catalog_objects_v2(
+                qwen_catalog_batch(384, profile_id, 768)?,
+                DurabilityClass::Strict,
+            )
+            .err()
+            .ok_or("mismatched embedding dimensions were accepted")?;
+        assert!(matches!(wrong_dimension, NativeRuntimeError::Model(_)));
+        let snapshot = database.catalog_snapshot()?;
+        assert!(
+            database
+                .catalog_describe(&snapshot, profile_id)?
+                .object
+                .is_none()
+        );
+        assert!(
+            database
+                .catalog_describe(&snapshot, collection_id)?
+                .object
+                .is_none()
+        );
+
+        let objects = qwen_catalog_batch(384, profile_id, 384)?;
+        database.create_catalog_objects_v2(objects.clone(), DurabilityClass::Strict)?;
+        let snapshot = database.catalog_snapshot()?;
+        assert_eq!(
+            database.catalog_describe(&snapshot, profile_id)?.object,
+            Some(objects[2].clone())
+        );
+        let outgoing = database.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: collection_id,
+                direction: DependencyDirection::Outgoing,
+                start_after: None,
+                item_limit: 4,
+                visit_limit: 4,
+                byte_limit: 4_096,
+            },
+        )?;
+        assert!(outgoing.items.contains(&DependencyEdge::new(
+            collection_id,
+            profile_id,
+            DependencyKind::EmbeddingProfile,
+        )));
+        drop(database);
+
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.recovery_report().replayed_transactions, 1);
+        let snapshot = reopened.catalog_snapshot()?;
+        assert_eq!(
+            reopened.catalog_describe(&snapshot, collection_id)?.object,
+            Some(objects[3].clone())
+        );
+        let incoming = reopened.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: profile_id,
+                direction: DependencyDirection::Incoming,
+                start_after: None,
+                item_limit: 1,
+                visit_limit: 1,
+                byte_limit: 64,
+            },
+        )?;
+        assert_eq!(
+            incoming.items,
+            [DependencyEdge::new(
+                collection_id,
+                profile_id,
+                DependencyKind::EmbeddingProfile,
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_qwen_profile_binding_commit_boundary_recovers_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let directory = TestDirectory::new();
+            let mut database = NativeDatabase::create(directory.path())?;
+            database.create_catalog_objects_v2(
+                qwen_catalog_batch(384, ObjectId::new(12)?, 384)?[..2].to_vec(),
+                DurabilityClass::Strict,
+            )?;
+            let profile = qwen_profile(384)?;
+            let collection = qwen_collection(ObjectId::new(12)?, 384)?;
+            let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+            transaction.create_catalog_object_v2(profile.clone())?;
+            transaction.create_catalog_object_v2(collection.clone())?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(directory.path())?;
+            let snapshot = reopened.catalog_snapshot()?;
+            let recovered_profile = reopened
+                .catalog_describe(&snapshot, ObjectId::new(12)?)?
+                .object;
+            let recovered_collection = reopened
+                .catalog_describe(&snapshot, ObjectId::new(13)?)?
+                .object;
+            assert!(
+                (recovered_profile.is_none() && recovered_collection.is_none())
+                    || (recovered_profile == Some(profile.clone())
+                        && recovered_collection == Some(collection.clone()))
+            );
+        }
+        Ok(())
     }
 
     #[test]

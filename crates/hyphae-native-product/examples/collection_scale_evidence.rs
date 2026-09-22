@@ -358,6 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn provision(product: &mut NativeProduct) -> Result<(), Box<dyn std::error::Error>> {
     let name = |value: &str| CatalogName::unquoted(value);
     let qualified = |value: &str| -> Result<QualifiedName, Box<dyn std::error::Error>> {
@@ -450,6 +451,7 @@ fn provision(product: &mut NativeProduct) -> Result<(), Box<dyn std::error::Erro
                         consolidate_after_deltas: 4,
                         retain_generations: 2,
                     },
+                    embedding_profile: None,
                 }],
                 bm25: None,
             },

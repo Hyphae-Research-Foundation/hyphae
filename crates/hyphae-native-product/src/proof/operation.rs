@@ -2980,6 +2980,7 @@ fn catalog_kind(value: u8) -> Result<CatalogObjectKind, NativeProofError> {
         7 => CatalogObjectKind::SearchCollection,
         8 => CatalogObjectKind::Analyzer,
         9 => CatalogObjectKind::CrossEngineLink,
+        10 => CatalogObjectKind::EmbeddingProfile,
         _ => return Err(NativeProofError::Invalid("invalid catalog object kind")),
     })
 }
