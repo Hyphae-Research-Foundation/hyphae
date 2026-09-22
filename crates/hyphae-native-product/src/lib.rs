@@ -19,6 +19,7 @@ mod catalog;
 pub mod chunker;
 mod default_scalar_keyspace;
 mod doctor;
+mod embedding;
 pub mod error;
 pub mod error_codec;
 mod lexical_analyzer;
@@ -36,7 +37,10 @@ mod telemetry;
 
 use std::{
     path::Path,
-    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    },
 };
 
 pub use access_catalog::*;
@@ -47,6 +51,7 @@ pub use cancellation::*;
 pub use capabilities::*;
 pub use catalog::*;
 pub use doctor::*;
+pub use embedding::*;
 pub use error::*;
 pub use error_codec::*;
 pub use hyphae_native_catalog::{
@@ -366,6 +371,7 @@ pub struct NativeProduct {
     pub(crate) access_control_epoch_known: AtomicBool,
     pub(crate) authorization_time_watermark: AtomicI64,
     pub(crate) catalog_cursor_key: [u8; 32],
+    pub(crate) embedding_executor: Option<Arc<dyn ProductEmbeddingExecutor>>,
     security_commit_interruption: Option<SecurityCommitInterruption>,
     #[cfg(test)]
     pub(crate) access_control_catalog_loads: AtomicU64,
@@ -966,6 +972,7 @@ impl NativeProduct {
             access_control_epoch_known: AtomicBool::new(true),
             authorization_time_watermark: AtomicI64::new(i64::MIN),
             catalog_cursor_key,
+            embedding_executor: None,
             security_commit_interruption: None,
             #[cfg(test)]
             access_control_catalog_loads: AtomicU64::new(0),
@@ -991,6 +998,7 @@ impl NativeProduct {
                 access_control_epoch_known: AtomicBool::new(true),
                 authorization_time_watermark: AtomicI64::new(i64::MIN),
                 catalog_cursor_key,
+                embedding_executor: None,
                 security_commit_interruption: None,
                 #[cfg(test)]
                 access_control_catalog_loads: AtomicU64::new(0),
@@ -1014,6 +1022,7 @@ impl NativeProduct {
                 access_control_epoch_known: AtomicBool::new(false),
                 authorization_time_watermark: AtomicI64::new(i64::MIN),
                 catalog_cursor_key,
+                embedding_executor: None,
                 security_commit_interruption: None,
                 #[cfg(test)]
                 access_control_catalog_loads: AtomicU64::new(0),
@@ -1051,6 +1060,7 @@ impl NativeProduct {
                     access_control_epoch_known: AtomicBool::new(false),
                     authorization_time_watermark: AtomicI64::new(i64::MIN),
                     catalog_cursor_key,
+                    embedding_executor: None,
                     security_commit_interruption: None,
                     #[cfg(test)]
                     access_control_catalog_loads: AtomicU64::new(0),
@@ -1081,6 +1091,7 @@ impl NativeProduct {
             access_control_epoch_known: AtomicBool::new(false),
             authorization_time_watermark: AtomicI64::new(i64::MIN),
             catalog_cursor_key,
+            embedding_executor: None,
             security_commit_interruption: None,
             #[cfg(test)]
             access_control_catalog_loads: AtomicU64::new(0),
@@ -1116,6 +1127,7 @@ impl NativeProduct {
                 access_control_epoch_known: AtomicBool::new(false),
                 authorization_time_watermark: AtomicI64::new(i64::MIN),
                 catalog_cursor_key,
+                embedding_executor: None,
                 security_commit_interruption: None,
                 #[cfg(test)]
                 access_control_catalog_loads: AtomicU64::new(0),
@@ -1150,6 +1162,7 @@ impl NativeProduct {
             access_control_epoch_known: AtomicBool::new(false),
             authorization_time_watermark: AtomicI64::new(i64::MIN),
             catalog_cursor_key,
+            embedding_executor: None,
             security_commit_interruption: None,
             #[cfg(test)]
             access_control_catalog_loads: AtomicU64::new(0),

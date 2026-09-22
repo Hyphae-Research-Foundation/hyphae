@@ -1,21 +1,20 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native embedding profile metadata v1
 
-Status: unreleased next-major catalog incubation; embedding execution is not implemented
+Status: unreleased next-major embedded product contract; no concrete executor or wire surface
 
-This contract is the first prerequisite for a future bounded
-`EmbedAndIngestBatch` operation. It defines a catalogued embedding profile and
-an optional named-vector binding. It does not define or ship that operation.
-No current build loads model files, tokenizes input, runs inference, generates
-vectors, starts a job, contacts a provider, selects a GPU, or changes search
-ingestion because this metadata exists.
+This contract defines a catalogued embedding profile, an optional named-vector
+binding, and the embedded-only bounded `EmbedAndIngestBatch` product operation.
+The product crate supplies only the executor trait and atomic orchestration. No
+current build supplies a concrete model executor, loads model files, contacts a
+provider, selects a device, or exposes the operation on a wire protocol.
 
 ## Object contract
 
 `CatalogObjectKind::EmbeddingProfile` is append-only kind tag `10`.
 `CatalogObjectV2::EmbeddingProfile` is search-owned, has a schema parent, and
 uses the existing generic `CreateCatalogObjectV2` WAL mutation (`51`). There is
-no embedding-specific WAL opcode or product operation.
+no embedding-specific WAL opcode.
 
 One `EmbeddingProfileDefinition` canonically contains:
 
@@ -104,6 +103,44 @@ while any such dependent is live, ready for a future public logical DROP
 operation. No public generic logical DROP operation is shipped by this
 contract.
 
+## Embedded operation
+
+`ProductOperation::EmbedAndIngestBatch` selects one collection and one
+normalized named-vector target. Its `ProductSearchIngestBatch` must be nonempty,
+contain at most 256 documents and 16 MiB of logical input, carry a nonzero
+idempotency identity, and have empty input vector maps. The operation resolves
+the target's catalogued profile and invokes the installed
+`ProductEmbeddingExecutor` for passage text only. One finite vector of the
+profile dimension and one nonzero input-token count must return for every input
+in original order.
+
+The executor receives the immutable profile plus explicit ceilings for input
+count and bytes, per-input and aggregate token positions, output dimension, and
+output bytes. Product-side request and result walks accumulate checked bounds
+without constructing an unbounded aggregate. Cancellation and deadline
+checkpoints run before execution and incrementally while validating output.
+
+Authorization binds `CatalogRead + DataWrite` to the collection and separately
+binds `CatalogRead` to the embedding profile. Managed authority is reloaded and
+both exact object requirements are checked at admission, immediately before
+executor invocation, and again after native staging immediately before commit.
+Loss of either scope publishes no completion or search state.
+
+The operation writes an internal completion marker in the same native
+transaction as the document, lexical, doc-value, generated vector, manifest,
+posting, and ordinary search-ingest idempotency mutations. The marker binds the
+collection, target, caller idempotency identity, complete profile identity, and
+complete vector-free input digest to the original transaction. A matching
+durable replay skips executor invocation and publication and returns the
+original commit receipt. `ProductEmbedAndIngestReceipt.commit` is non-optional,
+so every successful first execution and replay carries definite commit
+evidence. A mismatched reuse fails with `idempotency_conflict`.
+
+`NativeProduct::set_embedding_executor` is process-local configuration. Reopen
+preserves completion records but requires the caller to reinstall any executor;
+a matching replay does not require one. This contract ships no concrete CPU,
+accelerator, provider, artifact loader, or job executor.
+
 ## Canonical encoding and compatibility
 
 The profile body uses `HYCOBJ02` representation `2` under logical catalog codec
@@ -119,10 +156,11 @@ Collections with tuned BM25 but no profile remain byte-for-byte representation
 ID per named vector in vector order, then optional BM25 parameters. A
 representation-4 body with no binding is noncanonical.
 
-The product API version remains `1`, native protocol minor advances to `8`, and
-every request and response operation tag remains unchanged because this
-contract adds no product operation. Request tag `69` remains absent. Kind-10
-filters and profile or representation-4 catalog creation require minor 8.
+The product API version remains `1` and native protocol minor remains `8`. The
+Rust embedded operation and response have no protocol encoding; every request
+and response operation tag remains unchanged and request tag `69` remains
+absent. Kind-10 filters and profile or representation-4 catalog creation
+require minor 8.
 Responses containing kind 10, dependency kind 7, a profile definition, or a
 representation-4 search definition are rejected before encoding to a
 minor-7-or-older peer. Rust, Python, and TypeScript share the kind/dependency
@@ -140,7 +178,7 @@ compatibility claim.
 
 Catalog definitions and dependency entries use the existing catalog tree,
 backup, restore, describe, resolve, and reopen machinery. Their presence does
-not provision a search collection or model executor.
+not provision a search collection or install a model executor.
 
 The real artifact-manifest golden is
 `compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json`: 8,323 bytes with
