@@ -138,7 +138,7 @@
       "embedding-profile-catalog-codec-4-minor-8": "observed-partial-integration-not-selected",
       "embed-and-ingest-minor-9": "missing-product-runtime-wire-integration",
       "python-minor-8-9": "observed-partial-integration-not-selected",
-      "typescript-minor-8-9": "observed-partial-integration-not-selected",
+      "typescript-minor-8-9": "latest-bounds-fix-not-in-partial-integration",
       "product-runtime": "not-committed",
       "qwen-profile-execution": "not-committed",
       "cpu-backend": "not-committed",
