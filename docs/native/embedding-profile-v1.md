@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native embedding profile metadata v1
 
-Status: unreleased next-major embedded product contract; no concrete executor or wire surface
+Status: unreleased next-major embedded product contract; optional CPU executor, no wire surface
 
 This contract defines a catalogued embedding profile, an optional named-vector
 binding, and the embedded-only bounded `EmbedAndIngestBatch` product operation.
@@ -138,8 +138,25 @@ evidence. A mismatched reuse fails with `idempotency_conflict`.
 
 `NativeProduct::set_embedding_executor` is process-local configuration. Reopen
 preserves completion records but requires the caller to reinstall any executor;
-a matching replay does not require one. This contract ships no concrete CPU,
-accelerator, provider, artifact loader, or job executor.
+a matching replay does not require one. The core product crate ships no
+concrete model executor by itself.
+
+The optional publishable `hyphae-native-embed-cpu` crate supplies the first
+concrete executor without making the model mandatory for the product or CLI.
+It opens the manifest and complete local snapshot into one descriptor set,
+verifies SHA-256 and byte length for every manifest entry from those same
+descriptors, and constructs Candle safetensors through its safe buffered API.
+It has no model download, network, listener, subprocess, or sidecar surface.
+
+The executor registry is keyed by complete manifest digest and byte length.
+It enforces independent model-count, artifact, load-memory, padded-token,
+tensor-element, execution-memory, layer-work, and attention-work ceilings.
+CPU evaluation uses bounded token chunks so cancellation and deadline
+checkpoints run during long sequences, while preserving causal state for exact
+last-token pooling. `NativeProduct::embedding_execution_profile` reports the
+manifest revision, Candle version, CPU/f32 selection, compilation target, and
+checkpoint chunk size. Absence of the optional crate or a loaded matching
+model remains `unavailable`; it never triggers acquisition or a fallback.
 
 ## Canonical encoding and compatibility
 

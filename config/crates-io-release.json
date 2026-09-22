@@ -16,6 +16,26 @@
     {
       "source": "compatibility/valkey/rdb-v11.json",
       "packaged": "crates/hyphae-cli/tests/fixtures/valkey-rdb-v11.json"
+    },
+    {
+      "source": "compatibility/native-catalog-search-representation3.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-search-representation3.hex"
+    },
+    {
+      "source": "compatibility/native-catalog-search-representation4.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-search-representation4.hex"
+    },
+    {
+      "source": "compatibility/native-catalog-embedding-profile-v2.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-embedding-profile-v2.hex"
+    },
+    {
+      "source": "compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json",
+      "packaged": "crates/hyphae-native-catalog/compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json"
+    },
+    {
+      "source": "compatibility/qwen3-embedding-query-instruction-v1.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/qwen3-embedding-query-instruction-v1.hex"
     }
   ],
   "semver_baseline_packages": [
@@ -59,6 +79,7 @@
       "hyphae-native-product"
     ],
     [
+      "hyphae-native-embed-cpu",
       "hyphae-native-protocol"
     ],
     [

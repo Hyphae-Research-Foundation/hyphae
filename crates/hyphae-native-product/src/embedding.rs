@@ -40,6 +40,117 @@ pub struct ProductEmbeddingExecutionLimits {
     pub max_output_bytes: usize,
 }
 
+/// Maximum UTF-8 bytes in one execution-profile identity field.
+pub const MAX_PRODUCT_EMBEDDING_EXECUTION_PROFILE_FIELD_BYTES: usize = 128;
+
+/// Exact process-local backend identity used for numeric embedding execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductEmbeddingExecutionProfile {
+    backend: String,
+    backend_version: String,
+    device: String,
+    compute_dtype: String,
+    target: String,
+    model_revision: String,
+    artifact_manifest_digest: [u8; 32],
+    checkpoint_chunk_tokens: u32,
+}
+
+impl ProductEmbeddingExecutionProfile {
+    /// Constructs one bounded execution profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `invalid_request` for an empty, oversized, non-ASCII, or
+    /// otherwise noncanonical profile identity.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every execution identity component remains explicit"
+    )]
+    pub fn new(
+        backend: &str,
+        backend_version: &str,
+        device: &str,
+        compute_dtype: &str,
+        target: &str,
+        model_revision: &str,
+        artifact_manifest_digest: [u8; 32],
+        checkpoint_chunk_tokens: u32,
+    ) -> Result<Self, ProductError> {
+        let fields = [
+            backend,
+            backend_version,
+            device,
+            compute_dtype,
+            target,
+            model_revision,
+        ];
+        if fields.iter().any(|field| {
+            field.is_empty()
+                || field.len() > MAX_PRODUCT_EMBEDDING_EXECUTION_PROFILE_FIELD_BYTES
+                || !field.is_ascii()
+        }) || model_revision.len() != 40
+            || !model_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || artifact_manifest_digest == [0; 32]
+            || checkpoint_chunk_tokens == 0
+        {
+            return Err(invalid_request());
+        }
+        Ok(Self {
+            backend: backend.to_owned(),
+            backend_version: backend_version.to_owned(),
+            device: device.to_owned(),
+            compute_dtype: compute_dtype.to_owned(),
+            target: target.to_owned(),
+            model_revision: model_revision.to_owned(),
+            artifact_manifest_digest,
+            checkpoint_chunk_tokens,
+        })
+    }
+
+    /// Returns the local inference backend identity.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    /// Returns the exact inference backend version.
+    pub fn backend_version(&self) -> &str {
+        &self.backend_version
+    }
+
+    /// Returns the selected device class.
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// Returns the model-compute element representation.
+    pub fn compute_dtype(&self) -> &str {
+        &self.compute_dtype
+    }
+
+    /// Returns the compilation target identity used by this profile.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Returns the immutable upstream model revision.
+    pub fn model_revision(&self) -> &str {
+        &self.model_revision
+    }
+
+    /// Returns the complete artifact-manifest digest.
+    pub const fn artifact_manifest_digest(&self) -> [u8; 32] {
+        self.artifact_manifest_digest
+    }
+
+    /// Returns the maximum model token positions between checkpoints.
+    pub const fn checkpoint_chunk_tokens(&self) -> u32 {
+        self.checkpoint_chunk_tokens
+    }
+}
+
 /// Borrowed, catalog-bound request presented to an embedding executor.
 #[derive(Clone, Copy, Debug)]
 pub struct ProductEmbeddingExecutorRequest<'a> {
@@ -79,6 +190,22 @@ pub trait ProductEmbeddingExecutor: Debug + Send + Sync {
         request: ProductEmbeddingExecutorRequest<'_>,
         checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
     ) -> Result<ProductEmbeddingBatchOutput, ProductError>;
+
+    /// Reports the exact numeric backend profile for a loaded catalog profile.
+    ///
+    /// The default preserves model-optional executors that do not expose a
+    /// numeric profile. `None` never claims that execution is available.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return a stable executor error if profile discovery
+    /// cannot complete.
+    fn execution_profile(
+        &self,
+        _profile: &EmbeddingProfileDefinition,
+    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+        Ok(None)
+    }
 }
 
 /// Definite result of one embedded-and-ingested batch.
@@ -116,6 +243,25 @@ impl NativeProduct {
     /// Returns whether this product handle has an embedding executor installed.
     pub fn has_embedding_executor(&self) -> bool {
         self.embedding_executor.is_some()
+    }
+
+    /// Reports the installed executor profile for one catalog-bound target.
+    ///
+    /// `None` means no executor is installed or the installed executor makes
+    /// no numeric execution-profile claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable catalog, corruption, or executor error.
+    pub fn embedding_execution_profile(
+        &self,
+        collection: ObjectId,
+        target: &str,
+    ) -> Result<Option<ProductEmbeddingExecutionProfile>, ProductError> {
+        let profile = self.embedding_profile_for_target(collection, target)?;
+        self.embedding_executor
+            .as_ref()
+            .map_or(Ok(None), |executor| executor.execution_profile(&profile))
     }
 
     pub(crate) fn embedding_profile_for_target(
