@@ -56,11 +56,15 @@ row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
 The release-preparation tree contains the final package identity but is not an
-integration tree for the embedding work. Profile codec 4 and the minor-8
-catalog contract, minor-9 embed-and-ingest execution, Python and TypeScript
-minor-8/9 support, a Qwen execution profile, and CPU/CUDA backends remain open
-or observed only on unmerged lane commits. Their exact observed state and
-non-claims are recorded in the
+integration tree for the embedding work. The current committed core chain at
+`29e36cc699ebecf38646de09f4b2298cea117ca2` contains the catalog contract,
+profile binding, and product operation, while the Rust wire and SDK work remain
+on separate lane commits. No CPU executor crate or accelerator crate is
+committed; dirty worktree drafts are not release inputs. Cargo metadata confirms
+the existing 24-package graph, but package
+verification fails closed on catalog fixture ownership and CLI exhaustiveness.
+Their exact dependencies, dry-run commands, observed failures, and non-claims
+are recorded in the
 [`4.0.0` dependency ledger](../release/4.0.0-dependency-ledger.md). None of
 those observations closes a release gate or expands the candidate's shipped
 behavior.

@@ -118,7 +118,9 @@ These eight layers currently contain exactly 24 publishable crates. The
 `package_count` in `config/crates-io-release.json` is checked against the
 flattened layers, and the package audit separately requires that set to equal
 Cargo's complete publishable workspace set. The number is a candidate-tree
-fact, not a permanent product constant.
+fact, not a permanent product constant. The exact current-core dependency
+closure and candidate package commands are retained in the
+[`4.0.0` dependency ledger](4.0.0-dependency-ledger.md).
 
 Any development dependency between crates in the same layer must be path-only,
 without a version requirement. Cargo strips those dependencies from the
