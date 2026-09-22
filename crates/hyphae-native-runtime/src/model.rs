@@ -490,6 +490,7 @@ fn logical_dependency_target_is_valid(
             CatalogObjectKind::Relation | CatalogObjectKind::SecondaryIndex
         ),
         DependencyKind::Analyzer => target_kind == CatalogObjectKind::Analyzer,
+        DependencyKind::EmbeddingProfile => target_kind == CatalogObjectKind::EmbeddingProfile,
         DependencyKind::LinkEndpoint => !matches!(
             target_kind,
             CatalogObjectKind::Database

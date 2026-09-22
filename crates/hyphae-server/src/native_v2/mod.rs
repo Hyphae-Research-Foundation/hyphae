@@ -120,7 +120,7 @@ mod tests {
             contract
                 .contains("description: Bounded comma-separated Native product protocol minors")
         );
-        assert!(contract.contains("enum: [\"3\", \"4\", \"5\", \"6\", \"7\"]"));
+        assert!(contract.contains("enum: [\"3\", \"4\", \"5\", \"6\", \"7\", \"8\", \"9\"]"));
         assert!(contract.contains("Generic /v2/execute rejects these variants"));
         assert!(contract.contains("legacy-migration-1.2:"));
         assert!(contract.contains("Canonical hyp1 is always parsed without fallback"));
@@ -2006,7 +2006,7 @@ mod tests {
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             unsupported.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "7"
+            "9"
         );
 
         for (request_id, minor) in [("496", None), ("497", Some("garbage"))] {
@@ -2030,7 +2030,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "7"
+                "9"
             );
         }
 
@@ -2045,6 +2045,8 @@ mod tests {
             ("509", "3,4,5,6", "6"),
             ("521", "6", "6"),
             ("522", "3,4,5,6,7", "7"),
+            ("524", "8", "8"),
+            ("523", "3,4,5,6,7,8,9", "9"),
         ] {
             let mut accepted = http_request(
                 "/v2/execute",
@@ -2088,7 +2090,6 @@ mod tests {
             ("515", "03"),
             ("516", "3,"),
             ("517", "1,2,5,6,7,8,9,10,3"),
-            ("518", "8"),
             ("519", "3 4"),
         ] {
             let mut rejected = http_request(
@@ -2106,7 +2107,7 @@ mod tests {
             assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 rejected.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-                "7"
+                "9"
             );
         }
 
@@ -2150,7 +2151,7 @@ mod tests {
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             error.headers()[hyphae_contracts::v2::PROTOCOL_MINOR_HEADER_V2],
-            "7"
+            "9"
         );
         drop(service);
         Ok(())

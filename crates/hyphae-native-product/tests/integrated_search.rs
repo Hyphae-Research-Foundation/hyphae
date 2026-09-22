@@ -162,6 +162,7 @@ fn configure_catalog_full(
             metric: VectorMetric::SquaredL2,
             policy: VectorSearchPolicy::Ann(ann),
             lifecycle,
+            embedding_profile: None,
         },
         NamedVectorDefinition {
             id: FieldId::new(5)?,
@@ -173,6 +174,7 @@ fn configure_catalog_full(
                 ann,
             },
             lifecycle,
+            embedding_profile: None,
         },
     ];
     vectors.truncate(vector_target_count);
@@ -184,6 +186,7 @@ fn configure_catalog_full(
             metric: VectorMetric::SquaredL2,
             policy: VectorSearchPolicy::Exact,
             lifecycle,
+            embedding_profile: None,
         });
     }
     product.create_catalog_object_v2(

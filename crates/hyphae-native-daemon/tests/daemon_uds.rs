@@ -772,7 +772,7 @@ async fn security_operations_require_their_minor_and_reject_retired_shapes_befor
     )?;
 
     let current = Client::connect_authenticated(&test.socket, &owner_secret).await?;
-    assert_eq!(current.negotiated_minor, 7);
+    assert_eq!(current.negotiated_minor, 9);
     current
         .send_request(1, 2, &request(ProductOperation::SecurityStatus))
         .await?;

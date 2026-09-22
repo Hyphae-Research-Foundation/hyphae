@@ -133,6 +133,7 @@ fn configure(
                         consolidate_after_deltas: 4,
                         retain_generations: 2,
                     },
+                    embedding_profile: None,
                 }],
             },
         )),
