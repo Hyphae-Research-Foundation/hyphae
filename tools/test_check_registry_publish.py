@@ -88,7 +88,7 @@ def authority(ecosystem: str = "crates-io") -> dict:
         "repository": "Hyphae-Research-Foundation/hyphae",
         "ecosystem": ecosystem,
         "source": {
-            "tag": "release-v3.0.0-crates",
+            "tag": "release-v4.0.0-crates",
             "tag_object": TAG_OBJECT,
             "commit": COMMIT,
             "tree": TREE,
@@ -140,7 +140,7 @@ def evidence(ecosystem: str = "crates-io") -> dict:
             },
         },
         "package_inventory": {
-            "version": "3.0.0",
+            "version": "4.0.0",
             "config": "config/crates-io-release.json",
         },
     }
@@ -156,7 +156,7 @@ def publication_state(ecosystem: str = "crates-io") -> dict:
     return {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "3.0.0",
+        "version": "4.0.0",
         "source": source,
         "inventory": inventory,
         "status": "in-progress",
@@ -175,7 +175,7 @@ class RegistryPublishGateTests(unittest.TestCase):
             if "Apache publication authority differs" not in failure
         ]
         self.assertEqual(filtered, [])
-        self.assertEqual(EXPECTED_AUTHORITY["version"], "3.0.0")
+        self.assertEqual(EXPECTED_AUTHORITY["version"], "4.0.0")
         self.assertIn(
             ".github/workflows/registry-publish.yml",
             TRUSTED_MAIN_ONLY_CONTROL_FILES,
@@ -412,7 +412,7 @@ class RegistryPublishGateTests(unittest.TestCase):
                 path.write_text(original.replace(before, after, 1), encoding="utf-8")
                 self.assertNotEqual(validate_publish_workflow(root), [])
 
-    def test_dry_runs_remain_available_before_the_version_bump(self) -> None:
+    def test_dry_runs_remain_available_for_staged_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.materialize(root)
@@ -425,10 +425,14 @@ class RegistryPublishGateTests(unittest.TestCase):
         for ecosystem in ("crates-io", "npm"):
             failures = validate_publish_authority(ecosystem)
             self.assertTrue(
-                any("blocked until exact version 3.0.0" in item for item in failures)
+                any(
+                    "required source tag release-v4.0.0-crates is unavailable" in item
+                    or "HEAD is not the exact release-v4.0.0-crates source commit" in item
+                    for item in failures
+                )
             )
 
-    def test_live_publish_is_blocked_before_exact_1_2_2(self) -> None:
+    def test_live_publish_is_blocked_without_annotated_source_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch(
             "tools.check_registry_publish._git"
         ) as git:
@@ -439,7 +443,9 @@ class RegistryPublishGateTests(unittest.TestCase):
             root = Path(directory)
             self.materialize(root)
             failures = validate_publish_authority("crates-io", root)
-        self.assertTrue(any("blocked until exact version 3.0.0" in item for item in failures))
+        self.assertTrue(
+            any("required source tag release-v4.0.0-crates is unavailable" in item for item in failures)
+        )
 
     def test_policy_mutations_fail_closed(self) -> None:
         mutations = (

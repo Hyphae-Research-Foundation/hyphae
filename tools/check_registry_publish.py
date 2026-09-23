@@ -28,8 +28,8 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = Path("config/registry-publish-authority.json")
 EXPECTED_AUTHORITY = {
-    "version": "3.0.0",
-    "tag": "release-v3.0.0-crates",
+    "version": "4.0.0",
+    "tag": "release-v4.0.0-crates",
     "source_ref_kind": "annotated-tag",
     "require_exact_clean_source": True,
 }
@@ -403,8 +403,8 @@ def _policy(root: Path) -> dict[str, Any]:
         value["schema"] != "hyphae-registry-publish-authority-v1"
         or value["repository"] != "Hyphae-Research-Foundation/hyphae"
         or value["branch"] != "main"
-        or value["version"] != "3.0.0"
-        or value["tag"] != "release-v3.0.0-crates"
+        or value["version"] != "4.0.0"
+        or value["tag"] != "release-v4.0.0-crates"
         or value["tag_kind"] != "annotated"
         or value["tag_signature"]
         != {
@@ -420,7 +420,7 @@ def _policy(root: Path) -> dict[str, Any]:
         or value["tag_object"] != TAG_OBJECT
         or value["release_run_commit"] != RELEASE_RUN_COMMIT
     ):
-        raise GateFailure("registry authority policy differs from the pinned 3.0.0 authority")
+        raise GateFailure("registry authority policy differs from the pinned 4.0.0 authority")
     return value
 
 
@@ -524,7 +524,7 @@ def validate_publish_workflow(root: Path = ROOT) -> list[str]:
         "checks: read",
         "id-token: write",
         "Reject a non-main live dispatch before checkout",
-        "test '${{ inputs.source_tag }}' = release-v3.0.0-crates",
+        "test '${{ inputs.source_tag }}' = release-v4.0.0-crates",
         "refs/heads/main",
         "test \"${{ github.ref }}\" = refs/heads/main",
         "github.workflow_ref",
@@ -1266,7 +1266,7 @@ def _load_publication_state(
     expected = {
         "schema": "hyphae-registry-publication-state-v1",
         "ecosystem": ecosystem,
-        "version": "3.0.0",
+        "version": "4.0.0",
         "source": authority["source"],
         "inventory": _publication_inventory(ecosystem, root),
     }
@@ -1428,11 +1428,11 @@ def resolve_live_authority(
         or source_tree != policy["source_tree"]
         or tag_object != policy["tag_object"]
     ):
-        raise GateFailure("3.0.0 source tag identity differs from pinned authority")
+        raise GateFailure("4.0.0 source tag identity differs from pinned authority")
     _git(root, "fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
     origin_main = _git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
     if not _git(root, "merge-base", "--is-ancestor", source_commit, origin_main, check=False).returncode == 0:
-        raise GateFailure("3.0.0 source tag is not an ancestor of origin/main")
+        raise GateFailure("4.0.0 source tag is not an ancestor of origin/main")
     if workflow_sha != origin_main:
         raise GateFailure("registry control workflow is not the exact origin/main commit")
     checks, runs_by_path = fetch_required_checks(
@@ -1848,7 +1848,7 @@ def validate_evidence_receipt(value: dict[str, Any], ecosystem: str, authority: 
         or value["control"] != authority["control"]
         or value.get("transition", {}).get("target_release") != "1.2.0"
         or value.get("transition", {}).get("tree") != authority["source"]["tree"]
-        or value.get("package_inventory", {}).get("version") != "3.0.0"
+        or value.get("package_inventory", {}).get("version") != "4.0.0"
     ):
         raise GateFailure("publication evidence receipt identity differs")
     release = value.get("release")
