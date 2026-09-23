@@ -55,23 +55,22 @@ full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
 row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
-Lane 12 selects complete integration
-`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976` and composes it with release
-preparation parent `1560988a67899926055864635fa2aee21b02ef8a`. The selected
-integration carries the catalog, product/runtime, Rust wire, CPU, CLI, Python,
-TypeScript, and multilingual-harness lanes. Its CPU crate metadata, README, and
-legal files match Lane 05 `dbcc464912877b2dcc4e765337e3e15001179f32`. Cargo
-metadata and the release config agree on 25 publishable packages; the
-package-content audit and the build from all 25 extracted archives pass.
+Lane 12 integrates Lane14 `b4734f23ca5a569c40d8b29360221091ffe5ced5` through
+selection merge `a9cd13b3f754d37581118fa188c0cb5bea6e8696`. That source includes the catalog
+and runtime profile binding,
+minor-9 Rust/Python/TypeScript wire, CLI and CPU executor, and Lane06 H100 CUDA
+implementation `1eb9eb319140276f1862d7f332218a08321604af` via reviewed cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
+CUDA is a default-off feature of `hyphae-native-embed-cpu`, not another crate;
+the source still has 25 publishable Rust crates. The request-tag-73 fixture is
+shared across Rust, Python, and TypeScript and mirrored into the Rust package.
 
-Lane 06 `b36f929ea89f0388f9d75fd7c5de3423ddfc16fe` is tree-identical to Lane 05,
-so it contributes no additional package or CUDA implementation. No CUDA claim
-is made. The checked-in harness retains an explicit unverified placeholder, not
-a model/result receipt. The hosted matrix, verified model/result receipt, and
-exact-SHA G8 closure remain open. Exact dependencies, commands, measured
-package results, and non-claims are recorded in the
-[`4.0.0` dependency ledger](../release/4.0.0-dependency-ledger.md). None of
-these package observations closes a release gate or expands shipped behavior.
+Local H100 CPU and BF16/FP16 checks, including embedded, UDS, HTTP, durable
+replay without an executor, and corruption/authorization failure paths, are
+source-side evidence only. The checked-in multilingual harness still has an
+unverified result placeholder. The exact final candidate must pass package,
+SDK, security, and hosted-equivalent checks at its branch-tip SHA. Signed
+release evidence, an exact-SHA 4.0.0 G8 closure, and registry publication
+authority remain open; none of the historical closure rows below is expanded.
 
 ## Exact-SHA G8 release closures per release
 

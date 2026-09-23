@@ -24,8 +24,9 @@ closure.
   carries it through Rust, Python, and TypeScript with bounded codecs, durable
   commit evidence, actual execution-profile reporting, and replay status.
 - Add the offline `hyphae-native-embed-cpu` executor and CLI model/profile/
-  ingestion commands. The source candidate contains 25 publishable crates. No
-  CUDA crate or implementation is present or claimed.
+  ingestion commands. Its default-off CUDA feature selects a validated H100,
+  records driver, runtime, compute dtype, canonical FP32 output, and whole-batch
+  CPU fallback. CUDA adds no crate; the candidate contains 25 publishable crates.
 - Add the multilingual embedding measurement harness with controlled model
   acquisition, containment, legal review, and receipt validation. Its checked-in
   result remains `unverified-no-measurement`; it grants no model or performance
@@ -63,10 +64,11 @@ closure.
   vulnerable `lru` dependency to 0.16.4.
 
 The workspace, 25-crate graph, SDK manifests, plugin manifests, and package
-inventories now share final source version `4.0.0`. The candidate selects
-integration `d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`, remains unpublished,
-and does not inherit an exact-commit G7/G8 closure. The `3.0.0` release history
-and publication receipts remain authoritative and unchanged.
+inventories share source version `4.0.0`. The candidate integrates Lane14
+`b4734f23ca5a569c40d8b29360221091ffe5ced5`, including reviewed accelerator
+cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
+It remains unpublished and has no exact-commit G7/G8 closure. The `3.0.0`
+release history and publication receipts remain authoritative.
 
 ## [3.0.0] - 2026-09-03
 

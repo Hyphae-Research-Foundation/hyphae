@@ -3,10 +3,11 @@
 Do not install an archive until its digest, identity, and provenance all
 verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
-The current source tree is prepared as a `4.0.0` release candidate from selected
-integration `d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`, not as a published
-release. Until its eventual protected-main commit has a signed release and G8
-closure, use this procedure only for candidate verification. The retained
+The current source tree is prepared as a `4.0.0` release candidate integrating
+Lane14 `b4734f23ca5a569c40d8b29360221091ffe5ced5`. The selected Lane12 branch tip is the
+exact candidate SHA to verify; a source file cannot name its own eventual commit SHA. No 4.0.0
+release is published. Until a protected-main commit has a signed release and
+G8 closure, use this procedure only for candidate verification. The retained
 `3.0.0` publication evidence and registry authority remain unchanged.
 
 ## Maintainer tag-target invariant

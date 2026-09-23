@@ -44,12 +44,14 @@ commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
 
-**Source release candidate:** `4.0.0` composes selected integration
-`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`. Its 25-crate graph adds the
-offline CPU embedding executor and carries the minor-9 Rust, Python, and
-TypeScript embed-and-ingest surfaces plus the measurement harness. It is not
-published and has no inherited exact-SHA G8 or verified model-result receipt.
-No CUDA implementation or CUDA package is present or claimed.
+**Source release candidate:** `4.0.0` integrates Lane14
+`b4734f23ca5a569c40d8b29360221091ffe5ced5` through the Lane12 selection merge
+`a9cd13b3f754d37581118fa188c0cb5bea6e8696`. The 25-crate graph adds offline Qwen3 embedding in the existing
+`hyphae-native-embed-cpu` crate, with a default-off validated H100 CUDA feature.
+Native minor-9 Rust, Python, and TypeScript clients share request tag 73 and
+the catalog-bound embedded, UDS, and HTTP operation. Local CPU and H100 model
+checks do not grant a published release, an exact-SHA G8 closure, or a verified
+model-result receipt. Registry authority remains at `3.0.0`.
 
 **What changed in 3.0.0:** the bounded SQL slice grows into its analytics
 form (`HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,

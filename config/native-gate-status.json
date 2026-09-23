@@ -128,14 +128,16 @@
     "version": "4.0.0",
     "status": "selected-integration-prepared",
     "release_preparation_commit": "d07c7fb81d5d972a11a04dbecc9f839e5142a024",
-    "release_composition_parent": "1560988a67899926055864635fa2aee21b02ef8a",
+    "release_composition_parent": "3769eb2cffd3ea1026d5a5e7be0d1f9399f902ba",
+    "integration_selection_commit": "a9cd13b3f754d37581118fa188c0cb5bea6e8696",
     "dependency_ledger": "docs/release/4.0.0-dependency-ledger.md",
-    "integration_commit": "d9af7f4393b1ef17536e3ee20d911e5f3c8f0976",
+    "integration_commit": "b4734f23ca5a569c40d8b29360221091ffe5ced5",
     "integration_checkpoint": "f92a5ef21431e33b4d5a8503d1f81bc30479b8ef",
     "observed_core_chain_commit": "dbcc464912877b2dcc4e765337e3e15001179f32",
     "observed_rust_wire_commit": "e014925cc6b329e947a37120ac985644a5df12ca",
     "observed_cli_consumer_commit": "84de293d49331859edf45cc268d0aeba743bd0d2",
-    "observed_accelerator_lane_commit": "b36f929ea89f0388f9d75fd7c5de3423ddfc16fe",
+    "observed_accelerator_lane_commit": "1eb9eb319140276f1862d7f332218a08321604af",
+    "accelerator_cherry_pick_commit": "994ee8f03a1fb713c89758ea058866cda92d6c26",
     "integrated_scope": [
       "final-package-identity",
       "embedding-profile-catalog-codec-4-minor-8",
@@ -146,7 +148,9 @@
       "cli-consumer",
       "python-sdk-minor-8-9",
       "typescript-sdk-minor-8-9",
-      "multilingual-embedding-harness"
+      "multilingual-embedding-harness",
+      "validated-h100-cuda-feature",
+      "cross-language-embed-and-ingest-fixture"
     ],
     "required_dependency_status": {
       "embedding-profile-catalog-codec-4-minor-8": "composed-package-verified",
@@ -154,17 +158,17 @@
       "python-minor-8-9": "composed-selected-integration-local-suite-passed",
       "typescript-minor-8-9": "composed-selected-integration-local-suite-passed",
       "product-runtime": "composed-package-verified",
-      "qwen-profile-execution": "cpu-executor-package-verified-model-result-evidence-open",
+      "qwen-profile-execution": "cpu-and-h100-cuda-real-model-local-tests-passed-verified-result-receipt-open",
       "cpu-backend": "publishable-crate-composed-extracted-build-passed",
-      "cuda-backend": "no-cuda-implementation-commit-no-claim",
+      "cuda-backend": "default-off-same-crate-h100-bf16-fp16-local-passed-hosted-open",
       "multilingual-harness": "composed-unverified-placeholder-no-result-claim"
     },
     "crate_inventory": {
       "declared_publishable_packages": 25,
       "composed_metadata_publishable_packages": 25,
       "order_config": "config/crates-io-release.json",
-      "backend_package_policy": "publishable-crates-only; binary-only-accelerators-excluded",
-      "package_audit": "passed-25-packages-47-compile-time-assets",
+      "backend_package_policy": "cuda-default-off-feature-of-hyphae-native-embed-cpu; package-count-25",
+      "package_audit": "passed-25-packages-48-compile-time-assets",
       "exact_package_verification": "passed-25-extracted-packages-rust-1.96.0"
     },
     "receipts": {

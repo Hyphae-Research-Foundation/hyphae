@@ -8,14 +8,14 @@ Conformance runners and independent verifiers remain private workspace tools
 and are not registry packages.
 
 The checked-in package inventory is prepared at `4.0.0` for package and
-release-candidate verification and selects integration
-`d9af7f4393b1ef17536e3ee20d911e5f3c8f0976`. That version is not
-live-publication authority: `apache_publication_authority`, the registry control
-plane, and the historical receipt remain pinned to
-`release-v3.0.0-crates`. Promoting 4.0.0 requires a later exact-SHA
-control-plane update after the hosted release matrix and G8 closure pass. Do
-not create a release tag or dispatch a live publication from this preparation
-commit.
+release-candidate verification. It integrates Lane14
+`b4734f23ca5a569c40d8b29360221091ffe5ced5` through the Lane12 selection merge
+`a9cd13b3f754d37581118fa188c0cb5bea6e8696`. That version is not live-publication
+authority: `apache_publication_authority`, the registry control plane, and the
+historical receipt remain pinned to `release-v3.0.0-crates`. Promoting 4.0.0
+requires a later exact-SHA control-plane update after the hosted release matrix
+and G8 closure pass. Do not create a release tag or dispatch live publication
+from this preparation branch.
 
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion
@@ -133,22 +133,26 @@ The dependency policy permits wildcard requirements only when Cargo metadata
 also identifies the edge as a local path; registry wildcard requirements
 remain denied.
 
-### CPU and accelerator backend crates
+### CPU and accelerator backend
 
-`hyphae-native-embed-cpu` is the publishable 4.0.0 CPU executor in layer 6.
-It depends on `hyphae-native-catalog` and `hyphae-native-product`; the layer-8
-`hyphae-cli` package depends on it. Its generated package must contain
-`README.md`, `LICENSE`, `LICENSE-DOCUMENTATION`, `LICENSE-POLICY.md`, and
-`THIRD_PARTY_NOTICES.md`, as required for every crate in this release graph.
+`hyphae-native-embed-cpu` is the sole publishable Qwen3 executor crate in layer
+6. It depends on `hyphae-native-catalog` and `hyphae-native-product`; the
+layer-8 `hyphae-cli` depends on it at `=4.0.0`. Its default CPU build needs no
+GPU or model. The same crate has a default-off `cuda` feature, and the CLI
+forwards it. Lane06 `1eb9eb319140276f1862d7f332218a08321604af` supplies the validated H100 implementation;
+Lane14 incorporated it in reviewed cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`. No 26th crate
+or binary-only accelerator publication is introduced.
 
-No CUDA implementation or CUDA package is present or claimed. Observed Lane 06
-commit `b36f929ea89f0388f9d75fd7c5de3423ddfc16fe` is tree-identical to CPU commit
-`dbcc464912877b2dcc4e765337e3e15001179f32`; it therefore adds no package and
-cannot authorize a CUDA binary claim. Any future accelerator crate must be
-publishable at the exact release version, occupy the layer derived from its
-actual Cargo edges, and update `package_count`. A CUDA-linked binary would also
-require separate legal review, target-specific validation, and a device-bound
-receipt under the native acceleration roadmap.
+An accelerator-capable build selects only a validated H100 and reports its
+actual device, driver, runtime, compute dtype, FP32 publication, and fallback
+profile. An unavailable CUDA result discards partial work and retries the
+whole batch on CPU when permitted. Local H100 BF16/FP16 and embedded/UDS/HTTP
+checks are required source evidence, not hosted release or comparative
+performance authority. The exact generated crate must contain its README,
+license files, notices, and feature-gated CUDA source; the H100 package check
+must compile that extracted feature in addition to the default extracted
+workspace. The 25-package audit also checks the minor-9 protocol fixture
+mirror, raising the compile-time asset count to 48.
 
 Use the `Registry publish` workflow. Pull requests and manual dry runs remain
 unprivileged and execute package audits plus exact crate tarball verification
