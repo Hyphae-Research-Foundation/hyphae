@@ -1,8 +1,8 @@
 # SDKs
 
 Hyphae maintains three bounded clients. All expose the published `/v1` API
-and the Native `/v2` product API. The table describes the `4.0.0` source
-candidate; registry publication remains gated:
+and the Native `/v2` product API. The Rust client is published at `4.0.0`;
+the Python and TypeScript SDKs remain source-only at that version:
 
 | Client | Location | Runtime floor | Runtime dependencies |
 |---|---|---:|---|
@@ -21,11 +21,10 @@ SQL, structures, integrated search, transactions, and proofs. They reject
 malformed error envelopes, require a valid `X-Request-Id`, and require
 an error envelope's request ID to match its header.
 
-The Rust, TypeScript, and Python source packages are maintained at `4.0.0`.
-None has been published at that version. Live crates.io authority remains
-bound to `3.0.0`; its historical receipt and distribution boundary are
-unchanged. The `3.0.0` TypeScript and Python packages remain source-only and
-unpublished to npm or PyPI.
+The Rust client is part of the 25 crates published on crates.io at `4.0.0`.
+The TypeScript and Python packages are maintained at `4.0.0` in source but
+remain unpublished to npm and PyPI. The `3.0.0` registry receipt remains
+historical authority for that version.
 
 TypeScript and Python preserve the signed 64-bit integer domain and reject
 invalid JSON on `/v1`, but their generated success models provide static typing only.

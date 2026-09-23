@@ -9,7 +9,7 @@ Shared product, API, disk-format, and proof-format version constants for
 [Hyphae](https://hyphae.dev), the autonomous, embeddable, verifiable Rust data
 engine.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

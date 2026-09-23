@@ -8,7 +8,7 @@
 Secure, loopback-first HTTP server for the [Hyphae](https://hyphae.dev) data
 engine and its proof-bearing `/v1` API.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

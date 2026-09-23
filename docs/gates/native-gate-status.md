@@ -40,38 +40,29 @@ commit path. The closed G7 profile therefore certifies the operational-scale
 matrix of the engine without per-operation authorization; the 1.2 access
 control, and every commit and read path added in the releases since, adds
 work to the measured paths that G7 did not observe. Performance claims for
-1.2.x and later releases, including the 4.0.0 candidate, must either cite this
+1.2.x and later releases, including 4.0.0, must either cite this
 scoped profile explicitly or wait for a G7 re-execution on a release commit
 that carries the added work, and in every case remain bound to a receipt under
 the vocabulary of [`docs/product/claims.md`](../product/claims.md).
 
-## 4.0.0 release-candidate status
+## 4.0.0 release status
 
-The source and package inventories are prepared at `4.0.0`. No 4.0.0 release
-tag, signed release, exact-SHA G8 closure, or publication receipt exists yet,
-so 4.0.0 is deliberately absent from the historical closure table below.
-Publication remains blocked until a selected integration commit completes the
-full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
-row and registry receipt remain historical authority and are not rewritten by
-candidate preparation.
+The annotated tag `release-v4.0.0-crates` targets source commit
+`7cbcf97d165beeb08aba27ff21203fa468f45bec`. Its hosted
+Release run `35912595431` signed four platform packages; readiness run
+`35876137219` and exact-SHA G8 closure run `35912994589` produced the
+retained [G8 aggregate](evidence/closures/native-g8-7cbcf97.json), SHA-256
+`f0bd9a0e08eff9ea2c45511deff816f7fc9edf7cd86752302a684e7ab25a83ce`.
+The protected crates.io run `35923881783` published and reverified all 25
+Rust crates. The [publication receipt](../release/receipts/4.0.0.md) records
+the external registry checksums.
 
-Lane 12 integrates Lane14 `f2336d8664b32d812cea3291d942e286a89eea9d` through
-selection merge `b60238760aa67e860800f1b194d103623cd20a92`. That source
-includes the catalog and runtime profile binding, minor-9 Rust/Python/TypeScript
-wire, CLI and CPU executor, and Lane06 H100 CUDA implementation
-`1eb9eb319140276f1862d7f332218a08321604af` via reviewed cherry-pick
-`994ee8f03a1fb713c89758ea058866cda92d6c26`.
-CUDA is a default-off feature of `hyphae-native-embed-cpu`, not another crate;
-the source still has 25 publishable Rust crates. The request-tag-73 fixture is
-shared across Rust, Python, and TypeScript and mirrored into the Rust package.
-
-Local H100 CPU and BF16/FP16 checks, including embedded, UDS, HTTP, durable
-replay without an executor, and corruption/authorization failure paths, are
-source-side evidence only. The checked-in multilingual harness still has an
-unverified result placeholder. The exact final candidate must pass package,
-SDK, security, and hosted-equivalent checks at its branch-tip SHA. Signed
-release evidence, an exact-SHA 4.0.0 G8 closure, and registry publication
-authority remain open; none of the historical closure rows below is expanded.
+The historical G7 operational-scale closure remains scoped to its earlier
+source and environment. The checked-in multilingual model-result placeholder
+remains unverified; neither G8 nor publication promotes it to a model-quality
+or universal latency claim. The lexical recovery evidence covers a maintained
+250,000-short-document rung, with separate document-state and shared ANN
+memory budgets; it does not claim every 250,000-document corpus fits.
 
 ## Exact-SHA G8 release closures per release
 
@@ -87,6 +78,7 @@ and are bound by SHA-256 into each release's publication evidence:
 | `v1.2.2` | `0471ae2` | `32253721973` | `32253724833` | `32256031172` | `aa7a76f3e8aacc87a8da4afb412f7c8fb152b1703975da22bda1f74deaa44543` |
 | `release-v2.2.0-crates` | `5bd8afb` | `33216579500` | `33229504738` | `33217308987` | `adbaef5a411ee3f72aac49ab98dfaa258d61894c12ed3540bdf5da07e74a6179` |
 | `release-v3.0.0-crates` | `24bce1a` | `33836088262` | `33838703304` | `33836655173` | `41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf` |
+| `release-v4.0.0-crates` | `7cbcf97` | `35876137219` | `35912595431` | `35912994589` | `f0bd9a0e08eff9ea2c45511deff816f7fc9edf7cd86752302a684e7ab25a83ce` |
 
 The `v1.2.2` closure aggregate additionally anchors the crates.io, npm, and
 PyPI registry publications of `1.2.2`; the PyPI publication receipt binds it
@@ -115,6 +107,11 @@ for the full publication record. Unlike the closures above, the `3.0.0`
 aggregate is retained byte-for-byte in this repository at
 [`evidence/closures/native-g8-24bce1a.json`](evidence/closures/native-g8-24bce1a.json),
 whose SHA-256 is the value in the table.
+
+`release-v4.0.0-crates` closes on source commit `7cbcf97d` through the
+runs in the table. Its [retained aggregate](evidence/closures/native-g8-7cbcf97.json)
+is byte-identical to the workflow artifact. crates.io publication is recorded
+in the [4.0.0 receipt](../release/receipts/4.0.0.md).
 
 ## G3 local validation record
 

@@ -8,7 +8,7 @@
 The single `hyphae` executable: local data engine, operations CLI, `/v1`
 server, remote client, offline proof verifier, and MCP stdio adapter.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```bash
 cargo install hyphae-cli --version 4.0.0 --locked
@@ -17,8 +17,8 @@ hyphae version --json
 
 The base deployment is one binary and one data directory. KV, structured
 query, recovery, backup/restore, and verification work without an external
-database, cache, cloud, embedding provider, LLM, or GPU. Source builds for the
-4.0.0 candidate can load a complete local Qwen3 embedding snapshot with
+database, cache, cloud, embedding provider, LLM, or GPU. The 4.0.0 binary
+can load a complete local Qwen3 embedding snapshot with
 `hyphae serve --embedding-manifest ... --embedding-model-dir ...`; embedded and
 native UDS/HTTP calls use the same registered executor. The default CPU build
 remains offline. An accelerator-capable source build enables `--features cuda`
@@ -35,9 +35,9 @@ Code is Apache-2.0; documentation is CC-BY-SA-4.0. Quickstart, release
 verification, and security policy:
 [`Hyphae-Research-Foundation/hyphae`](https://github.com/Hyphae-Research-Foundation/hyphae).
 
-Source builds also provide `hyphae memory-panel init` and `serve` for a dedicated
-Unix memory client interface. The 3.0.0 registry package predates this addition.
-See the [source guide](../../docs/memory-panel.md) for independent provisioning
+The 4.0.0 binary also provides `hyphae memory-panel init` and `serve`
+for a dedicated Unix memory client interface. The 3.0.0 registry package
+predates this addition. See the [source guide](../../docs/memory-panel.md) for independent provisioning
 and the exact server-enforced operation boundary.
 
 Memory recalls support explicit `semantic`, `hybrid` and `lexical` modes.

@@ -8,7 +8,7 @@
 Exact provider-neutral cosine retrieval and explicit abstention semantics for
 [Hyphae](https://hyphae.dev).
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

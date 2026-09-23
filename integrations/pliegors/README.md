@@ -8,7 +8,7 @@
 Optional public-contract adapter between PliegoRS applications and the
 [Hyphae](https://hyphae.dev) `/v1` API.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

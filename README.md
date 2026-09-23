@@ -32,45 +32,25 @@ vector search over a shared transaction, WAL, MVCC, recovery, and proof
 substrate. The engine runs offline and does not embed PostgreSQL, Valkey,
 OpenSearch, a cloud service, an embedding provider, or an LLM.
 
-**Stable Native release:** [`3.0.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v3.0.0-crates)
-is the latest release of the active Native architecture and the complete
-24-crate graph is [published on crates.io](https://crates.io/crates/hyphae-cli/3.0.0)
-([publication receipt](docs/release/receipts/3.0.0.md)).
-G0 through
-G8 are closed for their versioned, bounded profiles. G7 uses an
-environment-bound operational-scale authority; G8 binds the release archives,
-SBOMs, signatures, provenance, and fault matrices to the exact release
-commit. The [native gate status](docs/gates/native-gate-status.md) is the
-current status authority; temporary workflow artifacts alone do not close a
-gate.
+**Stable Native release:** [`4.0.0`](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v4.0.0-crates)
+is the latest release of the Native architecture. Its 25-crate graph is
+[published on crates.io](https://crates.io/crates/hyphae-cli/4.0.0)
+([publication receipt](docs/release/receipts/4.0.0.md)). The annotated tag
+points to source commit `7cbcf97d`; its signed archives and exact-SHA G8
+closure are indexed in the [native gate status](docs/gates/native-gate-status.md).
+G7 retains its scoped C-60 operational-scale authority and does not certify
+new 4.0.0 performance or model-quality results.
 
-**Source release candidate:** `4.0.0` integrates Lane14
-`f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
-selection merge `b60238760aa67e860800f1b194d103623cd20a92`. The 25-crate
-graph adds offline Qwen3 embedding in the existing
-`hyphae-native-embed-cpu` crate, with a default-off validated H100 CUDA feature.
-Native minor-9 Rust, Python, and TypeScript clients share request tag 73 and
-the catalog-bound embedded, UDS, and HTTP operation. Local CPU and H100 model
-checks do not grant a published release, an exact-SHA G8 closure, or a verified
-model-result receipt. Registry authority remains at `3.0.0`.
-
-**What changed in 3.0.0:** the bounded SQL slice grows into its analytics
-form (`HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,
-aliases), the keyspace gains the Valkey-shaped conditional and range commands
-on wire minor 6, and search gains relative-score fusion, autocut, float doc
-values, range facets, lexical `AND`/`OR` with minimum-match, prefix and fuzzy
-expansion, phrase matching, and BM25F field boosts. The collection document
-bound moves from 100,000 to 250,000 documents on receipts, with the first
-complete lexical ladder at 1,000,000 documents and a dedicated-hardware
-re-measurement of the whole release bound to an exact commit. The major
-version marks durable records 2.x cannot read (`HYPOST02` postings, the
-chunked `HYPSMAN2`/`HYPSCHK1` manifest); every 2.x directory opens on 3.0 and
-upgrades in place on its first accepted mutation. See the
-[3.0.0 changelog](CHANGELOG.md#300---2026-09-03).
-
-G8 release evidence binds publication to the exact release commit. The G7
-closure certifies the C-60 operational-scale control matrix but makes no
-canonical dedicated-hardware latency, interference, or bare-metal claim.
+**What changed in 4.0.0:** snapshot-coherent Agent Memory recall and
+conditional enrichment, catalogued local embedding profiles, atomic
+embed-and-ingest on Native protocol minor 9, and an offline Qwen3 CPU executor
+with optional validated H100 CUDA. Vector updates use durable physical deltas;
+large lexical roots use bounded recovery and typed admission. The included
+multilingual measurement placeholder is unverified and grants no model-result
+claim. The 3.0 on-disk format transition remains a compatibility boundary:
+2.x readers cannot open upgraded postings or manifests. See the
+[4.0.0 changelog](CHANGELOG.md#400---2026-09-23) and
+[release verification guide](docs/release/verification.md).
 
 ## What Hyphae does
 
@@ -246,29 +226,24 @@ machine-readable measurement file has SHA-256
 ## Install
 
 Download the archive for your platform from the
-[`3.0.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v3.0.0-crates),
+[`4.0.0` GitHub release](https://github.com/Hyphae-Research-Foundation/hyphae/releases/tag/release-v4.0.0-crates),
 then verify its checksum and Sigstore bundle before installing the `hyphae`
 binary. To install from crates.io, run:
 
 ```bash
-cargo install hyphae-cli --version 3.0.0 --locked
+cargo install hyphae-cli --version 4.0.0 --locked
 ```
 
-That coordinate is live for all 24 published crates. Build and embed the exact
-release source with:
+Build the exact release source with:
 
 ```bash
-git checkout release-v3.0.0-crates
+git checkout release-v4.0.0-crates
 cargo build --release --locked -p hyphae-cli
 ./target/release/hyphae version --json
 ```
 
 The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
 checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
-
-The checked-out source is the `4.0.0` release candidate. It is not published
-and has no inherited exact-SHA G8 closure; the commands above intentionally
-remain bound to the verified `3.0.0` release until a new release is authorized.
 
 ## Legacy 0.2.1 compatibility flow
 
@@ -338,14 +313,10 @@ The Native line is organized around `hyphae-native-product` (embedded facade),
 `hyphae-native-runtime` (SQL, structures, search, transactions, and
 scheduling), `hyphae-native-protocol`/`hyphae-native-daemon` (local transport),
 and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,manifest,ann}`
-storage and execution primitives. `hyphae-cli` builds the single product
-binary.
+storage and execution primitives. `hyphae-cli` builds the single product binary.
 
-The `4.0.0` source candidate has 25 publishable crates. It adds
-`hyphae-native-embed-cpu` to the graph below; package audit and extracted-crate
-verification are local candidate evidence, not registry publication authority.
-
-Version `3.0.0` publishes the complete 24-crate graph:
+Version `4.0.0` publishes the complete 25-crate graph. CUDA is a default-off
+feature of `hyphae-native-embed-cpu`, so it adds no separate crate:
 
 - contracts and shared APIs: `hyphae-core`, `hyphae-contracts`,
   `hyphae-query`, and `hyphae-retrieval`;
@@ -354,9 +325,9 @@ Version `3.0.0` publishes the complete 24-crate graph:
   `hyphae-native-records`, `hyphae-native-wal`, `hyphae-native-blobs`,
   `hyphae-native-btree`, and `hyphae-native-manifest`;
 - runtime and public access: `hyphae-native-runtime`,
-  `hyphae-native-product`, `hyphae-native-protocol`,
-  `hyphae-native-daemon`, `hyphae-engine`, `hyphae-storage`,
-  `hyphae-client`, and `hyphae-server`; and
+  `hyphae-native-product`, `hyphae-native-embed-cpu`,
+  `hyphae-native-protocol`, `hyphae-native-daemon`, `hyphae-engine`,
+  `hyphae-storage`, `hyphae-client`, and `hyphae-server`; and
 - distribution and adapters: `hyphae-cli` and `hyphae-pliegors`.
 
 The compatibility crates remain available as part of that graph:

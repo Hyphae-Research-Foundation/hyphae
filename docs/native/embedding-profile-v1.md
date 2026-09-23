@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native embedding profile metadata v1
 
-Status: 4.0.0 release-candidate contract; offline CPU execution and optional H100 CUDA
+Status: 4.0.0 release contract; offline CPU execution and optional H100 CUDA
 
 This contract defines a catalogued embedding profile, an optional named-vector
 binding, and atomic embedding ingestion through the embedded product and native

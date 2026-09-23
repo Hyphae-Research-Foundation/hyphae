@@ -3,12 +3,12 @@
 Do not install an archive until its digest, identity, and provenance all
 verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
-The current source tree is prepared as a `4.0.0` release candidate integrating
-Lane14 `f2336d8664b32d812cea3291d942e286a89eea9d`. The selected
-Lane12 branch tip is the exact candidate SHA to verify; a source file cannot
-name its own eventual commit SHA. No 4.0.0 release is published. Until a protected-main commit has a signed release and
-G8 closure, use this procedure only for candidate verification. The retained
-`3.0.0` publication evidence and registry authority remain unchanged.
+The current `4.0.0` release is bound to annotated tag `release-v4.0.0-crates` and
+source commit `7cbcf97d165beeb08aba27ff21203fa468f45bec`. Its signed
+Release run `35912595431` and exact-SHA G8 closure run `35912994589` are retained in the
+[publication receipt](receipts/4.0.0.md). Verify that tag, source, checksums,
+and workflow identity together. The `3.0.0` publication remains historical
+authority for its own source.
 
 ## Maintainer tag-target invariant
 

@@ -1,6 +1,6 @@
 # Native quickstart
 
-Status: current for `3.0.0` and later published Native releases; the
+Status: current for `4.0.0` and later published Native releases; the
 closed G0-G8 profiles and their receipts are indexed by the
 [native gate status](gates/native-gate-status.md).
 
@@ -11,7 +11,7 @@ requires no database, cache, cloud service, embedding provider, or LLM.
 ## Install or build the binary
 
 ```bash
-cargo install hyphae-cli --version 3.0.0 --locked
+cargo install hyphae-cli --version 4.0.0 --locked
 hyphae version --json
 ```
 

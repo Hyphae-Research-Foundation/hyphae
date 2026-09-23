@@ -15,7 +15,10 @@ publishable packages and exact extracted archives were verified from this
 source. The exact source, tree, tag object, required checks, artifacts, and
 Release-run identity are pinned separately in
 [`config/registry-publish-authority.json`](../../config/registry-publish-authority.json).
-The live workflow rechecks these authorities before each registry upload.
+The protected crates.io workflow completed as
+[run `35923881783`](https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/35923881783);
+its [publication receipt](receipts/4.0.0.md) records all 25 registry checksums.
+The live workflow rechecked these authorities before each registry upload.
 
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion
