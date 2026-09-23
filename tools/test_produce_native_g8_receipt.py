@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -11,6 +12,8 @@ from tools.check_native_g8_receipts import GateFailure, authority, validate_rece
 from tools.produce_native_g8_receipt import (
     CHECKPOINT_BOUNDARIES,
     COMMIT_BOUNDARIES,
+    FIRST_PARTY_ARTIFACT_COUNT,
+    FIRST_PARTY_IDENTITY_COUNT,
     PROMOTION_BOUNDARIES,
     POWER_LOSS_COMMIT,
     SNAPSHOT_PIN_BOUNDARIES,
@@ -20,6 +23,10 @@ from tools.run_native_g8_test_gate import SUITES
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "packaging"))
+
+from g8_release_verification import expected_hyphae_identities  # noqa: E402
+
 COMMIT = "a" * 40
 WORKSPACE_VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))[
     "workspace"
@@ -78,8 +85,8 @@ def signed_release() -> dict:
         "attestation_verifications": 12,
         "software_license": "Apache-2.0",
         "license_authority": "tracked-package-manifests-and-local-locks-v1",
-        "first_party_artifact_count": 91,
-        "first_party_identity_count": 34,
+        "first_party_artifact_count": 92,
+        "first_party_identity_count": 35,
         "spdx_hyphae_components": ["hyphae-native-runtime"],
         "cyclonedx_hyphae_components": ["hyphae-native-runtime"],
         "spdx_sha256": "1" * 64,
@@ -304,12 +311,17 @@ class G8ProducerTests(unittest.TestCase):
             "sbom-signatures-provenance", signed_release(), platform="release"
         )
 
-    def test_signed_release_requires_semantically_verified_agpl_sboms(self) -> None:
+    def test_signed_release_inventory_matches_current_manifests(self) -> None:
+        identities = expected_hyphae_identities(ROOT)
+        self.assertEqual(sum(identities.values()), FIRST_PARTY_ARTIFACT_COUNT)
+        self.assertEqual(len(identities), FIRST_PARTY_IDENTITY_COUNT)
+
+    def test_signed_release_requires_semantically_verified_apache_sboms(self) -> None:
         for field, value in (
             ("software_license", "GPL-3.0-only"),
             ("license_authority", "untrusted"),
-            ("first_party_artifact_count", 90),
-            ("first_party_identity_count", 32),
+            ("first_party_artifact_count", 91),
+            ("first_party_identity_count", 34),
             ("spdx_hyphae_components", []),
             ("cyclonedx_hyphae_components", []),
             ("spdx_hyphae_components", ["third-party-runtime"]),
