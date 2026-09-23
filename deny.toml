@@ -2,7 +2,12 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Pinned Candle/gemm and tokenizers require transitive paste 1.0.15. This
+# advisory reports unmaintained status, not a vulnerability; no fixed paste
+# release exists. Keep the exception specific to this RustSec advisory.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is transitive via pinned Candle/gemm and tokenizers; unmaintained notice only, with no safe upgrade" },
+]
 
 [licenses]
 version = 2
