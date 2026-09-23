@@ -9,9 +9,9 @@ and are not registry packages.
 
 The checked-in package inventory is prepared at `4.0.0` for package and
 release-candidate verification. It integrates Lane14
-`b4734f23ca5a569c40d8b29360221091ffe5ced5` through the Lane12 selection merge
-`a9cd13b3f754d37581118fa188c0cb5bea6e8696`. That version is not live-publication
-authority: `apache_publication_authority`, the registry control plane, and the
+`f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. That version
+is not live-publication authority: `apache_publication_authority`, the registry control plane, and the
 historical receipt remain pinned to `release-v3.0.0-crates`. Promoting 4.0.0
 requires a later exact-SHA control-plane update after the hosted release matrix
 and G8 closure pass. Do not create a release tag or dispatch live publication

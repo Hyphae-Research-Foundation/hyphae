@@ -55,11 +55,12 @@ full hosted matrix and its exact-SHA G8 evidence is retained. The 3.0.0 closure
 row and registry receipt remain historical authority and are not rewritten by
 candidate preparation.
 
-Lane 12 integrates Lane14 `b4734f23ca5a569c40d8b29360221091ffe5ced5` through
-selection merge `a9cd13b3f754d37581118fa188c0cb5bea6e8696`. That source includes the catalog
-and runtime profile binding,
-minor-9 Rust/Python/TypeScript wire, CLI and CPU executor, and Lane06 H100 CUDA
-implementation `1eb9eb319140276f1862d7f332218a08321604af` via reviewed cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
+Lane 12 integrates Lane14 `f2336d8664b32d812cea3291d942e286a89eea9d` through
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. That source
+includes the catalog and runtime profile binding, minor-9 Rust/Python/TypeScript
+wire, CLI and CPU executor, and Lane06 H100 CUDA implementation
+`1eb9eb319140276f1862d7f332218a08321604af` via reviewed cherry-pick
+`994ee8f03a1fb713c89758ea058866cda92d6c26`.
 CUDA is a default-off feature of `hyphae-native-embed-cpu`, not another crate;
 the source still has 25 publishable Rust crates. The request-tag-73 fixture is
 shared across Rust, Python, and TypeScript and mirrored into the Rust package.

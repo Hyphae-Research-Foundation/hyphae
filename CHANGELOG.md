@@ -63,9 +63,12 @@ closure.
 - Update the isolated Tantivy benchmark baseline to 0.26.2, resolving the
   vulnerable `lru` dependency to 0.16.4.
 
+The Rust minimum supported version is 1.90 because the pinned `redb 4.2.0`
+requires it.
+
 The workspace, 25-crate graph, SDK manifests, plugin manifests, and package
 inventories share source version `4.0.0`. The candidate integrates Lane14
-`b4734f23ca5a569c40d8b29360221091ffe5ced5`, including reviewed accelerator
+`f2336d8664b32d812cea3291d942e286a89eea9d`, including reviewed accelerator
 cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
 It remains unpublished and has no exact-commit G7/G8 closure. The `3.0.0`
 release history and publication receipts remain authoritative.

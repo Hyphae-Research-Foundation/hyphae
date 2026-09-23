@@ -101,7 +101,7 @@ Consumer verification is documented in
 
 crates.io and npm use the separate `Registry publish` workflow. Dry-runs are
 allowed against the 25-package `4.0.0` source manifests integrating Lane14
-`b4734f23ca5a569c40d8b29360221091ffe5ced5`. Release artifact finalization is
+`f2336d8664b32d812cea3291d942e286a89eea9d`. Release artifact finalization is
 also pinned to `4.0.0`, but a manual run without a tag produces candidate
 artifacts only. Live registry publication remains fail-closed unless the source
 is a clean checkout of the annotated `release-v3.0.0-crates` tag and every

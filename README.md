@@ -45,8 +45,9 @@ current status authority; temporary workflow artifacts alone do not close a
 gate.
 
 **Source release candidate:** `4.0.0` integrates Lane14
-`b4734f23ca5a569c40d8b29360221091ffe5ced5` through the Lane12 selection merge
-`a9cd13b3f754d37581118fa188c0cb5bea6e8696`. The 25-crate graph adds offline Qwen3 embedding in the existing
+`f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. The 25-crate
+graph adds offline Qwen3 embedding in the existing
 `hyphae-native-embed-cpu` crate, with a default-off validated H100 CUDA feature.
 Native minor-9 Rust, Python, and TypeScript clients share request tag 73 and
 the catalog-bound embedded, UDS, and HTTP operation. Local CPU and H100 model

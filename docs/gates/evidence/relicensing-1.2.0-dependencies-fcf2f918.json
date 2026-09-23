@@ -8,7 +8,7 @@
         "licenses"
       ],
       "exit_status": 0,
-      "stderr_sha256": "3452872b8beff44d4ea661902f5ebb274960e9527c77932dd30729a8accb8c64",
+      "stderr_sha256": "ba6de222e483d2da22fe040ff162dd285c663b5ca134543db4d5b22ed9c79e96",
       "stdout_sha256": "71dadc8c8978da797b94dc581b666330c737551839c8fc820d7647130930c4b7"
     },
     "cargo_deny_unmatched_allowances": [
@@ -39,7 +39,7 @@
     "result": "pass"
   },
   "conclusion": "The exact locked Rust graph has no external GPL-2.0-only package and no external strong-copyleft dependency without a declared permissive alternative. This receipt does not change the current project license.",
-  "generated_at_utc": "2026-09-23T03:10:06.430402+00:00",
+  "generated_at_utc": "2026-09-23T03:32:53.766409+00:00",
   "inventory": {
     "canonical_sha256": "6de94f812530f489e76a0447023c87d4b14d5a604f3c95caa3dcf26f01eef687",
     "external_package_count": 354,
@@ -2732,13 +2732,13 @@
     "transitioned_from_release_1_1_0_license": "AGPL-3.0-only"
   },
   "source": {
-    "commit": "a9cd13b3f754d37581118fa188c0cb5bea6e8696",
+    "commit": "b60238760aa67e860800f1b194d103623cd20a92",
     "legal_base_commit": "fcf2f918e1539cfb7d67fd52abf0c7d57169ec18",
     "legal_base_tree": "51b283d27d0c0f5d194680de1d3e273b57f2ff95",
     "mode": "integration-tree",
     "repository": "https://github.com/Hyphae-Research-Foundation/hyphae.git",
-    "source_inputs_sha256": "8e0af91a1c72cd095a61170b73799ab0e124ce516bea845aa61ed15e1ab7d91e",
-    "tree": "99118f866ad17d617a7dd3881ee536713e858ca7",
+    "source_inputs_sha256": "8dcf32d55a3912e0518764ce27ea40874cd17432bade4a28c0003e42e4b85b8d",
+    "tree": "cdce387692563483f861069979d7cb7af60e9942",
     "worktree_clean": false
   },
   "source_inputs": [
@@ -2748,7 +2748,7 @@
     },
     {
       "path": "Cargo.toml",
-      "sha256": "c4c995add0fbabbcd08cc72049993087ee54738b8608f34b91e89c58b60e9dce"
+      "sha256": "fd21193076e285ba3b6fb5216622a17bd386e22d666e4c43c0a444b956580a26"
     },
     {
       "path": "benchmarks/baseline-harness/Cargo.lock",
@@ -2756,7 +2756,7 @@
     },
     {
       "path": "benchmarks/baseline-harness/Cargo.toml",
-      "sha256": "55da71e60bc995368532c0425b9855e179d8c0f10bae5b9ec79a21cce312e6c0"
+      "sha256": "9b972079fb3284f34d1024225c9cace61d492f1cd3744f5046c40addf0ffbdb7"
     },
     {
       "path": "conformance/g6/runners/rust/Cargo.lock",
@@ -2884,7 +2884,7 @@
     },
     {
       "path": "deny.toml",
-      "sha256": "73a0a72da0caac72fc2966e4a4b6c64a260d1a095fe1139ad8fe69782b1c1f17"
+      "sha256": "b95fefb943dc32029f607e71d4d1f28732daf63ee3b0672d817062bdc454732d"
     },
     {
       "path": "embed/Cargo.lock",
