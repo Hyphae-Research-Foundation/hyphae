@@ -21,6 +21,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM_CYCLES = 4
 MINIMUM_WRITES_PER_CYCLE = 32
+SOAK_SEARCH_BATCH_DOCUMENTS = 16
 
 
 def run_json(binary: Path, *arguments: str, timeout: int = 120) -> dict[str, Any]:
@@ -182,9 +183,11 @@ def write_cycle(binary: Path, data: Path, cycle: int, writes: int) -> int:
             },
         })
     transaction_steps.append({"operation": "commit"})
+    # The CLI requires one caller-stable token per committed script.
     transaction = run_json(
         binary, "transaction", "--data-dir", str(data), "execute",
         "--steps-json", json.dumps(transaction_steps, separators=(",", ":")),
+        "--idempotency-token", str(cycle + 1),
     )
     transaction_results = transaction.get("steps")
     if (
@@ -194,11 +197,16 @@ def write_cycle(binary: Path, data: Path, cycle: int, writes: int) -> int:
         or transaction_results[-1].get("status") != "committed"
     ):
         raise RuntimeError("SQL/structure soak transaction did not commit")
-    run_json(
-        binary, "search", "--data-dir", str(data), "ingest",
-        "--collection", "13", "--idempotency-id", str(cycle + 1),
-        "--documents-json", json.dumps(documents, separators=(",", ":")),
-    )
+    for offset in range(0, len(documents), SOAK_SEARCH_BATCH_DOCUMENTS):
+        run_json(
+            binary, "search", "--data-dir", str(data), "ingest",
+            "--collection", "13",
+            "--idempotency-id", str(cycle * writes + offset + 1),
+            "--documents-json", json.dumps(
+                documents[offset:offset + SOAK_SEARCH_BATCH_DOCUMENTS],
+                separators=(",", ":"),
+            ),
+        )
     run_json(binary, "checkpoint", "--data-dir", str(data))
     return cycle * writes + writes
 
