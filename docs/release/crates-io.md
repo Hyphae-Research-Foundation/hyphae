@@ -1,7 +1,7 @@
 # Publish the Rust crates
 
-The Apache registry publication is authorized only for exact version `3.0.0`
-from annotated tag `release-v3.0.0-crates`. The version, immutable
+The next Apache registry publication is staged for exact version `4.0.0`
+from annotated tag `release-v4.0.0-crates`. The version, immutable
 dependency layers, and exact source authority are defined in
 [`config/crates-io-release.json`](../../config/crates-io-release.json).
 Conformance runners and independent verifiers remain private workspace tools
@@ -10,12 +10,13 @@ and are not registry packages.
 The checked-in package inventory is prepared at `4.0.0` for package and
 release-candidate verification. It integrates Lane14
 `f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
-selection merge `b60238760aa67e860800f1b194d103623cd20a92`. That version
-is not live-publication authority: `apache_publication_authority`, the registry control plane, and the
-historical receipt remain pinned to `release-v3.0.0-crates`. Promoting 4.0.0
-requires a later exact-SHA control-plane update after the hosted release matrix
-and G8 closure pass. Do not create a release tag or dispatch live publication
-from this preparation branch.
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`.
+
+The tag pin names `release-v4.0.0-crates`, while the exact source, tree,
+tag-object, check, artifact, and Release-run pins still describe the retained
+3.0.0 authority. Live publication stays closed until the 4.0.0 signed Release
+and exact-SHA G8 closure pass and a separate control commit pins their evidence.
+Create the release tag from the selected main commit, not this control branch.
 
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion
@@ -25,8 +26,8 @@ the tag being published. The trusted checker and policy are loaded from the
 
 ## Preconditions
 
-1. Land version `3.0.0`, then create the annotated tag
-   `release-v3.0.0-crates`. The registry workflow fetches the exact remote tag
+1. Land version `4.0.0`, then create the annotated tag
+   `release-v4.0.0-crates`. The registry workflow fetches the exact remote tag
    object, requires its target to be an ancestor of current `origin/main`, and
    separately requires the trusted workflow SHA to equal current `origin/main`.
 2. Complete the pinned exact-SHA GitHub check suite in
@@ -271,14 +272,15 @@ repository, not from the receipt.)
 
 ## Verify consumers
 
-Use clean temporary projects, not workspace paths:
+After the 4.0.0 publication receipt exists, use clean temporary projects,
+not workspace paths:
 
 ```bash
-cargo install hyphae-cli --version 3.0.0 --locked
+cargo install hyphae-cli --version 4.0.0 --locked
 hyphae version --json
 ```
 
-Also create a minimal Rust application with exact `=3.0.0` dependencies on
+Also create a minimal Rust application with exact `=4.0.0` dependencies on
 `hyphae-engine`, `hyphae-query`, and `hyphae-native-product`; build it with
 `--locked`. Verify that docs.rs has accepted every library package, then record
 all crates.io URLs, checksums, and the Git tag in the publication receipt.

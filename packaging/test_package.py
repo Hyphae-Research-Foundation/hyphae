@@ -398,8 +398,8 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(crates_release["version"], version)
         self.assertEqual(npm_release["version"], version)
         publication_authority = {
-            "version": "3.0.0",
-            "tag": "release-v3.0.0-crates",
+            "version": "4.0.0",
+            "tag": "release-v4.0.0-crates",
             "source_ref_kind": "annotated-tag",
             "require_exact_clean_source": True,
         }
@@ -409,7 +409,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(
             npm_release["apache_publication_authority"], publication_authority
         )
-        self.assertNotEqual(version, publication_authority["version"])
+        self.assertEqual(version, publication_authority["version"])
         for layer in crates_release["layers"]:
             for package in layer:
                 readme_path = (
@@ -438,14 +438,14 @@ class PackageTests(unittest.TestCase):
         )
         self.assertIn('test "$RELEASE_TAG" = "release-v4.0.0-crates"', release_workflow)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        authority_version = re.escape(publication_authority["version"])
+        previous_version = re.escape("3.0.0")
         self.assertRegex(
             changelog,
             rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         )
         self.assertRegex(
             changelog,
-            rf"(?m)^## \[{authority_version}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
+            rf"(?m)^## \[{previous_version}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         )
 
     def test_release_workflow_separates_native_and_candidate_artifacts(
