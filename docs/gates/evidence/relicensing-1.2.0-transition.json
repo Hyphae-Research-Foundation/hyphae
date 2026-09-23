@@ -16,7 +16,7 @@
   },
   "transitioned_tree": {
     "digest_domain": "hyphae-relicensing-transition-tree-v1",
-    "content_sha256": "7f7d2437697ae0e170d155d9ae7b8d02a8b97079b59746413ffe130563a2a6e0",
+    "content_sha256": "2e088553c17875e8ebb1457736c0d6275869c2879b490df91c372456020bdaaf",
     "path_count": 1647,
     "excluded_paths": [
       "docs/gates/evidence/relicensing-1.2.0-transition.json"
@@ -25,7 +25,7 @@
       "narrative-documentation": 347,
       "normative-specification": 172,
       "reserved-trademark-asset": 2,
-      "software": 1124,
+      "software": 1126,
       "third-party-material": 3
     },
     "statement": "The digest binds sorted path names and current content bytes for every tracked or nonignored pending path except this self-referential receipt. The owner-attested base commit must remain an ancestor, so the same receipt validates both the pre-commit integration tree and the committed tree with identical content without predicting a future commit ID."
