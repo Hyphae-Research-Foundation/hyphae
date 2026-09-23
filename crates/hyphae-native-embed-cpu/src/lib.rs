@@ -27,8 +27,9 @@ use hyphae_native_catalog::{
     QWEN3_EMBEDDING_OUTPUT_DIMENSIONS, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
 };
 use hyphae_native_product::{
-    NativeProduct, ProductEmbeddingBatchOutput, ProductEmbeddingExecutor,
-    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
+    NativeProduct, ProductEmbeddingBackend, ProductEmbeddingBatchOutput,
+    ProductEmbeddingExecutionProfile, ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest,
+    ProductEmbeddingPrecision, ProductError, ProductErrorCode,
     ProductLocalEmbeddingExecutionProfile, ProductVector,
 };
 use serde::Deserialize;
@@ -488,6 +489,8 @@ struct ExecutionBackend {
     device_profile: String,
     compute_dtype: DType,
     compute_dtype_profile: &'static str,
+    driver_profile: String,
+    runtime_profile: String,
 }
 
 impl ExecutionBackend {
@@ -498,6 +501,8 @@ impl ExecutionBackend {
             device_profile: "cpu".to_owned(),
             compute_dtype: DType::F32,
             compute_dtype_profile: "float32",
+            driver_profile: "not-applicable".to_owned(),
+            runtime_profile: format!("candle/{CANDLE_VERSION}"),
         }
     }
 }
@@ -532,6 +537,12 @@ impl Qwen3CudaComputeDType {
 
 #[cfg(feature = "cuda")]
 fn select_validated_h100(compute_dtype: Qwen3CudaComputeDType) -> Option<ExecutionBackend> {
+    let driver_api = cudarc::runtime::result::version::get_driver_version().ok()?;
+    let runtime_api = cudarc::runtime::result::version::get_runtime_version().ok()?;
+    let driver_profile = nvidia_driver_release().map_or_else(
+        || format!("cuda-driver-api-{driver_api}"),
+        |release| format!("nvidia-{release};cuda-driver-api-{driver_api}"),
+    );
     let count = usize::try_from(CudaContext::device_count().ok()?).ok()?;
     for ordinal in 0..count {
         let Ok(context) = CudaContext::new(ordinal) else {
@@ -568,9 +579,28 @@ fn select_validated_h100(compute_dtype: Qwen3CudaComputeDType) -> Option<Executi
             ),
             compute_dtype: compute_dtype.candle(),
             compute_dtype_profile: compute_dtype.profile(),
+            driver_profile,
+            runtime_profile: format!("cuda-runtime-api-{runtime_api};candle/{CANDLE_VERSION}"),
         });
     }
     None
+}
+
+#[cfg(feature = "cuda")]
+fn nvidia_driver_release() -> Option<String> {
+    let version = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+    version
+        .lines()
+        .next()?
+        .split_ascii_whitespace()
+        .find_map(|part| {
+            let components: Vec<_> = part.split('.').collect();
+            (components.len() == 3
+                && components
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
+            .then(|| part.to_owned())
+        })
 }
 
 #[cfg(feature = "cuda")]
@@ -630,6 +660,54 @@ impl LoadedModel {
             u32::try_from(checkpoint_chunk_tokens)
                 .map_err(|_| product_error(ProductErrorCode::LimitExceeded))?,
         )
+    }
+}
+
+impl LoadedModel {
+    fn product_execution_profile(
+        &self,
+        embedding_profile: hyphae_native_product::ObjectId,
+        checkpoint_chunk_tokens: usize,
+    ) -> Result<ProductEmbeddingExecutionProfile, ProductError> {
+        let local = self.execution_profile(checkpoint_chunk_tokens)?;
+        let mut digest = String::with_capacity(64);
+        for byte in local.artifact_manifest_digest() {
+            use std::fmt::Write as _;
+            write!(digest, "{byte:02x}")
+                .map_err(|_| product_error(ProductErrorCode::Unavailable))?;
+        }
+        let cuda = self.backend.device.is_cuda();
+        let backend = if cuda {
+            ProductEmbeddingBackend::Cuda
+        } else {
+            ProductEmbeddingBackend::Cpu
+        };
+        let device = if cuda {
+            local.device().to_owned()
+        } else {
+            format!("cpu:{}", local.target())
+        };
+        Ok(ProductEmbeddingExecutionProfile {
+            embedding_profile,
+            backend,
+            device,
+            driver: self.backend.driver_profile.clone(),
+            runtime: format!(
+                "{};model={};manifest={digest};compute={};output=f32;checkpoint_tokens={}",
+                self.backend.runtime_profile,
+                local.model_revision(),
+                local.compute_dtype(),
+                local.checkpoint_chunk_tokens(),
+            ),
+            precision: ProductEmbeddingPrecision::F32,
+            kernels: vec![
+                format!("qwen3-forward-{}", local.compute_dtype()),
+                "last-token-pooling-f32".to_owned(),
+                "leading-dimension-projection-f32".to_owned(),
+                "l2-normalization-f32".to_owned(),
+            ],
+            fallback: false,
+        })
     }
 }
 
@@ -911,7 +989,9 @@ impl ProductEmbeddingExecutor for Qwen3AcceleratorExecutor {
         let primary = embed_with_model(&model.primary, self.limits, request, checkpoint);
         if let Some(cpu_fallback) = model.cpu_fallback.as_ref() {
             whole_batch_cpu_fallback(primary, checkpoint, |checkpoint| {
-                embed_with_model(cpu_fallback, self.limits, request, checkpoint)
+                let mut output = embed_with_model(cpu_fallback, self.limits, request, checkpoint)?;
+                output.execution_profile.fallback = true;
+                Ok(output)
             })
         } else {
             primary
@@ -1005,6 +1085,8 @@ fn embed_with_model(
     Ok(ProductEmbeddingBatchOutput {
         vectors,
         input_tokens: tokenized.input_tokens,
+        execution_profile: model
+            .product_execution_profile(request.profile.header.id, limits.checkpoint_chunk_tokens)?,
     })
 }
 

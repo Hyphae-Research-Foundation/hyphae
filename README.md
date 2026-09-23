@@ -426,7 +426,9 @@ authority.
 
 The repository pins its toolchain and enforces format, Clippy, tests,
 rustdoc, contracts, documentation, dependency policy, secret scanning,
-cross-platform packages, fuzzing, and recovery stress.
+cross-platform packages, fuzzing, and recovery stress. The full all-features
+commands below require a CUDA toolkit. CPU-only hosts use the non-CUDA suite in
+the [development guide](docs/development.md).
 
 ```console
 cargo fmt --all --check

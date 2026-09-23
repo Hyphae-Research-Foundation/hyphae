@@ -6,6 +6,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use hyphae_native_catalog::{
     CatalogObjectV2, EmbeddingProfileDefinition, LogicalCatalogObject, MAX_CATALOG_NAME_BYTES,
+    NamedVectorDefinition,
 };
 
 use crate::{
@@ -14,9 +15,15 @@ use crate::{
     ProductVector, SnapshotIdentity,
 };
 
-const COMPLETION_MAGIC: &[u8; 8] = b"HYPEMB01";
+const COMPLETION_MAGIC: &[u8; 8] = b"HYPEMB02";
 const COMPLETION_PREFIX_BYTES: usize = 68;
-const COMPLETION_BYTES: usize = COMPLETION_PREFIX_BYTES + 16;
+const MAX_COMPLETION_BYTES: usize = COMPLETION_PREFIX_BYTES
+    + 24
+    + 3 * (4 + crate::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES)
+    + 4
+    + crate::MAX_PRODUCT_EMBED_EXECUTION_KERNELS
+        * (4 + crate::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES)
+    + 16;
 const EMBEDDING_STORAGE_PREFIX: &[u8] = b"\0hyphae.product.embedding.v1\0";
 
 /// Largest generated-vector allocation admitted by one embedding operation.
@@ -171,6 +178,8 @@ pub struct ProductEmbeddingBatchOutput {
     pub vectors: Vec<ProductVector>,
     /// Actual formatted token positions consumed per input.
     pub input_tokens: Vec<u32>,
+    /// Exact backend that produced this complete batch, including fallback.
+    pub execution_profile: crate::ProductEmbeddingExecutionProfile,
 }
 
 /// Pluggable local embedding execution contract.
@@ -223,14 +232,17 @@ pub struct ProductEmbedAndIngestBatchReceipt {
     pub input_tokens: usize,
     /// Whether durable completion suppressed executor invocation and publication.
     pub idempotent_replay: bool,
+    /// Exact backend used for the original publication, retained on replay.
+    pub execution_profile: crate::ProductEmbeddingExecutionProfile,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletionMarker {
     digest: [u8; 32],
     profile: ObjectId,
     documents: usize,
     input_tokens: usize,
+    execution_profile: crate::ProductEmbeddingExecutionProfile,
     transaction_id: u128,
 }
 
@@ -286,9 +298,38 @@ impl NativeProduct {
             .iter()
             .find(|vector| vector.name.lookup() == target)
             .ok_or_else(invalid_request)?;
+        self.embedding_profile_for_vector(&snapshot, vector)
+    }
+
+    /// Resolves the public single-target binding and profile from one catalog snapshot.
+    pub(crate) fn single_embedding_target_profile(
+        &self,
+        collection: ObjectId,
+    ) -> Result<(String, EmbeddingProfileDefinition), ProductError> {
+        let snapshot = self.catalog_snapshot()?;
+        let object = self
+            .catalog_describe(&snapshot, collection)?
+            .ok_or_else(|| {
+                ProductError::from_code(ProductErrorCode::ObjectNotFound).with_object_id(collection)
+            })?;
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(definition)) = object else {
+            return Err(invalid_request());
+        };
+        let [vector] = definition.vectors.as_slice() else {
+            return Err(invalid_request());
+        };
+        let profile = self.embedding_profile_for_vector(&snapshot, vector)?;
+        Ok((vector.name.lookup().to_owned(), profile))
+    }
+
+    fn embedding_profile_for_vector(
+        &self,
+        snapshot: &crate::ProductCatalogSnapshot,
+        vector: &NamedVectorDefinition,
+    ) -> Result<EmbeddingProfileDefinition, ProductError> {
         let profile_id = vector.embedding_profile.ok_or_else(invalid_request)?;
         let profile = self
-            .catalog_describe(&snapshot, profile_id)?
+            .catalog_describe(snapshot, profile_id)?
             .ok_or_else(corruption)?;
         let LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(profile)) = profile else {
             return Err(corruption());
@@ -311,12 +352,41 @@ impl NativeProduct {
         limits: ProductLimits,
         logical_time_micros: i64,
         durability: ProductDurability,
+        reauthorize: impl FnMut(&NativeProduct) -> Result<(), ProductError>,
+        checkpoint: impl FnMut() -> Result<(), ProductError>,
+    ) -> Result<ProductEmbedAndIngestBatchReceipt, ProductError> {
+        let profile = self.embedding_profile_for_target(collection, target)?;
+        self.embed_and_ingest_resolved_batch(
+            collection,
+            target,
+            &profile,
+            batch,
+            limits,
+            logical_time_micros,
+            durability,
+            reauthorize,
+            checkpoint,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resolved operation keeps execution, authorization, bounds, and commit controls explicit"
+    )]
+    pub(crate) fn embed_and_ingest_resolved_batch(
+        &mut self,
+        collection: ObjectId,
+        target: &str,
+        profile: &EmbeddingProfileDefinition,
+        batch: &ProductSearchIngestBatch,
+        limits: ProductLimits,
+        logical_time_micros: i64,
+        durability: ProductDurability,
         mut reauthorize: impl FnMut(&NativeProduct) -> Result<(), ProductError>,
         mut checkpoint: impl FnMut() -> Result<(), ProductError>,
     ) -> Result<ProductEmbedAndIngestBatchReceipt, ProductError> {
         validate_embedding_batch_shape(target, batch, limits)?;
-        let profile = self.embedding_profile_for_target(collection, target)?;
-        let digest = embedding_request_digest(collection, target, batch, &profile)?;
+        let digest = embedding_request_digest(collection, target, batch, profile)?;
         let completion_key = completion_key(collection, batch.idempotency_id);
         if let Some(encoded) = self
             .database
@@ -333,6 +403,7 @@ impl NativeProduct {
                 documents: marker.documents,
                 input_tokens: marker.input_tokens,
                 idempotent_replay: true,
+                execution_profile: marker.execution_profile,
             });
         }
 
@@ -359,7 +430,7 @@ impl NativeProduct {
         };
         let output = executor.embed_passages(
             ProductEmbeddingExecutorRequest {
-                profile: &profile,
+                profile,
                 target,
                 documents: &batch.documents,
                 limits: execution_limits,
@@ -372,6 +443,8 @@ impl NativeProduct {
             execution_limits,
             &mut checkpoint,
         )?;
+        validate_execution_profile(&output.execution_profile, profile.header.id)?;
+        let execution_profile = output.execution_profile;
 
         let mut ingest = batch.clone();
         for (document, vector) in ingest.documents.iter_mut().zip(output.vectors) {
@@ -379,11 +452,12 @@ impl NativeProduct {
                 return Err(invalid_request());
             }
         }
-        let completion_prefix = encode_completion_prefix(CompletionMarker {
+        let completion_prefix = encode_completion_prefix(&CompletionMarker {
             digest,
             profile: profile.header.id,
             documents: ingest.documents.len(),
             input_tokens,
+            execution_profile: execution_profile.clone(),
             transaction_id: 0,
         })?;
         let (snapshot, commit) = self.ingest_search_batch_with_completion(
@@ -405,6 +479,7 @@ impl NativeProduct {
             documents: ingest.documents.len(),
             input_tokens,
             idempotent_replay: false,
+            execution_profile,
         })
     }
 }
@@ -582,8 +657,30 @@ fn completion_key(collection: ObjectId, idempotency_id: u128) -> Vec<u8> {
     key
 }
 
-fn encode_completion_prefix(marker: CompletionMarker) -> Result<Vec<u8>, ProductError> {
-    let mut encoded = Vec::with_capacity(COMPLETION_PREFIX_BYTES);
+fn validate_execution_profile(
+    profile: &crate::ProductEmbeddingExecutionProfile,
+    expected_profile: ObjectId,
+) -> Result<(), ProductError> {
+    let valid_text = |value: &str| {
+        !value.is_empty() && value.len() <= crate::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES
+    };
+    if profile.embedding_profile != expected_profile
+        || matches!(profile.backend, crate::ProductEmbeddingBackend::Cuda) && profile.fallback
+        || !valid_text(&profile.device)
+        || !valid_text(&profile.driver)
+        || !valid_text(&profile.runtime)
+        || profile.kernels.is_empty()
+        || profile.kernels.len() > crate::MAX_PRODUCT_EMBED_EXECUTION_KERNELS
+        || profile.kernels.iter().any(|kernel| !valid_text(kernel))
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
+fn encode_completion_prefix(marker: &CompletionMarker) -> Result<Vec<u8>, ProductError> {
+    validate_execution_profile(&marker.execution_profile, marker.profile)?;
+    let mut encoded = Vec::with_capacity(COMPLETION_PREFIX_BYTES + 256);
     encoded.extend_from_slice(COMPLETION_MAGIC);
     encoded.extend_from_slice(&marker.digest);
     encoded.extend_from_slice(&marker.profile.get().to_be_bytes());
@@ -598,11 +695,57 @@ fn encode_completion_prefix(marker: CompletionMarker) -> Result<Vec<u8>, Product
             .to_le_bytes(),
     );
     debug_assert_eq!(encoded.len(), COMPLETION_PREFIX_BYTES);
+    encoded.extend_from_slice(
+        &marker
+            .execution_profile
+            .embedding_profile
+            .get()
+            .to_le_bytes(),
+    );
+    encoded.push(match marker.execution_profile.backend {
+        crate::ProductEmbeddingBackend::Cpu => 0,
+        crate::ProductEmbeddingBackend::Cuda => 1,
+    });
+    encoded.push(match marker.execution_profile.precision {
+        crate::ProductEmbeddingPrecision::F32 => 1,
+    });
+    encoded.push(u8::from(marker.execution_profile.fallback));
+    encoded.extend_from_slice(&[0; 5]);
+    encode_completion_text(&mut encoded, &marker.execution_profile.device)?;
+    encode_completion_text(&mut encoded, &marker.execution_profile.driver)?;
+    encode_completion_text(&mut encoded, &marker.execution_profile.runtime)?;
+    encoded.extend_from_slice(
+        &u32::try_from(marker.execution_profile.kernels.len())
+            .map_err(|_| limit_exceeded())?
+            .to_le_bytes(),
+    );
+    for kernel in &marker.execution_profile.kernels {
+        encode_completion_text(&mut encoded, kernel)?;
+    }
+    if encoded.len() + 16 > MAX_COMPLETION_BYTES {
+        return Err(limit_exceeded());
+    }
     Ok(encoded)
 }
 
+fn encode_completion_text(encoded: &mut Vec<u8>, value: &str) -> Result<(), ProductError> {
+    if value.is_empty() || value.len() > crate::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES {
+        return Err(invalid_request());
+    }
+    encoded.extend_from_slice(
+        &u32::try_from(value.len())
+            .map_err(|_| limit_exceeded())?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
 fn decode_completion(encoded: &[u8]) -> Result<CompletionMarker, ProductError> {
-    if encoded.len() != COMPLETION_BYTES || encoded.get(..8) != Some(COMPLETION_MAGIC.as_slice()) {
+    if encoded.len() < COMPLETION_PREFIX_BYTES + 24 + 3 * 5 + 4 + 5 + 16
+        || encoded.len() > MAX_COMPLETION_BYTES
+        || encoded.get(..8) != Some(COMPLETION_MAGIC.as_slice())
+    {
         return Err(corruption());
     }
     let profile = ObjectId::new(u128::from_be_bytes(
@@ -617,11 +760,14 @@ fn decode_completion(encoded: &[u8]) -> Result<CompletionMarker, ProductError> {
         encoded[60..68].try_into().map_err(|_| corruption())?,
     ))
     .map_err(|_| corruption())?;
-    let transaction_id = u128::from_le_bytes(
-        encoded[COMPLETION_PREFIX_BYTES..]
-            .try_into()
-            .map_err(|_| corruption())?,
-    );
+    let body_end = encoded.len() - 16;
+    let mut offset = COMPLETION_PREFIX_BYTES;
+    let execution_profile = decode_completion_profile(&encoded[..body_end], &mut offset)?;
+    if offset != body_end || validate_execution_profile(&execution_profile, profile).is_err() {
+        return Err(corruption());
+    }
+    let transaction_id =
+        u128::from_le_bytes(encoded[body_end..].try_into().map_err(|_| corruption())?);
     if documents == 0
         || documents > crate::MAX_PRODUCT_SEARCH_BATCH_DOCUMENTS
         || input_tokens == 0
@@ -634,8 +780,85 @@ fn decode_completion(encoded: &[u8]) -> Result<CompletionMarker, ProductError> {
         profile,
         documents,
         input_tokens,
+        execution_profile,
         transaction_id,
     })
+}
+
+fn decode_completion_profile(
+    encoded: &[u8],
+    offset: &mut usize,
+) -> Result<crate::ProductEmbeddingExecutionProfile, ProductError> {
+    let embedding_profile = ObjectId::new(u128::from_le_bytes(
+        completion_bytes(encoded, offset, 16)?
+            .try_into()
+            .map_err(|_| corruption())?,
+    ))
+    .map_err(|_| corruption())?;
+    let header = completion_bytes(encoded, offset, 8)?;
+    let backend = match header[0] {
+        0 => crate::ProductEmbeddingBackend::Cpu,
+        1 => crate::ProductEmbeddingBackend::Cuda,
+        _ => return Err(corruption()),
+    };
+    let precision = match header[1] {
+        1 => crate::ProductEmbeddingPrecision::F32,
+        _ => return Err(corruption()),
+    };
+    if header[2] > 1 || header[3..] != [0; 5] {
+        return Err(corruption());
+    }
+    let fallback = header[2] == 1;
+    let device = decode_completion_text(encoded, offset)?;
+    let driver = decode_completion_text(encoded, offset)?;
+    let runtime = decode_completion_text(encoded, offset)?;
+    let count = usize::try_from(u32::from_le_bytes(
+        completion_bytes(encoded, offset, 4)?
+            .try_into()
+            .map_err(|_| corruption())?,
+    ))
+    .map_err(|_| corruption())?;
+    if count == 0 || count > crate::MAX_PRODUCT_EMBED_EXECUTION_KERNELS {
+        return Err(corruption());
+    }
+    let mut kernels = Vec::with_capacity(count);
+    for _ in 0..count {
+        kernels.push(decode_completion_text(encoded, offset)?);
+    }
+    Ok(crate::ProductEmbeddingExecutionProfile {
+        embedding_profile,
+        backend,
+        device,
+        driver,
+        runtime,
+        precision,
+        kernels,
+        fallback,
+    })
+}
+
+fn decode_completion_text(encoded: &[u8], offset: &mut usize) -> Result<String, ProductError> {
+    let length = usize::try_from(u32::from_le_bytes(
+        completion_bytes(encoded, offset, 4)?
+            .try_into()
+            .map_err(|_| corruption())?,
+    ))
+    .map_err(|_| corruption())?;
+    if length == 0 || length > crate::MAX_PRODUCT_EMBED_EXECUTION_TEXT_BYTES {
+        return Err(corruption());
+    }
+    String::from_utf8(completion_bytes(encoded, offset, length)?.to_vec()).map_err(|_| corruption())
+}
+
+fn completion_bytes<'a>(
+    encoded: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], ProductError> {
+    let end = offset.checked_add(length).ok_or_else(corruption)?;
+    let bytes = encoded.get(*offset..end).ok_or_else(corruption)?;
+    *offset = end;
+    Ok(bytes)
 }
 
 const fn doc_value_bytes(value: &ProductDocValue) -> usize {

@@ -32,6 +32,9 @@ citation. See [release verification](docs/release/verification.md).
 
 ## Required checks
 
+The full all-features checks require a CUDA toolkit. CPU-only hosts use the
+non-CUDA suite in the [development guide](docs/development.md).
+
 ```console
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

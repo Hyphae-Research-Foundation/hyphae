@@ -21,8 +21,10 @@ driver, BLAS, and runtime bindings.
 ## Decision
 
 The existing optional `hyphae-native-embed-cpu` publication owns both the
-portable CPU executor and a default-off `cuda` feature. The feature uses
-Candle 0.9.2 and safe cudarc 0.19 driver queries. Hyphae source remains under
+portable CPU executor and a default-off `cuda` feature. `hyphae-cli` exposes
+the same default-off feature so embedded, UDS, and HTTP execution can install
+the selected backend. The feature uses Candle 0.9.2 and safe cudarc 0.19
+driver and runtime queries. Hyphae source remains under
 `unsafe_code = "forbid"`; custom CUDA FFI, custom kernels, and CubeCL are not
 accepted by this decision.
 
@@ -30,9 +32,11 @@ accepted by this decision.
 selects only a device whose driver identity is exactly `NVIDIA H100 80GB HBM3`,
 whose compute capability is exactly 9.0, and whose memory is at least 79 GiB.
 Its execution profile includes the selected ordinal, name, `sm90`, CUDA UUID,
-and PCI domain, bus, and device identity. No compatible device, driver-query
-failure, or Candle-device construction failure selects the complete existing
-CPU path before any model is loaded.
+and PCI domain, bus, and device identity. The result profile also records
+the observed NVIDIA driver release, CUDA driver/runtime API versions, Candle
+version, model revision and manifest, compute dtype, and canonical FP32 output.
+No compatible device, driver-query failure, or Candle-device construction
+failure selects the complete existing CPU path before any model is loaded.
 
 Backend selection is immutable for the life of a registry. A CUDA-selected
 registry loads a CPU/f32 copy from cloned descriptors only after the same
@@ -49,7 +53,10 @@ transfer, out-of-memory, or device-loss failures produce no GPU batch; they
 either fail closed or complete the declared whole-batch CPU retry. Cancellation
 and deadline errors always fail closed. The product transaction starts only
 after one complete batch returns and validates, so failures publish no partial
-documents, vectors, or completion marker. Cooperative deadlines are checked
+documents, vectors, or completion marker. The complete execution profile is
+stored in the versioned `HYPEMB02` marker with the original transaction ID;
+replay returns the original commit and backend identity without an executor.
+Cooperative deadlines are checked
 between bounded token chunks; they do not claim to preempt a running CUDA
 kernel.
 

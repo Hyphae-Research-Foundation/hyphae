@@ -17,7 +17,7 @@ pub(crate) async fn serve(
     http_bind: Option<SocketAddr>,
     native_api_key_auth: bool,
     native_legacy_bearer_file: Option<PathBuf>,
-    embedding_executor: Option<Arc<hyphae_native_embed_cpu::Qwen3CpuExecutor>>,
+    embedding_executor: Option<Arc<crate::NodeEmbeddingExecutor>>,
 ) -> Result<(), CliFailure> {
     let mut product = NativeProduct::open(&data_dir)?;
     if let Some(executor) = embedding_executor {

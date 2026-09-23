@@ -3289,7 +3289,9 @@ fn model_profile_create_is_local_and_embed_failures_publish_nothing() -> Result<
         "--documents-json",
         r#"[{"id":101,"text":"bounded passage","doc_values":{}}]"#,
     ])?;
-    assert_eq!(missing_registry.status.code(), Some(2));
+    assert_eq!(missing_registry.status.code(), Some(10));
+    let missing_error: serde_json::Value = serde_json::from_slice(&missing_registry.stderr)?;
+    assert_eq!(missing_error["error"]["code"], "unavailable");
     let after = run(&["status", "--data-dir", &data_text])?;
     assert_eq!(
         after["snapshot"]["visible_csn"],

@@ -147,11 +147,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p hyphae-cli -p hyphae-native-embed-cpu --all-targets --locked -- -D warnings
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
+        run: |
+          cargo doc --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --no-deps --locked
+          cargo doc -p hyphae-cli -p hyphae-native-embed-cpu --no-deps --locked
       - name: Verify Linux hardware discovery and calibration receipts
         shell: bash
         run: |
@@ -196,7 +200,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+          cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked
       - name: Run exhaustive injected security crash matrix
         if: matrix.run-native-conformance
         run: cargo test --locked -p hyphae-native-product --test security_crash_matrix
@@ -316,7 +322,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run platform tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+          cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked
       - name: Run native conformance profile
         shell: bash
         run: |

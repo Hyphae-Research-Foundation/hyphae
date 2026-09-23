@@ -15,6 +15,10 @@ description = "Single-binary CLI, server, verifier, and MCP adapter for Hyphae."
 documentation = "https://docs.rs/hyphae-cli"
 publish.workspace = true
 
+[features]
+default = []
+cuda = ["hyphae-native-embed-cpu/cuda"]
+
 [[bin]]
 name = "hyphae"
 path = "src/main.rs"

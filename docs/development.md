@@ -24,15 +24,30 @@ See [architecture](architecture/overview.md) for the durable flow.
 
 ## Required local checks
 
+On a CPU-only host, check all other workspace features while building the
+embedding executor and CLI with their default CPU feature set:
+
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+cargo clippy --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-targets --all-features --locked -- -D warnings
+cargo clippy -p hyphae-cli -p hyphae-native-embed-cpu --all-targets --locked -- -D warnings
+cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --no-deps --locked
+RUSTDOCFLAGS='-D warnings' cargo doc -p hyphae-cli -p hyphae-native-embed-cpu --no-deps --locked
 python tools/generate_sdk_models.py --check
 python tools/check_documentation.py --binary target/debug/hyphae
 python tools/run_documentation_examples.py --binary target/debug/hyphae
 python packaging/test_package.py
+```
+
+An accelerator-capable build host with a CUDA toolkit additionally runs the
+complete all-features Rust suite and the real device tests:
+
+```bash
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
 ```
 
 Also run the common client and integration suites when those surfaces change:
