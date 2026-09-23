@@ -25,6 +25,10 @@ byte `1` (FP32), fallback boolean, five zero reserved bytes, nonempty bounded
 device/driver/runtime strings, and 1 through 64 nonempty bounded kernel names,
 followed by the existing fixed commit receipt. A successful replay returns the
 original commit evidence; a success without commit evidence is noncanonical.
+The minor-9 request fixture lives at
+`compatibility/native-protocol-v1-embed-and-ingest.bin`. The protocol crate
+packages a byte-identical mirror under `tests/fixtures/` so its extracted
+archive retains the exact Rust/Python/TypeScript request vector.
 
 Protocol minor 8 adds no request or response tags. It admits embedding-profile
 content inside existing catalog operations: object kind `10`, dependency kind

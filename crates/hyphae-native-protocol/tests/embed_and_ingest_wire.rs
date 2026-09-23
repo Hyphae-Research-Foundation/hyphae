@@ -50,7 +50,7 @@ fn embed_and_ingest_uses_minor_nine_request_tag_73_and_bounded_counts()
     )?;
     assert_eq!(
         shared_frame.as_slice(),
-        include_bytes!("../../../compatibility/native-protocol-v1-embed-and-ingest.bin")
+        include_bytes!("fixtures/native-protocol-v1-embed-and-ingest.bin")
     );
     let decoded = decode_product_request_for_minor(&encoded, 9)?;
     let ProductOperation::EmbedAndIngest { collection, batch } = decoded.operation else {
