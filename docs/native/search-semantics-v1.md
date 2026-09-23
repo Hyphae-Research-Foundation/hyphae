@@ -218,25 +218,43 @@ requires byte-for-byte equality with the physical metadata and postings.
 Orphan documents/postings, noncanonical terms, count divergence, invalid
 UTF-8, bad envelopes, and missing/corrupt blobs fail closed.
 
-Lexical complete-state materialization owns only one borrowed B+tree range
-visit over `[0x00,0x05)`. It never visits or copies ANN metadata, vectors,
-graphs, deltas, manifests, or Merkle nodes. The visit admits at most 131,072
-lexical entries and 64 MiB of encoded lexical key/value bytes. Before any live
-entry is copied or any document blob is read, retained accounting charges 512
-bytes plus four copies of the physical key length and the logical document
-bytes, when applicable; the aggregate is capped at the 64 MiB recovery
-authority. A separate zero-entry borrowed range over `[0x0c,+inf)` preserves
-unknown-prefix corruption authority. Prefixes `0x05` through `0x0b` belong
-exclusively to ANN validation.
+Lexical recovery visits `[0x00,0x05)` in resumable, 1,024-entry borrowed
+ranges with at most 64 MiB of encoded key/value bytes per range. The visit
+never copies ANN metadata, vectors, graphs, deltas, manifests, or Merkle nodes.
+Small roots retain the existing complete-state projection. When that
+projection's conservative charge exceeds 64 MiB, current-root validation
+checks index counts, every document's expected postings, term document
+frequencies, and every posting's source document in bounded ranges instead of
+retaining a corpus-sized lexical projection. It detects missing or extra
+postings, wrong term frequencies or carried lengths, malformed blobs, and
+unknown lexical keys. A separate zero-entry borrowed range over
+`[0x0c,+inf)` preserves unknown-prefix corruption authority. Prefixes `0x05`
+through `0x0b` belong exclusively to ANN validation.
+
+Complete posting-projection materialization retains the historical 64 MiB
+budget. It charges 512 bytes plus four copies of each live physical key
+length and the logical document bytes, when applicable. Large-root snapshots
+instead validate postings by range and retain only source documents. That
+state has a separate 64 MiB admission charge of 4,096 bytes per lexical index
+and 192 bytes plus document-ID length and logical text length per live
+document. Physical search mutations check the document-state charge before
+WAL publication, so an acknowledged root can be reloaded as a snapshot.
+Exceeding either retained-state budget returns `limit_exceeded` with
+`search_recovery_retained_bytes`, the configured 67,108,864-byte ceiling, and
+the measured charge; it does not assert durable corruption. The product's
+250,000-document bound remains an upper document-count limit alongside the
+document-state, request, and M05 shared-recovery limits. The earlier
+short-document scale receipts do not establish that every text/vector shape
+fits those separate limits.
 
 When an M05 root is loaded as complete product authority, measured lexical
-retention is subtracted from the shared 64 MiB recovery allowance before ANN
-metadata admission. Search and ANN cannot each consume an independent 64 MiB
-allowance. Oversized or malformed ANN values do not allocate through lexical
-materialization. Point, initial-bulk, and consolidation publication substitute
-the target index's exact candidate metadata charge into that same shared
-authority and reject overflow before page creation. Group point members carry
-that candidate state and charge forward in accepted commit order.
+retention and ANN metadata share the 64 MiB recovery allowance. Search and ANN
+cannot each consume an independent 64 MiB allowance. Oversized or malformed
+ANN values do not allocate through lexical materialization. Point,
+initial-bulk, and consolidation publication substitute the target index's
+candidate metadata charge into that same shared authority and reject overflow
+before WAL publication. Group point members carry that candidate state and
+charge forward in accepted commit order.
 
 Roots containing only M01 through M04 are grandfathered onto their historical
 bounded streaming load and may open, pin, back up, restore, and recover even

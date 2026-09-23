@@ -153,6 +153,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native delta all-engine transaction Linux evidence](gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md)
 - [Native lexical document lifecycle Linux evidence](gates/evidence/native-search-document-lifecycle-linux-2026-08-03.md)
 - [Native lexical tombstone compaction Linux evidence](gates/evidence/native-search-tombstone-compaction-linux-2026-08-03.md)
+- [Lexical recovery-limit reproduction and open release gate (2026-09-22)](gates/evidence/lexical-recovery-limit-2026-09-22.md)
 - [Native G2 SQLLogicTest evidence](gates/evidence/native-g2-sqllogictest.md)
 - [Native G2 metamorphic SQL evidence](gates/evidence/native-g2-metamorphic.md)
 - [Native G2 isolation litmus evidence](gates/evidence/native-g2-isolation-litmus.md)

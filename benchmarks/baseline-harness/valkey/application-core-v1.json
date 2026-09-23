@@ -7,7 +7,7 @@
   "claim_semantics_seal": {
     "algorithm": "sha256",
     "canonicalization": "sorted-key-compact-json-utf8-v1",
-    "sha256": "9f2935738383dc4e51350c3d895860601f2de8e1bcfe76646b30bfc2ccb406bd"
+    "sha256": "1f39af7e8c58f5674974a4ae0c5a42bd6398e0ac6a570f8af5bc7bd96b454701"
   },
   "oracle": {
     "role": "external_conformance_and_measurement_subject",
@@ -40,6 +40,7 @@
     "authority_paths": [
       "docs/native/structures-semantics-v1.md",
       "crates/hyphae-native-runtime/src/lib.rs",
+      "crates/hyphae-native-runtime/src/lexical_recovery.rs",
       "crates/hyphae-native-runtime/src/model.rs",
       "crates/hyphae-native-runtime/src/set_algebra.rs",
       "crates/hyphae-native-runtime/src/structure_v3.rs",
@@ -79,7 +80,7 @@
       "benchmarks/baseline-harness/valkey/test_check_profile.py",
       "benchmarks/baseline-harness/valkey/test_check_receipt.py"
     ],
-    "semantic_bundle_sha256": "184a33f6f4a7dc9f91b357a595f7ffe8676e0d9f4da8b9b032e2ff77ceb76163",
+    "semantic_bundle_sha256": "f3d2c1cf96f915d4ec1ea478a51c562fdd76eab8b663615eb0cf9023db8b0f7f",
     "semantic_change_requires_profile_revision": true
   },
   "claim_policy": {

@@ -27,9 +27,9 @@ EXPECTED_TREE = "c8cbc1ffb2c4526c3f487aaeadcb0234636f5ca5"
 EXPECTED_ARTIFACT_SHA256 = "19c23908e7d57e8d91ef85b41f5646307582f10f4f0fb999bbf89ed24ec9c983"
 EXPECTED_HYPHAE_COMMIT = "7e25fc7eaa7fe91bc55e16314074d66ad943b090"
 EXPECTED_HYPHAE_TREE = "aea2680c992697d68c2b52582f8399f9189108ac"
-EXPECTED_CLAIM_SEMANTICS_SEAL = "9f2935738383dc4e51350c3d895860601f2de8e1bcfe76646b30bfc2ccb406bd"
-EXPECTED_PROFILE_SHA256 = "2fa96457bd15eae458d459de91e761c2b987c7691e9e990fe7e67eccd7185c21"
-EXPECTED_SEMANTIC_BUNDLE_SHA256 = "184a33f6f4a7dc9f91b357a595f7ffe8676e0d9f4da8b9b032e2ff77ceb76163"
+EXPECTED_CLAIM_SEMANTICS_SEAL = "1f39af7e8c58f5674974a4ae0c5a42bd6398e0ac6a570f8af5bc7bd96b454701"
+EXPECTED_PROFILE_SHA256 = "e4e6401a5e0575bd5510dab9cf3da0467915ace667300b3ff969f523a2612c4e"
+EXPECTED_SEMANTIC_BUNDLE_SHA256 = "f3d2c1cf96f915d4ec1ea478a51c562fdd76eab8b663615eb0cf9023db8b0f7f"
 EXPECTED_BASELINE_RECEIPT_SCHEMA = "hyphae-baseline-harness-v2"
 EXPECTED_VALKEY_RECEIPT_SCHEMA = "hyphae-external-valkey-baseline-receipt-v2"
 CLASSIFICATIONS = {"exact", "equivalent", "stronger", "different", "excluded"}
@@ -399,6 +399,7 @@ def check_profile(
             errors.append("sealed semantic bundle omits an evidence authority")
         required_semantic_authority_paths = {
             "crates/hyphae-native-runtime/src/lib.rs",
+            "crates/hyphae-native-runtime/src/lexical_recovery.rs",
             "crates/hyphae-native-runtime/src/model.rs",
             "crates/hyphae-native-runtime/src/set_algebra.rs",
             "crates/hyphae-native-runtime/src/structure_v3.rs",

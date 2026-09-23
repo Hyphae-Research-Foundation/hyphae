@@ -61,7 +61,7 @@
     },
     {
       "reference": "docs/native/product-error-v1.md",
-      "sha256": "70f3b4f8ce59ce902a915cdc17945bf7ece8a9601041ef9890074cab89c7ebd1"
+      "sha256": "c4fc47cba568e68e8c6188ea19660f0b59f32f316244aa6e36179cbd9976c351"
     },
     {
       "reference": "docs/native/catalog-api-v1.md",
@@ -97,7 +97,7 @@
     },
     {
       "reference": "docs/native/search-semantics-v1.md",
-      "sha256": "e3a0991fe38b17d55ce00de6dc99e91b547cde7a8f1891f9f0b14c9c980e330f"
+      "sha256": "fb13a04f8fbb13fb91deab18e8593f87a72a8bb01bb7d0e3051171b90c9cbf3d"
     },
     {
       "reference": "docs/native/ann-semantics-v1.md",

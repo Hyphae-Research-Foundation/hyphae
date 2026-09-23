@@ -709,6 +709,8 @@ pub enum ProductLimitKind {
     StringValueBytes,
     /// Transactions admitted by one group commit.
     GroupCommitTransactions,
+    /// Retained bytes admitted for a bounded search materialization or M05 restore.
+    SearchRecoveryRetainedBytes,
     /// A future bounded limit not recognized by this build.
     Unknown(ProductErrorIdentifier),
 }
@@ -729,6 +731,7 @@ impl ProductLimitKind {
             Self::ExpirySweepKeys => "expiry_sweep_keys",
             Self::StringValueBytes => "string_value_bytes",
             Self::GroupCommitTransactions => "group_commit_transactions",
+            Self::SearchRecoveryRetainedBytes => "search_recovery_retained_bytes",
             Self::Unknown(raw) => raw.as_str(),
         }
     }
@@ -753,6 +756,7 @@ impl ProductLimitKind {
             "expiry_sweep_keys" => Self::ExpirySweepKeys,
             "string_value_bytes" => Self::StringValueBytes,
             "group_commit_transactions" => Self::GroupCommitTransactions,
+            "search_recovery_retained_bytes" => Self::SearchRecoveryRetainedBytes,
             _ => Self::Unknown(ProductErrorIdentifier::new(raw)?),
         })
     }
@@ -1464,9 +1468,18 @@ impl From<NativeRuntimeError> for ProductError {
                 hyphae_native_runtime::MAX_GROUP_COMMIT_BATCH_SIZE,
                 requested,
             ),
+            NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                configured,
+                observed,
+            } => Self::from_code(ProductErrorCode::LimitExceeded).with_limit(ProductLimit::new(
+                ProductLimitKind::SearchRecoveryRetainedBytes,
+                configured,
+                observed,
+            )),
             NativeRuntimeError::StructureIdentityTooLarge
             | NativeRuntimeError::SearchIdentityTooLarge
             | NativeRuntimeError::AnnDeltaLimitExceeded
+            | NativeRuntimeError::SearchRecoveryVisitLimitExceeded
             | NativeRuntimeError::AnnReadViewQueryMemoryOverflow
             | NativeRuntimeError::AnnConsolidationLimitExceeded
             | NativeRuntimeError::InitialAnnBulkPartitionLimit { .. }
@@ -1865,6 +1878,24 @@ mod tests {
         assert_redacted_mapping(
             NativeRuntimeError::Ann(AnnError::BuildCancelled),
             ProductErrorCode::Cancelled,
+        );
+    }
+
+    #[test]
+    fn lexical_recovery_budget_is_a_typed_limit_not_corruption() {
+        let error = ProductError::from(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+            configured: 67_108_864,
+            observed: 67_108_993,
+        });
+        assert_eq!(error.code(), ProductErrorCode::LimitExceeded);
+        assert_eq!(error.category(), ProductErrorCategory::Limit);
+        assert_eq!(
+            error.limit(),
+            Some(ProductLimit::new(
+                ProductLimitKind::SearchRecoveryRetainedBytes,
+                67_108_864,
+                67_108_993,
+            ))
         );
     }
 
