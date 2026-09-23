@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
 resolver = "2"
-exclude = ["embed", "fuzz"]
+exclude = ["benchmarks/multilingual-embedding-harness", "embed", "fuzz"]
 members = [
     "conformance/g8/independent-backup-verifier",
     "conformance/rust",
@@ -19,6 +19,7 @@ members = [
     "crates/hyphae-native-mvcc",
     "crates/hyphae-native-manifest",
     "crates/hyphae-native-daemon",
+    "crates/hyphae-native-embed-cpu",
     "crates/hyphae-native-pages",
     "crates/hyphae-native-product",
     "crates/hyphae-native-protocol",
@@ -34,9 +35,9 @@ members = [
 default-members = ["crates/hyphae-cli"]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
-rust-version = "1.89.0"
+rust-version = "1.90.0"
 authors = ["Hyphae Research Foundation"]
 license = "Apache-2.0"
 repository = "https://github.com/Hyphae-Research-Foundation/hyphae"
@@ -51,37 +52,42 @@ anyhow = "1.0.100"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 base64 = "0.23.0"
 blake3 = "1.8.5"
+candle-core = "0.9.2"
+candle-nn = "0.9.2"
+candle-transformers = "0.9.2"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 crossterm = "0.29.0"
 crc32c = "0.6.8"
+cudarc = { version = "0.19.0", default-features = false, features = ["driver", "runtime", "std"] }
 fs4 = "1.1.0"
 futures-channel = "0.3.31"
 futures-util = "0.3.31"
 getrandom = "0.3.4"
 http = "1.4.0"
 interprocess = { version = "2.4.3", features = ["tokio"] }
-hyphae-contracts = { path = "crates/hyphae-contracts", version = "=3.0.0" }
-hyphae-client = { path = "crates/hyphae-client", version = "=3.0.0" }
-hyphae-core = { path = "crates/hyphae-core", version = "=3.0.0" }
-hyphae-engine = { path = "crates/hyphae-engine", version = "=3.0.0" }
-hyphae-native-ann = { path = "crates/hyphae-native-ann", version = "=3.0.0" }
-hyphae-native-blobs = { path = "crates/hyphae-native-blobs", version = "=3.0.0" }
-hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=3.0.0" }
-hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=3.0.0" }
-hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=3.0.0" }
-hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=3.0.0" }
-hyphae-native-daemon = { path = "crates/hyphae-native-daemon", version = "=3.0.0" }
-hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=3.0.0" }
-hyphae-native-product = { path = "crates/hyphae-native-product", version = "=3.0.0" }
-hyphae-native-protocol = { path = "crates/hyphae-native-protocol", version = "=3.0.0" }
-hyphae-native-records = { path = "crates/hyphae-native-records", version = "=3.0.0" }
-hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=3.0.0" }
-hyphae-native-types = { path = "crates/hyphae-native-types", version = "=3.0.0" }
-hyphae-native-wal = { path = "crates/hyphae-native-wal", version = "=3.0.0" }
-hyphae-query = { path = "crates/hyphae-query", version = "=3.0.0" }
-hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=3.0.0" }
-hyphae-server = { path = "crates/hyphae-server", version = "=3.0.0" }
-hyphae-storage = { path = "crates/hyphae-storage", version = "=3.0.0" }
+hyphae-contracts = { path = "crates/hyphae-contracts", version = "=4.0.0" }
+hyphae-client = { path = "crates/hyphae-client", version = "=4.0.0" }
+hyphae-core = { path = "crates/hyphae-core", version = "=4.0.0" }
+hyphae-engine = { path = "crates/hyphae-engine", version = "=4.0.0" }
+hyphae-native-ann = { path = "crates/hyphae-native-ann", version = "=4.0.0" }
+hyphae-native-blobs = { path = "crates/hyphae-native-blobs", version = "=4.0.0" }
+hyphae-native-catalog = { path = "crates/hyphae-native-catalog", version = "=4.0.0" }
+hyphae-native-btree = { path = "crates/hyphae-native-btree", version = "=4.0.0" }
+hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc", version = "=4.0.0" }
+hyphae-native-manifest = { path = "crates/hyphae-native-manifest", version = "=4.0.0" }
+hyphae-native-embed-cpu = { path = "crates/hyphae-native-embed-cpu", version = "=4.0.0" }
+hyphae-native-daemon = { path = "crates/hyphae-native-daemon", version = "=4.0.0" }
+hyphae-native-pages = { path = "crates/hyphae-native-pages", version = "=4.0.0" }
+hyphae-native-product = { path = "crates/hyphae-native-product", version = "=4.0.0" }
+hyphae-native-protocol = { path = "crates/hyphae-native-protocol", version = "=4.0.0" }
+hyphae-native-records = { path = "crates/hyphae-native-records", version = "=4.0.0" }
+hyphae-native-runtime = { path = "crates/hyphae-native-runtime", version = "=4.0.0" }
+hyphae-native-types = { path = "crates/hyphae-native-types", version = "=4.0.0" }
+hyphae-native-wal = { path = "crates/hyphae-native-wal", version = "=4.0.0" }
+hyphae-query = { path = "crates/hyphae-query", version = "=4.0.0" }
+hyphae-retrieval = { path = "crates/hyphae-retrieval", version = "=4.0.0" }
+hyphae-server = { path = "crates/hyphae-server", version = "=4.0.0" }
+hyphae-storage = { path = "crates/hyphae-storage", version = "=4.0.0" }
 libm = "0.2.16"
 libc = "0.2.186"
 nix = { version = "0.31.3", default-features = false, features = ["sched"] }
@@ -92,11 +98,13 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 rustix = { version = "1.0.8", default-features = false }
 same-file = "1.0.6"
 schemars = { version = "1.2.1", features = ["uuid1"] }
+sha2 = "0.10.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
 subtle = "2.6.1"
 thiserror = "2.0.18"
+tokenizers = { version = "0.21.4", default-features = false, features = ["onig"] }
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1.25"
 widestring = "1.2.1"
@@ -122,6 +130,7 @@ hyphae-native-btree = { path = "crates/hyphae-native-btree" }
 hyphae-native-catalog = { path = "crates/hyphae-native-catalog" }
 hyphae-native-daemon = { path = "crates/hyphae-native-daemon" }
 hyphae-native-manifest = { path = "crates/hyphae-native-manifest" }
+hyphae-native-embed-cpu = { path = "crates/hyphae-native-embed-cpu" }
 hyphae-native-mvcc = { path = "crates/hyphae-native-mvcc" }
 hyphae-native-pages = { path = "crates/hyphae-native-pages" }
 hyphae-native-product = { path = "crates/hyphae-native-product" }

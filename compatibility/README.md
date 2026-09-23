@@ -44,6 +44,18 @@ Regenerate it only when intentionally changing the append-only native protocol:
 cargo run -p hyphae-native-protocol --example generate_sdk_fixture
 ```
 
+The three `native-catalog-*.hex` fixtures cover the unreleased next-major
+catalog boundary: one Qwen3 embedding profile, one historical representation-3
+search definition, and one representation-4 bound search definition. The
+profile fixture binds the byte-exact verified
+`qwen3-embedding-0.6b-artifact-manifest-v1.json` and the exact instruction bytes
+in `qwen3-embedding-query-instruction-v1.hex`. The never-merged BERT-only
+profile fixture had no compatibility standing and was replaced. Rust strictly
+decodes and re-encodes the current profile and search bytes; Python and
+TypeScript consume the same catalog bytes for content-derived minor-8 admission
+tests. Search representations 2 and 3 and the representation-4 binding layout
+are unchanged; representation 3 remains a minor-7-compatible control.
+
 ## Valkey/Redis RDB migration fixture
 
 `valkey/rdb-v11.json` is one immutable RDB version-11 source payload for the

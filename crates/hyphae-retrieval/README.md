@@ -8,11 +8,11 @@
 Exact provider-neutral cosine retrieval and explicit abstention semantics for
 [Hyphae](https://hyphae.dev).
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-retrieval = "=3.0.0"
+hyphae-retrieval = "=4.0.0"
 ```
 
 The caller owns vectors and any optional embedding provider. This crate does

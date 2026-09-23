@@ -1,7 +1,8 @@
 {
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "schema": 2,
-  "version": "3.0.0",
+  "version": "4.0.0",
+  "package_count": 25,
   "apache_publication_authority": {
     "version": "3.0.0",
     "tag": "release-v3.0.0-crates",
@@ -16,6 +17,30 @@
     {
       "source": "compatibility/valkey/rdb-v11.json",
       "packaged": "crates/hyphae-cli/tests/fixtures/valkey-rdb-v11.json"
+    },
+    {
+      "source": "compatibility/native-catalog-search-representation3.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-search-representation3.hex"
+    },
+    {
+      "source": "compatibility/native-catalog-search-representation4.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-search-representation4.hex"
+    },
+    {
+      "source": "compatibility/native-catalog-embedding-profile-v2.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/native-catalog-embedding-profile-v2.hex"
+    },
+    {
+      "source": "compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json",
+      "packaged": "crates/hyphae-native-catalog/compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json"
+    },
+    {
+      "source": "compatibility/qwen3-embedding-query-instruction-v1.hex",
+      "packaged": "crates/hyphae-native-catalog/compatibility/qwen3-embedding-query-instruction-v1.hex"
+    },
+    {
+      "source": "compatibility/native-protocol-v1-embed-and-ingest.bin",
+      "packaged": "crates/hyphae-native-protocol/tests/fixtures/native-protocol-v1-embed-and-ingest.bin"
     }
   ],
   "semver_baseline_packages": [
@@ -59,6 +84,7 @@
       "hyphae-native-product"
     ],
     [
+      "hyphae-native-embed-cpu",
       "hyphae-native-protocol"
     ],
     [

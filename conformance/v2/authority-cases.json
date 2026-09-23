@@ -58,7 +58,7 @@
   ],
   "digests": {
     "authentication_error_sha256": "f4a894f0909b4c1ba6a07b51e889f8b682f8cb023d6d6866040e4d124796817c",
-    "authority_contract_sha256": "a1d38a24d9189a65fc7e971bbf124dccfc1f746f7491a33ce11e024126e20b9a",
+    "authority_contract_sha256": "d9491a5df23974917823c7d6db6fe485ce2969ae754c5cf296415053e3b58aaf",
     "operation_matrix_sha256": "2d2929fa6ed593dada368d9ec40b8052199640fb94212dacb304f8684f6b9b7a",
     "role_matrix_sha256": "4eae42035b97dca29157d2607ec6ba8546a6cda594e4d0e91a10ba1a288768d1",
     "security_read_page_responses_blake3": "67c752f3f510e5b4805e097b284b2ef70fd308fa71dd0778aafc42acdf24dfe8",
@@ -243,7 +243,7 @@
         "assert_security_reads",
         "run_live_conformance"
       ],
-      "command": "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae --fixture-binary target/debug/hyphae-v2-fixture --wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl --output python-managed-v2-conformance.json",
+      "command": "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae --fixture-binary target/debug/hyphae-v2-fixture --wheel dist/hyphae_sdk-4.0.0-py3-none-any.whl --output python-managed-v2-conformance.json",
       "covers": [
         "digests.request",
         "pagination.audit",
@@ -558,7 +558,8 @@
   },
   "protocol": {
     "current_major": 1,
-    "current_minor": 7,
+    "current_minor": 9,
+    "managed_fixture_minor": 7,
     "rejections_before_dispatch": [
       {
         "case": "minor-0-read",

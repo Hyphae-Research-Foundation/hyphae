@@ -68,12 +68,12 @@ def cyclonedx(license_identifier: str = "Apache-2.0") -> dict:
 
 
 class G8ReleaseVerificationTests(unittest.TestCase):
-    def test_repository_release_authority_remains_91_artifacts_34_identities(
+    def test_repository_release_authority_has_92_artifacts_35_identities(
         self,
     ) -> None:
         identities = expected_hyphae_identities()
-        self.assertEqual(sum(identities.values()), 91)
-        self.assertEqual(len(identities), 34)
+        self.assertEqual(sum(identities.values()), 92)
+        self.assertEqual(len(identities), 35)
         self.assertNotIn(
             "hyphae-mcp-conformance-hosts",
             {name for name, _, _ in identities},

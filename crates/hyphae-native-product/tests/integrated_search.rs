@@ -19,12 +19,12 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
-    AnnConsolidationRequest, MAX_PRODUCT_SEARCH_BATCH_BYTES, MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
-    NativeProduct, ProductAggregation, ProductAggregationValue, ProductAuthorization,
-    ProductDocValue, ProductDocument, ProductDurability, ProductError, ProductErrorCategory,
-    ProductErrorCode, ProductExplicitTransactionStatus, ProductFacetRequest, ProductHighlight,
-    ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductResponse, ProductRetry,
+    AnnConsolidationRequest, CompactionRequest, CompactionTarget, MAX_PRODUCT_SEARCH_BATCH_BYTES,
+    MAX_PRODUCT_SEARCH_VECTOR_TARGETS, NativeProduct, ProductAggregation, ProductAggregationValue,
+    ProductAuthorization, ProductDocValue, ProductDocument, ProductDurability, ProductError,
+    ProductErrorCategory, ProductErrorCode, ProductExplicitTransactionStatus, ProductFacetRequest,
+    ProductHighlight, ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation,
+    ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse, ProductRetry,
     ProductSearchCollectionBinding, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
     ProductSearchFilter, ProductSearchIngestBatch, ProductSearchIngestionCoordinator,
     ProductSearchOperator, ProductSearchRequest, ProductSearchSort, ProductSession,
@@ -162,6 +162,7 @@ fn configure_catalog_full(
             metric: VectorMetric::SquaredL2,
             policy: VectorSearchPolicy::Ann(ann),
             lifecycle,
+            embedding_profile: None,
         },
         NamedVectorDefinition {
             id: FieldId::new(5)?,
@@ -173,6 +174,7 @@ fn configure_catalog_full(
                 ann,
             },
             lifecycle,
+            embedding_profile: None,
         },
     ];
     vectors.truncate(vector_target_count);
@@ -184,6 +186,7 @@ fn configure_catalog_full(
             metric: VectorMetric::SquaredL2,
             policy: VectorSearchPolicy::Exact,
             lifecycle,
+            embedding_profile: None,
         });
     }
     product.create_catalog_object_v2(
@@ -5871,5 +5874,96 @@ fn memory_proof_seals_lifecycle_and_applies_expiry_before_limit()
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn synthetic_scientific_corpus_reopens_beyond_legacy_posting_charge()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("scientific-recovery-over-legacy-charge");
+    let (mut product, binding) = configure_full(&path, None, vec![AnalyzerFilter::Lowercase], 0)?;
+    let terms = (0..145)
+        .map(|ordinal| format!("kinase{ordinal:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = format!("Synthetic scientific text about signaling and biomarkers. {terms} {terms}");
+    assert!((2_000..=3_100).contains(&text.len()));
+    for batch_ordinal in 0_u128..5 {
+        let batch = ProductSearchIngestBatch {
+            idempotency_id: batch_ordinal + 1,
+            documents: (1_u128..=128)
+                .map(|offset| {
+                    Ok(ProductDocument {
+                        object_id: ObjectId::new(batch_ordinal * 128 + offset)?,
+                        text: text.clone(),
+                        doc_values: BTreeMap::new(),
+                        vectors: BTreeMap::new(),
+                    })
+                })
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?,
+        };
+        let receipt = product.ingest_search_batch(
+            binding.collection,
+            &batch,
+            1,
+            ProductDurability::Strict,
+        )?;
+        assert!(receipt.commit.is_some());
+    }
+    let before = product.snapshot_bounded(0)?.identity();
+    drop(product);
+    let mut reopened = NativeProduct::open(&path)?;
+    assert_eq!(reopened.snapshot_bounded(0)?.identity(), before);
+    let result =
+        reopened.search_collection(binding.collection, &lexical_request("kinase001"), 1)?;
+    assert_eq!(result.total_documents, 640);
+    assert_eq!(result.hits.len(), 16);
+    let before_compaction = reopened.snapshot_bounded(0)?.identity();
+    let compaction = reopened.administration().compact(CompactionRequest {
+        target: CompactionTarget::Search,
+        durability: ProductDurability::Strict,
+    })?;
+    assert_eq!(compaction.scanned_entries, compaction.retained_entries);
+    assert_eq!(compaction.dropped_tombstones, 0);
+    assert!(compaction.commit.is_none());
+    assert_eq!(reopened.snapshot_bounded(0)?.identity(), before_compaction);
+    drop(reopened);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn short_title_corpus_reopens_above_scientific_text_failure_count()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = temporary("short-title-recovery-control");
+    let (mut product, binding) = configure_full(&path, None, vec![AnalyzerFilter::Lowercase], 0)?;
+    for batch_ordinal in 0_u128..4 {
+        let batch = ProductSearchIngestBatch {
+            idempotency_id: batch_ordinal + 1,
+            documents: (1_u128..=256)
+                .map(|offset| {
+                    Ok(ProductDocument {
+                        object_id: ObjectId::new(batch_ordinal * 256 + offset)?,
+                        text: "Kinase title".to_owned(),
+                        doc_values: BTreeMap::new(),
+                        vectors: BTreeMap::new(),
+                    })
+                })
+                .collect::<Result<_, Box<dyn std::error::Error>>>()?,
+        };
+        assert!(
+            product
+                .ingest_search_batch(binding.collection, &batch, 1, ProductDurability::Strict)?
+                .commit
+                .is_some()
+        );
+    }
+    drop(product);
+    let reopened = NativeProduct::open(&path)?;
+    let result = reopened.search_collection(binding.collection, &lexical_request("kinase"), 1)?;
+    assert_eq!(result.total_documents, 1_024);
+    assert_eq!(result.hits.len(), 16);
+    drop(reopened);
+    fs::remove_dir_all(path)?;
     Ok(())
 }

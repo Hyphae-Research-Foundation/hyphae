@@ -19,6 +19,7 @@ include = [
     "LICENSE-POLICY.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "compatibility/**",
     "src/**",
 ]
 

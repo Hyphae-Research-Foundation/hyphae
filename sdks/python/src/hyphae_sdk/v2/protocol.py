@@ -9,13 +9,21 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
-from .models import ClientError, ProductErrorFields, RequestOptions, Response, SensitiveBytes
+from .models import (
+    CATALOG_DEPENDENCY_KINDS,
+    CATALOG_OBJECT_KINDS,
+    ClientError,
+    ProductErrorFields,
+    RequestOptions,
+    Response,
+    SensitiveBytes,
+)
 
 
 MAX_PAYLOAD = 16 * 1024 * 1024
 FRAME_HEADER_SIZE = 32
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 7
+PROTOCOL_MINOR = 9
 G6_CAPABILITIES = 0x7F
 API_KEY_AUTH_CAPABILITY = 1 << 7
 API_KEY_BYTES = 102
@@ -34,6 +42,9 @@ MAX_AUTOCUT_STEEPNESS = 16
 MAX_LEXICAL_MINIMUM_MATCH = 64
 MAX_LEXICAL_FUZZY_DISTANCE = 2
 MAX_LEXICAL_FIELDS = 64
+MAX_EMBED_AND_INGEST_DOCUMENTS = 256
+MAX_EMBED_EXECUTION_KERNELS = 64
+MAX_EMBED_EXECUTION_TEXT_BYTES = 4_096
 FRAME_KINDS = {
     "hello": 1,
     "welcome": 2,
@@ -115,6 +126,7 @@ REQUEST_KINDS = {
     "security_api_key_rotate_abort": 66,
     "security_api_key_revoke_self": 67,
     "security_api_key_revoke": 68,
+    "embed_and_ingest": 73,
     "security_legacy_bearer_revoke": 70,
     "memory_recall": 71,
     "memory_enrich": 72,
@@ -420,6 +432,15 @@ def _document_required_minor(document: Any) -> int:
     )
 
 
+def _catalog_definition_required_minor(definition: Any) -> int:
+    if not isinstance(definition, bytes) or len(definition) < 10:
+        return 0
+    if definition[:8] != b"HYCOBJ02":
+        return 0
+    kind, representation = definition[8], definition[9]
+    return 8 if kind == 10 or (kind == 7 and representation == 4) else 0
+
+
 _MINOR_SIX_STRUCTURE_READS = frozenset({
     "sorted_set_score_range", "hash_scan_reverse", "hash_scan_match",
     "key_scan_match", "string_range", "set_random_members",
@@ -433,6 +454,8 @@ _MINOR_SIX_STRUCTURE_MUTATIONS = frozenset({
 def operation_required_minor(
     operation: str, arguments: dict[str, Any] | None = None
 ) -> int:
+    if operation == "embed_and_ingest":
+        return 9
     if operation in {"memory_recall", "memory_enrich"}:
         return 7
     if operation == "proof_generate" and arguments is not None:
@@ -451,10 +474,19 @@ def operation_required_minor(
     if operation in SECURITY_WRITE_OPERATIONS:
         return 2
     if operation == "catalog_visible_list":
-        return 3
+        return (
+            8
+            if arguments is not None
+            and arguments.get("kind") == "embedding_profile"
+            else 3
+        )
     if operation in SECURITY_READ_OPERATIONS:
         return 1
     if arguments is not None:
+        if operation == "catalog_list" and arguments.get("kind") == "embedding_profile":
+            return 8
+        if operation == "catalog_create":
+            return _catalog_definition_required_minor(arguments.get("definition"))
         if operation == "structure_read":
             request = arguments.get("request", arguments)
             if isinstance(request, dict) and request.get("kind") in _MINOR_SIX_STRUCTURE_READS:
@@ -537,7 +569,31 @@ def operation_required_minor(
     return 0
 
 
-def response_required_minor(kind: int) -> int:
+def response_required_minor(kind: int, value: Any = None) -> int:
+    if kind == 47:
+        return 9
+    if kind == 12 and isinstance(value, dict):
+        return _catalog_definition_required_minor(value.get("definition"))
+    if kind in {13, 42} and isinstance(value, dict):
+        items = value.get("items", [])
+        if isinstance(items, list) and any(
+            isinstance(item, dict)
+            and (
+                item.get("kind") == "embedding_profile"
+                or item.get("object_kind") == 10
+            )
+            for item in items
+        ):
+            return 8
+    if kind == 14 and isinstance(value, dict):
+        items = value.get("items", [])
+        if isinstance(items, list) and any(
+            isinstance(item, dict) and item.get("kind") == "embedding_profile"
+            for item in items
+        ):
+            return 8
+    if kind == 15:
+        return _catalog_definition_required_minor(value)
     if kind in {45, 46}:
         return 7
     if kind in SECURITY_WRITE_RESPONSE_KINDS:
@@ -547,6 +603,15 @@ def response_required_minor(kind: int) -> int:
     if kind in SECURITY_READ_RESPONSE_KINDS:
         return 1
     return 0
+
+
+def _require_response_content_minor(
+    kind: int, value: Any, negotiated_minor: int | None
+) -> None:
+    if negotiated_minor is not None and negotiated_minor < response_required_minor(
+        kind, value
+    ):
+        raise ClientError("native response is unavailable at the negotiated protocol minor")
 
 
 def _encode_u128(
@@ -625,7 +690,12 @@ def encode_product_request(
         )
     except (KeyError, struct.error) as error:
         raise ClientError("invalid request options") from error
-    body = _encode_operation(operation, arguments)
+    maximum_body_bytes = MAX_PAYLOAD - 16 - len(context)
+    body = _encode_operation(
+        operation, arguments, maximum_bytes=maximum_body_bytes
+    )
+    if len(body) > maximum_body_bytes:
+        raise ClientError("native request exceeds the 16 MiB protocol maximum")
     total = 16 + len(context) + len(body)
     if total > MAX_PAYLOAD:
         raise ClientError("product request exceeds the protocol maximum")
@@ -666,7 +736,12 @@ def decode_product_request(
     return operation, arguments, options
 
 
-def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
+def _encode_operation(
+    operation: str,
+    arguments: dict[str, Any],
+    *,
+    maximum_bytes: int = MAX_PAYLOAD,
+) -> bytes:
     if operation in {
         "capabilities",
         "admin_status",
@@ -790,6 +865,8 @@ def _encode_operation(operation: str, arguments: dict[str, Any]) -> bytes:
         return (_encode_identity(arguments["collection"], "search collection") + digest
                 + _encode_identity(arguments["idempotency_id"], "idempotency")
                 + _encode_search_document(arguments["document"]))
+    if operation == "embed_and_ingest":
+        return _encode_embed_and_ingest_request(arguments, maximum_bytes)
     if operation == "search_collection":
         return _encode_search_collection(arguments)
     if operation == "search_ingest":
@@ -1046,19 +1123,8 @@ def _encode_security_grants(value: Any) -> bytes:
 
 
 def _catalog_kind_tag(kind: Any) -> int:
-    kinds = (
-        "database",
-        "schema",
-        "relation",
-        "secondary_index",
-        "keyspace",
-        "structure",
-        "search_collection",
-        "analyzer",
-        "cross_engine_link",
-    )
     try:
-        return kinds.index(kind) + 1
+        return CATALOG_OBJECT_KINDS.index(kind) + 1
     except ValueError as error:
         raise ClientError("catalog object kind is invalid") from error
 
@@ -1185,6 +1251,11 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         }
     elif operation == "search_collection":
         result = _decode_search_collection(reader)
+    elif operation == "embed_and_ingest":
+        result = {
+            "collection": _decode_identity(reader, "search collection"),
+            "batch": _decode_embed_and_ingest_batch(reader),
+        }
     elif operation == "transaction_stage_structure":
         result = {"handle": reader.u64(), "mutation": _decode_structure_mutation(reader)}
     elif operation == "transaction_stage_search":
@@ -1199,15 +1270,11 @@ def _decode_operation(operation: str, encoded: bytes) -> dict[str, Any]:
         has_parent = reader.boolean()
         kind = reader.u8()
         reader.zeroes(6)
-        kinds = (
-            "database", "schema", "relation", "secondary_index", "keyspace",
-            "structure", "search_collection", "analyzer", "cross_engine_link",
-        )
-        if kind > len(kinds):
+        if kind > len(CATALOG_OBJECT_KINDS):
             raise ClientError("catalog object kind is invalid")
         result = {
             "parent": reader.u128() if has_parent else None,
-            "kind": None if kind == 0 else kinds[kind - 1],
+            "kind": None if kind == 0 else CATALOG_OBJECT_KINDS[kind - 1],
             "cursor": reader.bytes() or None,
             "item_limit": reader.u64(),
             "visit_limit": reader.u64(),
@@ -1667,14 +1734,17 @@ def decode_product_response(
     if kind == 12:
         value = {"snapshot": _decode_snapshot(reader), "definition": reader.bytes()}
         reader.finish()
+        _require_response_content_minor(kind, value, negotiated_minor)
         return Response("catalog_object", value, request_id)
     if kind == 13:
         value = _decode_catalog_page(reader, dependencies=False)
         reader.finish()
+        _require_response_content_minor(kind, value, negotiated_minor)
         return Response("catalog_page", value, request_id)
     if kind == 14:
         value = _decode_catalog_page(reader, dependencies=True)
         reader.finish()
+        _require_response_content_minor(kind, value, negotiated_minor)
         return Response("catalog_dependency_page", value, request_id)
     if kind == 15:
         present = reader.u8()
@@ -1683,6 +1753,7 @@ def decode_product_response(
         if present not in (0, 1):
             raise ClientError("catalog definition response is malformed")
         reader.finish()
+        _require_response_content_minor(kind, value, negotiated_minor)
         return Response("catalog_definition", value, request_id)
     if kind == 16:
         value = _decode_commit_outcome(reader)
@@ -1701,7 +1772,7 @@ def decode_product_response(
             reader.zeroes(6)
             if object_id == 0:
                 raise ClientError("catalog visible object identity is zero")
-            if not 1 <= object_kind <= 9:
+            if not 1 <= object_kind <= len(CATALOG_OBJECT_KINDS):
                 raise ClientError("catalog visible object kind is invalid")
             parent = reader.u128() if has_parent else None
             if parent == 0:
@@ -1713,6 +1784,7 @@ def decode_product_response(
                 "name": _decode_qualified_name(reader),
             })
         reader.finish()
+        _require_response_content_minor(kind, {"items": items}, negotiated_minor)
         return Response(
             "catalog_visible_page",
             {"cursor": cursor or None, "items": items},
@@ -1806,6 +1878,29 @@ def decode_product_response(
         return Response(
             "structure_mutation_batch",
             {"read_csn": read_csn, "commit": commit, "results": results},
+            request_id,
+        )
+    if kind == 47:
+        snapshot = _decode_snapshot(reader)
+        has_commit, replay = reader.boolean(), reader.boolean()
+        reader.zeroes(6)
+        documents = reader.u64()
+        if not has_commit:
+            raise ClientError("embed-and-ingest success is missing commit evidence")
+        if not 0 < documents <= MAX_EMBED_AND_INGEST_DOCUMENTS:
+            raise ClientError("embed-and-ingest document result exceeds its bound")
+        execution_profile = _decode_embedding_execution_profile(reader)
+        commit = _decode_commit_receipt(reader)
+        reader.finish()
+        return Response(
+            "embed_and_ingested",
+            {
+                "snapshot": snapshot,
+                "documents": documents,
+                "idempotent_replay": replay,
+                "execution_profile": execution_profile,
+                "commit": commit,
+            },
             request_id,
         )
     if kind == 24:
@@ -2780,6 +2875,249 @@ def _encode_search_batch(batch: Any) -> bytes:
     return _encode_identity(batch["idempotency_id"], "idempotency") + struct.pack("<I", len(documents)) + b"".join(_encode_search_document(document) for document in documents)
 
 
+def _encode_embed_and_ingest_request(
+    arguments: Any, maximum_bytes: int
+) -> bytes:
+    if (
+        not isinstance(arguments, dict)
+        or len(arguments) != 2
+        or "collection" not in arguments
+        or "batch" not in arguments
+    ):
+        raise ClientError("embed-and-ingest request fields are invalid")
+    batch = arguments["batch"]
+    if (
+        not isinstance(batch, dict)
+        or len(batch) != 2
+        or "idempotency_id" not in batch
+        or "documents" not in batch
+    ):
+        raise ClientError("embed-and-ingest batch fields are invalid")
+    documents = batch["documents"]
+    if (
+        not isinstance(documents, list)
+        or not 0 < len(documents) <= MAX_EMBED_AND_INGEST_DOCUMENTS
+    ):
+        raise ClientError("embed-and-ingest documents must be a nonempty bounded list")
+
+    output = bytearray()
+    _extend_embed_and_ingest(
+        output,
+        _encode_identity(arguments["collection"], "search collection"),
+        maximum_bytes,
+    )
+    _extend_embed_and_ingest(
+        output,
+        _encode_identity(batch["idempotency_id"], "idempotency"),
+        maximum_bytes,
+    )
+    _extend_embed_and_ingest(
+        output, struct.pack("<I", len(documents)), maximum_bytes
+    )
+    for document in tuple(documents):
+        _encode_embed_and_ingest_document(output, document, maximum_bytes)
+    return bytes(output)
+
+
+def _encode_embed_and_ingest_document(
+    output: bytearray, document: Any, maximum_bytes: int
+) -> None:
+    if (
+        not isinstance(document, dict)
+        or len(document) not in (2, 3)
+        or "object_id" not in document
+        or "text" not in document
+        or any(
+            field not in {"object_id", "text", "doc_values"}
+            for field in document
+        )
+    ):
+        raise ClientError("embed-and-ingest document fields are invalid")
+    text = document["text"]
+    values = document.get("doc_values", {})
+    if (
+        not isinstance(text, str)
+        or not isinstance(values, dict)
+        or len(values) > MAX_SEARCH_DOCUMENT_VALUES
+    ):
+        raise ClientError("embed-and-ingest document values exceed their bound")
+
+    object_id = _encode_identity(document["object_id"], "search document")
+    text_bytes = _encode_embed_and_ingest_text(
+        text,
+        maximum_bytes - len(output) - len(object_id) - 8,
+        "embed-and-ingest document text",
+    )
+    projected = len(output) + len(object_id) + 4 + len(text_bytes) + 4
+    if projected > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+
+    entries: list[tuple[bytes, bytes]] = []
+    for name, value in values.items():
+        if not isinstance(name, str):
+            raise ClientError("embed-and-ingest document values exceed their bound")
+        name_bytes = _encode_embed_and_ingest_text(
+            name,
+            maximum_bytes - projected - 4,
+            "embed-and-ingest document value name",
+        )
+        projected += 4 + len(name_bytes)
+        value_bytes = _encode_embed_and_ingest_doc_value(
+            value, maximum_bytes - projected
+        )
+        projected += len(value_bytes)
+        entries.append((name_bytes, value_bytes))
+
+    output.extend(object_id)
+    output.extend(struct.pack("<I", len(text_bytes)))
+    output.extend(text_bytes)
+    output.extend(struct.pack("<I", len(entries)))
+    for name_bytes, value_bytes in sorted(entries, key=lambda entry: entry[0]):
+        output.extend(struct.pack("<I", len(name_bytes)))
+        output.extend(name_bytes)
+        output.extend(value_bytes)
+
+
+def _extend_embed_and_ingest(
+    output: bytearray, encoded: bytes, maximum_bytes: int
+) -> None:
+    if len(encoded) > maximum_bytes - len(output):
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    output.extend(encoded)
+
+
+def _encode_embed_and_ingest_text(
+    value: str, maximum_bytes: int, name: str
+) -> bytes:
+    if value.isascii():
+        length = len(value)
+    else:
+        length = 0
+        for character in value:
+            codepoint = ord(character)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                raise ClientError(f"{name} is not valid UTF-8")
+            length += (
+                1
+                if codepoint <= 0x7F
+                else 2
+                if codepoint <= 0x7FF
+                else 3
+                if codepoint <= 0xFFFF
+                else 4
+            )
+            if length > maximum_bytes:
+                break
+    if length > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    return value.encode("utf-8")
+
+
+def _encode_embed_and_ingest_doc_value(value: Any, maximum_bytes: int) -> bytes:
+    if isinstance(value, bool):
+        length = 2
+    elif isinstance(value, int) and -(1 << 63) <= value < 1 << 63:
+        length = 9
+    elif isinstance(value, str):
+        if maximum_bytes < 5:
+            raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+        length = 5 + len(
+            _encode_embed_and_ingest_text(
+                value,
+                maximum_bytes - 5,
+                "embed-and-ingest document value",
+            )
+        )
+    elif isinstance(value, bytes):
+        length = 5 + len(value)
+    elif isinstance(value, float):
+        length = 9
+    else:
+        raise ClientError("integrated doc value is invalid")
+    if length > maximum_bytes:
+        raise ClientError("embed-and-ingest request exceeds the 16 MiB bound")
+    return _encode_doc_value(value)
+
+
+def _decode_embed_and_ingest_batch(reader: _Reader) -> dict[str, Any]:
+    idempotency_id = _decode_identity(reader, "idempotency")
+    count = reader.u32()
+    if (
+        not 0 < count <= MAX_EMBED_AND_INGEST_DOCUMENTS
+        or count > reader.remaining // 24
+    ):
+        raise ClientError("embed-and-ingest document count exceeds its bound")
+    return {
+        "idempotency_id": idempotency_id,
+        "documents": [_decode_embed_and_ingest_document(reader) for _ in range(count)],
+    }
+
+
+def _decode_embed_and_ingest_document(reader: _Reader) -> dict[str, Any]:
+    object_id = _decode_identity(reader, "search document")
+    text = reader.text()
+    value_count = reader.u32()
+    if value_count > MAX_SEARCH_DOCUMENT_VALUES or value_count > reader.remaining // 5:
+        raise ClientError("embed-and-ingest document value count exceeds its bound")
+    doc_values: dict[str, Any] = {}
+    previous_name: bytes | None = None
+    for _ in range(value_count):
+        name = reader.text()
+        encoded_name = name.encode("utf-8")
+        if previous_name is not None and encoded_name <= previous_name:
+            raise ClientError(
+                "embed-and-ingest value names must be strictly ascending by UTF-8 bytes"
+            )
+        previous_name = encoded_name
+        doc_values[name] = _decode_doc_value(reader)
+    return {"object_id": object_id, "text": text, "doc_values": doc_values}
+
+
+def _decode_embedding_execution_profile(reader: _Reader) -> dict[str, Any]:
+    embedding_profile = _decode_identity(reader, "embedding profile")
+    backend_tag = reader.u8()
+    precision_tag = reader.u8()
+    fallback = reader.boolean()
+    reader.zeroes(5)
+    if backend_tag > 1:
+        raise ClientError("embedding execution backend is invalid")
+    if precision_tag != 1:
+        raise ClientError("embedding execution precision is invalid")
+    device = _decode_bounded_text(reader, "embedding execution device")
+    driver = _decode_bounded_text(reader, "embedding execution driver")
+    runtime = _decode_bounded_text(reader, "embedding execution runtime")
+    kernel_count = reader.u32()
+    if (
+        not 0 < kernel_count <= MAX_EMBED_EXECUTION_KERNELS
+        or kernel_count > reader.remaining // 4
+    ):
+        raise ClientError("embedding execution kernel count exceeds its bound")
+    kernels = [
+        _decode_bounded_text(reader, "embedding execution kernel")
+        for _ in range(kernel_count)
+    ]
+    return {
+        "embedding_profile": embedding_profile,
+        "backend": ("cpu", "cuda")[backend_tag],
+        "device": device,
+        "driver": driver,
+        "runtime": runtime,
+        "precision": "f32",
+        "kernels": kernels,
+        "fallback": fallback,
+    }
+
+
+def _decode_bounded_text(reader: _Reader, name: str) -> str:
+    encoded = reader.bytes()
+    if not encoded or len(encoded) > MAX_EMBED_EXECUTION_TEXT_BYTES:
+        raise ClientError(f"{name} is empty or exceeds its bound")
+    try:
+        return encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ClientError(f"{name} is not valid UTF-8") from error
+
+
 def _encode_search_document(document: Any) -> bytes:
     output = bytearray(_encode_identity(document["object_id"], "search document"))
     output.extend(_text(document["text"]))
@@ -3715,22 +4053,24 @@ def _decode_catalog_page(reader: _Reader, *, dependencies: bool) -> dict[str, An
     }
     count = reader.u32()
     if dependencies:
-        kinds = ("parent", "secondary_index_relation", "foreign_key", "analyzer", "link_endpoint", "relation_schema")
         for _ in range(count):
             dependent, prerequisite, tag = reader.u128(), reader.u128(), reader.u8()
-            if not 1 <= tag <= len(kinds):
+            if not 1 <= tag <= len(CATALOG_DEPENDENCY_KINDS):
                 raise ClientError("catalog dependency kind is invalid")
-            page["items"].append({"dependent": dependent, "prerequisite": prerequisite, "kind": kinds[tag - 1]})
+            page["items"].append({
+                "dependent": dependent,
+                "prerequisite": prerequisite,
+                "kind": CATALOG_DEPENDENCY_KINDS[tag - 1],
+            })
     else:
-        kinds = ("database", "schema", "relation", "secondary_index", "keyspace", "structure", "search_collection", "analyzer", "cross_engine_link")
         for _ in range(count):
             object_id, tag, has_parent = reader.u128(), reader.u8(), reader.boolean()
             reader.zeroes(6)
-            if not 1 <= tag <= len(kinds):
+            if not 1 <= tag <= len(CATALOG_OBJECT_KINDS):
                 raise ClientError("catalog object kind is invalid")
             page["items"].append({
                 "id": object_id,
-                "kind": kinds[tag - 1],
+                "kind": CATALOG_OBJECT_KINDS[tag - 1],
                 "parent": reader.u128() if has_parent else None,
                 "name": _decode_qualified_name(reader),
             })

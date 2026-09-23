@@ -336,12 +336,12 @@ def add_final_signature_bundles(directory: Path) -> None:
 
 
 class PackageTests(unittest.TestCase):
-    def test_apache_publication_is_blocked_until_version_1_2_2(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "3.0.0"):
-            require_final_apache_release_version("1.2.1")
-        require_final_apache_release_version("3.0.0")
+    def test_release_finalization_is_bound_to_version_4_0_0(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "4.0.0"):
+            require_final_apache_release_version("3.0.0")
+        require_final_apache_release_version("4.0.0")
 
-    def test_release_candidate_versions_are_aligned(self) -> None:
+    def test_source_package_versions_are_aligned(self) -> None:
         cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         version = cargo["workspace"]["package"]["version"]
         python = tomllib.loads(
@@ -365,8 +365,18 @@ class PackageTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(version, "3.0.0")
-        self.assertEqual(python["project"]["version"], version)
+        crates_release = json.loads(
+            (ROOT / "config/crates-io-release.json").read_text(encoding="utf-8")
+        )
+        npm_release = json.loads(
+            (ROOT / "config/npm-release.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(version, "4.0.0")
+        self.assertEqual(python["project"]["version"], "4.0.0")
+        self.assertIn(
+            "Development Status :: 5 - Production/Stable",
+            python["project"]["classifiers"],
+        )
         self.assertEqual(typescript["version"], version)
         self.assertEqual(typescript_lock["version"], version)
         self.assertEqual(typescript_lock["packages"][""]["version"], version)
@@ -374,12 +384,68 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(integrations_lock["version"], version)
         self.assertEqual(integrations_lock["packages"][""]["version"], version)
         self.assertEqual(
+            integrations_lock["packages"][""]["peerDependencies"][
+                "@hyphae_/hyphae"
+            ],
+            version,
+        )
+        self.assertEqual(
+            integrations_lock["packages"]["../../sdks/typescript"]["version"], version
+        )
+        self.assertEqual(
             integrations["peerDependencies"]["@hyphae_/hyphae"], version
         )
+        self.assertEqual(crates_release["version"], version)
+        self.assertEqual(npm_release["version"], version)
+        publication_authority = {
+            "version": "3.0.0",
+            "tag": "release-v3.0.0-crates",
+            "source_ref_kind": "annotated-tag",
+            "require_exact_clean_source": True,
+        }
+        self.assertEqual(
+            crates_release["apache_publication_authority"], publication_authority
+        )
+        self.assertEqual(
+            npm_release["apache_publication_authority"], publication_authority
+        )
+        self.assertNotEqual(version, publication_authority["version"])
+        for layer in crates_release["layers"]:
+            for package in layer:
+                readme_path = (
+                    ROOT / "integrations/pliegors/README.md"
+                    if package == "hyphae-pliegors"
+                    else ROOT / "crates" / package / "README.md"
+                )
+                readme = readme_path.read_text(encoding="utf-8")
+                pin = (
+                    f"--version {version}"
+                    if package == "hyphae-cli"
+                    else f'{package} = "={version}"'
+                )
+                self.assertIn(pin, readme, readme_path.as_posix())
+        for readme_path in (
+            ROOT / "sdks/python/README.md",
+            ROOT / "sdks/typescript/README.md",
+        ):
+            self.assertIn(
+                f"version is `{version}`",
+                readme_path.read_text(encoding="utf-8"),
+                readme_path.as_posix(),
+            )
+        release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
+            "utf-8"
+        )
+        self.assertIn('test "$RELEASE_TAG" = "release-v4.0.0-crates"', release_workflow)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        authority_version = re.escape(publication_authority["version"])
         self.assertRegex(
             changelog,
-            rf"(?m)^## \[{re.escape(version)}\] - (?:Unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
+            rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
+        )
+        self.assertRegex(
+            changelog,
+            rf"(?m)^## \[{authority_version}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         )
 
     def test_release_workflow_separates_native_and_candidate_artifacts(

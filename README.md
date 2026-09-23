@@ -17,7 +17,7 @@
   <a href="https://github.com/Hyphae-Research-Foundation/hyphae/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Hyphae-Research-Foundation/hyphae?logo=github"></a>
   <a href="https://hyphae.dev"><img alt="Website" src="https://img.shields.io/badge/website-hyphae.dev-8FCBC6"></a>
   <a href="LICENSE-POLICY.md"><img alt="License" src="https://img.shields.io/badge/code-Apache--2.0-C86F4A"></a>
-  <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
+  <img alt="MSRV 1.90" src="https://img.shields.io/badge/MSRV-1.90-43585A?logo=rust">
 </p>
 
 <p align="center">
@@ -43,6 +43,16 @@ SBOMs, signatures, provenance, and fault matrices to the exact release
 commit. The [native gate status](docs/gates/native-gate-status.md) is the
 current status authority; temporary workflow artifacts alone do not close a
 gate.
+
+**Source release candidate:** `4.0.0` integrates Lane14
+`f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. The 25-crate
+graph adds offline Qwen3 embedding in the existing
+`hyphae-native-embed-cpu` crate, with a default-off validated H100 CUDA feature.
+Native minor-9 Rust, Python, and TypeScript clients share request tag 73 and
+the catalog-bound embedded, UDS, and HTTP operation. Local CPU and H100 model
+checks do not grant a published release, an exact-SHA G8 closure, or a verified
+model-result receipt. Registry authority remains at `3.0.0`.
 
 **What changed in 3.0.0:** the bounded SQL slice grows into its analytics
 form (`HAVING`, grouped `ORDER BY`, `SELECT DISTINCT`, `OFFSET`, `BETWEEN`,
@@ -256,6 +266,10 @@ cargo build --release --locked -p hyphae-cli
 The release contains Linux x64, macOS x64/arm64, and Windows x64 archives plus
 checksums, SPDX/CycloneDX SBOMs, provenance, signatures, and attestations.
 
+The checked-out source is the `4.0.0` release candidate. It is not published
+and has no inherited exact-SHA G8 closure; the commands above intentionally
+remain bound to the verified `3.0.0` release until a new release is authorized.
+
 ## Legacy 0.2.1 compatibility flow
 
 ```bash
@@ -326,6 +340,10 @@ scheduling), `hyphae-native-protocol`/`hyphae-native-daemon` (local transport),
 and the owned `hyphae-native-{types,catalog,pages,blobs,wal,mvcc,btree,records,manifest,ann}`
 storage and execution primitives. `hyphae-cli` builds the single product
 binary.
+
+The `4.0.0` source candidate has 25 publishable crates. It adds
+`hyphae-native-embed-cpu` to the graph below; package audit and extracted-crate
+verification are local candidate evidence, not registry publication authority.
 
 Version `3.0.0` publishes the complete 24-crate graph:
 
@@ -426,7 +444,9 @@ authority.
 
 The repository pins its toolchain and enforces format, Clippy, tests,
 rustdoc, contracts, documentation, dependency policy, secret scanning,
-cross-platform packages, fuzzing, and recovery stress.
+cross-platform packages, fuzzing, and recovery stress. The full all-features
+commands below require a CUDA toolkit. CPU-only hosts use the non-CUDA suite in
+the [development guide](docs/development.md).
 
 ```console
 cargo fmt --all --check

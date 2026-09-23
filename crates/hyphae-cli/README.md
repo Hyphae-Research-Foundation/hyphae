@@ -8,16 +8,22 @@
 The single `hyphae` executable: local data engine, operations CLI, `/v1`
 server, remote client, offline proof verifier, and MCP stdio adapter.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```bash
-cargo install hyphae-cli --version 3.0.0 --locked
+cargo install hyphae-cli --version 4.0.0 --locked
 hyphae version --json
 ```
 
 The base deployment is one binary and one data directory. KV, structured
 query, recovery, backup/restore, and verification work without an external
-database, cache, cloud, embedding provider, or LLM.
+database, cache, cloud, embedding provider, LLM, or GPU. Source builds for the
+4.0.0 candidate can load a complete local Qwen3 embedding snapshot with
+`hyphae serve --embedding-manifest ... --embedding-model-dir ...`; embedded and
+native UDS/HTTP calls use the same registered executor. The default CPU build
+remains offline. An accelerator-capable source build enables `--features cuda`
+and automatically selects a validated H100, recording its actual execution
+profile and using whole-batch CPU fallback when allowed.
 
 Remote request/proof JSON and bearer-token inputs are byte bounded before
 decoding. Named files are metadata-preflighted, read through one detection byte

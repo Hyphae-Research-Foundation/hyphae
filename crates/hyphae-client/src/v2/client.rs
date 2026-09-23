@@ -13,8 +13,8 @@ use hyphae_native_product::{
     AccessControlMutationReceipt, ApiKeyActivationReceipt, ApiKeyConfirmationDigest, ApiKeyId,
     ApiKeyStartReceipt, BackupRequest, BoundedSearchQuery, BuiltInRole, CatalogDependencyRequest,
     CatalogListRequest, CatalogVisibleListRequest, CustomRoleGrant, CustomRoleMutationReceipt,
-    DoctorRequest, ObjectId, ProductDurabilityPolicy, ProductError, ProductLimits,
-    ProductOperation, ProductPreparedHandle, ProductResponse, ProductScope,
+    DoctorRequest, ObjectId, ProductDurabilityPolicy, ProductEmbedAndIngestBatch, ProductError,
+    ProductLimits, ProductOperation, ProductPreparedHandle, ProductResponse, ProductScope,
     ProductSearchDocumentDelete, ProductSearchDocumentUpdate, ProductSearchIngestBatch,
     ProductSearchRequest, ProductStructureMutation, ProductStructureReadRequest, ProductValue,
     RestoreRequest, RoleAssignmentMutationReceipt, SecurityAssignmentListRequest,
@@ -410,6 +410,20 @@ impl HyphaeClient {
     ) -> Result<ProductResponse, ClientError> {
         self.execute(
             ProductOperation::SearchIngest { collection, batch },
+            options,
+        )
+        .await
+    }
+
+    /// Embeds catalog-bound text and atomically ingests the generated vectors.
+    pub async fn embed_and_ingest(
+        &self,
+        collection: ObjectId,
+        batch: ProductEmbedAndIngestBatch,
+        options: RequestOptions,
+    ) -> Result<ProductResponse, ClientError> {
+        self.execute(
+            ProductOperation::EmbedAndIngest { collection, batch },
             options,
         )
         .await

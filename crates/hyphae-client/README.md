@@ -8,11 +8,11 @@
 Bounded asynchronous Rust client for the [Hyphae](https://hyphae.dev) `/v1`
 HTTP API.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-client = "=3.0.0"
+hyphae-client = "=4.0.0"
 ```
 
 The client consumes only public versioned contracts and never opens or owns a
@@ -22,7 +22,7 @@ The additive `hyphae_client::v2` module exposes equivalent high-level Native
 operations over canonical HTTP v2 product envelopes and exact `HYPHLCL1`
 AF_UNIX/Windows named-pipe transport. API-key lifecycle operations use only
 `/v2/security/keys`; the generic `/v2/execute` route rejects them. The client
-offers protocol minor 3 and validates the exact selected response minor before
+offers protocol minors 3 through 9 and validates the exact selected response minor before
 retaining session state or decoding a body. It uses product-owned contract types
 and preserves typed product errors, deadlines, cancellation, and transaction
 outcome state.

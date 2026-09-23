@@ -26,14 +26,15 @@ from .protocol import (
     decode_product_error,
     decode_product_response,
     encode_product_request,
+    operation_required_minor,
 )
 
 PRODUCT_MEDIA_TYPE = "application/vnd.hyphae.product-v1"
 ERROR_MEDIA_TYPE = "application/vnd.hyphae.error-v1"
-PROTOCOL_MINOR = "7"
+PROTOCOL_MINOR = "9"
 # Every protocol minor this build speaks, ascending. The request offers the
 # whole set and the server echoes its selection, which must be a member.
-PROTOCOL_MINORS_SUPPORTED = (3, 4, 5, 6, 7)
+PROTOCOL_MINORS_SUPPORTED = (3, 4, 5, 6, 7, 8, 9)
 _STANDARD_HTTP_CONNECTION = http.client.HTTPConnection
 _STANDARD_HTTPS_CONNECTION = http.client.HTTPSConnection
 _CONNECT_PENDING = {
@@ -95,6 +96,7 @@ class HttpTransport:
         self._timeout_seconds = timeout_seconds
         self._response_bytes = response_bytes
         self._session_id: str | None = None
+        self._negotiated_minor = max(PROTOCOL_MINORS_SUPPORTED)
         self._closed = False
         self._state_lock = threading.Lock()
         self._active_connections: dict[
@@ -106,6 +108,13 @@ class HttpTransport:
         authentication = "bearer" if self._managed else "none"
         origin = f"{self._parsed.scheme}://{self._parsed.netloc}"
         return f"HttpTransport(base_url={origin!r}, authentication={authentication!r})"
+
+    @property
+    def negotiated_minor(self) -> int:
+        """Highest offered minor initially, then the server-selected minor."""
+
+        with self._state_lock:
+            return self._negotiated_minor
 
     def __enter__(self) -> HttpTransport:
         with self._state_lock:
@@ -176,6 +185,7 @@ class HttpTransport:
         with self._state_lock:
             if self._closed:
                 raise ClientError("HTTP transport is closed")
+            request_minor = self._negotiated_minor
         request_id = options.checked_request_id()
         if options.cancellation.cancelled:
             raise product_error("cancelled", request_id)
@@ -185,7 +195,7 @@ class HttpTransport:
             else None
         )
         body = encode_product_request(
-            operation, arguments, options, negotiated_minor=int(PROTOCOL_MINOR)
+            operation, arguments, options, negotiated_minor=request_minor
         )
         key_lifecycle = operation.startswith("security_api_key_") or operation == (
             "security_legacy_bearer_revoke"
@@ -295,7 +305,7 @@ class HttpTransport:
                 or int(selected_minor) not in PROTOCOL_MINORS_SUPPORTED
             ):
                 raise ClientError("HTTP v2 protocol minor is missing or unsupported")
-            negotiated_minor = int(selected_minor)
+            response_minor = int(selected_minor)
             if response_request_id != str(request_id):
                 raise ClientError("HTTP v2 response request ID mismatch")
             if session_id is not None and (
@@ -304,6 +314,10 @@ class HttpTransport:
                 or session_id == "0" * 32
             ):
                 raise ClientError("HTTP v2 response session ID is invalid")
+            if response_minor < operation_required_minor(operation, arguments):
+                raise ClientError(
+                    "native operation is unavailable at the negotiated protocol minor"
+                )
             if one_time_secret and 200 <= response.status < 300 and (
                 response.getheader("Cache-Control")
                 != "no-store, private, max-age=0"
@@ -320,9 +334,10 @@ class HttpTransport:
                 if response_socket is not None:
                     _abort_socket(response_socket)
                 raise self._interrupted_error(context, request_id)
-            if session_id is not None:
-                with self._state_lock:
-                    if not self._closed:
+            with self._state_lock:
+                if not self._closed:
+                    self._negotiated_minor = response_minor
+                    if session_id is not None:
                         self._session_id = session_id
             declared = response.getheader("Content-Length")
             maximum = min(self._response_bytes, options.limits["max_response_bytes"])
@@ -353,7 +368,7 @@ class HttpTransport:
                         "HTTP v2 returned an unexpected status or media type"
                     )
                 return decode_product_response(
-                    encoded, request_id, negotiated_minor=negotiated_minor
+                    encoded, request_id, negotiated_minor=response_minor
                 )
             if media_type == ERROR_MEDIA_TYPE:
                 raise ProductError(

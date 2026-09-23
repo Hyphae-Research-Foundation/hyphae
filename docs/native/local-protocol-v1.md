@@ -1,6 +1,43 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native local protocol v1
 
+Protocol minor 9 adds request tag `73` (`EmbedAndIngest`) and response tag
+`47` (`EmbedAndIngested`). The request body is one nonzero collection `u128`,
+one nonzero idempotency `u128`, a nonzero `u32` document count bounded to 256,
+then each document's nonzero object `u128`, length-framed UTF-8 source text,
+and canonical UTF-8-byte-ordered doc-value map. Vectors, target names, profile
+IDs, model paths, providers, devices, and backend preferences are not request
+fields. The complete product envelope remains bounded to 16 MiB and counts are
+validated against both fixed limits and remaining bytes before allocation.
+
+The collection must contain exactly one named vector and that vector must bind
+exactly one minor-8 embedding profile of the same vector type. Missing,
+ambiguous, mismatched, or multi-target bindings fail closed. Authorization is
+object-exact: the destination collection requires `catalog.read` plus
+`data.write`, while the bound profile requires `catalog.read` plus
+`search.execute`.
+
+Response `47` contains the existing snapshot, a required commit-presence byte
+of `1`, the idempotent-replay boolean, six zero reserved bytes, a nonzero
+bounded `u64` document count, and the execution profile. The execution profile
+contains the nonzero profile `u128`, backend byte (`0` CPU, `1` CUDA), precision
+byte `1` (FP32), fallback boolean, five zero reserved bytes, nonempty bounded
+device/driver/runtime strings, and 1 through 64 nonempty bounded kernel names,
+followed by the existing fixed commit receipt. A successful replay returns the
+original commit evidence; a success without commit evidence is noncanonical.
+The minor-9 request fixture lives at
+`compatibility/native-protocol-v1-embed-and-ingest.bin`. The protocol crate
+packages a byte-identical mirror under `tests/fixtures/` so its extracted
+archive retains the exact Rust/Python/TypeScript request vector.
+
+Protocol minor 8 adds no request or response tags. It admits embedding-profile
+content inside existing catalog operations: object kind `10`, dependency kind
+`7`, profile definitions, and search-collection representation 4 profile
+bindings. Minor requirements inspect catalog create/list filters and decoded
+response content, including definitions, summaries, visible summaries, and
+dependency edges. Peers at minors 0 through 7 reject profile-only content
+before dispatch or delivery while retaining every historical encoding.
+
 The unreleased Agent Memory candidate adds protocol minor 7: request `71`
 (`MemoryRecall`), response `45` (`MemoryRecall`), request `72`
 (`MemoryEnrich`, returning `SearchIngested`), and response `46`

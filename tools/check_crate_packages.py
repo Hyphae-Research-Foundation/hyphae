@@ -59,6 +59,7 @@ def validate_release_graph(
         return (), ["release config version or layers have invalid types"]
     expected_crates = tuple(crate for layer in layers for crate in layer)
     expected_set = set(expected_crates)
+    declared_package_count = release.get("package_count")
     baseline_packages = release.get("semver_baseline_packages", [])
     layer_by_crate = {
         crate: layer_index
@@ -67,6 +68,16 @@ def validate_release_graph(
     }
 
     failures: list[str] = []
+
+    if declared_package_count is not None and (
+        not isinstance(declared_package_count, int)
+        or isinstance(declared_package_count, bool)
+        or declared_package_count != len(expected_crates)
+    ):
+        failures.append(
+            "declared package count does not match the release layers; "
+            f"declared={declared_package_count!r}, actual={len(expected_crates)}"
+        )
 
     if not isinstance(baseline_packages, list):
         failures.append("semver baseline packages must be a list")

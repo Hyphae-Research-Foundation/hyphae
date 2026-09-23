@@ -15,6 +15,6 @@ rsync -az --delete -e "ssh -i $SSH_KEY" \
   "$REPO_DIR/" "root@$DEVBOX_IP:/workspace/hyphae/"
 
 if [ $# -eq 0 ]; then
-  set -- bash -c 'cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-features --locked'
+  set -- bash -c 'cargo fmt --all --check && cargo clippy --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-targets --all-features --locked -- -D warnings && cargo clippy -p hyphae-cli -p hyphae-native-embed-cpu --all-targets --locked -- -D warnings && cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked && cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked'
 fi
 ssh -i "$SSH_KEY" "root@$DEVBOX_IP" "cd /workspace/hyphae && source ~/.cargo/env && $*"

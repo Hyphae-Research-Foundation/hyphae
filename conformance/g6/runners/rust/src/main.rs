@@ -2296,6 +2296,7 @@ fn configure_search(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
                         metric: VectorMetric::SquaredL2,
                         policy: VectorSearchPolicy::Exact,
                         lifecycle,
+                        embedding_profile: None,
                     },
                     NamedVectorDefinition {
                         id: FieldId::new(4)?,
@@ -2304,6 +2305,7 @@ fn configure_search(product: &mut NativeProduct) -> Result<(), Box<dyn Error>> {
                         metric: VectorMetric::SquaredL2,
                         policy: VectorSearchPolicy::Ann(ann),
                         lifecycle,
+                        embedding_profile: None,
                     },
                 ],
                 bm25: None,

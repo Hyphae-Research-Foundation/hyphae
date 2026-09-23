@@ -30,8 +30,10 @@ AF_UNIX or a local named pipe and the binary HTTP v2 edge. Generic operations
 use `/v2/execute`; every API-key lifecycle operation and legacy-bearer revoke
 use only the strict,
 managed `/v2/security/keys` family. Every HTTP request and response carries the
-exact protocol minor 7 header before session retention or body decoding. The JSON
-corpus and static checker do not substitute for those hosted executions. The
+exact protocol minor 7 header before session retention or body decoding.
+The current handshake minor is 9; this security fixture deliberately retains
+minor 7 so its historical wire bytes remain under test. The JSON corpus
+and static checker do not substitute for those hosted executions. The
 role-matrix row remains fixed to the exhaustive managed write-plane test:
 durable Admin and Owner credentials execute all six security mutations, while
 durable Auditor, Developer, Operator, Reader, and Writer credentials receive

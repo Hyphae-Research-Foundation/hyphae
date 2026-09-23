@@ -142,7 +142,7 @@ ROLE_MATRIX_EVIDENCE = {
 PYTHON_MANAGED_LIVE_COMMAND = (
     "python tools/run_python_managed_v2_conformance.py --binary target/debug/hyphae "
     "--fixture-binary target/debug/hyphae-v2-fixture "
-    "--wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl "
+    "--wheel dist/hyphae_sdk-4.0.0-py3-none-any.whl "
     "--output python-managed-v2-conformance.json"
 )
 PYTHON_MANAGED_LIVE_ID = "python-managed-live"
@@ -273,11 +273,18 @@ def validate_protocol(corpus: dict[str, Any]) -> None:
         fail("protocol policy is missing")
     exact_keys(
         protocol,
-        {"current_major", "current_minor", "rejections_before_dispatch"},
+        {"current_major", "current_minor", "managed_fixture_minor", "rejections_before_dispatch"},
         "protocol policy",
     )
-    if protocol["current_major"] != 1 or protocol["current_minor"] != 7:
-        fail("protocol authority must describe Native 1.7")
+    if (
+        protocol["current_major"] != 1
+        or protocol["current_minor"] != 9
+        or protocol["managed_fixture_minor"] != 7
+    ):
+        fail(
+            "protocol authority must retain the Native 1.7 security fixture "
+            "under Native 1.9"
+        )
     if protocol["rejections_before_dispatch"] != PROTOCOL_REJECTIONS:
         fail("minor 0/1 operations must fail before dispatch")
 
@@ -308,7 +315,7 @@ def validate_native_sources(root: Path, corpus: dict[str, Any]) -> None:
         fail(f"cannot load Native authority source: {error}")
     if (
         "pub const PROTOCOL_MAJOR: u16 = 1;" not in handshake
-        or "pub const PROTOCOL_MINOR: u16 = 7;" not in handshake
+        or "pub const PROTOCOL_MINOR: u16 = 9;" not in handshake
     ):
         fail("Native protocol version differs from the corpus")
     minor_body = function_slice(product, "ensure_operation_minor", "ensure_response_minor")

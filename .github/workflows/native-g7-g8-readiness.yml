@@ -367,7 +367,9 @@ jobs:
           python-version: 3.13.7
       - name: Build Native product and independent verifier
         shell: bash
-        run: cargo build --workspace --all-features --locked
+        run: |
+          cargo build --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+          cargo build -p hyphae-cli -p hyphae-native-embed-cpu --locked
       - name: Run exact-SHA Native soak and independent restore verification
         shell: bash
         run: |

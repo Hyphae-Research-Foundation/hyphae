@@ -100,8 +100,11 @@ Consumer verification is documented in
 [`../docs/release/verification.md`](../docs/release/verification.md).
 
 crates.io and npm use the separate `Registry publish` workflow. Dry-runs are
-allowed against the current manifests, but live publication is fail-closed
-unless the source is a clean checkout of the annotated
-`release-v3.0.0-crates` tag and every package manifest and registry policy
-declares exact version `3.0.0` with
-Apache-2.0 authority.
+allowed against the 25-package `4.0.0` source manifests integrating Lane14
+`f2336d8664b32d812cea3291d942e286a89eea9d`. Release artifact finalization is
+also pinned to `4.0.0`, but a manual run without a tag produces candidate
+artifacts only. Live registry publication remains fail-closed unless the source
+is a clean checkout of the annotated `release-v3.0.0-crates` tag and every
+publication-authority field declares exact version `3.0.0` with Apache-2.0
+authority. This intentional split permits 4.0.0 package validation without
+rewriting or exercising the 3.0.0 live publication authority.

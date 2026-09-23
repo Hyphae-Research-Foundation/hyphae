@@ -3,6 +3,13 @@
 Do not install an archive until its digest, identity, and provenance all
 verify. Replace `VERSION` and `TARGET` with the downloaded release values.
 
+The current source tree is prepared as a `4.0.0` release candidate integrating
+Lane14 `f2336d8664b32d812cea3291d942e286a89eea9d`. The selected
+Lane12 branch tip is the exact candidate SHA to verify; a source file cannot
+name its own eventual commit SHA. No 4.0.0 release is published. Until a protected-main commit has a signed release and
+G8 closure, use this procedure only for candidate verification. The retained
+`3.0.0` publication evidence and registry authority remain unchanged.
+
 ## Maintainer tag-target invariant
 
 The version tag targets the canonical merge commit for the reviewed release

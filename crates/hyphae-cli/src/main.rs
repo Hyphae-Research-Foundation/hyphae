@@ -17,12 +17,17 @@ mod migrate_valkey;
 mod native;
 mod native_client;
 mod native_service;
+
+#[cfg(feature = "cuda")]
+type NodeEmbeddingExecutor = hyphae_native_embed_cpu::Qwen3AcceleratorExecutor;
+#[cfg(not(feature = "cuda"))]
+type NodeEmbeddingExecutor = hyphae_native_embed_cpu::Qwen3CpuExecutor;
 mod tui;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{BufWriter, Write, stderr, stdout},
+    io::{BufWriter, Read, Write, stderr, stdout},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -34,11 +39,14 @@ use hyphae_core::current_version;
 use hyphae_engine::decode_document;
 use hyphae_native_catalog::{
     AnalyzerDefinition, AnalyzerFilter, AnalyzerTokenizer, AnnIndexDefinition, CatalogObjectKind,
-    CatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind, FieldSourcePolicy,
-    IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy, KeyspaceMemoryClass,
-    KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject, NamedVectorDefinition,
-    ObjectHeaderV2, QualifiedName, SearchCollectionDefinitionV2, SearchFieldDefinitionV2,
-    SearchFieldOptions, StructureOwnership, VectorMetric, VectorSearchPolicy,
+    CatalogObjectV2, DefinitionVersion, DependencyDirection, DependencyKind,
+    EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+    FieldSourcePolicy, IncrementalVectorLifecycle, KeyspaceDefinition, KeyspaceEvictionPolicy,
+    KeyspaceMemoryClass, KeyspaceTtlPolicy, LexicalIndexPolicy, LogicalCatalogObject,
+    MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES, NamedVectorDefinition, ObjectHeaderV2,
+    QWEN3_EMBEDDING_QUERY_INSTRUCTION, QualifiedName, SearchCollectionDefinitionV2,
+    SearchFieldDefinitionV2, SearchFieldOptions, StructureOwnership, VectorMetric,
+    VectorSearchPolicy,
 };
 use hyphae_native_product::proof::{
     ExternalTrustedAnchor, NativeProofGenerationLimits, NativeProofKind, NativeVerificationLimits,
@@ -87,6 +95,7 @@ use native_client::{
 };
 use serde::{Deserialize, Deserializer, de::Visitor};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use hyphae_native_types::{
@@ -186,6 +195,11 @@ enum Command {
         local: LocalDirectory,
         #[command(subcommand)]
         operation: CatalogCommand,
+    },
+    /// Manage local embedding models, catalog profiles, and atomic ingestion.
+    Model {
+        #[command(subcommand)]
+        operation: ModelCommand,
     },
     /// Execute native SQL.
     Sql {
@@ -321,6 +335,12 @@ enum Command {
         /// Restricted 1.2-only legacy bearer file for Native HTTP only.
         #[arg(long, requires = "http_bind")]
         native_legacy_bearer_file: Option<PathBuf>,
+        /// Node-local verified embedding artifact manifest.
+        #[arg(long, requires = "embedding_model_dir")]
+        embedding_manifest: Option<PathBuf>,
+        /// Node-local complete embedding model snapshot.
+        #[arg(long, requires = "embedding_manifest")]
+        embedding_model_dir: Option<PathBuf>,
         /// Format-2 `/v1` listener. Native HTTP uses `--http-bind`.
         #[arg(long)]
         bind: Option<SocketAddr>,
@@ -397,6 +417,84 @@ enum Command {
         #[arg(long)]
         journal_memory_collection: Option<u128>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Verify and load one model into a temporary process-local registry.
+    Register {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+    },
+    /// Create one catalogued Qwen3 embedding profile.
+    ProfileCreate {
+        #[command(flatten)]
+        target: ModelTarget,
+        #[arg(long)]
+        id: u128,
+        #[arg(long)]
+        parent: u128,
+        #[arg(long)]
+        name: String,
+        /// Local manifest read by this CLI; only its digest and length are dispatched.
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value_t = 384)]
+        dimension: u16,
+        #[arg(long, default_value_t = 32_768)]
+        max_input_tokens: u32,
+        #[arg(long, value_enum, default_value_t = Durability::Strict)]
+        durability: Durability,
+    },
+    /// Embed vector-free documents and atomically ingest them.
+    EmbedIngest {
+        #[command(flatten)]
+        target: ModelTarget,
+        #[arg(long)]
+        collection: u128,
+        #[arg(long)]
+        idempotency_id: u128,
+        /// JSON array of `{id,text,doc_values}` documents.
+        #[arg(long)]
+        documents_json: String,
+        /// Embedded execution only: verified artifact manifest.
+        #[arg(long, requires = "model_dir")]
+        manifest: Option<PathBuf>,
+        /// Embedded execution only: complete model snapshot.
+        #[arg(long, requires = "manifest")]
+        model_dir: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Durability::Strict)]
+        durability: Durability,
+    },
+}
+
+#[derive(Clone, Debug, clap::Args)]
+struct ModelTarget {
+    #[arg(
+        long,
+        env = "HYPHAE_DATA_DIR",
+        required_unless_present_any = ["endpoint", "http_base_url"],
+        conflicts_with_all = ["endpoint", "http_base_url"]
+    )]
+    data_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "HYPHAE_NATIVE_ENDPOINT",
+        required_unless_present_any = ["data_dir", "http_base_url"],
+        conflicts_with_all = ["data_dir", "http_base_url"]
+    )]
+    endpoint: Option<String>,
+    #[arg(
+        long,
+        env = "HYPHAE_BASE_URL",
+        required_unless_present_any = ["data_dir", "endpoint"],
+        conflicts_with_all = ["data_dir", "endpoint"]
+    )]
+    http_base_url: Option<String>,
+    #[arg(long, env = "HYPHAE_NATIVE_API_KEY_FILE")]
+    native_api_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -970,6 +1068,9 @@ enum CatalogCommand {
         name: String,
         #[arg(long, default_value_t = 2)]
         dimension: u16,
+        /// Bind one `semantic` vector to this embedding profile.
+        #[arg(long)]
+        embedding_profile: Option<u128>,
         /// Adds frozen Latin diacritic folding to the collection analyzer.
         #[arg(long)]
         analyzer_ascii_folding: bool,
@@ -1237,6 +1338,15 @@ struct IngestDocument {
     doc_values: BTreeMap<String, Value>,
     #[serde(default)]
     vectors: BTreeMap<String, Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbedIngestDocument {
+    id: JsonU128,
+    text: String,
+    #[serde(default)]
+    doc_values: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2141,6 +2251,7 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             dispatch(&local, ProductOperation::Capabilities).map_err(Into::into)
         }
         Command::Catalog { local, operation } => catalog(&local, operation).map_err(Into::into),
+        Command::Model { operation } => model(operation).await.map_err(Into::into),
         Command::Sql { local, operation } => sql(&local, operation).map_err(Into::into),
         Command::Structure { local, operation } => structure(&local, operation).map_err(Into::into),
         Command::Search { local, operation } => search(&local, operation).map_err(Into::into),
@@ -2220,6 +2331,8 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
             http_bind,
             native_api_key_auth,
             native_legacy_bearer_file,
+            embedding_manifest,
+            embedding_model_dir,
             bind,
             bearer_token_file,
         } => {
@@ -2238,6 +2351,10 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                     http_bind,
                     native_api_key_auth,
                     native_legacy_bearer_file,
+                    load_embedding_executor_optional(
+                        embedding_manifest.as_deref(),
+                        embedding_model_dir.as_deref(),
+                    )?,
                 )
                 .await
                 .map_err(Into::into)
@@ -2246,6 +2363,8 @@ async fn run(cli: Cli) -> Result<(), RunFailure> {
                     || http_bind.is_some()
                     || native_api_key_auth
                     || native_legacy_bearer_file.is_some()
+                    || embedding_manifest.is_some()
+                    || embedding_model_dir.is_some()
                 {
                     return Err(RunFailure::Compatibility(
                         "native serve options cannot be used with a format-2 directory".into(),
@@ -3299,6 +3418,224 @@ fn dispatch(local: &LocalDirectory, operation: ProductOperation) -> Result<(), C
 }
 
 #[allow(clippy::too_many_lines)]
+async fn model(command: ModelCommand) -> Result<(), CliFailure> {
+    match command {
+        ModelCommand::Register {
+            manifest,
+            model_dir,
+        } => {
+            let executor = load_embedding_executor(&manifest, &model_dir)?;
+            let (manifest_digest, manifest_bytes) = embedding_manifest_identity(&manifest)?;
+            let profile = executor
+                .execution_profile_for(manifest_digest, manifest_bytes)?
+                .ok_or_else(CliFailure::internal)?;
+            print_json(&json!({
+                "schema": "hyphae-model-registry-v1",
+                "status": "loaded",
+                "loaded_models": executor.loaded_models(),
+                "execution_profile": local_embedding_profile_json(&profile),
+            }))
+        }
+        ModelCommand::ProfileCreate {
+            target,
+            id,
+            parent,
+            name,
+            manifest,
+            dimension,
+            max_input_tokens,
+            durability,
+        } => {
+            let (digest, byte_length) = embedding_manifest_identity(&manifest)?;
+            let object = LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+                EmbeddingProfileDefinition {
+                    header: catalog_header(id, EngineKind::Search, &name, Some(parent))?,
+                    artifact_manifest_digest: EmbeddingArtifactManifestDigest::new(digest)
+                        .map_err(|_| CliFailure::invalid())?,
+                    artifact_manifest_byte_length: byte_length,
+                    pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+                    vector_type: vector_type(dimension)?,
+                    max_input_tokens,
+                    query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+                },
+            ));
+            let response = dispatch_model_target(
+                &target,
+                ProductOperation::CatalogCreate { object },
+                durability.into(),
+                None,
+            )
+            .await?;
+            print_json(&response_json(response))
+        }
+        ModelCommand::EmbedIngest {
+            target,
+            collection,
+            idempotency_id,
+            documents_json,
+            manifest,
+            model_dir,
+            durability,
+        } => {
+            if idempotency_id == 0 {
+                return Err(CliFailure::invalid());
+            }
+            let documents = serde_json::from_str::<Vec<EmbedIngestDocument>>(&documents_json)?
+                .into_iter()
+                .map(|document| {
+                    Ok(hyphae_native_product::ProductEmbedAndIngestDocument {
+                        object_id: object_id(document.id.0)?,
+                        text: document.text,
+                        doc_values: document
+                            .doc_values
+                            .into_iter()
+                            .map(|(name, value)| Ok((name, product_doc_value(value)?)))
+                            .collect::<Result<_, CliFailure>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, CliFailure>>()?;
+            let executor = match (&target.data_dir, manifest.as_deref(), model_dir.as_deref()) {
+                (Some(_), Some(manifest), Some(model_dir)) => {
+                    Some(load_embedding_executor(manifest, model_dir)?)
+                }
+                (_, None, None) => None,
+                _ => return Err(CliFailure::invalid()),
+            };
+            let response = dispatch_model_target(
+                &target,
+                ProductOperation::EmbedAndIngest {
+                    collection: object_id(collection)?,
+                    batch: hyphae_native_product::ProductEmbedAndIngestBatch {
+                        idempotency_id,
+                        documents,
+                    },
+                },
+                durability.into(),
+                executor,
+            )
+            .await?;
+            print_json(&response_json(response))
+        }
+    }
+}
+
+async fn dispatch_model_target(
+    target: &ModelTarget,
+    operation: ProductOperation,
+    durability: ProductDurability,
+    executor: Option<std::sync::Arc<NodeEmbeddingExecutor>>,
+) -> Result<ProductResponse, CliFailure> {
+    if let Some(data_dir) = &target.data_dir {
+        let mut product = NativeProduct::open(data_dir)?;
+        if let Some(executor) = executor {
+            executor.install(&mut product);
+        }
+        return EmbeddedClient::open(product, target.native_api_key_file.as_deref(), false)?
+            .dispatch_with_durability(operation, durability)
+            .map_err(Into::into);
+    }
+    if executor.is_some() {
+        return Err(CliFailure::invalid());
+    }
+    let credential = target
+        .native_api_key_file
+        .as_deref()
+        .map(native_client::read_api_key_file)
+        .transpose()?;
+    let client = if let Some(endpoint) = &target.endpoint {
+        if let Some(key) = &credential {
+            hyphae_client::v2::HyphaeClient::local_authenticated(
+                endpoint.clone(),
+                key.credential()?,
+            )
+        } else {
+            hyphae_client::v2::HyphaeClient::local(endpoint.clone())
+        }
+    } else if let Some(base_url) = &target.http_base_url {
+        let mut transport =
+            hyphae_client::v2::HttpTransport::new(base_url).map_err(mcp::normalize_client_error)?;
+        if let Some(key) = &credential {
+            transport = transport
+                .bearer_token(key.credential()?)
+                .map_err(mcp::normalize_client_error)?;
+        }
+        Ok(hyphae_client::v2::HyphaeClient::new(transport))
+    } else {
+        return Err(CliFailure::invalid());
+    }
+    .map_err(mcp::normalize_client_error)?;
+    let options = hyphae_client::v2::RequestOptions {
+        logical_time_micros: native::logical_time_micros(),
+        durability: hyphae_native_product::ProductDurabilityPolicy { durability },
+        ..hyphae_client::v2::RequestOptions::default()
+    };
+    client
+        .execute(operation, options)
+        .await
+        .map_err(mcp::normalize_client_error)
+        .map_err(Into::into)
+}
+
+fn load_embedding_executor_optional(
+    manifest: Option<&Path>,
+    model_dir: Option<&Path>,
+) -> Result<Option<std::sync::Arc<NodeEmbeddingExecutor>>, CliFailure> {
+    match (manifest, model_dir) {
+        (None, None) => Ok(None),
+        (Some(manifest), Some(model_dir)) => load_embedding_executor(manifest, model_dir).map(Some),
+        _ => Err(CliFailure::invalid()),
+    }
+}
+
+fn load_embedding_executor(
+    manifest: &Path,
+    model_dir: &Path,
+) -> Result<std::sync::Arc<NodeEmbeddingExecutor>, CliFailure> {
+    let limits = hyphae_native_embed_cpu::Qwen3CpuLimits::default();
+    let descriptors =
+        hyphae_native_embed_cpu::Qwen3ArtifactDescriptors::open(manifest, model_dir, limits)
+            .map_err(|_| CliFailure::invalid())?;
+    let executor =
+        std::sync::Arc::new(NodeEmbeddingExecutor::new(limits).map_err(|_| CliFailure::invalid())?);
+    executor
+        .load_and_register(descriptors)
+        .map_err(|_| CliFailure::invalid())?;
+    Ok(executor)
+}
+
+fn embedding_manifest_identity(path: &Path) -> Result<([u8; 32], u64), CliFailure> {
+    let mut file = fs::File::open(path)?;
+    let byte_length = file.metadata()?.len();
+    if byte_length == 0 || byte_length > MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES {
+        return Err(CliFailure::invalid());
+    }
+    let capacity = usize::try_from(byte_length).map_err(|_| CliFailure::invalid())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != capacity {
+        return Err(CliFailure::invalid());
+    }
+    Ok((Sha256::digest(&bytes).into(), byte_length))
+}
+
+fn local_embedding_profile_json(
+    profile: &hyphae_native_product::ProductLocalEmbeddingExecutionProfile,
+) -> Value {
+    json!({
+        "backend": profile.backend(),
+        "backend_version": profile.backend_version(),
+        "device": profile.device(),
+        "compute_dtype": profile.compute_dtype(),
+        "target": profile.target(),
+        "model_revision": profile.model_revision(),
+        "artifact_manifest_digest": encode_hex(&profile.artifact_manifest_digest()),
+        "checkpoint_chunk_tokens": profile.checkpoint_chunk_tokens(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFailure> {
     let operation = match command {
         CatalogCommand::List {
@@ -3383,6 +3720,7 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
             analyzer,
             name,
             dimension,
+            embedding_profile,
             analyzer_ascii_folding,
             analyzer_english_stop,
             analyzer_english_stem,
@@ -3539,24 +3877,38 @@ fn catalog(local: &LocalDirectory, command: CatalogCommand) -> Result<(), CliFai
                         }
                         fields
                     },
-                    vectors: vec![
-                        NamedVectorDefinition {
+                    vectors: if let Some(profile) = embedding_profile {
+                        vec![NamedVectorDefinition {
                             id: field_id(7)?,
-                            name: catalog_name("exact")?,
+                            name: catalog_name("semantic")?,
                             vector_type: vector_type(dimension)?,
-                            metric: VectorMetric::SquaredL2,
+                            metric: VectorMetric::Cosine,
                             policy: VectorSearchPolicy::Exact,
                             lifecycle,
-                        },
-                        NamedVectorDefinition {
-                            id: field_id(8)?,
-                            name: catalog_name("ann")?,
-                            vector_type: vector_type(dimension)?,
-                            metric: VectorMetric::SquaredL2,
-                            policy: VectorSearchPolicy::Ann(ann),
-                            lifecycle,
-                        },
-                    ],
+                            embedding_profile: Some(object_id(profile)?),
+                        }]
+                    } else {
+                        vec![
+                            NamedVectorDefinition {
+                                id: field_id(7)?,
+                                name: catalog_name("exact")?,
+                                vector_type: vector_type(dimension)?,
+                                metric: VectorMetric::SquaredL2,
+                                policy: VectorSearchPolicy::Exact,
+                                lifecycle,
+                                embedding_profile: None,
+                            },
+                            NamedVectorDefinition {
+                                id: field_id(8)?,
+                                name: catalog_name("ann")?,
+                                vector_type: vector_type(dimension)?,
+                                metric: VectorMetric::SquaredL2,
+                                policy: VectorSearchPolicy::Ann(ann),
+                                lifecycle,
+                                embedding_profile: None,
+                            },
+                        ]
+                    },
                 },
             ));
             objects.push(object);
@@ -5569,6 +5921,29 @@ fn response_json(response: ProductResponse) -> Value {
             "documents": receipt.documents,
             "idempotent_replay": receipt.idempotent_replay,
         }),
+        ProductResponse::EmbedAndIngested(receipt) => json!({
+            "schema": "hyphae-embed-and-ingest-v1",
+            "status": if receipt.idempotent_replay { "existing" } else { "committed" },
+            "snapshot": snapshot_json(receipt.snapshot),
+            "commit": commit_json(receipt.commit),
+            "documents": receipt.documents,
+            "idempotent_replay": receipt.idempotent_replay,
+            "execution_profile": {
+                "embedding_profile": receipt.execution_profile.embedding_profile.get().to_string(),
+                "backend": match receipt.execution_profile.backend {
+                    hyphae_native_product::ProductEmbeddingBackend::Cpu => "cpu",
+                    hyphae_native_product::ProductEmbeddingBackend::Cuda => "cuda",
+                },
+                "device": receipt.execution_profile.device,
+                "driver": receipt.execution_profile.driver,
+                "runtime": receipt.execution_profile.runtime,
+                "precision": match receipt.execution_profile.precision {
+                    hyphae_native_product::ProductEmbeddingPrecision::F32 => "f32",
+                },
+                "kernels": receipt.execution_profile.kernels,
+                "fallback": receipt.execution_profile.fallback,
+            },
+        }),
         ProductResponse::Restore(restored) => json!({
             "status": "restored",
             "data_path": restored.data_path,
@@ -7189,6 +7564,7 @@ fn catalog_kind(kind: CatalogObjectKind) -> &'static str {
         CatalogObjectKind::SearchCollection => "search_collection",
         CatalogObjectKind::Analyzer => "analyzer",
         CatalogObjectKind::CrossEngineLink => "cross_engine_link",
+        CatalogObjectKind::EmbeddingProfile => "embedding_profile",
     }
 }
 
@@ -7237,6 +7613,7 @@ const fn dependency_kind(kind: DependencyKind) -> &'static str {
         DependencyKind::Analyzer => "analyzer",
         DependencyKind::LinkEndpoint => "link_endpoint",
         DependencyKind::RelationSchema => "relation_schema",
+        DependencyKind::EmbeddingProfile => "embedding_profile",
     }
 }
 
@@ -7298,13 +7675,68 @@ mod tests {
     use super::{
         Cli, Command, HardwareCalibrationMode, HardwareCommand, HardwareGovernorMode,
         TransactionStepInput, authorization_permissions, decode_hex, encode_hex,
-        hardware_with_writers, qualified_name, transaction_step,
+        hardware_with_writers, qualified_name, response_json, transaction_step,
     };
     use clap::Parser;
     use hyphae_native_product::{
-        ProductAuthorization, ProductDocValue, ProductOperation, ProductPermission,
-        ProductTransactionHandle, ProductTransactionSearchMutation,
+        CatalogVersion, Csn, ObjectId, ProductAuthorization, ProductCommitReceipt, ProductDocValue,
+        ProductDurability, ProductEmbedAndIngestReceipt, ProductEmbeddingBackend,
+        ProductEmbeddingExecutionProfile, ProductEmbeddingPrecision, ProductOperation,
+        ProductPermission, ProductResponse, ProductTransactionHandle, ProductTransactionId,
+        ProductTransactionSearchMutation, SnapshotIdentity,
     };
+
+    #[test]
+    fn embed_and_ingest_json_preserves_commit_profile_and_replay_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let commit = ProductCommitReceipt {
+            transaction_id: ProductTransactionId::new(9).ok_or("zero transaction")?,
+            commit_csn: 7,
+            catalog_version: 3,
+            commit_lsn: 42,
+            wal_block_digest: [4; 32],
+            durability: ProductDurability::Strict,
+            durability_cohort_size: 1,
+            durability_cohort_position: 0,
+        };
+        let profile = ProductEmbeddingExecutionProfile {
+            embedding_profile: ObjectId::new(20)?,
+            backend: ProductEmbeddingBackend::Cpu,
+            device: "cpu:x86_64-unknown-linux-gnu".to_owned(),
+            driver: "not-applicable".to_owned(),
+            runtime: "candle-qwen3/0.9.2".to_owned(),
+            precision: ProductEmbeddingPrecision::F32,
+            kernels: vec!["qwen3-forward".to_owned()],
+            fallback: false,
+        };
+        let snapshot = SnapshotIdentity {
+            directory_lineage: [1; 24],
+            visible_csn: Some(Csn::FIRST),
+            catalog_version: CatalogVersion::new(3)?,
+            root_digest: [2; 32],
+            logical_time_micros: 11,
+        };
+        for (replay, status) in [(false, "committed"), (true, "existing")] {
+            let output = response_json(ProductResponse::EmbedAndIngested(
+                ProductEmbedAndIngestReceipt {
+                    snapshot,
+                    commit,
+                    documents: 2,
+                    idempotent_replay: replay,
+                    execution_profile: profile.clone(),
+                },
+            ));
+            assert_eq!(output["schema"], "hyphae-embed-and-ingest-v1");
+            assert_eq!(output["status"], status);
+            assert_eq!(output["idempotent_replay"], replay);
+            assert_eq!(output["commit"]["commit_csn"], 7);
+            assert_eq!(output["commit"]["transaction_id"], "9");
+            assert_eq!(output["execution_profile"]["embedding_profile"], "20");
+            assert_eq!(output["execution_profile"]["backend"], "cpu");
+            assert_eq!(output["execution_profile"]["precision"], "f32");
+        }
+        Ok(())
+    }
     use hyphae_native_runtime::{
         CalibrationCacheStatus, CalibrationCorrectness, CalibrationCoverage,
         CalibrationFeatureDetection, CalibrationIdentity, CalibrationIoScaling,

@@ -54,6 +54,7 @@
         { "$ref": "#/$defs/OperationV2Search" },
         { "$ref": "#/$defs/OperationV2SearchCollection" },
         { "$ref": "#/$defs/OperationV2SearchIngest" },
+        { "$ref": "#/$defs/OperationV2EmbedAndIngest" },
         { "$ref": "#/$defs/OperationV2MemoryRecall" },
         { "$ref": "#/$defs/OperationV2MemoryEnrich" },
         { "$ref": "#/$defs/OperationV2Admin" },
@@ -130,6 +131,50 @@
       "properties": {
         "kind": { "const": "search_ingest" },
         "arguments": { "type": "object" }
+      }
+    },
+    "OperationV2EmbedAndIngest": {
+      "description": "Protocol minor 9. Catalog-bound embedding into exactly one profile-bound vector target followed by one atomic durable ingest.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "arguments"],
+      "properties": {
+        "kind": { "const": "embed_and_ingest" },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["collection", "batch"],
+          "properties": {
+            "collection": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+            "batch": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["idempotency_id", "documents"],
+              "properties": {
+                "idempotency_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+                "documents": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 256,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["object_id", "text"],
+                    "properties": {
+                      "object_id": { "type": "string", "pattern": "^[1-9][0-9]{0,38}$" },
+                      "text": { "type": "string" },
+                      "doc_values": {
+                        "description": "Bounded canonical product doc-value map. Caller-supplied vectors are not representable.",
+                        "type": "object",
+                        "maxProperties": 256
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "OperationV2MemoryRecall": {

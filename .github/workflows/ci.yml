@@ -147,11 +147,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p hyphae-cli -p hyphae-native-embed-cpu --all-targets --locked -- -D warnings
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
+        run: |
+          cargo doc --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --no-deps --locked
+          cargo doc -p hyphae-cli -p hyphae-native-embed-cpu --no-deps --locked
       - name: Verify Linux hardware discovery and calibration receipts
         shell: bash
         run: |
@@ -180,7 +184,7 @@ jobs:
             run-native-conformance: true
           - name: Linux MSRV
             os: ubuntu-latest
-            toolchain: 1.89.0
+            toolchain: 1.90.0
             native-platform: linux
             run-native-conformance: false
     runs-on: ${{ matrix.os }}
@@ -196,7 +200,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+          cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked
       - name: Run exhaustive injected security crash matrix
         if: matrix.run-native-conformance
         run: cargo test --locked -p hyphae-native-product --test security_crash_matrix
@@ -316,7 +322,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run platform tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --exclude hyphae-cli --exclude hyphae-native-embed-cpu --all-features --locked
+          cargo test -p hyphae-cli -p hyphae-native-embed-cpu --locked
       - name: Run native conformance profile
         shell: bash
         run: |
@@ -526,7 +534,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-managed-v2-wheel-${{ github.event.pull_request.head.sha || github.sha }}
-          path: dist/hyphae_sdk-3.0.0-py3-none-any.whl
+          path: dist/hyphae_sdk-4.0.0-py3-none-any.whl
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -578,7 +586,7 @@ jobs:
           python tools/run_python_managed_v2_conformance.py
           --binary target/debug/hyphae
           --fixture-binary target/debug/hyphae-v2-fixture
-          --wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl
+          --wheel dist/hyphae_sdk-4.0.0-py3-none-any.whl
           --startup-timeout-seconds 30
           --output python-managed-v2-conformance-${{ matrix.platform }}.json
       - name: Upload the platform receipt
@@ -656,14 +664,14 @@ jobs:
         run: |
           python -m unittest tools.test_check_python_windows_async_gate tools.test_run_python_windows_async_gate -v
           python tools/run_python_windows_async_gate.py \
-            --wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl \
+            --wheel dist/hyphae_sdk-4.0.0-py3-none-any.whl \
             --output python-windows-async-receipt.json \
             --transcript-output python-windows-async-transcript.json
           python tools/check_python_windows_async_gate.py \
             --receipt python-windows-async-receipt.json \
             --expected-source-commit "$(git rev-parse HEAD)" \
             --expected-source-tree "$(git rev-parse 'HEAD^{tree}')" \
-            --expected-wheel dist/hyphae_sdk-3.0.0-py3-none-any.whl \
+            --expected-wheel dist/hyphae_sdk-4.0.0-py3-none-any.whl \
             --expected-transcript python-windows-async-transcript.json
       - name: Upload the sanitized failure diagnostic
         if: failure()

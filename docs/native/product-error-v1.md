@@ -107,7 +107,12 @@ retaining its exact raw string, category, retry class, message, and fields.
 value, and an observed unsigned 64-bit value. The initial identities are
 `sql_statement_bytes`, `sql_parameters`, `sql_result_rows`, `request_bytes`,
 `response_bytes`, `hash_field_batch_items`, `set_member_batch_items`,
-`expiry_sweep_keys`, and `group_commit_transactions`. Unknown canonical limit
+`expiry_sweep_keys`, `group_commit_transactions`, and
+`search_recovery_retained_bytes`. The last identity names the conservative
+64 MiB retained-memory admission charge for complete search materialization,
+bounded document-only snapshot state, or M05 shared recovery, not on-disk byte
+size. A rejected candidate reports its measured charge and cannot publish a
+WAL commit. Unknown canonical limit
 identities are preserved.
 
 `details` is an ascending-tag typed field sequence. The initial registry is:

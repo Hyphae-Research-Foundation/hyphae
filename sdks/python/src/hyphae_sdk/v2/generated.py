@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Never, NotRequired, TypeAlias, TypedDict
 
-CONTRACT_SHA256 = "0f68106eafcd3d7a75451131b39fa98f75467d8bb98431f015152b127ee6df38"
+CONTRACT_SHA256 = "b9f0e9ff2442a2c6af3ff4a4862694070dcc69109569c2245af5e849b5886e10"
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -70,6 +70,11 @@ class OperationV2Catalog(TypedDict):
 
 class OperationV2Doctor(TypedDict):
     kind: Literal["doctor"]
+    arguments: dict[str, JsonValue]
+
+class OperationV2EmbedAndIngest(TypedDict):
+    """Protocol minor 9. Catalog-bound embedding into exactly one profile-bound vector target followed by one atomic durable ingest."""
+    kind: Literal["embed_and_ingest"]
     arguments: dict[str, JsonValue]
 
 class OperationV2MemoryEnrich(TypedDict):
@@ -163,7 +168,7 @@ class ProductLimitsV2(TypedDict):
 
 DurabilityV2: TypeAlias = Literal["strict", "group", "memory"]
 NativeReadStreamRecordV2: TypeAlias = NativeReadStreamRecordV2Data | NativeReadStreamRecordV2Completion
-OperationV2: TypeAlias = OperationV2Capabilities | OperationV2Catalog | OperationV2Sql | OperationV2Structure | OperationV2Search | OperationV2SearchCollection | OperationV2SearchIngest | OperationV2MemoryRecall | OperationV2MemoryEnrich | OperationV2Admin | OperationV2Telemetry | OperationV2Doctor | OperationV2Backup | OperationV2ProofVerify | OperationV2TransactionStatus | OperationV2SecurityApiKey
+OperationV2: TypeAlias = OperationV2Capabilities | OperationV2Catalog | OperationV2Sql | OperationV2Structure | OperationV2Search | OperationV2SearchCollection | OperationV2SearchIngest | OperationV2EmbedAndIngest | OperationV2MemoryRecall | OperationV2MemoryEnrich | OperationV2Admin | OperationV2Telemetry | OperationV2Doctor | OperationV2Backup | OperationV2ProofVerify | OperationV2TransactionStatus | OperationV2SecurityApiKey
 
 __all__ = [
     "CONTRACT_SHA256",
@@ -182,6 +187,7 @@ __all__ = [
     "OperationV2Capabilities",
     "OperationV2Catalog",
     "OperationV2Doctor",
+    "OperationV2EmbedAndIngest",
     "OperationV2MemoryEnrich",
     "OperationV2MemoryRecall",
     "OperationV2ProofVerify",

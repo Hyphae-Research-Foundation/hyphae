@@ -1132,6 +1132,7 @@ fn init_is_explicit_and_read_only_commands_never_create() -> Result<(), Box<dyn 
         "capabilities",
         "init",
         "catalog",
+        "model",
         "sql",
         "structure",
         "search",
@@ -3188,6 +3189,270 @@ fn product_error_categories_drive_stable_machine_readable_exit_classes()
     assert_eq!(format2.status.code(), Some(2));
     let format2_error: serde_json::Value = serde_json::from_slice(&format2.stderr)?;
     assert_eq!(format2_error["error"]["code"], "format2_directory");
+    Ok(())
+}
+
+fn qwen_embedding_manifest() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compatibility/qwen3-embedding-0.6b-artifact-manifest-v1.json")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn model_profile_create_is_local_and_embed_failures_publish_nothing() -> Result<(), Box<dyn Error>>
+{
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    let data_text = path(&data);
+    let manifest = qwen_embedding_manifest();
+    run(&["init", "--data-dir", &data_text])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.seed",
+    ])?;
+    let created = run(&[
+        "model",
+        "profile-create",
+        "--data-dir",
+        &data_text,
+        "--id",
+        "20",
+        "--parent",
+        "11",
+        "--name",
+        "main.public.qwen",
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(created["status"], "committed");
+    let profile = run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "describe",
+        "--id",
+        "20",
+    ])?;
+    assert_eq!(profile["object"]["kind"], "embedding_profile");
+
+    run(&[
+        "catalog",
+        "--data-dir",
+        &data_text,
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "21",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.embedded",
+        "--dimension",
+        "384",
+        "--embedding-profile",
+        "20",
+        "--reuse-schema",
+    ])?;
+    run(&[
+        "search",
+        "--data-dir",
+        &data_text,
+        "provision",
+        "--collection",
+        "21",
+    ])?;
+    let before = run(&["status", "--data-dir", &data_text])?;
+    let missing_registry = output(&[
+        "model",
+        "embed-ingest",
+        "--data-dir",
+        &data_text,
+        "--collection",
+        "21",
+        "--idempotency-id",
+        "77",
+        "--documents-json",
+        r#"[{"id":101,"text":"bounded passage","doc_values":{}}]"#,
+    ])?;
+    assert_eq!(missing_registry.status.code(), Some(10));
+    let missing_error: serde_json::Value = serde_json::from_slice(&missing_registry.stderr)?;
+    assert_eq!(missing_error["error"]["code"], "unavailable");
+    let after = run(&["status", "--data-dir", &data_text])?;
+    assert_eq!(
+        after["snapshot"]["visible_csn"],
+        before["snapshot"]["visible_csn"]
+    );
+    assert_eq!(
+        after["snapshot"]["catalog_version"],
+        before["snapshot"]["catalog_version"]
+    );
+    assert_eq!(
+        after["snapshot"]["root_digest"],
+        before["snapshot"]["root_digest"]
+    );
+
+    let vector_injection = output(&[
+        "model",
+        "embed-ingest",
+        "--endpoint",
+        "/tmp/does-not-exist.sock",
+        "--collection",
+        "21",
+        "--idempotency-id",
+        "78",
+        "--documents-json",
+        r#"[{"id":101,"text":"passage","doc_values":{},"vectors":{"semantic":[1.0]}}]"#,
+    ])?;
+    assert_eq!(vector_injection.status.code(), Some(2));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn served_model_profile_create_sends_no_local_path() -> Result<(), Box<dyn Error>> {
+    let temporary = TestDirectory::new()?;
+    let data = temporary.0.join("data");
+    // Keep the Unix endpoint below the short macOS socket-path limit.
+    let endpoint = std::env::temp_dir().join(format!("h{}.sock", Uuid::now_v7().simple()));
+    let manifest = qwen_embedding_manifest();
+    run(&["init", "--data-dir", &path(&data)])?;
+    run(&[
+        "catalog",
+        "--data-dir",
+        &path(&data),
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "13",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.seed",
+    ])?;
+    let mut child = spawn_native_serve(&data, &endpoint, &[])?;
+    wait_for_native_endpoint(&mut child, &endpoint)?;
+    let guard = ChildGuard(&mut child);
+    let created = run(&[
+        "model",
+        "profile-create",
+        "--endpoint",
+        &path(&endpoint),
+        "--id",
+        "20",
+        "--parent",
+        "11",
+        "--name",
+        "main.public.served_qwen",
+        "--manifest",
+        &path(&manifest),
+    ])?;
+    assert_eq!(created["status"], "committed");
+    let rejected_paths = output(&[
+        "model",
+        "embed-ingest",
+        "--endpoint",
+        &path(&endpoint),
+        "--collection",
+        "13",
+        "--idempotency-id",
+        "79",
+        "--documents-json",
+        r#"[{"id":101,"text":"passage","doc_values":{}}]"#,
+        "--manifest",
+        &path(&manifest),
+        "--model-dir",
+        &path(&temporary.0),
+    ])?;
+    assert_eq!(rejected_paths.status.code(), Some(2));
+    drop(guard);
+    let _ignored = fs::remove_file(&endpoint);
+    let described = run(&[
+        "catalog",
+        "--data-dir",
+        &path(&data),
+        "describe",
+        "--id",
+        "20",
+    ])?;
+    assert_eq!(described["object"]["kind"], "embedding_profile");
+    run(&[
+        "catalog",
+        "--data-dir",
+        &path(&data),
+        "create-search-collection",
+        "--database",
+        "10",
+        "--schema",
+        "11",
+        "--collection",
+        "21",
+        "--analyzer",
+        "12",
+        "--name",
+        "main.public.served_embedded",
+        "--dimension",
+        "384",
+        "--embedding-profile",
+        "20",
+        "--reuse-schema",
+    ])?;
+    run(&[
+        "search",
+        "--data-dir",
+        &path(&data),
+        "provision",
+        "--collection",
+        "21",
+    ])?;
+    let before = run(&["status", "--data-dir", &path(&data)])?;
+    let mut child = spawn_native_serve(&data, &endpoint, &[])?;
+    wait_for_native_endpoint(&mut child, &endpoint)?;
+    let guard = ChildGuard(&mut child);
+    let unavailable = output(&[
+        "model",
+        "embed-ingest",
+        "--endpoint",
+        &path(&endpoint),
+        "--collection",
+        "21",
+        "--idempotency-id",
+        "80",
+        "--documents-json",
+        r#"[{"id":101,"text":"passage","doc_values":{}}]"#,
+    ])?;
+    assert!(!unavailable.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&unavailable.stderr)?;
+    assert_eq!(error["error"]["code"], "unavailable");
+    drop(guard);
+    let _ignored = fs::remove_file(&endpoint);
+    let after = run(&["status", "--data-dir", &path(&data)])?;
+    assert_eq!(
+        after["snapshot"]["visible_csn"],
+        before["snapshot"]["visible_csn"]
+    );
+    assert_eq!(
+        after["snapshot"]["root_digest"],
+        before["snapshot"]["root_digest"]
+    );
     Ok(())
 }
 

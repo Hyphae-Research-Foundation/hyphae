@@ -4,9 +4,10 @@ Hyphae publishes the pure-Python client as the `hyphae-sdk` distribution. Its
 import package is `hyphae_sdk`. The `hyphae` name on PyPI belongs to an
 unrelated project and must never be used by this repository.
 
-The checked-in `3.0.0` Python SDK remains source-only. No terminal Python
-publication receipt records `3.0.0` on PyPI, and this runbook is not evidence
-that it has been published there.
+The checked-in `4.0.0` Python SDK is source-only and integrates Lane14
+`f2336d8664b32d812cea3291d942e286a89eea9d`. No terminal Python
+publication receipt records `4.0.0` on PyPI, and the live workflow remains pinned to its retained `3.0.0` authority.
+This runbook is not evidence that `4.0.0` has been published.
 
 Publication is a promotion protocol, not a maintainer workstation command.
 The `Python package` workflow runs only from the `main` control plane. Two

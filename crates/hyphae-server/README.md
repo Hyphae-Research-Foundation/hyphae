@@ -8,11 +8,11 @@
 Secure, loopback-first HTTP server for the [Hyphae](https://hyphae.dev) data
 engine and its proof-bearing `/v1` API.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-server = "=3.0.0"
+hyphae-server = "=4.0.0"
 ```
 
 Remote bind requires explicit authentication. Request, result, concurrency,

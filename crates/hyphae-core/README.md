@@ -9,11 +9,11 @@ Shared product, API, disk-format, and proof-format version constants for
 [Hyphae](https://hyphae.dev), the autonomous, embeddable, verifiable Rust data
 engine.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-core = "=3.0.0"
+hyphae-core = "=4.0.0"
 ```
 
 Most applications should depend on `hyphae-engine` instead. This crate exists

@@ -1,0 +1,73 @@
+{
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "schema": "hyphae-embedding-model-manifest-v1",
+  "status": "template-unverified",
+  "model": {
+    "repository": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": null,
+    "model_type": "qwen3",
+    "parameter_class": "0.6B",
+    "native_dimensions": 1024,
+    "supported_output_dimensions": [
+      384,
+      768,
+      1024
+    ]
+  },
+  "license": {
+    "expected_declared_spdx": "Apache-2.0",
+    "declared_spdx": null,
+    "declaration_source": null,
+    "bundled_license_text": {
+      "status": "unverified",
+      "path": null,
+      "sha256": null
+    },
+    "legal_evidence_sha256": null,
+    "product_claims_allowed": false
+  },
+  "runtime_policy": {
+    "automatic_network": false,
+    "local_files_only": true,
+    "trust_remote_code": false,
+    "weights_format": "safetensors-only",
+    "canonical_output_dtype": "float32"
+  },
+  "acquisition_provenance": {
+    "evidence_kind": "operator-retained-hugging-face-commit-responses-v1",
+    "repository": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": null,
+    "capture": null,
+    "acquisition_record_sha256": null,
+    "model_metadata_response": null,
+    "model_card_response": null,
+    "tree_metadata_responses": [],
+    "files": []
+  },
+  "files": [
+    {
+      "path": "config.json",
+      "role": "model-config",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "path": "model.safetensors",
+      "role": "weights",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "path": "tokenizer.json",
+      "role": "tokenizer",
+      "size_bytes": null,
+      "sha256": null
+    },
+    {
+      "path": "tokenizer_config.json",
+      "role": "tokenizer",
+      "size_bytes": null,
+      "sha256": null
+    }
+  ]
+}

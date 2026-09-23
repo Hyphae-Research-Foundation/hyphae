@@ -76,6 +76,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Run doctor and diagnose recovery](operations/doctor.md)
 - [Troubleshoot common failures](operations/troubleshooting.md)
 - [Verify a release](release/verification.md)
+- [4.0.0 release dependency ledger](release/4.0.0-dependency-ledger.md)
 - [0.2.1 publication receipt](release/receipts/0.2.1.md)
 - [1.1.0 publication receipt](release/receipts/1.1.0.md)
 - [3.0.0 publication receipt](release/receipts/3.0.0.md)
@@ -114,6 +115,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native reverse hash scan v1](native/native-hash-reverse-scan-v1.md)
 - [Native hash pattern scan v1](native/native-hash-pattern-scan-v1.md)
 - [Native catalog v1](native/catalog-v1.md)
+- [Native embedding profile metadata v1](native/embedding-profile-v1.md)
 - [Hyphae SQL semantics v1](native/sql-semantics-v1.md)
 - [Native structure-engine semantics v1](native/structures-semantics-v1.md)
 - [Native search-engine semantics v1](native/search-semantics-v1.md)
@@ -151,6 +153,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native delta all-engine transaction Linux evidence](gates/evidence/native-delta-all-engine-transaction-linux-2026-08-03.md)
 - [Native lexical document lifecycle Linux evidence](gates/evidence/native-search-document-lifecycle-linux-2026-08-03.md)
 - [Native lexical tombstone compaction Linux evidence](gates/evidence/native-search-tombstone-compaction-linux-2026-08-03.md)
+- [Lexical recovery-limit reproduction and open release gate (2026-09-22)](gates/evidence/lexical-recovery-limit-2026-09-22.md)
 - [Native G2 SQLLogicTest evidence](gates/evidence/native-g2-sqllogictest.md)
 - [Native G2 metamorphic SQL evidence](gates/evidence/native-g2-metamorphic.md)
 - [Native G2 isolation litmus evidence](gates/evidence/native-g2-isolation-litmus.md)
@@ -170,6 +173,7 @@ linked below. Tests and checked-in compatibility fixtures enforce both.
 - [Native hardware calibration v1](performance/native-hardware-calibration-v1.md)
 - [Native resource governor v1](performance/native-resource-governor-v1.md)
 - [Native scheduler authority v1](performance/native-scheduler-authority-v1.md)
+- [Multilingual embedding measurement harness v1](performance/multilingual-embedding-harness-v1.md)
 - [Native segmented substrate v1](performance/native-segmented-substrate-v1.md)
 - [Native structure execution v1](performance/native-structure-execution-v1.md)
 - [Native vector bulk-build experiment v1](performance/native-vector-bulk-build-v1.md)
@@ -352,3 +356,4 @@ relevant contract, guide, example, and gate evidence in the same change.
 
 - [Explicit semantic memory retrieval](adr/0031-explicit-semantic-memory-retrieval.md) — selectable vector-only recall, profile defaults and lexical fallback.
 - [ADR-0033: Version physiological redo separately from WAL v1](adr/0033-versioned-physiological-redo.md)
+- [ADR-0034: Bound optional CUDA execution to validated H100 profiles](adr/0034-validated-h100-cuda-execution.md)

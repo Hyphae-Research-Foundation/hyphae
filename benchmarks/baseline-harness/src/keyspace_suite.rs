@@ -42,7 +42,7 @@ const VALKEY_RECEIPT_SCHEMA: &str = "hyphae-external-valkey-baseline-receipt-v2"
 const HYPHAE_SEMANTIC_SOURCE_COMMIT: &str = "7e25fc7eaa7fe91bc55e16314074d66ad943b090";
 const HYPHAE_SEMANTIC_SOURCE_TREE: &str = "aea2680c992697d68c2b52582f8399f9189108ac";
 const HYPHAE_SEMANTIC_QUALIFICATION: &str =
-    "unshipped current source; this profile does not expand the stable 3.0.0 release claims";
+    "historical 3.0.0 classification source; the executed-source semantic bundle separately binds the candidate tree; no compatibility or performance claim";
 const VALKEY_NO_CONFIG_SHA256: &str =
     "6f3abe771321dcd8d832bd3927a0ccdd0ef08270cea41dbe7dcfa2bfae361166";
 const VALKEY_ALWAYS_CONFIG_SHA256: &str =

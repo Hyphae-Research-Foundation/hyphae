@@ -109,14 +109,22 @@ class NativeV2AuthorityConformanceTests(unittest.TestCase):
                 source = (ROOT / relative).read_text(encoding="utf-8")
                 if relative.endswith("handshake.rs"):
                     source = source.replace(
-                        "pub const PROTOCOL_MINOR: u16 = 7;",
-                        "pub const PROTOCOL_MINOR: u16 = 8;",
+                        "pub const PROTOCOL_MINOR: u16 = 9;",
+                        "pub const PROTOCOL_MINOR: u16 = 10;",
                     )
                 target.write_text(source, encoding="utf-8")
             with self.assertRaisesRegex(
                 AuthorityConformanceError, "protocol version"
             ):
                 validate(payload(), CONTRACT, root)
+
+    def test_managed_security_fixture_stays_on_minor_seven(self) -> None:
+        corpus = payload()
+        self.assertEqual(corpus["protocol"]["current_minor"], 9)
+        self.assertEqual(corpus["protocol"]["managed_fixture_minor"], 7)
+        corpus["protocol"]["managed_fixture_minor"] = 9
+        with self.assertRaisesRegex(AuthorityConformanceError, "protocol authority"):
+            validate(corpus, CONTRACT, ROOT)
 
     def test_cursor_epoch_and_limits_are_normative(self) -> None:
         corpus = payload()

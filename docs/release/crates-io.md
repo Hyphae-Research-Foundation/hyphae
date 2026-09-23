@@ -7,6 +7,16 @@ dependency layers, and exact source authority are defined in
 Conformance runners and independent verifiers remain private workspace tools
 and are not registry packages.
 
+The checked-in package inventory is prepared at `4.0.0` for package and
+release-candidate verification. It integrates Lane14
+`f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. That version
+is not live-publication authority: `apache_publication_authority`, the registry control plane, and the
+historical receipt remain pinned to `release-v3.0.0-crates`. Promoting 4.0.0
+requires a later exact-SHA control-plane update after the hosted release matrix
+and G8 closure pass. Do not create a release tag or dispatch live publication
+from this preparation branch.
+
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion
 protocol, never a maintainer-workstation command and never authority supplied by
@@ -102,9 +112,17 @@ to expose that exact version before starting the next layer:
    `hyphae-native-manifest`, `hyphae-retrieval`
 4. `hyphae-native-runtime`, `hyphae-storage`
 5. `hyphae-engine`, `hyphae-native-product`
-6. `hyphae-native-protocol`
+6. `hyphae-native-embed-cpu`, `hyphae-native-protocol`
 7. `hyphae-client`, `hyphae-native-daemon`, `hyphae-server`
 8. `hyphae-cli`, `hyphae-pliegors`
+
+These eight layers currently contain exactly 25 publishable crates. The
+`package_count` in `config/crates-io-release.json` is checked against the
+flattened layers, and the package audit separately requires that set to equal
+Cargo's complete publishable workspace set. The number is a candidate-tree
+fact, not a permanent product constant. The exact current-core dependency
+closure and candidate package commands are retained in the
+[`4.0.0` dependency ledger](4.0.0-dependency-ledger.md).
 
 Any development dependency between crates in the same layer must be path-only,
 without a version requirement. Cargo strips those dependencies from the
@@ -114,6 +132,27 @@ same-layer or forward edges before publication.
 The dependency policy permits wildcard requirements only when Cargo metadata
 also identifies the edge as a local path; registry wildcard requirements
 remain denied.
+
+### CPU and accelerator backend
+
+`hyphae-native-embed-cpu` is the sole publishable Qwen3 executor crate in layer
+6. It depends on `hyphae-native-catalog` and `hyphae-native-product`; the
+layer-8 `hyphae-cli` depends on it at `=4.0.0`. Its default CPU build needs no
+GPU or model. The same crate has a default-off `cuda` feature, and the CLI
+forwards it. Lane06 `1eb9eb319140276f1862d7f332218a08321604af` supplies the validated H100 implementation;
+Lane14 incorporated it in reviewed cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`. No 26th crate
+or binary-only accelerator publication is introduced.
+
+An accelerator-capable build selects only a validated H100 and reports its
+actual device, driver, runtime, compute dtype, FP32 publication, and fallback
+profile. An unavailable CUDA result discards partial work and retries the
+whole batch on CPU when permitted. Local H100 BF16/FP16 and embedded/UDS/HTTP
+checks are required source evidence, not hosted release or comparative
+performance authority. The exact generated crate must contain its README,
+license files, notices, and feature-gated CUDA source; the H100 package check
+must compile that extracted feature in addition to the default extracted
+workspace. The 25-package audit also checks the minor-9 protocol fixture
+mirror, raising the compile-time asset count to 48.
 
 Use the `Registry publish` workflow. Pull requests and manual dry runs remain
 unprivileged and execute package audits plus exact crate tarball verification

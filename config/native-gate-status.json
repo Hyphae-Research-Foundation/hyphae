@@ -123,5 +123,60 @@
       "registry_run": 33859889168,
       "retained_evidence": "docs/gates/evidence/closures/native-g8-24bce1a.json"
     }
-  ]
+  ],
+  "release_candidate": {
+    "version": "4.0.0",
+    "status": "selected-integration-prepared",
+    "release_preparation_commit": "d07c7fb81d5d972a11a04dbecc9f839e5142a024",
+    "release_composition_parent": "8d7a28dc39cffc66fb8cc94421e65dfb91a5f9d1",
+    "integration_selection_commit": "b60238760aa67e860800f1b194d103623cd20a92",
+    "dependency_ledger": "docs/release/4.0.0-dependency-ledger.md",
+    "integration_commit": "f2336d8664b32d812cea3291d942e286a89eea9d",
+    "integration_checkpoint": "f92a5ef21431e33b4d5a8503d1f81bc30479b8ef",
+    "observed_core_chain_commit": "dbcc464912877b2dcc4e765337e3e15001179f32",
+    "observed_rust_wire_commit": "e014925cc6b329e947a37120ac985644a5df12ca",
+    "observed_cli_consumer_commit": "84de293d49331859edf45cc268d0aeba743bd0d2",
+    "observed_accelerator_lane_commit": "1eb9eb319140276f1862d7f332218a08321604af",
+    "accelerator_cherry_pick_commit": "994ee8f03a1fb713c89758ea058866cda92d6c26",
+    "integrated_scope": [
+      "final-package-identity",
+      "embedding-profile-catalog-codec-4-minor-8",
+      "profile-runtime-binding",
+      "embed-and-ingest-minor-9",
+      "rust-wire-minor-8-9",
+      "cpu-backend-package",
+      "cli-consumer",
+      "python-sdk-minor-8-9",
+      "typescript-sdk-minor-8-9",
+      "multilingual-embedding-harness",
+      "validated-h100-cuda-feature",
+      "cross-language-embed-and-ingest-fixture"
+    ],
+    "required_dependency_status": {
+      "embedding-profile-catalog-codec-4-minor-8": "composed-package-verified",
+      "embed-and-ingest-minor-9": "product-wire-cli-composed-package-verified",
+      "python-minor-8-9": "composed-selected-integration-local-suite-passed",
+      "typescript-minor-8-9": "composed-selected-integration-local-suite-passed",
+      "product-runtime": "composed-package-verified",
+      "qwen-profile-execution": "cpu-and-h100-cuda-real-model-local-tests-passed-verified-result-receipt-open",
+      "cpu-backend": "publishable-crate-composed-extracted-build-passed",
+      "cuda-backend": "default-off-same-crate-h100-bf16-fp16-local-passed-hosted-open",
+      "multilingual-harness": "composed-unverified-placeholder-no-result-claim"
+    },
+    "crate_inventory": {
+      "declared_publishable_packages": 25,
+      "composed_metadata_publishable_packages": 25,
+      "order_config": "config/crates-io-release.json",
+      "backend_package_policy": "cuda-default-off-feature-of-hyphae-native-embed-cpu; package-count-25",
+      "package_audit": "passed-25-packages-48-compile-time-assets",
+      "exact_package_verification": "passed-25-extracted-packages-rust-1.96.0"
+    },
+    "receipts": {
+      "model_result": "open-no-verified-receipt",
+      "hosted_release_matrix": "open",
+      "exact_sha_g8": "open"
+    },
+    "exact_sha_g8": "open",
+    "publication": "blocked"
+  }
 }

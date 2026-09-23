@@ -12,9 +12,9 @@ reproduction steps, impact, and any proposed mitigation.
 
 | Version | Supported |
 |---|---|
-| `3.0.0` | Yes, current release line |
-| `2.2.0` | Security fixes only, until the next 3.x minor is released |
-| Older `2.x`, `1.x`, `0.x` | No |
+| `4.0.0` | Yes, current source release line; publication remains gated |
+| `3.0.0` | Security fixes only; current published release |
+| `2.2.0` and older | No |
 
 ## Baseline security guarantees
 
@@ -26,6 +26,8 @@ reproduction steps, impact, and any proposed mitigation.
   limits.
 - External providers are optional and cannot enter the core dependency path.
 
-These guarantees are release requirements. The `3.0.0` release evidence
-(signed archives, SBOMs, provenance, and G8 closure) is bound to its exact
-release commit; see `docs/release/verification.md` for how to verify it.
+These guarantees are release requirements. The `4.0.0` source candidate
+integrates Lane14 `f2336d8664b32d812cea3291d942e286a89eea9d` and requires a new
+exact-SHA hosted security matrix and G8 closure before release. It inherits no `3.0.0` release evidence.
+The signed `3.0.0` archives, SBOMs, provenance, and G8 closure remain bound to
+their historical release commit; see `docs/release/verification.md`.

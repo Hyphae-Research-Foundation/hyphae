@@ -9,6 +9,7 @@ export * from "./node-local.js";
 export {
   FRAME_HEADER_SIZE,
   FRAME_KIND,
+  PROTOCOL_MINOR,
   MAX_PAYLOAD,
   blake3,
   crc32c,

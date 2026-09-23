@@ -3,7 +3,12 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## Unreleased — Agent Memory / Omarchy candidate
+## [4.0.0] - 2026-09-21
+
+Hyphae 4.0.0 prepares the current Agent Memory and Native data-engine source as
+one final package identity. This section records the candidate's source
+contents; it does not claim registry publication or an exact-SHA release-gate
+closure.
 
 - Make `release-vVERSION-crates` the canonical Release and Python publication
   identity while retaining validation of the previous `vVERSION` source shape.
@@ -14,6 +19,18 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Add conditional `MemoryEnrich` (wire 72) so delayed inference cannot revive
   expired, changed or forgotten sources. Reuse the existing Candle
   `hyphae-embed` implementation through its persistent local worker.
+- Add catalogued Qwen3 embedding profiles, persistent runtime bindings, and the
+  atomic catalog-bound embed-and-ingest operation. Native protocol minor 9
+  carries it through Rust, Python, and TypeScript with bounded codecs, durable
+  commit evidence, actual execution-profile reporting, and replay status.
+- Add the offline `hyphae-native-embed-cpu` executor and CLI model/profile/
+  ingestion commands. Its default-off CUDA feature selects a validated H100,
+  records driver, runtime, compute dtype, canonical FP32 output, and whole-batch
+  CPU fallback. CUDA adds no crate; the candidate contains 25 publishable crates.
+- Add the multilingual embedding measurement harness with controlled model
+  acquisition, containment, legal review, and receipt validation. Its checked-in
+  result remains `unverified-no-measurement`; it grants no model or performance
+  claim.
 - Add optional semantic profiles, verified-backup migration, crash recovery,
   background enrichment, durable capture queue, project/global pause controls,
   and the bounded `hyphae agent ui` operator interface.
@@ -29,6 +46,15 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Bound Native protocol collection and vector allocations before reservation
   using domain limits, remaining wire bytes, checked arithmetic, and fallible
   allocation.
+- Persist vector updates and deletes as bounded per-index physical deltas, then
+  add the authenticated ANN overlay reader, point writer, absence fences, and
+  consolidation path under the existing WAL, MVCC, and proof authorities.
+- Fix bounded SQL `LIMIT`/`OFFSET`, constraints, and catalog conflict semantics,
+  and add PostgreSQL and Valkey application-core profiles as external
+  conformance subjects rather than runtime dependencies.
+- Define the Universal Engine self-hosted program and a proposed separately
+  versioned physiological-redo contract. The roadmap and proposal do not
+  promote unimplemented domains or redo behavior to shipped capability.
 - Update reviewed Rust dependencies, including the futures memory-safety and
   waker fixes, and keep auxiliary conformance lockfiles synchronized.
 - Refresh the pinned Codex 0.153.2 and Claude Code 2.1.260 MCP hosts, executable
@@ -37,8 +63,15 @@ for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 - Update the isolated Tantivy benchmark baseline to 0.26.2, resolving the
   vulnerable `lru` dependency to 0.16.4.
 
-This is unshipped source on top of 3.0.0. It is not a new crate/SDK registry
-release and does not inherit an exact-commit G7/G8 closure.
+The Rust minimum supported version is 1.90 because the pinned `redb 4.2.0`
+requires it.
+
+The workspace, 25-crate graph, SDK manifests, plugin manifests, and package
+inventories share source version `4.0.0`. The candidate integrates Lane14
+`f2336d8664b32d812cea3291d942e286a89eea9d`, including reviewed accelerator
+cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
+It remains unpublished and has no exact-commit G7/G8 closure. The `3.0.0`
+release history and publication receipts remain authoritative.
 
 ## [3.0.0] - 2026-09-03
 

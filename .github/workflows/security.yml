@@ -51,6 +51,11 @@ jobs:
           PYTHONPATH=. python -m unittest tools.test_generate_third_party_licenses -v
           python tools/generate_third_party_licenses.py --check
           python tools/check_license_policy.py
+      - name: Verify multilingual embedding evidence contracts
+        run: |
+          python -m unittest discover \
+            -s benchmarks/multilingual-embedding-harness/tests \
+            -p 'test_*.py' -v
       - name: Verify 1.2.0 relicensing classification preflight
         run: |
           PYTHONPATH=. python -m unittest \

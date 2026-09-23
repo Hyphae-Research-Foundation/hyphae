@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 
 use hyphae_native_catalog::{
-    CatalogError, CatalogName, CatalogObject, CatalogObjectKind, ColumnDefinition, DependencyEdge,
-    DependencyKind, LogicalCatalogObject, ObjectHeader, QualifiedName, RelationDefinition,
-    SearchCollectionDefinition, SearchFieldDefinition,
+    CatalogError, CatalogName, CatalogObject, CatalogObjectKind, CatalogObjectV2, ColumnDefinition,
+    DependencyEdge, DependencyKind, LogicalCatalogObject, ObjectHeader, QualifiedName,
+    RelationDefinition, SearchCollectionDefinition, SearchFieldDefinition,
 };
 use hyphae_native_types::{ColumnId, EngineKind, FieldId, LogicalType, ObjectId};
 use thiserror::Error;
@@ -193,6 +193,33 @@ impl CatalogState {
             {
                 return Err(CatalogError::InvalidObjectHierarchy.into());
             }
+            if edge.kind == DependencyKind::EmbeddingProfile {
+                self.validate_embedding_profile_dependency(object, edge.prerequisite)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_embedding_profile_dependency(
+        &self,
+        dependent: &LogicalCatalogObject,
+        profile_id: ObjectId,
+    ) -> Result<(), ModelError> {
+        let Some(LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(profile))) =
+            self.logical_objects.get(&profile_id)
+        else {
+            return Err(CatalogError::InvalidObjectHierarchy.into());
+        };
+        let LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(collection)) = dependent
+        else {
+            return Err(CatalogError::InvalidObjectHierarchy.into());
+        };
+        for vector in collection
+            .vectors
+            .iter()
+            .filter(|vector| vector.embedding_profile == Some(profile_id))
+        {
+            vector.validate_embedding_profile(profile)?;
         }
         Ok(())
     }
@@ -490,6 +517,7 @@ fn logical_dependency_target_is_valid(
             CatalogObjectKind::Relation | CatalogObjectKind::SecondaryIndex
         ),
         DependencyKind::Analyzer => target_kind == CatalogObjectKind::Analyzer,
+        DependencyKind::EmbeddingProfile => target_kind == CatalogObjectKind::EmbeddingProfile,
         DependencyKind::LinkEndpoint => !matches!(
             target_kind,
             CatalogObjectKind::Database

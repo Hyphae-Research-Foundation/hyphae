@@ -22,6 +22,7 @@ mod hardware;
 #[cfg(test)]
 mod hash_model_equivalence;
 mod hash_pattern;
+mod lexical_recovery;
 #[cfg(test)]
 mod list_lifecycle_equivalence;
 #[cfg(test)]
@@ -304,6 +305,16 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static DELTA_LATEST_VERSION_PAGE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static DOCUMENT_STATE_BUDGET_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn document_state_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(configured) = DOCUMENT_STATE_BUDGET_FOR_TEST.get() {
+        return configured;
+    }
+    RECOVERY_MEMORY_BYTES
 }
 
 #[cfg(test)]
@@ -814,6 +825,17 @@ pub enum NativeRuntimeError {
     /// The lexical-search B+tree contains malformed metadata or postings.
     #[error("native lexical-search B+tree namespace is invalid")]
     InvalidSearchTree,
+    /// A bounded lexical materialization exceeded its retained-memory budget.
+    #[error("native search recovery retained {observed} bytes exceeds {configured} bytes")]
+    SearchRecoveryRetainedLimitExceeded {
+        /// Configured retained-memory byte limit.
+        configured: u64,
+        /// Measured retained-memory bytes at rejection.
+        observed: u64,
+    },
+    /// One physical search entry could not fit a bounded borrowed visit.
+    #[error("native search recovery entry exceeds its bounded visit budget")]
+    SearchRecoveryVisitLimitExceeded,
     /// The ANN B+tree namespace or canonical graph generation is invalid.
     #[error("native ANN tree is invalid")]
     InvalidAnnTree,
@@ -1314,6 +1336,9 @@ fn catalog_error_is_corruption(source: &CatalogError) -> bool {
         | CatalogError::InvalidSearchFieldPolicy
         | CatalogError::DuplicateVectorId(_)
         | CatalogError::DuplicateVectorName(_)
+        | CatalogError::ZeroEmbeddingArtifactManifestDigest
+        | CatalogError::InvalidEmbeddingProfile
+        | CatalogError::InvalidEmbeddingProfileBinding
         | CatalogError::InvalidVectorPolicy
         | CatalogError::InvalidKeyspacePolicy
         | CatalogError::MissingDependencyTarget(_) => true,
@@ -3563,13 +3588,14 @@ impl SearchRecoveryMemoryProjection {
     }
 
     fn validate_shared_limit(&self) -> Result<(), NativeRuntimeError> {
-        if self.contains_m05
-            && self
-                .lexical_retained_bytes
-                .checked_add(self.ann_retained_bytes)
-                .is_none_or(|bytes| bytes > RECOVERY_MEMORY_BYTES)
-        {
-            return Err(NativeRuntimeError::InvalidAnnTree);
+        let combined = self
+            .lexical_retained_bytes
+            .saturating_add(self.ann_retained_bytes);
+        if self.contains_m05 && combined > RECOVERY_MEMORY_BYTES {
+            return Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                configured: RECOVERY_MEMORY_BYTES,
+                observed: combined,
+            });
         }
         Ok(())
     }
@@ -3862,6 +3888,7 @@ fn refresh_search_recovery_memory(
         });
     }
     let lexical_retained_bytes = measure_search_recovery_retained_bytes(pages, result_root)?;
+    lexical_recovery::measure_document_state(pages, BTree::from_root(result_root))?;
     let mut refreshed = SearchRecoveryMemoryRefresh {
         root: result_root,
         lexical_retained_bytes,
@@ -3900,13 +3927,14 @@ fn refresh_search_recovery_memory(
         refreshed.touched_ann.insert(index, result_bytes);
         refreshed.contains_m05 |= version == 5;
     }
-    if refreshed.contains_m05
-        && refreshed
-            .lexical_retained_bytes
-            .checked_add(refreshed.ann_retained_bytes)
-            .is_none_or(|bytes| bytes > RECOVERY_MEMORY_BYTES)
-    {
-        return Err(NativeRuntimeError::InvalidAnnTree);
+    let combined = refreshed
+        .lexical_retained_bytes
+        .saturating_add(refreshed.ann_retained_bytes);
+    if refreshed.contains_m05 && combined > RECOVERY_MEMORY_BYTES {
+        return Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+            configured: RECOVERY_MEMORY_BYTES,
+            observed: combined,
+        });
     }
     Ok(refreshed)
 }
@@ -29328,6 +29356,7 @@ fn decode_catalog_dependency_entry(
         4 => DependencyKind::Analyzer,
         5 => DependencyKind::LinkEndpoint,
         6 => DependencyKind::RelationSchema,
+        7 => DependencyKind::EmbeddingProfile,
         _ => return Err(NativeRuntimeError::InvalidCatalogTree),
     };
     let edge = match direction {
@@ -38482,7 +38511,55 @@ fn validate_roots_with_search_recovery_authority(
     visible_csn: Csn,
 ) -> Result<SearchRecoveryMemoryAuthority, NativeRuntimeError> {
     validate_root_structure(pages, roots, visible_csn)?;
-    load_state_with_search_recovery_authority(pages, blobs, roots).map(|(_, authority)| authority)
+    match load_state_with_search_recovery_authority(pages, blobs, roots) {
+        Ok((_, authority)) => Ok(authority),
+        Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { .. }) => {
+            validate_large_search_roots(pages, blobs, roots)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Large lexical corpora retain no corpus-sized search projection on open.
+/// Other domains preserve their complete validation and ANN uses its own
+/// bounded restore before the shared M05 budget is checked.
+fn validate_large_search_roots(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    roots: &RootSet,
+) -> Result<SearchRecoveryMemoryAuthority, NativeRuntimeError> {
+    let catalog = load_catalog_state(pages, blobs, roots)?;
+    load_relational_state(pages, blobs, roots, &catalog)?;
+    load_structure_state(pages, blobs, roots)?;
+    let root = roots
+        .root(SLOT_SEARCH)
+        .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+    let tree = BTree::from_root(root);
+    let lexical_retained_bytes = measure_search_recovery_retained_bytes(pages, root)?;
+    lexical_recovery::validate_root(pages, blobs, tree)?;
+    lexical_recovery::measure_document_state(pages, tree)?;
+    let ann =
+        ann_store::load_with_memory_limit(pages, Some(root), &catalog, RECOVERY_MEMORY_BYTES)?;
+    let ann_by_index = ann.recovery_memory_by_index();
+    let ann_retained_bytes = ann_by_index.values().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .ok_or(NativeRuntimeError::InvalidAnnTree)
+    })?;
+    let combined = lexical_retained_bytes.saturating_add(ann_retained_bytes);
+    if ann.contains_m05() && combined > RECOVERY_MEMORY_BYTES {
+        return Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+            configured: RECOVERY_MEMORY_BYTES,
+            observed: combined,
+        });
+    }
+    Ok(SearchRecoveryMemoryAuthority {
+        root: Some(root),
+        lexical_retained_bytes,
+        ann_by_index,
+        ann_retained_bytes,
+        contains_m05: ann.contains_m05(),
+    })
 }
 
 /// Structurally verifies one committed root set without decoding its
@@ -38598,10 +38675,26 @@ fn load_state_with_search_recovery_authority(
     record_full_state_materialization()?;
     let catalog = load_catalog_state(pages, blobs, roots)?;
     let relational = load_relational_state(pages, blobs, roots, &catalog)?;
-    let (search, search_retained_bytes) = load_search_state_with_retained(pages, blobs, roots)?;
-    let ann_memory_limit = RECOVERY_MEMORY_BYTES
-        .checked_sub(search_retained_bytes)
-        .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+    let (search, search_retained_bytes, large_search) =
+        match load_search_state_with_retained(pages, blobs, roots) {
+            Ok((search, retained)) => (search, retained, false),
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { .. }) => {
+                let root = roots
+                    .root(SLOT_SEARCH)
+                    .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+                let retained = measure_search_recovery_retained_bytes(pages, root)?;
+                let search = load_large_search_state_root(pages, blobs, root)?;
+                (search, retained, true)
+            }
+            Err(error) => return Err(error),
+        };
+    let ann_memory_limit = if large_search {
+        RECOVERY_MEMORY_BYTES
+    } else {
+        RECOVERY_MEMORY_BYTES
+            .checked_sub(search_retained_bytes)
+            .ok_or(NativeRuntimeError::InvalidSearchTree)?
+    };
     let ann = ann_store::load_with_memory_limit(
         pages,
         roots.root(SLOT_SEARCH),
@@ -38614,6 +38707,13 @@ fn load_state_with_search_recovery_authority(
             .checked_add(*bytes)
             .ok_or(NativeRuntimeError::InvalidAnnTree)
     })?;
+    let combined = search_retained_bytes.saturating_add(ann_retained_bytes);
+    if ann.contains_m05() && combined > RECOVERY_MEMORY_BYTES {
+        return Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+            configured: RECOVERY_MEMORY_BYTES,
+            observed: combined,
+        });
+    }
     let authority = SearchRecoveryMemoryAuthority {
         root: roots.root(SLOT_SEARCH),
         lexical_retained_bytes: search_retained_bytes,
@@ -39912,7 +40012,23 @@ fn load_search_state_root(
     blobs: &BlobStore,
     root: PageId,
 ) -> Result<SearchState, NativeRuntimeError> {
-    load_search_state_root_with_retained(pages, blobs, root).map(|(state, _)| state)
+    match load_search_state_root_with_retained(pages, blobs, root) {
+        Ok((state, _)) => Ok(state),
+        Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { .. }) => {
+            load_large_search_state_root(pages, blobs, root)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_large_search_state_root(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<SearchState, NativeRuntimeError> {
+    let tree = BTree::from_root(root);
+    lexical_recovery::validate_root(pages, blobs, tree)?;
+    lexical_recovery::load_document_state(pages, blobs, tree)
 }
 
 fn measure_search_recovery_retained_bytes(
@@ -39922,82 +40038,61 @@ fn measure_search_recovery_retained_bytes(
     let tree = BTree::from_root(root);
     let mut format = None;
     let mut retained_bytes = 0_u64;
-    let mut failure = None;
-    let stats = tree
-        .visit_range_borrowed_with_control(
-            pages,
-            Bound::Unbounded,
-            Bound::Excluded(&[5]),
-            BorrowedVisitLimits {
-                maximum_entries: usize::try_from(RECOVERY_MEMORY_BYTES / 512).unwrap_or(usize::MAX),
-                maximum_bytes: RECOVERY_MEMORY_BYTES,
-            },
-            || ControlFlow::Continue(()),
-            |key, value| {
-                let result = (|| {
-                    let logical_value_bytes = match key.first().copied() {
-                        Some(0) if key == SEARCH_FORMAT_KEY && format.is_none() => {
-                            format = Some(PhysicalSearchFormat::decode(value)?);
-                            return Ok(());
-                        }
-                        Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
-                            decode_search_index_metadata(value)?;
-                            Some(0)
-                        }
-                        Some(SEARCH_DOCUMENT_PREFIX) => {
-                            decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
-                            search_document_logical_bytes(
-                                value,
-                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
-                            )?
-                        }
-                        Some(SEARCH_TERM_META_PREFIX) => {
-                            let (_, term) = decode_search_object_key(key, SEARCH_TERM_META_PREFIX)?;
-                            if !is_canonical_search_term(term) {
-                                return Err(NativeRuntimeError::InvalidSearchTree);
-                            }
-                            decode_live_search_term_metadata(
-                                value,
-                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
-                            )?
-                            .map(|_| 0)
-                        }
-                        Some(SEARCH_POSTING_PREFIX) => {
-                            decode_search_posting_key(key)?;
-                            decode_live_search_posting(
-                                value,
-                                format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
-                            )?
-                            .map(|_| 0)
-                        }
-                        _ => return Err(NativeRuntimeError::InvalidSearchTree),
-                    };
-                    if let Some(logical_value_bytes) = logical_value_bytes {
-                        retained_bytes = retained_bytes
-                            .checked_add(search_recovery_entry_retained_bytes(
-                                key,
-                                logical_value_bytes,
-                            )?)
-                            .ok_or(NativeRuntimeError::InvalidSearchTree)?;
-                        if retained_bytes > RECOVERY_MEMORY_BYTES {
-                            return Err(NativeRuntimeError::InvalidSearchTree);
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    failure = Some(error);
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+    lexical_recovery::visit_chunked(
+        tree,
+        pages,
+        Bound::Unbounded,
+        Bound::Excluded(&[5]),
+        |key, value| {
+            let logical_value_bytes = match key.first().copied() {
+                Some(0) if key == SEARCH_FORMAT_KEY && format.is_none() => {
+                    format = Some(PhysicalSearchFormat::decode(value)?);
+                    return Ok(());
                 }
-            },
-        )
-        .map_err(map_borrowed_search_visit_error)?;
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    if !stats.complete || format.is_none() {
+                Some(SEARCH_INDEX_META_PREFIX) if key.len() == 17 => {
+                    decode_search_index_metadata(value)?;
+                    Some(0)
+                }
+                Some(SEARCH_DOCUMENT_PREFIX) => {
+                    decode_search_object_key(key, SEARCH_DOCUMENT_PREFIX)?;
+                    search_document_logical_bytes(
+                        value,
+                        format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                    )?
+                }
+                Some(SEARCH_TERM_META_PREFIX) => {
+                    let (_, term) = decode_search_object_key(key, SEARCH_TERM_META_PREFIX)?;
+                    if !is_canonical_search_term(term) {
+                        return Err(NativeRuntimeError::InvalidSearchTree);
+                    }
+                    decode_live_search_term_metadata(
+                        value,
+                        format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                    )?
+                    .map(|_| 0)
+                }
+                Some(SEARCH_POSTING_PREFIX) => {
+                    decode_search_posting_key(key)?;
+                    decode_live_search_posting(
+                        value,
+                        format.ok_or(NativeRuntimeError::InvalidSearchTree)?,
+                    )?
+                    .map(|_| 0)
+                }
+                _ => return Err(NativeRuntimeError::InvalidSearchTree),
+            };
+            if let Some(logical_value_bytes) = logical_value_bytes {
+                retained_bytes = retained_bytes
+                    .checked_add(search_recovery_entry_retained_bytes(
+                        key,
+                        logical_value_bytes,
+                    )?)
+                    .ok_or(NativeRuntimeError::InvalidSearchTree)?;
+            }
+            Ok(())
+        },
+    )?;
+    if format.is_none() {
         return Err(NativeRuntimeError::InvalidSearchTree);
     }
     Ok(retained_bytes)
@@ -40029,33 +40124,13 @@ fn load_search_state_root_with_retained(
     }
     let tree = BTree::from_root(root);
     let mut restored = BorrowedSearchRestore::new(blobs);
-    let mut failure = None;
-    let stats = tree
-        .visit_range_borrowed_with_control(
-            pages,
-            Bound::Unbounded,
-            Bound::Excluded(&[5]),
-            BorrowedVisitLimits {
-                maximum_entries: usize::try_from(RECOVERY_MEMORY_BYTES / 512).unwrap_or(usize::MAX),
-                maximum_bytes: RECOVERY_MEMORY_BYTES,
-            },
-            || ControlFlow::Continue(()),
-            |key, value| {
-                if let Err(error) = restored.accept(key, value) {
-                    failure = Some(error);
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            },
-        )
-        .map_err(map_borrowed_search_visit_error)?;
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    if !stats.complete {
-        return Err(NativeRuntimeError::InvalidSearchTree);
-    }
+    lexical_recovery::visit_chunked(
+        tree,
+        pages,
+        Bound::Unbounded,
+        Bound::Excluded(&[5]),
+        |key, value| restored.accept(key, value),
+    )?;
     tree.visit_range_borrowed_with_control(
         pages,
         Bound::Included(&[12]),
@@ -40204,7 +40279,10 @@ impl<'a> BorrowedSearchRestore<'a> {
             .checked_add(retained)
             .ok_or(NativeRuntimeError::InvalidSearchTree)?;
         if next > RECOVERY_MEMORY_BYTES {
-            return Err(NativeRuntimeError::InvalidSearchTree);
+            return Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                configured: RECOVERY_MEMORY_BYTES,
+                observed: next,
+            });
         }
         self.retained_bytes = next;
         Ok(())
@@ -40721,14 +40799,18 @@ mod tests {
         CatalogObjectKind, CatalogObjectV2, CrossEngineLinkDefinition,
         CrossEngineLinkDeleteBehavior, CrossEngineLinkMaintenance, CrossEngineLinkMapping,
         DefinitionVersion, DependencyDirection, DependencyEdge, DependencyKind,
-        IncrementalVectorLifecycle, LogicalCatalogObject, ObjectHeaderV2, SecondaryIndexDefinition,
+        EmbeddingArtifactManifestDigest, EmbeddingPipelineVersion, EmbeddingProfileDefinition,
+        IncrementalVectorLifecycle, LogicalCatalogObject, NamedVectorDefinition, ObjectHeaderV2,
+        QWEN3_EMBEDDING_QUERY_INSTRUCTION, SearchCollectionDefinitionV2, SecondaryIndexDefinition,
         StructureDefinition, StructureKind, StructureOwnership,
+        VectorMetric as CatalogVectorMetric, VectorSearchPolicy,
     };
     use hyphae_native_mvcc::{RootSet, WriteKey};
     use hyphae_native_pages::PageKind;
     use hyphae_native_types::{
-        CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, IntegerWidth, LogicalType,
-        Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
+        CanonicalF64, CatalogVersion, ColumnId, Csn, DurabilityClass, FieldId, IntegerWidth,
+        LogicalType, Lsn, ManifestGeneration, ObjectId, PageGeneration, PageId, TransactionId,
+        VectorElement, VectorType,
     };
     use hyphae_native_wal::WalFile;
 
@@ -41911,9 +41993,18 @@ mod tests {
         name: &str,
         parent: Option<u128>,
     ) -> Result<ObjectHeaderV2, Box<dyn std::error::Error>> {
+        logical_header_with_owner(id, name, parent, EngineKind::Kernel)
+    }
+
+    fn logical_header_with_owner(
+        id: u128,
+        name: &str,
+        parent: Option<u128>,
+        owner: EngineKind,
+    ) -> Result<ObjectHeaderV2, Box<dyn std::error::Error>> {
         Ok(ObjectHeaderV2 {
             id: ObjectId::new(id)?,
-            owner: EngineKind::Kernel,
+            owner,
             name: QualifiedName::new(
                 CatalogName::unquoted("main")?,
                 CatalogName::unquoted("public")?,
@@ -41922,6 +42013,222 @@ mod tests {
             parent: parent.map(ObjectId::new).transpose()?,
             definition_version: DefinitionVersion::FIRST,
         })
+    }
+
+    fn qwen_profile(dimension: u16) -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
+        Ok(LogicalCatalogObject::V2(CatalogObjectV2::EmbeddingProfile(
+            EmbeddingProfileDefinition {
+                header: logical_header_with_owner(
+                    12,
+                    "qwen3_embedding_0_6b",
+                    Some(11),
+                    EngineKind::Search,
+                )?,
+                artifact_manifest_digest: EmbeddingArtifactManifestDigest::new([7; 32])?,
+                artifact_manifest_byte_length: 8_323,
+                pipeline_version: EmbeddingPipelineVersion::Qwen3EmbeddingV1,
+                vector_type: VectorType::new(VectorElement::Float32, dimension)?,
+                max_input_tokens: 256,
+                query_instruction: QWEN3_EMBEDDING_QUERY_INSTRUCTION.to_owned(),
+            },
+        )))
+    }
+
+    fn qwen_collection(
+        profile: ObjectId,
+        dimension: u16,
+    ) -> Result<LogicalCatalogObject, Box<dyn std::error::Error>> {
+        Ok(LogicalCatalogObject::V2(CatalogObjectV2::SearchCollection(
+            SearchCollectionDefinitionV2 {
+                header: logical_header_with_owner(13, "documents", Some(11), EngineKind::Search)?,
+                fields: Vec::new(),
+                vectors: vec![NamedVectorDefinition {
+                    id: FieldId::new(1)?,
+                    name: CatalogName::unquoted("embedding")?,
+                    vector_type: VectorType::new(VectorElement::Float32, dimension)?,
+                    metric: CatalogVectorMetric::Cosine,
+                    policy: VectorSearchPolicy::Exact,
+                    lifecycle: IncrementalVectorLifecycle {
+                        delta_max_entries: 64,
+                        consolidate_after_deltas: 4,
+                        retain_generations: 2,
+                    },
+                    embedding_profile: Some(profile),
+                }],
+                bm25: None,
+            },
+        )))
+    }
+
+    fn qwen_catalog_batch(
+        profile_dimension: u16,
+        binding: ObjectId,
+        vector_dimension: u16,
+    ) -> Result<Vec<LogicalCatalogObject>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            LogicalCatalogObject::V2(CatalogObjectV2::Database(logical_header(
+                10, "database", None,
+            )?)),
+            LogicalCatalogObject::V2(CatalogObjectV2::Schema(logical_header(
+                11,
+                "schema",
+                Some(10),
+            )?)),
+            qwen_profile(profile_dimension)?,
+            qwen_collection(binding, vector_dimension)?,
+        ])
+    }
+
+    #[test]
+    fn qwen_profile_create_bind_is_atomic_and_replays_with_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TestDirectory::new();
+        let mut database = NativeDatabase::create(directory.path())?;
+        let profile_id = ObjectId::new(12)?;
+        let collection_id = ObjectId::new(13)?;
+
+        let wrong_kind = database
+            .create_catalog_objects_v2(
+                qwen_catalog_batch(384, ObjectId::new(11)?, 384)?,
+                DurabilityClass::Strict,
+            )
+            .err()
+            .ok_or("schema accepted as an embedding profile")?;
+        assert!(matches!(wrong_kind, NativeRuntimeError::Model(_)));
+        let snapshot = database.catalog_snapshot()?;
+        assert!(
+            database
+                .catalog_describe(&snapshot, profile_id)?
+                .object
+                .is_none()
+        );
+        assert!(
+            database
+                .catalog_describe(&snapshot, collection_id)?
+                .object
+                .is_none()
+        );
+
+        let wrong_dimension = database
+            .create_catalog_objects_v2(
+                qwen_catalog_batch(384, profile_id, 768)?,
+                DurabilityClass::Strict,
+            )
+            .err()
+            .ok_or("mismatched embedding dimensions were accepted")?;
+        assert!(matches!(wrong_dimension, NativeRuntimeError::Model(_)));
+        let snapshot = database.catalog_snapshot()?;
+        assert!(
+            database
+                .catalog_describe(&snapshot, profile_id)?
+                .object
+                .is_none()
+        );
+        assert!(
+            database
+                .catalog_describe(&snapshot, collection_id)?
+                .object
+                .is_none()
+        );
+
+        let objects = qwen_catalog_batch(384, profile_id, 384)?;
+        database.create_catalog_objects_v2(objects.clone(), DurabilityClass::Strict)?;
+        let snapshot = database.catalog_snapshot()?;
+        assert_eq!(
+            database.catalog_describe(&snapshot, profile_id)?.object,
+            Some(objects[2].clone())
+        );
+        let outgoing = database.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: collection_id,
+                direction: DependencyDirection::Outgoing,
+                start_after: None,
+                item_limit: 4,
+                visit_limit: 4,
+                byte_limit: 4_096,
+            },
+        )?;
+        assert!(outgoing.items.contains(&DependencyEdge::new(
+            collection_id,
+            profile_id,
+            DependencyKind::EmbeddingProfile,
+        )));
+        drop(database);
+
+        let reopened = NativeDatabase::open(directory.path())?;
+        assert_eq!(reopened.recovery_report().replayed_transactions, 1);
+        let snapshot = reopened.catalog_snapshot()?;
+        assert_eq!(
+            reopened.catalog_describe(&snapshot, collection_id)?.object,
+            Some(objects[3].clone())
+        );
+        let incoming = reopened.catalog_dependencies(
+            &snapshot,
+            CatalogDependencyRequest {
+                object: profile_id,
+                direction: DependencyDirection::Incoming,
+                start_after: None,
+                item_limit: 1,
+                visit_limit: 1,
+                byte_limit: 64,
+            },
+        )?;
+        assert_eq!(
+            incoming.items,
+            [DependencyEdge::new(
+                collection_id,
+                profile_id,
+                DependencyKind::EmbeddingProfile,
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_qwen_profile_binding_commit_boundary_recovers_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for boundary in [
+            CommitBoundary::BlobStaged,
+            CommitBoundary::BlobPromoted,
+            CommitBoundary::PageAppended,
+            CommitBoundary::PageSynchronized,
+            CommitBoundary::WalAppended,
+            CommitBoundary::WalSynchronized,
+            CommitBoundary::RootPublished,
+        ] {
+            let directory = TestDirectory::new();
+            let mut database = NativeDatabase::create(directory.path())?;
+            database.create_catalog_objects_v2(
+                qwen_catalog_batch(384, ObjectId::new(12)?, 384)?[..2].to_vec(),
+                DurabilityClass::Strict,
+            )?;
+            let profile = qwen_profile(384)?;
+            let collection = qwen_collection(ObjectId::new(12)?, 384)?;
+            let mut transaction = database.begin(0, DurabilityClass::Strict)?;
+            transaction.create_catalog_object_v2(profile.clone())?;
+            transaction.create_catalog_object_v2(collection.clone())?;
+            assert!(matches!(
+                transaction.commit_with_interruption(boundary),
+                Err(NativeRuntimeError::InjectedCrash(found)) if found == boundary
+            ));
+            drop(database);
+
+            let reopened = NativeDatabase::open(directory.path())?;
+            let snapshot = reopened.catalog_snapshot()?;
+            let recovered_profile = reopened
+                .catalog_describe(&snapshot, ObjectId::new(12)?)?
+                .object;
+            let recovered_collection = reopened
+                .catalog_describe(&snapshot, ObjectId::new(13)?)?
+                .object;
+            assert!(
+                (recovered_profile.is_none() && recovered_collection.is_none())
+                    || (recovered_profile == Some(profile.clone())
+                        && recovered_collection == Some(collection.clone()))
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -45762,6 +46069,97 @@ mod tests {
     }
 
     #[test]
+    fn large_lexical_validator_rejects_unknown_search_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(ObjectId::new(905_998)?, "unknown-prefix")?;
+        create.commit()?;
+        let root = database
+            .coordinator
+            .snapshot(1)?
+            .roots()
+            .root(super::SLOT_SEARCH)
+            .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
+        let tree = BTree::from_root(root);
+        super::lexical_recovery::validate_root(&database.pages, &database.blobs, tree)?;
+        let forged = tree
+            .upsert(&mut database.pages, Csn::new(2)?, vec![12], vec![1])?
+            .tree;
+        assert!(matches!(
+            super::lexical_recovery::validate_root(&database.pages, &database.blobs, forged),
+            Err(NativeRuntimeError::InvalidSearchTree)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn document_state_budget_rejects_before_wal_and_recovers_prior_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TestDirectory::new();
+        let index = ObjectId::new(905_999)?;
+        let mut database = NativeDatabase::create(temporary.path())?;
+        let mut create = database.begin(1, DurabilityClass::Strict)?;
+        create.create_search_index(index, "document-state-budget")?;
+        create.commit()?;
+        let mut first = database.begin(2, DurabilityClass::Strict)?;
+        first.index_document(index, b"first".to_vec(), "alpha")?;
+        first.commit()?;
+
+        let before = database.coordinator.snapshot(2)?.roots().clone();
+        let wal_before = fs::metadata(temporary.path().join(WAL_FILE))?.len();
+        let root = database
+            .search_recovery_memory
+            .root
+            .ok_or("missing search root")?;
+        let configured = super::lexical_recovery::measure_document_state(
+            &database.pages,
+            BTree::from_root(root),
+        )?
+        .checked_add(1)
+        .ok_or("document budget overflow")?;
+        let reopen_limit = configured
+            .checked_sub(2)
+            .ok_or("document budget underflow")?;
+        super::DOCUMENT_STATE_BUDGET_FOR_TEST.set(Some(reopen_limit));
+        let reopen_check =
+            super::validate_large_search_roots(&database.pages, &database.blobs, &before);
+        super::DOCUMENT_STATE_BUDGET_FOR_TEST.set(None);
+        assert!(matches!(
+            reopen_check,
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                configured: observed_limit,
+                observed,
+            }) if observed_limit == reopen_limit && observed == configured - 1
+        ));
+        let mut candidate = database.begin(3, DurabilityClass::Strict)?;
+        candidate.index_document(index, b"second".to_vec(), "beta")?;
+        super::DOCUMENT_STATE_BUDGET_FOR_TEST.set(Some(configured));
+        let result = candidate.commit();
+        super::DOCUMENT_STATE_BUDGET_FOR_TEST.set(None);
+        assert!(matches!(
+            result,
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                configured: observed_limit,
+                observed,
+            }) if observed_limit == configured && observed > configured
+        ));
+        assert_eq!(
+            fs::metadata(temporary.path().join(WAL_FILE))?.len(),
+            wal_before
+        );
+        assert_eq!(database.coordinator.snapshot(3)?.roots(), &before);
+        drop(database);
+
+        let reopened = NativeDatabase::open(temporary.path())?;
+        assert_eq!(reopened.coordinator.snapshot(3)?.roots(), &before);
+        assert_eq!(reopened.match_latest_text(index, "alpha", 10)?.len(), 1);
+        assert!(reopened.match_latest_text(index, "beta", 10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn shared_lexical_ann_limit_rejects_point_publication_before_pages_or_wal()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TestDirectory::new();
@@ -45826,7 +46224,8 @@ mod tests {
         let roots_before = database.coordinator.snapshot(3)?.roots().clone();
         assert!(matches!(
             database.commit_optimistic(point),
-            Err(NativeRuntimeError::InvalidAnnTree)
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { configured, observed })
+                if configured == RECOVERY_MEMORY_BYTES && observed > configured
         ));
         let physical_after = database.physical_observation()?;
         assert_eq!(physical_after.page_count, physical_before.page_count);
@@ -45922,7 +46321,12 @@ mod tests {
             if expected_commits == 1 {
                 assert!(matches!(
                     report.outcomes[1],
-                    GroupCommitOutcome::Rejected(NativeRuntimeError::InvalidAnnTree)
+                    GroupCommitOutcome::Rejected(
+                        NativeRuntimeError::SearchRecoveryRetainedLimitExceeded {
+                            configured,
+                            observed,
+                        }
+                    ) if configured == RECOVERY_MEMORY_BYTES && observed > configured
                 ));
             } else {
                 assert!(matches!(
@@ -46038,7 +46442,8 @@ mod tests {
         let roots_before = database.coordinator.snapshot(4)?.roots().clone();
         assert!(matches!(
             database.consolidate_ann(plan, DurabilityClass::Strict),
-            Err(NativeRuntimeError::InvalidAnnTree)
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { configured, observed })
+                if configured == RECOVERY_MEMORY_BYTES && observed > configured
         ));
         let physical_after = database.physical_observation()?;
         assert_eq!(physical_after.page_count, physical_before.page_count);
@@ -47216,7 +47621,8 @@ mod tests {
         migration.upsert_vector(first, ObjectId::new(1)?, Vector::new([1.0, 0.0])?)?;
         assert!(matches!(
             migration.commit(),
-            Err(NativeRuntimeError::InvalidAnnTree)
+            Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { configured, observed })
+                if configured == RECOVERY_MEMORY_BYTES && observed > configured
         ));
         let physical_after = reopened.physical_observation()?;
         assert_eq!(physical_after.page_count, physical_before.page_count);

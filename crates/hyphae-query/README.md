@@ -9,11 +9,11 @@ Pure deterministic query types and reference execution for
 [Hyphae](https://hyphae.dev). It provides structured values, filters, global
 sorting, logical cursors, aggregations, and explicit execution budgets.
 
-The crate is published at `3.0.0`:
+The source release candidate is `4.0.0`:
 
 ```toml
 [dependencies]
-hyphae-query = "=3.0.0"
+hyphae-query = "=4.0.0"
 ```
 
 The executor has no database, network, embedding, or LLM dependency. The

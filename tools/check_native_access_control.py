@@ -20,6 +20,8 @@ SCOPE_KINDS = {"instance", "catalog_subtree", "catalog_object"}
 OPERATION_SCOPE_RESOLUTION = {
     "instance",
     "request_object",
+    "collection_and_resolved_profile",
+    "collection_and_target_profile",
     "resolved_name",
     "request_page",
     "parent_object",
@@ -418,6 +420,27 @@ def validate_operations(
             or memory_rows[0]["inherits_underlying"] is not False
         ):
             fail(f"{variant} must retain collection, lifecycle, and maintenance authority")
+    for variant, required, resolver in (
+        (
+            "EmbedAndIngest",
+            ["catalog.read", "data.write", "search.execute"],
+            "collection_and_resolved_profile",
+        ),
+        (
+            "EmbedAndIngestBatch",
+            ["catalog.read", "data.write"],
+            "collection_and_target_profile",
+        ),
+    ):
+        rows = operations_by_variant.get(variant, [])
+        if (
+            len(rows) != 1
+            or rows[0]["classification"] != "fixed"
+            or rows[0]["required_all"] != required
+            or rows[0]["scope_resolution"] != resolver
+            or rows[0]["inherits_underlying"] is not False
+        ):
+            fail(f"{variant} must retain collection and embedding-profile authority")
     explain_rows = operations_by_variant.get("AdminExplainSql", [])
     if (
         len(explain_rows) != 1

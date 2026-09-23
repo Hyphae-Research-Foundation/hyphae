@@ -7,8 +7,16 @@ from .generated import __all__ as _generated_all
 from .http import HttpTransport
 from .local import LocalTransport
 from .models import (
+    CATALOG_DEPENDENCY_KINDS,
+    CATALOG_OBJECT_KINDS,
     CancellationToken,
+    CatalogDependencyKind,
+    CatalogObjectKind,
     ClientError,
+    EmbedAndIngestBatch,
+    EmbedAndIngestDocument,
+    EmbedAndIngestResult,
+    EmbeddingExecutionProfile,
     ProductError,
     ProductErrorFields,
     ProductDocument,
@@ -24,11 +32,19 @@ from .models import (
 )
 
 __all__ = [
+    "CATALOG_DEPENDENCY_KINDS",
+    "CATALOG_OBJECT_KINDS",
     "CancellationToken",
+    "CatalogDependencyKind",
+    "CatalogObjectKind",
     "AbortableTransport",
     "AsyncHyphaeClient",
     "AsyncTransaction",
     "ClientError",
+    "EmbedAndIngestBatch",
+    "EmbedAndIngestDocument",
+    "EmbedAndIngestResult",
+    "EmbeddingExecutionProfile",
     "HttpTransport",
     "HyphaeClient",
     "LocalTransport",

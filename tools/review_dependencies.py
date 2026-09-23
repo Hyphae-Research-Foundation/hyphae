@@ -38,6 +38,7 @@ CARGO_MANIFESTS = (
     "crates/hyphae-native-btree/Cargo.toml",
     "crates/hyphae-native-catalog/Cargo.toml",
     "crates/hyphae-native-daemon/Cargo.toml",
+    "crates/hyphae-native-embed-cpu/Cargo.toml",
     "crates/hyphae-native-manifest/Cargo.toml",
     "crates/hyphae-native-mvcc/Cargo.toml",
     "crates/hyphae-native-pages/Cargo.toml",
