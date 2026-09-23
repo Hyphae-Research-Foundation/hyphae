@@ -62,7 +62,7 @@ class NativeAccessControlContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["permissions"], 18)
         self.assertEqual(result["built_in_roles"], 7)
-        self.assertEqual(result["current_product_variants"], 71)
+        self.assertEqual(result["current_product_variants"], 73)
         self.assertEqual(result["planned_operations"], 2)
 
     def test_backup_verify_remains_planned_and_instance_scoped(self) -> None:
@@ -288,6 +288,36 @@ class NativeAccessControlContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     AccessControlValidationError,
                     "must retain collection, lifecycle, and maintenance authority",
+                ):
+                    validate(contract, SOURCE)
+
+    def test_embed_and_ingest_requires_collection_and_profile_authority(self) -> None:
+        for operation_id, field, value in (
+            (
+                "search.embed_and_ingest",
+                "required_all",
+                ["catalog.read", "data.write"],
+            ),
+            ("search.embed_and_ingest", "scope_resolution", "request_object"),
+            (
+                "search.embed_and_ingest_batch",
+                "required_all",
+                ["data.write"],
+            ),
+            ("search.embed_and_ingest_batch", "scope_resolution", "request_object"),
+        ):
+            with self.subTest(operation=operation_id, field=field):
+                contract = payload()
+                row = operation(contract, operation_id)
+                row[field] = value
+                row["allowed_roles"] = sorted(
+                    role["id"]
+                    for role in contract["built_in_roles"]
+                    if set(row["required_all"]).issubset(role["permissions"])
+                )
+                with self.assertRaisesRegex(
+                    AccessControlValidationError,
+                    "must retain collection and embedding-profile authority",
                 ):
                     validate(contract, SOURCE)
 

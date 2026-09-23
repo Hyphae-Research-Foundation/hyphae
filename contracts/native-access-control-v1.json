@@ -547,6 +547,26 @@
       "allowed_roles": ["admin", "developer", "owner", "writer"]
     },
     {
+      "id": "search.embed_and_ingest",
+      "status": "current",
+      "source_variant": "EmbedAndIngest",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write", "search.execute"],
+      "scope_resolution": "collection_and_resolved_profile",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
+      "id": "search.embed_and_ingest_batch",
+      "status": "current",
+      "source_variant": "EmbedAndIngestBatch",
+      "classification": "fixed",
+      "required_all": ["catalog.read", "data.write"],
+      "scope_resolution": "collection_and_target_profile",
+      "inherits_underlying": false,
+      "allowed_roles": ["admin", "developer", "owner", "writer"]
+    },
+    {
       "id": "search.document_update",
       "status": "current",
       "source_variant": "SearchDocumentUpdate",

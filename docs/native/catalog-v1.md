@@ -178,9 +178,10 @@ edge set in both directions.
 
 Embedding-profile kind `10`, dependency kind `7`, and search representation
 `4` are specified by [embedding profile metadata v1](embedding-profile-v1.md).
-They are unreleased next-major incubation and add catalog authority only. No
-embedding executor, model path, provider, job, GPU path, embedding product
-operation, or embedding WAL opcode exists.
+Profiles are metadata-only catalog objects. Model paths, providers, and GPU
+devices are process-local execution inputs, never catalog authority. The
+catalog-bound product operation uses the registered executor and records its
+actual execution profile with the durable ingest result.
 
 ## Implemented runtime persistence
 

@@ -124,8 +124,15 @@ the stable `ObjectId` in the strict internal `HYPDKB01` record before scope
 evaluation. They require `data.read` or `data.write` at that exact durable
 canonical keyspace, never merely at `instance`. The record is lineage-bound and
 names are not authority. Search operations bind the requested stable collection
-or index. A transaction accumulates the union of every referenced scope and
-reauthorizes the complete union before commit.
+or index. `EmbedAndIngestBatch` requires `catalog.read` and `data.write` on the
+collection and `catalog.read` on the embedding profile bound to the named
+vector target. Public `EmbedAndIngest` resolves its sole vector target and
+profile from one catalog snapshot. It requires `catalog.read` and `data.write`
+on the collection plus `catalog.read` and `search.execute` on that profile.
+Both operations check authorization before inference and immediately before
+commit; a revoked grant publishes no partial batch. A transaction accumulates
+the union of every referenced scope and reauthorizes the complete union before
+commit.
 
 `MemoryRecall` uses `memory_recall_objects`: `data.read` on the durable default
 scalar keyspace for lifecycle envelopes, plus `catalog.read` and
