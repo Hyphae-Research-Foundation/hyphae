@@ -105,6 +105,13 @@ positions, 4,096 output members, and 1,000,000 visits. Both set algebra and
 response count `1` and `format!("{:?}", read.value).len() <= 16,777,216`.
 Oversized request, work, item, or Debug-byte results are outside scope.
 
+The 4.0.0 candidate re-seals this foundation profile after reviewing the changed
+source bundle. The mapped keyspace and structure implementation and its scoped
+tests are unchanged; the bundle changes cover embedding, build manifests, and
+CI. The historical 3.0.0 classification source remains identified separately
+from the executed candidate tree. This review creates no Valkey compatibility
+or comparative performance claim.
+
 Validate the authority and run its mutation tests without building the Hyphae
 product graph:
 
