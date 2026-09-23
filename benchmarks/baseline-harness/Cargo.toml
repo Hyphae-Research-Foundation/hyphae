@@ -10,7 +10,7 @@
 name = "hyphae-baseline-harness"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 license = "Apache-2.0"
 description = "Dedicated-hardware baseline benchmark harness for Hyphae native engines"
 publish = false
