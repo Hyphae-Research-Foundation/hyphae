@@ -1,6 +1,6 @@
 # Development guide
 
-Hyphae uses Rust 2024 with MSRV 1.89.0 and a pinned validation toolchain. Code,
+Hyphae uses Rust 2024 with MSRV 1.90.0 and a pinned validation toolchain. Code,
 contracts, commit messages, and repository documentation are English. Unsafe
 Rust is forbidden workspace-wide.
 

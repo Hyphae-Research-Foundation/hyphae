@@ -184,7 +184,7 @@ jobs:
             run-native-conformance: true
           - name: Linux MSRV
             os: ubuntu-latest
-            toolchain: 1.89.0
+            toolchain: 1.90.0
             native-platform: linux
             run-native-conformance: false
     runs-on: ${{ matrix.os }}

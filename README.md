@@ -17,7 +17,7 @@
   <a href="https://github.com/Hyphae-Research-Foundation/hyphae/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/Hyphae-Research-Foundation/hyphae?logo=github"></a>
   <a href="https://hyphae.dev"><img alt="Website" src="https://img.shields.io/badge/website-hyphae.dev-8FCBC6"></a>
   <a href="LICENSE-POLICY.md"><img alt="License" src="https://img.shields.io/badge/code-Apache--2.0-C86F4A"></a>
-  <img alt="MSRV 1.89" src="https://img.shields.io/badge/MSRV-1.89-43585A?logo=rust">
+  <img alt="MSRV 1.90" src="https://img.shields.io/badge/MSRV-1.90-43585A?logo=rust">
 </p>
 
 <p align="center">

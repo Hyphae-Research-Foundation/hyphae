@@ -292,10 +292,10 @@ bounded `set_algebra`, `sorted_set_score/rank/range/cardinality`, and
 ### Native protocol minor 6: seven mutations, six reads
 
 Minor 6 adds seven Valkey-shaped typed mutations and six typed reads through
-the same `batch` and `read` envelopes. Current minor-7 clients return an
-ordered `results` array containing `changed` and the typed result for every
-mutation. Applied or mixed batches also carry the normal flat commit fields;
-an all-rejected batch returns `status: "no_op"` and `read_csn` without a
+the same `batch` and `read` envelopes. Clients negotiating minor 7 or later
+return an ordered `results` array containing `changed` and the typed result
+for every mutation. Applied or mixed batches also carry the normal flat commit
+fields; an all-rejected batch returns `status: "no_op"` and `read_csn` without a
 transaction or durability receipt.
 
 Release `3.0.0` defect: a batch whose conditional mutations are **all**

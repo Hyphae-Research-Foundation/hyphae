@@ -37,7 +37,7 @@ default-members = ["crates/hyphae-cli"]
 [workspace.package]
 version = "4.0.0"
 edition = "2024"
-rust-version = "1.89.0"
+rust-version = "1.90.0"
 authors = ["Hyphae Research Foundation"]
 license = "Apache-2.0"
 repository = "https://github.com/Hyphae-Research-Foundation/hyphae"
