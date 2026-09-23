@@ -36,6 +36,10 @@
     {
       "source": "compatibility/qwen3-embedding-query-instruction-v1.hex",
       "packaged": "crates/hyphae-native-catalog/compatibility/qwen3-embedding-query-instruction-v1.hex"
+    },
+    {
+      "source": "compatibility/native-protocol-v1-embed-and-ingest.bin",
+      "packaged": "crates/hyphae-native-protocol/tests/fixtures/native-protocol-v1-embed-and-ingest.bin"
     }
   ],
   "semver_baseline_packages": [
