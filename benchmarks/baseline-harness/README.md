@@ -107,9 +107,9 @@ Oversized request, work, item, or Debug-byte results are outside scope.
 
 The 4.0.0 candidate re-seals this foundation profile after reviewing the changed
 source bundle. The mapped keyspace and structure implementation and its scoped
-tests are unchanged; the bundle changes cover embedding, build manifests, and
-CI. The historical 3.0.0 classification source remains identified separately
-from the executed candidate tree. This review creates no Valkey compatibility
+tests are unchanged; the other changes cover embedding, build manifests, CI,
+and baseline receipt authority. The historical 3.0.0 classification source
+remains identified separately from the executed candidate tree. This review creates no Valkey compatibility
 or comparative performance claim.
 
 Validate the authority and run its mutation tests without building the Hyphae
