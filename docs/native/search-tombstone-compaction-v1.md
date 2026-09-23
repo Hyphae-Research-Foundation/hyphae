@@ -27,7 +27,9 @@ The operation supports native inverted B+tree search roots:
 Before appending a replacement page, planning:
 
 1. validates the complete B+tree shape and visible creating CSNs;
-2. validates the complete live lexical projection from stored source text;
+2. validates complete live lexical semantics from stored source text, using
+   bounded borrowed ranges when the complete projection exceeds its recovery
+   budget;
 3. validates every canonical V2 tombstone;
 4. loads the captured catalog and validates the complete ANN generations
    sharing the search root;

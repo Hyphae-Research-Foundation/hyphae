@@ -38682,10 +38682,8 @@ fn load_state_with_search_recovery_authority(
                 let root = roots
                     .root(SLOT_SEARCH)
                     .ok_or(NativeRuntimeError::InvalidCommittedRoot)?;
-                let tree = BTree::from_root(root);
                 let retained = measure_search_recovery_retained_bytes(pages, root)?;
-                lexical_recovery::validate_root(pages, blobs, tree)?;
-                let search = lexical_recovery::load_document_state(pages, blobs, tree)?;
+                let search = load_large_search_state_root(pages, blobs, root)?;
                 (search, retained, true)
             }
             Err(error) => return Err(error),
@@ -40014,7 +40012,23 @@ fn load_search_state_root(
     blobs: &BlobStore,
     root: PageId,
 ) -> Result<SearchState, NativeRuntimeError> {
-    load_search_state_root_with_retained(pages, blobs, root).map(|(state, _)| state)
+    match load_search_state_root_with_retained(pages, blobs, root) {
+        Ok((state, _)) => Ok(state),
+        Err(NativeRuntimeError::SearchRecoveryRetainedLimitExceeded { .. }) => {
+            load_large_search_state_root(pages, blobs, root)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn load_large_search_state_root(
+    pages: &PageStore,
+    blobs: &BlobStore,
+    root: PageId,
+) -> Result<SearchState, NativeRuntimeError> {
+    let tree = BTree::from_root(root);
+    lexical_recovery::validate_root(pages, blobs, tree)?;
+    lexical_recovery::load_document_state(pages, blobs, tree)
 }
 
 fn measure_search_recovery_retained_bytes(

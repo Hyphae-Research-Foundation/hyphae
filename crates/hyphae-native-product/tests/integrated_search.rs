@@ -19,12 +19,12 @@ use hyphae_native_product::proof::{
     verify_native_proof_offline,
 };
 use hyphae_native_product::{
-    AnnConsolidationRequest, MAX_PRODUCT_SEARCH_BATCH_BYTES, MAX_PRODUCT_SEARCH_VECTOR_TARGETS,
-    NativeProduct, ProductAggregation, ProductAggregationValue, ProductAuthorization,
-    ProductDocValue, ProductDocument, ProductDurability, ProductError, ProductErrorCategory,
-    ProductErrorCode, ProductExplicitTransactionStatus, ProductFacetRequest, ProductHighlight,
-    ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation, ProductOperation,
-    ProductPrincipal, ProductRequestContext, ProductResponse, ProductRetry,
+    AnnConsolidationRequest, CompactionRequest, CompactionTarget, MAX_PRODUCT_SEARCH_BATCH_BYTES,
+    MAX_PRODUCT_SEARCH_VECTOR_TARGETS, NativeProduct, ProductAggregation, ProductAggregationValue,
+    ProductAuthorization, ProductDocValue, ProductDocument, ProductDurability, ProductError,
+    ProductErrorCategory, ProductErrorCode, ProductExplicitTransactionStatus, ProductFacetRequest,
+    ProductHighlight, ProductLexicalBranch, ProductMissingPlacement, ProductNamedAggregation,
+    ProductOperation, ProductPrincipal, ProductRequestContext, ProductResponse, ProductRetry,
     ProductSearchCollectionBinding, ProductSearchDocumentDelete, ProductSearchDocumentUpdate,
     ProductSearchFilter, ProductSearchIngestBatch, ProductSearchIngestionCoordinator,
     ProductSearchOperator, ProductSearchRequest, ProductSearchSort, ProductSession,
@@ -5912,12 +5912,21 @@ fn synthetic_scientific_corpus_reopens_beyond_legacy_posting_charge()
     }
     let before = product.snapshot_bounded(0)?.identity();
     drop(product);
-    let reopened = NativeProduct::open(&path)?;
+    let mut reopened = NativeProduct::open(&path)?;
     assert_eq!(reopened.snapshot_bounded(0)?.identity(), before);
     let result =
         reopened.search_collection(binding.collection, &lexical_request("kinase001"), 1)?;
     assert_eq!(result.total_documents, 640);
     assert_eq!(result.hits.len(), 16);
+    let before_compaction = reopened.snapshot_bounded(0)?.identity();
+    let compaction = reopened.administration().compact(CompactionRequest {
+        target: CompactionTarget::Search,
+        durability: ProductDurability::Strict,
+    })?;
+    assert_eq!(compaction.scanned_entries, compaction.retained_entries);
+    assert_eq!(compaction.dropped_tombstones, 0);
+    assert!(compaction.commit.is_none());
+    assert_eq!(reopened.snapshot_bounded(0)?.identity(), before_compaction);
     drop(reopened);
     fs::remove_dir_all(path)?;
     Ok(())

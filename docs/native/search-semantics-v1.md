@@ -91,7 +91,7 @@ immutable merge segments. The bounded G4 phrase/prefix/fuzzy executor derives
 canonical positions from stored source under explicit work budgets; it does
 not claim a production positional-posting layout.
 
-`compact_search` validates the complete current lexical and ANN projection,
+`compact_search` validates the complete current lexical and ANN state,
 then rebuilds `HYSEABT2` without exact `HYDOCT01`, `HYTERMT1`, or `HYPOSTT1`
 tombstones. Every retained lexical and ANN key/value is copied byte-for-byte;
 historical roots remain immutable, and a root without tombstones advances no
@@ -230,6 +230,9 @@ postings, wrong term frequencies or carried lengths, malformed blobs, and
 unknown lexical keys. A separate zero-entry borrowed range over
 `[0x0c,+inf)` preserves unknown-prefix corruption authority. Prefixes `0x05`
 through `0x0b` belong exclusively to ANN validation.
+
+The same large-root validation and document-only load also apply to lexical
+compaction and initial ANN bulk publication.
 
 Complete posting-projection materialization retains the historical 64 MiB
 budget. It charges 512 bytes plus four copies of each live physical key
