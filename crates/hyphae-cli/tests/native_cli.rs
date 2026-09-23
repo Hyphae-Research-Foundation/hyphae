@@ -3328,7 +3328,8 @@ fn model_profile_create_is_local_and_embed_failures_publish_nothing() -> Result<
 fn served_model_profile_create_sends_no_local_path() -> Result<(), Box<dyn Error>> {
     let temporary = TestDirectory::new()?;
     let data = temporary.0.join("data");
-    let endpoint = temporary.0.join("native.sock");
+    // Keep the Unix endpoint below the short macOS socket-path limit.
+    let endpoint = std::env::temp_dir().join(format!("h{}.sock", Uuid::now_v7().simple()));
     let manifest = qwen_embedding_manifest();
     run(&["init", "--data-dir", &path(&data)])?;
     run(&[
