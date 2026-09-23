@@ -1,22 +1,21 @@
 # Publish the Rust crates
 
-The next Apache registry publication is staged for exact version `4.0.0`
-from annotated tag `release-v4.0.0-crates`. The version, immutable
-dependency layers, and exact source authority are defined in
+The 4.0.0 crates.io publication uses annotated tag
+`release-v4.0.0-crates`, whose immutable target is merge commit
+`7cbcf97d165beeb08aba27ff21203fa468f45bec`. The version and eight
+immutable dependency layers are defined in
 [`config/crates-io-release.json`](../../config/crates-io-release.json).
 Conformance runners and independent verifiers remain private workspace tools
 and are not registry packages.
 
-The checked-in package inventory is prepared at `4.0.0` for package and
-release-candidate verification. It integrates Lane14
+The selected source integrates Lane14
 `f2336d8664b32d812cea3291d942e286a89eea9d` through the Lane12
-selection merge `b60238760aa67e860800f1b194d103623cd20a92`.
-
-The tag pin names `release-v4.0.0-crates`, while the exact source, tree,
-tag-object, check, artifact, and Release-run pins still describe the retained
-3.0.0 authority. Live publication stays closed until the 4.0.0 signed Release
-and exact-SHA G8 closure pass and a separate control commit pins their evidence.
-Create the release tag from the selected main commit, not this control branch.
+selection merge `b60238760aa67e860800f1b194d103623cd20a92`. The 25
+publishable packages and exact extracted archives were verified from this
+source. The exact source, tree, tag object, required checks, artifacts, and
+Release-run identity are pinned separately in
+[`config/registry-publish-authority.json`](../../config/registry-publish-authority.json).
+The live workflow rechecks these authorities before each registry upload.
 
 crates.io publication is permanent: an uploaded version cannot be overwritten
 or deleted. Live crates.io and npm publication is therefore a GitHub promotion
@@ -183,11 +182,11 @@ tag, main tip, policy file, or digest changes between gate and upload.
 
 ## Readiness, G8 closure, and release dispatch inputs
 
-Three separate `workflow_dispatch` calls carry the source commit forward from
-readiness through the signed GitHub Release. Each is a distinct workflow with
-its own input names; do not assume one workflow's input name applies to
-another. The worked example throughout is the `3.0.0` publication, recorded in
-full in [the `3.0.0` receipt](receipts/3.0.0.md).
+Readiness and exact-SHA G8 closure are separate `workflow_dispatch` calls.
+The normal Release trigger is the immutable tag push; a manual Release dispatch
+is reserved for recovery after a failed tag run. Each workflow has its own
+input names. The historical `3.0.0` recovery example is recorded in
+[the `3.0.0` receipt](receipts/3.0.0.md); 4.0.0 uses the normal tag trigger.
 
 1. **Readiness matrix** — `.github/workflows/native-g7-g8-readiness.yml`,
    dispatched at the release readiness tag (`release-vX-registry`). Its
@@ -236,9 +235,9 @@ full in [the `3.0.0` receipt](receipts/3.0.0.md).
 
 ## Control-plane commits
 
-Publication authority is promoted to a new version in two separate control
-commits on `main`, mirroring the pattern used for `2.2.0`. Both are plain
-config/workflow edits — neither touches source crates or the tagged tree.
+The `3.0.0` publication promoted authority through the two control commits
+below. The `4.0.0` tag pin and exact-SHA pin follow the same source/control
+split. Control commits do not alter source crates or the tagged tree.
 
 - **Tag-pin control commit** — [`8a58749d…`](https://github.com/Hyphae-Research-Foundation/hyphae/commit/8a58749d892a52e38c651669ade03df5a6ee54af)
   ([PR `#263`](https://github.com/Hyphae-Research-Foundation/hyphae/pull/263)).

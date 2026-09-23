@@ -528,6 +528,52 @@ class RegistryPublishGateTests(unittest.TestCase):
                 ):
                     validate_authority_receipt(value, "crates-io", ROOT, policy())
 
+    def test_release_authority_rejects_wrong_workflow_ref(self) -> None:
+        from tools.check_registry_publish import _run_for_check
+
+        name, workflow, event, branch, commit = next(
+            row for row in EXPECTED_CHECKS if row[0] == "Publish GitHub release"
+        )
+        self.assertEqual((event, branch), ("push", "release-v4.0.0-crates"))
+        expected = {
+            "name": name,
+            "workflow": workflow,
+            "event": event,
+            "head_branch": branch,
+        }
+        check = {
+            "id": 91,
+            "name": name,
+            "head_sha": commit,
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/901/job/91",
+            "html_url": "https://github.com/Hyphae-Research-Foundation/hyphae/actions/runs/901/job/91",
+            "app": {"id": 15368, "slug": "github-actions"},
+        }
+        base_run = {
+            "id": 901,
+            "run_attempt": 1,
+            "path": workflow,
+            "head_sha": commit,
+            "head_branch": branch,
+            "event": event,
+            "status": "completed",
+            "conclusion": "success",
+            "repository": {"full_name": "Hyphae-Research-Foundation/hyphae"},
+        }
+        for mismatch in (
+            {"event": "workflow_dispatch"},
+            {"head_branch": "main"},
+        ):
+            with self.subTest(mismatch=mismatch), patch(
+                "tools.check_registry_publish._workflow_run",
+                return_value={**base_run, **mismatch},
+            ), self.assertRaisesRegex(GateFailure, "workflow identity differs"):
+                _run_for_check(
+                    check, expected, "Hyphae-Research-Foundation/hyphae", commit, "token"
+                )
+
     def test_failed_security_or_mcp_exact_sha_check_fails_closed(self) -> None:
         for name in ("Security hard-kill aggregate", "MCP real hosts"):
             expected = next(
