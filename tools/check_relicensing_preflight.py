@@ -1390,7 +1390,7 @@ def validate_preflight_evidence(
                 )
             # Keep these counts exact for the reviewed integration graph;
             # dependency updates do not change its immutable legal base.
-            if len(packages) != 299 or workspace_count != 27:
+            if len(packages) != 382 or workspace_count != 28:
                 failures.append(
                     f"{DEPENDENCY_RECEIPT_PATH}.inventory: frozen exact-source counts differ"
                 )
