@@ -115,7 +115,7 @@ class LicensePolicyTests(unittest.TestCase):
         self.assertRegex(JSON_EXCEPTION_PATHS_SHA256, r"^[0-9a-f]{64}$")
 
     def test_binary_exceptions_are_frozen_by_exact_inventory(self) -> None:
-        self.assertEqual(BINARY_EXCEPTION_PATH_COUNT, 6)
+        self.assertEqual(BINARY_EXCEPTION_PATH_COUNT, 8)
         self.assertRegex(BINARY_EXCEPTION_PATHS_SHA256, r"^[0-9a-f]{64}$")
 
     def test_new_compatibility_exception_paths_fail_closed_under_mutation(self) -> None:
@@ -142,6 +142,9 @@ class LicensePolicyTests(unittest.TestCase):
                     "compatibility/native-protocol-v1-transaction-document.bin",
                     "crates/hyphae-native-protocol/tests/fixtures/"
                     "native-protocol-v1-transaction-document.bin",
+                    "compatibility/native-protocol-v1-embed-and-ingest.bin",
+                    "crates/hyphae-native-protocol/tests/fixtures/"
+                    "native-protocol-v1-embed-and-ingest.bin",
                 ),
                 "compatibility/native-protocol-v1-invented.bin",
                 BINARY_EXCEPTION_PATH_COUNT,
