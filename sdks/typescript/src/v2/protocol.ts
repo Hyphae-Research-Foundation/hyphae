@@ -87,7 +87,7 @@ const REQUEST_KIND: Readonly<Record<string, number>> = {
   security_api_key_rotate_abort: 66,
   security_api_key_revoke_self: 67,
   security_api_key_revoke: 68,
-  embed_and_ingest: 69,
+  embed_and_ingest: 73,
   security_legacy_bearer_revoke: 70,
   memory_recall: 71,
   memory_enrich: 72,

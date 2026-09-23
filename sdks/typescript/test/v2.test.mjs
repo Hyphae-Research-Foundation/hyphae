@@ -295,7 +295,7 @@ test("v2 embed-and-ingest minor-nine codec is bounded and canonical", () => {
   assert.equal(operationRequiredMinor("embed_and_ingest", args), 9);
   assert.throws(() => encodeProductRequest("embed_and_ingest", args, {}, 8), /protocol minor/);
   const encoded = encodeProductRequest("embed_and_ingest", args, {}, 9);
-  assert.equal(new DataView(encoded.buffer).getUint16(12, true), 69);
+  assert.equal(new DataView(encoded.buffer).getUint16(12, true), 73);
   const decoded = decodeProductRequest(encoded, 9);
   assert.equal(decoded.operation, "embed_and_ingest");
   assert.deepEqual(Object.keys(decoded.args.batch.documents[0].doc_values), [privateUse, supplementary]);
@@ -334,6 +334,26 @@ test("v2 embed-and-ingest minor-nine codec is bounded and canonical", () => {
       /request fields/,
     );
   }
+});
+
+test("v2 embed-and-ingest matches shared Rust fixture", async () => {
+  const fixture = new Uint8Array(await readFile(new URL("../../../compatibility/native-protocol-v1-embed-and-ingest.bin", import.meta.url)));
+  const frame = decodeFrame(fixture);
+  assert.deepEqual([frame.kind, frame.streamId, frame.requestId], [FRAME_KIND.execute, 9, 44n]);
+  const decoded = decodeProductRequest(frame.payload, 9);
+  assert.equal(decoded.operation, "embed_and_ingest");
+  assert.equal(decoded.options.logicalTimeMicros, 1n);
+  assert.deepEqual(encodeFrame(frame.kind, frame.streamId, frame.requestId,
+    encodeProductRequest(decoded.operation, decoded.args, decoded.options, 9)), fixture);
+  const independent = encodeProductRequest("embed_and_ingest", {
+    collection: 13n,
+    batch: { idempotency_id: 7n, documents: [{
+      object_id: 201n, text: "rust", doc_values: {
+        "\u{1f600}": "supplementary", "\ue000": "private-use",
+      },
+    }] },
+  }, { logicalTimeMicros: 1n }, 9);
+  assert.deepEqual(encodeFrame(FRAME_KIND.execute, 9, 44n, independent), fixture);
 });
 
 test("v2 embed-and-ingest response reports execution profile and replay", () => {
@@ -1182,7 +1202,7 @@ test("v2 fresh HTTP transport sends minor-nine embed-and-ingest on its first req
   await assert.rejects(transport.execute("embed_and_ingest", args, { requestId: 17n }));
   assert.equal(requests, 1);
   assert.equal(seen.minor, "3,4,5,6,7,8,9");
-  assert.equal(new DataView(seen.body.buffer).getUint16(12, true), 69);
+  assert.equal(new DataView(seen.body.buffer).getUint16(12, true), 73);
 });
 
 test("v2 concurrent HTTP responses decode with their response-local selected minor", async () => {

@@ -24,15 +24,18 @@ use hyphae_native_catalog::{
     VectorMetric, VectorSearchPolicy,
 };
 use hyphae_native_product::{
-    CustomRoleGrant, NativeProduct, ProductAuthorization, ProductDocument, ProductDurability,
-    ProductEmbedAndIngestBatch, ProductEmbedAndIngestBatchReceipt, ProductEmbedAndIngestDocument,
-    ProductEmbedAndIngestReceipt, ProductEmbeddingBatchOutput, ProductEmbeddingExecutor,
-    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
+    BackupRequest, CustomRoleGrant, NativeProduct, ProductAuthorization, ProductDocument,
+    ProductDurability, ProductEmbedAndIngestBatch, ProductEmbedAndIngestBatchReceipt,
+    ProductEmbedAndIngestDocument, ProductEmbedAndIngestReceipt, ProductEmbeddingBatchOutput,
+    ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
     ProductLocalEmbeddingExecutionProfile, ProductOperation, ProductPermission, ProductPrincipal,
     ProductRequestContext, ProductResponse, ProductScope, ProductSearchIngestBatch, ProductSession,
-    ProductSessionId, ProductVector,
+    ProductSessionId, ProductVector, ProgressControl, RestoreRequest, restore,
 };
-use hyphae_native_types::{EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType};
+use hyphae_native_runtime::NativeDatabase;
+use hyphae_native_types::{
+    DurabilityClass, EngineKind, FieldId, LogicalType, ObjectId, VectorElement, VectorType,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -259,6 +262,16 @@ impl ProductEmbeddingExecutor for FakeExecutor {
         Ok(ProductEmbeddingBatchOutput {
             vectors: request.documents.iter().map(|_| vector.clone()).collect(),
             input_tokens: vec![self.tokens; request.documents.len()],
+            execution_profile: hyphae_native_product::ProductEmbeddingExecutionProfile {
+                embedding_profile: request.profile.header.id,
+                backend: hyphae_native_product::ProductEmbeddingBackend::Cpu,
+                device: "cpu:fake".to_owned(),
+                driver: "not-applicable".to_owned(),
+                runtime: "fake-executor-v1".to_owned(),
+                precision: hyphae_native_product::ProductEmbeddingPrecision::F32,
+                kernels: vec!["fake-embedding".to_owned()],
+                fallback: false,
+            },
         })
     }
 
@@ -329,6 +342,112 @@ fn path_free_operation_reports_commit_profile_and_exact_replay() -> Result<(), B
     assert_eq!(replay.execution_profile, committed.execution_profile);
     assert_eq!(executor.calls(), 1);
     drop(product);
+
+    let mut reopened = NativeProduct::open(&path)?;
+    assert!(!reopened.has_embedding_executor());
+    let mut reconnected = session(92)?;
+    let reopened_context = context(&reconnected, 3);
+    let reopened_replay =
+        wire_receipt(reopened.dispatch(&mut reconnected, &reopened_context, operation())?)?;
+    assert!(reopened_replay.idempotent_replay);
+    assert_eq!(reopened_replay.commit, committed.commit);
+    assert_eq!(
+        reopened_replay.execution_profile,
+        committed.execution_profile
+    );
+
+    let backup_path = path.with_extension("backup");
+    let restored_path = path.with_extension("restored");
+    let _ignored = fs::remove_dir_all(&backup_path);
+    let _ignored = fs::remove_dir_all(&restored_path);
+    reopened
+        .administration()
+        .backup(&BackupRequest::new(&backup_path)?, |_| {
+            ProgressControl::Continue
+        })?;
+    drop(reopened);
+    restore(&RestoreRequest::new(&backup_path, &restored_path)?, |_| {
+        ProgressControl::Continue
+    })?;
+    let mut restored = NativeProduct::open(&restored_path)?;
+    assert!(!restored.has_embedding_executor());
+    let mut restored_owner = session(93)?;
+    let restored_context = context(&restored_owner, 4);
+    let restored_replay =
+        wire_receipt(restored.dispatch(&mut restored_owner, &restored_context, operation())?)?;
+    assert!(restored_replay.idempotent_replay);
+    assert_eq!(restored_replay.commit, committed.commit);
+    assert_eq!(
+        restored_replay.execution_profile,
+        committed.execution_profile
+    );
+    drop(restored);
+    fs::remove_dir_all(path)?;
+    fs::remove_dir_all(backup_path)?;
+    fs::remove_dir_all(restored_path)?;
+    Ok(())
+}
+
+#[test]
+fn corrupt_completion_fails_closed_without_executor_or_new_publication()
+-> Result<(), Box<dyn Error>> {
+    let path = temporary("corrupt-completion");
+    let mut product = configured(&path)?;
+    let executor = Arc::new(FakeExecutor::new(0, 3));
+    product.set_embedding_executor(executor);
+    let operation = || ProductOperation::EmbedAndIngest {
+        collection: ObjectId::new(14).expect("nonzero collection"),
+        batch: ProductEmbedAndIngestBatch {
+            idempotency_id: 88,
+            documents: vec![ProductEmbedAndIngestDocument {
+                object_id: ObjectId::new(101).expect("nonzero object"),
+                text: "corruption check".to_owned(),
+                doc_values: BTreeMap::new(),
+            }],
+        },
+    };
+    let mut owner = session(94)?;
+    let first_context = context(&owner, 1);
+    let committed = wire_receipt(product.dispatch(&mut owner, &first_context, operation())?)?;
+    assert!(!committed.idempotent_replay);
+    drop(product);
+
+    let mut runtime = NativeDatabase::open(&path)?;
+    let mut key = b"\0hyphae.product.embedding.v1\0".to_vec();
+    key.extend_from_slice(&14_u128.to_be_bytes());
+    key.extend_from_slice(&88_u128.to_be_bytes());
+    let mut completion = runtime
+        .get_latest_structure(&key, 0)?
+        .ok_or("missing completion")?;
+    assert_eq!(&completion[..8], b"HYPEMB02");
+    completion[84] = 9; // Invalid backend tag in the durable execution profile.
+    let mut overwrite = runtime.begin(0, DurabilityClass::Strict)?;
+    overwrite.set(key, completion, None)?;
+    overwrite.commit()?;
+    drop(runtime);
+
+    let mut reopened = NativeProduct::open(&path)?;
+    assert!(!reopened.has_embedding_executor());
+    let before = reopened.snapshot_bounded(0)?.identity();
+    let mut reconnected = session(95)?;
+    let replay_context = context(&reconnected, 2);
+    let error = reopened
+        .dispatch(&mut reconnected, &replay_context, operation())
+        .expect_err("corrupt execution profile was accepted");
+    assert_eq!(error.code(), ProductErrorCode::Corruption);
+    assert_eq!(reopened.snapshot_bounded(0)?.identity(), before);
+    assert_eq!(
+        NativeProduct::search_documents_at_snapshot(
+            &reopened.snapshot_bounded(0)?,
+            ObjectId::new(14)?,
+            None,
+            8
+        )?
+        .documents
+        .len(),
+        1
+    );
+    drop(reopened);
     fs::remove_dir_all(path)?;
     Ok(())
 }
@@ -493,6 +612,18 @@ fn collection_authority_without_profile_scope_fails_before_execution() -> Result
         operation(batch("allowed")?)?,
     )?)?;
     assert_eq!(committed.profile, profile);
+    assert_eq!(executor.calls(), 1);
+
+    let allowed_authority = product.authenticate_api_key(&fs::read_to_string(&allowed_key)?, 0)?;
+    let owner = product.authenticate_api_key(&owner_secret, 0)?;
+    product.set_security_principal_enabled(&owner, allowed_authority.principal_id(), false, 15)?;
+    let mut revoked_input = batch("revoked")?;
+    revoked_input.idempotency_id = 78;
+    let revoked_context = context(&allowed, 12);
+    let revoked = product
+        .dispatch(&mut allowed, &revoked_context, operation(revoked_input)?)
+        .expect_err("revoked authority reached inference");
+    assert_eq!(revoked.code(), ProductErrorCode::AuthorizationDenied);
     assert_eq!(executor.calls(), 1);
 
     drop(product);

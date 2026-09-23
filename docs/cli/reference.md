@@ -28,6 +28,7 @@ binding or any malformed existing binding remains corruption.
 - `upgrade`
 - `capabilities`
 - `catalog`
+- `model`
 - `sql`
 - `structure`
 - `search`
@@ -93,6 +94,39 @@ uses the centrally authorized `maintain` operation whenever the directory can
 open; only a directory that cannot produce a product owner uses the bounded
 offline corruption/busy diagnostic. Native maintenance helpers that do not yet
 have a central product operation fail closed after bootstrap.
+
+## `model`
+
+```bash
+hyphae model register --manifest /models/qwen/manifest.json \
+  --model-dir /models/qwen/snapshot
+hyphae model profile-create --data-dir /data/hyphae --id 20 --parent 11 \
+  --name main.public.qwen --manifest /models/qwen/manifest.json
+hyphae model embed-ingest --data-dir /data/hyphae --collection 21 \
+  --idempotency-id 77 \
+  --documents-json '[{"id":101,"text":"offline passage","doc_values":{}}]' \
+  --manifest /models/qwen/manifest.json --model-dir /models/qwen/snapshot
+```
+
+`register` verifies a complete local snapshot and reports one process-local
+executor profile; it does not install a model in another process. Create a
+catalogued embedding profile under an existing schema, bind it to the sole
+named vector of a search collection, and provision that collection before
+`embed-ingest`. The default binary executes on CPU and requires no provider,
+network, or GPU. A build with `--features cuda` automatically selects a
+validated H100 and records its exact backend profile. Only the complete
+result from one CPU or CUDA execution is published.
+
+The embedded first execution supplies both model flags. A matching embedded
+replay can omit them and returns the original commit and execution profile from
+the durable completion record. New work without a registered model returns
+`unavailable`. UDS calls use `--endpoint <SOCKET>` and native HTTP calls use
+`--http-base-url <ORIGIN>` without model paths; start the service with
+`hyphae serve --embedding-manifest <MANIFEST> --embedding-model-dir <SNAPSHOT>`
+to register the executor there. Both routes use the same catalog, authorization,
+idempotency, and commit boundary. The collection must have exactly one bound
+named-vector target, and each batch is limited to 256 vector-free documents and
+16 MiB. See the [embedding profile contract](../native/embedding-profile-v1.md).
 
 ## `console`
 

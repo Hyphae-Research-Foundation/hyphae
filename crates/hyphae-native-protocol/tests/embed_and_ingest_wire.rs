@@ -41,6 +41,17 @@ fn embed_and_ingest_uses_minor_nine_request_tag_73_and_bounded_counts()
         decode_product_request_for_minor(&encoded, 8),
         Err(ProductCodecError::Unsupported)
     ));
+    let shared_frame = hyphae_native_protocol::encode_frame(
+        hyphae_native_protocol::FrameKind::Execute,
+        9,
+        44,
+        &encoded,
+        hyphae_native_protocol::DEFAULT_MAX_FRAME_PAYLOAD,
+    )?;
+    assert_eq!(
+        shared_frame.as_slice(),
+        include_bytes!("../../../compatibility/native-protocol-v1-embed-and-ingest.bin")
+    );
     let decoded = decode_product_request_for_minor(&encoded, 9)?;
     let ProductOperation::EmbedAndIngest { collection, batch } = decoded.operation else {
         return Err("embed-and-ingest operation expected".into());

@@ -385,7 +385,7 @@ class V2Tests(unittest.TestCase):
         encoded = encode_product_request(
             "embed_and_ingest", arguments, RequestOptions(), negotiated_minor=9
         )
-        self.assertEqual(struct.unpack_from("<H", encoded, 12)[0], 69)
+        self.assertEqual(struct.unpack_from("<H", encoded, 12)[0], 73)
         operation, decoded, _ = decode_product_request(encoded, negotiated_minor=9)
         self.assertEqual(operation, "embed_and_ingest")
         self.assertEqual(
@@ -478,6 +478,37 @@ class V2Tests(unittest.TestCase):
                     RequestOptions(),
                     negotiated_minor=9,
                 )
+
+    def test_embed_and_ingest_matches_shared_rust_fixture(self) -> None:
+        fixture = (
+            Path(__file__).parents[3]
+            / "compatibility"
+            / "native-protocol-v1-embed-and-ingest.bin"
+        ).read_bytes()
+        frame = decode_frame(fixture)
+        self.assertEqual((frame.kind, frame.stream_id, frame.request_id),
+                         (FRAME_KINDS["execute"], 9, 44))
+        operation, arguments, options = decode_product_request(
+            frame.payload, negotiated_minor=9
+        )
+        self.assertEqual(operation, "embed_and_ingest")
+        self.assertEqual(options.logical_time_micros, 1)
+        self.assertEqual(
+            encode_frame(frame.kind, frame.stream_id, frame.request_id,
+                         encode_product_request(operation, arguments, options,
+                                                negotiated_minor=9)),
+            fixture,
+        )
+        independent = encode_product_request(
+            "embed_and_ingest",
+            {"collection": 13, "batch": {"idempotency_id": 7, "documents": [
+                {"object_id": 201, "text": "rust", "doc_values": {
+                    "\U0001f600": "supplementary", "\ue000": "private-use"}}
+            ]}},
+            RequestOptions(logical_time_micros=1), negotiated_minor=9,
+        )
+        self.assertEqual(encode_frame(FRAME_KINDS["execute"], 9, 44, independent),
+                         fixture)
 
     def test_embed_and_ingest_response_reports_execution_profile_and_replay(self) -> None:
         import struct
@@ -1237,7 +1268,7 @@ class V2Tests(unittest.TestCase):
             "3,4,5,6,7,8,9",
         )
         self.assertEqual(
-            int.from_bytes(FakeHttpConnection.last_body[12:14], "little"), 69
+            int.from_bytes(FakeHttpConnection.last_body[12:14], "little"), 73
         )
 
     def test_concurrent_http_responses_decode_with_response_local_minor(self) -> None:

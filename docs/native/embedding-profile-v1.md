@@ -1,13 +1,15 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Native embedding profile metadata v1
 
-Status: unreleased next-major embedded product contract; optional CPU executor, no wire surface
+Status: 4.0.0 release-candidate contract; offline CPU execution and optional H100 CUDA
 
 This contract defines a catalogued embedding profile, an optional named-vector
-binding, and the embedded-only bounded `EmbedAndIngestBatch` product operation.
-The product crate supplies only the executor trait and atomic orchestration. No
-current build supplies a concrete model executor, loads model files, contacts a
-provider, selects a device, or exposes the operation on a wire protocol.
+binding, and atomic embedding ingestion through the embedded product and native
+minor-9 UDS/HTTP operation. The product crate owns the executor trait,
+authorization, and atomic publication. The CLI can load a verified local model
+for CPU execution; its default-off `cuda` feature can select a validated H100.
+No model, provider, network connection, or GPU is required for the default
+offline product.
 
 ## Object contract
 
@@ -103,7 +105,7 @@ while any such dependent is live, ready for a future public logical DROP
 operation. No public generic logical DROP operation is shipped by this
 contract.
 
-## Embedded operation
+## Product operation
 
 `ProductOperation::EmbedAndIngestBatch` selects one collection and one
 normalized named-vector target. Its `ProductSearchIngestBatch` must be nonempty,
@@ -120,11 +122,23 @@ output bytes. Product-side request and result walks accumulate checked bounds
 without constructing an unbounded aggregate. Cancellation and deadline
 checkpoints run before execution and incrementally while validating output.
 
-Authorization binds `CatalogRead + DataWrite` to the collection and separately
-binds `CatalogRead` to the embedding profile. Managed authority is reloaded and
-both exact object requirements are checked at admission, immediately before
-executor invocation, and again after native staging immediately before commit.
-Loss of either scope publishes no completion or search state.
+Authorization binds `CatalogRead + DataWrite` to the collection. The internal
+`EmbedAndIngestBatch` operation also requires `CatalogRead` on the embedding
+profile; public `EmbedAndIngest` requires `CatalogRead + SearchExecute` on that
+profile. Managed authority is reloaded and both exact object requirements are
+checked at admission, immediately before executor invocation, and after native
+staging immediately before commit. Loss of either scope publishes no completion
+or search state.
+
+Public `EmbedAndIngest` carries only the collection, a nonzero idempotency ID,
+and vector-free documents. It resolves exactly one bound named-vector target
+and its profile from one catalog snapshot; an absent or ambiguous binding fails
+closed. The embedded client, UDS daemon, and native HTTP edge submit to this
+same product dispatcher. The operation invokes the registered executor only
+after replay lookup and authorization, and returns the actual CPU/CUDA execution
+profile from the complete batch. The embedded CLI permits a model-free call so
+a matching durable replay can complete without installing an executor; a new
+request without a registered model returns `unavailable` without publication.
 
 The operation writes an internal completion marker in the same native
 transaction as the document, lexical, doc-value, generated vector, manifest,
@@ -138,8 +152,11 @@ evidence. A mismatched reuse fails with `idempotency_conflict`.
 
 `NativeProduct::set_embedding_executor` is process-local configuration. Reopen
 preserves completion records but requires the caller to reinstall any executor;
-a matching replay does not require one. The core product crate ships no
-concrete model executor by itself.
+a matching replay does not require one. The durable `HYPEMB02` completion
+record includes the original execution profile and transaction ID, so replay
+after reopen or backup/restore returns the original commit and profile without
+inference. Unknown tags, malformed lengths, and mismatched identities fail
+closed. The core product crate ships no concrete model executor by itself.
 
 The optional publishable `hyphae-native-embed-cpu` crate supplies the first
 concrete executor without making the model mandatory for the product or CLI.
@@ -158,6 +175,25 @@ manifest revision, Candle version, CPU/f32 selection, compilation target, and
 checkpoint chunk size. Absence of the optional crate or a loaded matching
 model remains `unavailable`; it never triggers acquisition or a fallback.
 
+The same optional crate has a default-off `cuda` feature. Its
+`Qwen3AcceleratorExecutor` enumerates visible devices and automatically selects
+the first device with the exact `NVIDIA H100 80GB HBM3` identity, compute
+capability 9.0, and at least 79 GiB of device memory. The reported execution
+profile binds the CUDA ordinal, exact name, `sm90`, driver UUID, PCI identity,
+Candle version, selected BF16 or FP16 model-compute dtype, FP32 output,
+whole-batch CPU/f32 fallback, target, model revision, manifest digest, and
+checkpoint chunk size.
+
+Accelerator selection is fixed before model loading. If no validated H100 can
+be selected, the whole registry uses the existing CPU/f32 path and reports its
+CPU profile. A selected CUDA registry preloads the same descriptor-verified
+model on CPU. An `unavailable` CUDA result discards all GPU output and reruns
+every input as one complete CPU/f32 batch. Cancellation, deadline, validation,
+and limit errors return immediately without fallback. Product publication
+begins only after one complete GPU or CPU batch returns and validates, so CUDA
+failure never publishes partial state or a CPU/GPU mixture. ADR-0034 defines
+the dependency and unsafe-FFI boundary.
+
 ## Canonical encoding and compatibility
 
 The profile body uses `HYCOBJ02` representation `2` under logical catalog codec
@@ -173,11 +209,13 @@ Collections with tuned BM25 but no profile remain byte-for-byte representation
 ID per named vector in vector order, then optional BM25 parameters. A
 representation-4 body with no binding is noncanonical.
 
-The product API version remains `1` and native protocol minor remains `8`. The
-Rust embedded operation and response have no protocol encoding; every request
-and response operation tag remains unchanged and request tag `69` remains
-absent. Kind-10 filters and profile or representation-4 catalog creation
-require minor 8.
+The product API version remains `1`. Native protocol minor 8 admits catalogued
+profiles without adding operation tags. Minor 9 adds public `EmbedAndIngest`
+request tag `73` and `EmbedAndIngested` response tag `47`. Request tag `69`
+remains unassigned; intentional unknown-tag-69 golden vectors stay invalid.
+Kind-10 filters and profile or representation-4 catalog creation require minor
+8; embedding ingestion requires minor 9. See
+[Native local protocol v1](local-protocol-v1.md) for the exact bounded encoding.
 Responses containing kind 10, dependency kind 7, a profile definition, or a
 representation-4 search definition are rejected before encoding to a
 minor-7-or-older peer. Rust, Python, and TypeScript share the kind/dependency

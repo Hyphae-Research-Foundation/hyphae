@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Optional, bounded, in-process Qwen3 CPU execution for Hyphae Native.
+//! Optional, bounded, in-process Qwen3 CPU and CUDA execution for Hyphae Native.
 //!
 //! This crate has no acquisition or listener surface. A caller opens a local
 //! manifest and snapshot into [`Qwen3ArtifactDescriptors`], then explicitly
@@ -19,14 +19,17 @@ use std::{
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::{Config as Qwen3Config, Model as Qwen3Model};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaContext, sys::CUdevice_attribute as CudaAttribute};
 use hyphae_native_catalog::{
     EmbeddingPipelineVersion, EmbeddingProfileDefinition, MAX_EMBEDDING_ARTIFACT_MANIFEST_BYTES,
     QWEN3_EMBEDDING_L2_EPSILON, QWEN3_EMBEDDING_NATIVE_DIMENSION,
     QWEN3_EMBEDDING_OUTPUT_DIMENSIONS, QWEN3_EMBEDDING_QUERY_INSTRUCTION,
 };
 use hyphae_native_product::{
-    NativeProduct, ProductEmbeddingBatchOutput, ProductEmbeddingExecutor,
-    ProductEmbeddingExecutorRequest, ProductError, ProductErrorCode,
+    NativeProduct, ProductEmbeddingBackend, ProductEmbeddingBatchOutput,
+    ProductEmbeddingExecutionProfile, ProductEmbeddingExecutor, ProductEmbeddingExecutorRequest,
+    ProductEmbeddingPrecision, ProductError, ProductErrorCode,
     ProductLocalEmbeddingExecutionProfile, ProductVector,
 };
 use serde::Deserialize;
@@ -54,6 +57,10 @@ const QWEN3_MAX_POSITIONS: usize = 32_768;
 const QWEN3_END_OF_TEXT_TOKEN_ID: u32 = 151_643;
 const QWEN3_PAD_TOKEN: &str = "<|endoftext|>";
 const CANDLE_VERSION: &str = "0.9.2";
+#[cfg(feature = "cuda")]
+const VALIDATED_H100_NAME: &str = "NVIDIA H100 80GB HBM3";
+#[cfg(feature = "cuda")]
+const VALIDATED_H100_MINIMUM_MEMORY_BYTES: usize = 79 * 1024 * 1024 * 1024;
 
 /// Fixed resource ceilings for model loading and CPU execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,6 +228,19 @@ impl Qwen3ArtifactDescriptors {
     /// Returns the number of opened snapshot file descriptors.
     pub fn snapshot_file_count(&self) -> usize {
         self.files.len()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn try_clone(&self) -> Result<Self, Qwen3CpuError> {
+        let files = self
+            .files
+            .iter()
+            .map(|(path, descriptor)| Ok((path.clone(), descriptor.try_clone()?)))
+            .collect::<Result<BTreeMap<_, _>, std::io::Error>>()?;
+        Ok(Self {
+            manifest: self.manifest.try_clone()?,
+            files,
+        })
     }
 }
 
@@ -462,6 +482,151 @@ struct ModelKey {
     manifest_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ExecutionBackend {
+    backend: &'static str,
+    device: Device,
+    device_profile: String,
+    compute_dtype: DType,
+    compute_dtype_profile: &'static str,
+    driver_profile: String,
+    runtime_profile: String,
+}
+
+impl ExecutionBackend {
+    fn cpu() -> Self {
+        Self {
+            backend: "candle-qwen3",
+            device: Device::Cpu,
+            device_profile: "cpu".to_owned(),
+            compute_dtype: DType::F32,
+            compute_dtype_profile: "float32",
+            driver_profile: "not-applicable".to_owned(),
+            runtime_profile: format!("candle/{CANDLE_VERSION}"),
+        }
+    }
+}
+
+/// CUDA model-compute dtype accepted by the validated H100 executor.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen3CudaComputeDType {
+    /// H100 bfloat16 model compute with canonical float32 output.
+    #[default]
+    BFloat16,
+    /// H100 IEEE float16 model compute with canonical float32 output.
+    Float16,
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen3CudaComputeDType {
+    const fn candle(self) -> DType {
+        match self {
+            Self::BFloat16 => DType::BF16,
+            Self::Float16 => DType::F16,
+        }
+    }
+
+    const fn profile(self) -> &'static str {
+        match self {
+            Self::BFloat16 => "bfloat16-f32-output+whole-batch-cpu-f32-fallback",
+            Self::Float16 => "float16-f32-output+whole-batch-cpu-f32-fallback",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn select_validated_h100(compute_dtype: Qwen3CudaComputeDType) -> Option<ExecutionBackend> {
+    let driver_api = cudarc::runtime::result::version::get_driver_version().ok()?;
+    let runtime_api = cudarc::runtime::result::version::get_runtime_version().ok()?;
+    let driver_profile = nvidia_driver_release().map_or_else(
+        || format!("cuda-driver-api-{driver_api}"),
+        |release| format!("nvidia-{release};cuda-driver-api-{driver_api}"),
+    );
+    let count = usize::try_from(CudaContext::device_count().ok()?).ok()?;
+    for ordinal in 0..count {
+        let Ok(context) = CudaContext::new(ordinal) else {
+            continue;
+        };
+        let (Ok(name), Ok(capability), Ok(memory)) = (
+            context.name(),
+            context.compute_capability(),
+            context.total_mem(),
+        ) else {
+            continue;
+        };
+        if name != VALIDATED_H100_NAME
+            || capability != (9, 0)
+            || memory < VALIDATED_H100_MINIMUM_MEMORY_BYTES
+        {
+            continue;
+        }
+        let (Ok(uuid), Ok(domain), Ok(bus), Ok(device_id), Ok(device)) = (
+            context.uuid(),
+            context.attribute(CudaAttribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID),
+            context.attribute(CudaAttribute::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID),
+            context.attribute(CudaAttribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID),
+            Device::new_cuda(ordinal),
+        ) else {
+            continue;
+        };
+        let uuid = format_cuda_uuid(uuid.bytes);
+        return Some(ExecutionBackend {
+            backend: "candle-qwen3-cuda",
+            device,
+            device_profile: format!(
+                "cuda:{ordinal};{name};sm90;{uuid};{domain:08x}:{bus:02x}:{device_id:02x}.0"
+            ),
+            compute_dtype: compute_dtype.candle(),
+            compute_dtype_profile: compute_dtype.profile(),
+            driver_profile,
+            runtime_profile: format!("cuda-runtime-api-{runtime_api};candle/{CANDLE_VERSION}"),
+        });
+    }
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn nvidia_driver_release() -> Option<String> {
+    let version = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+    version
+        .lines()
+        .next()?
+        .split_ascii_whitespace()
+        .find_map(|part| {
+            let components: Vec<_> = part.split('.').collect();
+            (components.len() == 3
+                && components
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
+            .then(|| part.to_owned())
+        })
+}
+
+#[cfg(feature = "cuda")]
+fn format_cuda_uuid(bytes: [std::ffi::c_char; 16]) -> String {
+    let bytes = bytes.map(i8::cast_unsigned);
+    format!(
+        "GPU-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 #[derive(Debug)]
 struct LoadedModel {
     key: ModelKey,
@@ -469,6 +634,14 @@ struct LoadedModel {
     tokenizer: Tokenizer,
     pad_token: u32,
     model: Qwen3Model,
+    backend: ExecutionBackend,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+struct AcceleratorModel {
+    primary: Arc<LoadedModel>,
+    cpu_fallback: Option<Arc<LoadedModel>>,
 }
 
 impl LoadedModel {
@@ -477,16 +650,64 @@ impl LoadedModel {
         checkpoint_chunk_tokens: usize,
     ) -> Result<ProductLocalEmbeddingExecutionProfile, ProductError> {
         ProductLocalEmbeddingExecutionProfile::new(
-            "candle-qwen3",
+            self.backend.backend,
             CANDLE_VERSION,
-            "cpu",
-            "float32",
+            &self.backend.device_profile,
+            self.backend.compute_dtype_profile,
             env!("HYPHAE_BUILD_TARGET"),
             &self.revision,
             self.key.digest,
             u32::try_from(checkpoint_chunk_tokens)
                 .map_err(|_| product_error(ProductErrorCode::LimitExceeded))?,
         )
+    }
+}
+
+impl LoadedModel {
+    fn product_execution_profile(
+        &self,
+        embedding_profile: hyphae_native_product::ObjectId,
+        checkpoint_chunk_tokens: usize,
+    ) -> Result<ProductEmbeddingExecutionProfile, ProductError> {
+        let local = self.execution_profile(checkpoint_chunk_tokens)?;
+        let mut digest = String::with_capacity(64);
+        for byte in local.artifact_manifest_digest() {
+            use std::fmt::Write as _;
+            write!(digest, "{byte:02x}")
+                .map_err(|_| product_error(ProductErrorCode::Unavailable))?;
+        }
+        let cuda = self.backend.device.is_cuda();
+        let backend = if cuda {
+            ProductEmbeddingBackend::Cuda
+        } else {
+            ProductEmbeddingBackend::Cpu
+        };
+        let device = if cuda {
+            local.device().to_owned()
+        } else {
+            format!("cpu:{}", local.target())
+        };
+        Ok(ProductEmbeddingExecutionProfile {
+            embedding_profile,
+            backend,
+            device,
+            driver: self.backend.driver_profile.clone(),
+            runtime: format!(
+                "{};model={};manifest={digest};compute={};output=f32;checkpoint_tokens={}",
+                self.backend.runtime_profile,
+                local.model_revision(),
+                local.compute_dtype(),
+                local.checkpoint_chunk_tokens(),
+            ),
+            precision: ProductEmbeddingPrecision::F32,
+            kernels: vec![
+                format!("qwen3-forward-{}", local.compute_dtype()),
+                "last-token-pooling-f32".to_owned(),
+                "leading-dimension-projection-f32".to_owned(),
+                "l2-normalization-f32".to_owned(),
+            ],
+            fallback: false,
+        })
     }
 }
 
@@ -524,7 +745,11 @@ impl Qwen3CpuExecutor {
         &self,
         descriptors: Qwen3ArtifactDescriptors,
     ) -> Result<ProductLocalEmbeddingExecutionProfile, Qwen3CpuError> {
-        let loaded = Arc::new(load_model(descriptors, self.limits)?);
+        let loaded = Arc::new(load_model(
+            descriptors,
+            self.limits,
+            ExecutionBackend::cpu(),
+        )?);
         let profile = loaded
             .execution_profile(self.limits.checkpoint_chunk_tokens)
             .map_err(|_| Qwen3CpuError::Model("execution profile is invalid".to_owned()))?;
@@ -577,7 +802,173 @@ impl Qwen3CpuExecutor {
     }
 }
 
+/// Digest-keyed executor that selects a validated H100 or a complete CPU path.
+///
+/// Backend selection is fixed when the registry is created. A registry that
+/// selects CUDA preloads a CPU model and retries an unavailable CUDA result as
+/// one complete CPU batch. Cancellation, deadlines, and limit failures never
+/// trigger fallback. If no validated H100 is available, the whole registry
+/// uses the CPU execution profile instead.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct Qwen3AcceleratorExecutor {
+    limits: Qwen3CpuLimits,
+    backend: ExecutionBackend,
+    models: RwLock<BTreeMap<ModelKey, AcceleratorModel>>,
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen3AcceleratorExecutor {
+    /// Creates a registry that prefers validated H100 bfloat16 execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a resource ceiling is invalid. Missing,
+    /// incompatible, or unusable CUDA devices select the complete CPU path.
+    pub fn new(limits: Qwen3CpuLimits) -> Result<Self, Qwen3CpuError> {
+        Self::new_with_compute_dtype(limits, Qwen3CudaComputeDType::BFloat16)
+    }
+
+    /// Creates a registry with an explicit H100 model-compute dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a resource ceiling is invalid. Missing,
+    /// incompatible, or unusable CUDA devices select the complete CPU path.
+    pub fn new_with_compute_dtype(
+        limits: Qwen3CpuLimits,
+        compute_dtype: Qwen3CudaComputeDType,
+    ) -> Result<Self, Qwen3CpuError> {
+        limits.validate()?;
+        Ok(Self {
+            limits,
+            backend: select_validated_h100(compute_dtype).unwrap_or_else(ExecutionBackend::cpu),
+            models: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    /// Returns whether this fixed registry selected validated H100 execution.
+    pub fn uses_cuda(&self) -> bool {
+        self.backend.device.is_cuda()
+    }
+
+    /// Returns the exact fixed device identity used by this registry.
+    pub fn device_profile(&self) -> &str {
+        &self.backend.device_profile
+    }
+
+    /// Verifies, loads, and atomically registers one descriptor-bound model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for manifest, artifact, tokenizer, model, memory, or
+    /// registry-limit failure. A failed load leaves the registry unchanged.
+    pub fn load_and_register(
+        &self,
+        descriptors: Qwen3ArtifactDescriptors,
+    ) -> Result<ProductLocalEmbeddingExecutionProfile, Qwen3CpuError> {
+        let cpu_descriptors = if self.backend.device.is_cuda() {
+            Some(descriptors.try_clone()?)
+        } else {
+            None
+        };
+        let loaded = Arc::new(load_model(descriptors, self.limits, self.backend.clone())?);
+        let cpu_fallback = cpu_descriptors
+            .map(|descriptors| load_model(descriptors, self.limits, ExecutionBackend::cpu()))
+            .transpose()?
+            .map(Arc::new);
+        if cpu_fallback
+            .as_ref()
+            .is_some_and(|fallback| fallback.key != loaded.key)
+        {
+            return Err(Qwen3CpuError::Model(
+                "CPU fallback model identity differs".to_owned(),
+            ));
+        }
+        let profile = loaded
+            .execution_profile(self.limits.checkpoint_chunk_tokens)
+            .map_err(|_| Qwen3CpuError::Model("execution profile is invalid".to_owned()))?;
+        let mut models = self
+            .models
+            .write()
+            .map_err(|_| Qwen3CpuError::Registry("registry lock is poisoned"))?;
+        if models.contains_key(&loaded.key) {
+            return Err(Qwen3CpuError::Registry("profile is already loaded"));
+        }
+        if models.len() >= self.limits.max_models {
+            return Err(Qwen3CpuError::Registry("model count exceeds its limit"));
+        }
+        models.insert(
+            loaded.key,
+            AcceleratorModel {
+                primary: loaded,
+                cpu_fallback,
+            },
+        );
+        Ok(profile)
+    }
+
+    /// Installs this registry as a product handle's process-local executor.
+    pub fn install(self: &Arc<Self>, product: &mut NativeProduct) {
+        product.set_embedding_executor(self.clone());
+    }
+
+    /// Returns the number of currently loaded immutable models.
+    pub fn loaded_models(&self) -> usize {
+        self.models.read().map_or(0, |models| models.len())
+    }
+
+    /// Reports the exact fixed profile for a loaded manifest identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a process-local lock is poisoned or the
+    /// profile fields cannot satisfy product bounds.
+    pub fn execution_profile_for(
+        &self,
+        manifest_digest: [u8; 32],
+        manifest_bytes: u64,
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
+        let models = self
+            .models
+            .read()
+            .map_err(|_| product_error(ProductErrorCode::Unavailable))?;
+        models
+            .get(&ModelKey {
+                digest: manifest_digest,
+                manifest_bytes,
+            })
+            .map(|model| {
+                model
+                    .primary
+                    .execution_profile(self.limits.checkpoint_chunk_tokens)
+            })
+            .transpose()
+    }
+}
+
 impl ProductEmbeddingExecutor for Qwen3CpuExecutor {
+    fn embed_passages(
+        &self,
+        request: ProductEmbeddingExecutorRequest<'_>,
+        checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
+    ) -> Result<ProductEmbeddingBatchOutput, ProductError> {
+        embed_with_registry(&self.models, self.limits, request, checkpoint)
+    }
+
+    fn execution_profile(
+        &self,
+        profile: &EmbeddingProfileDefinition,
+    ) -> Result<Option<ProductLocalEmbeddingExecutionProfile>, ProductError> {
+        self.execution_profile_for(
+            *profile.artifact_manifest_digest.as_bytes(),
+            profile.artifact_manifest_byte_length,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ProductEmbeddingExecutor for Qwen3AcceleratorExecutor {
     fn embed_passages(
         &self,
         request: ProductEmbeddingExecutorRequest<'_>,
@@ -595,42 +986,16 @@ impl ProductEmbeddingExecutor for Qwen3CpuExecutor {
             .get(&key)
             .cloned()
             .ok_or_else(|| product_error(ProductErrorCode::Unavailable))?;
-        checkpoint()?;
-        let inputs: Vec<&str> = request
-            .documents
-            .iter()
-            .map(|document| document.text.as_str())
-            .collect();
-        let tokenized = tokenize_inputs(
-            &model.tokenizer,
-            model.pad_token,
-            &inputs,
-            request.profile.max_input_tokens,
-            request.limits.max_input_bytes,
-            request.limits.max_total_input_tokens,
-            self.limits,
-            checkpoint,
-        )?;
-        let vectors = evaluate_batch(
-            &model,
-            &tokenized.padded_ids,
-            &tokenized.attention_masks,
-            usize::from(request.limits.output_dimension),
-            self.limits,
-            checkpoint,
-        )?;
-        let output_bytes = vectors
-            .len()
-            .checked_mul(usize::from(request.limits.output_dimension))
-            .and_then(|value| value.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| product_error(ProductErrorCode::LimitExceeded))?;
-        if output_bytes > request.limits.max_output_bytes {
-            return Err(product_error(ProductErrorCode::LimitExceeded));
+        let primary = embed_with_model(&model.primary, self.limits, request, checkpoint);
+        if let Some(cpu_fallback) = model.cpu_fallback.as_ref() {
+            whole_batch_cpu_fallback(primary, checkpoint, |checkpoint| {
+                let mut output = embed_with_model(cpu_fallback, self.limits, request, checkpoint)?;
+                output.execution_profile.fallback = true;
+                Ok(output)
+            })
+        } else {
+            primary
         }
-        Ok(ProductEmbeddingBatchOutput {
-            vectors,
-            input_tokens: tokenized.input_tokens,
-        })
     }
 
     fn execution_profile(
@@ -642,6 +1007,87 @@ impl ProductEmbeddingExecutor for Qwen3CpuExecutor {
             profile.artifact_manifest_byte_length,
         )
     }
+}
+
+#[cfg(feature = "cuda")]
+fn whole_batch_cpu_fallback<T>(
+    primary: Result<T, ProductError>,
+    checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
+    fallback: impl FnOnce(&mut dyn FnMut() -> Result<(), ProductError>) -> Result<T, ProductError>,
+) -> Result<T, ProductError> {
+    match primary {
+        Err(error) if error.code() == ProductErrorCode::Unavailable => {
+            checkpoint()?;
+            fallback(checkpoint)
+        }
+        result => result,
+    }
+}
+
+fn embed_with_registry(
+    models: &RwLock<BTreeMap<ModelKey, Arc<LoadedModel>>>,
+    limits: Qwen3CpuLimits,
+    request: ProductEmbeddingExecutorRequest<'_>,
+    checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
+) -> Result<ProductEmbeddingBatchOutput, ProductError> {
+    validate_product_request(request)?;
+    let key = ModelKey {
+        digest: *request.profile.artifact_manifest_digest.as_bytes(),
+        manifest_bytes: request.profile.artifact_manifest_byte_length,
+    };
+    let model = models
+        .read()
+        .map_err(|_| product_error(ProductErrorCode::Unavailable))?
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| product_error(ProductErrorCode::Unavailable))?;
+    embed_with_model(&model, limits, request, checkpoint)
+}
+
+fn embed_with_model(
+    model: &LoadedModel,
+    limits: Qwen3CpuLimits,
+    request: ProductEmbeddingExecutorRequest<'_>,
+    checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
+) -> Result<ProductEmbeddingBatchOutput, ProductError> {
+    checkpoint()?;
+    let inputs: Vec<&str> = request
+        .documents
+        .iter()
+        .map(|document| document.text.as_str())
+        .collect();
+    let tokenized = tokenize_inputs(
+        &model.tokenizer,
+        model.pad_token,
+        &inputs,
+        request.profile.max_input_tokens,
+        request.limits.max_input_bytes,
+        request.limits.max_total_input_tokens,
+        limits,
+        checkpoint,
+    )?;
+    let vectors = evaluate_batch(
+        model,
+        &tokenized.padded_ids,
+        &tokenized.attention_masks,
+        usize::from(request.limits.output_dimension),
+        limits,
+        checkpoint,
+    )?;
+    let output_bytes = vectors
+        .len()
+        .checked_mul(usize::from(request.limits.output_dimension))
+        .and_then(|value| value.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| product_error(ProductErrorCode::LimitExceeded))?;
+    if output_bytes > request.limits.max_output_bytes {
+        return Err(product_error(ProductErrorCode::LimitExceeded));
+    }
+    Ok(ProductEmbeddingBatchOutput {
+        vectors,
+        input_tokens: tokenized.input_tokens,
+        execution_profile: model
+            .product_execution_profile(request.profile.header.id, limits.checkpoint_chunk_tokens)?,
+    })
 }
 
 fn validate_product_request(
@@ -841,6 +1287,7 @@ fn evaluate_batch(
         let mut model = loaded.model.clone();
         vectors.push(evaluate_one(
             &mut model,
+            &loaded.backend.device,
             &admitted,
             output_dimension,
             limits.checkpoint_chunk_tokens,
@@ -852,17 +1299,17 @@ fn evaluate_batch(
 
 fn evaluate_one(
     model: &mut Qwen3Model,
+    device: &Device,
     ids: &[u32],
     output_dimension: usize,
     chunk_tokens: usize,
     checkpoint: &mut dyn FnMut() -> Result<(), ProductError>,
 ) -> Result<ProductVector, ProductError> {
-    let device = Device::Cpu;
     let mut offset = 0_usize;
     let mut final_hidden = None;
     for chunk in ids.chunks(chunk_tokens) {
         checkpoint()?;
-        let input = Tensor::from_slice(chunk, (1, chunk.len()), &device)
+        let input = Tensor::from_slice(chunk, (1, chunk.len()), device)
             .map_err(|_| product_error(ProductErrorCode::Unavailable))?;
         let hidden = model
             .forward(&input, offset)
@@ -903,6 +1350,7 @@ fn evaluate_one(
 fn load_model(
     mut descriptors: Qwen3ArtifactDescriptors,
     limits: Qwen3CpuLimits,
+    backend: ExecutionBackend,
 ) -> Result<LoadedModel, Qwen3CpuError> {
     let manifest_bytes = read_bounded(
         &mut descriptors.manifest,
@@ -982,10 +1430,13 @@ fn load_model(
             "padding token is outside the vocabulary".to_owned(),
         ));
     }
-    let device = Device::Cpu;
-    let builder = VarBuilder::from_buffered_safetensors(weights_bytes, DType::F32, &device)
-        .map_err(|error| Qwen3CpuError::Model(error.to_string()))?
-        .rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_owned());
+    let builder = VarBuilder::from_buffered_safetensors(
+        weights_bytes,
+        backend.compute_dtype,
+        &backend.device,
+    )
+    .map_err(|error| Qwen3CpuError::Model(error.to_string()))?
+    .rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_owned());
     let model = Qwen3Model::new(&config, builder)
         .map_err(|error| Qwen3CpuError::Model(error.to_string()))?;
     Ok(LoadedModel {
@@ -997,6 +1448,7 @@ fn load_model(
         tokenizer,
         pad_token,
         model,
+        backend,
     })
 }
 
@@ -1148,6 +1600,42 @@ mod tests {
         assert!(admit_execution_costs(&[vec![1, 2]], 2, limits).is_err());
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fallback_retries_only_the_complete_unavailable_batch() -> Result<(), ProductError> {
+        let mut checkpoints = 0_usize;
+        let mut fallback_calls = 0_usize;
+        let inputs = [1_u32, 2, 3];
+        let output = whole_batch_cpu_fallback(
+            Err(product_error(ProductErrorCode::Unavailable)),
+            &mut || {
+                checkpoints += 1;
+                Ok(())
+            },
+            |_| {
+                fallback_calls += 1;
+                Ok(inputs.to_vec())
+            },
+        )?;
+        assert_eq!(output, inputs);
+        assert_eq!(checkpoints, 1);
+        assert_eq!(fallback_calls, 1);
+
+        let Err(cancelled) = whole_batch_cpu_fallback(
+            Err::<Vec<u32>, _>(product_error(ProductErrorCode::Cancelled)),
+            &mut || Ok(()),
+            |_| {
+                fallback_calls += 1;
+                Ok(inputs.to_vec())
+            },
+        ) else {
+            return Err(product_error(ProductErrorCode::InvalidRequest));
+        };
+        assert_eq!(cancelled.code(), ProductErrorCode::Cancelled);
+        assert_eq!(fallback_calls, 1);
+        Ok(())
+    }
+
     #[test]
     fn real_descriptor_load_runs_only_when_explicitly_configured() -> Result<(), Qwen3CpuError> {
         let Some(snapshot) = std::env::var_os("HYPHAE_QWEN3_TEST_MODEL_DIR") else {
@@ -1157,7 +1645,7 @@ mod tests {
             .ok_or(Qwen3CpuError::Artifact("test manifest is not configured"))?;
         let limits = Qwen3CpuLimits::default();
         let descriptors = Qwen3ArtifactDescriptors::open(manifest, snapshot, limits)?;
-        let loaded = load_model(descriptors, limits)?;
+        let loaded = load_model(descriptors, limits, ExecutionBackend::cpu())?;
         assert_eq!(loaded.key.manifest_bytes, 8_323);
         assert_eq!(loaded.revision.len(), 40);
         let mut checkpoints = 0_usize;
@@ -1190,6 +1678,109 @@ mod tests {
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].dimension(), 384);
         assert!(checkpoints >= 4);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn real_h100_bfloat16_and_float16_run_under_lock() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("HYPHAE_QWEN3_CUDA_TEST").is_none() {
+            return Ok(());
+        }
+        let snapshot = std::env::var_os("HYPHAE_QWEN3_TEST_MODEL_DIR").ok_or(
+            Qwen3CpuError::Artifact("test model directory is not configured"),
+        )?;
+        let manifest = std::env::var_os("HYPHAE_QWEN3_TEST_MANIFEST")
+            .ok_or(Qwen3CpuError::Artifact("test manifest is not configured"))?;
+        let lock_path = std::env::var_os("HYPHAE_QWEN3_CUDA_TEST_LOCK")
+            .ok_or(Qwen3CpuError::Artifact("CUDA test lock is not configured"))?;
+        let expected_uuid = std::env::var("HYPHAE_QWEN3_CUDA_TEST_UUID")?;
+        let expected_pci = std::env::var("HYPHAE_QWEN3_CUDA_TEST_PCI_BUS_ID")?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        fs4::FileExt::lock(&lock)?;
+
+        for (compute_dtype, expected_dtype) in [
+            (
+                Qwen3CudaComputeDType::BFloat16,
+                "bfloat16-f32-output+whole-batch-cpu-f32-fallback",
+            ),
+            (
+                Qwen3CudaComputeDType::Float16,
+                "float16-f32-output+whole-batch-cpu-f32-fallback",
+            ),
+        ] {
+            let limits = Qwen3CpuLimits::default();
+            let executor = Qwen3AcceleratorExecutor::new_with_compute_dtype(limits, compute_dtype)?;
+            if !executor.uses_cuda() {
+                return Err(
+                    Qwen3CpuError::Model("validated H100 was not selected".to_owned()).into(),
+                );
+            }
+            assert!(executor.device_profile().contains(VALIDATED_H100_NAME));
+            assert!(executor.device_profile().contains(&expected_uuid));
+            assert!(executor.device_profile().ends_with(&expected_pci));
+
+            let descriptors = Qwen3ArtifactDescriptors::open(&manifest, &snapshot, limits)?;
+            let profile = executor.load_and_register(descriptors)?;
+            assert_eq!(profile.backend(), "candle-qwen3-cuda");
+            assert_eq!(profile.compute_dtype(), expected_dtype);
+            assert_eq!(profile.device(), executor.device_profile());
+            let loaded = executor
+                .models
+                .read()
+                .map_err(|_| Qwen3CpuError::Registry("registry lock is poisoned"))?
+                .values()
+                .next()
+                .cloned()
+                .ok_or(Qwen3CpuError::Registry("test model is absent"))?;
+            assert!(loaded.cpu_fallback.is_some());
+            let mut checkpoints = 0_usize;
+            let tokenized = tokenize_inputs(
+                &loaded.primary.tokenizer,
+                loaded.primary.pad_token,
+                &["descriptor-stable local H100 embedding"],
+                64,
+                64,
+                64,
+                limits,
+                &mut || {
+                    checkpoints += 1;
+                    Ok(())
+                },
+            )?;
+            let vectors = evaluate_batch(
+                &loaded.primary,
+                &tokenized.padded_ids,
+                &tokenized.attention_masks,
+                384,
+                limits,
+                &mut || {
+                    checkpoints += 1;
+                    Ok(())
+                },
+            )?;
+            assert_eq!(vectors.len(), 1);
+            assert_eq!(vectors[0].dimension(), 384);
+            assert_eq!(
+                std::mem::size_of_val(vectors[0].values()),
+                384 * size_of::<f32>()
+            );
+            assert!(vectors[0].values().iter().all(|value| value.is_finite()));
+            assert!(checkpoints >= 4);
+            eprintln!(
+                "backend={} version={} device={} dtype={} output=f32 dimension={}",
+                profile.backend(),
+                profile.backend_version(),
+                profile.device(),
+                profile.compute_dtype(),
+                vectors[0].dimension()
+            );
+        }
         Ok(())
     }
 

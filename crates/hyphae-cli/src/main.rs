@@ -17,6 +17,11 @@ mod migrate_valkey;
 mod native;
 mod native_client;
 mod native_service;
+
+#[cfg(feature = "cuda")]
+type NodeEmbeddingExecutor = hyphae_native_embed_cpu::Qwen3AcceleratorExecutor;
+#[cfg(not(feature = "cuda"))]
+type NodeEmbeddingExecutor = hyphae_native_embed_cpu::Qwen3CpuExecutor;
 mod tui;
 
 use std::{
@@ -3493,10 +3498,8 @@ async fn model(command: ModelCommand) -> Result<(), CliFailure> {
                 (Some(_), Some(manifest), Some(model_dir)) => {
                     Some(load_embedding_executor(manifest, model_dir)?)
                 }
-                (Some(_), _, _) | (None, Some(_), _) | (None, _, Some(_)) => {
-                    return Err(CliFailure::invalid());
-                }
-                (None, None, None) => None,
+                (_, None, None) => None,
+                _ => return Err(CliFailure::invalid()),
             };
             let response = dispatch_model_target(
                 &target,
@@ -3520,7 +3523,7 @@ async fn dispatch_model_target(
     target: &ModelTarget,
     operation: ProductOperation,
     durability: ProductDurability,
-    executor: Option<std::sync::Arc<hyphae_native_embed_cpu::Qwen3CpuExecutor>>,
+    executor: Option<std::sync::Arc<NodeEmbeddingExecutor>>,
 ) -> Result<ProductResponse, CliFailure> {
     if let Some(data_dir) = &target.data_dir {
         let mut product = NativeProduct::open(data_dir)?;
@@ -3576,7 +3579,7 @@ async fn dispatch_model_target(
 fn load_embedding_executor_optional(
     manifest: Option<&Path>,
     model_dir: Option<&Path>,
-) -> Result<Option<std::sync::Arc<hyphae_native_embed_cpu::Qwen3CpuExecutor>>, CliFailure> {
+) -> Result<Option<std::sync::Arc<NodeEmbeddingExecutor>>, CliFailure> {
     match (manifest, model_dir) {
         (None, None) => Ok(None),
         (Some(manifest), Some(model_dir)) => load_embedding_executor(manifest, model_dir).map(Some),
@@ -3587,15 +3590,13 @@ fn load_embedding_executor_optional(
 fn load_embedding_executor(
     manifest: &Path,
     model_dir: &Path,
-) -> Result<std::sync::Arc<hyphae_native_embed_cpu::Qwen3CpuExecutor>, CliFailure> {
+) -> Result<std::sync::Arc<NodeEmbeddingExecutor>, CliFailure> {
     let limits = hyphae_native_embed_cpu::Qwen3CpuLimits::default();
     let descriptors =
         hyphae_native_embed_cpu::Qwen3ArtifactDescriptors::open(manifest, model_dir, limits)
             .map_err(|_| CliFailure::invalid())?;
-    let executor = std::sync::Arc::new(
-        hyphae_native_embed_cpu::Qwen3CpuExecutor::new(limits)
-            .map_err(|_| CliFailure::invalid())?,
-    );
+    let executor =
+        std::sync::Arc::new(NodeEmbeddingExecutor::new(limits).map_err(|_| CliFailure::invalid())?);
     executor
         .load_and_register(descriptors)
         .map_err(|_| CliFailure::invalid())?;

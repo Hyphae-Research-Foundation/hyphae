@@ -213,7 +213,7 @@ pub struct ProductEmbeddingExecutionProfile {
     pub driver: String,
     /// Stable runtime description.
     pub runtime: String,
-    /// Arithmetic precision used by every reported kernel.
+    /// Canonical vector precision delivered for atomic publication.
     pub precision: ProductEmbeddingPrecision,
     /// Ordered kernel identities for the executed pipeline.
     pub kernels: Vec<String>,
