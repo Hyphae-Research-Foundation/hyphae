@@ -17,126 +17,126 @@
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Test (Linux stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Test (Linux MSRV)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Test (macOS stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Test (Windows stable)",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Public client conformance",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Optional framework integrations",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Release readiness",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Security hard-kill aggregate",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "MCP real hosts",
       "workflow": ".github/workflows/ci.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Dependency and license policy",
       "workflow": ".github/workflows/security.yml",
       "event": "push",
       "head_branch": "main",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Package x86_64-unknown-linux-gnu",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Package x86_64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Package aarch64-apple-darwin",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Package x86_64-pc-windows-msvc",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Assemble and verify release candidate",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Publish GitHub release",
       "workflow": ".github/workflows/release.yml",
-      "event": "workflow_dispatch",
-      "head_branch": "main",
-      "head_sha": "8a58749d892a52e38c651669ade03df5a6ee54af"
+      "event": "push",
+      "head_branch": "release-v4.0.0-crates",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "name": "Validate all exact-SHA G8 receipts",
       "workflow": ".github/workflows/native-g8-closure.yml",
       "event": "workflow_dispatch",
-      "head_branch": "release/fix/release-readiness-semver-offline-merge-evidence",
-      "head_sha": "24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "head_branch": "release/chore/v4-release-candidate-merge-evidence",
+      "head_sha": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
     }
   ],
   "required_artifacts": [
@@ -148,7 +148,7 @@
     {
       "id": "signed-release-receipt",
       "workflow": ".github/workflows/release.yml",
-      "name": "native-g8-signed-release-24bce1accdff8d14127797afe6f237a57c1cd4f3"
+      "name": "native-g8-signed-release-7cbcf97d165beeb08aba27ff21203fa468f45bec"
     },
     {
       "id": "g8-aggregate",
@@ -191,8 +191,8 @@
     "tools/produce_native_g8_receipt.py",
     "tools/verify_crate_packages.py"
   ],
-  "source_commit": "24bce1accdff8d14127797afe6f237a57c1cd4f3",
-  "source_tree": "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff",
-  "tag_object": "0bc6fe56498472804c3cc376b5b28d7652955701",
-  "release_run_commit": "8a58749d892a52e38c651669ade03df5a6ee54af"
+  "source_commit": "7cbcf97d165beeb08aba27ff21203fa468f45bec",
+  "source_tree": "7f167c978c7ceb32b7c9b0cde3c3e6eaf2b0ce23",
+  "tag_object": "17ce17ee34ba8c7220f4d440ad1d5edae367db1a",
+  "release_run_commit": "7cbcf97d165beeb08aba27ff21203fa468f45bec"
 }

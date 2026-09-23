@@ -59,10 +59,10 @@ EXPECTED_POLICY_KEYS = {
     "tag_object",
     "release_run_commit",
 }
-SOURCE_COMMIT = "24bce1accdff8d14127797afe6f237a57c1cd4f3"
-SOURCE_TREE = "52bdbb3ea7cd8d12e2cbd6cbe5f53cbcaa80d0ff"
-TAG_OBJECT = "0bc6fe56498472804c3cc376b5b28d7652955701"
-RELEASE_RUN_COMMIT = "8a58749d892a52e38c651669ade03df5a6ee54af"
+SOURCE_COMMIT = "7cbcf97d165beeb08aba27ff21203fa468f45bec"
+SOURCE_TREE = "7f167c978c7ceb32b7c9b0cde3c3e6eaf2b0ce23"
+TAG_OBJECT = "17ce17ee34ba8c7220f4d440ad1d5edae367db1a"
+RELEASE_RUN_COMMIT = "7cbcf97d165beeb08aba27ff21203fa468f45bec"
 EXPECTED_CHECKS = (
     ("Quality", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
     ("Test (Linux stable)", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
@@ -75,20 +75,20 @@ EXPECTED_CHECKS = (
     ("Security hard-kill aggregate", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
     ("MCP real hosts", ".github/workflows/ci.yml", "push", "main", SOURCE_COMMIT),
     ("Dependency and license policy", ".github/workflows/security.yml", "push", "main", SOURCE_COMMIT),
-    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Assemble and verify release candidate", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Publish GitHub release", ".github/workflows/release.yml", "workflow_dispatch", "main", RELEASE_RUN_COMMIT),
-    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/fix/release-readiness-semver-offline-merge-evidence", SOURCE_COMMIT),
+    ("Package x86_64-unknown-linux-gnu", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Package x86_64-apple-darwin", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Package aarch64-apple-darwin", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Package x86_64-pc-windows-msvc", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Assemble and verify release candidate", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Publish GitHub release", ".github/workflows/release.yml", "push", "release-v4.0.0-crates", RELEASE_RUN_COMMIT),
+    ("Validate all exact-SHA G8 receipts", ".github/workflows/native-g8-closure.yml", "workflow_dispatch", "release/chore/v4-release-candidate-merge-evidence", SOURCE_COMMIT),
 )
 EXPECTED_ARTIFACTS = (
     ("release-candidate", ".github/workflows/release.yml", "hyphae-release-candidate"),
     (
         "signed-release-receipt",
         ".github/workflows/release.yml",
-        "native-g8-signed-release-24bce1accdff8d14127797afe6f237a57c1cd4f3",
+        "native-g8-signed-release-7cbcf97d165beeb08aba27ff21203fa468f45bec",
     ),
     ("g8-aggregate", ".github/workflows/native-g8-closure.yml", "native-g8-aggregate-{commit}"),
     ("mcp-real-hosts", ".github/workflows/ci.yml", "mcp-real-hosts-{commit}"),
@@ -1626,7 +1626,7 @@ def _verify_release_and_g8(
     )
     certificate_identity = (
         f"https://github.com/{authority['repository']}/.github/workflows/release.yml@"
-        "refs/heads/main"
+        f"refs/tags/{tag}"
     )
     subprocess.run(
         [
@@ -1678,8 +1678,8 @@ def _verify_release_and_g8(
         != str(release_check["workflow_run_id"])
         or release_document.get("workflow", {}).get("run_attempt")
         != release_check["workflow_run_attempt"]
-        or release_document.get("workflow", {}).get("event") != "workflow_dispatch"
-        or release_document.get("workflow", {}).get("ref") != "refs/heads/main"
+        or release_document.get("workflow", {}).get("event") != "push"
+        or release_document.get("workflow", {}).get("ref") != f"refs/tags/{tag}"
     ):
         raise GateFailure("release evidence differs from the selected Release authority")
     return {
