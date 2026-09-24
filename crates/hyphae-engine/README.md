@@ -10,7 +10,7 @@ autonomous, durable, and verifiable Rust data engine. New applications should
 embed the Native product facade in `hyphae-native-product`; this crate serves
 existing format-2 data directories and the published `/v1` surface.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

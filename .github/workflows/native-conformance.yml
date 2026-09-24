@@ -17,7 +17,7 @@ jobs:
   aggregate:
     name: Native conformance aggregate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - name: Check out the exact tested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,7 +34,8 @@ jobs:
           retries: 3
           script: |
             const sha = context.payload.pull_request?.head.sha || context.sha;
-            const maxAttempts = 160;
+            // Platform CI can exceed 80 minutes; allow up to 120 minutes for it.
+            const maxAttempts = 240;
             let run;
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
               const response = await github.rest.actions.listWorkflowRuns({

@@ -1,7 +1,8 @@
 # Hyphae usage manual
 
-Status: current for the published `3.0.0` release. Every command below was
-executed against the released `3.0.0` binary; outputs are literal, trimmed
+Status: historical execution record for the published `3.0.0` release.
+For the current `4.0.0` installation, use the [Native quickstart](quickstart-native.md).
+Every command below was executed against the `3.0.0` binary; outputs are literal, trimmed
 only where marked. The normative
 semantics remain in the versioned specifications under
 [`docs/native/`](native/local-product-v1.md) and the contracts under

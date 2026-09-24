@@ -3,12 +3,12 @@
 All notable changes are documented here. Hyphae follows Semantic Versioning
 for public APIs after `0.1.0`; on-disk format versions are tracked separately.
 
-## [4.0.0] - 2026-09-21
+## [4.0.0] - 2026-09-23
 
-Hyphae 4.0.0 prepares the current Agent Memory and Native data-engine source as
-one final package identity. This section records the candidate's source
-contents; it does not claim registry publication or an exact-SHA release-gate
-closure.
+Hyphae 4.0.0 releases the Agent Memory and Native data-engine source as
+one package identity. The annotated tag targets merge commit `7cbcf97d`;
+its signed GitHub Release, exact-SHA G8 closure, and 25 crates.io packages
+are recorded in the [publication receipt](docs/release/receipts/4.0.0.md).
 
 - Make `release-vVERSION-crates` the canonical Release and Python publication
   identity while retaining validation of the previous `vVERSION` source shape.
@@ -26,7 +26,7 @@ closure.
 - Add the offline `hyphae-native-embed-cpu` executor and CLI model/profile/
   ingestion commands. Its default-off CUDA feature selects a validated H100,
   records driver, runtime, compute dtype, canonical FP32 output, and whole-batch
-  CPU fallback. CUDA adds no crate; the candidate contains 25 publishable crates.
+  CPU fallback. CUDA adds no crate; the release contains 25 published crates.
 - Add the multilingual embedding measurement harness with controlled model
   acquisition, containment, legal review, and receipt validation. Its checked-in
   result remains `unverified-no-measurement`; it grants no model or performance
@@ -49,6 +49,11 @@ closure.
 - Persist vector updates and deletes as bounded per-index physical deltas, then
   add the authenticated ANN overlay reader, point writer, absence fences, and
   consolidation path under the existing WAL, MVCC, and proof authorities.
+- Replace the fixed lexical recovery traversal with bounded chunked validation
+  and typed resource admission. A rejected oversized write leaves the prior
+  WAL and root intact; source-bound synthetic scientific text, backup/restore,
+  and a maintained 250,000-short-document rung are recorded in
+  [the lexical recovery evidence](docs/gates/evidence/lexical-recovery-limit-2026-09-22.md).
 - Fix bounded SQL `LIMIT`/`OFFSET`, constraints, and catalog conflict semantics,
   and add PostgreSQL and Valkey application-core profiles as external
   conformance subjects rather than runtime dependencies.
@@ -67,11 +72,15 @@ The Rust minimum supported version is 1.90 because the pinned `redb 4.2.0`
 requires it.
 
 The workspace, 25-crate graph, SDK manifests, plugin manifests, and package
-inventories share source version `4.0.0`. The candidate integrates Lane14
+inventories share source version `4.0.0`. The release integrates Lane14
 `f2336d8664b32d812cea3291d942e286a89eea9d`, including reviewed accelerator
-cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`.
-It remains unpublished and has no exact-commit G7/G8 closure. The `3.0.0`
-release history and publication receipts remain authoritative.
+cherry-pick `994ee8f03a1fb713c89758ea058866cda92d6c26`. Source commit
+`7cbcf97d165beeb08aba27ff21203fa468f45bec` passed the hosted release
+matrix and exact-SHA G8 closure (run `35912994589`, aggregate SHA-256
+`f0bd9a0e08eff9ea2c45511deff816f7fc9edf7cd86752302a684e7ab25a83ce`).
+The earlier G7 profile remains scoped to its own source; no new
+model-quality or universal latency claim follows from this release. The
+`3.0.0` release and receipts remain historical authority for that version.
 
 ## [3.0.0] - 2026-09-03
 

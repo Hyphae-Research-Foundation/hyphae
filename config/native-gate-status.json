@@ -122,11 +122,23 @@
       "aggregate_sha256": "41dacc41bde4420ec3f2d735828669231966dd53c545a2fdd7a6bf0691205ebf",
       "registry_run": 33859889168,
       "retained_evidence": "docs/gates/evidence/closures/native-g8-24bce1a.json"
+    },
+    {
+      "release": "4.0.0",
+      "tag": "release-v4.0.0-crates",
+      "commit": "7cbcf97",
+      "source_commit": "7cbcf97d165beeb08aba27ff21203fa468f45bec",
+      "readiness_run": 35876137219,
+      "release_run": 35912595431,
+      "closure_run": 35912994589,
+      "aggregate_sha256": "f0bd9a0e08eff9ea2c45511deff816f7fc9edf7cd86752302a684e7ab25a83ce",
+      "registry_run": 35923881783,
+      "retained_evidence": "docs/gates/evidence/closures/native-g8-7cbcf97.json"
     }
   ],
   "release_candidate": {
     "version": "4.0.0",
-    "status": "selected-integration-prepared",
+    "status": "released",
     "release_preparation_commit": "d07c7fb81d5d972a11a04dbecc9f839e5142a024",
     "release_composition_parent": "8d7a28dc39cffc66fb8cc94421e65dfb91a5f9d1",
     "integration_selection_commit": "b60238760aa67e860800f1b194d103623cd20a92",
@@ -173,10 +185,10 @@
     },
     "receipts": {
       "model_result": "open-no-verified-receipt",
-      "hosted_release_matrix": "open",
-      "exact_sha_g8": "open"
+      "hosted_release_matrix": "passed-35912595431",
+      "exact_sha_g8": "closed-35912994589"
     },
-    "exact_sha_g8": "open",
-    "publication": "blocked"
+    "exact_sha_g8": "closed",
+    "publication": "crates-io-published-35923881783"
   }
 }

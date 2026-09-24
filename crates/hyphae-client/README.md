@@ -8,7 +8,7 @@
 Bounded asynchronous Rust client for the [Hyphae](https://hyphae.dev) `/v1`
 HTTP API.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

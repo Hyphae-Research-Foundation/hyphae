@@ -9,7 +9,7 @@ Pure deterministic query types and reference execution for
 [Hyphae](https://hyphae.dev). It provides structured values, filters, global
 sorting, logical cursors, aggregations, and explicit execution budgets.
 
-The source release candidate is `4.0.0`:
+The published crate version is `4.0.0`:
 
 ```toml
 [dependencies]

@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
 # Lexical recovery limit: synthetic source-bound reproduction
 
-Status: candidate source repair and the tested 250,000-document short-text
-rung verified. This is not a tagged or published release. This receipt uses
-only synthetic text; it does not identify the sole cause of any external
-incident.
+Status: source-bound repair and the tested 250,000-document short-text
+rung verified before publication. The repair is included in the later 4.0.0
+tagged source, but the measurements below remain bound to their stated source
+commits. This receipt uses only synthetic text; it does not identify the sole
+cause of any external incident.
 
 ## Candidate before the repair
 
@@ -139,7 +140,10 @@ and the M05 shared lexical/ANN budget. It does not claim that every possible
 
 The source-bound reproduction, strict scientific corpus, verified
 backup/restore, and clean `8b9b214e` short-text scale with independent reopen
-and count pass. The draft PR tracks package and hosted receipts bound to its
-final head. Tag-bound signed-release/G8 closure remains separate from a
-reviewable candidate. No release, tag, or comparative performance claim
-follows from this source repair alone.
+and count pass. At the time of this reproduction, the draft PR still needed
+package and hosted receipts bound to its final head. The later annotated 4.0.0 tag targets
+`7cbcf97d165beeb08aba27ff21203fa468f45bec`, which contains both repair
+commits. Its separate signed Release run `35912595431` and exact-SHA G8 closure
+run `35912994589` passed. Those release gates do not turn the measurements here
+into tag-bound performance results or prove a unique cause for an external
+incident.

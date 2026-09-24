@@ -1,0 +1,134 @@
+{
+  "schema": "hyphae-v4-independent-crates-io-verification-v1",
+  "verified_at": "2026-09-23T22:04:01.295269+00:00",
+  "source_commit": "7cbcf97d165beeb08aba27ff21203fa468f45bec",
+  "version": "4.0.0",
+  "count": 25,
+  "crates": [
+    {
+      "name": "hyphae-core",
+      "version": "4.0.0",
+      "sha256": "48a2b5c8ad34d35a0f00ab8e79a3bea74bc21e9b0c4819f2e9cb2ee8552c93e3"
+    },
+    {
+      "name": "hyphae-native-types",
+      "version": "4.0.0",
+      "sha256": "7aab28165a5669842e9ed0cdda61b1d38495fd81c3047d24a0a7c9452f48f60c"
+    },
+    {
+      "name": "hyphae-native-ann",
+      "version": "4.0.0",
+      "sha256": "a693338f13cbc10f94d75a5ab4696ed3da2211c04be49ca58c1863fc0cacd3fc"
+    },
+    {
+      "name": "hyphae-native-catalog",
+      "version": "4.0.0",
+      "sha256": "131a114a26539bb42aae56037f9644f66376815db775b48ea8100fd336d42754"
+    },
+    {
+      "name": "hyphae-native-mvcc",
+      "version": "4.0.0",
+      "sha256": "7e7441bcbff81a4173e1d06bd3e44278d1a5fa9254c72a52d61d62476d388e89"
+    },
+    {
+      "name": "hyphae-native-pages",
+      "version": "4.0.0",
+      "sha256": "300990c884fe38713189d77e2955dd18d97c18df376fc831d436682e8af265b7"
+    },
+    {
+      "name": "hyphae-native-records",
+      "version": "4.0.0",
+      "sha256": "65c6d69640f93b5fcfeab709ababc6d3c2920d892a08510aaede2905291019dc"
+    },
+    {
+      "name": "hyphae-native-wal",
+      "version": "4.0.0",
+      "sha256": "3aa77dca0004447fb23220f037087b15fc9f9d4a12eadc3b1e28fb5610f2a386"
+    },
+    {
+      "name": "hyphae-query",
+      "version": "4.0.0",
+      "sha256": "9157529df72fd6b359e719cf2c71e3e66637c9d37de37821cd666a58884e2fc1"
+    },
+    {
+      "name": "hyphae-contracts",
+      "version": "4.0.0",
+      "sha256": "8fd0cc7fb0fd27e9ee500d8be802d5c90a0bf145f1e03304464afeb911fbb0a1"
+    },
+    {
+      "name": "hyphae-native-blobs",
+      "version": "4.0.0",
+      "sha256": "f5d07bba336571ba232853355e9827574aa6693eab5f178622561037cee7f516"
+    },
+    {
+      "name": "hyphae-native-btree",
+      "version": "4.0.0",
+      "sha256": "6b4e2149b6ba8cb7ba3ca8a88b4543308dd2864e9046ed1742d66f04645bafcc"
+    },
+    {
+      "name": "hyphae-native-manifest",
+      "version": "4.0.0",
+      "sha256": "545365e3d2d348ba75e2484a17c7a1a6aad3f9018011b1c961deb8eff2413e78"
+    },
+    {
+      "name": "hyphae-retrieval",
+      "version": "4.0.0",
+      "sha256": "11c27e25bbcc4735876b273ff7fa008ec14624131b8567a9ab97425a957ba95b"
+    },
+    {
+      "name": "hyphae-native-runtime",
+      "version": "4.0.0",
+      "sha256": "deac10b0c849ad2d542f90eca76a1b81c0425ef0ae87501665ca0a04fbd274ed"
+    },
+    {
+      "name": "hyphae-storage",
+      "version": "4.0.0",
+      "sha256": "82feaae9c4065ec34d80b15a9f34c96f2f7076c10a322bebe4b9d3e5be099061"
+    },
+    {
+      "name": "hyphae-engine",
+      "version": "4.0.0",
+      "sha256": "11b57dd83881849bcdd06e2af39d3ceeecb7cc6a1970b331a2211e2428967515"
+    },
+    {
+      "name": "hyphae-native-product",
+      "version": "4.0.0",
+      "sha256": "3f7f6562223eeba1a004bcf6dd9aac377fd6317866f419834ff3f3afc3eac261"
+    },
+    {
+      "name": "hyphae-native-embed-cpu",
+      "version": "4.0.0",
+      "sha256": "65bbf48e524434464fa5ddff46f9960dd6d59f686001b043ff37df6360035fce"
+    },
+    {
+      "name": "hyphae-native-protocol",
+      "version": "4.0.0",
+      "sha256": "a8f5c0e68997431acb367df8d8f01c36557c54d6703d34e0a64de90b012c4c07"
+    },
+    {
+      "name": "hyphae-client",
+      "version": "4.0.0",
+      "sha256": "63c41b2cdb45fc5cee21eb9b86c2f7de1b9f9cf7e66f430427dc6462e6ade604"
+    },
+    {
+      "name": "hyphae-native-daemon",
+      "version": "4.0.0",
+      "sha256": "53e8c4bf7fb1126bdd0f7445a3c9de81e52efac488ff2878badce437ddb87d3a"
+    },
+    {
+      "name": "hyphae-server",
+      "version": "4.0.0",
+      "sha256": "c8ad7d6a57f7d010a9decd44303f66384a70e4970846c6a2c48bbf7fcaa1d0e6"
+    },
+    {
+      "name": "hyphae-cli",
+      "version": "4.0.0",
+      "sha256": "d4ee38c5f816745afc00d454efcfee6abc399124eb384e262a2d96f651449a62"
+    },
+    {
+      "name": "hyphae-pliegors",
+      "version": "4.0.0",
+      "sha256": "bce818657ba1c05a2f28de3677a3564403233384feba6ec260c216ea813825bc"
+    }
+  ]
+}
