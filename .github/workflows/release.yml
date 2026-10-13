@@ -202,7 +202,7 @@ jobs:
           test "$(git rev-parse FETCH_HEAD)" = "$PR_MERGE_COMMIT"
           test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')"
       - name: Download native archives
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: hyphae-native-*
           path: dist
@@ -461,7 +461,7 @@ jobs:
           echo "CONTROL_PACKAGING=$control_root/packaging" >> "$GITHUB_ENV"
           echo "HYPHAE_RELEASE_SOURCE_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Download verified release candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: hyphae-release-candidate
           path: dist
