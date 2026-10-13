@@ -209,12 +209,12 @@ jobs:
             tools.test_python_distribution_receipt -v
           python control/tools/check_python_package.py --root source --workflow-root control
       - name: Download independent builder A by name
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: hyphae-python-independent-a-${{ inputs.source_tag }}
           path: independent-a
       - name: Download independent builder B by name
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: hyphae-python-independent-b-${{ inputs.source_tag }}
           path: independent-b
@@ -404,12 +404,12 @@ jobs:
         with:
           python-version: '3.11.15'
       - name: Download independent builder A
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: hyphae-python-independent-a-${{ inputs.source_tag }}
           path: independent-a
       - name: Download independent builder B
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: hyphae-python-independent-b-${{ inputs.source_tag }}
           path: independent-b
@@ -508,7 +508,7 @@ jobs:
           echo "sdist-sha256=$(sha256sum "independent-a/hyphae_sdk-$VERSION.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Download exact TestPyPI authority
         if: inputs.repository == 'pypi'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.testpypi_run_id }}
@@ -533,7 +533,7 @@ jobs:
             > testpypi-authority/github-run.json
       - name: Download exact signed Release authority
         if: inputs.repository == 'pypi'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority-inputs.outputs.release_run_id }}
@@ -541,7 +541,7 @@ jobs:
           path: release-authority
       - name: Download exact G8 closure authority
         if: inputs.repository == 'pypi'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority-inputs.outputs.g8_closure_run_id }}
@@ -934,7 +934,7 @@ jobs:
       id-token: write
     steps:
       - name: Download immutable preflighted publication artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}
           path: release
@@ -969,7 +969,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Download exact build receipt
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.build.outputs.publication-artifact-id }}
           path: release

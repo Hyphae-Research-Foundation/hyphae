@@ -145,42 +145,42 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
       - name: Restore a prior reconciliation receipt on workflow rerun
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
           name: registry-publication-${{ inputs.ecosystem }}-${{ steps.authority.outputs.source_commit }}
           path: ${{ github.workspace }}
       - name: Download exact Release readiness aggregate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority.outputs.release_run_id }}
           name: hyphae-release-candidate
           path: evidence/release-candidate
       - name: Download exact signed release receipt
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority.outputs.release_run_id }}
           name: native-g8-signed-release-${{ steps.authority.outputs.source_commit }}
           path: evidence/signed-release
       - name: Download exact G8 closure aggregate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority.outputs.g8_run_id }}
           name: native-g8-aggregate-${{ steps.authority.outputs.source_commit }}
           path: evidence/g8
       - name: Download exact security hard-kill aggregate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority.outputs.ci_run_id }}
           name: security-hard-kill-${{ steps.authority.outputs.source_commit }}
           path: evidence/security-hard-kill
       - name: Download exact MCP real-host receipts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ steps.authority.outputs.ci_run_id }}
